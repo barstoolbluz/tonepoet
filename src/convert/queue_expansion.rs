@@ -1373,7 +1373,9 @@ pub fn is_synthetic_cue_album_artifact(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with(SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX))
         && process_root
             .parent()
-            .is_some_and(|root| root == synthetic_cue_album_root())
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some(SYNTHETIC_CUE_ALBUM_DIR)
 }
 
 pub fn cleanup_synthetic_cue_artifact(path: &Path) {
@@ -1385,8 +1387,10 @@ pub fn cleanup_synthetic_cue_artifact(path: &Path) {
         let _ = fs::remove_dir_all(artifact_dir);
         if let Some(process_root) = process_root {
             sync_directory_best_effort(&process_root);
+            if let Some(root) = process_root.parent() {
+                sync_directory_best_effort(root);
+            }
         }
-        sync_directory_best_effort(&synthetic_cue_album_root());
     }
 }
 
@@ -3975,5 +3979,29 @@ mod authoritative_split_cue_grouping_tests {
         assert_eq!(fallback.paths.len(), 1);
         assert!(is_synthetic_cue_album_artifact(&fallback.paths[0]));
         cleanup_synthetic_cue_artifacts(&fallback.synthetic_cue_artifacts);
+    }
+}
+
+#[cfg(test)]
+mod synthetic_artifact_identity_tests {
+    use super::*;
+
+    #[test]
+    fn recognition_uses_persisted_path_shape_not_the_current_temp_directory() {
+        let persisted_under_other_temp = PathBuf::from("other-session-temp")
+            .join(SYNTHETIC_CUE_ALBUM_DIR)
+            .join(format!("{SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX}123"))
+            .join(format!("{SYNTHETIC_CUE_ALBUM_ARTIFACT_PREFIX}456"))
+            .join(SYNTHETIC_CUE_ALBUM_FILE);
+        assert!(is_synthetic_cue_album_artifact(
+            &persisted_under_other_temp
+        ));
+
+        let wrong_root = PathBuf::from("other-session-temp")
+            .join("not-tonepoet")
+            .join(format!("{SYNTHETIC_CUE_ALBUM_PROCESS_PREFIX}123"))
+            .join(format!("{SYNTHETIC_CUE_ALBUM_ARTIFACT_PREFIX}456"))
+            .join(SYNTHETIC_CUE_ALBUM_FILE);
+        assert!(!is_synthetic_cue_album_artifact(&wrong_root));
     }
 }

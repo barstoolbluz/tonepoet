@@ -46,6 +46,7 @@
           libbluray
           libudfread
           libaacs
+          dbus # keyring crate: sync-secret-service backend (libdbus-sys)
         ];
 
         # opus-tools — fix missing __opus_check_int/_ptr inline helpers

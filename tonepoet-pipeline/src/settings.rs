@@ -892,6 +892,22 @@ impl Default for VerificationSettings {
     }
 }
 
+/// Policy for existing ReplayGain tags on every output track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ReplayGainExistingTagPolicy {
+    /// Always run the scanner, preserving historical behavior.
+    Rescan,
+    /// Skip only when every output carries every non-empty tag required by the selected mode.
+    SkipIfComplete,
+}
+
+impl Default for ReplayGainExistingTagPolicy {
+    fn default() -> Self {
+        Self::Rescan
+    }
+}
+
 /// ReplayGain post-processing settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -900,6 +916,9 @@ pub struct ReplayGainSettings {
     pub mode: Option<ReplayGainMode>,
     /// Avoid clipping where the scanner supports it.
     pub prevent_clipping: bool,
+    /// Whether complete existing ReplayGain tag sets may suppress rescanning.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub existing_tags: ReplayGainExistingTagPolicy,
 }
 
 impl Default for ReplayGainSettings {
@@ -907,6 +926,7 @@ impl Default for ReplayGainSettings {
         Self {
             mode: None,
             prevent_clipping: true,
+            existing_tags: ReplayGainExistingTagPolicy::Rescan,
         }
     }
 }

@@ -2963,22 +2963,6 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> ConvertStageResult {
-    if let Err(error) = preflight_album_conversion_tools(req, runner) {
-        let records = source
-            .tracks
-            .iter()
-            .map(|track| failed_track_record(track, None, None, Vec::new(), error.clone()))
-            .collect();
-        return ConvertStageResult {
-            tracks: records,
-            artifacts: ArtifactSet {
-                audio: AudioArtifacts::Tracks(Vec::new()),
-                sidecars: Vec::new(),
-            },
-            record: stage_record(PipelineStage::Convert, StageOutcome::Failed(error)),
-        };
-    }
-
     let planned: BTreeMap<_, _> = plan
         .entries
         .iter()
@@ -6746,6 +6730,402 @@ FILE "album.flac" WAVE
     }
 }
 
+fn replaygain_value_present(tag: &lofty::tag::Tag, key: lofty::tag::ItemKey) -> bool {
+    tag.get_string(&key)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn replaygain_tag_set_complete(
+    tag: &lofty::tag::Tag,
+    mode: tonepoet_pipeline::ReplayGainMode,
+) -> bool {
+    use lofty::tag::ItemKey;
+    let track_complete = replaygain_value_present(tag, ItemKey::ReplayGainTrackGain)
+        && replaygain_value_present(tag, ItemKey::ReplayGainTrackPeak);
+    let album_complete = replaygain_value_present(tag, ItemKey::ReplayGainAlbumGain)
+        && replaygain_value_present(tag, ItemKey::ReplayGainAlbumPeak);
+    match mode {
+        tonepoet_pipeline::ReplayGainMode::Track => track_complete,
+        tonepoet_pipeline::ReplayGainMode::Album => album_complete,
+        tonepoet_pipeline::ReplayGainMode::Both => track_complete && album_complete,
+    }
+}
+
+#[cfg(test)]
+mod replaygain_existing_tag_policy_tests {
+    use super::*;
+    use super::chunk_2_1_3_postprocessing_gate_and_phase_tests::{request, stage_policy};
+    use crate::convert::pipeline::tool::{ProcessExit, StubToolRunner, ToolOutput};
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+    use tonepoet_pipeline::{
+        ReplayGainExistingTagPolicy, ReplayGainMode,
+    };
+
+    fn tag_with(values: &[(ItemKey, &str)]) -> Tag {
+        let mut tag = Tag::new(TagType::VorbisComments);
+        for (key, value) in values {
+            tag.insert_unchecked(TagItem::new(
+                key.clone(),
+                ItemValue::Text((*value).to_string()),
+            ));
+        }
+        tag
+    }
+
+    fn flac_block(block_type: u8, last: bool, data: &[u8]) -> Vec<u8> {
+        assert!(data.len() <= 0x00ff_ffff);
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.push((if last { 0x80 } else { 0 }) | block_type);
+        let len = data.len() as u32;
+        out.extend_from_slice(&len.to_be_bytes()[1..]);
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn vorbis_block_body(comments: &[(&str, &str)]) -> Vec<u8> {
+        let vendor = "tonepoet-replaygain-test";
+        let mut out = Vec::new();
+        out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        out.extend_from_slice(vendor.as_bytes());
+        out.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for (name, value) in comments {
+            let comment = format!("{name}={value}");
+            out.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+            out.extend_from_slice(comment.as_bytes());
+        }
+        out
+    }
+
+    fn write_synthetic_flac(path: &Path, comments: &[(&str, &str)]) {
+        let mut streaminfo = [0u8; 34];
+        streaminfo[0..2].copy_from_slice(&4096u16.to_be_bytes());
+        streaminfo[2..4].copy_from_slice(&4096u16.to_be_bytes());
+        let packed_audio_facts = (44_100u64 << 44)
+            | (1u64 << 41) // two channels: channels minus one
+            | (15u64 << 36) // 16-bit PCM: bits per sample minus one
+            | 4096u64;
+        streaminfo[10..18].copy_from_slice(&packed_audio_facts.to_be_bytes());
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"fLaC");
+        bytes.extend_from_slice(&flac_block(0, false, &streaminfo));
+        bytes.extend_from_slice(&flac_block(4, true, &vorbis_block_body(comments)));
+        std::fs::write(path, bytes).expect("write synthetic ReplayGain FLAC");
+    }
+
+    fn track_artifact(path: PathBuf, ordinal: u32) -> TrackArtifact {
+        TrackArtifact {
+            track_id: TrackId {
+                source_ordinal: ordinal,
+                disc_number: None,
+                track_number: ordinal,
+            },
+            staged_path: path.clone(),
+            final_path: path.with_extension("published.flac"),
+            samples: Some(44_100),
+            metadata_satisfaction: PlannedMetadataSatisfaction::default(),
+            metadata_required: PlannedMetadataSatisfaction::default(),
+            planned_command_hash: None,
+        }
+    }
+
+    fn artifacts(paths: &[PathBuf]) -> ArtifactSet {
+        ArtifactSet {
+            audio: AudioArtifacts::Tracks(
+                paths
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, path)| track_artifact(path, index as u32 + 1))
+                    .collect(),
+            ),
+            sidecars: Vec::new(),
+        }
+    }
+
+    fn replaygain_request(
+        root: &Path,
+        mode: ReplayGainMode,
+        existing_tags: ReplayGainExistingTagPolicy,
+    ) -> PipelineRequest {
+        let mut req = request(
+            root,
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, true, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.replay_gain.mode = Some(mode);
+        req.settings.replay_gain.existing_tags = existing_tags;
+        req
+    }
+
+    fn successful_loudgain_output() -> ToolOutput {
+        ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(1),
+            command: CommandRecord {
+                description: None,
+                binary: ToolBinary::Loudgain,
+                sanitized_args: Vec::new(),
+                cwd: None,
+                env_keys: Vec::new(),
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(1),
+            },
+        }
+    }
+
+    const COMPLETE_BOTH: &[(&str, &str)] = &[
+        ("REPLAYGAIN_TRACK_GAIN", "-7.25 dB"),
+        ("REPLAYGAIN_TRACK_PEAK", "0.9231"),
+        ("REPLAYGAIN_ALBUM_GAIN", "-6.80 dB"),
+        ("REPLAYGAIN_ALBUM_PEAK", "0.9772"),
+    ];
+
+    #[test]
+    fn completeness_is_mode_specific_and_requires_gain_and_peak_values() {
+        let track = tag_with(&[
+            (ItemKey::ReplayGainTrackGain, "-7.25 dB"),
+            (ItemKey::ReplayGainTrackPeak, "0.9231"),
+        ]);
+        assert!(replaygain_tag_set_complete(&track, ReplayGainMode::Track));
+        assert!(!replaygain_tag_set_complete(&track, ReplayGainMode::Album));
+        assert!(!replaygain_tag_set_complete(&track, ReplayGainMode::Both));
+
+        let album = tag_with(&[
+            (ItemKey::ReplayGainAlbumGain, "-6.80 dB"),
+            (ItemKey::ReplayGainAlbumPeak, "0.9772"),
+        ]);
+        assert!(!replaygain_tag_set_complete(&album, ReplayGainMode::Track));
+        assert!(replaygain_tag_set_complete(&album, ReplayGainMode::Album));
+        assert!(!replaygain_tag_set_complete(&album, ReplayGainMode::Both));
+
+        let both = tag_with(&[
+            (ItemKey::ReplayGainTrackGain, "-7.25 dB"),
+            (ItemKey::ReplayGainTrackPeak, "0.9231"),
+            (ItemKey::ReplayGainAlbumGain, "-6.80 dB"),
+            (ItemKey::ReplayGainAlbumPeak, "0.9772"),
+        ]);
+        assert!(replaygain_tag_set_complete(&both, ReplayGainMode::Track));
+        assert!(replaygain_tag_set_complete(&both, ReplayGainMode::Album));
+        assert!(replaygain_tag_set_complete(&both, ReplayGainMode::Both));
+    }
+
+    #[test]
+    fn blank_or_partial_tag_sets_never_count_as_complete() {
+        let blank_track_peak = tag_with(&[
+            (ItemKey::ReplayGainTrackGain, "-7.25 dB"),
+            (ItemKey::ReplayGainTrackPeak, "   "),
+        ]);
+        assert!(!replaygain_tag_set_complete(
+            &blank_track_peak,
+            ReplayGainMode::Track
+        ));
+
+        let partial_album = tag_with(&[(ItemKey::ReplayGainAlbumGain, "-6.80 dB")]);
+        assert!(!replaygain_tag_set_complete(
+            &partial_album,
+            ReplayGainMode::Album
+        ));
+    }
+
+    #[tokio::test]
+    async fn skip_if_complete_skips_subprocess_only_when_every_output_is_complete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let one = temp.path().join("01.flac");
+        let two = temp.path().join("02.flac");
+        write_synthetic_flac(&one, COMPLETE_BOTH);
+        write_synthetic_flac(&two, COMPLETE_BOTH);
+        let artifacts = artifacts(&[one, two]);
+        assert_eq!(
+            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both)
+                .expect("inspect complete outputs"),
+            true
+        );
+
+        let req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        let runner = StubToolRunner::new();
+        let record = apply_replaygain(
+            &artifacts,
+            &req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("complete tags should skip");
+
+        assert!(matches!(record.outcome, StageOutcome::Skipped));
+        assert_eq!(runner.transcript().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_incomplete_output_runs_exactly_one_loudgain_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let one = temp.path().join("01.flac");
+        let two = temp.path().join("02.flac");
+        write_synthetic_flac(&one, COMPLETE_BOTH);
+        write_synthetic_flac(
+            &two,
+            &[
+                ("REPLAYGAIN_TRACK_GAIN", "-7.25 dB"),
+                ("REPLAYGAIN_TRACK_PEAK", "0.9231"),
+                ("REPLAYGAIN_ALBUM_GAIN", "-6.80 dB"),
+            ],
+        );
+        let artifacts = artifacts(&[one, two]);
+        assert_eq!(
+            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both)
+                .expect("inspect partial outputs"),
+            false
+        );
+
+        let req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        let runner = StubToolRunner::new();
+        runner.push_output(successful_loudgain_output());
+        let record = apply_replaygain(
+            &artifacts,
+            &req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("partial tags must rescan");
+
+        assert!(matches!(record.outcome, StageOutcome::Ok));
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].binary, ToolBinary::Loudgain);
+    }
+
+    #[tokio::test]
+    async fn unreadable_output_fails_closed_to_one_rescan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let unreadable = temp.path().join("corrupt.flac");
+        std::fs::write(&unreadable, b"not a tagged audio file").expect("corrupt fixture");
+        let artifacts = artifacts(&[unreadable]);
+        assert!(
+            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both).is_err()
+        );
+
+        let req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        let runner = StubToolRunner::new();
+        runner.push_output(successful_loudgain_output());
+        let record = apply_replaygain(
+            &artifacts,
+            &req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("inspection uncertainty must rescan");
+
+        assert!(matches!(record.outcome, StageOutcome::Ok));
+        assert_eq!(runner.transcript().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_artifact_set_is_not_complete_and_never_invokes_loudgain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifacts = artifacts(&[]);
+        assert_eq!(
+            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both)
+                .expect("empty inspection"),
+            false
+        );
+
+        let req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        let runner = StubToolRunner::new();
+        let record = apply_replaygain(
+            &artifacts,
+            &req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("empty artifacts skip stage");
+
+        assert!(matches!(record.outcome, StageOutcome::Skipped));
+        assert_eq!(runner.transcript().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rescan_policy_invokes_loudgain_even_when_tags_are_complete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let one = temp.path().join("01.flac");
+        write_synthetic_flac(&one, COMPLETE_BOTH);
+        let artifacts = artifacts(&[one]);
+
+        let req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::Rescan,
+        );
+        let runner = StubToolRunner::new();
+        runner.push_output(successful_loudgain_output());
+        let record = apply_replaygain(
+            &artifacts,
+            &req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("explicit rescan must run");
+
+        assert!(matches!(record.outcome, StageOutcome::Ok));
+        assert_eq!(runner.transcript().len(), 1);
+    }
+}
+
+fn artifact_audio_paths(artifacts: &ArtifactSet) -> Vec<&Path> {
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => tracks.iter().map(|track| track.staged_path.as_path()).collect(),
+        AudioArtifacts::Merged(merged) => vec![merged.staged_path.as_path()],
+    }
+}
+
+fn all_artifacts_have_complete_replaygain(
+    artifacts: &ArtifactSet,
+    mode: tonepoet_pipeline::ReplayGainMode,
+) -> Result<bool, String> {
+    use lofty::file::TaggedFileExt;
+    let paths = artifact_audio_paths(artifacts);
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    for path in paths {
+        let tagged = lofty::read_from_path(path)
+            .map_err(|err| format!("could not inspect ReplayGain tags on '{}': {err}", path.display()))?;
+        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+            return Ok(false);
+        };
+        if !replaygain_tag_set_complete(tag, mode) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Apply ReplayGain tags via loudgain.
 pub async fn apply_replaygain(
     artifacts: &ArtifactSet,
@@ -6783,6 +7163,32 @@ pub async fn apply_replaygain_with_tool_limits(
         });
     }
 
+    let mode = req.settings.replay_gain.mode.unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
+    if req.settings.replay_gain.existing_tags
+        == tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete
+    {
+        match all_artifacts_have_complete_replaygain(artifacts, mode) {
+            Ok(true) => {
+                log::info!(
+                    "skipping ReplayGain scan for job {}: every output already has the complete {:?} tag set",
+                    req.job_id,
+                    mode
+                );
+                return Ok(StageRecord {
+                    stage: PipelineStage::ReplayGain,
+                    outcome: StageOutcome::Skipped,
+                    dsd_dst_stats: None,
+                });
+            }
+            Ok(false) => {}
+            Err(err) => {
+                // Inspection uncertainty must never be mistaken for complete tags.
+                // Rescanning is the safe behavior and the degradation is visible.
+                log::warn!("{err}; ReplayGain scan will run");
+            }
+        }
+    }
+
     let mut args = Vec::new();
     match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => {
@@ -6793,7 +7199,9 @@ pub async fn apply_replaygain_with_tool_limits(
                     dsd_dst_stats: None,
                 });
             }
-            args.push("-a".to_string());
+            if matches!(mode, tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both) {
+                args.push("-a".to_string());
+            }
             args.push("-k".to_string());
             args.push("-s".to_string());
             args.push("i".to_string());
@@ -6802,6 +7210,9 @@ pub async fn apply_replaygain_with_tool_limits(
             }
         }
         AudioArtifacts::Merged(merged) => {
+            if matches!(mode, tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both) {
+                args.push("-a".to_string());
+            }
             args.push("-k".to_string());
             args.push("-s".to_string());
             args.push("i".to_string());
@@ -15527,46 +15938,146 @@ fn compression_ratio(bytes_in: u64, bytes_out: u64) -> String {
         "0.0% change".to_string()
     }
 }
+fn sanitize_cue_quoted_value(value: &str) -> (Option<String>, bool) {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    let mut changed = false;
+    for ch in value.chars() {
+        let replacement = match ch {
+            '\r' | '\n' | '\t' => {
+                changed = true;
+                pending_space = true;
+                continue;
+            }
+            '"' => {
+                changed = true;
+                '\''
+            }
+            ch if ch.is_control() => {
+                changed = true;
+                pending_space = true;
+                continue;
+            }
+            ch => ch,
+        };
+        if pending_space && !sanitized.is_empty() && !sanitized.ends_with(' ') {
+            sanitized.push(' ');
+        }
+        pending_space = false;
+        sanitized.push(replacement);
+    }
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        (None, changed || !value.is_empty())
+    } else {
+        changed |= trimmed.len() != sanitized.len();
+        (Some(trimmed.to_string()), changed)
+    }
+}
+
+fn sanitize_cue_catalog(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 13 && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.to_string())
+}
+
+fn sanitize_cue_isrc(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_uppercase();
+    let bytes = value.as_bytes();
+    (bytes.len() == 12
+        && bytes[0..2].iter().all(|byte| byte.is_ascii_alphabetic())
+        && bytes[2..5].iter().all(|byte| byte.is_ascii_alphanumeric())
+        && bytes[5..12].iter().all(|byte| byte.is_ascii_digit()))
+    .then_some(value)
+}
+
+fn push_cue_quoted_line(cue: &mut String, prefix: &str, value: &str, field: &str) {
+    let (sanitized, changed) = sanitize_cue_quoted_value(value);
+    let indentation = prefix
+        .chars()
+        .take_while(|character| character.is_ascii_whitespace())
+        .collect::<String>();
+    match sanitized {
+        Some(value) => {
+            cue.push_str(prefix);
+            cue.push('"');
+            cue.push_str(&value);
+            cue.push_str("\"\n");
+            if changed {
+                cue.push_str(&format!(
+                    "{indentation}REM TONEPOET SANITIZED {field}\n"
+                ));
+            }
+        }
+        None => cue.push_str(&format!(
+            "{indentation}REM TONEPOET OMITTED invalid {field}\n"
+        )),
+    }
+}
+
+fn push_cue_file_line(cue: &mut String, filename: &str) {
+    let (filename, changed) = sanitize_cue_quoted_value(filename);
+    let filename = filename.unwrap_or_else(|| "unknown".to_string());
+    cue.push_str(&format!("FILE \"{filename}\" WAVE\n"));
+    if changed {
+        cue.push_str("REM TONEPOET SANITIZED FILE\n");
+    }
+}
+
 fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
     let mut cue = String::new();
     if let Some(catalog) = source.album_metadata.extra.get("catalog") {
-        cue.push_str(&format!("CATALOG {}\n", catalog));
+        if let Some(catalog) = sanitize_cue_catalog(catalog) {
+            cue.push_str(&format!("CATALOG {catalog}\n"));
+        } else {
+            cue.push_str("REM TONEPOET OMITTED invalid CATALOG\n");
+        }
     }
     if let Some(ref artist) = source.album_metadata.album_artist {
-        cue.push_str(&format!("PERFORMER \"{}\"\n", artist));
+        push_cue_quoted_line(&mut cue, "PERFORMER ", artist, "PERFORMER");
     }
     if let Some(ref album) = source.album_metadata.album {
-        cue.push_str(&format!("TITLE \"{}\"\n", album));
+        push_cue_quoted_line(&mut cue, "TITLE ", album, "TITLE");
     }
     if let Some(ref date) = source.album_metadata.date {
-        cue.push_str(&format!("REM DATE {}\n", date));
+        let (date, changed) = sanitize_cue_quoted_value(date);
+        if let Some(date) = date {
+            cue.push_str(&format!("REM DATE {date}\n"));
+            if changed {
+                cue.push_str("REM TONEPOET SANITIZED DATE\n");
+            }
+        }
     }
     if let Some(ref genre) = source.album_metadata.genre {
-        cue.push_str(&format!("REM GENRE \"{}\"\n", genre));
+        push_cue_quoted_line(&mut cue, "REM GENRE ", genre, "GENRE");
     }
     let push_track_body = |cue: &mut String, st: &PreparedTrack| {
         if let Some(ref isrc) = st.metadata.isrc {
-            cue.push_str(&format!("    ISRC {}\n", isrc));
+            if let Some(isrc) = sanitize_cue_isrc(isrc) {
+                cue.push_str(&format!("    ISRC {isrc}\n"));
+            } else {
+                cue.push_str("    REM TONEPOET OMITTED invalid ISRC\n");
+            }
         }
         if let Some(ref title) = st.metadata.title {
-            cue.push_str(&format!("    TITLE \"{}\"\n", title));
+            push_cue_quoted_line(cue, "    TITLE ", title, "TITLE");
         }
         if let Some(ref artist) = st.metadata.artist {
-            cue.push_str(&format!("    PERFORMER \"{}\"\n", artist));
+            push_cue_quoted_line(cue, "    PERFORMER ", artist, "PERFORMER");
         }
     };
     match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => {
-            for (i, t) in tracks.iter().enumerate() {
-                let filename = t
+            for (i, track) in tracks.iter().enumerate() {
+                let filename = track
                     .staged_path
                     .file_name()
-                    .and_then(|f| f.to_str())
+                    .and_then(|filename| filename.to_str())
                     .unwrap_or("unknown");
-                cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
+                push_cue_file_line(&mut cue, filename);
                 cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
-                if let Some(st) = source.tracks.iter().find(|s| s.id == t.track_id) {
-                    push_track_body(&mut cue, st);
+                if let Some(source_track) = source.tracks.iter().find(|source_track| source_track.id == track.track_id) {
+                    push_track_body(&mut cue, source_track);
                 }
                 cue.push_str("    INDEX 01 00:00:00\n");
             }
@@ -15575,47 +16086,28 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
             let filename = merged
                 .staged_path
                 .file_name()
-                .and_then(|f| f.to_str())
+                .and_then(|filename| filename.to_str())
                 .unwrap_or("merged");
-            cue.push_str(&format!("FILE \"{}\" WAVE\n", filename));
-            // A merged image is one continuous timeline: INDEX positions are
-            // the cumulative sample offsets of the preceding tracks, not
-            // all-zero (which described ten tracks all starting at 0:00).
-            // The arithmetic is only honest when every boundary-contributing
-            // track (all but the last — the last track's length is never
-            // emitted) carries measured samples at ONE shared rate. Anything
-            // else (DVD-A with rates unknown until packet inspection, a
-            // mid-album probe failure) falls back to placeholder zeros
-            // rather than silently wrong times — e.g. 96k samples divided
-            // by a 44.1k guess, or a None track shifting every later INDEX
-            // early by its full length.
-            let boundary_tracks =
-                &source.tracks[..source.tracks.len().saturating_sub(1)];
+            push_cue_file_line(&mut cue, filename);
+            let boundary_tracks = &source.tracks[..source.tracks.len().saturating_sub(1)];
             let shared_rate = boundary_tracks
                 .first()
-                .and_then(|st| st.sample_rate)
-                .filter(|rate| {
-                    boundary_tracks
-                        .iter()
-                        .all(|st| st.sample_rate == Some(*rate))
-                });
+                .and_then(|track| track.sample_rate)
+                .filter(|rate| boundary_tracks.iter().all(|track| track.sample_rate == Some(*rate)));
             let exact_boundaries = boundary_tracks.is_empty()
                 || (shared_rate.is_some()
-                    && boundary_tracks
-                        .iter()
-                        .all(|st| st.expected_samples.is_some()));
-            let mut offset_samples: u64 = 0;
-            for (i, st) in source.tracks.iter().enumerate() {
+                    && boundary_tracks.iter().all(|track| track.expected_samples.is_some()));
+            let mut offset_samples = 0_u64;
+            for (i, source_track) in source.tracks.iter().enumerate() {
                 cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
-                push_track_body(&mut cue, st);
+                push_track_body(&mut cue, source_track);
                 let index_time = if exact_boundaries {
                     cue_index_time(offset_samples, shared_rate.unwrap_or(1))
                 } else {
                     "00:00:00".to_string()
                 };
                 cue.push_str(&format!("    INDEX 01 {index_time}\n"));
-                offset_samples =
-                    offset_samples.saturating_add(st.expected_samples.unwrap_or(0));
+                offset_samples = offset_samples.saturating_add(source_track.expected_samples.unwrap_or(0));
             }
         }
     }
@@ -20407,6 +20899,26 @@ pub async fn prepare_pipeline_item_for_scheduler(
         );
     }
 
+    if let Err(error) = preflight_album_conversion_tools(&req, runner) {
+        emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
+        let record = stage_record(PipelineStage::Convert, StageOutcome::Failed(error));
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
+        };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+            &req,
+            &outcome,
+        );
+        return ScheduledMaterialization::Finished(
+            finalize_report(&req, reporter, source, plan, None, published, outcome).await,
+        );
+    }
+
     let action_output = match PipelineOutputCapability::capture_for_actions(&req) {
         Ok(binding) => binding,
         Err(error) => {
@@ -20676,43 +21188,6 @@ pub async fn prepare_pipeline_item_for_scheduler(
                 .await,
             );
         }
-    }
-
-    if let Err(error) = preflight_album_conversion_tools(&req, runner) {
-        emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
-        let record = stage_record(
-            PipelineStage::Convert,
-            StageOutcome::Failed(error.clone()),
-        );
-        emit_stage_finished(reporter, &item_id, record.clone()).await;
-        stages.push(record);
-        let failed = failed_track_records(&prepared, &error);
-        let outcome = AlbumOutcome::Blocked {
-            successful: Vec::new(),
-            failed,
-            stages,
-            reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
-        };
-        let published = publish_terminal_conversion_log_fragment_if_needed(
-            &req,
-            Some(&prepared),
-            None,
-            &outcome,
-            staging,
-            Some(runner),
-        );
-        return ScheduledMaterialization::Finished(
-            finalize_report(
-                &req,
-                reporter,
-                Some(prepared),
-                Some(album_plan),
-                None,
-                published,
-                outcome,
-            )
-            .await,
-        );
     }
 
     ScheduledMaterialization::Ready(ScheduledAlbum {
@@ -21747,6 +22222,24 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             failed: Vec::new(),
             stages,
             reason: BlockReason::MaterializeFailed,
+        };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
+            &req,
+            &outcome,
+        );
+        return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+    }
+
+    if let Err(error) = preflight_album_conversion_tools(&req, runner) {
+        emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
+        let record = stage_record(PipelineStage::Convert, StageOutcome::Failed(error));
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed: Vec::new(),
+            stages,
+            reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
         };
         let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(
             &req,
@@ -27147,6 +27640,47 @@ mod companion_copy_hardening_tests {
         );
 
         assert_eq!(companion_source_dir(&req, &prepared), Some(source_dir));
+    }
+
+    #[test]
+    fn synthetic_cue_album_companion_source_uses_real_track_root_not_artifact_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let real_album = temp.path().join("real-album");
+        let artifact_dir = temp
+            .path()
+            .join("different-tmp-root")
+            .join("tonepoet-synthetic-cue-albums")
+            .join("process-4242")
+            .join("artifact-deadbeef");
+        let staging_dir = temp.path().join("staging").join("cue-segments");
+        std::fs::create_dir_all(&real_album).expect("real album");
+        std::fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        std::fs::create_dir_all(&staging_dir).expect("staging dir");
+        let synthetic_cue = artifact_dir.join("album.cue");
+        let image = real_album.join("disc-a.wv");
+        let staged = staging_dir.join("01.wav");
+        std::fs::write(&synthetic_cue, b"synthetic cue").expect("synthetic cue");
+        std::fs::write(&image, b"image").expect("image");
+        std::fs::write(&staged, b"wav").expect("staged");
+
+        assert!(
+            crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&synthetic_cue),
+            "fixture must satisfy the production synthetic-artifact recognizer"
+        );
+        let req = test_request(temp.path(), synthetic_cue.clone());
+        let prepared = test_prepared_source(
+            SourceKind::CueImage,
+            synthetic_cue,
+            vec![cue_segment_track(staged, image)],
+        );
+
+        let selected = companion_source_dir(&req, &prepared);
+        assert_eq!(
+            selected,
+            Some(real_album),
+            "synthetic artifact directory must never become the companion sweep root",
+        );
+        assert_ne!(selected, Some(artifact_dir));
     }
 
     #[test]
@@ -35563,7 +36097,7 @@ mod build_cue_sheet_tests {
         source
             .album_metadata
             .extra
-            .insert("catalog".to_string(), "EOP-80778".to_string());
+            .insert("catalog".to_string(), "4988000000001".to_string());
         source.tracks[0].metadata.isrc = Some("GBAYE0300334".to_string());
         let artifacts = ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![
@@ -35574,11 +36108,63 @@ mod build_cue_sheet_tests {
         };
 
         let cue = build_cue_sheet(&source, &artifacts);
-        assert!(cue.contains("CATALOG EOP-80778"), "{cue}");
+        assert!(cue.contains("CATALOG 4988000000001"), "{cue}");
         assert!(cue.contains("REM DATE 1973"), "{cue}");
         assert!(cue.contains("REM GENRE \"Rock\""), "{cue}");
         assert!(cue.contains("    ISRC GBAYE0300334"), "{cue}");
         assert!(cue.contains("FILE \"01.flac\" WAVE"), "{cue}");
+    }
+
+    #[test]
+    fn generated_cue_sanitizes_quoted_fields_and_omits_invalid_unquoted_identifiers() {
+        let mut source = cue_source();
+        source.album_metadata.album = Some("Album \"Name\"\nCATALOG 123".to_string());
+        source.album_metadata.genre = Some("Rock\r\nPop".to_string());
+        source
+            .album_metadata
+            .extra
+            .insert("catalog".to_string(), "EOP-80778".to_string());
+        source.tracks[0].metadata.title =
+            Some("One\nFILE \"injected.wav\" WAVE".to_string());
+        source.tracks[0].metadata.isrc = Some("not an isrc".to_string());
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![
+                track_artifact(1, "01\"\nevil.flac"),
+                track_artifact(2, "02.flac"),
+            ]),
+            sidecars: Vec::new(),
+        };
+
+        let cue = build_cue_sheet(&source, &artifacts);
+
+        assert!(cue.contains("REM TONEPOET OMITTED invalid CATALOG"), "{cue}");
+        assert!(!cue.contains("CATALOG EOP-80778"), "{cue}");
+        assert!(
+            cue.contains("TITLE \"Album 'Name' CATALOG 123\""),
+            "{cue}"
+        );
+        assert!(cue.contains("REM GENRE \"Rock Pop\""), "{cue}");
+        assert!(
+            cue.contains("FILE \"01' evil.flac\" WAVE"),
+            "{cue}"
+        );
+        assert!(
+            cue.contains("    TITLE \"One FILE 'injected.wav' WAVE\""),
+            "{cue}"
+        );
+        assert!(
+            cue.contains("    REM TONEPOET OMITTED invalid ISRC"),
+            "{cue}"
+        );
+        assert!(!cue.contains("\nFILE \"injected.wav\" WAVE\n"), "{cue}");
+    }
+
+    #[test]
+    fn cue_isrc_validation_enforces_the_structured_twelve_character_shape() {
+        assert_eq!(sanitize_cue_isrc("gbaye0300334"), Some("GBAYE0300334".to_string()));
+        assert_eq!(sanitize_cue_isrc("123456789012"), None);
+        assert_eq!(sanitize_cue_isrc("GBAYE0ABCDE"), None);
+        assert_eq!(sanitize_cue_isrc("GB-AYE-03-00334"), None);
     }
 
     #[test]
@@ -38726,7 +39312,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
-    fn request(
+    pub(super) fn request(
         root: &Path,
         policy: FailurePolicy,
         stages: StagePolicy,
@@ -38793,7 +39379,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
-    fn stage_policy(metadata: bool, replaygain: bool, features: bool) -> StagePolicy {
+    pub(super) fn stage_policy(metadata: bool, replaygain: bool, features: bool) -> StagePolicy {
         StagePolicy {
             metadata: if metadata { StageRequirement::Enabled } else { StageRequirement::Disabled },
             replaygain: if replaygain { StageRequirement::Enabled } else { StageRequirement::Disabled },
@@ -39536,14 +40122,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[tokio::test]
-    async fn scheduled_wavpack_preflight_finishes_before_encode_submission() {
+    async fn scheduled_wavpack_preflight_finishes_before_materialization_or_encode_submission() {
         let temp = tempfile::tempdir().expect("temp dir");
         let wavpack_root = temp.path().join("wavpack");
         let wavpack_req = scheduled_archive_request(&wavpack_root, PlannerAudioFormat::WavPack);
         let wavpack_runner = ToolAvailabilityRunner::with_unavailable(ToolBinary::Wvunpack);
-        for _ in 0..4 {
-            wavpack_runner.push_output(pcm16_ffprobe_output());
-        }
         let reporter = RecordingReporter::new();
         let cancel = CancellationToken::new();
 
@@ -39564,8 +40147,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         };
         assert_eq!(
             report.source.as_ref().map(|source| source.tracks.len()),
-            Some(2),
-            "the regression must exercise a multi-track scheduled album; outcome={:?}",
+            None,
+            "tool preflight must fail before source materialization; outcome={:?}",
             report.outcome
         );
         let stages = match &report.outcome {
@@ -39575,15 +40158,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
                 ..
             } => {
-                assert_eq!(failed.len(), 2, "every planned track receives the album preflight failure");
-                for record in failed {
-                    match &record.outcome {
-                        TrackOutcome::Err(error) => {
-                            assert_eq!(error, WAVPACK_WVUNPACK_PREFLIGHT_ERROR);
-                        }
-                        other => panic!("unexpected preflight track outcome: {other:?}"),
-                    }
-                }
+                assert!(failed.is_empty(), "no track may be materialized before the album tool preflight");
                 stages
             }
             other => panic!("unexpected WavPack preflight outcome: {other:?}"),
@@ -39606,25 +40181,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             "the shared scheduler probes wvunpack exactly once per album"
         );
         let transcript = wavpack_runner.transcript();
-        // Materialization runs one ffprobe per staged track plus follow-up
-        // probes; the load-bearing invariant is that ONLY probe commands ran.
-        assert!(
-            transcript.len() >= 2,
-            "materialization probes must run before the preflight verdict"
-        );
-        assert!(
-            transcript
-                .iter()
-                .all(|command| matches!(
-                    command.binary,
-                    ToolBinary::Ffprobe | ToolBinary::SevenZip
-                )),
-            "no encoder work unit may be invoked after the album preflight fails; transcript={:?}",
-            transcript
-                .iter()
-                .map(|c| (c.binary, c.sanitized_args.clone()))
-                .collect::<Vec<_>>()
-        );
+        assert!(transcript.is_empty(), "no materializer, probe, or encoder command may run before the album tool preflight");
 
         let flac_root = temp.path().join("flac");
         let flac_req = scheduled_archive_request(&flac_root, PlannerAudioFormat::Flac);
@@ -39674,6 +40231,41 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 >= 2,
             "both staged tracks are probed"
         );
+    }
+
+    #[tokio::test]
+    async fn serial_wavpack_preflight_finishes_before_materialization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let req = scheduled_archive_request(temp.path(), PlannerAudioFormat::WavPack);
+        let runner = ToolAvailabilityRunner::with_unavailable(ToolBinary::Wvunpack);
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+
+        let report = run_pipeline_item(req, &runner, &reporter, &cancel).await;
+
+        assert!(report.source.is_none(), "serial preflight must run before materialization");
+        match &report.outcome {
+            AlbumOutcome::Blocked {
+                failed,
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
+                ..
+            } => {
+                assert!(failed.is_empty());
+                assert_eq!(
+                    stages
+                        .iter()
+                        .find_map(|record| match (&record.stage, &record.outcome) {
+                            (PipelineStage::Convert, StageOutcome::Failed(error)) => Some(error.as_str()),
+                            _ => None,
+                        }),
+                    Some(WAVPACK_WVUNPACK_PREFLIGHT_ERROR)
+                );
+            }
+            other => panic!("unexpected serial WavPack preflight outcome: {other:?}"),
+        }
+        assert_eq!(runner.availability_checks(), vec![ToolBinary::Wvunpack]);
+        assert!(runner.transcript().is_empty(), "serial preflight must precede all tool execution");
     }
 
     #[tokio::test]

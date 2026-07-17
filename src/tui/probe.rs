@@ -416,7 +416,7 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
         .map(|c| c.name().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let sample_rate = audio.rate();
+    let probed_sample_rate = audio.rate();
     let channels = audio.channels() as u32;
 
     // Bit depth: try bits_per_raw_sample from stream parameters, then sample format
@@ -467,12 +467,22 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     let format_name = friendly_format_name(&format_name_raw);
     let codec = friendly_codec_name(&codec_name);
 
-    // For DSD, bit depth is always 1
-    let bit_depth = if codec_name.starts_with("dsd_") {
-        Some(1)
-    } else {
-        bit_depth
-    };
+    // ffmpeg-next reports DSF/DFF dsd_u8 rates in bytes/second. Normalize
+    // once at the TUI probe boundary so display and DSD-to-PCM cascades use
+    // the same true-rate facts as the conversion pipeline.
+    let is_dsd = codec_name.starts_with("dsd_");
+    let (sample_rate, _) = crate::convert::pipeline::normalize_dsd_probe_rate(
+        if is_dsd {
+            crate::convert::pipeline::SourceAudioCoding::Dsd
+        } else {
+            crate::convert::pipeline::SourceAudioCoding::Unknown
+        },
+        probed_sample_rate,
+        None,
+    );
+
+    // For DSD, bit depth is always 1.
+    let bit_depth = if is_dsd { Some(1) } else { bit_depth };
 
     Ok(SourceInfo {
         format_name,
@@ -569,6 +579,9 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     // SourceMetadata.
     if super::sacd::is_sacd_iso(path) {
         return read_metadata_sacd(path);
+    }
+    if crate::dsf_tags::is_dsf(path) {
+        return crate::dsf_tags::read(path).map(|snapshot| source_metadata_from_dsf(&snapshot));
     }
 
     flac_metadata_writer::recover_before_read(path)?;
@@ -1622,8 +1635,34 @@ mod flac_metadata_writer {
         vorbis: &mut VorbisComments,
         changes: &[(lofty::tag::ItemKey, Option<String>)],
     ) -> Result<(), String> {
+        use std::collections::BTreeMap;
+
+        // Resolve logical alias groups before mutating the comment list. The
+        // metadata editor emits one canonical row per group, but callers may
+        // still submit legacy + canonical keys together. Equal requests
+        // coalesce; conflicting requests fail closed instead of making the
+        // result depend on slice order.
+        let mut resolved = BTreeMap::<String, Option<String>>::new();
         for (key, new_value) in changes {
-            let comment_key = vorbis_comment_key(key)?;
+            let raw_key = vorbis_comment_key(key)?;
+            let aliases = vorbis_key_aliases(&raw_key);
+            let comment_key = aliases.first().copied().unwrap_or(raw_key.as_str()).to_string();
+            let normalized_value = new_value
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            if let Some(previous) = resolved.get(&comment_key) {
+                if previous != &normalized_value {
+                    return Err(format!(
+                        "conflicting metadata changes target the same Vorbis alias group {comment_key}: {previous:?} versus {normalized_value:?}"
+                    ));
+                }
+                continue;
+            }
+            resolved.insert(comment_key, normalized_value);
+        }
+
+        for (comment_key, new_value) in resolved {
             let aliases = vorbis_key_aliases(&comment_key);
             vorbis.comments.retain(|comment| match comment {
                 VorbisComment::Parsed { name, .. } => {
@@ -1632,11 +1671,11 @@ mod flac_metadata_writer {
                 }
                 VorbisComment::Raw(_) => true,
             });
-            if let Some(value) = new_value.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()) {
+            if let Some(value) = new_value {
                 validate_vorbis_field_name(&comment_key)?;
                 vorbis.comments.push(VorbisComment::Parsed {
                     name: comment_key,
-                    value: value.to_string(),
+                    value,
                 });
             }
         }
@@ -5034,23 +5073,60 @@ impl MetadataField {
 /// Year values must be valid u32; non-numeric input returns an error.
 /// Empty strings clear the field (set to None).
 pub fn write_metadata_field(path: &Path, field: MetadataField, value: &str) -> Result<(), String> {
+    let change = metadata_field_change(field, value)?;
+    write_all_tags(path, &[change])
+}
+
+/// Execute an inline metadata edit under one crash-recovery authority.
+///
+/// Native FLAC writes already own a metadata-region journal and therefore use
+/// the ordinary writer. Every other format is enclosed by the database-backed
+/// full-file transaction; the inner writer is deliberately backup-free so it
+/// cannot retire or replace the transaction's rollback marker independently.
+pub fn write_metadata_field_transactional(
+    path: &Path,
+    field: MetadataField,
+    value: &str,
+) -> Result<(), String> {
+    let change = metadata_field_change(field, value)
+        .map_err(|error| format!("write failed before mutation: {error}"))?;
+    if uses_native_flac_metadata_journal(path) {
+        return write_all_tags(path, &[change]);
+    }
+
+    let db = crate::db::Database::open()
+        .map_err(|error| format!("write failed before mutation: metadata journal unavailable: {error}"))?;
+    write_metadata_field_with_database(&db, path, change)
+}
+
+fn write_metadata_field_with_database(
+    db: &crate::db::Database,
+    path: &Path,
+    change: (lofty::tag::ItemKey, Option<String>),
+) -> Result<(), String> {
+    db.atomic_metadata_write(path, || {
+        write_all_tags_without_full_file_backup(path, std::slice::from_ref(&change))
+    })
+}
+
+fn metadata_field_change(
+    field: MetadataField,
+    value: &str,
+) -> Result<(lofty::tag::ItemKey, Option<String>), String> {
     let trimmed = value.trim();
     if matches!(field, MetadataField::Year) && !trimmed.is_empty() {
         trimmed
             .parse::<u32>()
             .map_err(|_| format!("year must be a number, got '{}'", trimmed))?;
     }
-    write_all_tags(
-        path,
-        &[(
-            metadata_field_item_key(field),
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            },
-        )],
-    )
+    Ok((
+        metadata_field_item_key(field),
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        },
+    ))
 }
 
 fn metadata_field_item_key(field: MetadataField) -> lofty::tag::ItemKey {
@@ -5747,6 +5823,142 @@ pub fn canonical_metadata_display_key(display_key: &str) -> String {
     }
 }
 
+
+#[derive(Debug, Clone)]
+struct CanonicalEditorTagField {
+    display_key: String,
+    item_key: lofty::tag::ItemKey,
+    value: String,
+    is_binary: bool,
+}
+
+fn canonical_editor_item_key(
+    canonical_display_key: &str,
+    fallback: &lofty::tag::ItemKey,
+) -> lofty::tag::ItemKey {
+    match canonical_display_key {
+        "TRACKTOTAL" => lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+        "DISCTOTAL" => lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+        "COMMENT" => lofty::tag::ItemKey::Comment,
+        _ => fallback.clone(),
+    }
+}
+
+fn append_distinct_editor_value(current: &mut String, next: &str) {
+    if next.is_empty() {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(next);
+        return;
+    }
+    if current.split("; ").any(|value| value == next) {
+        return;
+    }
+    current.push_str("; ");
+    current.push_str(next);
+}
+
+/// Collect one logical row per canonical editor key. Vorbis/ID3 aliases are
+/// collapsed before placeholder synthesis, so COMMENT/DESCRIPTION and total
+/// spellings cannot produce competing rows or order-dependent writes.
+fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEditorTagField> {
+    use lofty::tag::ItemValue;
+    use std::collections::HashMap;
+
+    let mut fields = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    for item in tag.items() {
+        let raw_display = item_key_display(item.key(), tag.tag_type());
+        let display_key = canonical_metadata_display_key(&raw_display);
+        let (value, is_binary) = match item.value() {
+            ItemValue::Text(value) => (value.clone(), false),
+            ItemValue::Locator(value) => (value.clone(), false),
+            ItemValue::Binary(value) => (format!("<binary, {} bytes>", value.len()), true),
+        };
+        if let Some(index) = indexes.get(&display_key).copied() {
+            let field: &mut CanonicalEditorTagField = &mut fields[index];
+            append_distinct_editor_value(&mut field.value, &value);
+            field.is_binary |= is_binary;
+            continue;
+        }
+        indexes.insert(display_key.clone(), fields.len());
+        fields.push(CanonicalEditorTagField {
+            item_key: canonical_editor_item_key(&display_key, item.key()),
+            display_key,
+            value,
+            is_binary,
+        });
+    }
+    fields
+}
+
+fn canonical_editor_fields_from_dsf(
+    snapshot: &crate::dsf_tags::DsfTagSnapshot,
+) -> Vec<CanonicalEditorTagField> {
+    snapshot
+        .fields
+        .iter()
+        .map(|(display_key, values)| {
+            let display_key = canonical_metadata_display_key(display_key);
+            CanonicalEditorTagField {
+                item_key: canonical_editor_item_key(
+                    &display_key,
+                    &lofty::tag::ItemKey::Unknown(display_key.clone()),
+                ),
+                display_key,
+                value: values.join("; "),
+                is_binary: false,
+            }
+        })
+        .collect()
+}
+
+fn source_metadata_from_dsf(snapshot: &crate::dsf_tags::DsfTagSnapshot) -> SourceMetadata {
+    SourceMetadata {
+        title: snapshot.first("TITLE").map(ToOwned::to_owned),
+        artist: snapshot.first("ARTIST").map(ToOwned::to_owned),
+        album: snapshot.first("ALBUM").map(ToOwned::to_owned),
+        genre: snapshot.first("GENRE").map(ToOwned::to_owned),
+        year: snapshot.first("DATE").map(ToOwned::to_owned),
+        tool: snapshot
+            .first("ENCODER")
+            .or_else(|| snapshot.first("ENCODINGTOOL"))
+            .map(ToOwned::to_owned),
+        track_number: snapshot.parsed_u32("TRACKNUMBER"),
+        catalog_number: snapshot.first("CATALOGNUMBER").map(ToOwned::to_owned),
+        rg_track_gain: snapshot.first("REPLAYGAIN_TRACK_GAIN").map(ToOwned::to_owned),
+        rg_track_peak: snapshot.first("REPLAYGAIN_TRACK_PEAK").map(ToOwned::to_owned),
+        rg_album_gain: snapshot.first("REPLAYGAIN_ALBUM_GAIN").map(ToOwned::to_owned),
+        rg_album_peak: snapshot.first("REPLAYGAIN_ALBUM_PEAK").map(ToOwned::to_owned),
+        r128_track_gain: snapshot.first("R128_TRACK_GAIN").and_then(r128_raw_to_db),
+        r128_album_gain: snapshot.first("R128_ALBUM_GAIN").and_then(r128_raw_to_db),
+        isrc: snapshot.first("ISRC").map(ToOwned::to_owned),
+        ..SourceMetadata::default()
+    }
+}
+
+fn tag_entries_from_dsf_snapshot(snapshot: &crate::dsf_tags::DsfTagSnapshot) -> Vec<TagEntry> {
+    let mut entries = canonical_editor_fields_from_dsf(snapshot)
+        .into_iter()
+        .map(|field| TagEntry {
+            row_scope: RowScope::File,
+            display_key: field.display_key,
+            item_key: field.item_key,
+            value: field.value.clone(),
+            original: field.value.clone(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec![field.value.clone()],
+            per_file_originals: vec![field.value],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        })
+        .collect::<Vec<_>>();
+    sort_entries_standard_first(&mut entries);
+    entries
+}
+
 /// Priority order for standard fields (displayed first, in this order).
 pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "TITLE",
@@ -5763,9 +5975,6 @@ pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "DISCNUMBER",
     "DISCTOTAL",
     "COMMENT",
-    "YEAR",
-    "TOTALTRACKS",
-    "TOTALDISCS",
     "CATALOGNUMBER",
     "RELEASECOUNTRY",
     "CONDUCTOR",
@@ -5805,7 +6014,7 @@ pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usiz
     for &field in CORE_EDITOR_FIELDS {
         let exists = entries
             .iter()
-            .any(|e| e.display_key.eq_ignore_ascii_case(field));
+            .any(|entry| canonical_metadata_display_key(&entry.display_key) == field);
         if !exists {
             entries.push(TagEntry {
                 row_scope: crate::tui::probe::RowScope::File,
@@ -6058,42 +6267,32 @@ fn source_metadata_from_tags(
 
 fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEntry> {
     use lofty::file::TaggedFileExt;
-    use lofty::tag::ItemValue;
 
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        Some(t) => t,
-        None => return Vec::new(), // tagless file — editor opens empty
+        Some(tag) => tag,
+        None => return Vec::new(),
     };
 
-    let tag_type = tag.tag_type();
-    let mut entries: Vec<TagEntry> = Vec::new();
-
-    for item in tag.items() {
-        let key = item.key().clone();
-        let display_key = item_key_display(&key, tag_type);
-        let (value, is_binary) = match item.value() {
-            ItemValue::Text(t) => (t.clone(), false),
-            ItemValue::Locator(l) => (l.clone(), false),
-            ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
-        };
-        entries.push(TagEntry {
+    let mut entries = canonical_editor_fields_from_tag(tag)
+        .into_iter()
+        .map(|field| TagEntry {
             row_scope: crate::tui::probe::RowScope::File,
-            display_key,
-            item_key: key,
-            value: value.clone(),
-            original: value.clone(),
-            is_binary,
+            display_key: field.display_key,
+            item_key: field.item_key,
+            value: field.value.clone(),
+            original: field.value.clone(),
+            is_binary: field.is_binary,
             is_mixed: false,
-            per_file_values: vec![value.clone()],
-            per_file_originals: vec![value],
+            per_file_values: vec![field.value.clone()],
+            per_file_originals: vec![field.value],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
-        });
-    }
+        })
+        .collect::<Vec<_>>();
 
-    for e in &mut entries {
-        if is_synthetic_preview(e) {
-            e.is_binary = true;
+    for entry in &mut entries {
+        if is_synthetic_preview(entry) {
+            entry.is_binary = true;
         }
     }
 
@@ -6104,6 +6303,9 @@ fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEn
 /// Read all tags from an audio file's primary tag.
 /// Returns entries sorted: standard fields first, then alphabetical.
 pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
+    if crate::dsf_tags::is_dsf(path) {
+        return crate::dsf_tags::read(path).map(|snapshot| tag_entries_from_dsf_snapshot(&snapshot));
+    }
     flac_metadata_writer::recover_before_read(path)?;
     let tagged = lofty::read_from_path(path)
         .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
@@ -6183,7 +6385,6 @@ pub struct MergedTagsAndMetadata {
 /// Duplicate keys within a single file are joined with "; ".
 pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry>, String> {
     use lofty::file::TaggedFileExt;
-    use lofty::tag::{ItemValue, TagType};
     use std::collections::HashMap;
 
     if paths.is_empty() {
@@ -6193,108 +6394,97 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         return read_all_tags(&paths[0]);
     }
 
-    // Read all files, collecting per-key values. This legacy API deliberately
-    // does not extract artwork/source metadata; callers that need those should
-    // use `read_all_tags_merged_with_metadata` so the extra work is explicit.
-    let mut first_tag_type: Option<TagType> = None;
-    let n = paths.len();
-
     struct KeyData {
-        display_key: String,
+        item_key: lofty::tag::ItemKey,
         is_binary: bool,
         values: Vec<String>,
     }
 
-    let mut key_order: Vec<lofty::tag::ItemKey> = Vec::new();
-    let mut key_map: HashMap<lofty::tag::ItemKey, KeyData> = HashMap::new();
+    let n = paths.len();
+    let mut key_order = Vec::<String>::new();
+    let mut key_map = HashMap::<String, KeyData>::new();
 
     for (file_idx, path) in paths.iter().enumerate() {
+        if crate::dsf_tags::is_dsf(path) {
+            let snapshot = crate::dsf_tags::read(path)?;
+            for field in canonical_editor_fields_from_dsf(&snapshot) {
+                let key = field.display_key.clone();
+                if !key_map.contains_key(&key) {
+                    key_order.push(key.clone());
+                    key_map.insert(
+                        key.clone(),
+                        KeyData {
+                            item_key: field.item_key.clone(),
+                            is_binary: false,
+                            values: vec![String::new(); n],
+                        },
+                    );
+                }
+                if let Some(data) = key_map.get_mut(&key) {
+                    data.values[file_idx] = field.value;
+                }
+            }
+            continue;
+        }
         flac_metadata_writer::recover_before_read(path)?;
         let tagged = lofty::read_from_path(path)
-            .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
-
-        let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-            Some(t) => t,
-            None => continue,
+            .map_err(|err| format!("failed to read '{}': {}", path.display(), err))?;
+        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+            continue;
         };
 
-        if first_tag_type.is_none() {
-            first_tag_type = Some(tag.tag_type());
-        }
-        let tag_type = first_tag_type.unwrap();
-
-        let mut file_values: HashMap<lofty::tag::ItemKey, (String, bool)> = HashMap::new();
-        for item in tag.items() {
-            let key = item.key().clone();
-            let (val, is_bin) = match item.value() {
-                ItemValue::Text(t) => (t.clone(), false),
-                ItemValue::Locator(l) => (l.clone(), false),
-                ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
-            };
-            let entry = file_values
-                .entry(key.clone())
-                .or_insert_with(|| (String::new(), is_bin));
-            if entry.0.is_empty() {
-                entry.0 = val;
-            } else {
-                entry.0 = format!("{}; {}", entry.0, val);
-            }
+        for field in canonical_editor_fields_from_tag(tag) {
+            let key = field.display_key.clone();
             if !key_map.contains_key(&key) {
-                let display = item_key_display(&key, tag_type);
                 key_order.push(key.clone());
                 key_map.insert(
-                    key,
+                    key.clone(),
                     KeyData {
-                        display_key: display,
-                        is_binary: is_bin,
+                        item_key: field.item_key.clone(),
+                        is_binary: field.is_binary,
                         values: vec![String::new(); n],
                     },
                 );
             }
-        }
-
-        for (key, (val, is_bin)) in &file_values {
-            if let Some(data) = key_map.get_mut(key) {
-                data.values[file_idx] = val.clone();
-                if *is_bin {
-                    data.is_binary = true;
-                }
+            if let Some(data) = key_map.get_mut(&key) {
+                data.values[file_idx] = field.value;
+                data.is_binary |= field.is_binary;
             }
         }
     }
 
-    let mut entries: Vec<TagEntry> = Vec::new();
-    for key in &key_order {
-        let data = &key_map[key];
-        let all_same = data.values.windows(2).all(|w| w[0] == w[1]);
+    let mut entries = Vec::new();
+    for key in key_order {
+        let data = key_map.remove(&key).ok_or_else(|| {
+            format!("metadata merge lost canonical key {key} while preserving row order")
+        })?;
+        let all_same = data.values.windows(2).all(|values| values[0] == values[1]);
         let is_mixed = !all_same;
         let display_value = if is_mixed {
             "<multiple values>".to_string()
         } else {
-            data.values[0].clone()
+            data.values.first().cloned().unwrap_or_default()
         };
-
         entries.push(TagEntry {
             row_scope: crate::tui::probe::RowScope::File,
-            display_key: data.display_key.clone(),
-            item_key: key.clone(),
+            display_key: key,
+            item_key: data.item_key,
             value: display_value.clone(),
             original: display_value,
             is_binary: data.is_binary,
             is_mixed,
             per_file_values: data.values.clone(),
-            per_file_originals: data.values.clone(),
+            per_file_originals: data.values,
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
     }
 
-    for e in &mut entries {
-        if is_synthetic_preview(e) {
-            e.is_binary = true;
+    for entry in &mut entries {
+        if is_synthetic_preview(entry) {
+            entry.is_binary = true;
         }
     }
-
     sort_entries_standard_first(&mut entries);
     Ok(entries)
 }
@@ -6308,7 +6498,6 @@ pub fn read_all_tags_merged_with_metadata(
     paths: &[std::path::PathBuf],
 ) -> Result<MergedTagsAndMetadata, String> {
     use lofty::file::TaggedFileExt;
-    use lofty::tag::{ItemValue, TagType};
     use std::collections::HashMap;
 
     let n = paths.len();
@@ -6322,6 +6511,23 @@ pub fn read_all_tags_merged_with_metadata(
 
     if paths.len() == 1 {
         let path = &paths[0];
+        if crate::dsf_tags::is_dsf(path) {
+            return match crate::dsf_tags::read(path) {
+                Ok(snapshot) => Ok(MergedTagsAndMetadata {
+                    entries: tag_entries_from_dsf_snapshot(&snapshot),
+                    metadata: vec![source_metadata_from_dsf(&snapshot)],
+                    metadata_errors: vec![None],
+                }),
+                Err(reason) => Ok(MergedTagsAndMetadata {
+                    entries: Vec::new(),
+                    metadata: vec![SourceMetadata::default()],
+                    metadata_errors: vec![Some(MetadataReadIssue {
+                        kind: MetadataReadIssueKind::TagRead,
+                        reason,
+                    })],
+                }),
+            };
+        }
         if let Err(err) = flac_metadata_writer::recover_before_read(path) {
             return Ok(MergedTagsAndMetadata {
                 entries: Vec::new(),
@@ -6348,27 +6554,49 @@ pub fn read_all_tags_merged_with_metadata(
         });
     }
 
-    // Read all files, collecting per-key values and per-file source metadata.
-    // Unlike the legacy all-or-nothing merge, this editor-open path is
-    // partial-success: a corrupt, inaccessible, or unsupported file records a
-    // per-file error and leaves its value slots empty, while the rest of the
-    // selection remains editable.
-    let mut first_tag_type: Option<TagType> = None;
-    let mut metadata = vec![SourceMetadata::default(); n];
-    let mut metadata_errors = vec![None; n];
-
-    // For each ItemKey, store: display_key, is_binary, per_file_value[file_idx]
     struct KeyData {
-        display_key: String,
+        item_key: lofty::tag::ItemKey,
         is_binary: bool,
-        values: Vec<String>, // one per file, "" if absent or unreadable
+        values: Vec<String>,
     }
 
-    // Use Vec<(ItemKey, KeyData)> to preserve insertion order (first-seen).
-    let mut key_order: Vec<lofty::tag::ItemKey> = Vec::new();
-    let mut key_map: HashMap<lofty::tag::ItemKey, KeyData> = HashMap::new();
+    let mut metadata = vec![SourceMetadata::default(); n];
+    let mut metadata_errors = vec![None; n];
+    let mut key_order = Vec::<String>::new();
+    let mut key_map = HashMap::<String, KeyData>::new();
 
     for (file_idx, path) in paths.iter().enumerate() {
+        if crate::dsf_tags::is_dsf(path) {
+            match crate::dsf_tags::read(path) {
+                Ok(snapshot) => {
+                    metadata[file_idx] = source_metadata_from_dsf(&snapshot);
+                    for field in canonical_editor_fields_from_dsf(&snapshot) {
+                        let key = field.display_key.clone();
+                        if !key_map.contains_key(&key) {
+                            key_order.push(key.clone());
+                            key_map.insert(
+                                key.clone(),
+                                KeyData {
+                                    item_key: field.item_key.clone(),
+                                    is_binary: false,
+                                    values: vec![String::new(); n],
+                                },
+                            );
+                        }
+                        if let Some(data) = key_map.get_mut(&key) {
+                            data.values[file_idx] = field.value;
+                        }
+                    }
+                }
+                Err(reason) => {
+                    metadata_errors[file_idx] = Some(MetadataReadIssue {
+                        kind: MetadataReadIssueKind::TagRead,
+                        reason,
+                    });
+                }
+            }
+            continue;
+        }
         if let Err(err) = flac_metadata_writer::recover_before_read(path) {
             metadata_errors[file_idx] = Some(MetadataReadIssue::filesystem(path, err));
             continue;
@@ -6381,96 +6609,61 @@ pub fn read_all_tags_merged_with_metadata(
             }
         };
         metadata[file_idx] = source_metadata_from_tags(path, tagged.tags(), false);
-
-        let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-            Some(t) => t,
-            None => continue, // file has no tags — all values stay ""
+        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+            continue;
         };
-
-        if first_tag_type.is_none() {
-            first_tag_type = Some(tag.tag_type());
-        }
-        let tag_type = first_tag_type.unwrap_or_else(|| tag.tag_type());
-
-        // Collect values per key. Join duplicates within this file with "; ".
-        let mut file_values: HashMap<lofty::tag::ItemKey, (String, bool)> = HashMap::new();
-        for item in tag.items() {
-            let key = item.key().clone();
-            let (val, is_bin) = match item.value() {
-                ItemValue::Text(t) => (t.clone(), false),
-                ItemValue::Locator(l) => (l.clone(), false),
-                ItemValue::Binary(b) => (format!("<binary, {} bytes>", b.len()), true),
-            };
-            let entry = file_values
-                .entry(key.clone())
-                .or_insert_with(|| (String::new(), is_bin));
-            if entry.0.is_empty() {
-                entry.0 = val;
-            } else {
-                entry.0 = format!("{}; {}", entry.0, val);
-            }
-            // Ensure this key is in the order list.
+        for field in canonical_editor_fields_from_tag(tag) {
+            let key = field.display_key.clone();
             if !key_map.contains_key(&key) {
-                let display = item_key_display(&key, tag_type);
                 key_order.push(key.clone());
                 key_map.insert(
-                    key,
+                    key.clone(),
                     KeyData {
-                        display_key: display,
-                        is_binary: is_bin,
+                        item_key: field.item_key.clone(),
+                        is_binary: field.is_binary,
                         values: vec![String::new(); n],
                     },
                 );
             }
-        }
-
-        // Write this file's values into the key_map.
-        for (key, (val, is_bin)) in &file_values {
-            if let Some(data) = key_map.get_mut(key) {
-                data.values[file_idx] = val.clone();
-                if *is_bin {
-                    data.is_binary = true;
-                }
+            if let Some(data) = key_map.get_mut(&key) {
+                data.values[file_idx] = field.value;
+                data.is_binary |= field.is_binary;
             }
         }
     }
 
-    // Build merged TagEntry list.
-    let mut entries: Vec<TagEntry> = Vec::new();
-    for key in &key_order {
-        let data = &key_map[key];
-        let all_same = data.values.windows(2).all(|w| w[0] == w[1]);
+    let mut entries = Vec::new();
+    for key in key_order {
+        let data = key_map.remove(&key).ok_or_else(|| {
+            format!("metadata merge lost canonical key {key} while preserving row order")
+        })?;
+        let all_same = data.values.windows(2).all(|values| values[0] == values[1]);
         let is_mixed = !all_same;
         let display_value = if is_mixed {
             "<multiple values>".to_string()
         } else {
-            data.values[0].clone()
+            data.values.first().cloned().unwrap_or_default()
         };
-
         entries.push(TagEntry {
             row_scope: crate::tui::probe::RowScope::File,
-            display_key: data.display_key.clone(),
-            item_key: key.clone(),
+            display_key: key,
+            item_key: data.item_key,
             value: display_value.clone(),
             original: display_value,
             is_binary: data.is_binary,
             is_mixed,
             per_file_values: data.values.clone(),
-            per_file_originals: data.values.clone(),
+            per_file_originals: data.values,
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
     }
 
-    // Force-binary on synthetic-preview rows (CUESHEET) so inline
-    // edit is blocked — see read_all_tags for rationale.
-    for e in &mut entries {
-        if is_synthetic_preview(e) {
-            e.is_binary = true;
+    for entry in &mut entries {
+        if is_synthetic_preview(entry) {
+            entry.is_binary = true;
         }
     }
-
-    // Sort with standard key priority.
     sort_entries_standard_first(&mut entries);
 
     Ok(MergedTagsAndMetadata {
@@ -6863,6 +7056,25 @@ fn write_all_tags_with_cancel_report(
 
     check_metadata_write_cancel(cancel, "before starting file")?;
 
+    if crate::dsf_tags::is_dsf(path) {
+        let dsf_changes = changes
+            .iter()
+            .map(|(key, value)| {
+                let canonical_key = match key {
+                    lofty::tag::ItemKey::Unknown(value) => Some(value.as_str()),
+                    _ => key.map_key(lofty::tag::TagType::VorbisComments, true),
+                }
+                .ok_or_else(|| format!("cannot map {:?} to the DSF editor tag canon", key))?;
+                Ok(crate::dsf_tags::DsfTagChange {
+                    canonical_key: canonical_metadata_display_key(canonical_key),
+                    value: value.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let warning = crate::dsf_tags::write_with_backup(path, &dsf_changes)?;
+        return Ok(MetadataWriteCommitReport::from_warnings(warning.into_iter().collect()));
+    }
+
     if flac_metadata_writer::is_probably_flac(path) {
         match flac_metadata_writer::write_vorbis_comment_changes(path, changes, cancel) {
             Ok(report) => {
@@ -6878,6 +7090,42 @@ fn write_all_tags_with_cancel_report(
     check_metadata_write_cancel(cancel, "before starting full-file fallback rewrite")?;
     let cleanup_warning = write_all_tags_lofty_with_backup(path, changes)?;
     Ok(MetadataWriteCommitReport::from_warnings(cleanup_warning.into_iter().collect()))
+}
+
+fn write_all_tags_without_full_file_backup(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<(), String> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+
+    if crate::dsf_tags::is_dsf(path) {
+        let dsf_changes = changes
+            .iter()
+            .map(|(key, value)| {
+                let canonical_key = match key {
+                    lofty::tag::ItemKey::Unknown(value) => Some(value.as_str()),
+                    _ => key.map_key(lofty::tag::TagType::VorbisComments, true),
+                }
+                .ok_or_else(|| format!("cannot map {:?} to the DSF editor tag canon", key))?;
+                Ok(crate::dsf_tags::DsfTagChange {
+                    canonical_key: canonical_metadata_display_key(canonical_key),
+                    value: value.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        return crate::dsf_tags::write_without_backup(path, &dsf_changes);
+    }
+
+    if flac_metadata_writer::is_probably_flac(path) {
+        return Err(format!(
+            "internal transaction error: native FLAC path '{}' reached the full-file writer",
+            path.display()
+        ));
+    }
+
+    write_all_tags_lofty_in_place(path, changes)
 }
 
 fn native_flac_write_refused_error(path: &std::path::Path, operation: &str, native_err: &str) -> String {
@@ -6909,43 +7157,139 @@ fn run_test_lofty_fallback_hook(path: &std::path::Path) {
     }
 }
 
-fn write_all_tags_lofty_with_backup(
+fn lofty_vorbis_comment_key(key: &lofty::tag::ItemKey) -> Option<String> {
+    let mapped = match key {
+        lofty::tag::ItemKey::Unknown(name) => Some(name.as_str()),
+        _ => key.map_key(lofty::tag::TagType::VorbisComments, true),
+    }?;
+    let mapped = mapped.trim();
+    (!mapped.is_empty()).then(|| mapped.to_ascii_uppercase())
+}
+
+fn canonical_vorbis_alias_group<'a>(
+    key: &'a str,
+) -> (&'a str, &'static [&'static str]) {
+    match key {
+        "TRACKTOTAL" | "TOTALTRACKS" => ("TRACKTOTAL", &["TRACKTOTAL", "TOTALTRACKS"]),
+        "DISCTOTAL" | "TOTALDISCS" => ("DISCTOTAL", &["DISCTOTAL", "TOTALDISCS"]),
+        "COMMENT" | "DESCRIPTION" => ("COMMENT", &["COMMENT", "DESCRIPTION"]),
+        _ => (key, &[]),
+    }
+}
+
+fn normalized_vorbis_lofty_changes(
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<
+    Vec<(
+        String,
+        lofty::tag::ItemKey,
+        Option<String>,
+        Vec<lofty::tag::ItemKey>,
+    )>,
+    String,
+> {
+    use std::collections::BTreeMap;
+
+    let mut resolved = BTreeMap::<String, Option<String>>::new();
+    for (key, value) in changes {
+        let raw = lofty_vorbis_comment_key(key)
+            .ok_or_else(|| format!("cannot map {:?} to a Vorbis comment key", key))?;
+        let (canonical, _) = canonical_vorbis_alias_group(&raw);
+        let normalized = value
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(previous) = resolved.get(canonical) {
+            if previous != &normalized {
+                return Err(format!(
+                    "conflicting metadata changes target the same Vorbis alias group {canonical}: {previous:?} versus {normalized:?}"
+                ));
+            }
+        } else {
+            resolved.insert(canonical.to_string(), normalized);
+        }
+    }
+
+    Ok(resolved
+        .into_iter()
+        .map(|(canonical, value)| {
+            let (_, aliases) = canonical_vorbis_alias_group(&canonical);
+            let removal_keys = aliases
+                .iter()
+                .map(|alias| lofty::tag::ItemKey::Unknown((*alias).to_string()))
+                .chain(std::iter::once(lofty::tag::ItemKey::Unknown(canonical.clone())))
+                .collect::<Vec<_>>();
+            let insert_key = match canonical.as_str() {
+                "COMMENT" => lofty::tag::ItemKey::Comment,
+                _ => lofty::tag::ItemKey::Unknown(canonical.clone()),
+            };
+            (canonical, insert_key, value, removal_keys)
+        })
+        .collect())
+}
+
+
+fn apply_vorbis_lofty_changes(
+    tag: &mut lofty::tag::Tag,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<(), String> {
+    use lofty::tag::{ItemValue, TagItem};
+
+    for (canonical, insert_key, new_value, removal_keys) in
+        normalized_vorbis_lofty_changes(changes)?
+    {
+        // Remove the actual ItemKey instances Lofty parsed, not only guessed
+        // Unknown aliases. Some Vorbis spellings map to typed ItemKey variants,
+        // while others remain Unknown; canonicalizing each existing item before
+        // collecting its key covers both.
+        let parsed_alias_keys = tag
+            .items()
+            .filter_map(|item| {
+                let raw = lofty_vorbis_comment_key(item.key())?;
+                let (existing_canonical, _) = canonical_vorbis_alias_group(&raw);
+                (existing_canonical == canonical).then(|| item.key().clone())
+            })
+            .collect::<Vec<_>>();
+        for removal_key in parsed_alias_keys.iter().chain(removal_keys.iter()) {
+            tag.remove_key(removal_key);
+        }
+        tag.remove_key(&insert_key);
+        if let Some(value) = new_value {
+            tag.insert_unchecked(TagItem::new(insert_key, ItemValue::Text(value)));
+        }
+    }
+    Ok(())
+}
+
+fn write_all_tags_lofty_in_place(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
-) -> Result<Option<String>, String> {
+) -> Result<(), String> {
     use lofty::config::WriteOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{ItemValue, TagItem};
 
-    // Non-FLAC formats keep the existing file-scope rollback path until they
-    // receive native metadata-region writers. FLACs must not silently enter
-    // this path: a native FLAC refusal is returned to the caller as an
-    // explicit, user-visible error instead of creating a full-file backup.
-    #[cfg(test)]
-    run_test_lofty_fallback_hook(path);
-    let backup = crate::db::Database::backup_path_for(path);
-    std::fs::copy(path, &backup)
-        .map_err(|e| format!("backup failed for '{}': {}", path.display(), e))?;
+    let mut tagged = lofty::read_from_path(path)
+        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
 
-    let result = (|| -> Result<(), String> {
-        let mut tagged = lofty::read_from_path(path)
-            .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+    if tagged.primary_tag().is_none() {
+        let tag_type = tagged.primary_tag_type();
+        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+    let tag = tagged
+        .primary_tag_mut()
+        .ok_or_else(|| "failed to create primary tag".to_string())?;
 
-        if tagged.primary_tag().is_none() {
-            let tt = tagged.primary_tag_type();
-            tagged.insert_tag(lofty::tag::Tag::new(tt));
-        }
-        let tag = tagged
-            .primary_tag_mut()
-            .ok_or_else(|| "failed to create primary tag".to_string())?;
-
+    if tag.tag_type() == lofty::tag::TagType::VorbisComments {
+        apply_vorbis_lofty_changes(tag, changes)?;
+    } else {
         for (key, new_value) in changes {
             match new_value {
-                Some(val) if !val.trim().is_empty() => {
+                Some(value) if !value.trim().is_empty() => {
                     tag.remove_key(key);
                     tag.insert_unchecked(TagItem::new(
                         key.clone(),
-                        ItemValue::Text(val.trim().to_string()),
+                        ItemValue::Text(value.trim().to_string()),
                     ));
                 }
                 _ => {
@@ -6953,32 +7297,45 @@ fn write_all_tags_lofty_with_backup(
                 }
             }
         }
+    }
 
-        tagged
-            .save_to_path(path, WriteOptions::default())
-            .map_err(|e| format!("failed to save '{}': {}", path.display(), e))?;
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|error| format!("failed to save '{}': {error}", path.display()))
+}
 
-        Ok(())
-    })();
+fn write_all_tags_lofty_with_backup(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<Option<String>, String> {
+    // Non-FLAC formats keep the existing file-scope rollback path until they
+    // receive native metadata-region writers. FLACs must not silently enter
+    // this path: a native FLAC refusal is returned to the caller as an
+    // explicit, user-visible error instead of creating a full-file backup.
+    #[cfg(test)]
+    run_test_lofty_fallback_hook(path);
+    let backup = crate::db::Database::backup_path_for(path);
+    crate::db::Database::create_backup_for(path, &backup)
+        .map_err(|error| format!("backup failed for '{}': {error}", path.display()))?;
 
-    match result {
+    match write_all_tags_lofty_in_place(path, changes) {
         Ok(()) => match std::fs::remove_file(&backup) {
             Ok(()) => Ok(None),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
                 "metadata write for '{}' committed, but full-file rollback marker '{}' was already absent during cleanup",
                 path.display(),
                 backup.display()
             ))),
-            Err(err) => Ok(Some(format!(
-                "metadata write for '{}' committed, but cleanup of full-file rollback marker '{}' failed: {err}. Remove the marker after verifying the file, or allow legacy startup recovery to inspect it.",
+            Err(error) => Ok(Some(format!(
+                "metadata write for '{}' committed, but cleanup of full-file rollback marker '{}' failed: {error}. Verify the committed file, then remove the marker explicitly; future full-file writes will refuse to overwrite it.",
                 path.display(),
                 backup.display()
             ))),
         },
-        Err(err) => match std::fs::rename(&backup, path) {
-            Ok(()) => Err(err),
-            Err(restore_err) => Err(format!(
-                "{err}; additionally failed to restore '{}' from rollback marker '{}': {restore_err}",
+        Err(error) => match crate::db::Database::restore_backup_for(path, &backup) {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!(
+                "{error}; rollback could not be completed for '{}' from rollback marker '{}': {restore_error}",
                 path.display(),
                 backup.display()
             )),
@@ -7268,8 +7625,8 @@ fn write_artwork_lofty_with_backup(
     use lofty::picture::Picture;
 
     let backup = crate::db::Database::backup_path_for(path);
-    std::fs::copy(path, &backup)
-        .map_err(|e| format!("backup failed for '{}': {}", path.display(), e))?;
+    crate::db::Database::create_backup_for(path, &backup)
+        .map_err(|error| format!("backup failed for '{}': {error}", path.display()))?;
 
     let result = (|| -> Result<(), String> {
         let mut tagged = lofty::read_from_path(path)
@@ -7295,10 +7652,10 @@ fn write_artwork_lofty_with_backup(
     })();
 
     if let Err(err) = result {
-        return match std::fs::rename(&backup, path) {
+        return match crate::db::Database::restore_backup_for(path, &backup) {
             Ok(()) => Err(err),
             Err(restore_err) => Err(format!(
-                "{err}; additionally failed to restore '{}' from artwork rollback marker '{}': {restore_err}",
+                "{err}; rollback could not be completed for '{}' from artwork rollback marker '{}': {restore_err}",
                 path.display(),
                 backup.display()
             )),
@@ -7315,8 +7672,8 @@ fn remove_artwork_lofty_with_backup(
     use lofty::file::{AudioFile, TaggedFileExt};
 
     let backup = crate::db::Database::backup_path_for(path);
-    std::fs::copy(path, &backup)
-        .map_err(|e| format!("backup failed for '{}': {}", path.display(), e))?;
+    crate::db::Database::create_backup_for(path, &backup)
+        .map_err(|error| format!("backup failed for '{}': {error}", path.display()))?;
 
     let result = (|| -> Result<(), String> {
         let mut tagged = lofty::read_from_path(path)
@@ -7332,10 +7689,10 @@ fn remove_artwork_lofty_with_backup(
     })();
 
     if let Err(err) = result {
-        return match std::fs::rename(&backup, path) {
+        return match crate::db::Database::restore_backup_for(path, &backup) {
             Ok(()) => Err(err),
             Err(restore_err) => Err(format!(
-                "{err}; additionally failed to restore '{}' from artwork rollback marker '{}': {restore_err}",
+                "{err}; rollback could not be completed for '{}' from artwork rollback marker '{}': {restore_err}",
                 path.display(),
                 backup.display()
             )),
@@ -7372,20 +7729,12 @@ fn rollback_artwork_tokens(tokens: &mut [ArtworkRollbackToken]) -> Vec<String> {
             }
             ArtworkRollbackToken::FullFileBackup { path, backup } => {
                 if backup.exists() {
-                    match std::fs::rename(&*backup, &*path) {
-                        Ok(()) => {}
-                        Err(rename_err) => match std::fs::copy(&*backup, &*path) {
-                            Ok(_) => {
-                                let _ = std::fs::remove_file(&*backup);
-                            }
-                            Err(copy_err) => issues.push(format!(
-                                "restore '{}' from '{}' failed: rename: {}; copy: {}",
-                                path.display(),
-                                backup.display(),
-                                rename_err,
-                                copy_err
-                            )),
-                        },
+                    if let Err(error) = crate::db::Database::restore_backup_for(path, backup) {
+                        issues.push(format!(
+                            "restore '{}' from '{}' could not be completed: {error}",
+                            path.display(),
+                            backup.display()
+                        ));
                     }
                 } else {
                     issues.push(format!(
@@ -7596,6 +7945,26 @@ pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn inline_non_flac_writer_uses_one_database_transaction_and_restores_exact_bytes() {
+        let db = crate::db::Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("corrupt.opus");
+        let original = b"not a parseable Opus file";
+        std::fs::write(&path, original).expect("write fixture");
+        let change = metadata_field_change(MetadataField::Title, "New title")
+            .expect("valid title change");
+
+        let error = write_metadata_field_with_database(&db, &path, change)
+            .expect_err("unreadable carrier must fail and roll back");
+
+        assert!(error.starts_with("write failed (rolled back): failed to read"));
+        assert_eq!(std::fs::read(&path).expect("read restored fixture"), original);
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
     #[test]
     fn editing_totals_removes_legacy_alias_spellings() {
         // A FLAC tagged with legacy TOTALTRACKS reads as ItemKey::TrackTotal;
@@ -7771,6 +8140,81 @@ mod tests {
         assert_eq!(canonical_metadata_display_key("Album Artist"), "ALBUMARTIST");
         assert_eq!(canonical_metadata_display_key("MUSICBRAINZ_ALBUMID"), "MUSICBRAINZ_ALBUMID");
         assert_eq!(canonical_metadata_display_key("MusicBrainz Release Track Id"), "MUSICBRAINZ_RELEASETRACKID");
+    }
+
+    #[test]
+    fn placeholder_synthesis_recognizes_legacy_alias_rows_as_canonical_fields() {
+        let mut entries = vec![TagEntry {
+            row_scope: RowScope::File,
+            display_key: "DESCRIPTION".to_string(),
+            item_key: lofty::tag::ItemKey::Unknown("DESCRIPTION".to_string()),
+            value: "legacy comment".to_string(),
+            original: "legacy comment".to_string(),
+            is_binary: false,
+            is_mixed: false,
+            per_file_values: vec!["legacy comment".to_string()],
+            per_file_originals: vec!["legacy comment".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }];
+
+        ensure_standard_fields_present(&mut entries, 1);
+
+        let logical_comments = entries
+            .iter()
+            .filter(|entry| canonical_metadata_display_key(&entry.display_key) == "COMMENT")
+            .collect::<Vec<_>>();
+        assert_eq!(logical_comments.len(), 1);
+        assert_eq!(logical_comments[0].value, "legacy comment");
+    }
+
+    #[test]
+    fn lofty_vorbis_alias_write_collapses_typed_and_legacy_spellings() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Comment,
+            ItemValue::Text("old canonical comment".to_string()),
+        ));
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("DESCRIPTION".to_string()),
+            ItemValue::Text("old legacy comment".to_string()),
+        ));
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("TRACKTOTAL".to_string()),
+            ItemValue::Text("10".to_string()),
+        ));
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("TOTALTRACKS".to_string()),
+            ItemValue::Text("9".to_string()),
+        ));
+
+        apply_vorbis_lofty_changes(
+            &mut tag,
+            &[
+                (ItemKey::Comment, Some("new comment".to_string())),
+                (
+                    ItemKey::Unknown("TOTALTRACKS".to_string()),
+                    Some("12".to_string()),
+                ),
+            ],
+        )
+        .expect("alias-complete write");
+
+        let fields = canonical_editor_fields_from_tag(&tag);
+        let comments = fields
+            .iter()
+            .filter(|field| field.display_key == "COMMENT")
+            .map(|field| field.value.as_str())
+            .collect::<Vec<_>>();
+        let totals = fields
+            .iter()
+            .filter(|field| field.display_key == "TRACKTOTAL")
+            .map(|field| field.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(comments, vec!["new comment"]);
+        assert_eq!(totals, vec!["12"]);
     }
 
     #[test]

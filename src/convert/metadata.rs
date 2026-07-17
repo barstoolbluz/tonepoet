@@ -90,15 +90,17 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
         }
 
         metadata.track_number = vorbis.track();
-        // metaflac's total_tracks() reads only TOTALTRACKS; accept the
-        // foobar/flac-convention TRACKTOTAL spelling too (now the spelling
-        // tonepoet writes).
-        metadata.total_tracks = vorbis.total_tracks().or_else(|| {
-            vorbis
-                .get("TRACKTOTAL")
-                .and_then(|values| values.first())
-                .and_then(|value| value.parse::<u32>().ok())
-        });
+        // Prefer tonepoet's canonical foobar-style spelling. Legacy aliases
+        // remain readable, but can never override a conflicting canonical
+        // value merely because metaflac checks them first internally.
+        metadata.total_tracks = ["TRACKTOTAL", "TOTALTRACKS"]
+            .into_iter()
+            .find_map(|key| {
+                vorbis
+                    .get(key)
+                    .and_then(|values| values.first())
+                    .and_then(|value| value.parse::<u32>().ok())
+            });
 
         if let Some(disc_vec) = vorbis.get("DISCNUMBER") {
             if let Some(disc) = disc_vec.first() {

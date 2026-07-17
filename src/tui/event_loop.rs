@@ -3449,18 +3449,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             value,
             result,
         } => {
-            // Step 3 (main thread): invalidate caches. Native FLAC writes
-            // are recovered by their sidecar metadata journal; non-FLAC
-            // fallback writes may also have a legacy DB/full-file backup.
+            // The blocking writer owns the complete journal/backup lifecycle.
+            // The reducer only publishes the result and invalidates caches.
             let path_str = path.display().to_string();
-            let uses_native_flac_journal = crate::tui::probe::uses_native_flac_metadata_journal(&path);
-            let backup = crate::db::Database::backup_path_for(&path);
+            let uses_native_flac_journal =
+                crate::tui::probe::uses_native_flac_metadata_journal(&path);
             match result {
                 Ok(()) => {
-                    if !uses_native_flac_journal {
-                        let _ = app.db.complete_metadata_write(&path_str);
-                        let _ = std::fs::remove_file(&backup);
-                    }
                     app.browse.remove_probe_cache_entry(&path);
                     app.browse.probe_pending.remove(&path);
                     app.browse.invalidate_search_tag_cache_for_metadata_path(&path);
@@ -3509,17 +3504,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         ));
                     }
                 }
-                Err(e) => {
-                    // Non-FLAC fallback may still leave a file-scope backup.
-                    // Native FLAC writes restore from their metadata journal
-                    // internally and are not represented in the DB journal.
-                    if backup.exists() {
-                        let _ = std::fs::rename(&backup, &path);
+                Err(error) => {
+                    if uses_native_flac_journal {
+                        app.set_status(format!("write failed: {error}"));
+                    } else {
+                        // The database-backed transaction returns a complete,
+                        // user-facing outcome including whether rollback
+                        // succeeded or recovery authority remains armed.
+                        app.set_status(error);
                     }
-                    if !uses_native_flac_journal {
-                        let _ = app.db.complete_metadata_write(&path_str);
-                    }
-                    app.set_status(format!("write failed (rolled back): {}", e));
                 }
             }
         }
@@ -4161,27 +4154,32 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     };
                     let m = matches[0].clone();
                     app.set_status(format!("GNUDB: found {} — reading...", m.title));
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
+                    spawn_gnudb_worker(tx.clone(), read_operation_id, async move {
                         let result = super::gnudb::read_gnudb(&m.category, &m.disc_id).await;
-                        let _ = tx
-                            .send(AppMessage::GnudbReadComplete {
-                                operation_id: read_operation_id,
-                                result,
-                                paths,
-                                origin_matches: None,
-                            })
-                            .await;
+                        AppMessage::GnudbReadComplete {
+                            operation_id: read_operation_id,
+                            result,
+                            paths,
+                            origin_matches: None,
+                        }
                     });
                 }
                 Ok(matches) if matches.is_empty() => {
-                    finish_gnudb_operation_if_current(app, operation_id);
+                    retire_gnudb_operation_with_editor_restore(app, operation_id);
                     app.set_status("GNUDB: no matches found");
                 }
                 Ok(matches) => {
                     let Some(picker_operation_id) = advance_gnudb_operation(app, operation_id) else {
                         return;
                     };
+                    if !gnudb_operation_has_overlay_authority(app, picker_operation_id) {
+                        retire_gnudb_operation_with_editor_restore(app, picker_operation_id);
+                        app.set_status(
+                            "GNUDB: result discarded because another overlay owns the screen; retry the lookup"
+                                .to_string(),
+                        );
+                        return;
+                    }
                     app.set_status(format!("GNUDB: {} matches found", matches.len()));
                     app.active_overlay = ActiveOverlay::GnudbSelect {
                         operation_id: picker_operation_id,
@@ -4192,7 +4190,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     };
                 }
                 Err(e) => {
-                    finish_gnudb_operation_if_current(app, operation_id);
+                    retire_gnudb_operation_with_editor_restore(app, operation_id);
                     app.set_status(format!("GNUDB error: {}", e));
                 }
             }
@@ -4206,9 +4204,17 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             if !gnudb_operation_is_current(app, operation_id) {
                 return;
             }
-            finish_gnudb_operation_if_current(app, operation_id);
             match result {
                 Ok(entry) => {
+                    if !gnudb_operation_has_overlay_authority(app, operation_id) {
+                        retire_gnudb_operation_with_editor_restore(app, operation_id);
+                        app.set_status(
+                            "GNUDB: read result discarded because another overlay owns the screen; retry the lookup"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    finish_gnudb_operation_if_current(app, operation_id);
                     let mut review = super::gnudb::build_review_state(&entry, paths);
                     review.origin_matches = origin_matches;
                     app.set_status(format!(
@@ -4220,6 +4226,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
                 }
                 Err(e) => {
+                    retire_gnudb_operation_with_editor_restore(app, operation_id);
                     app.set_status(format!("GNUDB read error: {}", e));
                 }
             }
@@ -4231,11 +4238,20 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             if !gnudb_operation_is_current(app, operation_id) {
                 return;
             }
-            finish_gnudb_operation_if_current(app, operation_id);
             if entries.is_empty() {
+                retire_gnudb_operation_with_editor_restore(app, operation_id);
                 app.set_status("GNUDB: no matches found for any disc");
                 return;
             }
+            if !gnudb_operation_has_overlay_authority(app, operation_id) {
+                retire_gnudb_operation_with_editor_restore(app, operation_id);
+                app.set_status(
+                    "GNUDB: multi-disc result discarded because another overlay owns the screen; retry the lookup"
+                        .to_string(),
+                );
+                return;
+            }
+            finish_gnudb_operation_if_current(app, operation_id);
 
             let review = super::gnudb::build_multi_disc_review_state(&entries);
             let n_discs = entries.len();
@@ -4247,6 +4263,16 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 n_tracks,
             ));
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
+        }
+        AppMessage::GnudbWorkerFailed {
+            operation_id,
+            detail,
+        } => {
+            if !gnudb_operation_is_current(app, operation_id) {
+                return;
+            }
+            retire_gnudb_operation_with_editor_restore(app, operation_id);
+            app.set_status(format!("GNUDB worker failed: {detail}; the lookup was retired"));
         }
 
         AppMessage::CtdbComplete { mut pages } => {
@@ -4381,21 +4407,47 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 Err(message) => app.set_status(message),
             }
         }
-        AppMessage::CuePreviewComplete { result } => {
+        AppMessage::CuePreviewComplete {
+            operation_id,
+            result,
+        } => {
+            if !cue_operation_is_current(app, operation_id) {
+                return;
+            }
             match result {
                 Ok((cue_content, cue_path, summary)) => {
+                    if !cue_operation_has_overlay_authority(app, operation_id) {
+                        finish_cue_operation_if_current(app, operation_id);
+                        app.set_status(
+                            "MusicBrainz CUE: preview discarded because another workflow owns the editor or overlay; retry the command"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    finish_cue_operation_if_current(app, operation_id);
                     app.active_overlay = ActiveOverlay::CuePreview(Box::new(
                         super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
                     ));
                     app.set_status(summary);
                 }
-                Err(err) => app.set_status(format!("MusicBrainz CUE: {}", err)),
+                Err(err) => {
+                    finish_cue_operation_if_current(app, operation_id);
+                    app.set_status(format!("MusicBrainz CUE: {}", err));
+                }
             }
         }
-        AppMessage::CueFillPrepComplete { cue_path, result } => {
+        AppMessage::CueFillPrepComplete {
+            operation_id,
+            cue_path,
+            result,
+        } => {
+            if !cue_operation_is_current(app, operation_id) {
+                return;
+            }
             let (album, tracks, layout, sectors) = match result {
                 Ok(prep) => prep,
                 Err(err) => {
+                    finish_cue_operation_if_current(app, operation_id);
                     app.set_status(format!(":cue-fill: {}", err));
                     return;
                 }
@@ -4403,6 +4455,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             let toc_string = match super::musicbrainz::build_mb_toc(&sectors) {
                 Some(s) => s,
                 None => {
+                    finish_cue_operation_if_current(app, operation_id);
                     app.set_status(":cue-fill: TOC too short".to_string());
                     return;
                 }
@@ -4418,9 +4471,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             let tx = tx.clone();
             let toc_for_msg = toc_string.clone();
             tokio::spawn(async move {
-                let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+                let worker = tokio::spawn(async move {
+                    super::musicbrainz::lookup_release_by_toc(&sectors, cached).await
+                });
+                let outcome = worker.await.unwrap_or_else(|err| {
+                    Err(format!(":cue-fill lookup worker failed: {err}"))
+                });
                 let _ = tx
                     .send(AppMessage::CueFillComplete {
+                        operation_id,
                         outcome,
                         cue_path,
                         album,
@@ -4432,15 +4491,20 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             });
         }
         AppMessage::CueMbComplete {
+            operation_id,
             outcome,
             paths,
             output_dir,
             single_image,
             toc_string,
         } => {
+            if !cue_operation_is_current(app, operation_id) {
+                return;
+            }
             handle_cue_mb_complete(
                 app,
                 tx,
+                operation_id,
                 outcome,
                 paths,
                 output_dir,
@@ -4449,6 +4513,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             );
         }
         AppMessage::CueFillComplete {
+            operation_id,
             outcome,
             cue_path,
             album,
@@ -4456,8 +4521,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             layout,
             toc_string,
         } => {
+            if !cue_operation_is_current(app, operation_id) {
+                return;
+            }
             handle_cue_fill_complete(
-                app, tx, outcome, cue_path, *album, tracks, layout, toc_string,
+                app,
+                tx,
+                operation_id,
+                outcome,
+                cue_path,
+                *album,
+                tracks,
+                layout,
+                toc_string,
             );
         }
         AppMessage::TagsFromMbComplete { outcome, ctx } => {
@@ -4487,13 +4563,18 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             );
         }
         AppMessage::MetadataEditorSplitCueAlbumGroupingComplete {
+            operation_id,
             infos,
             active_cue_path,
             result,
         } => {
+            if !cue_operation_is_current(app, operation_id) {
+                return;
+            }
             super::keybindings::handle_metadata_editor_split_cue_album_grouping_complete(
                 app,
                 tx,
+                operation_id,
                 infos,
                 active_cue_path,
                 result,
@@ -4881,30 +4962,38 @@ fn handle_paste(app: &mut AppState, text: &str) {
 fn handle_cue_mb_complete(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
     paths: Vec<std::path::PathBuf>,
     output_dir: std::path::PathBuf,
     single_image: bool,
     toc_string: String,
 ) {
+    if !cue_operation_is_current(app, operation_id) {
+        return;
+    }
     let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
-            app.set_status(format!("MusicBrainz CUE lookup failed: {}", e));
+        Ok(outcome) => outcome,
+        Err(error) => {
+            finish_cue_operation_if_current(app, operation_id);
+            app.set_status(format!("MusicBrainz CUE lookup failed: {error}"));
             return;
         }
     };
 
-    // Cache the response (positive or negative) so retries don't re-hit MB.
+    // Cache only while this operation is still authoritative. Stale work is a
+    // total no-op, including cache mutation, so a superseded request cannot
+    // publish data under a newer workflow's lifecycle.
     if let Some(json) = outcome.cache_response.as_deref() {
-        if let Err(e) = app.db.store_mb_response(&toc_string, json) {
-            log::warn!("MB cache store failed: {}", e);
+        if let Err(error) = app.db.store_mb_response(&toc_string, json) {
+            log::warn!("MB cache store failed: {error}");
         }
     }
 
     let release = match outcome.releases.into_iter().next() {
-        Some(r) => r,
+        Some(release) => release,
         None => {
+            finish_cue_operation_if_current(app, operation_id);
             app.set_status("MusicBrainz CUE: no release matched this disc TOC".to_string());
             return;
         }
@@ -4914,8 +5003,9 @@ fn handle_cue_mb_complete(
     let tx = tx.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let (mut album, mut tracks) = super::cue_generate::gather_cue_info_blocking(&paths, &output_dir)
-                .map_err(|e| e.to_string())?;
+            let (mut album, mut tracks) =
+                super::cue_generate::gather_cue_info_blocking(&paths, &output_dir)
+                    .map_err(|error| error.to_string())?;
 
             super::cue_generate::apply_mb_overrides(&mut album, &mut tracks, &release);
 
@@ -4923,10 +5013,15 @@ fn handle_cue_mb_complete(
                 let image_name = super::cue_generate::derive_image_filename(&album, &paths[0]);
                 let ext = paths[0]
                     .extension()
-                    .and_then(|e| e.to_str())
+                    .and_then(|extension| extension.to_str())
                     .unwrap_or("flac");
-                let fmt = super::cue_generate::cue_format_tag(ext);
-                super::cue_generate::generate_single_image_cue(&album, &tracks, &image_name, fmt)
+                let format_tag = super::cue_generate::cue_format_tag(ext);
+                super::cue_generate::generate_single_image_cue(
+                    &album,
+                    &tracks,
+                    &image_name,
+                    format_tag,
+                )
             } else {
                 super::cue_generate::generate_multifile_cue(&album, &tracks)
             };
@@ -4939,7 +5034,10 @@ fn handle_cue_mb_complete(
             } else {
                 "multi-file"
             };
-            let pregaps = tracks.iter().filter(|t| t.pregap_frames.is_some()).count();
+            let pregaps = tracks
+                .iter()
+                .filter(|track| track.pregap_frames.is_some())
+                .count();
             let pregap_note = if pregaps > 0 {
                 format!(
                     ", {} pregap{}",
@@ -4957,9 +5055,14 @@ fn handle_cue_mb_complete(
             Ok((cue_content, cue_path, summary))
         })
         .await
-        .unwrap_or_else(|err| Err(format!("preview task failed: {}", err)));
+        .unwrap_or_else(|error| Err(format!("preview task failed: {error}")));
 
-        let _ = tx.send(AppMessage::CuePreviewComplete { result }).await;
+        let _ = tx
+            .send(AppMessage::CuePreviewComplete {
+                operation_id,
+                result,
+            })
+            .await;
     });
 }
 
@@ -5506,9 +5609,20 @@ pub(super) fn begin_tags_mb_lookup_operation(
     editor_owned: bool,
 ) -> Result<super::message::TagsMbOperationId, String> {
     // MusicBrainz and GNUDB share the metadata-editor authority domain.
-    // A new MB dispatch retires GNUDB authority first so any later GNUDB
-    // completion is a total no-op.
-    app.active_gnudb_operation = None;
+    // Refuse rather than silently retiring GNUDB: the user can cancel the
+    // exact workflow explicitly and any parked editor remains recoverable.
+    if app.active_gnudb_operation.is_some() {
+        return Err(
+            ":tags-mb: a GNUDB workflow is active; run :gnudb-cancel before starting MusicBrainz"
+                .to_string(),
+        );
+    }
+    if app.active_cue_operation.is_some() {
+        return Err(
+            ":tags-mb: a CUE workflow is active; finish it before starting MusicBrainz"
+                .to_string(),
+        );
+    }
     if let Some(active) = app.active_tags_mb_operation {
         if active.picker_owned {
             let active_picker_matches = matches!(
@@ -5594,9 +5708,25 @@ pub(super) fn transition_tags_mb_operation_phase(
     true
 }
 
+fn metadata_editor_session_guard(
+    state: &super::app::MetadataEditorState,
+) -> super::message::MetadataEditorSessionGuard {
+    let details = &state.active_surface().technical_details;
+    super::message::MetadataEditorSessionGuard {
+        session_id: details.session_id,
+        save_generation: details.save_generation,
+        editor_generation: state.model.editor_save_generation,
+    }
+}
+
 pub(super) fn begin_gnudb_operation(
     app: &mut AppState,
 ) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_cue_operation.is_some() {
+        return Err(
+            "GNUDB: a CUE workflow is active; finish it before starting GNUDB".to_string(),
+        );
+    }
     if app.active_tags_mb_operation.is_some() {
         return Err(
             "GNUDB: a MusicBrainz workflow is active; cancel it before starting GNUDB"
@@ -5605,7 +5735,7 @@ pub(super) fn begin_gnudb_operation(
     }
     if app.active_gnudb_operation.is_some() {
         return Err(
-            "GNUDB: another GNUDB workflow is active; cancel it before starting again"
+            "GNUDB: another GNUDB workflow is active; run :gnudb-cancel before starting again"
                 .to_string(),
         );
     }
@@ -5618,7 +5748,18 @@ pub(super) fn begin_gnudb_operation(
         })?;
     app.tags_mb_operation_generation = generation;
     let operation_id = super::message::TagsMbOperationId(generation);
-    app.active_gnudb_operation = Some(operation_id);
+    let editor_session = app
+        .pending_metadata_editor
+        .as_deref()
+        .or_else(|| match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => Some(state.as_ref()),
+            _ => None,
+        })
+        .map(metadata_editor_session_guard);
+    app.active_gnudb_operation = Some(super::app::ActiveGnudbOperation {
+        operation_id,
+        editor_session,
+    });
     Ok(operation_id)
 }
 
@@ -5628,7 +5769,30 @@ pub(super) fn gnudb_operation_is_current(
 ) -> bool {
     operation_id.is_assigned()
         && app.active_tags_mb_operation.is_none()
-        && app.active_gnudb_operation == Some(operation_id)
+        && app
+            .active_gnudb_operation
+            .is_some_and(|active| active.operation_id == operation_id)
+}
+
+pub(super) fn gnudb_operation_has_overlay_authority(
+    app: &AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    if !gnudb_operation_is_current(app, operation_id)
+        || !matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        return false;
+    }
+    let Some(active) = app.active_gnudb_operation else {
+        return false;
+    };
+    match active.editor_session {
+        Some(guard) => app
+            .pending_metadata_editor
+            .as_deref()
+            .is_some_and(|state| metadata_editor_matches_session_guard(state, guard)),
+        None => app.pending_metadata_editor.is_none(),
+    }
 }
 
 pub(super) fn finish_gnudb_operation_if_current(
@@ -5642,6 +5806,60 @@ pub(super) fn finish_gnudb_operation_if_current(
     true
 }
 
+fn restore_gnudb_editor_if_owned(
+    app: &mut AppState,
+    active: super::app::ActiveGnudbOperation,
+) -> bool {
+    let Some(guard) = active.editor_session else {
+        return false;
+    };
+    if !matches!(app.active_overlay, ActiveOverlay::None) {
+        return false;
+    }
+    let matches = app
+        .pending_metadata_editor
+        .as_deref()
+        .is_some_and(|state| metadata_editor_matches_session_guard(state, guard));
+    if !matches {
+        return false;
+    }
+    if let Some(editor) = app.pending_metadata_editor.take() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+        return true;
+    }
+    false
+}
+
+pub(super) fn cancel_gnudb_operation(
+    app: &mut AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    let Some(active) = app.active_gnudb_operation else {
+        return false;
+    };
+    if active.operation_id != operation_id || !gnudb_operation_is_current(app, operation_id) {
+        return false;
+    }
+    app.active_gnudb_operation = None;
+    restore_gnudb_editor_if_owned(app, active);
+    true
+}
+
+pub(super) fn retire_gnudb_operation_with_editor_restore(
+    app: &mut AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    let Some(active) = app.active_gnudb_operation else {
+        return false;
+    };
+    if active.operation_id != operation_id || !gnudb_operation_is_current(app, operation_id) {
+        return false;
+    }
+    app.active_gnudb_operation = None;
+    restore_gnudb_editor_if_owned(app, active);
+    true
+}
+
 pub(super) fn advance_gnudb_operation(
     app: &mut AppState,
     operation_id: super::message::TagsMbOperationId,
@@ -5649,16 +5867,104 @@ pub(super) fn advance_gnudb_operation(
     if !gnudb_operation_is_current(app, operation_id) {
         return None;
     }
+    let active = app.active_gnudb_operation?;
     let generation = app.tags_mb_operation_generation.checked_add(1)?;
     app.tags_mb_operation_generation = generation;
     let next = super::message::TagsMbOperationId(generation);
-    app.active_gnudb_operation = Some(next);
+    app.active_gnudb_operation = Some(super::app::ActiveGnudbOperation {
+        operation_id: next,
+        editor_session: active.editor_session,
+    });
     Some(next)
+}
+
+pub(super) fn spawn_gnudb_worker<F>(
+    tx: mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
+    future: F,
+) where
+    F: std::future::Future<Output = AppMessage> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let message = match tokio::spawn(future).await {
+            Ok(message) => message,
+            Err(error) => AppMessage::GnudbWorkerFailed {
+                operation_id,
+                detail: if error.is_panic() {
+                    "worker panicked".to_string()
+                } else {
+                    format!("worker was cancelled: {error}")
+                },
+            },
+        };
+        let _ = tx.send(message).await;
+    });
+}
+
+pub(super) fn begin_cue_operation(
+    app: &mut AppState,
+    label: &str,
+) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_tags_mb_operation.is_some() || app.active_gnudb_operation.is_some() {
+        return Err(format!(
+            "{label}: a metadata lookup already owns the editor or overlay; finish or cancel it before retrying"
+        ));
+    }
+    if app.active_cue_operation.is_some() {
+        return Err(format!(
+            "{label}: another CUE workflow is still active; cancel or finish it before retrying"
+        ));
+    }
+    let generation = app
+        .tags_mb_operation_generation
+        .checked_add(1)
+        .ok_or_else(|| format!(
+            "{label}: operation identity space exhausted; restart Tonepoet before retrying"
+        ))?;
+    app.tags_mb_operation_generation = generation;
+    let operation_id = super::message::TagsMbOperationId(generation);
+    app.active_cue_operation = Some(super::app::ActiveCueOperation { operation_id });
+    Ok(operation_id)
+}
+
+pub(super) fn cue_operation_is_current(
+    app: &AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    operation_id.is_assigned()
+        && app
+            .active_cue_operation
+            .is_some_and(|active| active.operation_id == operation_id)
+}
+
+pub(super) fn cue_operation_has_overlay_authority(
+    app: &AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    cue_operation_is_current(app, operation_id)
+        && matches!(app.active_overlay, ActiveOverlay::None)
+        && app.pending_metadata_editor.is_none()
+        && app.pending_cue_preview.is_none()
+        && app.pending_mb_select.is_none()
+}
+
+pub(super) fn finish_cue_operation_if_current(
+    app: &mut AppState,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    if !cue_operation_is_current(app, operation_id) {
+        return false;
+    }
+    app.active_cue_operation = None;
+    true
 }
 
 pub(super) fn begin_mb_select_operation(
     app: &mut AppState,
 ) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_cue_operation.is_some() {
+        return Err(":mb-back: a CUE workflow is active; finish it before returning".to_string());
+    }
     if app.active_gnudb_operation.is_some() {
         return Err(
             ":mb-back: a GNUDB workflow is active; cancel it before returning"
@@ -5682,6 +5988,11 @@ fn begin_tags_mb_apply_operation(
     app: &mut AppState,
     picker_owned: bool,
 ) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_cue_operation.is_some() {
+        return Err(
+            ":tags-mb: a CUE workflow is active; finish it before selecting again".to_string(),
+        );
+    }
     if app.active_gnudb_operation.is_some() {
         return Err(
             ":tags-mb: a GNUDB workflow is active; cancel it before selecting again"
@@ -6614,6 +6925,7 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
 fn handle_cue_fill_complete(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     outcome: Result<super::musicbrainz::MbLookupOutcome, String>,
     cue_path: std::path::PathBuf,
     mut album: super::cue_generate::CueAlbumInfo,
@@ -6621,23 +6933,28 @@ fn handle_cue_fill_complete(
     layout: super::message::CueFillLayout,
     toc_string: String,
 ) {
+    if !cue_operation_is_current(app, operation_id) {
+        return;
+    }
     let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
-            app.set_status(format!(":cue-fill: lookup failed: {}", e));
+        Ok(outcome) => outcome,
+        Err(error) => {
+            finish_cue_operation_if_current(app, operation_id);
+            app.set_status(format!(":cue-fill: lookup failed: {error}"));
             return;
         }
     };
 
     if let Some(json) = outcome.cache_response.as_deref() {
-        if let Err(e) = app.db.store_mb_response(&toc_string, json) {
-            log::warn!("MB cache store failed: {}", e);
+        if let Err(error) = app.db.store_mb_response(&toc_string, json) {
+            log::warn!("MB cache store failed: {error}");
         }
     }
 
     let release = match outcome.releases.into_iter().next() {
-        Some(r) => r,
+        Some(release) => release,
         None => {
+            finish_cue_operation_if_current(app, operation_id);
             app.set_status(":cue-fill: no MusicBrainz release matched this disc TOC".to_string());
             return;
         }
@@ -6645,11 +6962,12 @@ fn handle_cue_fill_complete(
 
     let stats = super::cue_generate::fill_cue_with_mb(&mut album, &mut tracks, &release);
     if stats.is_empty() {
+        finish_cue_operation_if_current(app, operation_id);
         app.set_status(format!(
             ":cue-fill: nothing to fill (CUE already complete) — {}",
             cue_path
                 .file_name()
-                .map(|s| s.to_string_lossy().to_string())
+                .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default(),
         ));
         return;
@@ -6699,15 +7017,96 @@ fn handle_cue_fill_complete(
         parts.push("catalog".to_string());
     }
     let summary = format!("Will fill: {}", parts.join(", "));
+    if !cue_operation_has_overlay_authority(app, operation_id) {
+        finish_cue_operation_if_current(app, operation_id);
+        app.set_status(
+            ":cue-fill: result discarded because another workflow owns the editor or overlay; retry the command"
+                .to_string(),
+        );
+        return;
+    }
+    finish_cue_operation_if_current(app, operation_id);
     let _ = tx;
-    app.active_overlay = ActiveOverlay::CuePreview(Box::new(super::app::CuePreviewState::new(
-        cue_content,
-        cue_path,
-        summary.clone(),
-    )));
+    app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+        super::app::CuePreviewState::new(cue_content, cue_path, summary.clone()),
+    ));
     app.set_status(summary);
 }
 
+
+#[cfg(test)]
+mod metadata_write_completion_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::probe::MetadataField;
+
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(4);
+        tx
+    }
+
+    #[test]
+    fn non_flac_completion_publishes_structured_transaction_failure_verbatim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("track.opus");
+        std::fs::write(&path, b"restored original bytes").expect("write destination");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataWriteComplete {
+                path: path.clone(),
+                field: MetadataField::Title,
+                value: "new title".to_string(),
+                result: Err(
+                    "write failed (rolled back): synthetic writer failure".to_string(),
+                ),
+            },
+            &tx(),
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged restored destination"),
+            b"restored original bytes"
+        );
+        assert_eq!(
+            app.status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("write failed (rolled back): synthetic writer failure")
+        );
+    }
+
+    #[test]
+    fn native_flac_failure_does_not_consume_unrelated_full_file_backup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("track.flac");
+        let backup = crate::db::Database::backup_path_for(&path);
+        std::fs::write(&path, b"current FLAC bytes").expect("write destination");
+        std::fs::write(&backup, b"unrelated stale backup").expect("write stale backup");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataWriteComplete {
+                path: path.clone(),
+                field: MetadataField::Title,
+                value: "new title".to_string(),
+                result: Err("native writer failure".to_string()),
+            },
+            &tx(),
+        );
+
+        assert_eq!(std::fs::read(&path).expect("unchanged destination"), b"current FLAC bytes");
+        assert_eq!(std::fs::read(&backup).expect("stale backup retained"), b"unrelated stale backup");
+        assert_eq!(
+            app.status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("write failed: native writer failure")
+        );
+    }
+}
 
 #[cfg(test)]
 mod browse_archive_quit_lifecycle_tests {
@@ -9138,6 +9537,209 @@ mod musicbrainz_completion_dispatch_tests {
             "duplicate completion must be a total no-op"
         );
     }
+
+    #[test]
+    fn gnudb_cancel_restores_exact_owned_dirty_editor() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = single_source_file_editor();
+        editor.active_surface_mut().dirty = true;
+        let guard = session_guard_for(&editor);
+        app.pending_metadata_editor = Some(editor);
+
+        let operation_id = begin_gnudb_operation(&mut app).expect("begin GNUDB operation");
+        assert_eq!(
+            app.active_gnudb_operation,
+            Some(crate::tui::app::ActiveGnudbOperation {
+                operation_id,
+                editor_session: Some(guard),
+            })
+        );
+        assert!(cancel_gnudb_operation(&mut app, operation_id));
+        assert!(app.active_gnudb_operation.is_none());
+        assert!(app.pending_metadata_editor.is_none());
+        let ActiveOverlay::MetadataEditor(restored) = &app.active_overlay else {
+            panic!("owned editor must be restored on GNUDB cancellation");
+        };
+        assert!(restored.active_surface().dirty);
+        assert_eq!(session_guard_for(restored), guard);
+    }
+
+    #[test]
+    fn gnudb_worker_failure_restores_owned_editor_and_retires_only_current_operation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = single_source_file_editor();
+        editor.active_surface_mut().dirty = true;
+        let guard = session_guard_for(&editor);
+        app.pending_metadata_editor = Some(editor);
+        let operation_id = begin_gnudb_operation(&mut app).expect("begin GNUDB operation");
+
+        handle_message(
+            &mut app,
+            AppMessage::GnudbWorkerFailed {
+                operation_id,
+                detail: "worker panicked".to_string(),
+            },
+            &tx(),
+        );
+
+        assert!(app.active_gnudb_operation.is_none());
+        assert!(app.pending_metadata_editor.is_none());
+        let ActiveOverlay::MetadataEditor(restored) = &app.active_overlay else {
+            panic!("worker failure must restore the exact parked editor");
+        };
+        assert_eq!(session_guard_for(restored), guard);
+        assert!(restored.active_surface().dirty);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("GNUDB worker failed: worker panicked; the lookup was retired")
+        );
+    }
+
+    #[test]
+    fn stale_gnudb_completion_is_total_no_op() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let stale = begin_gnudb_operation(&mut app).expect("first GNUDB operation");
+        let current = advance_gnudb_operation(&mut app, stale).expect("advance GNUDB operation");
+        app.set_status("current workflow status");
+        let before_status = app.status_message.as_ref().map(|(message, _)| message.clone());
+
+        handle_message(
+            &mut app,
+            AppMessage::GnudbWorkerFailed {
+                operation_id: stale,
+                detail: "late panic".to_string(),
+            },
+            &tx(),
+        );
+
+        assert_eq!(
+            app.active_gnudb_operation.map(|active| active.operation_id),
+            Some(current)
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.clone()),
+            before_status
+        );
+    }
+
+    #[test]
+    fn cue_preview_completion_requires_identity_and_overlay_authority() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let operation_id = begin_cue_operation(&mut app, "test CUE").expect("begin CUE operation");
+        app.active_overlay = ActiveOverlay::Help {
+            screen: AppScreen::Browse,
+            scroll: 7,
+        };
+
+        handle_message(
+            &mut app,
+            AppMessage::CuePreviewComplete {
+                operation_id,
+                result: Ok((
+                    "FILE \"album.flac\" WAVE\n".to_string(),
+                    std::path::PathBuf::from("album.cue"),
+                    "preview ready".to_string(),
+                )),
+            },
+            &tx(),
+        );
+
+        assert!(app.active_cue_operation.is_none());
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Help {
+                screen: AppScreen::Browse,
+                scroll: 7
+            }
+        ));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some(
+                "MusicBrainz CUE: preview discarded because another workflow owns the editor or overlay; retry the command"
+            )
+        );
+    }
+
+    #[test]
+    fn current_cue_preview_completion_opens_exact_preview_and_consumes_operation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let operation_id = begin_cue_operation(&mut app, "test CUE").expect("begin CUE operation");
+        let content = "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n".to_string();
+        let path = std::path::PathBuf::from("album.cue");
+
+        handle_message(
+            &mut app,
+            AppMessage::CuePreviewComplete {
+                operation_id,
+                result: Ok((content.clone(), path.clone(), "preview ready".to_string())),
+            },
+            &tx(),
+        );
+
+        assert!(app.active_cue_operation.is_none());
+        let ActiveOverlay::CuePreview(preview) = &app.active_overlay else {
+            panic!("authoritative completion must open CuePreview");
+        };
+        assert_eq!(preview.content, content);
+        assert_eq!(preview.write_path, path);
+        assert_eq!(preview.summary, "preview ready");
+    }
+
+    #[test]
+    fn stale_cue_completion_cannot_mutate_newer_workflow() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let stale = begin_cue_operation(&mut app, "old CUE").expect("old operation");
+        assert!(finish_cue_operation_if_current(&mut app, stale));
+        let current = begin_cue_operation(&mut app, "new CUE").expect("new operation");
+        app.set_status("new workflow status");
+        let before_status = app.status_message.as_ref().map(|(message, _)| message.clone());
+
+        handle_message(
+            &mut app,
+            AppMessage::CuePreviewComplete {
+                operation_id: stale,
+                result: Err("late failure".to_string()),
+            },
+            &tx(),
+        );
+
+        assert_eq!(
+            app.active_cue_operation.map(|active| active.operation_id),
+            Some(current)
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.clone()),
+            before_status
+        );
+    }
+
+    #[test]
+    fn metadata_split_cue_grouping_error_fails_closed_without_fallback_editor() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let operation_id = begin_cue_operation(&mut app, "metadata grouping")
+            .expect("begin metadata grouping");
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataEditorSplitCueAlbumGroupingComplete {
+                operation_id,
+                infos: Vec::new(),
+                active_cue_path: None,
+                result: Err("synthetic grouping failure".to_string()),
+            },
+            &tx(),
+        );
+
+        assert!(app.active_cue_operation.is_none());
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("metadata: split-CUE grouping failed: synthetic grouping failure")
+        );
+    }
+
 }
 
 #[cfg(test)]

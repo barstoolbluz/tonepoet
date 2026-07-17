@@ -1738,8 +1738,24 @@ fn compute_track_boundaries_for_layout(
             next_start = Some(cue_frames_to_samples(next_frames as u64, probe.sample_rate));
             break;
         }
-        let end = next_start.unwrap_or(probe.total_samples);
+        let is_lossy_tail = probe.coding == SourceAudioCoding::Lossy && next_start.is_none();
+        // Lossy headers are estimates. In particular, Xing-less VBR headers
+        // may understate the decoded duration enough that the final INDEX 01
+        // appears to start beyond `total_samples`. Admit that final tail and
+        // let the open-ended decode establish the authoritative length.
+        let end = if is_lossy_tail {
+            next_start.unwrap_or_else(|| probe.total_samples.max(start.saturating_add(1)))
+        } else {
+            next_start.unwrap_or(probe.total_samples)
+        };
 
+        if !is_lossy_tail && start >= probe.total_samples {
+            return Err(MaterializeError::Parse(format!(
+                "track {} starts beyond image duration for {}",
+                track.number,
+                image_path.display()
+            )));
+        }
         if end <= start {
             return Err(MaterializeError::Parse(format!(
                 "invalid CUE boundary for track {} in image {}",
@@ -1747,14 +1763,15 @@ fn compute_track_boundaries_for_layout(
                 image_path.display()
             )));
         }
-        if end > probe.total_samples {
+        if !is_lossy_tail && end > probe.total_samples {
             return Err(MaterializeError::Parse(format!(
-                "track {} starts beyond image duration for {}",
+                "track {} ends beyond image duration for {}",
                 track.number,
                 image_path.display()
             )));
         }
-        if !probe.exact_samples
+        if !is_lossy_tail
+            && !probe.exact_samples
             && next_start.is_none()
             && probe.total_samples.saturating_sub(start) < probe.sample_rate as u64 / 20
         {
@@ -1875,11 +1892,16 @@ enum SegmentLengthPolicy {
 }
 
 /// Maximum acceptable shortfall of a lossy image-tail decode versus its
-/// header-derived length (~100 ms). Codec delay/padding classes top out
+/// header-derived length (~120 ms). Codec delay/padding classes top out
 /// around 4.7k samples (AAC); anything beyond this indicates a truncated
 /// source and fails closed.
-fn lossy_tail_shortfall_limit(sample_rate: u32) -> u64 {
-    ((sample_rate as u64) / 10).max(8_192)
+fn lossy_tail_shortfall_limit(sample_rate: u32, header_samples: u64) -> u64 {
+    // Permit at most ~120 ms of codec delay/padding, but never let that fixed
+    // allowance consume an entire short tail. The relative cap keeps the
+    // truncation guard meaningful even when the header-derived tail is small.
+    let codec_delay_cap = (u64::from(sample_rate).saturating_mul(120) / 1_000).max(1);
+    let relative_cap = (header_samples / 4).max(1);
+    codec_delay_cap.min(relative_cap)
 }
 
 /// Rebuild a staged-segment destination for a corrected sample count. The
@@ -2006,15 +2028,16 @@ async fn stage_cue_segment_as_wav(
                     if measured != samples {
                         let _ = remove_path_if_exists(&tmp_destination);
                         return Err(MaterializeError::Parse(format!(
-                            "staged CUE segment {} has {} samples, expected {}",
-                            tmp_destination.display(),
+                            "CUE image {} decoded {} samples for the requested segment, expected {}; temporary staging file was {}",
+                            image.display(),
                             measured,
-                            samples
+                            samples,
+                            tmp_destination.display()
                         )));
                     }
                 }
                 SegmentLengthPolicy::LossyTail => {
-                    let limit = lossy_tail_shortfall_limit(sample_rate);
+                    let limit = lossy_tail_shortfall_limit(sample_rate, samples);
                     if measured == 0 {
                         let _ = remove_path_if_exists(&tmp_destination);
                         return Err(MaterializeError::Parse(format!(
@@ -2022,7 +2045,7 @@ async fn stage_cue_segment_as_wav(
                             image.display()
                         )));
                     }
-                    if measured + limit < samples {
+                    if measured.saturating_add(limit) < samples {
                         let _ = remove_path_if_exists(&tmp_destination);
                         return Err(MaterializeError::Parse(format!(
                             "lossy CUE image {} decoded {} samples short of its header length for the tail segment (measured {}, expected {}, limit {}); the source appears truncated",
@@ -2033,7 +2056,7 @@ async fn stage_cue_segment_as_wav(
                             limit
                         )));
                     }
-                    if measured > samples + sample_rate as u64 {
+                    if measured > samples.saturating_add(u64::from(sample_rate)) {
                         log::warn!(
                             "lossy CUE image {} decoded {} samples beyond its header length for the tail segment (measured {}, header {}); keeping the full decode",
                             image.display(),
@@ -3872,6 +3895,46 @@ TRACK XX AUDIO
         );
     }
 
+    #[test]
+    fn lossy_tail_shortfall_limit_stays_meaningful_for_short_tails() {
+        assert_eq!(lossy_tail_shortfall_limit(44_100, 4_000), 1_000);
+        assert_eq!(lossy_tail_shortfall_limit(44_100, 17_280), 4_320);
+        assert_eq!(lossy_tail_shortfall_limit(96_000, 100_000), 11_520);
+    }
+
+    #[test]
+    fn lossy_final_track_is_admitted_when_header_duration_understates_index() {
+        let image = PathBuf::from("album.mp3");
+        let sheet = parse_cue(
+            "FILE \"album.mp3\" MP3\n  TRACK 01 AUDIO\n    INDEX 01 00:01:00\n",
+        );
+        let mut probes = HashMap::new();
+        probes.insert(
+            path_identity(&image),
+            AudioProbe {
+                sample_rate: 44_100,
+                total_samples: 30_000,
+                exact_samples: false,
+                bit_depth: None,
+                coding: SourceAudioCoding::Lossy,
+                codec_name: Some("mp3".to_string()),
+                format_name: Some("mp3".to_string()),
+            },
+        );
+
+        let bounds = compute_track_boundaries_for_layout(&sheet, &[image.clone()], &probes)
+            .expect("lossy final track is admitted for open-ended decode");
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].start_sample, 44_100);
+        assert_eq!(bounds[0].samples, 1);
+        assert!(bounds[0].is_image_tail);
+
+        probes.get_mut(&path_identity(&image)).unwrap().coding = SourceAudioCoding::Pcm;
+        let error = compute_track_boundaries_for_layout(&sheet, &[image], &probes)
+            .expect_err("lossless duration remains authoritative");
+        assert!(error.to_string().contains("starts beyond image duration"));
+    }
+
     #[tokio::test]
     async fn lossy_tail_shortfall_within_bound_backfills_measured_facts() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -3940,6 +4003,36 @@ TRACK XX AUDIO
     }
 
     #[tokio::test]
+    async fn short_lossy_tail_cannot_hide_major_truncation_under_fixed_codec_allowance() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let provisional = temp
+            .path()
+            .join("staging/cue-segments/001-cue01-track01-s0-n4000.wav");
+        let runner = stub_runner_with_expected_probes(vec![expected_temp_ffprobe_for(
+            &provisional,
+            ffprobe_json_staged_segment(44_100, 2_500),
+        )]);
+        let cancel = CancellationToken::new();
+
+        let error = stage_cue_segment_as_wav(
+            Path::new("short-tail.mp3"),
+            0,
+            4_000,
+            44_100,
+            CueSegmentCarrier::PcmS32LeWav,
+            &provisional,
+            SegmentLengthPolicy::LossyTail,
+            &runner,
+            &cancel,
+        )
+        .await
+        .expect_err("a 37.5% shortfall in a short tail must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("short-tail.mp3"), "{message}");
+        assert!(message.contains("limit 1000"), "{message}");
+    }
+
+    #[tokio::test]
     async fn lossy_tail_overage_is_kept_and_backfilled() {
         let temp = tempfile::tempdir().expect("temp dir");
         let provisional = temp
@@ -3999,10 +4092,9 @@ TRACK XX AUDIO
         .await
         .expect_err("exact segments must not tolerate any count mismatch");
         let message = err.to_string();
-        assert!(
-            message.contains("has 15435 samples, expected 17280"),
-            "{message}"
-        );
+        assert!(message.contains("album.flac"), "{message}");
+        assert!(message.contains("decoded 15435 samples"), "{message}");
+        assert!(message.contains("expected 17280"), "{message}");
     }
 
     #[tokio::test]

@@ -74,7 +74,7 @@ enum Commands {
         #[arg(short, long)]
         workers: Option<usize>,
 
-        /// ReplayGain mode (track, album, both, off)
+        /// ReplayGain mode (track, album, both, *-if-missing, off)
         #[arg(long)]
         replaygain: Option<String>,
 
@@ -344,11 +344,21 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(async_main(cli))
 }
 
+fn require_startup_config(
+    loaded: anyhow::Result<TonepoetConfig>,
+) -> anyhow::Result<TonepoetConfig> {
+    loaded.map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load tonepoet configuration; archive-password secret migration or secret-store access may require user action: {error}"
+        )
+    })
+}
+
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let log_level = if cli.verbose { "debug" } else { "info" };
     init_logging(log_level, matches!(&cli.command, Commands::Tui { .. }));
 
-    let config = TonepoetConfig::load().unwrap_or_default();
+    let config = require_startup_config(TonepoetConfig::load())?;
 
     match cli.command {
         Commands::InternalActionScriptSupervisor { .. }
@@ -640,6 +650,22 @@ fn parse_cli_bit_depth(value: &str) -> Result<u32, String> {
 
 
 #[cfg(test)]
+mod startup_config_tests {
+    #[test]
+    fn startup_config_failure_is_returned_instead_of_defaulting() {
+        let error = super::require_startup_config(Err(anyhow::anyhow!(
+            "keyring backend unavailable: Secret Service is locked"
+        )))
+        .expect_err("startup must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to load tonepoet configuration; archive-password secret migration or secret-store access may require user action: keyring backend unavailable: Secret Service is locked"
+        );
+    }
+}
+
+#[cfg(test)]
 mod bit_depth_cli_tests {
     use super::parse_cli_bit_depth;
 
@@ -732,15 +758,28 @@ mod bit_depth_cli_tests {
     }
 }
 
-fn parse_replaygain_mode(s: &str) -> Option<tonepoet::convert::simple_wizard::ReplayGainMode> {
+fn parse_replaygain_mode(
+    s: &str,
+) -> Result<(
+    Option<tonepoet::convert::simple_wizard::ReplayGainMode>,
+    tonepoet_pipeline::ReplayGainExistingTagPolicy,
+), String> {
     use tonepoet::convert::simple_wizard::ReplayGainMode;
-    match s.to_lowercase().as_str() {
-        "track" => Some(ReplayGainMode::Track),
-        "album" => Some(ReplayGainMode::Album),
-        "both" => Some(ReplayGainMode::Both),
-        "off" | "none" => None,
-        _ => Some(ReplayGainMode::Album),
-    }
+    use tonepoet_pipeline::ReplayGainExistingTagPolicy;
+    let normalized = s.trim().to_ascii_lowercase().replace('_', "-");
+    let parsed = match normalized.as_str() {
+        "track" => (Some(ReplayGainMode::Track), ReplayGainExistingTagPolicy::Rescan),
+        "album" => (Some(ReplayGainMode::Album), ReplayGainExistingTagPolicy::Rescan),
+        "both" => (Some(ReplayGainMode::Both), ReplayGainExistingTagPolicy::Rescan),
+        "track-if-missing" => (Some(ReplayGainMode::Track), ReplayGainExistingTagPolicy::SkipIfComplete),
+        "album-if-missing" => (Some(ReplayGainMode::Album), ReplayGainExistingTagPolicy::SkipIfComplete),
+        "both-if-missing" => (Some(ReplayGainMode::Both), ReplayGainExistingTagPolicy::SkipIfComplete),
+        "off" | "none" => (None, ReplayGainExistingTagPolicy::Rescan),
+        _ => return Err(format!(
+            "invalid ReplayGain mode '{s}'; expected track, album, both, track-if-missing, album-if-missing, both-if-missing, or off"
+        )),
+    };
+    Ok(parsed)
 }
 
 fn parse_dvda_group(s: &str) -> tonepoet::convert::pipeline::DvdaGroupSelection {
@@ -857,8 +896,22 @@ async fn run_convert(
     }
 
     if let Some(rg) = &replaygain {
-        options.replaygain_mode = parse_replaygain_mode(rg);
+        let (mode, existing_tags) = parse_replaygain_mode(rg).map_err(anyhow::Error::msg)?;
+        options.replaygain_mode = mode.clone();
         options.calculate_replaygain = options.replaygain_mode.is_some();
+        if options.pipeline_settings.is_none() {
+            options.pipeline_settings = Some(
+                tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options)
+                    .map_err(anyhow::Error::msg)?,
+            );
+        }
+        let settings = options.pipeline_settings.get_or_insert_with(Default::default);
+        settings.replay_gain.mode = mode.map(|mode| match mode {
+            tonepoet::convert::simple_wizard::ReplayGainMode::Track => tonepoet_pipeline::ReplayGainMode::Track,
+            tonepoet::convert::simple_wizard::ReplayGainMode::Album => tonepoet_pipeline::ReplayGainMode::Album,
+            tonepoet::convert::simple_wizard::ReplayGainMode::Both => tonepoet_pipeline::ReplayGainMode::Both,
+        });
+        settings.replay_gain.existing_tags = existing_tags;
     } else if config.conversion.calculate_replaygain {
         options.calculate_replaygain = true;
         if options.replaygain_mode.is_none() {
@@ -1007,6 +1060,24 @@ async fn run_convert(
         for warning in &planned.warnings {
             eprintln!("Warning: {warning}");
         }
+        let needs_archive_password = planned
+            .items
+            .iter()
+            .any(|(path, _, _)| tonepoet::is_encrypted_archive_ext(path));
+        let resolved_archive_password = match resolve_cli_archive_password(
+            needs_archive_password,
+            &archive_password,
+            config,
+            tonepoet::tui::keychain::load_keychain,
+        ) {
+            Ok(password) => password,
+            Err(error) => {
+                tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+                    &planned_synthetic_cue_artifacts,
+                );
+                return Err(anyhow::anyhow!(error));
+            }
+        };
         for (path, format, cue_sidecar_override) in planned.items {
             add_item_to_queue(
                 &mut q,
@@ -1014,8 +1085,7 @@ async fn run_convert(
                 format,
                 cue_sidecar_override,
                 &options,
-                &archive_password,
-                config,
+                &resolved_archive_password,
             );
         }
 
@@ -1251,23 +1321,45 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
     }
 }
 
+fn resolve_cli_archive_password<F>(
+    needs_archive_password: bool,
+    cli_password: &Option<String>,
+    config: &TonepoetConfig,
+    load_mru: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Result<Vec<String>, String>,
+{
+    if let Some(password) = cli_password
+        .clone()
+        .or_else(|| config.conversion.archive_password.clone())
+    {
+        return Ok(Some(password));
+    }
+    if !needs_archive_password {
+        return Ok(None);
+    }
+    load_mru()
+        .map(|passwords| passwords.into_iter().next())
+        .map_err(|error| {
+            format!(
+                "cannot resolve stored archive passwords before queue admission: {error}"
+            )
+        })
+}
+
 fn add_item_to_queue(
     queue: &mut ConversionQueue,
     path: PathBuf,
     format: FileFormat,
     cue_sidecar_override: Option<tonepoet::convert::pipeline::CueSidecarPolicy>,
     options: &ConversionOptions,
-    archive_password: &Option<String>,
-    config: &TonepoetConfig,
+    resolved_archive_password: &Option<String>,
 ) {
     let mut item = ConversionItem::new(path.clone(), format, options.clone());
     item.cue_sidecar_override = cue_sidecar_override;
     if tonepoet::is_encrypted_archive_ext(&path) {
-        // Password priority: CLI flag → config → keychain MRU → None.
-        item.archive_password = archive_password
-            .clone()
-            .or_else(|| config.conversion.archive_password.clone())
-            .or_else(|| tonepoet::tui::keychain::load_keychain().into_iter().next());
+        item.set_archive_password(resolved_archive_password.clone(), None);
     }
     queue.add_item_direct(item);
 }
@@ -1347,12 +1439,15 @@ fn build_pipeline_request_template(
 
     let output_root = output.clone().unwrap_or_else(|| PathBuf::from("."));
 
-    let rg_enabled = match replaygain.as_deref() {
-        Some("off") | Some("none") => false,
-        _ => options.calculate_replaygain,
-    };
+    let parsed_rg = replaygain
+        .as_deref()
+        .and_then(|value| parse_replaygain_mode(value).ok());
+    let rg_enabled = parsed_rg
+        .as_ref()
+        .map(|(mode, _)| mode.is_some())
+        .unwrap_or(options.calculate_replaygain);
 
-    Some(PipelineRequest {
+    let mut request = PipelineRequest {
         actions: tonepoet::convert::pipeline::ActionPipeline::default(),
         worker_count: None,
         scratch_staging: None,
@@ -1446,7 +1541,16 @@ fn build_pipeline_request_template(
         batch_resolved_identity: None,
         expected_album_track_count: None,
         suppress_incremental_conversion_log_append: false,
-    })
+    };
+    if let Some((mode, existing_tags)) = parsed_rg {
+        request.settings.replay_gain.mode = mode.map(|mode| match mode {
+            tonepoet::convert::simple_wizard::ReplayGainMode::Track => tonepoet_pipeline::ReplayGainMode::Track,
+            tonepoet::convert::simple_wizard::ReplayGainMode::Album => tonepoet_pipeline::ReplayGainMode::Album,
+            tonepoet::convert::simple_wizard::ReplayGainMode::Both => tonepoet_pipeline::ReplayGainMode::Both,
+        });
+        request.settings.replay_gain.existing_tags = existing_tags;
+    }
+    Some(request)
 }
 
 /// Convert a wizard ConversionPreset to ConversionOptions
@@ -1909,7 +2013,8 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
     }
 
     if reset {
-        let default_config = TonepoetConfig::default();
+        let mut default_config = TonepoetConfig::default();
+        default_config.clear_archive_password();
         default_config.save()?;
         println!("Configuration reset to defaults.");
         println!("Saved to: {}", TonepoetConfig::config_path().display());
@@ -3492,6 +3597,45 @@ FILE "side_b.flac" WAVE
     }
 
     #[test]
+    fn cli_archive_password_resolution_propagates_mru_backend_failure_before_admission() {
+        let calls = std::cell::Cell::new(0usize);
+        let error = resolve_cli_archive_password(
+            true,
+            &None,
+            &TonepoetConfig::default(),
+            || {
+                calls.set(calls.get() + 1);
+                Err("keyring backend unavailable: Secret Service is locked".to_string())
+            },
+        )
+        .expect_err("unavailable MRU backend must fail queue admission");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            error,
+            "cannot resolve stored archive passwords before queue admission: keyring backend unavailable: Secret Service is locked"
+        );
+    }
+
+    #[test]
+    fn explicit_cli_archive_password_bypasses_unavailable_mru_backend() {
+        let calls = std::cell::Cell::new(0usize);
+        let password = resolve_cli_archive_password(
+            true,
+            &Some("ephemeral-cli-secret".to_string()),
+            &TonepoetConfig::default(),
+            || {
+                calls.set(calls.get() + 1);
+                Err("must not be called".to_string())
+            },
+        )
+        .expect("explicit CLI password is self-contained");
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(password.as_deref(), Some("ephemeral-cli-secret"));
+    }
+
+    #[test]
     fn cli_synthetic_artifacts_are_manager_owned_and_drop_cleaned() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_mergeable_split_cue_album_fixture(temp.path());
@@ -3513,7 +3657,6 @@ FILE "side_b.flac" WAVE
                     cue_sidecar_override,
                     &ConversionOptions::default(),
                     &None,
-                    &TonepoetConfig::default(),
                 );
             }
             for item in q.all_items_mut() {

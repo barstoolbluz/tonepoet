@@ -117,8 +117,10 @@ fn fallback_options(output_opts: &OutputOptionsState, config: &TonepoetConfig) -
     let format = FormatState::new();
     let mut options = ConversionOptions::default();
     options.output_format = *format.format.selected_value();
-    options.target_sample_rate = Some(*format.sample_rate.selected_value());
-    options.target_bit_depth = Some(format.bit_depth.selected_value().to_backend_depth());
+    options.target_sample_rate = (*format.sample_rate.selected_value() != crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL)
+        .then_some(*format.sample_rate.selected_value());
+    options.target_bit_depth = (!format.bit_depth.selected_value().is_source())
+        .then_some(format.bit_depth.selected_value().to_backend_depth());
     options.dither_type = Some(*format.dither.selected_value());
     options.naming_template = Some(output_opts.filename_template.clone());
     options.folder_template = Some(output_opts.folder_template.clone());
@@ -166,7 +168,7 @@ pub fn try_pills_to_options(
     );
 
     // Use backend bit depth for quality settings when the legacy path still needs it.
-    let backend_depth = bit_depth.to_backend_depth();
+    let backend_depth = if bit_depth.is_source() { 24 } else { bit_depth.to_backend_depth() };
 
     let quality = match output_format {
         AudioFormat::Flac => QualitySettings::Flac {
@@ -217,9 +219,9 @@ pub fn try_pills_to_options(
         (false, None)
     } else {
         match rg {
-            ReplayGainChoice::Album => (true, Some(ReplayGainMode::Album)),
-            ReplayGainChoice::Track => (true, Some(ReplayGainMode::Track)),
-            ReplayGainChoice::Both => (true, Some(ReplayGainMode::Both)),
+            ReplayGainChoice::Album | ReplayGainChoice::AlbumIfMissing => (true, Some(ReplayGainMode::Album)),
+            ReplayGainChoice::Track | ReplayGainChoice::TrackIfMissing => (true, Some(ReplayGainMode::Track)),
+            ReplayGainChoice::Both | ReplayGainChoice::BothIfMissing => (true, Some(ReplayGainMode::Both)),
             ReplayGainChoice::Off => (false, None),
         }
     };
@@ -231,7 +233,7 @@ pub fn try_pills_to_options(
     } else {
         None
     };
-    let target_bit_depth = if legacy_bit_depth_applies && !is_dsd {
+    let target_bit_depth = if legacy_bit_depth_applies && !is_dsd && !bit_depth.is_source() {
         Some(backend_depth)
     } else {
         None
@@ -242,7 +244,8 @@ pub fn try_pills_to_options(
     Ok(ConversionOptions {
         output_format,
         quality,
-        target_sample_rate: Some(target_sample_rate),
+        target_sample_rate: (target_sample_rate != crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL)
+            .then_some(target_sample_rate),
         target_bit_depth,
         dither_type,
         calculate_replaygain,
@@ -297,10 +300,16 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
 
     let (target_sample_rate, target_bit_depth, dither_type, preferred_tool, nyquist_transition) =
         if is_dsd {
-            let dsd_rate = pipeline_enums::DsdRate::from_hz(selected_rate)
-                .ok_or_else(|| format!("{} is not a supported DSD target rate", selected_rate))?;
+            let rate_target = if selected_rate == crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL {
+                pipeline_enums::RateTarget::Source
+            } else {
+                pipeline_enums::RateTarget::Dsd(
+                    pipeline_enums::DsdRate::from_hz(selected_rate)
+                        .ok_or_else(|| format!("{} is not a supported DSD target rate", selected_rate))?,
+                )
+            };
             (
-                pipeline_enums::RateTarget::Dsd(dsd_rate),
+                rate_target,
                 pipeline_enums::BitDepthTarget::Source,
                 pipeline_enums::DitherType::None,
                 pipeline_enums::PreferredTool::Sox,
@@ -308,6 +317,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             )
         } else {
             let target_depth = match *format.bit_depth.selected_value() {
+                BitDepthChoice::Source => pipeline_enums::BitDepthTarget::Source,
                 BitDepthChoice::Int16 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Int16),
                 BitDepthChoice::Int24 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Int24),
                 BitDepthChoice::Int32 => pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Int32),
@@ -333,7 +343,11 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
                 ),
             };
             (
-                pipeline_enums::RateTarget::PcmHz(selected_rate),
+                if selected_rate == crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL {
+                    pipeline_enums::RateTarget::Source
+                } else {
+                    pipeline_enums::RateTarget::PcmHz(selected_rate)
+                },
                 target_depth,
                 map_dither(*format.dither.selected_value()),
                 tool,
@@ -345,9 +359,9 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         None
     } else {
         match *format.replaygain.selected_value() {
-            ReplayGainChoice::Album => Some(pipeline_enums::ReplayGainMode::Album),
-            ReplayGainChoice::Track => Some(pipeline_enums::ReplayGainMode::Track),
-            ReplayGainChoice::Both => Some(pipeline_enums::ReplayGainMode::Both),
+            ReplayGainChoice::Album | ReplayGainChoice::AlbumIfMissing => Some(pipeline_enums::ReplayGainMode::Album),
+            ReplayGainChoice::Track | ReplayGainChoice::TrackIfMissing => Some(pipeline_enums::ReplayGainMode::Track),
+            ReplayGainChoice::Both | ReplayGainChoice::BothIfMissing => Some(pipeline_enums::ReplayGainMode::Both),
             ReplayGainChoice::Off => None,
         }
     };
@@ -452,6 +466,14 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         replay_gain: {
             let mut replay_gain: tonepoet_pipeline::ReplayGainSettings = Default::default();
             replay_gain.mode = replay_gain_mode;
+            replay_gain.existing_tags = match *format.replaygain.selected_value() {
+                ReplayGainChoice::AlbumIfMissing
+                | ReplayGainChoice::TrackIfMissing
+                | ReplayGainChoice::BothIfMissing => {
+                    tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete
+                }
+                _ => tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan,
+            };
             replay_gain
         },
     };
@@ -608,16 +630,16 @@ pub fn commit_batch_with_cue_artifacts(
         }
 
         // For encrypted archives, resolve password:
-        // session override → keychain MRU → config → None.
+        // session override → configured reference → keychain MRU → None.
         let archive_pw = if crate::is_encrypted_archive_ext(path) {
-            app.archive_passwords
-                .get(path)
-                .cloned()
-                .or_else(|| {
-                    app.keychain.ensure_loaded();
-                    app.keychain.passwords.first().cloned()
-                })
-                .or_else(|| app.config.conversion.archive_password.clone())
+            match super::app::archive_password_for_path(app, path) {
+                Ok(password) => password,
+                Err(error) => {
+                    outcome.errors = outcome.errors.saturating_add(1);
+                    outcome.last_error = Some(error);
+                    continue;
+                }
+            }
         } else {
             None
         };
@@ -625,15 +647,42 @@ pub fn commit_batch_with_cue_artifacts(
         let cue_sidecar_override =
             cue_sidecar_override_for_commit_path(path, cue_artifact_audio);
 
+        let archive_reference = archive_pw.as_deref().map(super::keychain::reference_for_password);
         match app.manager.add_file_ready_for_processing_with_cue_sidecar_override(
             path.clone(),
             queued_options.clone(),
-            archive_pw,
+            archive_pw.clone(),
             cue_sidecar_override,
         ) {
-            Ok(_) => {
+            Ok(item_id) => {
                 outcome.enqueued += 1;
                 active_queue_identities.insert(path_identity);
+                if let (Some(password), Some(reference_result)) =
+                    (archive_pw.as_deref(), archive_reference)
+                {
+                    match reference_result {
+                        Ok(reference) => {
+                            if let Err(error) = app.manager.attach_archive_password_reference(
+                                &item_id,
+                                password,
+                                reference,
+                            ) {
+                                outcome.last_error = Some(format!(
+                                    "queued {}, but its archive-password reference could not be attached: {}",
+                                    path.display(),
+                                    error
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            outcome.last_error = Some(format!(
+                                "queued {}, but its archive password is process-only because the OS secret store is unavailable: {}",
+                                path.display(),
+                                error
+                            ));
+                        }
+                    }
+                }
             }
             Err(err) => {
                 log::warn!("commit failed for {}: {err}", path.display());

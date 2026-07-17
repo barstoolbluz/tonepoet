@@ -176,13 +176,14 @@ fn flac_md5_sentinel() -> PipelineSettings {
         replay_gain: ReplayGainSettings {
             mode: Some(ReplayGainMode::Both),
             prevent_clipping: false,
+            existing_tags: tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete,
         },
     }
 }
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 69);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 70);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();
@@ -195,10 +196,11 @@ fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
 }
 
 #[test]
-fn fingerprint_is_stable_for_identical_settings() {
-    let settings = flac_md5_sentinel();
-    assert_eq!(settings_fingerprint(&settings), settings_fingerprint(&settings));
-    assert_eq!(settings_fingerprint(&settings).to_hex().len(), 64);
+fn sentinel_fingerprint_is_stable_and_exact() {
+    assert_eq!(
+        settings_fingerprint(&flac_md5_sentinel()).to_hex(),
+        "42aba0f48394333997aa732a5d94395d74d21fd0c87be76ddf6c95d7794b8bc9"
+    );
 }
 
 #[test]
@@ -498,6 +500,12 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     assert_mutation_changes_fingerprint!(covered, base, "replay_gain.prevent_clipping", |settings| {
         settings.replay_gain.prevent_clipping = true;
     });
+    assert_mutation_changes_fingerprint!(covered, base, "replay_gain.existing_tags", |settings| {
+        // The sentinel fixture already selects SkipIfComplete; mutate AWAY
+        // from it so the mutation is not a no-op.
+        settings.replay_gain.existing_tags =
+            tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan;
+    });
 
     covered.sort_unstable();
     let mut expected = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
@@ -508,15 +516,15 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
 #[cfg(feature = "serde")]
 #[test]
 fn serde_recursive_field_count_matches_checked_inventory_for_known_shapes() {
-    // Counts re-baselined 2026-07-15: this serde-gated sentinel only runs
-    // under workspace feature unification and had been dark while settings
-    // grew (56 -> 79 / 63 -> 86). The mutation-inventory test above is the
-    // authoritative drift guard; this pins raw serialized shape.
+    // Counts re-baselined 2026-07-15 (79/86), then +1 each for
+    // replay_gain.existing_tags (F3 skip-if-present policy). The
+    // mutation-inventory test above is the authoritative drift guard; this
+    // pins raw serialized shape.
     let default = serde_json::to_value(PipelineSettings::default()).unwrap();
     let sentinel = serde_json::to_value(flac_md5_sentinel()).unwrap();
 
-    assert_eq!(recursive_object_key_count(&default), 79);
-    assert_eq!(recursive_object_key_count(&sentinel), 86);
+    assert_eq!(recursive_object_key_count(&default), 80);
+    assert_eq!(recursive_object_key_count(&sentinel), 87);
 }
 
 #[cfg(feature = "serde")]

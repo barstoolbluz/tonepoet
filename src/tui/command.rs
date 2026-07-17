@@ -1363,6 +1363,16 @@ pub(crate) fn spawn_split_cue_album_grouping_ladder_for_metadata_editor(
     if !same_folder_split_cue_infos(&infos) {
         return false;
     }
+    let operation_id = match super::event_loop::begin_cue_operation(
+        app,
+        "metadata split-CUE grouping",
+    ) {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            app.set_status(error);
+            return true;
+        }
+    };
     let (concat_candidates, concat_cached, per_cue_cached) =
         split_cue_album_grouping_probe_inputs(app, &infos);
     app.set_status(format!(
@@ -1387,6 +1397,7 @@ pub(crate) fn spawn_split_cue_album_grouping_ladder_for_metadata_editor(
         });
         let _ = tx
             .send(AppMessage::MetadataEditorSplitCueAlbumGroupingComplete {
+                operation_id,
                 infos,
                 active_cue_path,
                 result,
@@ -2357,6 +2368,9 @@ pub enum Command {
     /// for the gnudb flow. No-op when the editor wasn't reached
     /// through gnudb.
     GnudbBack,
+    /// Cancel the active GNUDB workflow and restore its exact parked editor,
+    /// when the operation owns one. Stale worker completions become no-ops.
+    GnudbCancel,
     /// Switch the SACD metadata editor to a specific area. The
     /// argument distinguishes stereo / mch / toggle (which flips
     /// to the area not currently shown). No-op when the editor
@@ -2511,6 +2525,7 @@ impl std::fmt::Debug for Command {
             Command::CueSheetEdit => f.write_str("CueSheetEdit"),
             Command::MbBack => f.write_str("MbBack"),
             Command::GnudbBack => f.write_str("GnudbBack"),
+            Command::GnudbCancel => f.write_str("GnudbCancel"),
             Command::SacdSwitchArea(target) => f.debug_tuple("SacdSwitchArea").field(target).finish(),
             Command::DvdaSwitchGroup(group) => f.debug_tuple("DvdaSwitchGroup").field(group).finish(),
             Command::MarkCompareRef => f.write_str("MarkCompareRef"),
@@ -2588,6 +2603,7 @@ pub fn parse_command(input: &str) -> Command {
         "cuesheet-edit" | "cue-edit" => Command::CueSheetEdit,
         "mb-back" | "tags-mb-back" => Command::MbBack,
         "gnudb-back" | "tags-gnudb-back" => Command::GnudbBack,
+        "gnudb-cancel" | "tags-gnudb-cancel" => Command::GnudbCancel,
         "area" | "sacd-area" => {
             let target = match args.trim().to_ascii_lowercase().as_str() {
                 "stereo" | "2ch" | "two-channel" | "2.0" => SacdAreaTarget::Stereo,
@@ -4015,6 +4031,16 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         return;
                     }
                 };
+                let operation_id = match super::event_loop::begin_cue_operation(
+                    app,
+                    "MusicBrainz CUE",
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(error) => {
+                        app.set_status(error);
+                        return;
+                    }
+                };
                 let cached = app.db.get_cached_mb_response(&toc_string);
                 let n_cached = if cached.is_some() {
                     "cached"
@@ -4032,9 +4058,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 let paths_for_msg = paths.clone();
                 let output_dir_for_msg = output_dir.clone();
                 tokio::spawn(async move {
-                    let outcome = super::musicbrainz::lookup_release_by_toc(&sectors, cached).await;
+                    let worker = tokio::spawn(async move {
+                        super::musicbrainz::lookup_release_by_toc(&sectors, cached).await
+                    });
+                    let outcome = worker.await.unwrap_or_else(|error| {
+                        Err(format!("MusicBrainz CUE lookup worker failed: {error}"))
+                    });
                     let _ = tx
                         .send(AppMessage::CueMbComplete {
+                            operation_id,
                             outcome,
                             paths: paths_for_msg,
                             output_dir: output_dir_for_msg,
@@ -4236,6 +4268,29 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.pending_metadata_editor = Some(taken.state);
             app.active_overlay = super::app::ActiveOverlay::GnudbReview(review);
             app.set_status(":gnudb-back: review per-track values".to_string());
+        }
+        Command::GnudbCancel => {
+            let Some(active) = app.active_gnudb_operation else {
+                app.set_status("GNUDB: no active lookup to cancel");
+                return;
+            };
+            if matches!(app.active_overlay, super::app::ActiveOverlay::GnudbSelect { .. }) {
+                app.active_overlay = super::app::ActiveOverlay::None;
+            }
+            let restored = super::event_loop::cancel_gnudb_operation(app, active.operation_id);
+            if restored {
+                let editor_restored = matches!(
+                    app.active_overlay,
+                    super::app::ActiveOverlay::MetadataEditor(_)
+                );
+                if editor_restored {
+                    app.set_status("GNUDB lookup cancelled; parked metadata editor restored");
+                } else {
+                    app.set_status("GNUDB lookup cancelled");
+                }
+            } else {
+                app.set_status("GNUDB: active lookup could not be cancelled safely");
+            }
         }
         Command::SacdSwitchArea(target) => {
             let mut state = if let Some(parked) = app.pending_metadata_editor.take() {
@@ -4895,6 +4950,13 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             } else {
                 paths.clone()
             };
+            let operation_id = match super::event_loop::begin_cue_operation(app, ":cue-fill") {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    app.set_status(error);
+                    return;
+                }
+            };
             let tx = tx.clone();
             app.set_status(":cue-fill: probing selected files…".to_string());
             tokio::spawn(async move {
@@ -4926,7 +4988,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 .unwrap_or_else(|err| Err(format!("cue-fill preparation task failed: {}", err)));
 
                 let _ = tx
-                    .send(AppMessage::CueFillPrepComplete { cue_path, result })
+                    .send(AppMessage::CueFillPrepComplete {
+                        operation_id,
+                        cue_path,
+                        result,
+                    })
                     .await;
             });
         }
@@ -6323,6 +6389,7 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
     let mut count = 0usize;
     let mut errors = 0usize;
     let mut first_error: Option<String> = None;
+    let mut first_warning: Option<String> = None;
     let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
     let expansion_warning = if let Some(err) = expansion_errors.first() {
         if paths.is_empty() {
@@ -6338,14 +6405,15 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
     for path in paths {
         let is_synthetic_cue_artifact = synthetic_cue_artifacts.contains(&path);
         let archive_password = if crate::is_encrypted_archive_ext(&path) {
-            app.archive_passwords
-                .get(&path)
-                .cloned()
-                .or_else(|| {
-                    app.keychain.ensure_loaded();
-                    app.keychain.passwords.first().cloned()
-                })
-                .or_else(|| app.config.conversion.archive_password.clone())
+            match super::app::archive_password_for_path(app, &path) {
+                Ok(password) => password,
+                Err(error) => {
+                    errors = errors.saturating_add(1);
+                    first_error.get_or_insert_with(|| error.clone());
+                    log::error!("{error}");
+                    continue;
+                }
+            }
         } else {
             None
         };
@@ -6353,18 +6421,51 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
             &path,
             &cue_artifact_audio,
         );
+        let archive_reference = archive_password
+            .as_deref()
+            .map(super::keychain::reference_for_password);
         match app.manager.add_file_ready_for_processing_with_cue_sidecar_override(
             path.clone(),
             options.clone(),
-            archive_password,
+            archive_password.clone(),
             cue_sidecar_override,
         ) {
-            Ok(_item_id) => {
+            Ok(item_id) => {
                 // Synthetic album-CUE artifacts are transactionally registered
                 // by the manager's ready-admission helper while the queue write
                 // lock is still held. Re-registering here would split lifecycle
                 // ownership from queue admission and can mask registry failures.
                 count = count.saturating_add(1);
+                if let (Some(password), Some(reference_result)) =
+                    (archive_password.as_deref(), archive_reference)
+                {
+                    match reference_result {
+                        Ok(reference) => {
+                            if let Err(error) = app.manager.attach_archive_password_reference(
+                                &item_id,
+                                password,
+                                reference,
+                            ) {
+                                let message = format!(
+                                    "queued {}, but its archive-password reference could not be attached: {}",
+                                    path.display(),
+                                    error
+                                );
+                                first_warning.get_or_insert_with(|| message.clone());
+                                log::warn!("{message}");
+                            }
+                        }
+                        Err(error) => {
+                            let message = format!(
+                                "queued {}, but its archive password is process-only because the OS secret store is unavailable: {}",
+                                path.display(),
+                                error
+                            );
+                            first_warning.get_or_insert_with(|| message.clone());
+                            log::warn!("{message}");
+                        }
+                    }
+                }
             }
             Err(crate::convert::ConversionError::SyntheticCueArtifactOwnershipFailed {
                 artifact,
@@ -6398,6 +6499,10 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
     } else {
         format!("Queued {} files; {} failed", count, errors)
     };
+    if let Some(warning) = first_warning {
+        status.push_str(" — note: ");
+        status.push_str(&warning);
+    }
     if let Some(warning) = expansion_warning {
         // A separate set_status is overwritten by this one in the same
         // reducer pass; fold the expansion warning into the visible status.
@@ -6494,7 +6599,14 @@ pub(crate) fn install_browse_convert_source_paths(
         let staging_dir = pending.staging_dir.clone();
         let cancel = pending.cancel.clone();
         app.convert.install_pending_archive_preview(pending);
-        let password = archive_preview_password_for_path(app, &first);
+        let password = match archive_preview_password_for_path(app, &first) {
+            Ok(password) => password,
+            Err(error) => {
+                app.convert.clear_pending_archive_preview();
+                app.set_status(error);
+                return;
+            }
+        };
         let tool_paths = app.manager.config.tool_paths.clone();
         spawn_archive_preview(
             generation,
@@ -7067,18 +7179,30 @@ fn execute_commit_with_source_options_transform(
     };
     let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");
     let mut archive_passwords_by_path: BTreeMap<std::path::PathBuf, String> = BTreeMap::new();
+    let mut archive_password_refs_by_path: BTreeMap<std::path::PathBuf, String> = BTreeMap::new();
+    let mut archive_password_reference_warning: Option<String> = None;
     for path in &batch {
         if crate::is_encrypted_archive_ext(path) {
-            if let Some(password) = app
-                .archive_passwords
-                .get(path)
-                .cloned()
-                .or_else(|| {
-                    app.keychain.ensure_loaded();
-                    app.keychain.passwords.first().cloned()
-                })
-                .or_else(|| app.config.conversion.archive_password.clone())
-            {
+            let password = match super::app::archive_password_for_path(app, path) {
+                Ok(password) => password,
+                Err(error) => {
+                    app.set_status(error);
+                    return;
+                }
+            };
+            if let Some(password) = password {
+                match super::keychain::reference_for_password(&password) {
+                    Ok(reference) => {
+                        archive_password_refs_by_path.insert(path.clone(), reference);
+                    }
+                    Err(error) => {
+                        archive_password_reference_warning.get_or_insert_with(|| {
+                            format!(
+                                "archive password is process-only because the OS secret store is unavailable: {error}"
+                            )
+                        });
+                    }
+                }
                 archive_passwords_by_path.insert(path.clone(), password);
             }
         }
@@ -7105,9 +7229,11 @@ fn execute_commit_with_source_options_transform(
                 item.archive_metadata_overrides = archive_metadata_overrides.clone();
             }
 
-            if let Some(password) = archive_passwords_by_path.get(&item.input_path) {
-                item.archive_password = Some(password.clone());
-            }
+            let password = archive_passwords_by_path.get(&item.input_path).cloned();
+            let reference = archive_password_refs_by_path
+                .get(&item.input_path)
+                .cloned();
+            item.set_archive_password(password, reference);
             let mut item_source = commit_source.clone();
             if let Some(ref pw) = item.archive_password {
                 item_source.archive_password = Some(SecretString::new(pw.clone()));
@@ -7263,6 +7389,10 @@ fn execute_commit_with_source_options_transform(
         parts.join(", ")
     };
     if let Some(warning) = synthetic_artifact_lifecycle_warning {
+        success_status.push_str("; ");
+        success_status.push_str(&warning);
+    }
+    if let Some(warning) = archive_password_reference_warning {
         success_status.push_str("; ");
         success_status.push_str(&warning);
     }
@@ -9873,7 +10003,10 @@ fn bluray_is_album_level_sidecar_key(key: &str) -> bool {
             | "CATALOGNUMBER"
             | "PUBLISHER"
             | "DISCNUMBER"
+            | "TRACKTOTAL"
             | "TOTALTRACKS"
+            | "DISCTOTAL"
+            | "TOTALDISCS"
             | "MUSICBRAINZ_ALBUMID"
             | "MUSICBRAINZ_ALBUMARTISTID"
             | "MUSICBRAINZ_RELEASEGROUPID"
@@ -11336,7 +11469,8 @@ fn set_toml_optional_i64(table: &mut Table, key: &str, value: Option<i64>) {
 
 const DVDV_ALBUM_PRIMARY_TOML_KEYS: &[(&str, &str)] = &[
     ("ARTIST", "artist"), ("ALBUMARTIST", "album_artist"), ("ALBUM", "album"), ("GENRE", "genre"),
-    ("DATE", "date"), ("DISCNUMBER", "disc_number"), ("TOTALTRACKS", "total_tracks"),
+    ("DATE", "date"), ("DISCNUMBER", "disc_number"), ("TRACKTOTAL", "total_tracks"),
+    ("DISCTOTAL", "total_discs"),
     ("MUSICBRAINZ_ALBUMID", "musicbrainz_albumid"),
     ("MUSICBRAINZ_ALBUMARTISTID", "musicbrainz_albumartistid"),
     ("MUSICBRAINZ_RELEASEGROUPID", "musicbrainz_releasegroupid"),
@@ -11364,6 +11498,8 @@ fn dvdv_toml_extra_key_to_internal(key: &str) -> String {
         "musicbrainz_releasegroupid" => "MUSICBRAINZ_RELEASEGROUPID".to_string(),
         "musicbrainz_releasetrackid" => "MUSICBRAINZ_RELEASETRACKID".to_string(),
         "musicbrainz_trackid" => "MUSICBRAINZ_TRACKID".to_string(),
+        "tracktotal" | "totaltracks" => "TRACKTOTAL".to_string(),
+        "disctotal" | "totaldiscs" => "DISCTOTAL".to_string(),
         _ => key.to_string(),
     }
 }
@@ -12378,6 +12514,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 "384" | "384000" => Some(384_000),
                 "705.6" | "705600" => Some(705_600),
                 "768" | "768000" => Some(768_000),
+                "source" | "same" => Some(crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL),
                 _ => None,
             };
             if let Some(r) = rate {
@@ -12393,13 +12530,14 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 }
             } else {
                 app.set_status(format!(
-                    "Unknown rate: {}. Try: 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, 768",
+                    "Unknown rate: {}. Try: source, 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, 768",
                     value
                 ));
             }
         }
         "d" | "depth" => {
             let depth = match value.to_lowercase().as_str() {
+                "source" | "same" => Some(BitDepthChoice::Source),
                 "16" => Some(BitDepthChoice::Int16),
                 "24" => Some(BitDepthChoice::Int24),
                 "32" => Some(BitDepthChoice::Int32),
@@ -12420,7 +12558,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 }
             } else {
                 app.set_status(format!(
-                    "Unknown depth: {}. Try: 16, 24, 32, 32f, 64f",
+                    "Unknown depth: {}. Try: source, 16, 24, 32, 32f, 64f",
                     value
                 ));
             }
@@ -12455,6 +12593,9 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 "album" => Some(ReplayGainChoice::Album),
                 "track" => Some(ReplayGainChoice::Track),
                 "both" => Some(ReplayGainChoice::Both),
+                "album-if-missing" | "album_if_missing" => Some(ReplayGainChoice::AlbumIfMissing),
+                "track-if-missing" | "track_if_missing" => Some(ReplayGainChoice::TrackIfMissing),
+                "both-if-missing" | "both_if_missing" => Some(ReplayGainChoice::BothIfMissing),
                 "off" | "none" => Some(ReplayGainChoice::Off),
                 _ => None,
             };
@@ -12471,7 +12612,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 }
             } else {
                 app.set_status(format!(
-                    "Unknown rg mode: {}. Try: album, track, both, off",
+                    "Unknown rg mode: {}. Try: album, track, both, album-if-missing, track-if-missing, both-if-missing, off",
                     value
                 ));
             }
@@ -12986,6 +13127,30 @@ mod dvdv_sidecar_idempotency_tests {
         )
     }
 
+
+    #[test]
+    fn dvdv_toml_totals_use_canonical_editor_keys() {
+        let parsed = parse_dvdv_metadata_toml_sidecar_presentations(
+            Path::new("/tmp/tonepoet.dvdvideo.metadata.toml"),
+            r#"schema_version = 1
+format = "tonepoet-dvdvideo-metadata"
+
+[[presentations]]
+[presentations.album]
+total_tracks = "9"
+total_discs = "2"
+"#,
+        )
+        .expect("parse canonical totals");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].album.get("TRACKTOTAL").map(String::as_str), Some("9"));
+        assert_eq!(parsed[0].album.get("DISCTOTAL").map(String::as_str), Some("2"));
+        assert!(!parsed[0].album.contains_key("TOTALTRACKS"));
+        assert!(!parsed[0].album.contains_key("TOTALDISCS"));
+        assert_eq!(dvdv_toml_extra_key_to_internal("TOTALTRACKS"), "TRACKTOTAL");
+        assert_eq!(dvdv_toml_extra_key_to_internal("TOTALDISCS"), "DISCTOTAL");
+    }
 
     #[test]
     fn dvdv_sidecar_struct_roundtrip_preserves_presentation_and_extensions() {
@@ -13997,6 +14162,14 @@ mod bluray_sidecar_tests {
             "tonepoet-bluray-sidecar-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn bluray_album_level_vocabulary_accepts_canonical_and_legacy_totals() {
+        for key in ["TRACKTOTAL", "TOTALTRACKS", "DISCTOTAL", "TOTALDISCS"] {
+            assert!(bluray_is_album_level_sidecar_key(key), "{key}");
+        }
+        assert!(!bluray_is_album_level_sidecar_key("TRACKNUMBER"));
     }
 
     fn minimal_sidecar_text(album: &str) -> String {
@@ -15706,7 +15879,11 @@ mod execute_queue_state_consistency_tests {
         let handler_start = source
             .find("pub(crate) fn handle_browse_convert_expansion_complete(")
             .expect("expansion completion handler should exist");
-        let handler_body = &source[handler_start..];
+        let handler_end = source[handler_start..]
+            .find("\nfn current_audio_paths(")
+            .map(|offset| handler_start + offset)
+            .expect("expansion completion handler should have a bounded end");
+        let handler_body = &source[handler_start..handler_end];
         let finish_call = handler_body
             .find("finish_browse_queue_review_after_expansion(")
             .expect("fresh ConvertReview completions should publish via queue review helper");
@@ -15810,7 +15987,11 @@ mod execute_queue_state_consistency_tests {
         let handler_start = source
             .find("pub(crate) fn handle_browse_convert_expansion_complete(")
             .expect("expansion completion handler should exist");
-        let handler_body = &source[handler_start..];
+        let handler_end = source[handler_start..]
+            .find("\nfn current_audio_paths(")
+            .map(|offset| handler_start + offset)
+            .expect("expansion completion handler should have a bounded end");
+        let handler_body = &source[handler_start..handler_end];
         let generation_guard = handler_body
             .find("if generation != app.probe_generation")
             .expect("completion must generation-check stale jobs");
@@ -16251,7 +16432,11 @@ mod command_companion_policy_tests {
         let command_path = source
             .find("fn execute_commit_with_source_options_transform(")
             .expect("command commit path should exist");
-        let command_body = &source[command_path..];
+        let command_end = source[command_path..]
+            .find("\nfn execute_go(")
+            .map(|offset| command_path + offset)
+            .expect("command commit path should have a bounded end");
+        let command_body = &source[command_path..command_end];
 
         let policy_build = command_body
             .find("let companion_policy = companion_copy_policy_from_conversion_options(&options);")
@@ -16274,7 +16459,11 @@ mod command_companion_policy_tests {
         let command_path = source
             .find("fn execute_commit_with_source_options_transform(")
             .expect("command commit path should exist");
-        let command_body = &source[command_path..];
+        let command_end = source[command_path..]
+            .find("\nfn execute_go(")
+            .map(|offset| command_path + offset)
+            .expect("command commit path should have a bounded end");
+        let command_body = &source[command_path..command_end];
 
         let canonical_build = command_body
             .find(r#"let canonical_naming_template = options.effective_naming_template("%NN% - %TITLE%");"#)

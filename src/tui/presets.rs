@@ -36,9 +36,9 @@ pub struct TuiPreset {
     // Format pane
     pub format: String, // "flac", "opus", etc.
     pub sample_rate: u32,
-    pub bit_depth: String,  // "16", "24", "32", "32f", "64f"
+    pub bit_depth: String,  // "source", "16", "24", "32", "32f", "64f"
     pub dither: String,     // "tpdf", "none", "shibata", ...
-    pub replaygain: String, // "album", "track", "both", "off"
+    pub replaygain: String, // "album", "track", "both", optional "-if-missing", or "off"
     #[serde(default = "default_resampler")]
     pub resampler: String, // "sox", "ssrc", "soxr"
     #[serde(default)]
@@ -797,6 +797,7 @@ fn parse_format(s: &str) -> Option<AudioFormat> {
 
 fn parse_bit_depth(s: &str) -> Option<BitDepthChoice> {
     match s {
+        "source" => Some(BitDepthChoice::Source),
         "16" => Some(BitDepthChoice::Int16),
         "24" => Some(BitDepthChoice::Int24),
         "32" => Some(BitDepthChoice::Int32),
@@ -864,6 +865,9 @@ fn parse_replaygain(s: &str) -> Option<ReplayGainChoice> {
         "album" => Some(ReplayGainChoice::Album),
         "track" => Some(ReplayGainChoice::Track),
         "both" => Some(ReplayGainChoice::Both),
+        "album if missing" | "album-if-missing" => Some(ReplayGainChoice::AlbumIfMissing),
+        "track if missing" | "track-if-missing" => Some(ReplayGainChoice::TrackIfMissing),
+        "both if missing" | "both-if-missing" => Some(ReplayGainChoice::BothIfMissing),
         "off" => Some(ReplayGainChoice::Off),
         _ => None,
     }
@@ -1136,4 +1140,55 @@ merge = "multi-file"
 
         assert!(metadata.album_artist_for_conversion.is_none());
     }
+    #[test]
+    fn dsd_source_rate_preset_round_trips_without_a_loaded_source() {
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Dsf);
+        format.apply_format_constraints();
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let preset = TuiPreset::from_pill_state("dsd-source-rate", &format, &output, &metadata);
+
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(*restored_format.format.selected_value(), AudioFormat::Dsf);
+        assert_eq!(*restored_format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
+    }
+
+    #[test]
+    fn source_coupled_and_replaygain_policy_values_round_trip() {
+        let mut format = FormatState::new();
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.bit_depth.select_value(&BitDepthChoice::Source);
+        format.replaygain.select_value(&ReplayGainChoice::BothIfMissing);
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let preset = TuiPreset::from_pill_state("source-coupled", &format, &output, &metadata);
+        assert_eq!(preset.sample_rate, SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(preset.bit_depth, "source");
+        assert_eq!(preset.replaygain, "both if missing");
+
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(*restored_format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(*restored_format.bit_depth.selected_value(), BitDepthChoice::Source);
+        assert_eq!(*restored_format.replaygain.selected_value(), ReplayGainChoice::BothIfMissing);
+    }
+
 }

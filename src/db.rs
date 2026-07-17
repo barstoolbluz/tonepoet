@@ -8,7 +8,7 @@ use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 21;
+const CURRENT_VERSION: u32 = 22;
 
 // ── CTDB parity matrix cache tunables ─────────────────────────────────
 //
@@ -56,6 +56,19 @@ const MB_SEARCH_CACHE_EVICT_TARGET: usize = (MB_SEARCH_CACHE_MAX_ROWS * 90) / 10
 pub struct Database {
     conn: Connection,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataJournalEntry {
+    file_path: String,
+    backup_path: String,
+    started_at: String,
+    state: String,
+}
+
+const METADATA_STATE_ALLOCATING: &str = "allocating";
+const METADATA_STATE_PREPARED: &str = "prepared";
+const METADATA_STATE_COMMITTED: &str = "committed";
+const METADATA_STATE_ROLLED_BACK: &str = "rolled_back";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabasePragmaProfile {
@@ -251,6 +264,9 @@ impl Database {
         }
         if version < 21 {
             self.migrate_v21()?;
+        }
+        if version < 22 {
+            self.migrate_v22()?;
         }
 
         self.conn
@@ -967,6 +983,40 @@ impl Database {
     }
 
     // ── AccurateRip cache ───────────────────────────────────────
+
+
+    /// v22: distinguish in-flight writes from committed and rolled-back
+    /// cleanup states. This prevents startup recovery from restoring an old
+    /// backup over a write that committed before cleanup failed.
+    fn migrate_v22(&mut self) -> Result<(), String> {
+        let mut columns = self
+            .conn
+            .prepare("PRAGMA table_info(metadata_journal)")
+            .map_err(|error| format!("v22 migration inspect metadata_journal: {error}"))?;
+        let names = columns
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("v22 migration inspect metadata_journal: {error}"))?;
+        let mut has_state = false;
+        for name in names {
+            if name
+                .map_err(|error| format!("v22 migration decode metadata_journal column: {error}"))?
+                == "state"
+            {
+                has_state = true;
+                break;
+            }
+        }
+        drop(columns);
+
+        if !has_state {
+            self.conn
+                .execute_batch(
+                    "ALTER TABLE metadata_journal ADD COLUMN state TEXT NOT NULL DEFAULT 'prepared';",
+                )
+                .map_err(|error| format!("v22 migration: {error}"))?;
+        }
+        Ok(())
+    }
 
     /// Look up cached AR results for a file. Returns None if not cached
     /// or stale (mtime/size changed).
@@ -1703,24 +1753,58 @@ impl Database {
             Err(_) => return Vec::new(),
         };
 
-        rows.flatten()
-            .filter_map(|json| serde_json::from_str::<crate::convert::ConversionItem>(&json).ok())
-            .filter(|item| {
-                let path_str = item.input_path.to_string_lossy();
-                if path_str.contains("..") {
-                    log::warn!(
-                        "Filtered queue item with suspicious path: {:?}",
-                        item.input_path
+        let mut discarded_row = false;
+        let mut items = Vec::<crate::convert::ConversionItem>::new();
+        for row in rows {
+            match row {
+                Ok(json) => match serde_json::from_str::<crate::convert::ConversionItem>(&json) {
+                    Ok(item) => items.push(item),
+                    Err(error) => {
+                        discarded_row = true;
+                        log::error!(
+                            "Discarding malformed persisted SQLite queue row during secret sanitization: {}",
+                            error
+                        );
+                    }
+                },
+                Err(error) => {
+                    discarded_row = true;
+                    log::error!(
+                        "Discarding unreadable persisted SQLite queue row during secret sanitization: {}",
+                        error
                     );
-                    return false;
                 }
-                if !item.input_path.exists() {
-                    log::info!("Filtered queue item - file gone: {:?}", item.input_path);
-                    return false;
-                }
-                true
-            })
-            .collect()
+            }
+        }
+        drop(stmt);
+        let secrets_or_status_changed =
+            crate::convert::queue::restore_archive_passwords_after_load(&mut items);
+        let original_len = items.len();
+        items.retain(|item| {
+            let path_str = item.input_path.to_string_lossy();
+            if path_str.contains("..") {
+                log::warn!(
+                    "Filtered queue item with suspicious path: {:?}",
+                    item.input_path
+                );
+                return false;
+            }
+            if !item.input_path.exists() {
+                log::info!("Filtered queue item - file gone: {:?}", item.input_path);
+                return false;
+            }
+            true
+        });
+        if discarded_row || secrets_or_status_changed || items.len() != original_len {
+            let refs: Vec<&crate::convert::ConversionItem> = items.iter().collect();
+            if let Err(error) = self.sync_queue(&refs) {
+                log::error!(
+                    "Sanitized SQLite queue state but could not rewrite queue rows: {}",
+                    error
+                );
+            }
+        }
+        items
     }
 
     /// Check if the queue table has any rows.
@@ -1909,51 +1993,126 @@ impl Database {
     /// `.tonepoet-meta-journal` that stores the original FLAC metadata region
     /// plus the intended replacement metadata-region identity.
     pub fn begin_metadata_write(&self, file_path: &str, backup_path: &str) -> Result<(), String> {
+        self.begin_metadata_write_with_state(file_path, backup_path, METADATA_STATE_PREPARED)
+    }
+
+    fn begin_metadata_write_with_state(
+        &self,
+        file_path: &str,
+        backup_path: &str,
+        state: &str,
+    ) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO metadata_journal (file_path, backup_path, started_at)
-             VALUES (?1, ?2, ?3)",
-                params![file_path, backup_path, chrono::Utc::now().to_rfc3339()],
+                "INSERT INTO metadata_journal (file_path, backup_path, started_at, state)
+             VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    file_path,
+                    backup_path,
+                    chrono::Utc::now().to_rfc3339(),
+                    state,
+                ],
             )
-            .map_err(|e| format!("journal insert: {}", e))?;
+            .map_err(|e| {
+                format!(
+                    "journal insert refused for '{file_path}': an unresolved metadata write already owns this path or the journal is unavailable: {e}"
+                )
+            })?;
         Ok(())
     }
 
-    /// Remove the journal entry after a successful write.
+    fn set_metadata_write_state(&self, file_path: &str, state: &str) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE metadata_journal SET state = ?2 WHERE file_path = ?1",
+                params![file_path, state],
+            )
+            .map_err(|e| format!("journal state update for '{file_path}' to '{state}': {e}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "journal state update for '{file_path}' to '{state}' changed {changed} rows; expected exactly one"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove the journal entry after backup cleanup reaches a terminal state.
     pub fn complete_metadata_write(&self, file_path: &str) -> Result<(), String> {
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "DELETE FROM metadata_journal WHERE file_path = ?1",
                 params![file_path],
             )
-            .map_err(|e| format!("journal delete: {}", e))?;
+            .map_err(|e| format!("journal delete for '{file_path}': {e}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "journal delete for '{file_path}' removed {changed} rows; expected exactly one"
+            ));
+        }
         Ok(())
     }
 
-    /// Get all stale journal entries (for crash recovery on startup).
-    pub fn stale_metadata_writes(&self) -> Result<Vec<(String, String, String)>, String> {
+    fn metadata_journal_entry(&self, file_path: &str) -> Result<Option<MetadataJournalEntry>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT file_path, backup_path, started_at FROM metadata_journal")
-            .map_err(|e| format!("journal query: {}", e))?;
+            .prepare(
+                "SELECT file_path, backup_path, started_at, state
+                 FROM metadata_journal WHERE file_path = ?1",
+            )
+            .map_err(|e| format!("journal lookup for '{file_path}': {e}"))?;
+        let mut rows = stmt
+            .query(params![file_path])
+            .map_err(|e| format!("journal lookup for '{file_path}': {e}"))?;
+        let Some(row) = rows
+            .next()
+            .map_err(|e| format!("journal lookup for '{file_path}': {e}"))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(MetadataJournalEntry {
+            file_path: row.get(0).map_err(|e| format!("journal file_path decode: {e}"))?,
+            backup_path: row.get(1).map_err(|e| format!("journal backup_path decode: {e}"))?,
+            started_at: row.get(2).map_err(|e| format!("journal started_at decode: {e}"))?,
+            state: row.get(3).map_err(|e| format!("journal state decode: {e}"))?,
+        }))
+    }
+
+    fn metadata_journal_entries(&self) -> Result<Vec<MetadataJournalEntry>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT file_path, backup_path, started_at, state
+                 FROM metadata_journal ORDER BY file_path",
+            )
+            .map_err(|e| format!("journal query: {e}"))?;
 
         let rows = stmt
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok(MetadataJournalEntry {
+                    file_path: row.get(0)?,
+                    backup_path: row.get(1)?,
+                    started_at: row.get(2)?,
+                    state: row.get(3)?,
+                })
             })
-            .map_err(|e| format!("journal query: {}", e))?;
+            .map_err(|e| format!("journal query: {e}"))?;
 
         let mut entries = Vec::new();
         for row in rows {
-            if let Ok(entry) = row {
-                entries.push(entry);
-            }
+            entries.push(row.map_err(|e| format!("journal row decode: {e}"))?);
         }
         Ok(entries)
+    }
+
+    /// Compatibility view used by diagnostics and existing tests.
+    pub fn stale_metadata_writes(&self) -> Result<Vec<(String, String, String)>, String> {
+        Ok(self
+            .metadata_journal_entries()?
+            .into_iter()
+            .map(|entry| (entry.file_path, entry.backup_path, entry.started_at))
+            .collect())
     }
 
     // ── Browse directory-summary cache ───────────────────────────
@@ -2185,13 +2344,15 @@ impl Database {
 
     // ── Atomic metadata write ──────────────────────────────────
 
-    /// Perform an atomic metadata write with hardlink backup + journal.
+    /// Perform an atomic metadata write with an independent copy backup + journal.
     ///
-    /// 1. Creates a hardlink backup (copy fallback for cross-fs)
-    /// 2. Records the in-flight write in the journal table
-    /// 3. Calls the provided write function
-    /// 4. On success: removes journal entry + backup
-    /// 5. On failure: restores from backup (instant rollback)
+    /// 1. Exclusively reserves an empty, non-authoritative unique marker
+    /// 2. Records allocating ownership, then durably populates the backup
+    /// 3. Records prepared state, then calls the provided write function
+    /// 4. On success: durably syncs the destination and parent directory, records
+    ///    committed state, then removes backup and journal
+    /// 5. On write or durability failure: restores, records rolled-back state,
+    ///    then retires both
     pub fn atomic_metadata_write<F>(
         &self,
         file_path: &std::path::Path,
@@ -2200,77 +2361,352 @@ impl Database {
     where
         F: FnOnce() -> Result<(), String>,
     {
+        self.atomic_metadata_write_with_durability(
+            file_path,
+            write_fn,
+            Self::sync_metadata_destination,
+        )
+    }
+
+    fn atomic_metadata_write_with_durability<F, S>(
+        &self,
+        file_path: &std::path::Path,
+        write_fn: F,
+        sync_fn: S,
+    ) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<(), String>,
+        S: FnOnce(&std::path::Path) -> Result<(), String>,
+    {
         let path_str = file_path.display().to_string();
-        let backup = Self::backup_path(file_path);
-        let backup_str = backup.display().to_string();
+        let legacy_backup = Self::backup_path(file_path);
 
-        // Step 1: create backup.
-        Self::create_backup(file_path, &backup)?;
-
-        // Step 2: record in journal.
-        if let Err(e) = self.begin_metadata_write(&path_str, &backup_str) {
-            let _ = std::fs::remove_file(&backup);
-            return Err(format!("journal error (write aborted): {}", e));
+        // A previous operation that reached a terminal state may have failed
+        // only during cleanup. Retire that state before allocating a new
+        // rollback marker. A prepared state is still authoritative and must
+        // block retries until recovery restores it.
+        if let Some(entry) = self.metadata_journal_entry(&path_str)? {
+            match entry.state.as_str() {
+                METADATA_STATE_COMMITTED | METADATA_STATE_ROLLED_BACK => {
+                    let recorded_backup = std::path::PathBuf::from(&entry.backup_path);
+                    Self::remove_backup_marker(&recorded_backup)?;
+                    self.complete_metadata_write(&path_str)?;
+                }
+                METADATA_STATE_ALLOCATING | METADATA_STATE_PREPARED => {
+                    return Err(format!(
+                        "metadata write refused for '{}': unresolved {} journal still owns rollback marker '{}' from {}",
+                        file_path.display(),
+                        entry.state.as_str(),
+                        entry.backup_path,
+                        entry.started_at
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "metadata write refused for '{}': journal has unknown state {:?}",
+                        file_path.display(),
+                        other
+                    ));
+                }
+            }
         }
 
-        // Step 3: execute the write.
-        let result = write_fn();
+        // A deterministic marker belongs to the older standalone backup path.
+        // It may be the only authoritative original copy from a failed write;
+        // a database transaction must not bypass or overwrite it merely because
+        // its own marker uses a unique operation suffix.
+        if legacy_backup.exists() {
+            return Err(format!(
+                "backup refused: rollback marker '{}' already exists and will not be overwritten",
+                legacy_backup.display()
+            ));
+        }
 
-        // Step 4/5: cleanup.
-        match result {
+        // Open the source before reserving any marker. A missing or unreadable
+        // destination therefore leaves no filesystem or journal artifact.
+        let mut source = std::fs::File::open(file_path)
+            .map_err(|error| format!("open '{}' for backup: {error}", file_path.display()))?;
+
+        // Reserve an empty unique marker with create_new before journaling it.
+        // A crash in this narrow window can leave only an empty, non-authoritative
+        // orphan; the destination has not been mutated and no foreign marker can
+        // ever be mistaken for this transaction's recovery authority.
+        let (backup, mut destination) = Self::reserve_transaction_backup(file_path)?;
+        let backup_str = backup.display().to_string();
+        if let Err(journal_error) = self.begin_metadata_write_with_state(
+            &path_str,
+            &backup_str,
+            METADATA_STATE_ALLOCATING,
+        ) {
+            drop(destination);
+            return match Self::remove_backup_marker(&backup) {
+                Ok(()) => Err(format!(
+                    "journal error (write aborted before backup population): {journal_error}"
+                )),
+                Err(cleanup_error) => Err(format!(
+                    "journal error (write aborted before backup population): {journal_error}; additionally could not remove the empty non-authoritative marker '{}': {cleanup_error}",
+                    backup.display()
+                )),
+            };
+        }
+
+        if let Err(error) = std::io::copy(&mut source, &mut destination)
+            .and_then(|_| destination.sync_all())
+        {
+            drop(destination);
+            let reason = format!(
+                "backup allocation failed for '{}': copy to rollback marker '{}': {error}",
+                file_path.display(),
+                backup.display()
+            );
+            return Err(self.abort_allocating_metadata_write(&path_str, &backup, reason));
+        }
+        drop(destination);
+        if let Err(error) = Self::sync_parent_directory(&backup) {
+            let reason = format!(
+                "backup allocation failed for '{}': rollback marker '{}' was populated, but parent-directory durability could not be confirmed: {error}",
+                file_path.display(),
+                backup.display()
+            );
+            return Err(self.abort_allocating_metadata_write(&path_str, &backup, reason));
+        }
+
+        if let Err(error) = self.set_metadata_write_state(&path_str, METADATA_STATE_PREPARED) {
+            return match Self::remove_backup_marker(&backup) {
+                Ok(()) => match self.complete_metadata_write(&path_str) {
+                    Ok(()) => Err(format!(
+                        "metadata write for '{}' was aborted before mutation because prepared state could not be recorded: {error}",
+                        file_path.display()
+                    )),
+                    Err(journal_error) => Err(format!(
+                        "metadata write for '{}' was aborted before mutation because prepared state could not be recorded: {error}; marker was removed, but allocating journal cleanup failed: {journal_error}",
+                        file_path.display()
+                    )),
+                },
+                Err(cleanup_error) => Err(format!(
+                    "metadata write for '{}' was aborted before mutation because prepared state could not be recorded: {error}; allocating journal and marker '{}' remain because cleanup failed: {cleanup_error}",
+                    file_path.display(),
+                    backup.display()
+                )),
+            };
+        }
+
+        match write_fn() {
             Ok(()) => {
-                let _ = self.complete_metadata_write(&path_str);
-                let _ = std::fs::remove_file(&backup);
+                if let Err(sync_error) = sync_fn(file_path) {
+                    return self.rollback_prepared_metadata_write(
+                        file_path,
+                        &path_str,
+                        &backup,
+                        &backup_str,
+                        format!("metadata durability sync failed: {sync_error}"),
+                    );
+                }
+                // The write becomes committed only after the rewritten media
+                // file and its parent directory are durable. A crash before
+                // this update leaves prepared state, so recovery restores the
+                // old bytes.
+                if let Err(error) =
+                    self.set_metadata_write_state(&path_str, METADATA_STATE_COMMITTED)
+                {
+                    return match Self::copy_backup_over(file_path, &backup) {
+                        Ok(()) => Err(format!(
+                            "metadata bytes were written to '{}', but commit authority could not be recorded: {error}; original bytes were restored and the prepared journal plus rollback marker remain armed for idempotent recovery",
+                            file_path.display()
+                        )),
+                        Err(rollback_error) => Err(format!(
+                            "metadata bytes were written to '{}', but commit authority could not be recorded: {error}; rollback also failed: {rollback_error}. Prepared journal and rollback marker '{}' remain armed",
+                            file_path.display(),
+                            backup.display()
+                        )),
+                    };
+                }
+                Self::remove_backup_marker(&backup).map_err(|error| {
+                    format!(
+                        "metadata write for '{}' committed, but rollback marker cleanup failed: {error}; committed journal remains armed and recovery must preserve the new bytes",
+                        file_path.display()
+                    )
+                })?;
+                self.complete_metadata_write(&path_str).map_err(|error| {
+                    format!(
+                        "metadata write for '{}' committed and rollback marker was removed, but journal cleanup failed: {error}; recovery must retire the committed journal without restoring old bytes",
+                        file_path.display()
+                    )
+                })?;
                 Ok(())
             }
-            Err(e) => {
-                // Rollback: restore from backup.
-                if backup.exists() {
-                    if let Err(rollback_err) = std::fs::rename(&backup, file_path) {
-                        let _ = self.complete_metadata_write(&path_str);
-                        return Err(format!(
-                            "write failed AND rollback failed ({}: {}). Backup at: {}",
-                            e, rollback_err, backup_str
-                        ));
-                    }
-                }
-                let _ = self.complete_metadata_write(&path_str);
-                Err(format!("write failed (rolled back): {}", e))
-            }
+            Err(write_error) => self.rollback_prepared_metadata_write(
+                file_path,
+                &path_str,
+                &backup,
+                &backup_str,
+                write_error,
+            ),
         }
+    }
+
+    fn rollback_prepared_metadata_write(
+        &self,
+        file_path: &std::path::Path,
+        path_str: &str,
+        backup: &std::path::Path,
+        backup_str: &str,
+        write_error: String,
+    ) -> Result<(), String> {
+        if !backup.exists() {
+            return Err(format!(
+                "write failed and rollback marker is missing: {write_error}. Expected backup at: {backup_str}. Prepared journal remains unresolved and blocks retries until the recovery failure is repaired explicitly"
+            ));
+        }
+
+        Self::copy_backup_over(file_path, backup).map_err(|rollback_error| {
+            format!(
+                "write failed AND rollback could not be completed ({write_error}: {rollback_error}). Backup at: {backup_str}"
+            )
+        })?;
+        self.set_metadata_write_state(path_str, METADATA_STATE_ROLLED_BACK)
+            .map_err(|journal_error| {
+                format!(
+                    "write failed ({write_error}); original bytes were restored, but rollback completion could not be recorded: {journal_error}. Prepared journal and backup remain armed for idempotent recovery"
+                )
+            })?;
+        Self::remove_backup_marker(backup).map_err(|cleanup_error| {
+            format!(
+                "write failed ({write_error}); original bytes were restored, but rollback marker cleanup failed: {cleanup_error}. Rolled-back journal remains armed"
+            )
+        })?;
+        self.complete_metadata_write(path_str).map_err(|journal_error| {
+            format!(
+                "write failed ({write_error}); original bytes were restored and rollback marker removed, but journal cleanup failed: {journal_error}. Recovery must retire the rolled-back journal without changing the file"
+            )
+        })?;
+        Err(format!("write failed (rolled back): {write_error}"))
+    }
+
+    fn sync_metadata_destination(file_path: &std::path::Path) -> Result<(), String> {
+        #[cfg(windows)]
+        let destination = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file_path);
+        #[cfg(not(windows))]
+        let destination = std::fs::File::open(file_path);
+
+        destination
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("sync rewritten media file '{}': {error}", file_path.display()))?;
+        Self::sync_parent_directory(file_path).map_err(|error| {
+            format!(
+                "sync parent directory after metadata write to '{}': {error}",
+                file_path.display()
+            )
+        })
     }
 
     /// Recover from any stale legacy DB journal entries. Native FLAC recovery
     /// is handled separately by the FLAC metadata-region journal scanner.
     /// Returns descriptions of recovered files.
     pub fn recover_stale_metadata_writes(&self) -> Vec<String> {
-        let entries = match self.stale_metadata_writes() {
-            Ok(e) => e,
-            Err(_) => return Vec::new(),
+        let entries = match self.metadata_journal_entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                return vec![format!(
+                    "RECOVERY FAILED: metadata journal could not be read: {error}"
+                )]
+            }
         };
 
         let mut messages = Vec::new();
-        for (file_path, backup_path, started_at) in &entries {
-            let backup = std::path::PathBuf::from(backup_path);
-            let original = std::path::PathBuf::from(file_path);
-
-            if backup.exists() {
-                match std::fs::rename(&backup, &original) {
-                    Ok(()) => {
+        for entry in entries {
+            let backup = std::path::PathBuf::from(&entry.backup_path);
+            let original = std::path::PathBuf::from(&entry.file_path);
+            match entry.state.as_str() {
+                METADATA_STATE_ALLOCATING => {
+                    if let Err(error) = Self::remove_backup_marker(&backup) {
                         messages.push(format!(
-                            "Recovered: {} (write started {})",
-                            file_path, started_at
+                            "RECOVERY INCOMPLETE for {}: allocating state proves no writer started, but marker '{}' could not be retired without changing the destination: {}",
+                            entry.file_path, entry.backup_path, error
                         ));
+                        continue;
                     }
-                    Err(e) => {
-                        messages.push(format!(
-                            "RECOVERY FAILED for {}: {}. Backup at: {}",
-                            file_path, e, backup_path
-                        ));
+                    match self.complete_metadata_write(&entry.file_path) {
+                        Ok(()) => messages.push(format!(
+                            "Retired incomplete metadata backup allocation for {} without changing the file (operation started {})",
+                            entry.file_path, entry.started_at
+                        )),
+                        Err(error) => messages.push(format!(
+                            "RECOVERY INCOMPLETE for {}: allocating marker was retired without changing the file, but journal cleanup failed: {}",
+                            entry.file_path, error
+                        )),
                     }
                 }
+                METADATA_STATE_PREPARED => {
+                    if !backup.exists() {
+                        messages.push(format!(
+                            "RECOVERY FAILED for {}: rollback marker is missing (write started {}); prepared journal remains unresolved and blocks retries",
+                            entry.file_path, entry.started_at
+                        ));
+                        continue;
+                    }
+
+                    if let Err(error) = Self::copy_backup_over(&original, &backup) {
+                        messages.push(format!(
+                            "RECOVERY FAILED for {}: {}. Backup at: {}",
+                            entry.file_path, error, entry.backup_path
+                        ));
+                        continue;
+                    }
+                    if let Err(error) =
+                        self.set_metadata_write_state(&entry.file_path, METADATA_STATE_ROLLED_BACK)
+                    {
+                        messages.push(format!(
+                            "RECOVERY INCOMPLETE for {}: original bytes were restored, but rollback completion could not be recorded: {}. Backup at: {}",
+                            entry.file_path, error, entry.backup_path
+                        ));
+                        continue;
+                    }
+                    if let Err(error) = Self::remove_backup_marker(&backup) {
+                        messages.push(format!(
+                            "RECOVERY INCOMPLETE for {}: original bytes were restored, but rollback marker cleanup failed: {}",
+                            entry.file_path, error
+                        ));
+                        continue;
+                    }
+                    match self.complete_metadata_write(&entry.file_path) {
+                        Ok(()) => messages.push(format!(
+                            "Recovered: {} (write started {})",
+                            entry.file_path, entry.started_at
+                        )),
+                        Err(error) => messages.push(format!(
+                            "RECOVERY INCOMPLETE for {}: original bytes were restored and rollback marker removed, but journal cleanup failed: {}",
+                            entry.file_path, error
+                        )),
+                    }
+                }
+                METADATA_STATE_COMMITTED | METADATA_STATE_ROLLED_BACK => {
+                    let state = entry.state.as_str();
+                    if let Err(error) = Self::remove_backup_marker(&backup) {
+                        messages.push(format!(
+                            "RECOVERY INCOMPLETE for {}: terminal journal state '{}' must preserve current bytes, but rollback marker cleanup failed: {}",
+                            entry.file_path, state, error
+                        ));
+                        continue;
+                    }
+                    match self.complete_metadata_write(&entry.file_path) {
+                        Ok(()) => messages.push(format!(
+                            "Finalized metadata journal for {} in state {} (write started {})",
+                            entry.file_path, state, entry.started_at
+                        )),
+                        Err(error) => messages.push(format!(
+                            "RECOVERY INCOMPLETE for {}: terminal journal state '{}' was preserved, but journal cleanup failed: {}",
+                            entry.file_path, state, error
+                        )),
+                    }
+                }
+                other => messages.push(format!(
+                    "RECOVERY FAILED for {}: unknown metadata journal state {:?}; no file or marker was changed",
+                    entry.file_path, other
+                )),
             }
-            let _ = self.complete_metadata_write(file_path);
         }
         messages
     }
@@ -2288,6 +2724,97 @@ impl Database {
         Self::create_backup(original, backup)
     }
 
+    /// Restore an independent full-file backup over an existing destination.
+    ///
+    /// `rename(backup, original)` cannot portably replace an existing path and
+    /// can replace a symlink rather than restoring through it. Copying is the
+    /// inverse of `create_backup`: it overwrites the destination's bytes while
+    /// preserving the destination path identity. The rollback marker is removed
+    /// only after the copy succeeds.
+    pub fn restore_backup_for(
+        original: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), String> {
+        Self::copy_backup_over(original, backup)?;
+        Self::remove_backup_marker(backup)
+    }
+
+    fn copy_backup_over(
+        original: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), String> {
+        // Read and validate the marker FIRST, and only replace the
+        // destination with an atomic rename of a fully-written temp file.
+        // Truncating the destination in place before the copy meant a bad
+        // marker (directory, symlink, unreadable) destroyed the very bytes
+        // this restore exists to recover.
+        let restore_error = |detail: String| {
+            format!(
+                "restore '{}' from rollback marker '{}': {detail}",
+                original.display(),
+                backup.display()
+            )
+        };
+        let marker_metadata = std::fs::symlink_metadata(backup)
+            .map_err(|error| restore_error(error.to_string()))?;
+        if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+            return Err(restore_error("marker is not a regular file".to_string()));
+        }
+        let bytes = std::fs::read(backup).map_err(|error| restore_error(error.to_string()))?;
+        let parent = original
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| restore_error("destination has no parent directory".to_string()))?;
+        let mut temp = tempfile::Builder::new()
+            .prefix(".metadata-restore.")
+            .tempfile_in(parent)
+            .map_err(|error| restore_error(format!("create restore temporary: {error}")))?;
+        {
+            use std::io::Write;
+            temp.as_file_mut()
+                .write_all(&bytes)
+                .map_err(|error| restore_error(format!("write restore temporary: {error}")))?;
+            temp.as_file()
+                .sync_all()
+                .map_err(|error| restore_error(format!("sync restore temporary: {error}")))?;
+        }
+        temp.persist(original)
+            .map_err(|error| restore_error(format!("publish restored bytes: {error}")))?;
+        Self::sync_parent_directory(original).map_err(|error| {
+            restore_error(format!(
+                "restored bytes were published, but parent-directory durability could not be confirmed: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn remove_backup_marker(backup: &std::path::Path) -> Result<(), String> {
+        match std::fs::remove_file(backup) {
+            Ok(()) => Self::sync_parent_directory(backup).map_err(|error| {
+                format!(
+                    "rollback marker '{}' was removed, but parent-directory durability could not be confirmed: {error}",
+                    backup.display()
+                )
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "remove rollback marker '{}': {error}",
+                backup.display()
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    fn sync_parent_directory(path: &std::path::Path) -> std::io::Result<()> {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(parent)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync_parent_directory(_path: &std::path::Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn backup_path(original: &std::path::Path) -> std::path::PathBuf {
         let mut name = original
             .file_name()
@@ -2297,13 +2824,131 @@ impl Database {
         original.with_file_name(name)
     }
 
-    /// Create a backup by copying the file. We MUST copy, not hardlink:
-    /// hardlinks share the same inode, so in-place writes by lofty would
-    /// corrupt both the original AND the "backup". A copy has its own
-    /// inode and is immune to writes to the original.
+    fn transaction_backup_path(original: &std::path::Path) -> std::path::PathBuf {
+        let base = Self::backup_path(original);
+        let file_name = base
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown.tonepoet-bak".to_string());
+        base.with_file_name(format!("{file_name}.txn-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn reserve_transaction_backup(
+        original: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, std::fs::File), String> {
+        const MAX_RESERVATION_ATTEMPTS: usize = 16;
+        for _ in 0..MAX_RESERVATION_ATTEMPTS {
+            let backup = Self::transaction_backup_path(original);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup)
+            {
+                Ok(file) => return Ok((backup, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "reserve unique rollback marker for '{}': {error}",
+                        original.display()
+                    ))
+                }
+            }
+        }
+        Err(format!(
+            "reserve unique rollback marker for '{}': exhausted {MAX_RESERVATION_ATTEMPTS} collision-safe attempts",
+            original.display()
+        ))
+    }
+
+    fn abort_allocating_metadata_write(
+        &self,
+        file_path: &str,
+        backup: &std::path::Path,
+        reason: String,
+    ) -> String {
+        match Self::remove_backup_marker(backup) {
+            Ok(()) => match self.complete_metadata_write(file_path) {
+                Ok(()) => reason,
+                Err(journal_error) => format!(
+                    "{reason}; rollback marker was removed, but allocating journal cleanup failed: {journal_error}"
+                ),
+            },
+            Err(cleanup_error) => format!(
+                "{reason}; allocating journal and transaction-owned marker '{}' remain for recovery because marker cleanup failed: {cleanup_error}",
+                backup.display()
+            ),
+        }
+    }
+
+    /// Create a backup by copying the file into a newly-created marker. We
+    /// MUST copy, not hardlink, and MUST NOT overwrite an existing marker: an
+    /// existing marker may be the only authoritative pre-write copy left by a
+    /// failed rollback.
     fn create_backup(original: &std::path::Path, backup: &std::path::Path) -> Result<(), String> {
-        let _ = std::fs::remove_file(backup); // Remove stale backup.
-        std::fs::copy(original, backup).map_err(|e| format!("backup failed: {}", e))?;
+        let mut source = std::fs::File::open(original)
+            .map_err(|error| format!("open '{}' for backup: {error}", original.display()))?;
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(backup)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!(
+                        "backup refused: rollback marker '{}' already exists and will not be overwritten",
+                        backup.display()
+                    )
+                } else {
+                    format!(
+                        "create rollback marker '{}' for '{}': {error}",
+                        backup.display(),
+                        original.display()
+                    )
+                }
+            })?;
+        if let Err(error) = std::io::copy(&mut source, &mut destination)
+            .and_then(|_| destination.sync_all())
+        {
+            drop(destination);
+            let cleanup = std::fs::remove_file(backup);
+            let copy_error = format!(
+                "copy '{}' to rollback marker '{}': {error}",
+                original.display(),
+                backup.display()
+            );
+            return match cleanup {
+                Ok(()) => Err(copy_error),
+                Err(cleanup_error)
+                    if cleanup_error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Err(copy_error)
+                }
+                Err(cleanup_error) => Err(format!(
+                    "{copy_error}; additionally could not remove the incomplete marker: {cleanup_error}"
+                )),
+            };
+        }
+        drop(destination);
+        if let Err(error) = Self::sync_parent_directory(backup) {
+            let cleanup = std::fs::remove_file(backup);
+            return match cleanup {
+                Ok(()) => Err(format!(
+                    "rollback marker '{}' was written, but parent-directory durability could not be confirmed: {error}",
+                    backup.display()
+                )),
+                Err(cleanup_error)
+                    if cleanup_error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Err(format!(
+                        "rollback marker '{}' was written, but parent-directory durability could not be confirmed: {error}",
+                        backup.display()
+                    ))
+                }
+                Err(cleanup_error) => Err(format!(
+                    "rollback marker '{}' was written, but parent-directory durability could not be confirmed: {error}; additionally could not remove the uncommitted marker: {cleanup_error}",
+                    backup.display()
+                )),
+            };
+        }
         Ok(())
     }
 
@@ -2854,6 +3499,552 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn partially_applied_v22_schema_is_reopened_idempotently() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create partial v22 database");
+            conn.execute_batch(
+                "CREATE TABLE metadata_journal (
+                    file_path TEXT PRIMARY KEY,
+                    backup_path TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'prepared'
+                 );
+                 INSERT INTO metadata_journal (file_path, backup_path, started_at)
+                 VALUES ('/music/partial.dsf', '/music/partial.dsf.tonepoet-bak', '2026-07-17T00:00:00Z');
+                 PRAGMA user_version = 21;",
+            )
+            .expect("seed partially applied v22 schema");
+        }
+
+        let db = Database::open_path(&path).expect("finish partial v22 migration");
+        let entry = db
+            .metadata_journal_entry("/music/partial.dsf")
+            .expect("read migrated journal")
+            .expect("partial journal retained");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+
+        assert_eq!(entry.state, METADATA_STATE_PREPARED);
+        assert_eq!(entry.backup_path, "/music/partial.dsf.tonepoet-bak");
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn v21_metadata_journal_rows_migrate_to_prepared_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create v21 database");
+            conn.execute_batch(
+                "CREATE TABLE metadata_journal (
+                    file_path TEXT PRIMARY KEY,
+                    backup_path TEXT NOT NULL,
+                    started_at TEXT NOT NULL
+                 );
+                 INSERT INTO metadata_journal (file_path, backup_path, started_at)
+                 VALUES ('/music/legacy.dsf', '/music/legacy.dsf.tonepoet-bak', '2026-07-17T00:00:00Z');
+                 PRAGMA user_version = 21;",
+            )
+            .expect("seed v21 schema");
+        }
+
+        let db = Database::open_path(&path).expect("migrate v21 database");
+        let entry = db
+            .metadata_journal_entry("/music/legacy.dsf")
+            .expect("read migrated journal")
+            .expect("legacy journal retained");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+
+        assert_eq!(entry.state, METADATA_STATE_PREPARED);
+        assert_eq!(entry.backup_path, "/music/legacy.dsf.tonepoet-bak");
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn restore_backup_overwrites_existing_destination_and_removes_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"mutated bytes").expect("write mutated destination");
+        std::fs::write(&backup, b"original bytes").expect("write rollback marker");
+
+        Database::restore_backup_for(&original, &backup).expect("restore rollback marker");
+
+        assert_eq!(std::fs::read(&original).expect("read restored destination"), b"original bytes");
+        assert!(!backup.exists(), "successful restore must remove rollback marker");
+    }
+
+    #[test]
+    fn exclusive_backup_collision_never_claims_or_changes_preexisting_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.dsf");
+        let backup = temp.path().join("track.dsf.tonepoet-bak.txn-collision");
+        std::fs::write(&original, b"current destination bytes").expect("write destination");
+        std::fs::write(&backup, b"foreign authoritative bytes").expect("write marker");
+
+        let error = Database::create_backup(&original, &backup)
+            .expect_err("preexisting marker must refuse exclusive backup creation");
+
+        assert_eq!(
+            error,
+            format!(
+                "backup refused: rollback marker '{}' already exists and will not be overwritten",
+                backup.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&backup).expect("read preexisting marker"),
+            b"foreign authoritative bytes"
+        );
+        assert_eq!(
+            std::fs::read(&original).expect("read unchanged destination"),
+            b"current destination bytes"
+        );
+    }
+
+    #[test]
+    fn existing_rollback_marker_blocks_retry_without_overwriting_authority() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.dsf");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"partially mutated destination").expect("write destination");
+        std::fs::write(&backup, b"authoritative original bytes").expect("write authority");
+        let invoked = std::cell::Cell::new(false);
+
+        let error = db
+            .atomic_metadata_write(&original, || {
+                invoked.set(true);
+                Ok(())
+            })
+            .expect_err("existing rollback authority must block retry");
+
+        assert_eq!(invoked.get(), false);
+        assert_eq!(
+            error,
+            format!(
+                "backup refused: rollback marker '{}' already exists and will not be overwritten",
+                backup.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&backup).expect("read retained authority"),
+            b"authoritative original bytes"
+        );
+        assert_eq!(
+            std::fs::read(&original).expect("read destination"),
+            b"partially mutated destination"
+        );
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn failed_rollback_retains_original_marker_and_blocks_retry_without_recopying_mutated_bytes() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.dsf");
+        std::fs::write(&original, b"authoritative original bytes").expect("write original");
+
+        let first_error = db
+            .atomic_metadata_write(&original, || {
+                std::fs::remove_file(&original).map_err(|error| error.to_string())?;
+                std::fs::create_dir(&original).map_err(|error| error.to_string())?;
+                Err("synthetic writer failure after replacing destination with a directory".to_string())
+            })
+            .expect_err("rollback over a directory must fail");
+        assert!(first_error.contains("write failed AND rollback could not be completed"));
+
+        let path = original.display().to_string();
+        let entry = db
+            .metadata_journal_entry(&path)
+            .expect("read retained journal")
+            .expect("prepared journal retained");
+        let backup = std::path::PathBuf::from(&entry.backup_path);
+        assert_eq!(entry.state, METADATA_STATE_PREPARED);
+        assert_eq!(
+            std::fs::read(&backup).expect("read retained rollback authority"),
+            b"authoritative original bytes"
+        );
+
+        let invoked = std::cell::Cell::new(false);
+        let retry_error = db
+            .atomic_metadata_write(&original, || {
+                invoked.set(true);
+                Ok(())
+            })
+            .expect_err("unresolved journal must block retry");
+
+        assert_eq!(invoked.get(), false);
+        assert!(retry_error.contains("unresolved prepared journal"));
+        assert_eq!(
+            std::fs::read(&backup).expect("read authority after blocked retry"),
+            b"authoritative original bytes"
+        );
+    }
+
+    #[test]
+    fn duplicate_journal_begin_is_rejected_without_replacing_original_record() {
+        let db = Database::open_memory().expect("memory database");
+        let file = "/music/album.dsf";
+        db.begin_metadata_write(file, "/recovery/original.tonepoet-bak")
+            .expect("first journal owner");
+
+        let error = db
+            .begin_metadata_write(file, "/recovery/retry.tonepoet-bak")
+            .expect_err("second owner must be rejected");
+        assert!(error.contains("journal insert refused"));
+        let entry = db
+            .metadata_journal_entry(file)
+            .expect("read journal")
+            .expect("journal retained");
+        assert_eq!(entry.backup_path, "/recovery/original.tonepoet-bak");
+        assert_eq!(entry.state, METADATA_STATE_PREPARED);
+    }
+
+    #[test]
+    fn committed_cleanup_failure_preserves_new_bytes_during_later_recovery() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"old bytes").expect("write old destination");
+
+        let error = db
+            .atomic_metadata_write(&original, || {
+                std::fs::write(&original, b"committed new bytes")
+                    .map_err(|error| error.to_string())?;
+                let transaction_backup = db
+                    .metadata_journal_entry(&original.display().to_string())?
+                    .ok_or_else(|| "prepared journal missing inside writer".to_string())?
+                    .backup_path;
+                let transaction_backup = std::path::PathBuf::from(transaction_backup);
+                std::fs::remove_file(&transaction_backup)
+                    .map_err(|error| error.to_string())?;
+                std::fs::create_dir(&transaction_backup)
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .expect_err("directory marker must force cleanup failure");
+
+        assert!(error.contains("committed, but rollback marker cleanup failed"));
+        assert_eq!(
+            std::fs::read(&original).expect("read committed destination"),
+            b"committed new bytes"
+        );
+        let entry = db
+            .metadata_journal_entry(&original.display().to_string())
+            .expect("read journal")
+            .expect("committed journal retained");
+        assert_eq!(entry.state, METADATA_STATE_COMMITTED);
+        let transaction_backup = std::path::PathBuf::from(&entry.backup_path);
+        assert!(transaction_backup.is_dir());
+        assert!(!backup.exists(), "legacy deterministic marker was never used");
+
+        std::fs::remove_dir(&transaction_backup).expect("remove synthetic cleanup blocker");
+        let messages = db.recover_stale_metadata_writes();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("state committed"));
+        assert_eq!(
+            std::fs::read(&original).expect("read preserved committed destination"),
+            b"committed new bytes"
+        );
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn committed_journal_delete_failure_preserves_new_bytes_and_recovery_never_restores() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        std::fs::write(&original, b"old bytes").expect("write old destination");
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER block_metadata_journal_delete
+                 BEFORE DELETE ON metadata_journal
+                 BEGIN
+                   SELECT RAISE(ABORT, 'synthetic journal delete failure');
+                 END;",
+            )
+            .expect("install delete blocker");
+
+        let error = db
+            .atomic_metadata_write(&original, || {
+                std::fs::write(&original, b"committed new bytes")
+                    .map_err(|error| error.to_string())
+            })
+            .expect_err("journal deletion must be surfaced");
+
+        assert!(error.contains("committed and rollback marker was removed"));
+        assert!(error.contains("synthetic journal delete failure"));
+        assert_eq!(
+            std::fs::read(&original).expect("read committed destination"),
+            b"committed new bytes"
+        );
+        let entry = db
+            .metadata_journal_entry(&original.display().to_string())
+            .expect("read journal")
+            .expect("committed journal retained");
+        assert_eq!(entry.state, METADATA_STATE_COMMITTED);
+        assert!(!std::path::Path::new(&entry.backup_path).exists());
+
+        db.conn
+            .execute_batch("DROP TRIGGER block_metadata_journal_delete;")
+            .expect("remove delete blocker");
+        let messages = db.recover_stale_metadata_writes();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("state committed"));
+        assert_eq!(
+            std::fs::read(&original).expect("read preserved committed destination"),
+            b"committed new bytes"
+        );
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn rolled_back_journal_delete_failure_retains_terminal_state_without_reapplying_backup() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        std::fs::write(&original, b"authoritative original bytes")
+            .expect("write original destination");
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER block_metadata_journal_delete
+                 BEFORE DELETE ON metadata_journal
+                 BEGIN
+                   SELECT RAISE(ABORT, 'synthetic journal delete failure');
+                 END;",
+            )
+            .expect("install delete blocker");
+
+        let error = db
+            .atomic_metadata_write(&original, || {
+                std::fs::write(&original, b"partially mutated bytes")
+                    .map_err(|error| error.to_string())?;
+                Err("synthetic writer failure".to_string())
+            })
+            .expect_err("rollback journal deletion must be surfaced");
+
+        assert!(error.contains("original bytes were restored and rollback marker removed"));
+        assert!(error.contains("synthetic journal delete failure"));
+        assert_eq!(
+            std::fs::read(&original).expect("read restored destination"),
+            b"authoritative original bytes"
+        );
+        let entry = db
+            .metadata_journal_entry(&original.display().to_string())
+            .expect("read journal")
+            .expect("rolled-back journal retained");
+        assert_eq!(entry.state, METADATA_STATE_ROLLED_BACK);
+        assert!(!std::path::Path::new(&entry.backup_path).exists());
+
+        db.conn
+            .execute_batch("DROP TRIGGER block_metadata_journal_delete;")
+            .expect("remove delete blocker");
+        let messages = db.recover_stale_metadata_writes();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("state rolled_back"));
+        assert_eq!(
+            std::fs::read(&original).expect("read preserved restored destination"),
+            b"authoritative original bytes"
+        );
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn allocating_recovery_retires_marker_without_replacing_destination() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = temp.path().join("track.opus.tonepoet-bak.txn-test");
+        std::fs::write(&original, b"current destination bytes").expect("write destination");
+        std::fs::write(&backup, b"partial allocation bytes").expect("write partial marker");
+        db.begin_metadata_write_with_state(
+            &original.display().to_string(),
+            &backup.display().to_string(),
+            METADATA_STATE_ALLOCATING,
+        )
+        .expect("begin allocating journal");
+
+        let messages = db.recover_stale_metadata_writes();
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("Retired incomplete metadata backup allocation"));
+        assert_eq!(
+            std::fs::read(&original).expect("read preserved destination"),
+            b"current destination bytes"
+        );
+        assert!(!backup.exists());
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn rolled_back_terminal_recovery_never_reapplies_stale_backup() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"already restored original").expect("write restored bytes");
+        std::fs::write(&backup, b"stale marker bytes").expect("write stale marker");
+        let path = original.display().to_string();
+        db.begin_metadata_write(&path, &backup.display().to_string())
+            .expect("begin journal");
+        db.set_metadata_write_state(&path, METADATA_STATE_ROLLED_BACK)
+            .expect("record rollback completion");
+
+        let messages = db.recover_stale_metadata_writes();
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("state rolled_back"));
+        assert_eq!(
+            std::fs::read(&original).expect("read preserved restored destination"),
+            b"already restored original"
+        );
+        assert!(!backup.exists());
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn atomic_metadata_write_restores_exact_bytes_after_mutating_failure() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        std::fs::write(&original, b"original bytes").expect("write original");
+
+        let result = db.atomic_metadata_write(&original, || {
+            std::fs::write(&original, b"partially mutated bytes")
+                .map_err(|error| error.to_string())?;
+            Err("synthetic writer failure".to_string())
+        });
+
+        assert_eq!(
+            result.expect_err("writer failure must propagate"),
+            "write failed (rolled back): synthetic writer failure"
+        );
+        assert_eq!(std::fs::read(&original).expect("read restored original"), b"original bytes");
+        assert!(!Database::backup_path_for(&original).exists());
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn durability_sync_failure_restores_exact_bytes_before_commit() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        std::fs::write(&original, b"durable original bytes").expect("write original");
+
+        let result = db.atomic_metadata_write_with_durability(
+            &original,
+            || {
+                std::fs::write(&original, b"unsynced replacement bytes")
+                    .map_err(|error| error.to_string())
+            },
+            |_| Err("synthetic destination sync failure".to_string()),
+        );
+
+        assert_eq!(
+            result.expect_err("sync failure must roll back before commit"),
+            "write failed (rolled back): metadata durability sync failed: synthetic destination sync failure"
+        );
+        assert_eq!(
+            std::fs::read(&original).expect("read restored destination"),
+            b"durable original bytes"
+        );
+        assert!(!Database::backup_path_for(&original).exists());
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn stale_metadata_recovery_restores_exact_bytes_and_clears_authority() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"partially mutated bytes").expect("write destination");
+        std::fs::write(&backup, b"original bytes").expect("write rollback marker");
+        db.begin_metadata_write(&original.display().to_string(), &backup.display().to_string())
+            .expect("begin journal");
+
+        let messages = db.recover_stale_metadata_writes();
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with(&format!("Recovered: {} (write started ", original.display())));
+        assert_eq!(std::fs::read(&original).expect("read restored original"), b"original bytes");
+        assert!(!backup.exists());
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn stale_metadata_recovery_failure_retains_journal_authority() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"partially mutated bytes").expect("write destination");
+        std::fs::create_dir(&backup).expect("directory rollback marker forces copy failure");
+        let original_string = original.display().to_string();
+        let backup_string = backup.display().to_string();
+        db.begin_metadata_write(&original_string, &backup_string)
+            .expect("begin journal");
+
+        let messages = db.recover_stale_metadata_writes();
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with(&format!(
+            "RECOVERY FAILED for {}: restore '{}' from rollback marker '{}'",
+            original.display(),
+            original.display(),
+            backup.display()
+        )));
+        assert_eq!(
+            std::fs::read(&original).expect("destination unchanged"),
+            b"partially mutated bytes"
+        );
+        assert!(backup.is_dir());
+        let retained = db
+            .stale_metadata_writes()
+            .expect("read retained journal");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(&retained[0].0, &original_string);
+        assert_eq!(&retained[0].1, &backup_string);
+    }
+
+    #[test]
+    fn stale_metadata_recovery_missing_marker_reports_failure_and_retains_blocking_authority() {
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"partially mutated bytes").expect("write destination");
+        db.begin_metadata_write(&original.display().to_string(), &backup.display().to_string())
+            .expect("begin journal");
+
+        let messages = db.recover_stale_metadata_writes();
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with(&format!(
+            "RECOVERY FAILED for {}: rollback marker is missing (write started ",
+            original.display()
+        )));
+        assert!(messages[0].contains("prepared journal remains unresolved and blocks retries"));
+        assert_eq!(
+            std::fs::read(&original).expect("destination unchanged"),
+            b"partially mutated bytes"
+        );
+        let retained = db.stale_metadata_writes().expect("read retained journal");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0, original.display().to_string());
+        assert_eq!(retained[0].1, backup.display().to_string());
     }
 
     #[test]

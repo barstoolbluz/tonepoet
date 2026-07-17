@@ -759,7 +759,12 @@ fn estimate_output_size(
     let bytes = match target_format {
         // DSD: 1-bit per sample at the DSD rate, scaled to batch
         AudioFormat::Dsf | AudioFormat::Dff => {
-            let dsd_rate = *format.sample_rate.selected_value() as f64;
+            let selected_rate = *format.sample_rate.selected_value();
+            let dsd_rate = if selected_rate == crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL {
+                info.sample_rate as f64
+            } else {
+                selected_rate as f64
+            };
             let channels = info.channels as f64;
             (info.duration_secs * dsd_rate * channels / 8.0 * batch_scale) as u64
         }
@@ -770,8 +775,17 @@ fn estimate_output_size(
         // Lossless: scale proportionally from source file size when possible,
         // otherwise fall back to raw PCM formula with compression estimate.
         _ => {
-            let target_rate = *format.sample_rate.selected_value() as f64;
-            let target_bits = format.bit_depth.selected_value().bits() as f64;
+            let selected_rate = *format.sample_rate.selected_value();
+            let target_rate = if selected_rate == crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL {
+                info.sample_rate as f64
+            } else {
+                selected_rate as f64
+            };
+            let target_bits = if format.bit_depth.selected_value().is_source() {
+                info.bit_depth? as f64
+            } else {
+                format.bit_depth.selected_value().bits() as f64
+            };
             let channels = info.channels as f64;
             let target_raw = info.duration_secs * target_rate * target_bits * channels / 8.0;
 

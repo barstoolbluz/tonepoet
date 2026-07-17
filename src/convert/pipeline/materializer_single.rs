@@ -49,15 +49,18 @@ impl super::stages::Materializer for SingleFileMaterializer {
                     &req.container,
                 )
             {
-                if dsd.sample_rate_hz > 0 {
+                let header_is_authoritative = !matches!(
+                    dsd.validation,
+                    crate::convert::pipeline::plan_bridge::DsdPlannerValidationStatus::Errors { .. }
+                ) && dsd.sample_rate_hz > 0
+                    && dsd.sample_count_per_channel.is_some_and(|count| count > 0);
+                if header_is_authoritative {
                     probe.sample_rate = dsd.sample_rate_hz;
-                }
-                if let Some(count) = dsd.sample_count_per_channel {
-                    probe.expected_samples = Some(count);
+                    probe.expected_samples = dsd.sample_count_per_channel;
                 }
             }
         }
-        let metadata = read_track_metadata(&req.container);
+        let metadata = read_track_metadata(&req.container)?;
         let track_number = metadata.track_number.unwrap_or(1).max(1);
         let track = PreparedTrack {
             id: TrackId {
@@ -196,16 +199,21 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
         .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
 }
 
-pub(crate) fn read_track_metadata(path: &Path) -> TrackMetadata {
+pub(crate) fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
+    if crate::dsf_tags::is_dsf(path) {
+        return crate::dsf_tags::read(path)
+            .map(|snapshot| crate::dsf_tags::to_track_metadata(&snapshot))
+            .map_err(MaterializeError::Parse);
+    }
     use lofty::prelude::*;
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
-        Err(_) => return TrackMetadata::default(),
+        Err(_) => return Ok(TrackMetadata::default()),
     };
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(tag) => tag,
-        None => return TrackMetadata::default(),
+        None => return Ok(TrackMetadata::default()),
     };
 
     let mut extra = BTreeMap::new();
@@ -219,7 +227,7 @@ pub(crate) fn read_track_metadata(path: &Path) -> TrackMetadata {
         extra.insert("disctotal".to_string(), total.to_string());
     }
 
-    TrackMetadata {
+    Ok(TrackMetadata {
         title: tag.title().map(|value| value.to_string()),
         artist: tag.artist().map(|value| value.to_string()),
         album_artist: tag
@@ -232,7 +240,7 @@ pub(crate) fn read_track_metadata(path: &Path) -> TrackMetadata {
         comment: tag.comment().map(|value| value.to_string()),
         extra,
         ..TrackMetadata::default()
-    }
+    })
 }
 
 fn apply_track_selection(
@@ -273,6 +281,30 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn corrupt_dsf_metadata_is_a_materialization_error_not_empty_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("corrupt.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&path, Some(b"NOT-AN-ID3-TAG"))
+            .expect("write DSF with corrupt metadata area");
+
+        let error = read_track_metadata(&path)
+            .expect_err("corrupt DSF metadata must fail closed");
+        match error {
+            MaterializeError::Parse(message) => {
+                assert_eq!(
+                    message,
+                    format!(
+                        "failed to read DSF ID3 tags from '{}': invalid DSF metadata area in '{}': header declares metadata at offset 8284, but no ID3 marker is present",
+                        path.display(),
+                        path.display()
+                    )
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 
     fn track_with_metadata(metadata: TrackMetadata) -> PreparedTrack {
         PreparedTrack {

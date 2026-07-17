@@ -13,6 +13,7 @@ license = "GPL-3.0-or-later"
 [dependencies]
 tonepoet-pipeline = { path = "tonepoet-pipeline", features = ["serde"] }
 fs2 = "0.4"
+same-file = "1"
 tonepoet-backend = { path = "crates/tonepoet-backend" }
 tonepoet-features = { path = "crates/tonepoet-features" }
 sacd-rs = { path = "crates/sacd-rs" }
@@ -31,6 +32,8 @@ toml_edit = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.18", features = ["v4"] }
 lofty = "0.21"
+id3 = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 log = "0.4"
 env_logger = "0.10"
 anyhow = "1"

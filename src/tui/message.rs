@@ -504,6 +504,12 @@ pub enum AppMessage {
             Vec<std::path::PathBuf>,
         )>,
     },
+    /// Panic/cancellation containment result for any GNUDB worker. The reducer
+    /// may retire only the matching operation and restore only its owned editor.
+    GnudbWorkerFailed {
+        operation_id: TagsMbOperationId,
+        detail: String,
+    },
     /// Result of an async AccurateRip verification (one or more discs).
     AccurateRipComplete {
         pages: Vec<crate::tui::app::ArVerifyPage>,
@@ -527,6 +533,7 @@ pub enum AppMessage {
     /// `toc_string` is provided so the handler can write `cache_response`
     /// back into the SQLite cache.
     CueMbComplete {
+        operation_id: TagsMbOperationId,
         outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
         paths: Vec<std::path::PathBuf>,
         output_dir: std::path::PathBuf,
@@ -542,12 +549,14 @@ pub enum AppMessage {
     /// Result of async CUE preview construction. Used by MB-enriched CUE
     /// generation so probe/tag reads do not block message handling.
     CuePreviewComplete {
+        operation_id: TagsMbOperationId,
         result: Result<(String, std::path::PathBuf, String), String>,
     },
     /// Result of async `:cue-fill` preparation. Carries probe-derived album,
     /// track, layout, and TOC-sector data back to the event loop so DB cache
     /// lookup still happens on the main thread before the MB request is spawned.
     CueFillPrepComplete {
+        operation_id: TagsMbOperationId,
         cue_path: std::path::PathBuf,
         result: Result<
             (
@@ -563,6 +572,7 @@ pub enum AppMessage {
     /// the path of the original `.cue` and the pre-built album/tracks
     /// (with parsed pregaps and durations applied) ready for fill+write.
     CueFillComplete {
+        operation_id: TagsMbOperationId,
         outcome: Result<crate::tui::musicbrainz::MbLookupOutcome, String>,
         cue_path: std::path::PathBuf,
         album: Box<crate::tui::cue_generate::CueAlbumInfo>,
@@ -604,6 +614,7 @@ pub enum AppMessage {
     /// metadata editor. This keeps metadata-editor grouping on the same
     /// title/concat-TOC/per-CUE/ambiguous-merge policy used by MB dispatch.
     MetadataEditorSplitCueAlbumGroupingComplete {
+        operation_id: TagsMbOperationId,
         infos: Vec<crate::tui::cue_parser::SingleImageInfo>,
         active_cue_path: Option<std::path::PathBuf>,
         result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,

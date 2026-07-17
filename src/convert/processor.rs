@@ -749,7 +749,10 @@ fn dispatch_track_metadata_for_output_planning(
     source_kind: SourceKind,
 ) -> Option<TrackMetadata> {
     match source_kind {
-        SourceKind::SingleFile => Some(read_single_file_track_metadata(&req.container)),
+        // A failed tag read yields no planning evidence (None -> the batch
+        // stays provisional); the materializer owns the authoritative
+        // fail-closed read.
+        SourceKind::SingleFile => read_single_file_track_metadata(&req.container).ok(),
         SourceKind::CueImage => {
             let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(
                 &req.container,
@@ -814,7 +817,7 @@ fn single_file_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
     // The dispatcher only uses these fields as conservative organizational
     // evidence; written metadata still comes from the materialized source and
     // explicit request overrides.
-    let metadata = read_single_file_track_metadata(path);
+    let metadata = read_single_file_track_metadata(path).ok()?;
     batch_identity_probe_from_track_metadata(&metadata)
 }
 

@@ -1570,6 +1570,10 @@ fn resolve_target_bit_depth(request: &PlanRequest) -> Result<PcmBitDepth> {
                         "a PCM-lossless Source target requires an authoritative source PCM representation; choose an explicit target bit depth",
                     )
                 }),
+            // `representation_kind()` resolves Unspecified to an inferred
+            // class before returning, so the Unspecified arm is unreachable
+            // by contract here — grouped with Unknown only to satisfy
+            // exhaustiveness, sharing its fail-closed answer.
             SourceRepresentationKind::Unknown | SourceRepresentationKind::Unspecified => {
                 Err(PlanningError::invalid_source(
                     "bit_depth",

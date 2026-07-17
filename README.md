@@ -50,7 +50,7 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 **Input (decode-only):** All output formats plus ISO (SACD, DVD-Audio, DVD-Video, Blu-ray), Blu-ray BDMV directories, CUE+image, 7z/zip/rar/tar/tar.gz/tar.bz2/tar.xz/tar.zst archives, SHN, APE, DTS, AC3
 
-**CLI depth policy:** `--bit-depth` accepts `16`, `24`, `32`, `32f`, `64f`, or `source`. With no flag, the CLI retains `source`. For DSD and lossy inputs, where a PCM source width is undefined, `source` resolves to the target format's conservative PCM default (24-bit for FLAC, ALAC, WavPack, WAV, and AIFF) and the conversion log identifies that value as a plan default. A PCM source whose original width cannot be measured still fails closed and asks for an explicit depth. Explicit numeric requests never carry the default-policy label.
+**CLI depth policy:** `--bit-depth` accepts `16`, `24`, `32`, `32f`, `64f`, or `source`. With no flag, the CLI retains `source`. For DSD and lossy inputs, where a PCM source width is undefined, `source` resolves to the target format's conservative PCM default (24-bit for FLAC, ALAC, WavPack, WAV, and AIFF) and the conversion log identifies that value as a plan default. A PCM source whose original width cannot be measured still fails closed and asks for an explicit depth. Explicit numeric requests never carry the default-policy label. Twenty-bit DVD-Audio PCM is carried in a 24-bit output container, with the widening identified in the conversion log rather than misreported as a 24-bit source measurement.
 
 **Resamplers:**
 

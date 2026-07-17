@@ -250,11 +250,17 @@ fn all_format_families_have_expected_visible_rows_and_valid_pipeline_mapping() {
         assert_eq!(rows.contains(&FormatField::ModulatorOrder), is_dsd, "{:?}", format);
         assert_eq!(rows.contains(&FormatField::ConversionPreset), is_dsd, "{:?}", format);
 
+        // The same-as-source sentinel sits first on the rate row and stays
+        // enabled for every format; it is neither a PCM nor a DSD rate.
         let pcm_rates_enabled = state
             .sample_rate
             .options
             .iter()
-            .filter(|o| o.enabled && o.value < 2_822_400)
+            .filter(|o| {
+                o.enabled
+                    && o.value != tonepoet::tui::app::SOURCE_SAMPLE_RATE_SENTINEL
+                    && o.value < 2_822_400
+            })
             .count();
         let dsd_rates_enabled = state
             .sample_rate

@@ -1071,7 +1071,7 @@ impl ConversionManager {
             options,
             cue_sidecar_override,
         );
-        item.archive_password = archive_password;
+        item.set_archive_password(archive_password, None);
         item.status = ConversionStatus::Queued;
         if !conversion_item_has_full_pipeline_handoff(&item) {
             return Err(ConversionError::ConversionFailed(
@@ -1152,7 +1152,7 @@ impl ConversionManager {
             request,
             cue_sidecar_override,
         );
-        item.archive_password = archive_password;
+        item.set_archive_password(archive_password, None);
         item.status = ConversionStatus::Queued;
 
         if item.pipeline_request.is_none() {
@@ -2078,7 +2078,7 @@ impl ConversionManager {
         }
     }
 
-    /// Resume conversions  
+    /// Resume conversions
     pub fn resume_conversions(&mut self) {
         self.invalidate_deferred_stop_requests();
         self.paused = false;
@@ -2372,33 +2372,50 @@ impl ConversionManager {
         match std::fs::read_to_string(&queue_path) {
             Ok(content) => {
                 match serde_json::from_str::<Vec<ConversionItem>>(&content) {
-                    Ok(items) => {
-                        // Validate paths for security (prevent path traversal attacks)
+                    Ok(mut items) => {
+                        // Migrate/clear secrets before filtering. A stale or
+                        // suspicious row can still contain legacy cleartext,
+                        // and filtering it only in memory would leave that
+                        // secret in the persisted JSON forever.
+                        let secrets_or_status_changed =
+                            crate::convert::queue::restore_archive_passwords_after_load(&mut items);
+                        let original_len = items.len();
+                        // Validate paths for security (prevent path traversal attacks).
+                        items.retain(|item| {
+                            let path_str = item.input_path.to_string_lossy();
+                            if path_str.contains("..") {
+                                log::warn!(
+                                    "Filtered out queue item with suspicious path: {:?}",
+                                    item.input_path
+                                );
+                                return false;
+                            }
+
+                            if !item.input_path.exists() {
+                                log::info!(
+                                    "Filtered out queue item - file no longer exists: {:?}",
+                                    item.input_path
+                                );
+                                return false;
+                            }
+
+                            true
+                        });
+                        if secrets_or_status_changed || items.len() != original_len {
+                            if let Ok(json) = serde_json::to_string_pretty(&items) {
+                                let temp_path = queue_path.with_extension("json.tmp");
+                                if let Err(error) = std::fs::write(&temp_path, json)
+                                    .and_then(|_| std::fs::rename(&temp_path, &queue_path))
+                                {
+                                    log::error!(
+                                        "Sanitized persisted queue state but could not rewrite {:?}: {}",
+                                        queue_path,
+                                        error
+                                    );
+                                }
+                            }
+                        }
                         items
-                            .into_iter()
-                            .filter(|item| {
-                                // Filter out items with suspicious paths
-                                let path_str = item.input_path.to_string_lossy();
-                                if path_str.contains("..") {
-                                    log::warn!(
-                                        "Filtered out queue item with suspicious path: {:?}",
-                                        item.input_path
-                                    );
-                                    return false;
-                                }
-
-                                // Filter out items where file no longer exists
-                                if !item.input_path.exists() {
-                                    log::info!(
-                                        "Filtered out queue item - file no longer exists: {:?}",
-                                        item.input_path
-                                    );
-                                    return false;
-                                }
-
-                                true
-                            })
-                            .collect()
                     }
                     Err(e) => {
                         log::error!(
@@ -2470,6 +2487,34 @@ impl ConversionManager {
         std::fs::write(&temp_path, json)?;
         std::fs::rename(&temp_path, &queue_path)?;
 
+        Ok(())
+    }
+
+    /// Attach a persistable OS-secret-store reference to an in-memory queue
+    /// item without changing its process-local password. CLI callers never use
+    /// this method, so `--archive-password` remains ephemeral.
+    pub fn attach_archive_password_reference(
+        &self,
+        item_id: &str,
+        password: &str,
+        reference: String,
+    ) -> Result<(), String> {
+        let mut queue = self
+            .queue
+            .try_write()
+            .map_err(|_| "Queue is busy, try again".to_string())?;
+        let item = queue
+            .all_items_mut()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .ok_or_else(|| format!("queue item '{item_id}' no longer exists"))?;
+        if item.archive_password.as_deref() != Some(password) {
+            return Err(format!(
+                "queue item '{item_id}' archive password changed before its secret reference could be attached"
+            ));
+        }
+        item.archive_password_required = true;
+        item.archive_password_ref = Some(reference);
         Ok(())
     }
 }

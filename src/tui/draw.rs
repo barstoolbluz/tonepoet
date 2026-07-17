@@ -115,8 +115,11 @@ fn wizard_theme_from_tonepoet_theme(theme: super::theme::Theme) -> tonepoet_wiza
 
 /// Draw settings screen showing conversion configuration + password keychain
 fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
-    // Ensure keychain is loaded on first visit.
-    app.keychain.ensure_loaded();
+    // Ensure keychain is loaded on first visit. A failed backend access is
+    // surfaced in the keychain pane below via `load_error` (and retried on
+    // the next explicit user action), so the per-frame Result is redundant
+    // here.
+    let _ = app.keychain.ensure_loaded();
 
     // Top-level: appearance pane + conversion pane + performance pane + keychain pane + footer
     let chunks = Layout::default()
@@ -334,6 +337,18 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
 
     if kc_inner.height < 2 {
         // Too small to render anything.
+    } else if let Some(error) = app.keychain.load_error.as_ref() {
+        let error_lines = vec![
+            Line::from(Span::styled(
+                format!("  Keychain unavailable: {error}"),
+                Style::default().fg(theme.red),
+            )),
+            Line::from(Span::styled(
+                "  Unlock the platform keychain, then retry with any keychain action",
+                theme.muted(),
+            )),
+        ];
+        f.render_widget(Paragraph::new(error_lines), kc_inner);
     } else if app.keychain.passwords.is_empty() {
         let empty_lines = vec![
             Line::from(Span::styled("  No saved passwords", theme.muted())),

@@ -128,6 +128,7 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "verification.prefer_native_flac_verify",
     "replay_gain.mode",
     "replay_gain.prevent_clipping",
+    "replay_gain.existing_tags",
 ];
 
 /// Number of conversion-affecting field paths in [`SETTINGS_FINGERPRINT_FIELD_PATHS`].
@@ -402,6 +403,13 @@ fn push_replay_gain(writer: &mut FingerprintWriter, settings: &ReplayGainSetting
     writer.field_static(
         "replay_gain.prevent_clipping",
         bool_value(settings.prevent_clipping),
+    );
+    writer.field_static(
+        "replay_gain.existing_tags",
+        match settings.existing_tags {
+            crate::ReplayGainExistingTagPolicy::Rescan => "rescan",
+            crate::ReplayGainExistingTagPolicy::SkipIfComplete => "skip_if_complete",
+        },
     );
 }
 

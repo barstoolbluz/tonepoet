@@ -512,8 +512,13 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
         }
         (KeyCode::Char('0'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
             app.config.performance.browsing.archive_listing_timeout = 0;
-            let _ = app.config.save();
-            app.set_status("archive listing timeout disabled");
+            if let Err(error) = app.config.save() {
+                app.set_status(format!(
+                    "archive listing timeout changed, but config save failed: {error}"
+                ));
+            } else {
+                app.set_status("archive listing timeout disabled");
+            }
             return;
         }
         _ => {}
@@ -552,10 +557,12 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             if total > 0 {
                 match super::keychain::remove_password(app.keychain.selected) {
-                    Ok(()) => {
-                        app.keychain.reload();
-                        app.set_status("Password removed");
-                    }
+                    Ok(()) => match app.keychain.reload() {
+                        Ok(()) => app.set_status("Password removed"),
+                        Err(error) => app.set_status(format!(
+                            "Password was removed from the MRU, but stored-password reload failed: {error}"
+                        )),
+                    },
                     Err(e) => app.set_status(&format!("Remove failed: {}", e)),
                 }
             }
@@ -1104,10 +1111,21 @@ fn clear_browse_info_focus(app: &mut AppState) {
     app.browse_info_focus = None;
 }
 
-fn persist_browse_config(app: &mut AppState) {
+fn persist_browse_config(app: &mut AppState) -> bool {
     app.config.browsing = app.browse.capture_browsing_config();
     if let Err(err) = app.config.save() {
         app.set_status(format!("browse settings changed, but config save failed: {err}"));
+        false
+    } else {
+        true
+    }
+}
+
+fn save_browse_layout(app: &mut AppState) {
+    let persisted = persist_browse_config(app);
+    app.browse.close_options_menu();
+    if persisted {
+        app.set_status("browse layout saved");
     }
 }
 
@@ -3912,15 +3930,11 @@ pub fn load_browse_selection_pub(
 }
 
 
-fn archive_listing_password_for_path(app: &mut AppState, path: &std::path::Path) -> Option<String> {
-    app.archive_passwords
-        .get(path)
-        .cloned()
-        .or_else(|| {
-            app.keychain.ensure_loaded();
-            app.keychain.passwords.first().cloned()
-        })
-        .or_else(|| app.config.conversion.archive_password.clone())
+fn archive_listing_password_for_path(
+    app: &mut AppState,
+    path: &std::path::Path,
+) -> Result<Option<String>, String> {
+    super::app::archive_password_for_path(app, path)
 }
 
 fn archive_listing_timeout_from_config(app: &AppState) -> Option<std::time::Duration> {
@@ -3963,14 +3977,26 @@ pub(super) fn start_browse_archive_listing(
 
     if let Some(listing) = app.cached_archive_listing(&cache_key) {
         let count = listing.entries.len();
-        let password = archive_listing_password_for_path(app, &path);
+        let password = match archive_listing_password_for_path(app, &path) {
+            Ok(password) => password,
+            Err(error) => {
+                app.set_status(error);
+                return;
+            }
+        };
         app.browse.enter_archive(listing, password);
         app.force_redraw = true;
         app.set_status(format!("Opened from cache ({} entries)", count));
         return;
     }
 
-    let password = archive_listing_password_for_path(app, &path);
+    let password = match archive_listing_password_for_path(app, &path) {
+        Ok(password) => password,
+        Err(error) => {
+            app.set_status(error);
+            return;
+        }
+    };
     let timeout = archive_listing_timeout_from_config(app);
     let (id, cancel) = app.begin_archive_listing(path.clone());
     let tx = tx.clone();
@@ -4136,35 +4162,72 @@ fn load_browse_selection(
                 return;
             }
             let mut count = 0;
+            let mut password_reference_warning: Option<String> = None;
             let options = conversion_options_from_current_convert_output(app);
             for p in paths_to_add {
                 // Resolve archive password:
-                // session override → keychain MRU → config → None.
+                // session override → configured reference → keychain MRU → None.
                 let archive_pw = if crate::is_encrypted_archive_ext(&p) {
-                    app.archive_passwords
-                        .get(&p)
-                        .cloned()
-                        .or_else(|| {
-                            app.keychain.ensure_loaded();
-                            app.keychain.passwords.first().cloned()
-                        })
-                        .or_else(|| app.config.conversion.archive_password.clone())
+                    match super::app::archive_password_for_path(app, &p) {
+                        Ok(password) => password,
+                        Err(error) => {
+                            password_reference_warning.get_or_insert_with(|| error.clone());
+                            log::error!("{error}");
+                            continue;
+                        }
+                    }
                 } else {
                     None
                 };
-                if app
-                    .manager
-                    .add_file_ready_for_processing(p, options.clone(), archive_pw)
-                    .is_ok()
-                {
-                    count += 1;
+                let archive_reference = archive_pw
+                    .as_deref()
+                    .map(super::keychain::reference_for_password);
+                match app.manager.add_file_ready_for_processing(
+                    p.clone(),
+                    options.clone(),
+                    archive_pw.clone(),
+                ) {
+                    Ok(item_id) => {
+                        count += 1;
+                        if let (Some(password), Some(reference_result)) =
+                            (archive_pw.as_deref(), archive_reference)
+                        {
+                            match reference_result {
+                                Ok(reference) => {
+                                    if let Err(error) = app.manager.attach_archive_password_reference(
+                                        &item_id,
+                                        password,
+                                        reference,
+                                    ) {
+                                        password_reference_warning.get_or_insert_with(|| format!(
+                                            "archive-password reference could not be attached for {}: {}",
+                                            p.display(),
+                                            error
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    password_reference_warning.get_or_insert_with(|| format!(
+                                        "archive password is process-only because the OS secret store is unavailable: {}",
+                                        error
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => log::warn!("queue add failed for {}: {}", p.display(), error),
                 }
             }
             app.browse.clear_multi_selection();
-            app.set_status(super::command::status_with_stale_selection_notice(
+            let mut status = super::command::status_with_stale_selection_notice(
                 dropped_stale_count,
                 format!("Queued {} files", count),
-            ));
+            );
+            if let Some(warning) = password_reference_warning {
+                status.push_str("; ");
+                status.push_str(&warning);
+            }
+            app.set_status(status);
             app.current_screen = AppScreen::Queue;
             app.browse.return_target = BrowseReturnTarget::None;
         }
@@ -4800,11 +4863,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             let paths = paths.clone();
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
                     app.active_overlay = ActiveOverlay::None;
-                    if let Some(parked) = app.pending_metadata_editor.take() {
-                        app.active_overlay = ActiveOverlay::MetadataEditor(parked);
-                    }
+                    super::event_loop::cancel_gnudb_operation(app, operation_id);
                 }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
@@ -4848,17 +4908,20 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         app.active_overlay = ActiveOverlay::None;
                         let tx = tx.clone();
                         let origin = matches.clone();
-                        tokio::spawn(async move {
-                            let result = super::gnudb::read_gnudb(&category, &disc_id).await;
-                            let _ = tx
-                                .send(AppMessage::GnudbReadComplete {
+                        super::event_loop::spawn_gnudb_worker(
+                            tx,
+                            read_operation_id,
+                            async move {
+                                let result =
+                                    super::gnudb::read_gnudb(&category, &disc_id).await;
+                                AppMessage::GnudbReadComplete {
                                     operation_id: read_operation_id,
                                     result,
                                     paths,
                                     origin_matches: Some(origin),
-                                })
-                                .await;
-                        });
+                                }
+                            },
+                        );
                     }
                 }
                 _ => {}
@@ -5798,6 +5861,17 @@ fn run_context_action_restoring_parked(
     app.active_overlay = ActiveOverlay::None;
     super::context_menu::execute_context_action(app, action, tx, invert);
     if matches!(app.active_overlay, ActiveOverlay::None) {
+        // An editor-originated GNUDB operation owns the parked editor until
+        // its guarded completion, explicit cancellation, or error retirement.
+        // Restoring it here would let the eventual completion overwrite a live
+        // dirty editor instead of transitioning from an owned parked session.
+        if app
+            .active_gnudb_operation
+            .is_some_and(|active| active.editor_session.is_some())
+            && app.pending_metadata_editor.is_some()
+        {
+            return;
+        }
         // Same innermost-first restoration order as
         // `close_context_menu_restoring_parked`. See that function's
         // comment for why the SACD `:tags-mb` flow demands it.
@@ -5821,7 +5895,10 @@ fn run_context_action_restoring_parked(
             &app.active_overlay,
             ActiveOverlay::MbSelect(_)
         ) || app.active_tags_mb_operation.is_some();
-        if !preserve_mb_editor {
+        let preserve_gnudb_editor = app
+            .active_gnudb_operation
+            .is_some_and(|active| active.editor_session.is_some());
+        if !preserve_mb_editor && !preserve_gnudb_editor {
             app.pending_metadata_editor = None;
         }
         app.pending_cue_preview = None;
@@ -7324,7 +7401,10 @@ pub(crate) fn file_picker_theme_from_theme(theme: &super::theme::Theme) -> tui_f
 
 #[cfg(test)]
 mod progress_dialog_theme_tests {
-    use super::{complete_theme_builder_action, file_picker_theme_from_theme, handle_config_key, handle_overlay_key};
+    use super::{
+        complete_theme_builder_action, file_picker_theme_from_theme, handle_config_key,
+        handle_overlay_key, save_browse_layout,
+    };
     use crate::tui::test_support::XdgConfigHomeGuard;
     use crate::tui::theme;
     use tokio::sync::mpsc;
@@ -7562,6 +7642,66 @@ mod progress_dialog_theme_tests {
 
         handle_config_key(&mut app, KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
         assert_eq!(app.config.performance.browsing.archive_listing_timeout, 0);
+    }
+
+    #[test]
+    fn performance_config_zero_surfaces_exact_config_save_failure() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-performance-save-failure-test");
+        let config_path = TonepoetConfig::config_path();
+        let parent = config_path.parent().expect("config parent");
+        std::fs::create_dir_all(parent).expect("create config parent");
+        let lock_path = parent.join(".config.toml.save.lock");
+        std::fs::write(&lock_path, b"not a tonepoet lock marker")
+            .expect("install invalid lock marker");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.set_config_focus(ConfigFocus::Performance);
+        app.config.performance.browsing.archive_listing_timeout = 30;
+
+        handle_config_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.config.performance.browsing.archive_listing_timeout, 0);
+        let expected = format!(
+            "archive listing timeout changed, but config save failed: store lock path '{}' does not contain a recognized tonepoet lock marker",
+            lock_path.display()
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn browse_layout_save_does_not_overwrite_exact_config_failure_status() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::AppState;
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-browse-layout-save-failure-test");
+        let config_path = TonepoetConfig::config_path();
+        let parent = config_path.parent().expect("config parent");
+        std::fs::create_dir_all(parent).expect("create config parent");
+        let lock_path = parent.join(".config.toml.save.lock");
+        std::fs::write(&lock_path, b"not a tonepoet lock marker")
+            .expect("install invalid lock marker");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        save_browse_layout(&mut app);
+
+        let expected = format!(
+            "browse settings changed, but config save failed: store lock path '{}' does not contain a recognized tonepoet lock marker",
+            lock_path.display()
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -10944,32 +11084,30 @@ fn metadata_cue_surfaces_for_grouping_decision(
 pub(super) fn handle_metadata_editor_split_cue_album_grouping_complete(
     app: &mut AppState,
     _tx: &mpsc::Sender<AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
     infos: Vec<super::cue_parser::SingleImageInfo>,
     active_cue_path: Option<std::path::PathBuf>,
     result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
 ) {
+    if !super::event_loop::cue_operation_is_current(app, operation_id) {
+        return;
+    }
     let outcome = match result {
         Ok(outcome) => *outcome,
-        Err(err) => {
-            app.set_status(format!("metadata: split-CUE grouping failed: {err}"));
-            let decision = crate::tui::command::SplitCueAlbumGroupingDecision {
-                groups: vec![infos
-                    .iter()
-                    .map(|info| metadata_cue_surface_key(&info.cue_path))
-                    .collect()],
-                reason: crate::tui::command::SplitCueAlbumGroupingReason::AmbiguousMerge,
-            };
-            let (surfaces, active_surface) = metadata_cue_surfaces_for_grouping_decision(
-                &infos,
-                &decision,
-                active_cue_path.as_deref(),
-            );
-            if !surfaces.is_empty() {
-                open_metadata_editor_for_cue_surfaces_with_active(app, surfaces, active_surface);
-            }
+        Err(error) => {
+            super::event_loop::finish_cue_operation_if_current(app, operation_id);
+            app.set_status(format!("metadata: split-CUE grouping failed: {error}"));
             return;
         }
     };
+    if !super::event_loop::cue_operation_has_overlay_authority(app, operation_id) {
+        super::event_loop::finish_cue_operation_if_current(app, operation_id);
+        app.set_status(
+            "metadata: split-CUE grouping result discarded because another workflow owns the editor or overlay; retry the action"
+                .to_string(),
+        );
+        return;
+    }
     crate::tui::command::store_split_cue_album_grouping_outcome(app, &infos, &outcome);
     let (surfaces, active_surface) = metadata_cue_surfaces_for_grouping_decision(
         &infos,
@@ -10977,9 +11115,11 @@ pub(super) fn handle_metadata_editor_split_cue_album_grouping_complete(
         active_cue_path.as_deref(),
     );
     if surfaces.is_empty() {
+        super::event_loop::finish_cue_operation_if_current(app, operation_id);
         app.set_status("metadata: split-CUE grouping produced no usable CUE surfaces");
         return;
     }
+    super::event_loop::finish_cue_operation_if_current(app, operation_id);
     open_metadata_editor_for_cue_surfaces_with_active(app, surfaces, active_surface);
 }
 
@@ -13653,13 +13793,25 @@ fn open_browse_archive_metadata_editor_for_entries(
         return;
     }
     let cancel = pending.cancel.clone();
-    let password = app
+    let password = if let Some(password) = app
         .browse
         .archive
         .as_ref()
         .filter(|arc| arc.listing.archive_path == archive_path)
         .and_then(|arc| arc.password.clone())
-        .or_else(|| super::app::archive_preview_password_for_path(app, &archive_path));
+    {
+        Some(password)
+    } else {
+        match super::app::archive_preview_password_for_path(app, &archive_path) {
+            Ok(password) => password,
+            Err(error) => {
+                let _ = app.db.delete_pending_archive_session(&archive_path);
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                app.set_status(format!("metadata: {error}"));
+                return;
+            }
+        }
+    };
     let target_count = target_inner_paths.as_ref().map(|paths| paths.len());
     app.pending_browse_archive_metadata = Some(pending);
     app.set_status(match target_count {
@@ -14406,13 +14558,24 @@ pub(super) fn start_browse_archive_entry_delete(
         return;
     }
     let cancel = pending.cancel.clone();
-    let password = app
+    let password = match app
         .browse
         .archive
         .as_ref()
         .filter(|arc| arc.listing.archive_path == archive_path)
         .and_then(|arc| arc.password.clone())
-        .or_else(|| archive_listing_password_for_path(app, &archive_path));
+    {
+        Some(password) => Some(password),
+        None => match archive_listing_password_for_path(app, &archive_path) {
+            Ok(password) => password,
+            Err(error) => {
+                let _ = app.db.delete_pending_archive_session(&archive_path);
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                app.set_status(error);
+                return;
+            }
+        },
+    };
     let tx = tx.clone();
 
     app.browse.bump_archive_probe_epoch_for(&archive_path);
@@ -18666,17 +18829,20 @@ fn handle_generic_overlay_mouse(
                             let tx = _tx.clone();
                             let paths_c = paths.clone();
                             let origin = matches.clone();
-                            tokio::spawn(async move {
-                                let result = super::gnudb::read_gnudb(&category, &disc_id).await;
-                                let _ = tx
-                                    .send(AppMessage::GnudbReadComplete {
+                            super::event_loop::spawn_gnudb_worker(
+                                tx,
+                                read_operation_id,
+                                async move {
+                                    let result =
+                                        super::gnudb::read_gnudb(&category, &disc_id).await;
+                                    AppMessage::GnudbReadComplete {
                                         operation_id: read_operation_id,
                                         result,
                                         paths: paths_c,
                                         origin_matches: Some(origin),
-                                    })
-                                    .await;
-                            });
+                                    }
+                                },
+                            );
                             return true;
                         }
                         selected = clicked_row;
@@ -23275,11 +23441,20 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
 
 /// Apply a text edit to the target field, setting modified flag as needed
 
-fn store_archive_password_for_path(app: &mut AppState, archive_path: &std::path::Path, password: &str) {
+fn store_archive_password_for_path(
+    app: &mut AppState,
+    archive_path: &std::path::Path,
+    password: &str,
+) -> Result<(), String> {
     app.archive_passwords
         .insert(archive_path.to_path_buf(), password.to_string());
-    let _ = super::keychain::add_password(password);
-    app.keychain.reload();
+    super::keychain::add_password(password).map_err(|error| {
+        format!(
+            "password is available for this session, but could not be stored in the OS secret store: {error}"
+        )
+    })?;
+    app.keychain.reload()?;
+    Ok(())
 }
 fn apply_text_edit(
     app: &mut AppState,
@@ -23363,23 +23538,6 @@ fn apply_text_edit(
                 return;
             }
 
-            // Cheap durable intent only: do not copy the file on the TUI
-            // thread. Native FLAC writes are deliberately NOT recorded in the
-            // DB metadata journal: their sole recovery artifact is the FLAC
-            // sidecar `.tonepoet-meta-journal`, created and cleared by the
-            // blocking writer itself. The DB journal remains the legacy
-            // file-scope backup journal for non-FLAC fallback writers.
-            if !crate::tui::probe::uses_native_flac_metadata_journal(&write_path) {
-                let backup = crate::db::Database::backup_path_for(&write_path);
-                if let Err(e) = app
-                    .db
-                    .begin_metadata_write(&write_path.display().to_string(), &backup.display().to_string())
-                {
-                    app.set_status(format!("journal error: {}", e));
-                    return;
-                }
-            }
-
             app.set_status(format!(
                 "Writing {}...",
                 write_path.file_name().unwrap_or_default().to_string_lossy()
@@ -23396,10 +23554,14 @@ fn apply_text_edit(
             tokio::spawn(async move {
                 let value_for_write = write_value.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::tui::probe::write_metadata_field(&write_path, write_field, &value_for_write)
+                    crate::tui::probe::write_metadata_field_transactional(
+                        &write_path,
+                        write_field,
+                        &value_for_write,
+                    )
                 })
                 .await
-                .unwrap_or_else(|e| Err(format!("task panic: {}", e)));
+                .unwrap_or_else(|e| Err(format!("write failed before completion: task panic: {e}")));
 
                 let _ = tx
                     .send(AppMessage::MetadataWriteComplete {
@@ -23447,23 +23609,34 @@ fn apply_text_edit(
         TextEditTarget::KeychainAdd => {
             if !trimmed.is_empty() {
                 match super::keychain::add_password(trimmed) {
-                    Ok(()) => {
-                        app.keychain.reload();
-                        app.set_status("Password added");
-                    }
+                    Ok(()) => match app.keychain.reload() {
+                        Ok(()) => app.set_status("Password added"),
+                        Err(error) => app.set_status(format!(
+                            "Password was stored, but stored-password reload failed: {error}"
+                        )),
+                    },
                     Err(e) => app.set_status(&format!("Add failed: {}", e)),
                 }
             }
         }
         TextEditTarget::ArchivePassword(archive_path) => {
             if !trimmed.is_empty() {
-                store_archive_password_for_path(app, &archive_path, trimmed);
+                let persistence_error =
+                    store_archive_password_for_path(app, &archive_path, trimmed).err();
                 let name = archive_path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                app.set_status(&format!("Password set for {} (saved to keychain)", name));
                 start_browse_archive_listing(app, archive_path, tx, true);
+                match persistence_error {
+                    None => app.set_status(format!(
+                        "Password set for {} (saved to OS secret store)",
+                        name
+                    )),
+                    Some(error) => app.set_status(format!(
+                        "{error}; continuing with the session-only password for {name}"
+                    )),
+                }
             }
         }
         TextEditTarget::ArchivePasswordForMetadataEdit {
@@ -23471,16 +23644,36 @@ fn apply_text_edit(
             target_inner_paths,
         } => {
             if !trimmed.is_empty() {
-                store_archive_password_for_path(app, &archive_path, trimmed);
-                app.set_status("Password set; retrying archive metadata editor");
-                open_browse_archive_metadata_editor_for_entries(app, archive_path, target_inner_paths);
+                let persistence_error =
+                    store_archive_password_for_path(app, &archive_path, trimmed).err();
+                open_browse_archive_metadata_editor_for_entries(
+                    app,
+                    archive_path,
+                    target_inner_paths,
+                );
+                match persistence_error {
+                    None => app.set_status("Password set; retrying archive metadata editor"),
+                    Some(error) => app.set_status(format!(
+                        "{error}; retrying the metadata editor with the session-only password"
+                    )),
+                }
             }
         }
         TextEditTarget::ArchivePasswordForConvertPreview(archive_path) => {
             if !trimmed.is_empty() {
-                store_archive_password_for_path(app, &archive_path, trimmed);
-                app.set_status("Password set; retrying archive preview");
-                super::app::install_archive_preview_convert_source(app, archive_path, tx.clone());
+                let persistence_error =
+                    store_archive_password_for_path(app, &archive_path, trimmed).err();
+                super::app::install_archive_preview_convert_source(
+                    app,
+                    archive_path,
+                    tx.clone(),
+                );
+                match persistence_error {
+                    None => app.set_status("Password set; retrying archive preview"),
+                    Some(error) => app.set_status(format!(
+                        "{error}; retrying the preview with the session-only password"
+                    )),
+                }
             }
         }
     }
@@ -26917,13 +27110,24 @@ fn start_browse_archive_entry_rename(
         return Err(message);
     }
     let cancel = pending.cancel.clone();
-    let password = app
+    let password = match app
         .browse
         .archive
         .as_ref()
         .filter(|arc| arc.listing.archive_path == archive_path)
         .and_then(|arc| arc.password.clone())
-        .or_else(|| archive_listing_password_for_path(app, &archive_path));
+    {
+        Some(password) => Some(password),
+        None => match archive_listing_password_for_path(app, &archive_path) {
+            Ok(password) => password,
+            Err(error) => {
+                let _ = app.db.delete_pending_archive_session(&archive_path);
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                app.set_status(error.clone());
+                return Err(error);
+            }
+        },
+    };
     let tx = tx.clone();
 
     // Mutation is now in progress. Reject any archive-entry info-pane probe
@@ -27801,12 +28005,26 @@ fn execute_confirm_action(
                     editor_generation: state.model.editor_save_generation,
                 }
             });
+            let operation_id = match super::event_loop::begin_mb_select_operation(app) {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    app.active_overlay = app
+                        .pending_metadata_editor
+                        .take()
+                        .map(ActiveOverlay::MetadataEditor)
+                        .unwrap_or(ActiveOverlay::None);
+                    app.set_status(error);
+                    return;
+                }
+            };
             let mut mb_state = super::app::MbSelectState::new_with_editor_session(
                 cache.releases.clone(),
                 cache.paths.clone(),
                 editor_session,
-            );
-            mb_state.selected = cache.selected;
+            )
+            .with_operation_id(operation_id);
+            mb_state.selected = cache.selected.min(mb_state.releases.len().saturating_sub(1));
+            prefetch_current_mb_row(tx, &mb_state, &app.db);
             app.active_overlay = ActiveOverlay::MbSelect(Box::new(mb_state));
             app.set_status(":mb-back: pick a different release".to_string());
         }
@@ -29462,11 +29680,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::BrowseOptionsSort => app.browse.options_menu = super::browse::BrowseOptionsMenu::Sort,
             TuiButton::BrowseOptionsFilter => app.browse.options_menu = super::browse::BrowseOptionsMenu::Filter,
             TuiButton::BrowseOptionsArchiveListing => app.browse.options_menu = super::browse::BrowseOptionsMenu::ArchiveListing,
-            TuiButton::BrowseOptionsSaveLayout => {
-                persist_browse_config(app);
-                app.browse.close_options_menu();
-                app.set_status("browse layout saved");
-            }
+            TuiButton::BrowseOptionsSaveLayout => save_browse_layout(app),
             TuiButton::BrowseOptionsRestoreDefaults => {
                 app.config.browsing = crate::config::BrowsingConfig::default().normalized();
                 app.browse.apply_browsing_config_with_search(&app.config.browsing, Some(tx));
@@ -30748,11 +30962,19 @@ mod phase4_tests {
         // :gnudb-back no longer discards (so no confirmation): the exact
         // editor — dirty siblings included — is parked behind the restored
         // review and returned on accept/cancel.
-        assert!(
-            matches!(&app.active_overlay, ActiveOverlay::GnudbReview(_)),
-            "expected restored gnudb review, got {:?}",
-            app.active_overlay
-        );
+        match &app.active_overlay {
+            ActiveOverlay::GnudbReview(review) => {
+                assert_eq!(review.active_page, 0);
+                assert_eq!(review.cursor, 0);
+                assert_eq!(review.scroll, 0);
+                assert_eq!(
+                    review.paths,
+                    vec![std::path::PathBuf::from("/tmp/album.flac")]
+                );
+                assert_eq!(review.source, crate::tui::app::ReviewSource::Gnudb);
+            }
+            other => panic!("expected restored gnudb review, got {:?}", other),
+        }
         let parked = app
             .pending_metadata_editor
             .as_ref()

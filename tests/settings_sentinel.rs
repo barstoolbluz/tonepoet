@@ -105,6 +105,7 @@ use tonepoet_pipeline::{
 /// - verification.prefer_native_flac_verify: false
 /// - replay_gain.mode: Some(Both)
 /// - replay_gain.prevent_clipping: false
+/// - replay_gain.existing_tags: SkipIfComplete
 fn raw_all_non_default_sentinel() -> PipelineSettings {
     PipelineSettings {
         target_format: AudioFormat::Custom {
@@ -205,6 +206,7 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
         replay_gain: ReplayGainSettings {
             mode: Some(ReplayGainMode::Both),
             prevent_clipping: false,
+            existing_tags: tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete,
         },
     }
 }
@@ -222,7 +224,12 @@ fn flac_md5_sentinel() -> PipelineSettings {
 /// FLAC-only MD5 and native FLAC verification rules.
 fn custom_format_sentinel() -> PipelineSettings {
     let mut settings = raw_all_non_default_sentinel();
-    settings.target_format = AudioFormat::Wav;
+    // Keep this sentinel genuinely custom: replacing it with WAV makes the
+    // target-format coverage self-satisfying and leaves Custom unexercised.
+    settings.target_format = AudioFormat::Custom {
+        extension: "sent".to_string(),
+        display_name: "Sentinel Audio".to_string(),
+    };
     settings.flac.verify = false;
     settings.metadata.store_source_audio_md5 = false;
     settings
@@ -332,6 +339,7 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.verification.prefer_native_flac_verify, &expected.verification.prefer_native_flac_verify, "verification.prefer_native_flac_verify");
     assert_eq!(&actual.replay_gain.mode, &expected.replay_gain.mode, "replay_gain.mode");
     assert_eq!(&actual.replay_gain.prevent_clipping, &expected.replay_gain.prevent_clipping, "replay_gain.prevent_clipping");
+    assert_eq!(&actual.replay_gain.existing_tags, &expected.replay_gain.existing_tags, "replay_gain.existing_tags");
 }
 
 macro_rules! assert_covered_by_non_default {
@@ -429,6 +437,7 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "verification.prefer_native_flac_verify", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "replay_gain.mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "replay_gain.prevent_clipping", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "replay_gain.existing_tags", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
 ];
 
 fn field_differs_from_default(
@@ -507,6 +516,7 @@ fn field_differs_from_default(
         "verification.prefer_native_flac_verify" => settings.verification.prefer_native_flac_verify != default.verification.prefer_native_flac_verify,
         "replay_gain.mode" => settings.replay_gain.mode != default.replay_gain.mode,
         "replay_gain.prevent_clipping" => settings.replay_gain.prevent_clipping != default.replay_gain.prevent_clipping,
+        "replay_gain.existing_tags" => settings.replay_gain.existing_tags != default.replay_gain.existing_tags,
         other => panic!("unknown PipelineSettings field path in sentinel inventory: {}", other),
     }
 }
@@ -644,6 +654,7 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, verification.prefer_native_flac_verify, "verification.prefer_native_flac_verify");
     assert_covered_by_non_default!(default, raw, raw, replay_gain.mode, "replay_gain.mode");
     assert_covered_by_non_default!(default, raw, raw, replay_gain.prevent_clipping, "replay_gain.prevent_clipping");
+    assert_covered_by_non_default!(default, raw, raw, replay_gain.existing_tags, "replay_gain.existing_tags");
 
     assert!(raw.validate().is_err());
 }
@@ -724,6 +735,7 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, verification.prefer_native_flac_verify, "verification.prefer_native_flac_verify");
     assert_covered_by_non_default!(default, flac, custom, replay_gain.mode, "replay_gain.mode");
     assert_covered_by_non_default!(default, flac, custom, replay_gain.prevent_clipping, "replay_gain.prevent_clipping");
+    assert_covered_by_non_default!(default, flac, custom, replay_gain.existing_tags, "replay_gain.existing_tags");
 }
 
 #[test]
@@ -880,6 +892,7 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("verification.prefer_native_flac_verify", LegacyProjectionStatus::Defaulted),
     ("replay_gain.mode", LegacyProjectionStatus::Translated),
     ("replay_gain.prevent_clipping", LegacyProjectionStatus::Defaulted),
+    ("replay_gain.existing_tags", LegacyProjectionStatus::Defaulted),
 ];
 
 #[test]
@@ -1068,6 +1081,7 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "verification.prefer_native_flac_verify", flac.verification.prefer_native_flac_verify, true);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "replay_gain.mode", flac.replay_gain.mode, Some(ReplayGainMode::Both));
     assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "replay_gain.prevent_clipping", flac.replay_gain.prevent_clipping, true);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "replay_gain.existing_tags", flac.replay_gain.existing_tags, tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan);
 
     assert_legacy_coverage(&covered);
 }

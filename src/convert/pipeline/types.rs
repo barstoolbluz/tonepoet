@@ -584,6 +584,10 @@ pub struct AlbumBatchDispatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceOptions {
+    /// Process-local archive secret. Legacy serialized requests may deserialize
+    /// it for one-time queue migration, but current serializers omit it so a
+    /// `PipelineRequest` can never leak the secret into JSON/SQLite/manifests.
+    #[serde(default, skip_serializing)]
     pub archive_password: Option<SecretString>,
     pub sacd_area: Option<SacdArea>,
     /// DVD-Audio group-selection policy. This is the active internal contract;

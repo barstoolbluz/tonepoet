@@ -1,9 +1,24 @@
+#![deny(unsafe_code)]
+
+use same_file::Handle as SameFileHandle;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        std::cell::RefCell::new(None);
+    static TEST_CONFIG_PUBLICATION_SYNC_FAILURE: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+    static TEST_LOCK_MARKER_SYNC_FAILURE: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+    static TEST_STALE_ARTIFACT_REMOVE_FAILURE: std::cell::RefCell<Option<(PathBuf, String)>> =
+        std::cell::RefCell::new(None);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TonepoetConfig {
@@ -315,8 +330,15 @@ pub struct ConversionSettings {
     /// Maximum percentage of total RAM that scratch/tmpfs staging may reserve (0-90).
     #[serde(default = "default_scratch_memory_limit_percent")]
     pub scratch_memory_limit_percent: u8,
-    /// Default archive password
+    /// Ephemeral default archive password. Legacy config files may deserialize
+    /// this once for migration, but current saves never persist it. Save-state
+    /// semantics are tri-state: Some(password) sets or rotates; None with an
+    /// archive_password_ref retains; both fields None explicitly clear.
+    #[serde(default, skip_serializing)]
     pub archive_password: Option<String>,
+    /// Opaque OS secret-store reference for the default archive password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_password_ref: Option<String>,
     /// Default ordered pre/post conversion action pipeline.
     #[serde(default, skip_serializing_if = "crate::convert::pipeline::ActionPipeline::is_empty")]
     pub actions: crate::convert::pipeline::ActionPipeline,
@@ -353,6 +375,7 @@ impl Default for ConversionSettings {
             scratch_directory: None,
             scratch_memory_limit_percent: default_scratch_memory_limit_percent(),
             archive_password: None,
+            archive_password_ref: None,
             actions: crate::convert::pipeline::ActionPipeline::default(),
             append_lineage_to_comment: false,
         }
@@ -386,130 +409,347 @@ impl ConfigSaveOutcome {
     }
 }
 
-struct ConfigSaveLock {
+#[derive(Debug)]
+pub(crate) struct StoreFileLock {
     _path: PathBuf,
-    _file: fs::File,
+    _handle: SameFileHandle,
 }
 
-impl ConfigSaveLock {
+const STORE_LOCK_MARKER: &[u8] = b"tonepoet-store-lock-v1\n";
+const MAX_STORE_LOCK_MARKER_BYTES: u64 = 4096;
+
+impl StoreFileLock {
+    pub(crate) fn acquire_for_path(path: &Path) -> anyhow::Result<(Self, PathBuf)> {
+        let target_path = resolve_config_save_target(path)?;
+        let parent = target_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let lock = Self::acquire(parent, &target_path)?;
+        Ok((lock, target_path))
+    }
+
     fn acquire(parent: &Path, target_path: &Path) -> anyhow::Result<Self> {
         let lock_path = config_sidecar_path(parent, target_path, "save.lock");
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        let mut file = options.open(&lock_path)?;
-        lock_config_file(&file).map_err(|error| {
-            let lock_is_held = error.kind() == std::io::ErrorKind::WouldBlock
-                || error.raw_os_error() == Some(33); // Windows ERROR_LOCK_VIOLATION
-            if lock_is_held {
-                anyhow::anyhow!("config save already in progress: {}", lock_path.display())
-            } else {
-                anyhow::Error::from(error)
+        validate_lock_path_before_open(&lock_path)?;
+
+        let (file, created) = match open_store_lock(&lock_path, true) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                validate_lock_path_before_open(&lock_path)?;
+                let file = open_store_lock(&lock_path, false).map_err(|error| {
+                    anyhow::anyhow!(
+                        "open existing store lock '{}' without following links: {error}",
+                        lock_path.display()
+                    )
+                })?;
+                (file, false)
             }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "create store lock '{}' without following links: {error}",
+                    lock_path.display()
+                ))
+            }
+        };
+
+        let mut file = file;
+        validate_opened_lock_object(&lock_path, &file)?;
+
+        if created {
+            fs2::FileExt::lock_exclusive(&file).map_err(|error| {
+                anyhow::anyhow!("lock newly created store sidecar '{}': {error}", lock_path.display())
+            })?;
+        } else {
+            fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+                let lock_is_held = error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(33); // Windows ERROR_LOCK_VIOLATION
+                if lock_is_held {
+                    anyhow::anyhow!("store update already in progress: {}", lock_path.display())
+                } else {
+                    anyhow::anyhow!("lock store sidecar '{}': {error}", lock_path.display())
+                }
+            })?;
+        }
+
+        // Compare the locked object with the current pathname before touching a
+        // newly created marker. The temporary identity handle owns only a clone;
+        // the original `file` retains the advisory lock throughout.
+        let initial_identity = SameFileHandle::from_file(file.try_clone()?).map_err(|error| {
+            anyhow::anyhow!(
+                "inspect initial store lock identity '{}': {error}",
+                lock_path.display()
+            )
         })?;
+        validate_locked_path_identity(&lock_path, &initial_identity)?;
+        drop(initial_identity);
 
-        // Advisory locks are owned by the open file description/handle and are
-        // released by the OS if the process exits. The sidecar file is only
-        // diagnostic; it is intentionally not deleted on Drop, so a resumed or
-        // dying stale owner cannot remove a newer owner's lock pathname.
-        let _ = file.set_len(0);
-        let _ = writeln!(
-            file,
-            "pid={} target={}",
-            std::process::id(),
-            target_path.display()
-        );
-        let _ = file.sync_all();
+        if created {
+            if let Err(error) = initialize_store_lock_marker(&mut file, parent, &lock_path) {
+                // Never unlink a newly created lock pathname after releasing its
+                // file lock. Another process could acquire the same inode in the
+                // release-to-unlink window, after which removing the pathname
+                // would split lock authority across two inodes. Retaining the
+                // persistent marker is fail-closed: a complete marker remains
+                // reusable, while an incomplete marker is rejected explicitly.
+                drop(file);
+                return Err(anyhow::anyhow!(
+                    "{error}; store lock marker '{}' was retained to avoid splitting lock authority",
+                    lock_path.display()
+                ));
+            }
+        } else {
+            validate_store_lock_marker(&mut file, target_path, &lock_path)?;
+        }
 
-        Ok(Self { _path: lock_path, _file: file })
+        // `same-file` includes file size in Windows identities. Capture the
+        // long-lived handle only after marker initialization so its identity
+        // matches a fresh pathname handle on every supported platform.
+        let handle = SameFileHandle::from_file(file).map_err(|error| {
+            anyhow::anyhow!(
+                "capture final store lock identity '{}': {error}",
+                lock_path.display()
+            )
+        })?;
+        validate_locked_path_identity(&lock_path, &handle)?;
+
+        Ok(Self {
+            _path: lock_path,
+            _handle: handle,
+        })
     }
 }
 
-#[cfg(unix)]
-fn lock_config_file(file: &fs::File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-
-    unsafe extern "C" {
-        fn flock(fd: i32, operation: i32) -> i32;
+fn open_store_lock(lock_path: &Path, create_new: bool) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if create_new {
+        options.create_new(true);
     }
-
-    let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(lock_path)
 }
 
-#[cfg(windows)]
-fn lock_config_file(file: &fs::File) -> std::io::Result<()> {
-    use std::ffi::c_void;
-    use std::mem::zeroed;
-    use std::os::windows::io::AsRawHandle;
-
-    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x00000001;
-    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x00000002;
-
-    #[repr(C)]
-    struct Overlapped {
-        internal: usize,
-        internal_high: usize,
-        offset: u32,
-        offset_high: u32,
-        event: *mut c_void,
-    }
-
-    unsafe extern "system" {
-        fn LockFileEx(
-            hFile: *mut c_void,
-            dwFlags: u32,
-            dwReserved: u32,
-            nNumberOfBytesToLockLow: u32,
-            nNumberOfBytesToLockHigh: u32,
-            lpOverlapped: *mut Overlapped,
-        ) -> i32;
-    }
-
-    let mut overlapped: Overlapped = unsafe { zeroed() };
-    let rc = unsafe {
-        LockFileEx(
-            file.as_raw_handle() as *mut c_void,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            1,
-            0,
-            &mut overlapped,
+fn initialize_store_lock_marker(
+    file: &mut fs::File,
+    parent: &Path,
+    lock_path: &Path,
+) -> anyhow::Result<()> {
+    file.write_all(STORE_LOCK_MARKER).map_err(|error| {
+        anyhow::anyhow!(
+            "write store lock provenance marker '{}': {error}",
+            lock_path.display()
         )
-    };
-    if rc != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    })?;
+    file.sync_all().map_err(|error| {
+        anyhow::anyhow!(
+            "sync store lock provenance marker '{}': {error}",
+            lock_path.display()
+        )
+    })?;
+    sync_store_lock_parent_dir(parent).map_err(|error| {
+        anyhow::anyhow!(
+            "sync parent after creating store lock '{}': {error}",
+            lock_path.display()
+        )
+    })
 }
 
-#[cfg(not(any(unix, windows)))]
-fn lock_config_file(_file: &fs::File) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "crash-safe config save locking is unsupported on this platform",
+fn sync_store_lock_parent_dir(parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(message) = TEST_LOCK_MARKER_SYNC_FAILURE.with(|slot| slot.borrow_mut().take()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, message));
+    }
+    sync_parent_dir(parent)
+}
+
+fn validate_opened_lock_object(lock_path: &Path, file: &fs::File) -> anyhow::Result<()> {
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!("inspect opened store lock '{}': {error}", lock_path.display())
+    })?;
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "store lock path '{}' is not a regular file",
+            lock_path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(anyhow::anyhow!(
+                "store lock path '{}' has {} hard links; refusing ambiguous lock authority",
+                lock_path.display(),
+                metadata.nlink()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_store_lock_marker(
+    file: &mut fs::File,
+    target_path: &Path,
+    lock_path: &Path,
+) -> anyhow::Result<()> {
+    let length = file.metadata()?.len();
+    if length == 0 || length > MAX_STORE_LOCK_MARKER_BYTES {
+        return Err(anyhow::anyhow!(
+            "store lock path '{}' has invalid provenance-marker length {}",
+            lock_path.display(),
+            length
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    {
+        let mut limited = (&mut *file).take(MAX_STORE_LOCK_MARKER_BYTES + 1);
+        limited.read_to_end(&mut bytes)?;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    if bytes == STORE_LOCK_MARKER || legacy_store_lock_marker_matches(&bytes, target_path) {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "store lock path '{}' does not contain a recognized tonepoet lock marker",
+        lock_path.display()
     ))
 }
 
-fn atomic_write_config(config_path: &Path, content: &[u8]) -> anyhow::Result<ConfigSaveOutcome> {
-    let target_path = resolve_config_save_target(config_path)?;
+fn legacy_store_lock_marker_matches(bytes: &[u8], target_path: &Path) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some(line) = text.strip_suffix('\n') else {
+        return false;
+    };
+    let Some((pid, target)) = line
+        .strip_prefix("pid=")
+        .and_then(|rest| rest.split_once(" target="))
+    else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && target == target_path.to_string_lossy().as_ref()
+}
+
+fn validate_lock_path_before_open(lock_path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow::anyhow!(
+            "refusing symlinked store lock path '{}'",
+            lock_path.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(anyhow::anyhow!(
+            "store lock path '{}' is not a regular file",
+            lock_path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "inspect store lock path '{}': {error}",
+            lock_path.display()
+        )),
+    }
+}
+
+fn validate_locked_path_identity(
+    lock_path: &Path,
+    held: &SameFileHandle,
+) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(lock_path).map_err(|error| {
+        anyhow::anyhow!(
+            "reinspect locked store sidecar '{}': {error}",
+            lock_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow::anyhow!(
+            "store lock path '{}' became a symlink during acquisition",
+            lock_path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "store lock path '{}' is not a regular file",
+            lock_path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(anyhow::anyhow!(
+                "store lock path '{}' has {} hard links; refusing ambiguous lock authority",
+                lock_path.display(),
+                metadata.nlink()
+            ));
+        }
+    }
+    let current = SameFileHandle::from_path(lock_path).map_err(|error| {
+        anyhow::anyhow!(
+            "open current store lock path '{}' for identity validation: {error}",
+            lock_path.display()
+        )
+    })?;
+    if held != &current {
+        return Err(anyhow::anyhow!(
+            "store lock path '{}' changed identity during acquisition",
+            lock_path.display()
+        ));
+    }
+    let final_metadata = fs::symlink_metadata(lock_path).map_err(|error| {
+        anyhow::anyhow!(
+            "final store lock path validation '{}': {error}",
+            lock_path.display()
+        )
+    })?;
+    if final_metadata.file_type().is_symlink() || !final_metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "store lock path '{}' changed type during acquisition",
+            lock_path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if final_metadata.nlink() != 1 {
+            return Err(anyhow::anyhow!(
+                "store lock path '{}' changed hard-link count during acquisition",
+                lock_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recover_config_artifacts_locked(target_path: &Path) -> anyhow::Result<()> {
     let parent = target_path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("config path has no parent: {}", target_path.display()))?;
-    fs::create_dir_all(parent)?;
-    let _lock = ConfigSaveLock::acquire(parent, &target_path)?;
-    recover_stale_config_artifacts(parent, &target_path)?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    recover_stale_config_artifacts(parent, target_path)
+}
+
+fn atomic_write_config_locked(
+    target_path: &Path,
+    content: &[u8],
+) -> anyhow::Result<ConfigSaveOutcome> {
+    let parent = target_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    recover_stale_config_artifacts(parent, target_path)?;
 
     let file_name = target_path
         .file_name()
@@ -519,7 +759,7 @@ fn atomic_write_config(config_path: &Path, content: &[u8]) -> anyhow::Result<Con
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let mode = config_file_mode(&target_path)?;
+    let mode = config_file_mode(target_path)?;
 
     let mut last_create_error = None;
     for attempt in 0..128u32 {
@@ -529,7 +769,7 @@ fn atomic_write_config(config_path: &Path, content: &[u8]) -> anyhow::Result<Con
             stamp,
             attempt
         ));
-        match write_and_publish_config_temp(&target_path, &tmp_path, content, mode) {
+        match write_and_publish_config_temp(target_path, &tmp_path, content, mode) {
             Ok(outcome) => return Ok(outcome),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 last_create_error = Some(error);
@@ -548,20 +788,78 @@ fn atomic_write_config(config_path: &Path, content: &[u8]) -> anyhow::Result<Con
         .into())
 }
 
-fn resolve_config_save_target(config_path: &Path) -> anyhow::Result<PathBuf> {
-    match fs::symlink_metadata(config_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            let link = fs::read_link(config_path)?;
-            Ok(if link.is_absolute() {
-                link
-            } else {
-                config_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(link)
-            })
+pub(crate) fn resolve_config_save_target(config_path: &Path) -> anyhow::Result<PathBuf> {
+    const MAX_CONFIG_SYMLINK_DEPTH: usize = 40;
+
+    let mut current = config_path.to_path_buf();
+    let mut visited = std::collections::HashSet::new();
+
+    for depth in 0..=MAX_CONFIG_SYMLINK_DEPTH {
+        if !visited.insert(symlink_cycle_key(&current)) {
+            return Err(anyhow::anyhow!(
+                "configuration path symlink cycle detected at '{}'",
+                current.display()
+            ));
         }
-        Ok(_) | Err(_) => Ok(config_path.to_path_buf()),
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if depth == MAX_CONFIG_SYMLINK_DEPTH {
+                    return Err(anyhow::anyhow!(
+                        "configuration path '{}' exceeds the maximum symlink depth of {}",
+                        config_path.display(),
+                        MAX_CONFIG_SYMLINK_DEPTH
+                    ));
+                }
+                let link = fs::read_link(&current).map_err(|error| {
+                    anyhow::anyhow!(
+                        "read configuration symlink '{}': {error}",
+                        current.display()
+                    )
+                })?;
+                current = if link.is_absolute() {
+                    link
+                } else {
+                    current
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(link)
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "inspect configuration path '{}': {error}",
+                    current.display()
+                ))
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "configuration path '{}' could not be resolved within the bounded symlink traversal",
+        config_path.display()
+    ))
+}
+
+fn symlink_cycle_key(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut key = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Prefix(prefix) => key.push(prefix.as_os_str()),
+            Component::RootDir => key.push(component.as_os_str()),
+            Component::ParentDir => key.push(".."),
+            Component::Normal(part) => key.push(part),
+        }
+    }
+    if key.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        key
     }
 }
 
@@ -588,43 +886,368 @@ fn config_sidecar_path(parent: &Path, target_path: &Path, suffix: &str) -> PathB
     parent.join(format!(".{file_name}.{suffix}"))
 }
 
-fn recover_stale_config_artifacts(parent: &Path, target_path: &Path) -> std::io::Result<()> {
-    let Some(file_name) = target_path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(());
-    };
+#[derive(Debug)]
+struct ValidatedRecoveryBackup {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn recover_stale_config_artifacts(parent: &Path, target_path: &Path) -> anyhow::Result<()> {
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "configuration recovery target '{}' has no UTF-8 file name",
+                target_path.display()
+            )
+        })?;
     let temp_prefix = format!(".{file_name}.tmp.");
     let backup_prefix = format!(".{file_name}.replace-backup.");
-    let mut backups = Vec::new();
-    let Ok(entries) = fs::read_dir(parent) else {
-        return Ok(());
-    };
+    let entries = fs::read_dir(parent).map_err(|error| {
+        anyhow::anyhow!(
+            "enumerate stale configuration artifacts in '{}': {error}",
+            parent.display()
+        )
+    })?;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let mut stale_temps = Vec::new();
+    let mut backup_paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            anyhow::anyhow!(
+                "read stale configuration artifact entry in '{}': {error}",
+                parent.display()
+            )
+        })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        let path = entry.path();
         if name.starts_with(&temp_prefix) {
-            let _ = fs::remove_file(&path);
+            stale_temps.push(path);
         } else if name.starts_with(&backup_prefix) {
-            backups.push(path);
+            backup_paths.push(path);
         }
     }
 
-    if !target_path.exists() {
-        backups.sort_by_key(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        });
-        if let Some(backup) = backups.pop() {
-            fs::rename(&backup, target_path)?;
+    stale_temps.sort();
+    backup_paths.sort();
+
+    let mut first_validation_error = None;
+    for path in &stale_temps {
+        if let Err(error) =
+            validate_recovery_artifact_is_regular(path, "stale temporary configuration file")
+        {
+            if first_validation_error.is_none() {
+                first_validation_error = Some(error);
+            }
         }
     }
 
-    for backup in backups {
-        let _ = fs::remove_file(backup);
+    let mut backups = Vec::with_capacity(backup_paths.len());
+    for path in backup_paths {
+        match read_and_validate_recovery_config(
+            &path,
+            "stale configuration replacement backup",
+        ) {
+            Ok(bytes) => backups.push(ValidatedRecoveryBackup { path, bytes }),
+            Err(error) => {
+                if first_validation_error.is_none() {
+                    first_validation_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_validation_error {
+        return Err(error);
+    }
+
+    if stale_temps.is_empty() && backups.is_empty() {
+        // No recovery artifacts exist, so there is nothing to arbitrate.
+        // The target's shape is the saver's concern: an atomic replace onto
+        // a non-regular target fails with the honest OS error and cleans up
+        // its temp file. Validating the target here would turn that save
+        // into a recovery error and leave the rename-failure cleanup path
+        // unreachable.
+        return Ok(());
+    }
+
+    let target_exists = match fs::symlink_metadata(target_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(anyhow::anyhow!(
+                    "configuration recovery target '{}' is not a regular file",
+                    target_path.display()
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect configuration recovery target '{}': {error}",
+                target_path.display()
+            ))
+        }
+    };
+
+    if !target_exists && backups.len() > 1 {
+        let candidates = backups
+            .iter()
+            .map(|backup| format!("'{}'", backup.path.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow::anyhow!(
+            "cannot recover missing configuration '{}': multiple valid replacement backups are present: {candidates}",
+            target_path.display()
+        ));
+    }
+
+    if target_exists && !backups.is_empty() {
+        read_and_validate_recovery_config(target_path, "published configuration")?;
+    }
+
+    if !target_exists {
+        if let Some(backup) = backups.first() {
+            restore_config_backup_durably(parent, target_path, backup)?;
+        }
+    }
+
+    let mut cleanup_paths = stale_temps;
+    cleanup_paths.extend(backups.into_iter().map(|backup| backup.path));
+    let had_cleanup = !cleanup_paths.is_empty();
+    if had_cleanup {
+        sync_publication_parent_dir(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot safely remove stale configuration artifacts because parent-directory durability is unavailable: {error}; artifacts were retained and secret reconciliation was not attempted"
+            )
+        })?;
+    }
+    for path in cleanup_paths {
+        remove_stale_config_artifact(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "remove stale configuration artifact '{}': {error}",
+                path.display()
+            )
+        })?;
+    }
+    if had_cleanup {
+        sync_publication_parent_dir(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "stale configuration artifacts were removed, but parent-directory durability could not be confirmed: {error}; secret reconciliation was not attempted"
+            )
+        })?;
     }
     Ok(())
+}
+
+fn validate_recovery_artifact_is_regular(path: &Path, kind: &str) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!("inspect {kind} '{}': {error}", path.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "{kind} '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_and_validate_recovery_config(path: &Path, kind: &str) -> anyhow::Result<Vec<u8>> {
+    validate_recovery_artifact_is_regular(path, kind)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        anyhow::anyhow!("open {kind} '{}' without following links: {error}", path.display())
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!("inspect opened {kind} '{}': {error}", path.display())
+    })?;
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "{kind} '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    let held = SameFileHandle::from_file(file.try_clone()?).map_err(|error| {
+        anyhow::anyhow!("inspect {kind} identity '{}': {error}", path.display())
+    })?;
+    let current = SameFileHandle::from_path(path).map_err(|error| {
+        anyhow::anyhow!("reopen {kind} identity '{}': {error}", path.display())
+    })?;
+    if held != current {
+        return Err(anyhow::anyhow!(
+            "{kind} '{}' changed identity during validation",
+            path.display()
+        ));
+    }
+    validate_recovery_artifact_is_regular(path, kind)?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        anyhow::anyhow!("read {kind} '{}': {error}", path.display())
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "{kind} '{}' is not a valid UTF-8 Tonepoet configuration",
+            path.display()
+        )
+    })?;
+    toml::from_str::<TonepoetConfig>(text).map_err(|_| {
+        anyhow::anyhow!(
+            "{kind} '{}' is not a valid Tonepoet configuration",
+            path.display()
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn restore_config_backup_durably(
+    parent: &Path,
+    target_path: &Path,
+    backup: &ValidatedRecoveryBackup,
+) -> anyhow::Result<()> {
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    #[cfg(unix)]
+    let mode = 0o600;
+
+    let mut last_create_error = None;
+    for attempt in 0..128u32 {
+        let temporary = parent.join(format!(
+            ".{file_name}.tmp.recovery.{}.{}.{}",
+            std::process::id(),
+            stamp,
+            attempt
+        ));
+        #[cfg(unix)]
+        let opened = {
+            let mut options = OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .mode(mode & 0o777)
+                .open(&temporary)
+        };
+        #[cfg(not(unix))]
+        let opened = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary);
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_create_error = Some(error);
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "create configuration recovery temporary file '{}': {error}",
+                    temporary.display()
+                ))
+            }
+        };
+
+        let publish_result = (|| -> anyhow::Result<()> {
+            file.write_all(&backup.bytes).map_err(|error| {
+                anyhow::anyhow!(
+                    "write configuration recovery temporary file '{}': {error}",
+                    temporary.display()
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                anyhow::anyhow!(
+                    "sync configuration recovery temporary file '{}': {error}",
+                    temporary.display()
+                )
+            })?;
+            drop(file);
+            fs::rename(&temporary, target_path).map_err(|error| {
+                anyhow::anyhow!(
+                    "restore configuration '{}' from replacement backup '{}': {error}",
+                    target_path.display(),
+                    backup.path.display()
+                )
+            })?;
+            sync_publication_parent_dir(parent).map_err(|error| {
+                anyhow::anyhow!(
+                    "configuration recovery replaced '{}', but parent-directory durability could not be confirmed: {error}; replacement backup '{}' was retained and secret reconciliation was not attempted",
+                    target_path.display(),
+                    backup.path.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        match publish_result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                match fs::symlink_metadata(&temporary) {
+                    Ok(_) => {
+                        if let Err(cleanup_error) = remove_stale_config_artifact(&temporary) {
+                            return Err(anyhow::anyhow!(
+                                "{error}; additionally failed to remove recovery temporary file '{}': {cleanup_error}",
+                                temporary.display()
+                            ));
+                        }
+                    }
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(metadata_error) => {
+                        return Err(anyhow::anyhow!(
+                            "{error}; additionally failed to inspect recovery temporary file '{}' for cleanup: {metadata_error}",
+                            temporary.display()
+                        ))
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Err(anyhow::Error::new(last_create_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique configuration recovery temporary file",
+        )
+    })))
+}
+
+fn remove_stale_config_artifact(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let injected = TEST_STALE_ARTIFACT_REMOVE_FAILURE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.take() {
+                Some((target, message)) if target == path => Some(message),
+                Some(value) => {
+                    *slot = Some(value);
+                    None
+                }
+                None => None,
+            }
+        });
+        if let Some(message) = injected {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, message));
+        }
+    }
+    fs::remove_file(path)
 }
 
 fn write_and_publish_config_temp(
@@ -633,7 +1256,13 @@ fn write_and_publish_config_temp(
     content: &[u8],
     mode: u32,
 ) -> std::io::Result<ConfigSaveOutcome> {
-    write_and_publish_config_temp_with_sync(config_path, tmp_path, content, mode, sync_parent_dir)
+    write_and_publish_config_temp_with_sync(
+        config_path,
+        tmp_path,
+        content,
+        mode,
+        sync_publication_parent_dir,
+    )
 }
 
 fn write_and_publish_config_temp_with_sync(
@@ -668,7 +1297,11 @@ fn write_and_publish_config_temp_with_sync(
         drop(tmp);
         replace_config_file(tmp_path, config_path)?;
         published = true;
-        match sync_parent(config_path.parent().expect("validated parent")) {
+        let parent = config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        match sync_parent(parent) {
             Ok(()) => Ok(ConfigSaveOutcome::Durable),
             Err(error) => Ok(ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(
                 format!("config.toml was written, but parent-directory durability could not be confirmed: {error}"),
@@ -682,92 +1315,334 @@ fn write_and_publish_config_temp_with_sync(
     result
 }
 
-#[cfg(unix)]
-fn replace_config_file(tmp_path: &Path, config_path: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_config_file(tmp_path: &Path, config_path: &Path) -> std::io::Result<()> {
+    // std::fs::rename performs same-filesystem replacement on supported Unix
+    // and Windows targets without requiring handwritten platform FFI.
     fs::rename(tmp_path, config_path)
 }
 
-#[cfg(windows)]
-fn replace_config_file(tmp_path: &Path, config_path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
-
-    unsafe extern "system" {
-        fn MoveFileExW(
-            lpExistingFileName: *const u16,
-            lpNewFileName: *const u16,
-            dwFlags: u32,
-        ) -> i32;
-    }
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    let from = wide(tmp_path);
-    let to = wide(config_path);
-    let ok = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn replace_config_file(tmp_path: &Path, config_path: &Path) -> std::io::Result<()> {
-    match fs::rename(tmp_path, config_path) {
-        Ok(()) => Ok(()),
-        Err(error) if config_path.exists() => Err(std::io::Error::new(
-            error.kind(),
-            format!(
-                "atomic replacement of an existing config is unsupported on this platform; existing config left unchanged: {error}"
-            ),
-        )),
-        Err(error) => Err(error),
-    }
-}
 
 #[cfg(unix)]
-fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
     fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+    // Some callers use this as a best-available metadata flush rather than a
+    // durability classification. Publication paths must instead call
+    // `sync_publication_parent_dir`, which reports the missing guarantee.
     Ok(())
 }
+
+pub(crate) fn sync_publication_parent_dir(parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(message) =
+        TEST_CONFIG_PUBLICATION_SYNC_FAILURE.with(|slot| slot.borrow_mut().take())
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, message));
+    }
+
+    #[cfg(unix)]
+    {
+        return sync_parent_dir(parent);
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = parent;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows replacement was not performed with write-through semantics",
+        ));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = parent;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "parent-directory durability is unsupported on this platform",
+        ))
+    }
+}
+
+fn create_restricted_migration_backup(source: &Path, backup: &Path) -> std::io::Result<()> {
+    let source_bytes = std::fs::read(source)?;
+    let created = if backup.exists() {
+        if source_bytes != std::fs::read(backup)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "existing migration backup '{}' does not match current source '{}'",
+                    backup.display(),
+                    source.display()
+                ),
+            ));
+        }
+        false
+    } else {
+        match crate::secret_store::atomic_write_private_file(backup, &source_bytes)? {
+            crate::secret_store::PrivateFilePublishOutcome::Durable => true,
+            crate::secret_store::PrivateFilePublishOutcome::ReplacedButDurabilityUnconfirmed(
+                detail,
+            ) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "cleartext migration backup was replaced but is not durably published: {detail}"
+                    ),
+                ))
+            }
+        }
+    };
+    #[cfg(unix)]
+    {
+        if let Err(error) = std::fs::set_permissions(
+            backup,
+            std::fs::Permissions::from_mode(0o600),
+        ) {
+            let cleanup_error = created
+                .then(|| std::fs::remove_file(backup).err())
+                .flatten();
+            return Err(migration_backup_permission_error(
+                backup,
+                error,
+                cleanup_error,
+            ));
+        }
+        std::fs::File::open(backup)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = created;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn migration_backup_permission_error(
+    backup: &Path,
+    permission_error: std::io::Error,
+    cleanup_error: Option<std::io::Error>,
+) -> std::io::Error {
+    let message = match cleanup_error {
+        Some(cleanup_error) => format!(
+            "restrict cleartext migration backup '{}': {permission_error}; additionally failed to remove the newly created unrestricted backup: {cleanup_error}",
+            backup.display()
+        ),
+        None => format!(
+            "restrict cleartext migration backup '{}': {permission_error}",
+            backup.display()
+        ),
+    };
+    std::io::Error::new(permission_error.kind(), message)
+}
+
+fn published_config_secret_references(config_path: &Path) -> anyhow::Result<Vec<String>> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => {
+            let value: toml::Value = toml::from_str(&content).map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot inspect archive-password authority because '{}' is not valid TOML: {error}",
+                    config_path.display()
+                )
+            })?;
+            Ok(value
+                .get("conversion")
+                .and_then(|conversion| conversion.get("archive_password_ref"))
+                .and_then(toml::Value::as_str)
+                .map(|reference| vec![reference.to_string()])
+                .unwrap_or_default())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(anyhow::anyhow!(
+            "read '{}' while inspecting archive-password authority: {error}",
+            config_path.display()
+        )),
+    }
+}
+
+fn reconcile_config_secret_publication_locked(config_path: &Path) -> anyhow::Result<Vec<String>> {
+    let published_references = published_config_secret_references(config_path)?;
+    crate::secret_store::reconcile_pending_publication(config_path, &published_references)
+        .map_err(anyhow::Error::msg)?;
+    Ok(published_references)
+}
+
+fn config_secret_slot_references(config_path: &Path) -> anyhow::Result<[String; 2]> {
+    let durable_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(config_path)
+    };
+    let durable_key = durable_path.to_string_lossy();
+    Ok([
+        crate::secret_store::stable_reference("config-a", durable_key.as_ref())
+            .map_err(anyhow::Error::new)?,
+        crate::secret_store::stable_reference("config-b", durable_key.as_ref())
+            .map_err(anyhow::Error::new)?,
+    ])
+}
+
+fn next_config_secret_reference(
+    config_path: &Path,
+    current_reference: Option<&str>,
+) -> anyhow::Result<String> {
+    let [slot_a, slot_b] = config_secret_slot_references(config_path)?;
+    Ok(if current_reference == Some(slot_a.as_str()) {
+        slot_b
+    } else {
+        slot_a
+    })
+}
+
 
 impl TonepoetConfig {
     /// Load config from the default path (~/.config/tonepoet/config.toml)
     pub fn load() -> anyhow::Result<Self> {
-        let config_path = Self::config_path();
-        if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            let config: TonepoetConfig = toml::from_str(&content)?;
-            Ok(config)
-        } else {
-            Ok(Self::default())
+        Self::load_from_path(Self::config_path())
+    }
+
+    /// Load config from an explicit path. Cleartext legacy passwords are
+    /// migrated while holding the same cross-process lock across authoritative
+    /// reads, journal reconciliation, keyring mutation, config publication, and
+    /// journal retirement.
+    pub fn load_from_path<P: AsRef<Path>>(config_path: P) -> anyhow::Result<Self> {
+        let (_lock, target_path) = StoreFileLock::acquire_for_path(config_path.as_ref())?;
+        recover_config_artifacts_locked(&target_path)?;
+        Self::load_from_locked_path(&target_path)
+    }
+
+    fn load_from_locked_path(config_path: &Path) -> anyhow::Result<Self> {
+        let _published_references = reconcile_config_secret_publication_locked(config_path)?;
+        if !config_path.exists() {
+            return Ok(Self::default());
         }
+
+        let content = std::fs::read_to_string(config_path)?;
+        let mut config: TonepoetConfig = toml::from_str(&content)?;
+
+        if let Some(cleartext) = config.conversion.archive_password.clone() {
+            let backup = config_path.with_extension("toml.pre-keychain-migration");
+            let mut pending_reference = None;
+            let reference = if let Some(reference) = config.conversion.archive_password_ref.as_deref() {
+                let stored = crate::secret_store::get(reference).map_err(anyhow::Error::new)?;
+                if stored != cleartext {
+                    return Err(anyhow::anyhow!(
+                        "archive-password migration is ambiguous: config cleartext and secret reference disagree"
+                    ));
+                }
+                reference.to_string()
+            } else {
+                let reference = next_config_secret_reference(config_path, None)?;
+                crate::secret_store::begin_pending_publication(
+                    config_path,
+                    std::slice::from_ref(&reference),
+                )
+                .map_err(anyhow::Error::msg)?;
+                if let Err(store_error) = crate::secret_store::set(&reference, &cleartext) {
+                    let primary = anyhow::anyhow!(store_error);
+                    return match crate::secret_store::abort_pending_publication(
+                        config_path,
+                        std::slice::from_ref(&reference),
+                    ) {
+                        Ok(()) => Err(primary),
+                        Err(cleanup_error) => Err(anyhow::anyhow!(
+                            "{primary}; additionally {cleanup_error}"
+                        )),
+                    };
+                }
+                pending_reference = Some(reference.clone());
+                reference
+            };
+
+            if let Err(backup_error) = create_restricted_migration_backup(config_path, &backup) {
+                let Some(reference) = pending_reference else {
+                    return Err(backup_error.into());
+                };
+                return match crate::secret_store::abort_pending_publication(
+                    config_path,
+                    std::slice::from_ref(&reference),
+                ) {
+                    Ok(()) => Err(backup_error.into()),
+                    Err(cleanup_error) => Err(anyhow::anyhow!(
+                        "could not create restricted archive-password migration backup '{}': {backup_error}; additionally {cleanup_error}",
+                        backup.display()
+                    )),
+                };
+            }
+
+            config.conversion.archive_password_ref = Some(reference.clone());
+            let mut persisted = config.clone();
+            persisted.conversion.archive_password = None;
+            let save_outcome = match toml::to_string_pretty(&persisted)
+                .map_err(anyhow::Error::new)
+                .and_then(|content| atomic_write_config_locked(config_path, content.as_bytes()))
+            {
+                Ok(outcome) => outcome,
+                Err(save_error) => {
+                    let Some(reference) = pending_reference else {
+                        return Err(save_error);
+                    };
+                    return match crate::secret_store::abort_pending_publication(
+                        config_path,
+                        std::slice::from_ref(&reference),
+                    ) {
+                        Ok(()) => Err(save_error),
+                        Err(cleanup_error) => Err(anyhow::anyhow!(
+                            "{save_error}; additionally {cleanup_error}"
+                        )),
+                    };
+                }
+            };
+            match save_outcome {
+                ConfigSaveOutcome::Durable => {
+                    if pending_reference.is_some() {
+                        crate::secret_store::reconcile_pending_publication(
+                            config_path,
+                            std::slice::from_ref(&reference),
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    }
+                }
+                ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(detail) => {
+                    let authority = if pending_reference.is_some() {
+                        "the pending secret-publication journal was retained for reconciliation"
+                    } else {
+                        "no new secret reference was created"
+                    };
+                    return Err(anyhow::anyhow!(
+                        "archive-password migration was replaced but is not durably published: {detail}; {authority}"
+                    ));
+                }
+            }
+        } else if let Some(reference) = config.conversion.archive_password_ref.as_deref() {
+            config.conversion.archive_password = Some(
+                crate::secret_store::get(reference).map_err(anyhow::Error::new)?,
+            );
+        }
+        Ok(config)
+    }
+
+    /// Explicitly request removal of the configured archive-password authority
+    /// on the next save. A reference-only state retains the existing authority;
+    /// clearing both fields requests durable reference removal and retirement.
+    pub fn clear_archive_password(&mut self) {
+        self.conversion.archive_password = None;
+        self.conversion.archive_password_ref = None;
     }
 
     /// Save config to the default path.
     ///
-    /// The write is serialized with an OS-backed save lock, uses a
-    /// same-directory temporary file, fsyncs it, atomically publishes it on
-    /// supported platforms, preserves an existing file's permissions, follows a
-    /// final symlink to support dotfile-managed configs, and fsyncs the parent
-    /// directory when the platform exposes that durability primitive.
+    /// This convenience API requires confirmed durable publication. If the
+    /// destination was replaced but its parent-directory update could not be
+    /// confirmed durable, the method returns that structured detail as an
+    /// error; callers must not report ordinary save success.
+    ///
+    /// The entire secret-publication transaction is serialized by one OS lock:
+    /// authoritative read, journal reconciliation, keyring mutation, atomic file
+    /// publication, and journal retirement all occur under the same ownership.
     pub fn save(&self) -> anyhow::Result<()> {
-        self.save_with_outcome().map(|_| ())
+        require_durable_config_save(self.save_with_outcome()?)
     }
 
     pub fn save_with_outcome(&self) -> anyhow::Result<ConfigSaveOutcome> {
@@ -776,26 +1651,196 @@ impl TonepoetConfig {
 
     /// Save config to an explicit path. This exists so UI persistence paths can
     /// be tested against temporary config files without mutating the user's
-    /// real configuration.
+    /// real configuration. Like `save`, it returns an error after replacement
+    /// when publication durability cannot be confirmed.
     pub fn save_to_path<P: AsRef<Path>>(&self, config_path: P) -> anyhow::Result<()> {
-        self.save_to_path_with_outcome(config_path).map(|_| ())
+        require_durable_config_save(self.save_to_path_with_outcome(config_path)?)
     }
 
     pub fn save_to_path_with_outcome<P: AsRef<Path>>(
         &self,
         config_path: P,
     ) -> anyhow::Result<ConfigSaveOutcome> {
-        let config_path = config_path.as_ref();
-        let target_path = resolve_config_save_target(config_path)?;
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
+        self.save_to_path_with_outcome_impl(config_path.as_ref(), || Ok(()))
+    }
+
+    fn save_to_path_with_outcome_impl<F>(
+        &self,
+        config_path: &Path,
+        mut after_secret_stored: F,
+    ) -> anyhow::Result<ConfigSaveOutcome>
+    where
+        F: FnMut() -> anyhow::Result<()>,
+    {
+        let (_lock, target_path) = StoreFileLock::acquire_for_path(config_path)?;
+        recover_config_artifacts_locked(&target_path)?;
+        let published_references = reconcile_config_secret_publication_locked(&target_path)?;
+        let published_reference = published_references.first().cloned();
+
+        let mut persisted = self.clone();
+        let mut newly_stored_reference = None;
+        let mut pending_transaction = false;
+
+        match (
+            persisted.conversion.archive_password.as_deref(),
+            persisted.conversion.archive_password_ref.clone(),
+        ) {
+            (Some(secret), requested_reference) => {
+                let candidate_reference = published_reference
+                    .clone()
+                    .or(requested_reference);
+                let reusable_reference = match candidate_reference.as_deref() {
+                    Some(reference) => {
+                        let stored = crate::secret_store::get(reference).map_err(|error| {
+                            anyhow::anyhow!(
+                                "cannot verify existing archive-password reference '{reference}' while saving configuration; no replacement reference was stored: {error}"
+                            )
+                        })?;
+                        (stored == secret).then(|| reference.to_string())
+                    }
+                    None => None,
+                };
+
+                persisted.conversion.archive_password_ref = Some(match reusable_reference {
+                    Some(reference) => reference,
+                    None => {
+                        let reference = next_config_secret_reference(
+                            &target_path,
+                            published_reference.as_deref(),
+                        )?;
+                        crate::secret_store::begin_pending_publication_with_retirement(
+                            &target_path,
+                            std::slice::from_ref(&reference),
+                            &published_references,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        pending_transaction = true;
+                        if let Err(store_error) = crate::secret_store::set(&reference, secret) {
+                            let primary = anyhow::anyhow!(store_error);
+                            return match crate::secret_store::abort_pending_publication(
+                                &target_path,
+                                std::slice::from_ref(&reference),
+                            ) {
+                                Ok(()) => Err(primary),
+                                Err(cleanup_error) => Err(anyhow::anyhow!(
+                                    "{primary}; additionally {cleanup_error}"
+                                )),
+                            };
+                        }
+                        if let Err(hook_error) = after_secret_stored() {
+                            return match crate::secret_store::abort_pending_publication(
+                                &target_path,
+                                std::slice::from_ref(&reference),
+                            ) {
+                                Ok(()) => Err(hook_error),
+                                Err(cleanup_error) => Err(anyhow::anyhow!(
+                                    "{hook_error}; additionally {cleanup_error}"
+                                )),
+                            };
+                        }
+                        newly_stored_reference = Some(reference.clone());
+                        reference
+                    }
+                });
+            }
+            (None, Some(reference)) => {
+                if let Some(published) = published_reference.as_deref() {
+                    if published != reference {
+                        return Err(anyhow::anyhow!(
+                            "cannot retain archive-password reference '{reference}' because the published configuration owns '{published}'"
+                        ));
+                    }
+                }
+                crate::secret_store::get(&reference).map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot retain unavailable archive-password reference '{reference}' while saving configuration: {error}"
+                    )
+                })?;
+                persisted.conversion.archive_password_ref = Some(reference);
+            }
+            (None, None) => {
+                // Both fields absent is an explicit clear operation. This is
+                // distinct from retaining an existing authority, represented
+                // by archive_password_ref = Some(reference).
+                persisted.conversion.archive_password_ref = None;
+                if !published_references.is_empty() {
+                    crate::secret_store::begin_pending_publication_with_retirement(
+                        &target_path,
+                        &[],
+                        &published_references,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    pending_transaction = true;
+                }
+            }
         }
-        let content = toml::to_string_pretty(self)?;
-        atomic_write_config(config_path, content.as_bytes())
+        persisted.conversion.archive_password = None;
+        let desired_references = persisted
+            .conversion
+            .archive_password_ref
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let result = toml::to_string_pretty(&persisted)
+            .map_err(anyhow::Error::new)
+            .and_then(|content| atomic_write_config_locked(&target_path, content.as_bytes()));
+        match result {
+            Ok(ConfigSaveOutcome::Durable) => {
+                if pending_transaction {
+                    crate::secret_store::reconcile_pending_publication(
+                        &target_path,
+                        &desired_references,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
+                Ok(ConfigSaveOutcome::Durable)
+            }
+            Ok(ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(detail)) => {
+                let authority = if pending_transaction {
+                    "the pending secret-publication journal was retained for reconciliation"
+                } else {
+                    "no secret-store mutation was pending"
+                };
+                Ok(ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(format!(
+                    "{detail}; {authority}"
+                )))
+            }
+            Err(save_error) => {
+                if let Some(reference) = newly_stored_reference {
+                    return match crate::secret_store::abort_pending_publication(
+                        &target_path,
+                        std::slice::from_ref(&reference),
+                    ) {
+                        Ok(()) => Err(save_error),
+                        Err(cleanup_error) => Err(anyhow::anyhow!(
+                            "{save_error}; additionally {cleanup_error}"
+                        )),
+                    };
+                }
+                if pending_transaction {
+                    return match crate::secret_store::reconcile_pending_publication(
+                        &target_path,
+                        &published_references,
+                    ) {
+                        Ok(()) => Err(save_error),
+                        Err(cleanup_error) => Err(anyhow::anyhow!(
+                            "{save_error}; additionally failed to reconcile the uncommitted archive-password clear operation: {cleanup_error}"
+                        )),
+                    };
+                }
+                Err(save_error)
+            }
+        }
     }
 
     /// Get the config file path
     pub fn config_path() -> PathBuf {
+        #[cfg(test)]
+        if let Some(path) = TEST_CONFIG_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return path;
+        }
+
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tonepoet")
@@ -803,9 +1848,83 @@ impl TonepoetConfig {
     }
 }
 
+fn require_durable_config_save(outcome: ConfigSaveOutcome) -> anyhow::Result<()> {
+    match outcome {
+        ConfigSaveOutcome::Durable => Ok(()),
+        ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(message) => {
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
 #[cfg(test)]
 mod theme_config_tests {
     use super::*;
+
+    struct PublicSaveInjectionGuard;
+
+    impl PublicSaveInjectionGuard {
+        fn install(path: PathBuf, sync_failure: &str) -> Self {
+            TEST_CONFIG_PATH_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(path));
+            TEST_CONFIG_PUBLICATION_SYNC_FAILURE.with(|slot| {
+                *slot.borrow_mut() = Some(sync_failure.to_string());
+            });
+            Self
+        }
+    }
+
+    impl Drop for PublicSaveInjectionGuard {
+        fn drop(&mut self) {
+            TEST_CONFIG_PATH_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            TEST_CONFIG_PUBLICATION_SYNC_FAILURE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    struct RecoveryArtifactInjectionGuard;
+
+    impl RecoveryArtifactInjectionGuard {
+        fn fail_next_directory_sync(message: &str) -> Self {
+            TEST_CONFIG_PUBLICATION_SYNC_FAILURE.with(|slot| {
+                *slot.borrow_mut() = Some(message.to_string());
+            });
+            Self
+        }
+
+        fn fail_remove(path: PathBuf, message: &str) -> Self {
+            TEST_STALE_ARTIFACT_REMOVE_FAILURE.with(|slot| {
+                *slot.borrow_mut() = Some((path, message.to_string()));
+            });
+            Self
+        }
+    }
+
+    impl Drop for RecoveryArtifactInjectionGuard {
+        fn drop(&mut self) {
+            TEST_CONFIG_PUBLICATION_SYNC_FAILURE.with(|slot| *slot.borrow_mut() = None);
+            TEST_STALE_ARTIFACT_REMOVE_FAILURE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn assert_no_secret_publication_outcome(outcome: ConfigSaveOutcome) {
+        #[cfg(unix)]
+        assert_eq!(outcome, ConfigSaveOutcome::Durable);
+
+        #[cfg(windows)]
+        assert_eq!(
+            outcome,
+            ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(
+                "config.toml was written, but parent-directory durability could not be confirmed: Windows replacement was not performed with write-through semantics; no secret-store mutation was pending".to_string(),
+            )
+        );
+
+        #[cfg(not(any(unix, windows)))]
+        assert_eq!(
+            outcome,
+            ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(
+                "config.toml was written, but parent-directory durability could not be confirmed: parent-directory durability is unsupported on this platform; no secret-store mutation was pending".to_string(),
+            )
+        );
+    }
 
     #[test]
     fn ui_theme_defaults_to_tokyo_night_when_missing_from_toml() {
@@ -1006,7 +2125,10 @@ append_lineage_to_comment = false
         let path = temp.path().join("nested").join("config.toml");
         let mut config = TonepoetConfig::default();
         config.conversion.write_log_file = true;
-        config.save_to_path(&path).expect("atomic save");
+        let outcome = config
+            .save_to_path_with_outcome(&path)
+            .expect("atomic replacement");
+        assert_no_secret_publication_outcome(outcome);
 
         let encoded = std::fs::read_to_string(&path).expect("saved config");
         assert!(encoded.contains("write_log_file = true"));
@@ -1018,6 +2140,922 @@ append_lineage_to_comment = false
             .filter(|entry| entry.file_name().to_string_lossy().contains(".config.toml.tmp"))
             .count();
         assert_eq!(temp_leftovers, 0, "successful atomic save must not leave temp files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_persists_only_secret_reference_and_rehydrates_exact_value() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password = Some("config-secret-value".to_string());
+
+        config.save_to_path(&path).expect("save with secret reference");
+
+        let encoded = std::fs::read_to_string(&path).expect("saved config");
+        assert!(!encoded.contains("config-secret-value"));
+        let persisted: TonepoetConfig = toml::from_str(&encoded).expect("persisted config");
+        let reference = persisted
+            .conversion
+            .archive_password_ref
+            .as_deref()
+            .expect("secret reference");
+        assert_eq!(
+            crate::secret_store::get(reference).expect("rehydrate secret"),
+            "config-secret-value"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_config_save_explicitly_clears_and_retires_archive_password() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let mut configured = TonepoetConfig::default();
+        configured.conversion.archive_password = Some("reset-me".to_string());
+        configured.save_to_path(&path).expect("save password before reset");
+        let before_reset: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read configured file"),
+        )
+        .expect("parse configured file");
+        let old_reference = before_reset
+            .conversion
+            .archive_password_ref
+            .expect("configured reference");
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+
+        TonepoetConfig::default()
+            .save_to_path(&path)
+            .expect("default save clears password authority");
+
+        let reset: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read reset file"),
+        )
+        .expect("parse reset file");
+        assert_eq!(reset.conversion.archive_password, None);
+        assert_eq!(reset.conversion.archive_password_ref, None);
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
+        assert_eq!(
+            crate::secret_store::get(&old_reference)
+                .expect_err("reset must retire old config authority")
+                .to_string(),
+            format!(
+                "archive-password secret store read failed: reference '{}' is unavailable in the opt-in test backend. No cleartext fallback was used",
+                old_reference
+            )
+        );
+        assert!(!crate::secret_store::pending_publication_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reference_only_save_explicitly_retains_existing_archive_password() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let mut configured = TonepoetConfig::default();
+        configured.conversion.archive_password = Some("retain-me".to_string());
+        configured.save_to_path(&path).expect("save initial password");
+        let persisted: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read initial config"),
+        )
+        .expect("parse initial config");
+        let reference = persisted
+            .conversion
+            .archive_password_ref
+            .expect("initial reference");
+
+        let mut retaining = TonepoetConfig::default();
+        retaining.conversion.archive_password_ref = Some(reference.clone());
+        retaining.conversion.write_log_file = true;
+        retaining.save_to_path(&path).expect("retain reference-only authority");
+
+        let retained: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read retained config"),
+        )
+        .expect("parse retained config");
+        assert_eq!(retained.conversion.archive_password, None);
+        assert_eq!(retained.conversion.archive_password_ref, Some(reference.clone()));
+        assert!(retained.conversion.write_log_file);
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("retained authority remains"),
+            "retain-me"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_saves_and_rotation_are_state_idempotent() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password = Some("first-secret".to_string());
+
+        config.save_to_path(&path).expect("first save");
+        let first_persisted: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read first config"),
+        )
+        .expect("parse first config");
+        let first_reference = first_persisted
+            .conversion
+            .archive_password_ref
+            .clone()
+            .expect("first reference");
+
+        config.save_to_path(&path).expect("repeat same in-memory save");
+        let repeated_persisted: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read repeated config"),
+        )
+        .expect("parse repeated config");
+        assert_eq!(
+            repeated_persisted.conversion.archive_password_ref,
+            Some(first_reference.clone())
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+        assert_eq!(
+            crate::secret_store::get(&first_reference).expect("first authority"),
+            "first-secret"
+        );
+
+        config.conversion.archive_password = Some("rotated-secret".to_string());
+        config.save_to_path(&path).expect("rotate password");
+        let rotated_persisted: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read rotated config"),
+        )
+        .expect("parse rotated config");
+        let rotated_reference = rotated_persisted
+            .conversion
+            .archive_password_ref
+            .clone()
+            .expect("rotated reference");
+        assert_ne!(rotated_reference, first_reference);
+        assert_eq!(
+            crate::secret_store::get(&rotated_reference).expect("rotated authority"),
+            "rotated-secret"
+        );
+        assert_eq!(
+            crate::secret_store::get(&first_reference)
+                .expect_err("superseded first authority must be absent")
+                .to_string(),
+            format!(
+                "archive-password secret store read failed: reference '{}' is unavailable in the opt-in test backend. No cleartext fallback was used",
+                first_reference
+            )
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+
+        config.conversion.archive_password = Some("failed-rotation".to_string());
+        let error = config
+            .save_to_path_with_outcome_impl(&path, || {
+                Err(anyhow::anyhow!("synthetic failure before config publication"))
+            })
+            .expect_err("failed rotation must preserve old authority");
+        assert_eq!(
+            error.to_string(),
+            "synthetic failure before config publication"
+        );
+        let after_failure: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read config after failed rotation"),
+        )
+        .expect("parse config after failed rotation");
+        assert_eq!(
+            after_failure.conversion.archive_password_ref,
+            Some(rotated_reference.clone())
+        );
+        assert_eq!(
+            crate::secret_store::get(&rotated_reference).expect("old authority retained"),
+            "rotated-secret"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+        assert!(!crate::secret_store::pending_publication_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_retires_a_pre_slot_config_reference_from_v3() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let old_reference = crate::secret_store::allocate_reference();
+        crate::secret_store::set(&old_reference, "v3-secret").expect("store v3 authority");
+        let mut old_persisted = TonepoetConfig::default();
+        old_persisted.conversion.archive_password_ref = Some(old_reference.clone());
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&old_persisted).expect("serialize v3 config"),
+        )
+        .expect("write v3 config");
+
+        let mut replacement = TonepoetConfig::default();
+        replacement.conversion.archive_password = Some("v4-secret".to_string());
+        replacement
+            .save_to_path(&path)
+            .expect("rotate v3 config authority");
+
+        let persisted: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read rotated config"),
+        )
+        .expect("parse rotated config");
+        let new_reference = persisted
+            .conversion
+            .archive_password_ref
+            .expect("new config reference");
+        assert_ne!(new_reference, old_reference);
+        assert_eq!(
+            crate::secret_store::get(&new_reference).expect("new authority"),
+            "v4-secret"
+        );
+        assert_eq!(
+            crate::secret_store::get(&old_reference)
+                .expect_err("pre-v4 authority must be retired")
+                .to_string(),
+            format!(
+                "archive-password secret store read failed: reference '{}' is unavailable in the opt-in test backend. No cleartext fallback was used",
+                old_reference
+            )
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn competing_config_writer_threads_are_serialized_across_the_whole_transaction() {
+        use std::sync::{Arc, Barrier};
+
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let stored = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        let first_path = path.clone();
+        let first_stored = Arc::clone(&stored);
+        let first_release = Arc::clone(&release);
+        let first = std::thread::spawn(move || {
+            let mut config = TonepoetConfig::default();
+            config.conversion.archive_password = Some("writer-a".to_string());
+            config.save_to_path_with_outcome_impl(&first_path, || {
+                first_stored.wait();
+                first_release.wait();
+                Ok(())
+            })
+        });
+
+        stored.wait();
+        let mut second_config = TonepoetConfig::default();
+        second_config.conversion.archive_password = Some("writer-b".to_string());
+        let blocked = second_config
+            .save_to_path(&path)
+            .expect_err("second writer must not reconcile another writer's journal");
+        let lock_path = temp.path().join(".config.toml.save.lock");
+        assert_eq!(
+            blocked.to_string(),
+            format!("store update already in progress: {}", lock_path.display())
+        );
+        release.wait();
+        assert_eq!(
+            first.join().expect("first writer thread").expect("first writer"),
+            ConfigSaveOutcome::Durable
+        );
+
+        second_config
+            .save_to_path(&path)
+            .expect("retry after lock release");
+        let persisted: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("read final config"),
+        )
+        .expect("parse final config");
+        let final_reference = persisted
+            .conversion
+            .archive_password_ref
+            .expect("final reference");
+        let [slot_a, slot_b] = config_secret_slot_references(&path).expect("config slots");
+        assert_eq!(final_reference, slot_b);
+        assert_eq!(
+            crate::secret_store::get(&slot_a)
+                .expect_err("writer A slot must be retired")
+                .to_string(),
+            format!(
+                "archive-password secret store read failed: reference '{}' is unavailable in the opt-in test backend. No cleartext fallback was used",
+                slot_a
+            )
+        );
+        assert_eq!(
+            crate::secret_store::get(&final_reference).expect("final authority"),
+            "writer-b"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+        assert!(!crate::secret_store::pending_publication_path(&path).exists());
+    }
+
+    #[test]
+    #[ignore]
+    fn store_lock_subprocess_helper() {
+        let target = PathBuf::from(
+            std::env::var_os("TONEPOET_TEST_LOCK_TARGET")
+                .expect("subprocess lock target"),
+        );
+        let ready = PathBuf::from(
+            std::env::var_os("TONEPOET_TEST_LOCK_READY")
+                .expect("subprocess ready marker"),
+        );
+        let (_lock, resolved) = StoreFileLock::acquire_for_path(&target)
+            .expect("subprocess acquires store lock");
+        std::fs::write(&ready, resolved.to_string_lossy().as_bytes())
+            .expect("publish subprocess ready marker");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn store_lock_excludes_an_independent_process_and_releases_after_process_death() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("config.toml");
+        let ready = temp.path().join("child-ready");
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut child = std::process::Command::new(executable)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("config::theme_config_tests::store_lock_subprocess_helper")
+            .env("TONEPOET_TEST_LOCK_TARGET", &target)
+            .env("TONEPOET_TEST_LOCK_READY", &ready)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn independent lock holder");
+
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            if let Some(status) = child.try_wait().expect("poll lock holder") {
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut stderr| {
+                        use std::io::Read;
+                        let mut bytes = Vec::new();
+                        stderr.read_to_end(&mut bytes).expect("read child stderr");
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    })
+                    .unwrap_or_default();
+                panic!("lock-holder subprocess exited early with {status}: {stderr}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("independent lock holder did not publish readiness");
+        }
+
+        let lock_path = temp.path().join(".config.toml.save.lock");
+        let blocked = StoreFileLock::acquire_for_path(&target)
+            .expect_err("independent holder must exclude this process")
+            .to_string();
+
+        child.kill().expect("terminate lock holder abnormally");
+        let status = child.wait().expect("reap lock holder");
+        assert!(!status.success());
+        assert_eq!(
+            blocked,
+            format!("store update already in progress: {}", lock_path.display())
+        );
+        let (_recovered_lock, resolved) = StoreFileLock::acquire_for_path(&target)
+            .expect("OS releases lock after holder process dies");
+        assert_eq!(resolved, target);
+        assert!(std::fs::symlink_metadata(&lock_path)
+            .expect("lock sidecar metadata")
+            .is_file());
+    }
+
+    #[test]
+    fn store_lock_marker_is_created_once_and_existing_marker_is_not_rewritten() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("config.toml");
+        let lock_path = temp.path().join(".config.toml.save.lock");
+
+        {
+            let (_lock, resolved) = StoreFileLock::acquire_for_path(&target)
+                .expect("create first store lock marker");
+            assert_eq!(resolved, target);
+        }
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read first marker"),
+            STORE_LOCK_MARKER
+        );
+
+        let legacy = format!("pid=42 target={}\n", target.display());
+        std::fs::write(&lock_path, legacy.as_bytes()).expect("install v4 legacy marker");
+        {
+            let (_lock, resolved) = StoreFileLock::acquire_for_path(&target)
+                .expect("accept legacy marker without migration write");
+            assert_eq!(resolved, target);
+        }
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read unchanged legacy marker"),
+            legacy.as_bytes()
+        );
+    }
+
+    #[test]
+    fn failed_new_lock_marker_initialization_retains_one_lock_inode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("config.toml");
+        let lock_path = temp.path().join(".config.toml.save.lock");
+        TEST_LOCK_MARKER_SYNC_FAILURE.with(|slot| {
+            *slot.borrow_mut() = Some("synthetic lock-parent sync failure".to_string());
+        });
+
+        let error = StoreFileLock::acquire_for_path(&target)
+            .expect_err("marker parent-sync failure must abort acquisition")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "sync parent after creating store lock '{}': synthetic lock-parent sync failure; store lock marker '{}' was retained to avoid splitting lock authority",
+                lock_path.display(),
+                lock_path.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&lock_path).expect("retained marker"),
+            STORE_LOCK_MARKER
+        );
+
+        let (_lock, resolved) = StoreFileLock::acquire_for_path(&target)
+            .expect("retained complete marker remains the sole lock authority");
+        assert_eq!(resolved, target);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("unchanged retained marker"),
+            STORE_LOCK_MARKER
+        );
+    }
+
+    #[test]
+    fn store_lock_rejects_unrecognized_regular_file_without_rewriting_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("config.toml");
+        let lock_path = temp.path().join(".config.toml.save.lock");
+        std::fs::write(&lock_path, b"unrelated regular-file bytes")
+            .expect("write unrelated lock-path object");
+
+        assert_eq!(
+            StoreFileLock::acquire_for_path(&target)
+                .expect_err("unrecognized marker must fail closed")
+                .to_string(),
+            format!(
+                "store lock path '{}' does not contain a recognized tonepoet lock marker",
+                lock_path.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read untouched unrelated file"),
+            b"unrelated regular-file bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_lock_rejects_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("config.toml");
+        let lock_path = temp.path().join(".config.toml.save.lock");
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, b"authoritative victim bytes").expect("write victim");
+        symlink(&victim, &lock_path).expect("create hostile lock symlink");
+
+        assert_eq!(
+            StoreFileLock::acquire_for_path(&target)
+                .expect_err("symlinked lock path must fail closed")
+                .to_string(),
+            format!("refusing symlinked store lock path '{}'", lock_path.display())
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("read untouched victim"),
+            b"authoritative victim bytes"
+        );
+        assert!(std::fs::symlink_metadata(&lock_path)
+            .expect("lock symlink remains")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_lock_rejects_hard_link_without_touching_its_other_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("config.toml");
+        let lock_path = temp.path().join(".config.toml.save.lock");
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, b"hard-linked victim bytes").expect("write victim");
+        std::fs::hard_link(&victim, &lock_path).expect("create hostile lock hard link");
+
+        assert_eq!(
+            StoreFileLock::acquire_for_path(&target)
+                .expect_err("multiply linked lock path must fail closed")
+                .to_string(),
+            format!(
+                "store lock path '{}' has 2 hard links; refusing ambiguous lock authority",
+                lock_path.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("read untouched hard-link target"),
+            b"hard-linked victim bytes"
+        );
+    }
+
+    #[test]
+    fn config_save_with_unavailable_existing_reference_fails_without_storing_a_replacement() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password = Some("rehydrated-secret".to_string());
+        config.conversion.archive_password_ref =
+            Some("archive-password:missing-save-reference".to_string());
+
+        let error = config
+            .save_to_path(&path)
+            .expect_err("an unavailable existing reference must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "cannot verify existing archive-password reference 'archive-password:missing-save-reference' while saving configuration; no replacement reference was stored: archive-password secret store read failed: reference 'archive-password:missing-save-reference' is unavailable in the opt-in test backend. No cleartext fallback was used"
+        );
+        assert!(!path.exists(), "failed validation must not publish configuration");
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_failure_removes_unpublished_secret_reference() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::create_dir(&path).expect("directory target blocks atomic rename");
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password = Some("must-not-be-orphaned".to_string());
+
+        config
+            .save_to_path(&path)
+            .expect_err("publishing over a directory must fail");
+
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            0,
+            "a failed config publish must not orphan its newly created secret"
+        );
+    }
+
+    #[test]
+    fn config_load_with_unavailable_secret_reference_fails_instead_of_defaulting() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password_ref =
+            Some("archive-password:missing-config-reference".to_string());
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&config).expect("serialize referenced config"),
+        )
+        .expect("write referenced config");
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("unavailable referenced secret must fail startup config load");
+        assert_eq!(
+            error.to_string(),
+            "archive-password secret store read failed: reference 'archive-password:missing-config-reference' is unavailable in the opt-in test backend. No cleartext fallback was used"
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_disagreeing_legacy_cleartext_and_reference() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let reference = crate::secret_store::store("referenced-secret").expect("store reference");
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password_ref = Some(reference);
+        let baseline = toml::to_string_pretty(&config).expect("serialize referenced config");
+        let legacy = baseline.replacen(
+            "[conversion]\n",
+            "[conversion]\narchive_password = \"conflicting-cleartext\"\n",
+            1,
+        );
+        std::fs::write(&path, &legacy).expect("write conflicting legacy config");
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("conflicting persisted password authorities must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "archive-password migration is ambiguous: config cleartext and secret reference disagree"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("original retained"), legacy);
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_backup_permission_error_reports_cleanup_failure() {
+        let error = migration_backup_permission_error(
+            Path::new("/tmp/config.toml.pre-keychain-migration"),
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "chmod denied"),
+            Some(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unlink denied",
+            )),
+        );
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "restrict cleartext migration backup '/tmp/config.toml.pre-keychain-migration': chmod denied; additionally failed to remove the newly created unrestricted backup: unlink denied"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_migration_rejects_a_stale_backup_and_removes_new_secret_reference() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let baseline = toml::to_string_pretty(&TonepoetConfig::default())
+            .expect("serialize baseline config");
+        let legacy = baseline.replacen(
+            "[conversion]\n",
+            "[conversion]\narchive_password = \"current-secret\"\n",
+            1,
+        );
+        std::fs::write(&path, &legacy).expect("legacy config");
+        std::fs::write(
+            temp.path().join("config.toml.pre-keychain-migration"),
+            "stale backup bytes",
+        )
+        .expect("stale backup");
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("stale backup must block migration");
+
+        assert!(
+            error.to_string().contains("does not match current source"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("source retained"), legacy);
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matching_existing_config_migration_backup_is_restricted_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("config.toml");
+        let backup = temp.path().join("config.toml.pre-keychain-migration");
+        let bytes = b"archive_password = \"legacy-secret\"\n";
+        std::fs::write(&source, bytes).expect("source");
+        std::fs::write(&backup, bytes).expect("matching backup");
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive backup mode");
+
+        create_restricted_migration_backup(&source, &backup)
+            .expect("matching backup should be accepted and restricted");
+
+        assert_eq!(std::fs::read(&backup).expect("backup bytes"), bytes);
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_config_replacement_backup_is_restored_before_secret_reconciliation() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let backup = temp
+            .path()
+            .join(".config.toml.replace-backup.crashed.1");
+        let reference = crate::secret_store::allocate_reference();
+        crate::secret_store::set(&reference, "restored-authority")
+            .expect("store referenced secret");
+        crate::secret_store::begin_pending_publication(
+            &path,
+            std::slice::from_ref(&reference),
+        )
+        .expect("journal interrupted publication");
+        let mut persisted = TonepoetConfig::default();
+        persisted.conversion.archive_password_ref = Some(reference.clone());
+        std::fs::write(
+            &backup,
+            toml::to_string_pretty(&persisted).expect("serialize replacement backup"),
+        )
+        .expect("write replacement backup");
+
+        let loaded = TonepoetConfig::load_from_path(&path)
+            .expect("restore authoritative config before reconciling its secret");
+
+        assert_eq!(
+            loaded.conversion.archive_password.as_deref(),
+            Some("restored-authority")
+        );
+        assert_eq!(
+            loaded.conversion.archive_password_ref.as_deref(),
+            Some(reference.as_str())
+        );
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("restored secret retained"),
+            "restored-authority"
+        );
+        assert!(path.exists());
+        assert!(!backup.exists());
+        assert!(!crate::secret_store::pending_publication_path(&path).exists());
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_config_reconciles_an_unpublished_secret_before_returning_defaults() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let orphan = crate::secret_store::allocate_reference();
+        crate::secret_store::begin_pending_publication(
+            &path,
+            std::slice::from_ref(&orphan),
+        )
+        .expect("journal interrupted initial save");
+        crate::secret_store::set(&orphan, "unpublished-secret")
+            .expect("store simulated orphan");
+
+        let loaded = TonepoetConfig::load_from_path(&path)
+            .expect("missing config should reconcile and return defaults");
+
+        assert_eq!(loaded.conversion.archive_password, None);
+        assert_eq!(loaded.conversion.archive_password_ref, None);
+        assert!(crate::secret_store::get(&orphan).is_err());
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
+        assert!(!crate::secret_store::pending_publication_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_migration_reconciles_crash_after_secret_store_before_reference_publish() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let baseline = toml::to_string_pretty(&TonepoetConfig::default())
+            .expect("serialize baseline config");
+        let legacy = baseline.replacen(
+            "[conversion]\n",
+            "[conversion]\narchive_password = \"legacy-after-crash\"\n",
+            1,
+        );
+        std::fs::write(&path, &legacy).expect("write legacy config");
+        let orphan = crate::secret_store::allocate_reference();
+        crate::secret_store::begin_pending_publication(
+            &path,
+            std::slice::from_ref(&orphan),
+        )
+        .expect("journal simulated interrupted migration");
+        crate::secret_store::set(&orphan, "legacy-after-crash")
+            .expect("store simulated orphan");
+
+        let loaded = TonepoetConfig::load_from_path(&path)
+            .expect("reconcile interrupted migration and retry");
+
+        assert_eq!(
+            loaded.conversion.archive_password.as_deref(),
+            Some("legacy-after-crash")
+        );
+        assert!(crate::secret_store::get(&orphan).is_err());
+        let rewritten = std::fs::read_to_string(&path).expect("read rewritten config");
+        let persisted: TonepoetConfig = toml::from_str(&rewritten).expect("parse rewritten config");
+        let published = persisted
+            .conversion
+            .archive_password_ref
+            .as_deref()
+            .expect("published replacement reference");
+        assert_ne!(published, orphan.as_str());
+        assert_eq!(
+            crate::secret_store::get(published).expect("published secret"),
+            "legacy-after-crash"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+        assert!(!crate::secret_store::pending_publication_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_load_preserves_reference_published_before_crash_and_retires_journal() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let reference = crate::secret_store::allocate_reference();
+        crate::secret_store::begin_pending_publication(
+            &path,
+            std::slice::from_ref(&reference),
+        )
+        .expect("journal simulated publication");
+        crate::secret_store::set(&reference, "published-before-crash")
+            .expect("store secret");
+        let mut persisted = TonepoetConfig::default();
+        persisted.conversion.archive_password_ref = Some(reference.clone());
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&persisted).expect("serialize referenced config"),
+        )
+        .expect("publish reference without retiring journal");
+
+        let loaded = TonepoetConfig::load_from_path(&path)
+            .expect("reconcile published reference");
+
+        assert_eq!(
+            loaded.conversion.archive_password.as_deref(),
+            Some("published-before-crash")
+        );
+        assert_eq!(
+            loaded.conversion.archive_password_ref.as_deref(),
+            Some(reference.as_str())
+        );
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("published secret retained"),
+            "published-before-crash"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+        assert!(!crate::secret_store::pending_publication_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_load_migrates_cleartext_with_backup_and_runtime_rehydration() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let baseline = toml::to_string_pretty(&TonepoetConfig::default())
+            .expect("serialize baseline config");
+        let legacy = baseline.replacen(
+            "[conversion]\n",
+            "[conversion]\narchive_password = \"legacy-config-secret\"\n",
+            1,
+        );
+        std::fs::write(&path, &legacy).expect("legacy config");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive legacy mode");
+
+        let loaded = TonepoetConfig::load_from_path(&path).expect("migrate legacy config");
+
+        assert_eq!(
+            loaded.conversion.archive_password.as_deref(),
+            Some("legacy-config-secret")
+        );
+        let rewritten = std::fs::read_to_string(&path).expect("rewritten config");
+        assert!(!rewritten.contains("legacy-config-secret"));
+        let persisted: TonepoetConfig = toml::from_str(&rewritten).expect("rewritten config parses");
+        let reference = persisted
+            .conversion
+            .archive_password_ref
+            .as_deref()
+            .expect("migrated reference");
+        assert_eq!(
+            crate::secret_store::get(reference).expect("migrated secret"),
+            "legacy-config-secret"
+        );
+        let migration_backup = temp.path().join("config.toml.pre-keychain-migration");
+        assert_eq!(
+            std::fs::read_to_string(&migration_backup).expect("migration backup"),
+            legacy
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&migration_backup)
+                .expect("migration backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1056,7 +3094,7 @@ append_lineage_to_comment = false
             .save_to_path_with_outcome(&path)
             .expect("replace existing regular file");
 
-        assert_eq!(outcome, ConfigSaveOutcome::Durable);
+        assert_no_secret_publication_outcome(outcome);
         let encoded = std::fs::read_to_string(&path).expect("new config");
         assert!(encoded.contains("write_log_file = true"));
         assert!(!encoded.contains("old = true"));
@@ -1108,6 +3146,111 @@ append_lineage_to_comment = false
         assert!(!encoded.contains("old = true"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn config_save_resolves_complete_final_symlink_chain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let actual_dir = temp.path().join("actual");
+        std::fs::create_dir(&actual_dir).expect("actual dir");
+        let actual = actual_dir.join("tonepoet.toml");
+        std::fs::write(&actual, b"old = true\n").expect("actual config");
+        let middle = temp.path().join("current-config");
+        let entry = temp.path().join("config.toml");
+        std::os::unix::fs::symlink(&actual, &middle).expect("middle symlink");
+        std::os::unix::fs::symlink("current-config", &entry).expect("entry symlink");
+        let mut config = TonepoetConfig::default();
+        config.conversion.write_log_file = true;
+
+        config.save_to_path(&entry).expect("save through complete chain");
+
+        assert!(std::fs::symlink_metadata(&entry)
+            .expect("entry metadata")
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&middle)
+            .expect("middle metadata")
+            .file_type()
+            .is_symlink());
+        let encoded = std::fs::read_to_string(&actual).expect("actual target updated");
+        assert!(encoded.contains("write_log_file = true"));
+        assert!(!encoded.contains("old = true"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_rejects_symlink_cycle_without_replacing_either_link() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("config.toml");
+        let second = temp.path().join("current-config");
+        std::os::unix::fs::symlink("current-config", &first).expect("first symlink");
+        std::os::unix::fs::symlink("config.toml", &second).expect("second symlink");
+
+        let error = TonepoetConfig::default()
+            .save_to_path(&first)
+            .expect_err("symlink cycle must fail closed")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "configuration path symlink cycle detected at '{}'",
+                first.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_link(&first).expect("first remains"),
+            PathBuf::from("current-config")
+        );
+        assert_eq!(
+            std::fs::read_link(&second).expect("second remains"),
+            PathBuf::from("config.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_rejects_excessive_symlink_depth_without_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("config.toml");
+        for index in 0..=40usize {
+            let current = if index == 0 {
+                entry.clone()
+            } else {
+                temp.path().join(format!("link-{index}"))
+            };
+            let next = if index == 40 {
+                PathBuf::from("actual-config")
+            } else {
+                PathBuf::from(format!("link-{}", index + 1))
+            };
+            std::os::unix::fs::symlink(&next, &current).expect("build deep symlink chain");
+        }
+        let actual = temp.path().join("actual-config");
+        std::fs::write(&actual, b"authoritative bytes").expect("actual target");
+
+        let error = TonepoetConfig::default()
+            .save_to_path(&entry)
+            .expect_err("over-deep chain must fail closed")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "configuration path '{}' exceeds the maximum symlink depth of 40",
+                entry.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&actual).expect("actual remains unchanged"),
+            b"authoritative bytes"
+        );
+        assert!(std::fs::symlink_metadata(&entry)
+            .expect("entry remains")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn config_save_removes_stale_temporary_files() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1115,16 +3258,23 @@ append_lineage_to_comment = false
         let stale = temp.path().join(".config.toml.tmp.crashed.123");
         let stale_backup = temp.path().join(".config.toml.replace-backup.crashed.123");
         std::fs::write(&stale, b"secret = true\n").expect("stale temp");
-        std::fs::write(&stale_backup, b"old_secret = true\n").expect("stale backup");
+        std::fs::write(
+            &stale_backup,
+            toml::to_string_pretty(&TonepoetConfig::default())
+                .expect("serialize valid stale backup"),
+        )
+        .expect("stale backup");
 
-        TonepoetConfig::default()
-            .save_to_path(&path)
-            .expect("save config");
+        let outcome = TonepoetConfig::default()
+            .save_to_path_with_outcome(&path)
+            .expect("replace config after stale-artifact recovery");
+        assert_no_secret_publication_outcome(outcome);
 
         assert!(!stale.exists(), "save should recover stale temp files containing full config content");
         assert!(!stale_backup.exists(), "save should recover stale replace backups containing config content");
     }
 
+    #[cfg(unix)]
     #[test]
     fn abandoned_config_save_lock_sidecar_does_not_block_or_delay_save() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1132,15 +3282,22 @@ append_lineage_to_comment = false
         let stale_tmp = temp.path().join(".config.toml.tmp.crashed.1");
         let lock = temp.path().join(".config.toml.save.lock");
         std::fs::write(&stale_tmp, b"archive_password = secret\n").expect("stale temp");
-        std::fs::write(&lock, b"pid=crashed").expect("abandoned diagnostic lock file");
+        let legacy_marker = format!("pid=4242 target={}\n", path.display());
+        std::fs::write(&lock, legacy_marker.as_bytes())
+            .expect("abandoned legacy lock marker");
 
-        TonepoetConfig::default()
-            .save_to_path(&path)
+        let outcome = TonepoetConfig::default()
+            .save_to_path_with_outcome(&path)
             .expect("OS-backed lock must not treat an abandoned sidecar file as an active save");
+        assert_no_secret_publication_outcome(outcome);
 
         assert!(path.exists(), "save should complete immediately after crash recovery");
         assert!(!stale_tmp.exists(), "stale temp containing serialized config should be removed after the lock is acquired");
-        assert!(lock.exists(), "the diagnostic lock sidecar may persist without blocking future saves");
+        assert_eq!(
+            std::fs::read(&lock).expect("read retained legacy marker"),
+            legacy_marker.as_bytes(),
+            "an abandoned valid marker remains non-authoritative and is not rewritten"
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -1150,27 +3307,230 @@ append_lineage_to_comment = false
         let path = temp.path().join("config.toml");
         let active_tmp = temp.path().join(".config.toml.tmp.other.1");
         std::fs::write(&active_tmp, b"archive_password = secret\n").expect("active temp");
-        let _lock = ConfigSaveLock::acquire(temp.path(), &path).expect("hold save lock");
+        let _lock = StoreFileLock::acquire(temp.path(), &path).expect("hold save lock");
 
         let error = TonepoetConfig::default()
             .save_to_path(&path)
             .expect_err("concurrent save should be rejected while OS lock is held");
 
-        assert!(error.to_string().contains("already in progress"));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "store update already in progress: {}",
+                temp.path().join(".config.toml.save.lock").display()
+            )
+        );
         assert!(active_tmp.exists(), "must not clean active temp files while another saver owns the OS lock");
     }
 
     #[test]
-    fn stale_non_unix_backup_is_restored_before_cleanup_when_target_missing() {
+    fn two_valid_replacement_backups_fail_closed_without_selecting_by_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let first = temp.path().join(".config.toml.replace-backup.crashed.1");
+        let second = temp.path().join(".config.toml.replace-backup.crashed.2");
+        let mut first_config = TonepoetConfig::default();
+        first_config.conversion.archive_password_ref = Some("tonepoet-secret:first".to_string());
+        let mut second_config = TonepoetConfig::default();
+        second_config.conversion.archive_password_ref = Some("tonepoet-secret:second".to_string());
+        std::fs::write(
+            &first,
+            toml::to_string_pretty(&first_config).expect("serialize first backup"),
+        )
+        .expect("first backup");
+        std::fs::write(
+            &second,
+            toml::to_string_pretty(&second_config).expect("serialize second backup"),
+        )
+        .expect("second backup");
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("multiple plausible backups must not be guessed")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "cannot recover missing configuration '{}': multiple valid replacement backups are present: '{}', '{}'",
+                path.display(),
+                first.display(),
+                second.display()
+            )
+        );
+        assert!(!path.exists());
+        assert!(first.exists());
+        assert!(second.exists());
+    }
+
+    #[test]
+    fn malformed_replacement_backup_is_rejected_without_cleanup() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("config.toml");
         let backup = temp.path().join(".config.toml.replace-backup.crashed.1");
-        std::fs::write(&backup, b"old = true\n").expect("backup");
+        std::fs::write(&backup, b"not valid tonepoet config = [").expect("malformed backup");
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("malformed backup must fail closed")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "stale configuration replacement backup '{}' is not a valid Tonepoet configuration",
+                backup.display()
+            )
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(&backup).expect("malformed backup retained"),
+            b"not valid tonepoet config = ["
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_replacement_backup_is_rejected_without_following_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let target = temp.path().join("outside-config");
+        let backup = temp.path().join(".config.toml.replace-backup.crashed.1");
+        let bytes = toml::to_string_pretty(&TonepoetConfig::default())
+            .expect("serialize target config");
+        std::fs::write(&target, &bytes).expect("target config");
+        std::os::unix::fs::symlink(&target, &backup).expect("symlink backup");
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("symlinked backup must fail closed")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "stale configuration replacement backup '{}' is not a regular file",
+                backup.display()
+            )
+        );
+        assert!(!path.exists());
+        assert!(std::fs::symlink_metadata(&backup)
+            .expect("backup remains")
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).expect("target retained"), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_sync_failure_retains_backup_journal_and_credential_authority() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let backup = temp.path().join(".config.toml.replace-backup.crashed.1");
+        let reference = crate::secret_store::stable_reference("recovery-test", "sync-failure")
+            .expect("stable reference");
+        crate::secret_store::set(&reference, "retained-secret")
+            .expect("store recovery secret");
+        crate::secret_store::begin_pending_publication(
+            &path,
+            std::slice::from_ref(&reference),
+        )
+        .expect("write pending journal");
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password_ref = Some(reference.clone());
+        std::fs::write(
+            &backup,
+            toml::to_string_pretty(&config).expect("serialize backup"),
+        )
+        .expect("backup");
+        let _injection = RecoveryArtifactInjectionGuard::fail_next_directory_sync(
+            "synthetic recovery directory sync failure",
+        );
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("nondurable recovery must stop before secret reconciliation")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "configuration recovery replaced '{}', but parent-directory durability could not be confirmed: synthetic recovery directory sync failure; replacement backup '{}' was retained and secret reconciliation was not attempted",
+                path.display(),
+                backup.display()
+            )
+        );
+        assert!(path.exists(), "rename occurred but was not certified durable");
+        assert!(backup.exists(), "authoritative backup must remain available");
+        assert!(crate::secret_store::pending_publication_path(&path).exists());
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("credential retained"),
+            "retained-secret"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_temporary_cleanup_failure_is_visible_and_retains_secret_authority() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let stale = temp.path().join(".config.toml.tmp.crashed.1");
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&TonepoetConfig::default()).expect("serialize config"),
+        )
+        .expect("published config");
+        std::fs::write(&stale, b"historical cleartext = true\n").expect("stale temp");
+        let reference = crate::secret_store::stable_reference("recovery-test", "cleanup-failure")
+            .expect("stable reference");
+        crate::secret_store::set(&reference, "unreconciled-secret")
+            .expect("store pending secret");
+        crate::secret_store::begin_pending_publication(
+            &path,
+            std::slice::from_ref(&reference),
+        )
+        .expect("pending journal");
+        let _injection = RecoveryArtifactInjectionGuard::fail_remove(
+            stale.clone(),
+            "synthetic stale temporary cleanup failure",
+        );
+
+        let error = TonepoetConfig::load_from_path(&path)
+            .expect_err("cleanup failure must be visible")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "remove stale configuration artifact '{}': synthetic stale temporary cleanup failure",
+                stale.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(&stale).expect("stale temp retained"),
+            b"historical cleartext = true\n"
+        );
+        assert!(crate::secret_store::pending_publication_path(&path).exists());
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("credential retained"),
+            "unreconciled-secret"
+        );
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_valid_backup_is_restored_durably_before_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let backup = temp.path().join(".config.toml.replace-backup.crashed.1");
+        let bytes = toml::to_string_pretty(&TonepoetConfig::default())
+            .expect("serialize valid backup");
+        std::fs::write(&backup, &bytes).expect("backup");
 
         recover_stale_config_artifacts(temp.path(), &path).expect("recover artifacts");
 
-        assert_eq!(std::fs::read_to_string(&path).expect("restored"), "old = true\n");
-        assert!(!backup.exists(), "backup should have been moved back into place");
+        assert_eq!(std::fs::read_to_string(&path).expect("restored"), bytes);
+        assert!(!backup.exists(), "backup should be removed only after durable restore");
     }
 
     #[test]
@@ -1188,9 +3548,66 @@ append_lineage_to_comment = false
         )
         .expect("rename succeeds; sync warning is an outcome");
 
-        assert!(matches!(outcome, ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(_)));
+        assert_eq!(
+            outcome,
+            ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(
+                "config.toml was written, but parent-directory durability could not be confirmed: sync failed".to_string()
+            )
+        );
         assert_eq!(std::fs::read_to_string(&path).expect("published"), "new = true\n");
         assert!(!tmp.exists(), "published temp path should be gone after rename");
+    }
+
+    #[test]
+    fn public_save_returns_exact_error_when_publication_durability_is_unconfirmed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let _injection = PublicSaveInjectionGuard::install(
+            path.clone(),
+            "synthetic public-save sync failure",
+        );
+
+        let error = TonepoetConfig::default()
+            .save()
+            .expect_err("the production save API must not discard durability failure")
+            .to_string();
+
+        assert_eq!(
+            error,
+            "config.toml was written, but parent-directory durability could not be confirmed: synthetic public-save sync failure; no secret-store mutation was pending"
+        );
+        let persisted: TonepoetConfig = toml::from_str(
+            &std::fs::read_to_string(&path).expect("replacement was published"),
+        )
+        .expect("published config parses");
+        assert_eq!(persisted.conversion.archive_password, None);
+        assert_eq!(persisted.conversion.archive_password_ref, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_replacement_is_never_classified_as_durable_without_write_through() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let structured_path = temp.path().join("structured.toml");
+        let strict_path = temp.path().join("strict.toml");
+        let expected =
+            "config.toml was written, but parent-directory durability could not be confirmed: Windows replacement was not performed with write-through semantics; no secret-store mutation was pending";
+
+        let outcome = TonepoetConfig::default()
+            .save_to_path_with_outcome(&structured_path)
+            .expect("replacement itself succeeds");
+        assert_eq!(
+            outcome,
+            ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(expected.to_string())
+        );
+        assert!(structured_path.exists());
+
+        let error = TonepoetConfig::default()
+            .save_to_path(&strict_path)
+            .expect_err("strict save must reject unconfirmed Windows durability")
+            .to_string();
+        assert_eq!(error, expected);
+        assert!(strict_path.exists());
     }
 
 }

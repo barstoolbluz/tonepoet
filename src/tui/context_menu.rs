@@ -1679,7 +1679,7 @@ fn launch_gnudb_for_split_cue_grouping_decision(
     } else if let Some(info) = selected.into_iter().next() {
         launch_single_image_gnudb(operation_id, info, app, tx);
     } else {
-        super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
+        super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
         app.set_status("GNUDB: no usable CUE/image pairs for lookup");
     }
 }
@@ -1698,7 +1698,7 @@ pub(super) fn handle_gnudb_split_cue_album_grouping_complete(
     let outcome = match result {
         Ok(outcome) => *outcome,
         Err(err) => {
-            super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
+            super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
             app.set_status(format!("GNUDB: split-CUE grouping failed: {err}"));
             return;
         }
@@ -1813,7 +1813,7 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         let durations =
             super::gnudb::collect_durations(group_paths, &app.browse);
         if durations.len() != group_paths.len() {
-            super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
+            super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
             app.set_status("Probe all files first (some durations missing)");
             return;
         }
@@ -1823,16 +1823,13 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             disc_id.disc_id
         ));
         let paths_for_editor = group_paths.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
+        super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
             let result = super::gnudb::query_gnudb(&disc_id).await;
-            let _ = tx
-                .send(super::message::AppMessage::GnudbQueryComplete {
-                    operation_id,
-                    result,
-                    paths: paths_for_editor,
-                })
-                .await;
+            super::message::AppMessage::GnudbQueryComplete {
+                operation_id,
+                result,
+                paths: paths_for_editor,
+            }
         });
     } else {
         // Multi-disc — query each disc sequentially in one task.
@@ -1856,12 +1853,11 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             disc_queries.push((label, disc_id, group_paths));
         }
         if disc_queries.is_empty() {
-            super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
+            super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
             app.set_status("Could not probe disc durations");
             return;
         }
-        let tx = tx.clone();
-        tokio::spawn(async move {
+        super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
             let mut all_entries = Vec::new();
             for (label, disc_id, group_paths) in disc_queries {
                 if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
@@ -1874,12 +1870,10 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
                     }
                 }
             }
-            let _ = tx
-                .send(super::message::AppMessage::GnudbMultiDiscComplete {
-                    operation_id,
-                    entries: all_entries,
-                })
-                .await;
+            super::message::AppMessage::GnudbMultiDiscComplete {
+                operation_id,
+                entries: all_entries,
+            }
         });
     }
 }
@@ -1920,7 +1914,7 @@ pub(super) fn launch_multi_single_image_gnudb(
     }
 
     if queries.is_empty() {
-        super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
+        super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
         app.set_status("GNUDB: no usable CUE/image pairs for lookup");
         return;
     }
@@ -1929,8 +1923,7 @@ pub(super) fn launch_multi_single_image_gnudb(
         "Querying gnudb.org ({} CUE parts)...",
         queries.len(),
     ));
-    let tx = tx.clone();
-    tokio::spawn(async move {
+    super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
         let mut all_entries = Vec::new();
         for (label, disc_id, paths_for_editor) in queries {
             if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
@@ -1941,12 +1934,10 @@ pub(super) fn launch_multi_single_image_gnudb(
                 }
             }
         }
-        let _ = tx
-            .send(super::message::AppMessage::GnudbMultiDiscComplete {
-                operation_id,
-                entries: all_entries,
-            })
-            .await;
+        super::message::AppMessage::GnudbMultiDiscComplete {
+            operation_id,
+            entries: all_entries,
+        }
     });
 }
 
@@ -1962,7 +1953,7 @@ pub(super) fn launch_single_image_gnudb(
         .map(|&(_, count)| count as f64 / info.sample_rate as f64)
         .collect();
     if durations.is_empty() {
-        super::event_loop::finish_gnudb_operation_if_current(app, operation_id);
+        super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
         app.set_status("GNUDB: CUE has no usable track boundaries");
         return;
     }
@@ -1974,16 +1965,13 @@ pub(super) fn launch_single_image_gnudb(
     let paths_for_editor: Vec<std::path::PathBuf> = (0..info.sheet.tracks.len())
         .map(|_| info.audio_path.clone())
         .collect();
-    let tx = tx.clone();
-    tokio::spawn(async move {
+    super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
         let result = super::gnudb::query_gnudb(&disc_id).await;
-        let _ = tx
-            .send(super::message::AppMessage::GnudbQueryComplete {
-                operation_id,
-                result,
-                paths: paths_for_editor,
-            })
-            .await;
+        super::message::AppMessage::GnudbQueryComplete {
+            operation_id,
+            result,
+            paths: paths_for_editor,
+        }
     });
 }
 

@@ -264,11 +264,15 @@ pub enum ReplayGainChoice {
     Album,
     Track,
     Both,
+    AlbumIfMissing,
+    TrackIfMissing,
+    BothIfMissing,
 }
 
 /// Bit depth options including float formats
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BitDepthChoice {
+    Source,
     Int16,
     Int24,
     Int32,
@@ -280,6 +284,7 @@ impl BitDepthChoice {
     /// Get the integer bit depth (for formats that use integer encoding)
     pub fn bits(&self) -> u32 {
         match self {
+            Self::Source => 0,
             Self::Int16 => 16,
             Self::Int24 => 24,
             Self::Int32 => 32,
@@ -291,6 +296,7 @@ impl BitDepthChoice {
     /// Map to the backend's bit depth convention (320 = float32)
     pub fn to_backend_depth(&self) -> u32 {
         match self {
+            Self::Source => 0,
             Self::Int16 => 16,
             Self::Int24 => 24,
             Self::Int32 => 32,
@@ -301,6 +307,10 @@ impl BitDepthChoice {
 
     pub fn is_float(&self) -> bool {
         matches!(self, Self::Float32 | Self::Float64)
+    }
+
+    pub fn is_source(&self) -> bool {
+        matches!(self, Self::Source)
     }
 }
 /// PCM resampler preference exposed in the format pane.
@@ -937,17 +947,33 @@ pub(crate) fn create_pending_archive_preview(
     }
 }
 
-pub(crate) fn archive_preview_password_for_path(app: &mut AppState, path: &Path) -> Option<String> {
+pub(crate) fn stored_archive_password(app: &mut AppState) -> Result<Option<String>, String> {
+    if let Some(password) = app.config.conversion.archive_password.clone() {
+        return Ok(Some(password));
+    }
+    app.keychain
+        .ensure_loaded()
+        .map_err(|error| format!("cannot resolve stored archive passwords: {error}"))?;
+    Ok(app.keychain.passwords.first().cloned())
+}
+
+pub(crate) fn archive_password_for_path(
+    app: &mut AppState,
+    path: &Path,
+) -> Result<Option<String>, String> {
     if let Some(password) = app.archive_passwords.get(path).cloned() {
-        return Some(password);
+        return Ok(Some(password));
     }
+    stored_archive_password(app).map_err(|error| {
+        format!("{error} for '{}'; the operation was not started", path.display())
+    })
+}
 
-    app.keychain.ensure_loaded();
-    if let Some(password) = app.keychain.passwords.first().cloned() {
-        return Some(password);
-    }
-
-    app.config.conversion.archive_password.clone()
+pub(crate) fn archive_preview_password_for_path(
+    app: &mut AppState,
+    path: &Path,
+) -> Result<Option<String>, String> {
+    archive_password_for_path(app, path)
 }
 
 pub(crate) fn install_archive_preview_convert_source(
@@ -974,7 +1000,14 @@ pub(crate) fn install_archive_preview_convert_source(
     let cancel = pending.cancel.clone();
     app.convert.install_pending_archive_preview(pending);
 
-    let password = archive_preview_password_for_path(app, &path);
+    let password = match archive_preview_password_for_path(app, &path) {
+        Ok(password) => password,
+        Err(error) => {
+            app.convert.clear_pending_archive_preview();
+            app.set_status(error);
+            return;
+        }
+    };
     let tool_paths = app.manager.config.tool_paths.clone();
     spawn_archive_preview(
         generation,
@@ -2365,6 +2398,38 @@ mod clamp_pill_tests {
     }
 
     #[test]
+    fn constraint_fallback_never_auto_selects_source_pills() {
+        use super::SOURCE_SAMPLE_RATE_SENTINEL;
+        let mut format = FormatState::new();
+        // PCM -> DSF disables every PCM rate. The always-enabled source
+        // sentinel sits at index 0; the clamp must skip it and land on a
+        // real DSD rate.
+        format.format.select_value(&AudioFormat::Dsf);
+        format.apply_format_constraints();
+        assert_ne!(
+            *format.sample_rate.selected_value(),
+            SOURCE_SAMPLE_RATE_SENTINEL,
+            "constraint fallback silently rebound the rate to same-as-source"
+        );
+        // DSD -> PCM likewise lands on a real rate, not the sentinel.
+        format.format.select_value(&AudioFormat::Wav);
+        format.apply_format_constraints();
+        assert_ne!(
+            *format.sample_rate.selected_value(),
+            SOURCE_SAMPLE_RATE_SENTINEL
+        );
+        // A DELIBERATE source selection survives every format change.
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.format.select_value(&AudioFormat::Dsf);
+        format.apply_format_constraints();
+        assert_eq!(
+            *format.sample_rate.selected_value(),
+            SOURCE_SAMPLE_RATE_SENTINEL,
+            "an explicit source-rate choice must not be clamped away"
+        );
+    }
+
+    #[test]
     fn pcm_rate_cap_still_degrades_to_nearest_lower_rate() {
         let mut format = FormatState::new();
         format.sample_rate.select_value(&96_000);
@@ -2796,6 +2861,10 @@ impl OutputOptionsField {
     }
 }
 
+/// Sentinel used only by the sample-rate pill to represent the pipeline's
+/// typed `RateTarget::Source` choice. Zero is not a valid audio sample rate.
+pub const SOURCE_SAMPLE_RATE_SENTINEL: u32 = 0;
+
 /// State for the format pane (formerly "output")
 #[derive(Debug, Clone)]
 pub struct FormatState {
@@ -2964,6 +3033,7 @@ impl FormatState {
         );
 
         let sample_rate = PillState::new(vec![
+            (SOURCE_SAMPLE_RATE_SENTINEL, "source"),
             // PCM rates (kHz)
             (44_100, "44.1"),
             (48_000, "48"),
@@ -2983,6 +3053,7 @@ impl FormatState {
         ]);
 
         let bit_depth = PillState::new(vec![
+            (BitDepthChoice::Source, "source"),
             (BitDepthChoice::Int16, "16"),
             (BitDepthChoice::Int24, "24"),
             (BitDepthChoice::Int32, "32"),
@@ -3009,8 +3080,11 @@ impl FormatState {
 
         let replaygain = PillState::new(vec![
             (ReplayGainChoice::Both, "both"),
+            (ReplayGainChoice::BothIfMissing, "both if missing"),
             (ReplayGainChoice::Album, "album"),
+            (ReplayGainChoice::AlbumIfMissing, "album if missing"),
             (ReplayGainChoice::Track, "track"),
+            (ReplayGainChoice::TrackIfMissing, "track if missing"),
             (ReplayGainChoice::Off, "off"),
         ]);
 
@@ -3100,6 +3174,9 @@ impl FormatState {
             soxr_cutoff: None,
             soxr_phase: None,
         };
+        // Keep historical defaults while presenting source-coupled choices first.
+        state.sample_rate.select_value(&44_100);
+        state.bit_depth.select_value(&BitDepthChoice::Int16);
         state.apply_format_constraints();
         state
     }
@@ -3151,6 +3228,8 @@ impl FormatState {
     pub fn ssrc_dither_invalid_for_selected_rate(&self) -> bool {
         matches!(*self.resampler.selected_value(), ResamplerChoice::Ssrc)
             && !self.ssrc_dither_override_active()
+            && *self.sample_rate.selected_value() != SOURCE_SAMPLE_RATE_SENTINEL
+            && !self.bit_depth.selected_value().is_source()
             && !self.bit_depth.selected_value().is_float()
             && !selected_global_ssrc_dither_valid_for_rate(
                 *self.dither.selected_value(),
@@ -3421,11 +3500,11 @@ impl FormatState {
             self.selected_container_index = 0;
             self.resampler_overridden = false;
             let rate_before = *self.sample_rate.selected_value();
-            let rate_before_was_dsd =
-                tonepoet_pipeline::DsdRate::from_hz(rate_before).is_some();
+            let rate_before_was_dsd = rate_before != SOURCE_SAMPLE_RATE_SENTINEL
+                && tonepoet_pipeline::DsdRate::from_hz(rate_before).is_some();
             self.apply_format_constraints();
             if self.is_dsd_selected() {
-                if !rate_before_was_dsd {
+                if !rate_before_was_dsd && rate_before != SOURCE_SAMPLE_RATE_SENTINEL {
                     self.pcm_rate_before_dsd = Some(rate_before);
                 }
                 self.dither.select_value(&DitherType::None);
@@ -3482,11 +3561,19 @@ impl FormatState {
             return;
         };
 
+        let target = *self.bit_depth.selected_value();
+        if target.is_source() {
+            // Source-coupled depth does not prove a reduction at the TUI layer.
+            // The planner resolves the actual depth and owns any required
+            // conversion-specific dither decision.
+            self.dither.select_value(&DitherType::None);
+            return;
+        }
+
         // DSD and PCM are incommensurable encoding schemes — the conversion
         // is a reconstruction, not a truncation. Always dither at the PCM
         // output stage: TPDF for ≥24-bit, Shibata for ≤16-bit.
         if source_bits == 1 {
-            let target = *self.bit_depth.selected_value();
             let desired = if target.bits() <= 16 {
                 DitherType::Shibata
             } else {
@@ -3496,7 +3583,6 @@ impl FormatState {
             return;
         }
 
-        let target = *self.bit_depth.selected_value();
         let target_bits = target.bits();
         let desired = if source_bits > target_bits && target_bits <= 16 {
             DitherType::Shibata
@@ -3515,7 +3601,10 @@ impl FormatState {
             return;
         }
         let target_rate = *self.sample_rate.selected_value();
-        if source_rate == Some(target_rate) || source_rate.is_none() {
+        if target_rate == SOURCE_SAMPLE_RATE_SENTINEL
+            || source_rate == Some(target_rate)
+            || source_rate.is_none()
+        {
             // Same rate or unknown source → no resampling needed
             self.resampler.select_value(&ResamplerChoice::None);
         } else {
@@ -3609,7 +3698,11 @@ impl FormatState {
     /// the DSD rate pill — not during constraint reapplication, so preset values
     /// and manual overrides are preserved.
     fn cascade_dsd_rate_defaults(&mut self) {
-        if let Some(dsd_rate) = tonepoet_pipeline::DsdRate::from_hz(*self.sample_rate.selected_value()) {
+        let selected_rate = *self.sample_rate.selected_value();
+        if selected_rate == SOURCE_SAMPLE_RATE_SENTINEL {
+            return;
+        }
+        if let Some(dsd_rate) = tonepoet_pipeline::DsdRate::from_hz(selected_rate) {
             self.noise_shaper.select_value(&dsd_rate.default_noise_shaper());
             self.modulator_order.select_value(&dsd_rate.default_modulator_order());
         }
@@ -3634,7 +3727,9 @@ impl FormatState {
         let is_dsd = is_dsd_format(fmt);
 
         for opt in &mut self.sample_rate.options {
-            opt.enabled = if is_dsd {
+            opt.enabled = if opt.value == SOURCE_SAMPLE_RATE_SENTINEL {
+                true
+            } else if is_dsd {
                 opt.value >= DSD_RATE_MIN
             } else {
                 opt.value < DSD_RATE_MIN
@@ -3667,7 +3762,7 @@ impl FormatState {
                 self.bit_depth.set_all_enabled(false);
                 self.dither.set_all_enabled(false);
                 for opt in &mut self.sample_rate.options {
-                    if opt.value > 192_000 {
+                    if opt.value != SOURCE_SAMPLE_RATE_SENTINEL && opt.value > 192_000 {
                         opt.enabled = false;
                     }
                 }
@@ -3676,7 +3771,7 @@ impl FormatState {
                 self.bit_depth.set_all_enabled(false);
                 self.dither.set_all_enabled(false);
                 for opt in &mut self.sample_rate.options {
-                    if opt.value > 48_000 {
+                    if opt.value != SOURCE_SAMPLE_RATE_SENTINEL && opt.value > 48_000 {
                         opt.enabled = false;
                     }
                 }
@@ -3688,7 +3783,7 @@ impl FormatState {
                     self.bit_depth.set_enabled(&BitDepthChoice::Int32, false);
                 }
                 for opt in &mut self.sample_rate.options {
-                    if opt.value > 384_000 {
+                    if opt.value != SOURCE_SAMPLE_RATE_SENTINEL && opt.value > 384_000 {
                         opt.enabled = false;
                     }
                 }
@@ -3718,7 +3813,7 @@ impl FormatState {
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
                 for opt in &mut self.sample_rate.options {
-                    if opt.value > 384_000 {
+                    if opt.value != SOURCE_SAMPLE_RATE_SENTINEL && opt.value > 384_000 {
                         opt.enabled = false;
                     }
                 }
@@ -3740,7 +3835,7 @@ impl FormatState {
 
     fn clamp_disabled_selections(&mut self) {
         clamp_sample_rate_pill(&mut self.sample_rate);
-        clamp_pill(&mut self.bit_depth);
+        clamp_pill_excluding(&mut self.bit_depth, |option| option.value.is_source());
         clamp_pill(&mut self.resampler);
         clamp_pill(&mut self.dither);
         clamp_pill(&mut self.replaygain);
@@ -3787,23 +3882,41 @@ fn step_dsd_to_pcm_gain_db(value: &mut f32, delta: f32) {
 }
 
 fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
+    clamp_pill_excluding(pill, |_| false);
+}
+
+/// Clamp like `clamp_pill`, but never AUTO-select an option matching
+/// `auto_excluded`. Source-coupled pills ("same as source") sit first on
+/// their rows and are enabled for every format; they must remain a
+/// deliberate user choice — constraint fallback landing on them would
+/// silently rebind the conversion to source-relative semantics.
+fn clamp_pill_excluding<T: Clone + PartialEq>(
+    pill: &mut PillState<T>,
+    auto_excluded: impl Fn(&crate::tui::pill::PillOption<T>) -> bool,
+) {
     if !pill.options[pill.selected].enabled {
         // Prefer the nearest enabled option BELOW the disabled selection
         // (quality-ordered pills like bit depth degrade gracefully: FLAC+32
         // switching to ALAC lands on 24, not wrapped-around 16), then scan
         // upward.
         for idx in (0..pill.selected).rev() {
-            if pill.options[idx].enabled {
+            if pill.options[idx].enabled && !auto_excluded(&pill.options[idx]) {
                 pill.selected = idx;
                 return;
             }
         }
         let len = pill.options.len();
         for idx in (pill.selected + 1)..len {
-            if pill.options[idx].enabled {
+            if pill.options[idx].enabled && !auto_excluded(&pill.options[idx]) {
                 pill.selected = idx;
                 return;
             }
+        }
+        // Last resort: an excluded option is still better than a disabled
+        // selection (unreachable today — every format enables at least one
+        // ordinary option).
+        if let Some(idx) = pill.options.iter().position(|o| o.enabled) {
+            pill.selected = idx;
         }
     }
 }
@@ -3813,16 +3926,26 @@ fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
 /// back to PCM must NOT land on the maximum PCM rate — DSD64 scanning
 /// downward would select 768 kHz and silently arm a large upsample from a
 /// typical 44.1/48 kHz source. Land on the lowest enabled rate instead.
+/// The same-as-source sentinel is never an automatic landing spot.
 fn clamp_sample_rate_pill(pill: &mut PillState<u32>) {
+    if pill.options[pill.selected].value == SOURCE_SAMPLE_RATE_SENTINEL {
+        // A deliberate source selection is enabled for every format;
+        // nothing to clamp and nothing may clamp it away.
+        return;
+    }
     if !pill.options[pill.selected].enabled
         && tonepoet_pipeline::DsdRate::from_hz(pill.options[pill.selected].value).is_some()
     {
-        if let Some(idx) = pill.options.iter().position(|o| o.enabled) {
+        if let Some(idx) = pill
+            .options
+            .iter()
+            .position(|o| o.enabled && o.value != SOURCE_SAMPLE_RATE_SENTINEL)
+        {
             pill.selected = idx;
             return;
         }
     }
-    clamp_pill(pill);
+    clamp_pill_excluding(pill, |option| option.value == SOURCE_SAMPLE_RATE_SENTINEL);
 }
 
 fn select_enabled_index<T: Clone + PartialEq>(pill: &mut PillState<T>, index: usize) {
@@ -8097,6 +8220,25 @@ pub struct ActiveTagsMbOperation {
     pub phase: TagsMbOperationPhase,
 }
 
+/// App-wide owner record for one asynchronous GNUDB workflow. When
+/// `editor_session` is present, the operation owns the matching editor parked
+/// in `pending_metadata_editor`; completions may replace the overlay only while
+/// that exact parked session remains authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveGnudbOperation {
+    pub operation_id: crate::tui::message::TagsMbOperationId,
+    pub editor_session: Option<crate::tui::message::MetadataEditorSessionGuard>,
+}
+
+/// Authority for one asynchronous CUE-generation/fill or split-CUE editor-open
+/// workflow. These operations do not mutate an existing editor, but their
+/// completions may open an overlay, so they must prove both identity and an
+/// unobstructed overlay slot before doing so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveCueOperation {
+    pub operation_id: crate::tui::message::TagsMbOperationId,
+}
+
 /// State for the MusicBrainz release-selection overlay shown when MB
 /// returns >1 candidate release for a disc TOC. Lists releases sorted
 /// by descending score; user picks one to advance to the metadata
@@ -8589,6 +8731,9 @@ pub struct KeychainState {
     pub focused: bool,
     /// Whether passwords have been loaded from disk.
     pub loaded: bool,
+    /// Last explicit load/migration/backend failure. Callers must surface this
+    /// rather than treating an unavailable secret store as an empty MRU.
+    pub load_error: Option<String>,
 }
 
 impl Default for KeychainState {
@@ -8599,6 +8744,7 @@ impl Default for KeychainState {
             reveal: false,
             focused: false,
             loaded: false,
+            load_error: None,
         }
     }
 }
@@ -8617,21 +8763,74 @@ pub struct PendingArchiveListing {
 
 
 impl KeychainState {
-    /// Load passwords from disk if not already loaded.
-    pub fn ensure_loaded(&mut self) {
-        if !self.loaded {
-            self.passwords = crate::tui::keychain::load_keychain();
-            self.loaded = true;
+    /// Load passwords from disk if not already loaded. A failed backend access
+    /// remains visible in `load_error`, but does not mark the state loaded: the
+    /// next explicit user action retries so unlocking the platform keychain can
+    /// recover without restarting tonepoet.
+    pub fn ensure_loaded(&mut self) -> Result<(), String> {
+        self.ensure_loaded_with(crate::tui::keychain::load_keychain)
+    }
+
+    fn ensure_loaded_with<F>(&mut self, load: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<Vec<String>, String>,
+    {
+        if self.loaded {
+            return Ok(());
         }
+        self.reload_with(load)
     }
 
     /// Reload from disk (e.g., after add/remove).
-    pub fn reload(&mut self) {
-        self.passwords = crate::tui::keychain::load_keychain();
-        self.loaded = true;
-        if self.selected >= self.passwords.len() && !self.passwords.is_empty() {
-            self.selected = self.passwords.len() - 1;
+    pub fn reload(&mut self) -> Result<(), String> {
+        self.reload_with(crate::tui::keychain::load_keychain)
+    }
+
+    fn reload_with<F>(&mut self, load: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<Vec<String>, String>,
+    {
+        match load() {
+            Ok(passwords) => {
+                self.passwords = passwords;
+                self.loaded = true;
+                self.load_error = None;
+                if self.selected >= self.passwords.len() && !self.passwords.is_empty() {
+                    self.selected = self.passwords.len() - 1;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.passwords.clear();
+                self.selected = 0;
+                self.loaded = false;
+                self.load_error = Some(error.clone());
+                Err(error)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod keychain_state_retry_tests {
+    use super::KeychainState;
+
+    #[test]
+    fn failed_load_is_retried_and_recovers_after_backend_unlock() {
+        let mut state = KeychainState::default();
+        let first = state.ensure_loaded_with(|| Err("secret service is locked".to_string()));
+
+        assert_eq!(first, Err("secret service is locked".to_string()));
+        assert_eq!(state.loaded, false);
+        assert_eq!(state.passwords, Vec::<String>::new());
+        assert_eq!(state.load_error.as_deref(), Some("secret service is locked"));
+
+        let second = state.ensure_loaded_with(|| Ok(vec!["recovered-secret".to_string()]));
+
+        assert_eq!(second, Ok(()));
+        assert_eq!(state.loaded, true);
+        assert_eq!(state.passwords, vec!["recovered-secret"]);
+        assert_eq!(state.load_error, None);
     }
 }
 
@@ -9129,7 +9328,9 @@ pub struct AppState {
     /// Currently authoritative GNUDB lookup/read workflow, if any. GNUDB
     /// completions must match this identity and must never run while a
     /// MusicBrainz workflow owns the metadata-editor authority.
-    pub active_gnudb_operation: Option<crate::tui::message::TagsMbOperationId>,
+    pub active_gnudb_operation: Option<ActiveGnudbOperation>,
+    /// Currently authoritative asynchronous CUE/split-CUE overlay workflow.
+    pub active_cue_operation: Option<ActiveCueOperation>,
 
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
@@ -9883,6 +10084,7 @@ impl AppState {
             tags_mb_operation_generation: 0,
             active_tags_mb_operation: None,
             active_gnudb_operation: None,
+            active_cue_operation: None,
             status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),
             processing_active: false,
             should_quit: false,
@@ -11390,6 +11592,14 @@ fn parse_optional_power_of_two_u32(
 }
 
 fn validate_ssrc_dither_id_for_target_rate(dither_id: u8, target_rate_hz: u32) -> Result<(), String> {
+    if target_rate_hz == SOURCE_SAMPLE_RATE_SENTINEL {
+        // The concrete rate is unavailable at the TUI boundary. The pipeline
+        // performs the same validation after resolving RateTarget::Source, so
+        // rejecting here would make every shaped ID unusable in a source-coupled
+        // preset without adding safety.
+        return Ok(());
+    }
+
     // Mirror SSRC's rate-dependent dither menu. IDs 98 and 99 are treated as
     // sample-rate-independent simple/no-shaper choices; shaped ATH and legacy
     // IDs must be available for the selected destination rate.
@@ -11511,6 +11721,28 @@ fn next_char_boundary(text: &str, cursor: usize) -> usize {
 }
 
 #[cfg(test)]
+mod source_coupled_format_pill_tests {
+    use super::*;
+
+    #[test]
+    fn source_choices_are_first_without_changing_historical_defaults() {
+        let format = FormatState::new();
+
+        assert_eq!(
+            format.sample_rate.options.first().map(|option| (option.value, option.label.as_str())),
+            Some((SOURCE_SAMPLE_RATE_SENTINEL, "source"))
+        );
+        assert_eq!(
+            format.bit_depth.options.first().map(|option| (option.value, option.label.as_str())),
+            Some((BitDepthChoice::Source, "source"))
+        );
+        assert_eq!(*format.sample_rate.selected_value(), 44_100);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int16);
+    }
+
+}
+
+#[cfg(test)]
 mod ssrc_format_settings_handler_tests {
     use super::*;
     use tonepoet_pipeline::enums::SsrcPdfType;
@@ -11518,6 +11750,23 @@ mod ssrc_format_settings_handler_tests {
     fn ssrc_kind(format: &FormatState) -> FormatSettingsKind {
         build_format_settings_kind(format, FormatSettingsOpenTarget::Resampler)
             .expect("SSRC settings should be available")
+    }
+
+    #[test]
+    fn source_coupled_rate_defers_ssrc_dither_validation_to_the_pipeline() {
+        assert_eq!(
+            validate_ssrc_dither_id_for_target_rate(16, SOURCE_SAMPLE_RATE_SENTINEL),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn concrete_rate_still_rejects_an_unavailable_ssrc_dither_id() {
+        assert_eq!(
+            validate_ssrc_dither_id_for_target_rate(16, 96_000)
+                .expect_err("96 kHz must reject shaped id 16"),
+            "SSRC dither id 16 is not available for target sample rate 96000 Hz"
+        );
     }
 
     #[test]
