@@ -1667,33 +1667,43 @@ pub fn classify_source_audio_probe(
     let codec = codec_name.unwrap_or_default().trim().to_ascii_lowercase();
     let sample_fmt = sample_fmt.unwrap_or_default().trim().to_ascii_lowercase();
 
-    let coding = if codec.starts_with("dsd") {
+    // Codec names below are ffprobe codec_name spellings (verified against
+    // ffmpeg's codec table), not marketing names.
+    let coding = if codec.starts_with("dsd") || codec == "dst" {
+        // DST is losslessly-compressed DSD (SACD/DFF rips).
         SourceAudioCoding::Dsd
-    } else if matches!(
-        codec.as_str(),
-        "mp1"
-            | "mp2"
-            | "mp3"
-            | "aac"
-            | "vorbis"
-            | "opus"
-            | "ac3"
-            | "eac3"
-            | "dts"
-            | "wmalossy"
-            | "wmav1"
-            | "wmav2"
-            | "mpc7"
-            | "mpc8"
-            | "cook"
-            | "atrac3"
-            | "atrac3plus"
-            | "amr_nb"
-            | "amr_wb"
-            | "gsm"
-            | "ra_144"
-            | "ra_288"
-    ) {
+    } else if codec.starts_with("adpcm_")
+        || codec.starts_with("pcm_alaw")
+        || codec.starts_with("pcm_mulaw")
+        || codec.starts_with("pcm_vidc")
+        || matches!(
+            codec.as_str(),
+            "mp1"
+                | "mp2"
+                | "mp3"
+                | "aac"
+                | "vorbis"
+                | "opus"
+                | "ac3"
+                | "eac3"
+                | "dts"
+                | "wmav1"
+                | "wmav2"
+                | "wmapro"
+                | "wmavoice"
+                | "mpc7"
+                | "mpc8"
+                | "cook"
+                | "atrac3"
+                | "atrac3plus"
+                | "amr_nb"
+                | "amr_wb"
+                | "gsm"
+                | "speex"
+                | "ra_144"
+                | "ra_288"
+        )
+    {
         SourceAudioCoding::Lossy
     } else if codec.starts_with("pcm_")
         || matches!(
@@ -1707,6 +1717,10 @@ pub fn classify_source_audio_probe(
                 | "truehd"
                 | "mlp"
                 | "tak"
+                | "wmalossless"
+                | "mp4als"
+                | "als"
+                | "ralf"
         )
     {
         SourceAudioCoding::Pcm
@@ -2481,6 +2495,30 @@ mod source_audio_probe_classification_tests {
             classify_source_audio_probe(Some("wavpack"), Some("s32p"), Some(24)),
             (SourceAudioCoding::Pcm, Some(24)),
         );
+    }
+
+    #[test]
+    fn real_ffprobe_spellings_for_lossless_and_dst_classify_correctly() {
+        for codec in ["wmalossless", "mp4als", "als", "ralf"] {
+            assert_eq!(
+                classify_source_audio_probe(Some(codec), Some("s16"), Some(16)),
+                (SourceAudioCoding::Pcm, Some(16)),
+                "{codec} is lossless and must keep its measured width",
+            );
+        }
+        // DST is losslessly-compressed DSD, not Unknown.
+        assert_eq!(
+            classify_source_audio_probe(Some("dst"), None, None),
+            (SourceAudioCoding::Dsd, None),
+        );
+        // Companded/ADPCM PCM variants are lossy, never authoritative PCM.
+        for codec in ["pcm_alaw", "pcm_mulaw", "adpcm_ms", "wmapro", "speex"] {
+            assert_eq!(
+                classify_source_audio_probe(Some(codec), Some("s16"), Some(16)).0,
+                SourceAudioCoding::Lossy,
+                "{codec} must classify lossy",
+            );
+        }
     }
 
     #[test]

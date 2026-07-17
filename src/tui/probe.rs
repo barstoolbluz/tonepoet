@@ -6609,34 +6609,35 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
     progress: Option<MetadataWriteProgressCallback>,
     cancel: Option<MetadataWriteCancelFlag>,
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
-    if let Some((entry_idx, _)) = entries_snap
-        .iter()
-        .enumerate()
-        .find(|(_, (_, values, originals))| {
-            values.len() != paths.len() || originals.len() != paths.len()
-        })
-    {
-        let reason = format!(
-            "legacy whole-file metadata write row {entry_idx} is not aligned to {} path(s); track-scoped callers must use the explicit RowScope API",
-            paths.len()
-        );
-        return paths
-            .iter()
-            .cloned()
-            .map(|path| crate::tui::app::MetadataEditorWriteResult::skipped(path, reason.clone()))
-            .collect();
-    }
+    // Rows whose value vectors don't align to the path count cannot be
+    // whole-file writes. Route them as Track scope — which the underlying
+    // writer SKIPS (track-dimension data round-trips through the regenerated
+    // CUESHEET, never through per-file tags) — and keep writing the aligned
+    // rows. Refusing the entire save here broke CLI tags-mb on single-image
+    // sources, whose CUESHEET expansion always carries track-dimension rows
+    // alongside perfectly aligned album/CUESHEET rows.
+    let mut misaligned_rows = Vec::new();
     let scoped_entries: Vec<_> = entries_snap
         .iter()
-        .map(|(key, values, originals)| {
-            (
-                key.clone(),
-                RowScope::File,
-                values.clone(),
-                originals.clone(),
-            )
+        .enumerate()
+        .map(|(idx, (key, values, originals))| {
+            let scope = if values.len() != paths.len() || originals.len() != paths.len() {
+                misaligned_rows.push(idx);
+                RowScope::Track
+            } else {
+                RowScope::File
+            };
+            (key.clone(), scope, values.clone(), originals.clone())
         })
         .collect();
+    if !misaligned_rows.is_empty() {
+        log::warn!(
+            "legacy metadata write: {} row(s) not aligned to {} path(s) routed track-scoped and skipped for whole-file writes: rows {:?}",
+            misaligned_rows.len(),
+            paths.len(),
+            misaligned_rows
+        );
+    }
     apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
         paths,
         &scoped_entries,
@@ -7574,6 +7575,74 @@ pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_wrapper_writes_aligned_rows_and_skips_misaligned_per_row() {
+        // CLI tags-mb shape: one image, an aligned album row plus a
+        // track-dimension row expanded to n_tracks values. The save must
+        // write the aligned row and skip ONLY the misaligned one — refusing
+        // the whole save broke single-image CLI saves.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("single.flac");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=0.2", "-c:a", "flac",
+            ])
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        };
+        assert!(status.success());
+
+        let entries = vec![
+            (
+                lofty::tag::ItemKey::AlbumTitle,
+                vec!["Aligned Album".to_string()],
+                vec![String::new()],
+            ),
+            (
+                lofty::tag::ItemKey::TrackTitle,
+                vec!["Track One".to_string(), "Track Two".to_string()],
+                vec![String::new(), String::new()],
+            ),
+        ];
+        let results = apply_audio_tag_changes_with_save_blocks_and_progress(
+            &[path.clone()],
+            &entries,
+            &[],
+            &[None],
+            None,
+            None,
+        );
+        assert!(
+            matches!(
+                &results[0].outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::Saved
+                    | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+            ),
+            "aligned rows must still save: {results:?}"
+        );
+        let reread = read_all_tags_merged(&[path]).expect("re-read");
+        assert!(
+            reread.iter().any(|entry| {
+                entry.display_key.eq_ignore_ascii_case("ALBUM")
+                    && entry.per_file_values.iter().any(|v| v == "Aligned Album")
+            }),
+            "aligned album row must be written"
+        );
+        assert!(
+            !reread.iter().any(|entry| {
+                entry.display_key.eq_ignore_ascii_case("TITLE")
+                    && entry.per_file_values.iter().any(|v| !v.is_empty())
+            }),
+            "misaligned track row must be skipped, not sprayed"
+        );
+    }
+
 
     struct LoftyFallbackHookGuard;
 

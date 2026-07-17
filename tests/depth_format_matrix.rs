@@ -63,7 +63,13 @@ fn require_tools_or_skip(test_name: &str, tools: &[&str]) -> bool {
     if missing.is_empty() {
         return true;
     }
-    if std::env::var("TONEPOET_REQUIRE_TOOLS").as_deref() == Ok("1") {
+    // Any non-empty value except "0" enforces (matches
+    // unified_synthetic_cue_output_boundary.rs) — CI setting =true must not
+    // silently downgrade to a skip.
+    let required = std::env::var_os("TONEPOET_REQUIRE_TOOLS")
+        .map(|value| value != "0" && !value.is_empty())
+        .unwrap_or(false);
+    if required {
         panic!("{test_name}: required tools unavailable: {}", missing.join(", "));
     }
     eprintln!("{test_name}: skipped; required tools unavailable: {}", missing.join(", "));

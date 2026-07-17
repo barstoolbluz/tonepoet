@@ -34587,9 +34587,10 @@ mod single_image_metadata_editor_regression_tests {
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !available
-            && std::env::var("TONEPOET_REQUIRE_TOOLS").as_deref() == Ok("1")
-        {
+        let required = std::env::var_os("TONEPOET_REQUIRE_TOOLS")
+            .map(|value| value != "0" && !value.is_empty())
+            .unwrap_or(false);
+        if !available && required {
             panic!("required fixture tool is unavailable: {tool}");
         }
         available

@@ -1543,6 +1543,18 @@ fn reject_unsupported_resolved_depth(
 fn resolve_target_bit_depth(request: &PlanRequest) -> Result<PcmBitDepth> {
     match request.settings.target_bit_depth {
         BitDepthTarget::Source => match request.source.representation_kind() {
+            // Non-PCM-lossless targets make no bit-depth promise: the encode
+            // needs SOME working width, and the format default is not a
+            // substitution. Only PCM-lossless targets fail closed on an
+            // unmeasurable source (handled below); everything else resolves.
+            _ if !request.settings.target_format.is_pcm_lossless() => {
+                Ok(request
+                    .source
+                    .authoritative_pcm_depth()
+                    .unwrap_or_else(|| {
+                        default_pcm_depth_for_format(&request.settings.target_format)
+                    }))
+            }
             // DSD and lossy sources have no authoritative PCM word length.
             // Resolve Source to the documented format default even when the
             // realized decoder carrier reports an integer width.

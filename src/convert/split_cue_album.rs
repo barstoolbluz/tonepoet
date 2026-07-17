@@ -269,6 +269,12 @@ pub enum SplitCueReferenceResolution {
     Resolved(PathBuf),
     Missing,
     Ambiguous(Vec<PathBuf>),
+    /// The referenced path exists but is not a supported audio target
+    /// (non-audio extension, symlink, or not a regular file). Distinct from
+    /// Missing so callers can report the real problem instead of
+    /// "was not found", and so an existing-but-unsupported direct target is
+    /// never silently rebound to a same-stem audio sibling.
+    UnsupportedTarget(PathBuf),
 }
 
 /// Collect candidate CUEs without recursion. A selected directory contributes
@@ -434,6 +440,12 @@ pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember
                         .join(", ")
                 ));
             }
+            SplitCueReferenceResolution::UnsupportedTarget(path) => {
+                return Err(format!(
+                    "member image is not supported audio: {}",
+                    path.display()
+                ));
+            }
         };
         let meta = std::fs::symlink_metadata(&resolved)
             .map_err(|_| format!("member image missing: {file_ref}"))?;
@@ -511,6 +523,11 @@ pub fn resolve_split_cue_file_reference(
     };
     if split_cue_regular_audio_file(&direct) {
         return SplitCueReferenceResolution::Resolved(direct);
+    }
+    if std::fs::symlink_metadata(&direct).is_ok() {
+        // The literal target exists but failed the audio test — report that,
+        // and never rebind past it to a same-stem sibling.
+        return SplitCueReferenceResolution::UnsupportedTarget(direct);
     }
 
     let search_dir = raw_path
@@ -600,6 +617,30 @@ fn unique_split_cue_candidate(candidates: Vec<PathBuf>) -> SplitCueReferenceReso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_non_audio_direct_target_reports_unsupported_not_missing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(temp.path().join("notes.txt"), b"not audio").expect("fixture");
+        // A same-stem audio sibling exists — the resolver must NOT silently
+        // rebind past the existing literal target.
+        std::fs::write(temp.path().join("notes.flac"), b"audio").expect("fixture");
+
+        match resolve_split_cue_file_reference(temp.path(), "notes.txt") {
+            SplitCueReferenceResolution::UnsupportedTarget(path) => {
+                assert!(path.ends_with("notes.txt"));
+            }
+            other => panic!("expected UnsupportedTarget, got {other:?}"),
+        }
+
+        // A genuinely absent reference still reports Missing... unless a
+        // same-name audio candidate exists (the deliberate fallback search).
+        match resolve_split_cue_file_reference(temp.path(), "absent.txt") {
+            SplitCueReferenceResolution::Missing => {}
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
 
     fn cue_paths() -> Vec<PathBuf> {
         vec![

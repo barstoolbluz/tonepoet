@@ -840,7 +840,9 @@ fn first_resolved_member_audio_path_with_quote(parts: &[SyntheticCueAlbumPart]) 
             };
             let resolved = match resolve_cue_file_reference_for_queue(parent, file_ref) {
                 CueReferenceResolution::Resolved(path) => path,
-                CueReferenceResolution::Missing | CueReferenceResolution::Ambiguous(_) => continue,
+                CueReferenceResolution::Missing
+                | CueReferenceResolution::Ambiguous(_)
+                | CueReferenceResolution::UnsupportedTarget(_) => continue,
             };
             if resolved.display().to_string().contains('"') {
                 return Some(resolved);
@@ -938,7 +940,9 @@ fn resolved_file_order_for_parsed_cue(
         let file_ref = track.file.as_deref()?;
         let path = match resolve_cue_file_reference_for_queue(parent, file_ref) {
             CueReferenceResolution::Resolved(path) => path,
-            CueReferenceResolution::Missing | CueReferenceResolution::Ambiguous(_) => return None,
+            CueReferenceResolution::Missing
+            | CueReferenceResolution::Ambiguous(_)
+            | CueReferenceResolution::UnsupportedTarget(_) => return None,
         };
         let key = queue_path_key(&path);
         if last_key.as_ref() != Some(&key) {
@@ -1140,6 +1144,13 @@ fn generate_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart]) -> Result
             let resolved = match resolve_cue_file_reference_for_queue(parent, file_ref) {
                 CueReferenceResolution::Resolved(path) => path,
                 CueReferenceResolution::Missing => return Err(format!("FILE reference {:?} not found", file_ref)),
+                CueReferenceResolution::UnsupportedTarget(path) => {
+                    return Err(format!(
+                        "FILE reference {:?} exists but is not supported audio: {}",
+                        file_ref,
+                        path.display()
+                    ))
+                }
                 CueReferenceResolution::Ambiguous(paths) => {
                     return Err(format!("FILE reference {:?} ambiguous: {}", file_ref, format_candidate_paths_for_log(&paths)))
                 }

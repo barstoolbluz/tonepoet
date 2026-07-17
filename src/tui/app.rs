@@ -561,6 +561,13 @@ pub(crate) fn probe_cue_proxy_source(cue_path: &Path) -> Result<CueProxyProbeRes
                     format_candidate_paths_for_cue_probe(&candidates)
                 ));
             }
+            crate::tui::browse::CueReferenceResolution::UnsupportedTarget(path) => {
+                resolution_errors.push(format!(
+                    "FILE {:?} exists but is not supported audio ({})",
+                    file_ref,
+                    path.display()
+                ));
+            }
         }
     }
 
@@ -12497,8 +12504,10 @@ FILE "02.flac" WAVE
         });
         assert!(non_audio_result.info.is_none());
         // The unified FILE-ref resolver rejects non-audio references at
-        // resolution, so no probe is attempted at all.
+        // resolution, so no probe is attempted — and the message names the
+        // real problem instead of claiming the file "was not found".
         let notice = non_audio_result.probe_notice.expect("non-audio reference should warn");
+        assert!(notice.contains("exists but is not supported audio"), "{notice}");
         assert!(notice.contains("set format manually"), "{notice}");
         assert!(hook.probed_paths.is_empty(), "{:?}", hook.probed_paths);
         assert!(hook.metadata_paths.is_empty());

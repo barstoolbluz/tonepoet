@@ -14308,13 +14308,20 @@ fn conversion_summary(
         .map(|depth| measured_target_stream_description(depth, target_rate))
         .unwrap_or_else(|| target_stream_description(track, target_depth, target_rate, &req.settings));
     let target_stream = if let Some((depth, reason)) = defaulted_source_target {
-        let rate = target_rate
-            .map(|hz| format!(" at {}", format_sample_rate(hz)))
-            .unwrap_or_default();
-        format!(
-            "requested {}-bit (default for {reason} source){rate}",
-            depth.bits()
-        )
+        if verified_output_bit_depth.is_some() {
+            // The output WAS measured: keep the measured description and
+            // note the default as the plan choice it is — the label must
+            // accompany the verified fact, never replace it.
+            format!("{target_stream} ({}-bit default for {reason} source)", depth.bits())
+        } else {
+            let rate = target_rate
+                .map(|hz| format!(" at {}", format_sample_rate(hz)))
+                .unwrap_or_default();
+            format!(
+                "requested {}-bit (default for {reason} source){rate}",
+                depth.bits()
+            )
+        }
     } else if output_depth_unverified {
         format!("requested {target_stream}")
     } else {
@@ -14333,9 +14340,12 @@ fn conversion_summary(
         summary.push_str(" [output depth unverified]");
     }
     if req.settings.target_bit_depth == BitDepthTarget::Source
+        && req.settings.target_format.is_pcm_lossless()
         && matches!(track.bit_depth.or(track.source_audio.bit_depth), Some(20))
     {
-        summary.push_str(" [20-bit source stored as 24-bit]");
+        // Only PCM-lossless targets actually store a 24-bit container; lossy
+        // targets have no stored width and must not carry this claim.
+        summary.push_str(" [source is 20-bit; stored as 24-bit]");
     }
     let mut transforms = Vec::new();
     if let (Some(source_rate), Some(target_rate)) = (source_rate, target_rate) {

@@ -151,6 +151,32 @@ fn invalid_pcm_target_rejects_dsd_rate() {
 }
 
 #[test]
+fn lossy_targets_resolve_source_depth_to_the_format_default() {
+    // A lossy encode makes no bit-depth promise: unmeasured-PCM and Unknown
+    // sources must resolve to the working default, never fail closed (that
+    // rule is reserved for PCM-lossless targets).
+    for representation in [
+        SourceRepresentationKind::Pcm,
+        SourceRepresentationKind::Unknown,
+    ] {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Mp3;
+        settings.target_bit_depth = BitDepthTarget::Source;
+        settings.force_encode = true;
+        let mut req = request(settings);
+        req.output_path = PathBuf::from("out.mp3");
+        req.source.bit_depth = None;
+        req.source.true_source_depth = None;
+        req.source.source_representation = representation;
+
+        let plan = plan_conversion(&req).unwrap_or_else(|err| {
+            panic!("lossy target must plan for {representation:?} source: {err}")
+        });
+        assert!(!plan.commands().is_empty());
+    }
+}
+
+#[test]
 fn pcm_lossless_source_target_requires_authoritative_source_depth() {
     let mut settings = PipelineSettings::default();
     settings.target_bit_depth = BitDepthTarget::Source;

@@ -119,6 +119,11 @@ pub fn classify_file(path: &Path) -> EntryKind {
         Some("m4a") | Some("mp4") | Some("aac") => EntryKind::AudioFile(AudioFormat::Aac),
         Some("alac") => EntryKind::AudioFile(AudioFormat::Alac),
         Some("opus") => EntryKind::AudioFile(AudioFormat::Opus),
+        // Documented input-only formats: CUE FILE references to these must
+        // resolve as audio (the unified split-CUE resolver classifies its
+        // direct targets, and dropping them regressed BIN-era DTS/AC3 rips).
+        Some("dts") => EntryKind::AudioFile(AudioFormat::Dts),
+        Some("ac3") => EntryKind::AudioFile(AudioFormat::Ac3),
         Some("7z") | Some("zip") | Some("rar") | Some("tar") | Some("iso") | Some("cab")
         | Some("dmg") | Some("tgz") | Some("tbz2") | Some("txz") => EntryKind::Archive,
         _ => EntryKind::OtherFile,

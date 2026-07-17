@@ -6084,7 +6084,10 @@ fn start_mb_select_apply_operation(
         if state.operation_id.is_assigned() {
             cancel_mb_select_operation(app, state.operation_id);
         } else {
-            restore_parked_editor(app);
+            // An UNASSIGNED picker owns no operation, so any active operation
+            // here is FOREIGN — restoring must not finish it (same class as
+            // the refusal arm below).
+            restore_parked_editor_without_finishing(app);
         }
         app.set_status(
             ":tags-mb: invalid picker selection; restored the metadata editor".to_string(),

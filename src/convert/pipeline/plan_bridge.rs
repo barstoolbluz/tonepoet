@@ -143,7 +143,7 @@ pub fn plan_request_for_track(
         .validate()
         .map_err(|err| ConvertError::Backend(format!("invalid pipeline settings: {err}")))?;
 
-    // settings-sentinel-allow: settings originates from request.settings.clone() (line 26)
+    // settings-sentinel-allow: settings originates from request.settings.clone() above
     Ok(PlanRequest {
         input_path: realized_input.to_path_buf(),
         output_path: staged_output.to_path_buf(),
@@ -1436,7 +1436,6 @@ mod tests {
             req.settings.metadata.transfer_tags = true;
             req.settings.metadata.preserve_artwork = true;
             let mut prepared = track(cue_carrier(input.clone(), temp.path().join("album.flac"), 0, 44_100));
-        prepared.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
             prepared.sample_rate = Some(44_100);
             prepared.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
             prepared.bit_depth = Some(16);
