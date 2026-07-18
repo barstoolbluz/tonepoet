@@ -5363,7 +5363,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             // route install a review that orphaned the parked dirty session.
             if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_))
                 || app.pending_metadata_editor.is_some()
+                || app.pending_cue_preview.is_some()
             {
+                // pending_cue_preview: the editable cuesheet buffer has its
+                // own `:` parking; installing the review would strand that
+                // parked session exactly like a parked editor.
                 app.set_status(
                     "import-cue: close the metadata editor first — unsaved edits are preserved",
                 );
@@ -12727,9 +12731,6 @@ fn expand_path(path: &str) -> String {
 
 /// Build a list of proposed changes by comparing CUE sheet metadata
 /// against the current tags in the metadata editor.
-/// CUE fields that can be imported, mapped to their tag display keys.
-
-
 #[allow(dead_code)] // Legacy CUE diff flow; will be removed in cleanup.
 fn build_cue_diff(
     state: &super::app::MetadataEditorState,

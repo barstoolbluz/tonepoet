@@ -30516,6 +30516,40 @@ mod phase4_tests {
     }
 
     #[test]
+    fn import_cue_refuses_over_a_parked_cue_preview() {
+        // Same shape for the OTHER parkable session type: the editable
+        // cuesheet buffer parks into pending_cue_preview when `:` opens the
+        // command input; installing the review would strand it identically.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_cue_preview = Some(Box::new(crate::tui::app::CuePreviewState::new(
+            "FILE \"a.flac\" WAVE\n".to_string(),
+            std::path::PathBuf::from("/tmp/a.cue"),
+            "edited".to_string(),
+        )));
+        app.active_overlay = ActiveOverlay::None;
+        let (tx, _rx) = mpsc::channel(4);
+
+        super::super::command::execute_command(
+            &mut app,
+            super::super::command::Command::ImportCue,
+            &tx,
+        );
+
+        assert!(
+            matches!(app.active_overlay, ActiveOverlay::None),
+            "no review may be installed over a parked cue-preview session"
+        );
+        assert!(
+            app.pending_cue_preview.is_some(),
+            "the parked cue buffer must survive"
+        );
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.starts_with("import-cue:")));
+    }
+
+    #[test]
     fn review_click_commit_lands_on_the_row_the_edit_was_opened_on() {
         // Audit E-finding: a row click moved the review cursor under an open
         // inline edit, so Enter wrote the buffer to the NEW row. The click
