@@ -357,11 +357,17 @@ pub enum AppMessage {
         error: Option<String>,
     },
     /// Result of an async metadata tag write.
+    MetadataWriteProgress {
+        operation_id: u64,
+        path: std::path::PathBuf,
+        detail: String,
+    },
     MetadataWriteComplete {
+        operation_id: u64,
         path: std::path::PathBuf,
         field: crate::tui::probe::MetadataField,
         value: String,
-        result: Result<(), String>,
+        result: Result<crate::tui::probe::MetadataWriteCommitReport, String>,
     },
     /// Results of an async recursive search. Carries the launch identity so
     /// the reducer can reject stale completions after query, root, mode,
@@ -415,6 +421,12 @@ pub enum AppMessage {
         /// embedded-CUESHEET deletion save. This prevents the reducer from
         /// marking stale CUE-derived rows clean.
         refreshed_entries: Option<Result<Vec<crate::tui::probe::TagEntry>, String>>,
+    },
+    /// Byte-level progress from a session-guarded metadata write.
+    MetadataEditorWriteProgress {
+        session_id: u64,
+        save_generation: u64,
+        detail: String,
     },
     /// Result of a background Details-tab media probe from the metadata editor.
     /// Reduced into the active editor model by the event loop; rendering never
@@ -503,6 +515,11 @@ pub enum AppMessage {
             crate::tui::gnudb::GnudbEntry,
             Vec<std::path::PathBuf>,
         )>,
+        /// Query/read failures with the disc label and failed stage. Empty
+        /// match sets are not failures and therefore do not appear here.
+        failures: Vec<String>,
+        /// Number of disc/CUE-part queries attempted.
+        attempted: usize,
     },
     /// Panic/cancellation containment result for any GNUDB worker. The reducer
     /// may retire only the matching operation and restore only its owned editor.

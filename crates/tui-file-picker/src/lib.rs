@@ -5,6 +5,7 @@
 //! a selected path means and map [`HitRegion`]s or [`FilePickerAction`]s into
 //! their own message systems.
 
+pub mod display_width;
 mod filter;
 mod input;
 mod progress;

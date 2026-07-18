@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::broadcast;
@@ -23,6 +23,13 @@ struct Cli {
     /// Enable verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum DsfRecoveryAction {
+    Status,
+    RestoreBackup,
+    KeepCurrent,
 }
 
 #[derive(Subcommand, Debug)]
@@ -216,6 +223,17 @@ enum Commands {
         path: bool,
     },
 
+    /// Inspect or resolve an unversioned legacy DSF rollback marker.
+    /// This command does not load the ordinary tonepoet configuration, so it
+    /// remains available during configuration or secret-store recovery.
+    DsfRecover {
+        #[arg(value_enum)]
+        action: DsfRecoveryAction,
+
+        #[arg(required = true)]
+        path: PathBuf,
+    },
+
     /// Probe a DVD-Audio ISO or directory and print disc structure
     DvdaInfo {
         /// Path to a DVD-Audio ISO image or a directory containing AUDIO_TS/
@@ -354,9 +372,54 @@ fn require_startup_config(
     })
 }
 
+fn run_dsf_recovery(action: DsfRecoveryAction, path: &std::path::Path) -> anyhow::Result<()> {
+    match action {
+        DsfRecoveryAction::Status => {
+            let inspection = tonepoet::dsf_tags::inspect_legacy_backup(path)
+                .map_err(anyhow::Error::msg)?;
+            println!("target: {}", inspection.target.display());
+            println!("marker: {}", inspection.marker.display());
+            println!("target bytes: {}", inspection.target_bytes);
+            println!("marker bytes: {}", inspection.marker_bytes);
+            println!("byte-identical: {}", inspection.byte_identical);
+        }
+        DsfRecoveryAction::RestoreBackup => {
+            let inspection = tonepoet::dsf_tags::resolve_legacy_backup(
+                path,
+                tonepoet::dsf_tags::DsfLegacyBackupResolution::RestoreBackup,
+            )
+            .map_err(anyhow::Error::msg)?;
+            println!(
+                "restored '{}' from legacy rollback marker '{}' ({} bytes)",
+                inspection.target.display(),
+                inspection.marker.display(),
+                inspection.marker_bytes
+            );
+        }
+        DsfRecoveryAction::KeepCurrent => {
+            let inspection = tonepoet::dsf_tags::resolve_legacy_backup(
+                path,
+                tonepoet::dsf_tags::DsfLegacyBackupResolution::KeepCurrent,
+            )
+            .map_err(anyhow::Error::msg)?;
+            println!(
+                "kept current DSF '{}' and retired legacy rollback marker '{}'",
+                inspection.target.display(),
+                inspection.marker.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let log_level = if cli.verbose { "debug" } else { "info" };
     init_logging(log_level, matches!(&cli.command, Commands::Tui { .. }));
+
+    if let Commands::DsfRecover { action, path } = &cli.command {
+        run_dsf_recovery(*action, path)?;
+        return Ok(());
+    }
 
     let config = require_startup_config(TonepoetConfig::load())?;
 
@@ -442,6 +505,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Commands::Config { show, reset, path } => {
             run_config(show, reset, path, &config)?;
         }
+        Commands::DsfRecover { .. } => unreachable!("handled before config load"),
         Commands::DvdaInfo { path } => {
             run_dvda_info(&path)?;
         }
@@ -1330,14 +1394,23 @@ fn resolve_cli_archive_password<F>(
 where
     F: FnOnce() -> Result<Vec<String>, String>,
 {
+    if !needs_archive_password {
+        return Ok(None);
+    }
     if let Some(password) = cli_password
         .clone()
         .or_else(|| config.conversion.archive_password.clone())
     {
         return Ok(Some(password));
     }
-    if !needs_archive_password {
-        return Ok(None);
+    if let Some(reference) = config.conversion.archive_password_ref.as_deref() {
+        return tonepoet::secret_store::get(reference)
+            .map(Some)
+            .map_err(|error| {
+                format!(
+                    "cannot resolve configured archive password before queue admission: {error}"
+                )
+            });
     }
     load_mru()
         .map(|passwords| passwords.into_iter().next())
@@ -2015,8 +2088,11 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
     if reset {
         let mut default_config = TonepoetConfig::default();
         default_config.clear_archive_password();
-        default_config.save()?;
+        let outcome = default_config.save_with_outcome()?;
         println!("Configuration reset to defaults.");
+        if let Some(warning) = outcome.warning() {
+            eprintln!("Warning: {warning}");
+        }
         println!("Saved to: {}", TonepoetConfig::config_path().display());
         return Ok(());
     }
@@ -3636,6 +3712,29 @@ FILE "side_b.flac" WAVE
     }
 
     #[test]
+    fn non_archive_cli_admission_does_not_resolve_config_or_mru_secrets() {
+        let calls = std::cell::Cell::new(0usize);
+        let mut config = TonepoetConfig::default();
+        config.conversion.archive_password = Some("unused-cleartext".to_string());
+        config.conversion.archive_password_ref =
+            Some("archive-password:unavailable-but-unused".to_string());
+
+        let password = resolve_cli_archive_password(
+            false,
+            &Some("unused-cli-secret".to_string()),
+            &config,
+            || {
+            calls.set(calls.get() + 1);
+            Err("must not be called".to_string())
+            },
+        )
+        .expect("non-archive queue admission must be independent of secret backends");
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(password, None);
+    }
+
+    #[test]
     fn cli_synthetic_artifacts_are_manager_owned_and_drop_cleaned() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_mergeable_split_cue_album_fixture(temp.path());
@@ -3683,4 +3782,28 @@ FILE "side_b.flac" WAVE
         );
     }
 
+}
+
+#[cfg(test)]
+mod dsf_recovery_cli_tests {
+    use super::*;
+
+    #[test]
+    fn dsf_recover_subcommand_parses_all_explicit_resolution_actions() {
+        for (raw, expected) in [
+            ("status", DsfRecoveryAction::Status),
+            ("restore-backup", DsfRecoveryAction::RestoreBackup),
+            ("keep-current", DsfRecoveryAction::KeepCurrent),
+        ] {
+            let cli = Cli::try_parse_from(["tonepoet", "dsf-recover", raw, "album.dsf"])
+                .expect("parse DSF recovery action");
+            match cli.command {
+                Commands::DsfRecover { action, path } => {
+                    assert_eq!(action, expected);
+                    assert_eq!(path, PathBuf::from("album.dsf"));
+                }
+                other => panic!("expected dsf-recover command, got {other:?}"),
+            }
+        }
+    }
 }

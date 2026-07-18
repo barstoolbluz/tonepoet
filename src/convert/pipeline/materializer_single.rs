@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, ToolRunnerError};
-use super::reporter::PipelineReporter;
+use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 
@@ -24,7 +24,7 @@ impl super::stages::Materializer for SingleFileMaterializer {
         req: &PipelineRequest,
         _staging: &StagingDir,
         runner: &dyn ToolRunner,
-        _reporter: Option<&dyn PipelineReporter>,
+        reporter: Option<&dyn PipelineReporter>,
         _tool_paths: &HashMap<String, std::path::PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<PreparedSource, MaterializeError> {
@@ -60,7 +60,15 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 }
             }
         }
-        let metadata = read_track_metadata(&req.container)?;
+        let (metadata, metadata_warnings) = read_track_metadata_with_warnings(&req.container)?;
+        report_dsf_metadata_warnings(
+            reporter,
+            &req.item_id,
+            &req.container,
+            &metadata_warnings,
+            0.5,
+        )
+        .await;
         let track_number = metadata.track_number.unwrap_or(1).max(1);
         let track = PreparedTrack {
             id: TrackId {
@@ -199,21 +207,66 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
         .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
 }
 
+#[cfg(test)]
 pub(crate) fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
+    let (metadata, warnings) = read_track_metadata_with_warnings(path)?;
+    for warning in &warnings {
+        log::warn!(
+            "DSF metadata degraded for '{}'; audio conversion will continue: {}",
+            path.display(),
+            warning
+        );
+    }
+    Ok(metadata)
+}
+
+pub(crate) async fn report_dsf_metadata_warnings(
+    reporter: Option<&dyn PipelineReporter>,
+    item_id: &str,
+    path: &Path,
+    warnings: &[String],
+    phase_progress: f32,
+) {
+    for warning in warnings {
+        let message = format!(
+            "DSF metadata warning for '{}': {}; audio conversion will continue",
+            path.display(),
+            warning
+        );
+        log::warn!("{message}");
+        if let Some(reporter) = reporter {
+            reporter
+                .emit(PipelineEvent::Progress {
+                    item_id: item_id.to_string(),
+                    stage: PipelineStage::Materialize,
+                    phase_progress: phase_progress.clamp(0.0, 1.0),
+                    message: Some(message),
+                })
+                .await;
+        }
+    }
+}
+
+pub(crate) fn read_track_metadata_with_warnings(
+    path: &Path,
+) -> Result<(TrackMetadata, Vec<String>), MaterializeError> {
     if crate::dsf_tags::is_dsf(path) {
-        return crate::dsf_tags::read(path)
-            .map(|snapshot| crate::dsf_tags::to_track_metadata(&snapshot))
-            .map_err(MaterializeError::Parse);
+        let outcome = crate::dsf_tags::read_with_warnings(path)
+            .map_err(MaterializeError::Parse)?;
+        return Ok((
+            crate::dsf_tags::to_track_metadata(&outcome.snapshot),
+            outcome.warnings,
+        ));
     }
     use lofty::prelude::*;
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
-        Err(_) => return Ok(TrackMetadata::default()),
+        Err(_) => return Ok((TrackMetadata::default(), Vec::new())),
     };
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(tag) => tag,
-        None => return Ok(TrackMetadata::default()),
+        None => return Ok((TrackMetadata::default(), Vec::new())),
     };
 
     let mut extra = BTreeMap::new();
@@ -227,7 +280,7 @@ pub(crate) fn read_track_metadata(path: &Path) -> Result<TrackMetadata, Material
         extra.insert("disctotal".to_string(), total.to_string());
     }
 
-    Ok(TrackMetadata {
+    Ok((TrackMetadata {
         title: tag.title().map(|value| value.to_string()),
         artist: tag.artist().map(|value| value.to_string()),
         album_artist: tag
@@ -240,7 +293,7 @@ pub(crate) fn read_track_metadata(path: &Path) -> Result<TrackMetadata, Material
         comment: tag.comment().map(|value| value.to_string()),
         extra,
         ..TrackMetadata::default()
-    })
+    }, Vec::new()))
 }
 
 fn apply_track_selection(
@@ -282,28 +335,79 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[tokio::test]
+    async fn dsf_metadata_warning_is_visible_through_pipeline_progress() {
+        let reporter = super::super::reporter::RecordingReporter::new();
+        let path = PathBuf::from("quirky.dsf");
+        let warning = "declared DSF file size does not match the readable file length".to_string();
+
+        report_dsf_metadata_warnings(
+            Some(&reporter),
+            "queue-item-7",
+            &path,
+            std::slice::from_ref(&warning),
+            0.25,
+        )
+        .await;
+
+        let events = reporter.events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            PipelineEvent::Progress {
+                item_id,
+                stage,
+                phase_progress,
+                message,
+            } => {
+                assert_eq!(item_id, "queue-item-7");
+                assert_eq!(*stage, PipelineStage::Materialize);
+                assert_eq!(*phase_progress, 0.25);
+                assert_eq!(
+                    message.as_deref(),
+                    Some(
+                        "DSF metadata warning for 'quirky.dsf': declared DSF file size does not match the readable file length; audio conversion will continue"
+                    )
+                );
+            }
+            other => panic!("expected materialization progress warning, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn corrupt_dsf_metadata_is_a_materialization_error_not_empty_metadata() {
+    fn corrupt_dsf_metadata_degrades_to_empty_metadata_for_conversion() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("corrupt.dsf");
         crate::dsf_tags::write_test_dsf_fixture(&path, Some(b"NOT-AN-ID3-TAG"))
             .expect("write DSF with corrupt metadata area");
 
-        let error = read_track_metadata(&path)
-            .expect_err("corrupt DSF metadata must fail closed");
-        match error {
-            MaterializeError::Parse(message) => {
-                assert_eq!(
-                    message,
-                    format!(
-                        "failed to read DSF ID3 tags from '{}': invalid DSF metadata area in '{}': header declares metadata at offset 8284, but no ID3 marker is present",
-                        path.display(),
-                        path.display()
-                    )
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let metadata = read_track_metadata(&path)
+            .expect("unreadable DSF tag bytes must not block audio conversion");
+        // Split across two asserts: 15-element tuples have no PartialEq/Debug.
+        assert_eq!(
+            (
+                metadata.title.as_deref(),
+                metadata.artist.as_deref(),
+                metadata.album_artist.as_deref(),
+                metadata.composer.as_deref(),
+                metadata.performer.as_deref(),
+                metadata.genre.as_deref(),
+                metadata.date.as_deref(),
+                metadata.track_number,
+                metadata.disc_number,
+                metadata.isrc.as_deref(),
+            ),
+            (None, None, None, None, None, None, None, None, None, None),
+        );
+        assert_eq!(
+            (
+                metadata.publisher.as_deref(),
+                metadata.copyright.as_deref(),
+                metadata.comment.as_deref(),
+                metadata.pre_emphasis,
+                metadata.extra.len(),
+            ),
+            (None, None, None, false, 0),
+        );
     }
 
     fn track_with_metadata(metadata: TrackMetadata) -> PreparedTrack {

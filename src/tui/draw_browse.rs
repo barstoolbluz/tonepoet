@@ -319,7 +319,7 @@ fn draw_toolbar_button(
     enabled: bool,
     theme: super::theme::Theme,
 ) {
-    let width = label.chars().count() as u16;
+    let width = super::display_width::width(label) as u16;
     let style = if enabled {
         browse_toolbar_button_style(theme)
     } else {
@@ -359,7 +359,7 @@ fn draw_explore_pane(
     // Solid title bar (matches convert screen pane style)
     let bar_style = Style::default().fg(theme.bg).bg(border_color);
     let title = "▾ explore ";
-    let title_w = title.chars().count();
+    let title_w = super::display_width::width(&title);
     let dash_count = w.saturating_sub(2 + title_w);
     let top_line = Line::from(vec![
         Span::styled("┌", theme.border(border_color)),
@@ -738,10 +738,10 @@ fn options_submenu_rows(
 fn options_menu_panel_width(title: &str, rows: &[(String, Option<TuiButton>)], outer_width: u16) -> u16 {
     let content_width = rows
         .iter()
-        .map(|(row, _)| row.chars().count())
+        .map(|(row, _)| super::display_width::width(row))
         .max()
         .unwrap_or(12)
-        .max(title.chars().count() + 4) as u16;
+        .max(super::display_width::width(&title) + 4) as u16;
     content_width.saturating_add(2).min(40).min(outer_width.max(1))
 }
 
@@ -830,13 +830,7 @@ fn archive_listing_choice_mark(config_value: &str, choice: &str) -> &'static str
 }
 
 fn fit_menu_row(row: &str, width: u16) -> String {
-    let target = width as usize;
-    let mut fitted = row.chars().take(target).collect::<String>();
-    let current = fitted.chars().count();
-    if current < target {
-        fitted.push_str(&" ".repeat(target - current));
-    }
-    fitted
+    super::display_width::pad_or_truncate(row, width as usize, false)
 }
 
 fn render_options_menu_panel(
@@ -1178,7 +1172,7 @@ fn search_control_labels_for_tier(
 }
 
 fn search_control_label_width(label: &str) -> usize {
-    label.chars().count()
+    super::display_width::width(label)
 }
 
 fn search_control_total_width(labels: &[(SearchControlKind, String)]) -> usize {
@@ -1498,7 +1492,7 @@ fn render_path_input_spans(
     theme: super::theme::Theme,
 ) -> (Vec<Span<'static>>, u16) {
     let prefix = " path: ";
-    let prefix_w = prefix.chars().count();
+    let prefix_w = super::display_width::width(prefix);
     let input_max = inner_width
         .saturating_sub(prefix_w)
         .saturating_sub(1)
@@ -1568,8 +1562,9 @@ fn draw_breadcrumb_inline(f: &mut Frame, area: Rect, browse: &BrowseState, theme
     };
 
     let prefix = " path: ";
-    let prefix_w = prefix.chars().count();
-    let suffix_w = filter_suffix.chars().count() + type_ahead_suffix.chars().count();
+    let prefix_w = super::display_width::width(prefix);
+    let suffix_w = super::display_width::width(&filter_suffix)
+        + super::display_width::width(&type_ahead_suffix);
     let path_max = (area.width as usize)
         .saturating_sub(prefix_w)
         .saturating_sub(suffix_w)
@@ -1600,23 +1595,7 @@ fn draw_breadcrumb_inline(f: &mut Frame, area: Rect, browse: &BrowseState, theme
 /// Truncate a string from the LEFT to fit `max` chars, prepending `…` if cut.
 /// Used so the end of paths (most contextual portion) stays visible.
 fn truncate_left(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    if max < 2 {
-        return s
-            .chars()
-            .rev()
-            .take(max)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-    }
-    let skip = count - (max - 1);
-    let truncated: String = s.chars().skip(skip).collect();
-    format!("…{}", truncated)
+    super::display_width::truncate_left(s, max)
 }
 
 /// Draw the directory listing (left pane) with a sortable column header row.
@@ -1644,8 +1623,8 @@ fn draw_browse_list(
     } else {
         " search "
     };
-    let search_display_w = search_label.chars().count();
-    let title_w = title.chars().count();
+    let search_display_w = super::display_width::width(search_label);
+    let title_w = super::display_width::width(&title);
     let fill_count = w.saturating_sub(1 + title_w + search_display_w + 1);
 
     let bar_style = Style::default().fg(theme.bg).bg(border_color);
@@ -1696,7 +1675,7 @@ fn draw_browse_list(
         // Layout: │ + " / "(3) + input(input_w) + │
         let input_w = inner_w.saturating_sub(3);
         let (view, _cursor_col) = browse.search.input.view(input_w);
-        let view_len = view.chars().count();
+        let view_len = super::display_width::width(&view);
         let padded = if view.is_empty() {
             " ".repeat(input_w.max(1))
         } else {
@@ -1832,7 +1811,7 @@ fn draw_browse_list(
         let (visible, cursor_col_in_view) = input.view(input_width);
         filter_cursor = Some(cursor_col_in_view);
 
-        let visible_w = visible.chars().count();
+        let visible_w = super::display_width::width(&visible);
         let pad = input_width.saturating_sub(visible_w);
         lines.push(Line::from(vec![
             Span::styled("│", theme.border(border_color)),
@@ -1868,6 +1847,37 @@ fn draw_browse_list(
 }
 
 /// Render the column header row with sort indicator (▲/▼) on the active column.
+fn normalize_bordered_spans_width(
+    spans: &mut Vec<Span<'static>>,
+    target_width: usize,
+) {
+    let Some(right_border) = spans.pop() else {
+        return;
+    };
+    let content_target = target_width.saturating_sub(right_border.width());
+    let mut normalized = Vec::with_capacity(spans.len() + 2);
+    let mut remaining = content_target;
+    for span in spans.drain(..) {
+        if remaining == 0 {
+            break;
+        }
+        let span_width = span.width();
+        if span_width <= remaining {
+            remaining -= span_width;
+            normalized.push(span);
+        } else {
+            let fitted = super::display_width::fit_prefix(span.content.as_ref(), remaining);
+            normalized.push(Span::styled(fitted, span.style));
+            remaining = 0;
+        }
+    }
+    if remaining > 0 {
+        normalized.push(Span::raw(" ".repeat(remaining)));
+    }
+    normalized.push(right_border);
+    *spans = normalized;
+}
+
 fn render_header_row(
     border_color: ratatui::style::Color,
     width: usize,
@@ -1909,14 +1919,8 @@ fn render_header_row(
     spans.push(Span::raw(" ".repeat(ROW_TRAILING)));
     spans.push(Span::styled("│", theme.border(border_color)));
 
-    // Pad any shortfall to reach the right border cleanly (safety net).
-    let used: usize = spans.iter().map(|s| s.width()).sum();
-    if used < width {
-        let pad = width - used;
-        let last = spans.pop().unwrap();
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(last);
-    }
+    // Symmetrically pad or trim before the right border.
+    normalize_bordered_spans_width(&mut spans, width);
 
     Line::from(spans)
 }
@@ -1985,14 +1989,8 @@ fn render_entry_line(
     spans.push(Span::raw(" ".repeat(ROW_TRAILING)));
     spans.push(Span::styled("│", theme.border(border_color)));
 
-    // Pad any shortfall before the right border (safety net on narrow widths).
-    let used: usize = spans.iter().map(|s| s.width()).sum();
-    if used < width {
-        let pad = width - used;
-        let last = spans.pop().unwrap();
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(last);
-    }
+    // Symmetrically pad or trim before the right border.
+    normalize_bordered_spans_width(&mut spans, width);
 
     // Selected row gets a subtle bg highlight; hovered row gets a dimmer one.
     let bg = if is_selected {
@@ -2161,23 +2159,7 @@ fn is_audio_column(column: BrowseColumn) -> bool {
 /// Pad a string to `width` chars, or truncate with ellipsis if too long.
 /// `right_align` pads on the left when true.
 fn pad_or_truncate(s: &str, width: usize, right_align: bool) -> String {
-    let count = s.chars().count();
-    if count == width {
-        return s.to_string();
-    }
-    if count > width {
-        if width < 2 {
-            return s.chars().take(width).collect();
-        }
-        let truncated: String = s.chars().take(width - 1).collect();
-        return format!("{}…", truncated);
-    }
-    let pad = width - count;
-    if right_align {
-        format!("{}{}", " ".repeat(pad), s)
-    } else {
-        format!("{}{}", s, " ".repeat(pad))
-    }
+    super::display_width::pad_or_truncate(s, width, right_align)
 }
 
 /// Draw the info pane (right pane) showing details for the selected entry
@@ -2220,7 +2202,7 @@ fn draw_browse_info(
     // Solid title bar (matches convert screen pane style)
     let bar_style = Style::default().fg(theme.bg).bg(border_color);
     let title = "▾ info ";
-    let title_w = title.chars().count();
+    let title_w = super::display_width::width(&title);
     let fill_count = w.saturating_sub(2 + title_w);
 
     let top_line = Line::from(vec![
@@ -2337,12 +2319,7 @@ fn draw_browse_info(
 pub(crate) fn truncate_for_disc_overlay(s: &str, max_chars: usize) -> String { truncate_to(s, max_chars) }
 
 fn truncate_to(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_chars || max_chars < 2 {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max_chars - 1).collect();
-    format!("{}…", truncated)
+    super::display_width::truncate_right(s, max_chars)
 }
 
 fn push_key_value_line(
@@ -2561,7 +2538,7 @@ fn push_disc_probe_summary_lines(
             lines.push(vec![]);
             let row = lines.len();
             let label = " audio streams ";
-            let width = label.chars().count();
+            let width = super::display_width::width(label);
             let pad = content_width.saturating_sub(width + 3);
             let bg = if audio_streams_hovered { theme.blue } else { theme.purple };
             lines.push(vec![
@@ -2998,7 +2975,7 @@ fn entry_info_lines(
                 lines.push(vec![]);
                 analyze_row = lines.len();
                 let analyze_label = " analyze ";
-                let analyze_w = analyze_label.chars().count();
+                let analyze_w = super::display_width::width(analyze_label);
                 let analyze_pad = content_width.saturating_sub(analyze_w + 3);
                 let analyze_bg = if analyze_hovered {
                     theme.blue
@@ -3217,7 +3194,7 @@ fn entry_info_lines(
                 lines.push(vec![]);
                 let analyze_row_unprobed = lines.len();
                 let a_label = " analyze ";
-                let a_w = a_label.chars().count();
+                let a_w = super::display_width::width(a_label);
                 let a_pad = content_width.saturating_sub(a_w + 3);
                 let a_bg = if analyze_hovered {
                     theme.blue
@@ -3238,7 +3215,7 @@ fn entry_info_lines(
                 lines.push(vec![]);
                 let et_row = lines.len();
                 let et_label = " edit tags ";
-                let et_w2 = et_label.chars().count();
+                let et_w2 = super::display_width::width(et_label);
                 let et_pad2 = content_width.saturating_sub(et_w2 + 3);
                 let et_bg2 = if edit_tags_hovered {
                     theme.blue
@@ -3269,7 +3246,7 @@ fn entry_info_lines(
             lines.push(vec![]);
             let edit_tags_row = lines.len();
             let et_label = " edit tags ";
-            let et_w = et_label.chars().count();
+            let et_w = super::display_width::width(et_label);
             let et_pad = content_width.saturating_sub(et_w + 3);
             let et_bg = if edit_tags_hovered {
                 theme.blue
@@ -3442,7 +3419,7 @@ fn entry_info_lines(
             lines.push(vec![]);
             let edit_tags_row = lines.len();
             let et_label = " edit tags ";
-            let et_w = et_label.chars().count();
+            let et_w = super::display_width::width(et_label);
             let et_pad = content_width.saturating_sub(et_w + 3);
             let et_bg = if edit_tags_hovered {
                 theme.blue
@@ -3589,6 +3566,52 @@ mod browse_list_render_allocation_tests {
             ),
             "Artist  "
         );
+    }
+
+    #[test]
+    fn entry_rows_keep_right_border_at_exact_display_width() {
+        let browse = BrowseState::new();
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let width = 40usize;
+        let columns = [BrowseColumnCell {
+            column: BrowseColumn::Name,
+            width: width - 8,
+        }];
+
+        for name in [
+            "Japan Epic 25 ・ 8P-5137",
+            "日本語アルバム",
+            "e\u{301}lan vital",
+        ] {
+            let entry = BrowseEntry::new(
+                PathBuf::from(format!("/tmp/{name}")),
+                name.to_string(),
+                EntryKind::OtherFile,
+                0,
+                None,
+            );
+            let line = render_entry_line(
+                theme.border_dim,
+                width,
+                &columns,
+                &browse,
+                &entry,
+                None,
+                false,
+                false,
+                false,
+                false,
+                theme,
+            );
+            assert_eq!(line.width(), width, "{name}");
+            assert_eq!(
+                line.spans.last().map(|span| span.content.as_ref()),
+                Some("│"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -4312,7 +4335,7 @@ mod path_field_render_tests {
             .collect::<String>();
 
         assert!(rendered.starts_with(" path: Music/Album"));
-        assert_eq!(cursor_col, (" path: Music/Al".chars().count()) as u16);
+        assert_eq!(cursor_col, crate::tui::display_width::width(" path: Music/Al") as u16);
         assert!(spans.iter().any(|span| {
             span.content.as_ref().contains("Al")
                 && span.style.bg == Some(theme.selection_bg)

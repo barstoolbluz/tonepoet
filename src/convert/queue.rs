@@ -190,6 +190,11 @@ pub struct ConversionItem {
     /// resumed item cannot silently attempt extraction without credentials.
     #[serde(default)]
     pub archive_password_required: bool,
+    /// Process-local marker set only while sanitizing a legacy persisted row
+    /// that actually contained cleartext. New CLI passwords remain ephemeral:
+    /// a normal queue save must not promote them into durable secret storage.
+    #[serde(skip)]
+    pub archive_password_needs_migration: bool,
     /// Exact Chunk 1 planner settings selected by the UI/CLI.
     ///
     /// Kept on the queue item so persisted queued work can recover without
@@ -245,6 +250,7 @@ impl Default for ConversionItem {
             archive_password: None,
             archive_password_ref: None,
             archive_password_required: false,
+            archive_password_needs_migration: false,
             pipeline_settings: None,
             cue_sidecar_override: None,
             pre_extracted_staging: None,
@@ -282,6 +288,7 @@ impl ConversionItem {
             archive_password,
             archive_password_ref: None,
             archive_password_required: false,
+            archive_password_needs_migration: false,
             pipeline_settings,
             cue_sidecar_override: None,
             pre_extracted_staging: None,
@@ -391,104 +398,178 @@ impl ConversionItem {
         self.archive_password_required = password.is_some() || reference.is_some();
         self.archive_password = password.clone();
         self.archive_password_ref = reference;
+        // This setter represents an explicit current-process choice, not
+        // surviving legacy cleartext loaded from disk. Never let a stale
+        // migration marker promote a replacement password into durable storage.
+        self.archive_password_needs_migration = false;
         if let Some(request) = self.pipeline_request.as_mut() {
             request.source.archive_password = password.map(super::pipeline::SecretString::new);
         }
     }
 
-    /// Rehydrate or migrate archive-password state after queue deserialization.
-    ///
-    /// Legacy cleartext values are accepted only as migration input and are
-    /// immediately moved into the OS secret store under an opaque account
-    /// derived from the durable queue-item id. Interrupted retries therefore
-    /// overwrite the same account instead of accumulating random orphan entries.
-    /// An unavailable reference or backend fails closed: the password is cleared
-    /// and the item becomes retryable with a user-visible password error.
-    pub fn restore_archive_password_after_load(&mut self) -> Result<bool, String> {
+    /// Sanitize archive-password state after queue deserialization without
+    /// resolving opaque references. Secret lookup is deliberately deferred to
+    /// the execution boundary so queue history and startup do not depend on the
+    /// backend being available.
+    pub(crate) fn restore_archive_password_after_load(&mut self) -> QueueSecretLoadReport {
+        let mut report = QueueSecretLoadReport::default();
         let nested_legacy = self
             .pipeline_request
             .as_ref()
             .and_then(|request| request.source.archive_password.as_ref())
             .map(|secret| secret.expose().to_string());
+
+        if self.is_finished() {
+            if self.archive_password.is_some()
+                || nested_legacy.is_some()
+                || self.archive_password_ref.is_some()
+                || self.archive_password_required
+            {
+                report.rewrite_required = true;
+            }
+            if let Some(reference) = self.archive_password_ref.take() {
+                if crate::secret_store::reference_has_namespace(&reference, "queue-item") {
+                    report.retire_references.push(reference);
+                }
+            }
+            self.archive_password = None;
+            self.archive_password_required = false;
+            self.archive_password_needs_migration = false;
+            if let Some(request) = self.pipeline_request.as_mut() {
+                request.source.archive_password = None;
+            }
+            return report;
+        }
+
         if let (Some(top_level), Some(nested)) =
             (self.archive_password.as_deref(), nested_legacy.as_deref())
         {
             if top_level != nested {
+                log::warn!(
+                    "queue item '{}' contains contradictory legacy archive-password fields; preserving the contradiction only in memory so execution can fail closed",
+                    self.input_path.display()
+                );
+                self.archive_password_required = true;
+                self.archive_password_needs_migration = true;
+                report.rewrite_required = true;
+                return report;
+            }
+        }
+        let legacy_password = self.archive_password.clone().or(nested_legacy);
+        self.archive_password_needs_migration = legacy_password.is_some();
+        if self
+            .pipeline_request
+            .as_ref()
+            .and_then(|request| request.source.archive_password.as_ref())
+            .is_some()
+        {
+            report.rewrite_required = true;
+        }
+        if let Some(request) = self.pipeline_request.as_mut() {
+            request.source.archive_password = None;
+        }
+
+        if self.archive_password_ref.is_none() {
+            if let Some(password) = legacy_password.as_deref() {
+                match crate::secret_store::stable_reference("queue-item", &self.id)
+                    .and_then(|reference| {
+                        crate::secret_store::set(&reference, password)?;
+                        Ok(reference)
+                    })
+                {
+                    Ok(reference) => {
+                        self.archive_password_ref = Some(reference);
+                        self.archive_password_needs_migration = false;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "queue item '{}' retained its legacy archive password in memory for this process because migration is unavailable: {}",
+                            self.input_path.display(),
+                            error
+                        );
+                    }
+                }
+                report.rewrite_required = true;
+            }
+        } else if legacy_password.is_some() {
+            report.rewrite_required = true;
+        }
+
+        self.archive_password = legacy_password;
+        self.archive_password_required = self.archive_password_required
+            || self.archive_password.is_some()
+            || self.archive_password_ref.is_some();
+        report
+    }
+
+    /// Resolve the archive password immediately before executable request
+    /// construction. Any contradiction, missing required secret, or backend
+    /// error fails this item only; it never mutates terminal history at load.
+    pub(crate) fn resolve_archive_password_for_execution(&mut self) -> Result<(), String> {
+        if self.is_finished() {
+            return Ok(());
+        }
+        let nested = self
+            .pipeline_request
+            .as_ref()
+            .and_then(|request| request.source.archive_password.as_ref())
+            .map(|secret| secret.expose().to_string());
+        if let (Some(top_level), Some(nested)) =
+            (self.archive_password.as_deref(), nested.as_deref())
+        {
+            if top_level != nested {
                 let message = format!(
-                    "Archive password state is ambiguous for resumed queue item '{}': legacy queue fields disagree. Set the archive password again, then retry.",
+                    "Archive password state is ambiguous for queue item '{}': process-local fields disagree. Set the archive password again, then retry.",
                     self.input_path.display()
                 );
                 self.fail_closed_for_unavailable_archive_password(message.clone());
                 return Err(message);
             }
         }
-        let legacy_password = self.archive_password.clone().or(nested_legacy);
-
-        let (password, migrated) = if let Some(reference) = self.archive_password_ref.as_deref() {
+        let process_local = self.archive_password.clone().or(nested);
+        let resolved = if let Some(reference) = self.archive_password_ref.as_deref() {
             match crate::secret_store::get(reference) {
                 Ok(password) => {
-                    if legacy_password
+                    if process_local
                         .as_deref()
-                        .is_some_and(|legacy| legacy != password)
+                        .is_some_and(|local| local != password)
                     {
                         let message = format!(
-                            "Archive password state is ambiguous for resumed queue item '{}': the persisted reference and legacy cleartext disagree. Set the archive password again, then retry.",
+                            "Archive password state is ambiguous for queue item '{}': the persisted reference and process-local value disagree. Set the archive password again, then retry.",
                             self.input_path.display()
                         );
                         self.fail_closed_for_unavailable_archive_password(message.clone());
                         return Err(message);
                     }
-                    (Some(password), false)
+                    Some(password)
                 }
                 Err(error) => {
-                    self.fail_closed_for_unavailable_archive_password(format!(
-                        "Archive password unavailable for resumed queue item '{}': {error}. Set the archive password again, then retry.",
+                    let message = format!(
+                        "Archive password unavailable for queue item '{}': {error}. Set the archive password again, then retry.",
                         self.input_path.display()
-                    ));
-                    return Err(error.to_string());
+                    );
+                    self.fail_closed_for_unavailable_archive_password(message.clone());
+                    return Err(message);
                 }
             }
-        } else if let Some(password) = legacy_password {
-            let reference = match crate::secret_store::stable_reference("queue-item", &self.id) {
-                Ok(reference) => reference,
-                Err(error) => {
-                    self.fail_closed_for_unavailable_archive_password(format!(
-                        "Archive password migration failed for resumed queue item '{}': {error}. Set the archive password again, then retry.",
-                        self.input_path.display()
-                    ));
-                    return Err(error.to_string());
-                }
-            };
-            match crate::secret_store::set(&reference, &password) {
-                Ok(()) => {
-                    self.archive_password_ref = Some(reference);
-                    (Some(password), true)
-                }
-                Err(error) => {
-                    self.fail_closed_for_unavailable_archive_password(format!(
-                        "Archive password migration failed for resumed queue item '{}': {error}. Set the archive password again, then retry.",
-                        self.input_path.display()
-                    ));
-                    return Err(error.to_string());
-                }
-            }
-        } else if self.archive_password_required {
+        } else {
+            process_local
+        };
+
+        if self.archive_password_required && resolved.is_none() {
             let message = format!(
-                "Archive password unavailable for resumed queue item '{}': the password was process-only and was not persisted. Set the archive password again, then retry.",
+                "Archive password unavailable for queue item '{}': no persisted or process-local secret is available. Set the archive password again, then retry.",
                 self.input_path.display()
             );
             self.fail_closed_for_unavailable_archive_password(message.clone());
             return Err(message);
-        } else {
-            (None, false)
-        };
-
-        self.archive_password_required = password.is_some() || self.archive_password_ref.is_some();
-        self.archive_password = password.clone();
-        if let Some(request) = self.pipeline_request.as_mut() {
-            request.source.archive_password = password.map(super::pipeline::SecretString::new);
         }
-        Ok(migrated)
+        self.archive_password = resolved.clone();
+        if let Some(request) = self.pipeline_request.as_mut() {
+            request.source.archive_password =
+                resolved.map(super::pipeline::SecretString::new);
+        }
+        Ok(())
     }
 
     fn fail_closed_for_unavailable_archive_password(&mut self, message: String) {
@@ -525,29 +606,169 @@ impl ConversionItem {
     }
 }
 
-/// Rehydrate persisted queue secrets and migrate legacy cleartext fields.
-/// Returns true when at least one item gained a new reference and the
-/// persistence store should be rewritten immediately.
-pub(crate) fn restore_archive_passwords_after_load(items: &mut [ConversionItem]) -> bool {
-    let mut migrated = false;
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueueSecretLoadReport {
+    pub rewrite_required: bool,
+    pub retire_references: Vec<String>,
+}
+
+impl QueueSecretLoadReport {
+    fn merge(&mut self, item: Self) {
+        self.rewrite_required |= item.rewrite_required;
+        self.retire_references.extend(item.retire_references);
+    }
+}
+
+/// Sanitize persisted queue secrets without resolving references. The returned
+/// references may be retired only after the sanitized queue is durably
+/// republished.
+pub(crate) fn restore_archive_passwords_after_load(
+    items: &mut [ConversionItem],
+) -> QueueSecretLoadReport {
+    let mut report = QueueSecretLoadReport::default();
     for item in items {
-        match item.restore_archive_password_after_load() {
-            Ok(item_migrated) => migrated |= item_migrated,
-            Err(error) => {
-                // The item was changed to a fail-closed retry state and any
-                // legacy in-memory secret was cleared. Rewrite the store even
-                // when migration itself failed, or the cleartext legacy field
-                // would remain on disk indefinitely.
-                migrated = true;
-                log::warn!(
-                    "queue item '{}' could not restore its archive password: {}",
-                    item.input_path.display(),
-                    error
-                );
+        report.merge(item.restore_archive_password_after_load());
+    }
+    report
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueueSecretPersistReport {
+    pub retire_references: Vec<String>,
+}
+
+/// Prepare a cloned queue snapshot for durable publication.
+///
+/// Process-local cleartext is never serialized. When a pending item still has
+/// a legacy cleartext password, this boundary first publishes or validates an
+/// opaque reference. Any backend error aborts the queue publication rather
+/// than silently persisting a row that can no longer recover its credential.
+/// Terminal rows discard all archive-password state and report queue-owned
+/// references that may be retired only after the sanitized snapshot commits.
+pub(crate) fn prepare_archive_passwords_for_persistence(
+    items: &mut [ConversionItem],
+) -> Result<QueueSecretPersistReport, String> {
+    let mut report = QueueSecretPersistReport::default();
+
+    for item in items {
+        let nested = item
+            .pipeline_request
+            .as_ref()
+            .and_then(|request| request.source.archive_password.as_ref())
+            .map(|secret| secret.expose().to_string());
+
+        if item.is_finished() {
+            if let Some(reference) = item.archive_password_ref.take() {
+                if crate::secret_store::reference_has_namespace(&reference, "queue-item") {
+                    report.retire_references.push(reference);
+                }
+            }
+            item.archive_password = None;
+            item.archive_password_required = false;
+            item.archive_password_needs_migration = false;
+            if let Some(request) = item.pipeline_request.as_mut() {
+                request.source.archive_password = None;
+            }
+            continue;
+        }
+
+        if let (Some(top_level), Some(nested_value)) =
+            (item.archive_password.as_deref(), nested.as_deref())
+        {
+            if top_level != nested_value {
+                return Err(format!(
+                    "queue item '{}' has contradictory process-local archive-password fields; refusing to publish ambiguous state",
+                    item.input_path.display()
+                ));
             }
         }
+
+        let process_local = item.archive_password.clone().or(nested);
+        if let Some(password) = process_local.as_deref() {
+            let reference = if let Some(reference) = item.archive_password_ref.clone() {
+                match crate::secret_store::get(&reference) {
+                    Ok(existing) if existing == password => reference,
+                    Ok(_) => {
+                        return Err(format!(
+                            "queue item '{}' has a persisted archive-password reference that disagrees with its process-local value; refusing to overwrite either authority",
+                            item.input_path.display()
+                        ));
+                    }
+                    Err(error) if error.is_not_found() => {
+                        crate::secret_store::set(&reference, password).map_err(|set_error| {
+                            format!(
+                                "could not publish the archive password for queue item '{}': {}",
+                                item.input_path.display(),
+                                set_error
+                            )
+                        })?;
+                        reference
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "could not validate the archive-password reference for queue item '{}': {}",
+                            item.input_path.display(),
+                            error
+                        ));
+                    }
+                }
+            } else if item.archive_password_needs_migration {
+                let reference = crate::secret_store::stable_reference("queue-item", &item.id)
+                    .map_err(|error| {
+                        format!(
+                            "could not derive an archive-password reference for queue item '{}': {}",
+                            item.input_path.display(),
+                            error
+                        )
+                    })?;
+                crate::secret_store::set(&reference, password).map_err(|error| {
+                    format!(
+                        "could not publish the archive password for queue item '{}': {}",
+                        item.input_path.display(),
+                        error
+                    )
+                })?;
+                reference
+            } else {
+                item.archive_password = None;
+                if let Some(request) = item.pipeline_request.as_mut() {
+                    request.source.archive_password = None;
+                }
+                continue;
+            };
+            item.archive_password_ref = Some(reference);
+            item.archive_password_required = true;
+            item.archive_password_needs_migration = false;
+        }
+
+        item.archive_password = None;
+        if let Some(request) = item.pipeline_request.as_mut() {
+            request.source.archive_password = None;
+        }
     }
-    migrated
+
+    report.retire_references.sort();
+    report.retire_references.dedup();
+    Ok(report)
+}
+
+pub(crate) fn retire_queue_owned_secret_references(references: &[String]) {
+    let mut owned = references
+        .iter()
+        .filter(|reference| {
+            crate::secret_store::reference_has_namespace(reference, "queue-item")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    owned.sort();
+    owned.dedup();
+    if let Err(error) = crate::secret_store::delete_many_if_present(&owned) {
+        log::warn!(
+            "could not retire {} queue-owned archive-password reference(s): {}",
+            owned.len(),
+            error
+        );
+    }
 }
 
 fn _status_progress(status: &ConversionStatus) -> f32 {
@@ -571,6 +792,19 @@ pub struct ConversionQueue {
     current: Option<ConversionItem>,
     /// Completed items (kept for history)
     completed: Vec<ConversionItem>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RemovedFinishedItem {
+    item: ConversionItem,
+    location: RemovedFinishedItemLocation,
+}
+
+#[derive(Debug)]
+enum RemovedFinishedItemLocation {
+    Pending(usize),
+    Current,
+    Completed(usize),
 }
 
 impl ConversionQueue {
@@ -894,6 +1128,66 @@ impl ConversionQueue {
 
     pub fn remove_item_by_id(&mut self, item_id: &str) -> bool {
         !self.remove_matching_items(|item| item.id.as_str() == item_id).is_empty()
+    }
+
+    /// Remove one terminal item matching `should_remove` while retaining enough
+    /// location information to restore the exact queue shape if a surrounding
+    /// admission transaction later rolls back.
+    pub(crate) fn take_finished_item_matching<F>(
+        &mut self,
+        mut should_remove: F,
+    ) -> Option<RemovedFinishedItem>
+    where
+        F: FnMut(&ConversionItem) -> bool,
+    {
+        if let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.is_finished() && should_remove(item))
+        {
+            return self.items.remove(index).map(|item| RemovedFinishedItem {
+                item,
+                location: RemovedFinishedItemLocation::Pending(index),
+            });
+        }
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|item| item.is_finished() && should_remove(item))
+        {
+            return self.current.take().map(|item| RemovedFinishedItem {
+                item,
+                location: RemovedFinishedItemLocation::Current,
+            });
+        }
+        let index = self
+            .completed
+            .iter()
+            .position(|item| item.is_finished() && should_remove(item))?;
+        Some(RemovedFinishedItem {
+            item: self.completed.remove(index),
+            location: RemovedFinishedItemLocation::Completed(index),
+        })
+    }
+
+    pub(crate) fn restore_finished_item(&mut self, removed: RemovedFinishedItem) {
+        match removed.location {
+            RemovedFinishedItemLocation::Pending(index) => {
+                self.items.insert(index.min(self.items.len()), removed.item);
+            }
+            RemovedFinishedItemLocation::Current => {
+                debug_assert!(self.current.is_none());
+                if self.current.is_none() {
+                    self.current = Some(removed.item);
+                } else {
+                    self.completed.push(removed.item);
+                }
+            }
+            RemovedFinishedItemLocation::Completed(index) => {
+                self.completed
+                    .insert(index.min(self.completed.len()), removed.item);
+            }
+        }
     }
 
     pub(crate) fn remove_matching_item_ids<F>(&mut self, should_remove: F) -> Vec<String>
@@ -1296,6 +1590,107 @@ mod cue_sidecar_override_queue_tests {
     }
 
     #[test]
+    fn persistence_boundary_keeps_new_cli_password_ephemeral() {
+        let mut item = item_with_pipeline_request(Some("cli-process-only"));
+        assert!(!item.archive_password_needs_migration);
+
+        let report = prepare_archive_passwords_for_persistence(std::slice::from_mut(&mut item))
+            .expect("new process-local passwords do not require secret-store access");
+
+        assert_eq!(report, QueueSecretPersistReport::default());
+        assert_eq!(item.archive_password, None);
+        assert_eq!(item.archive_password_ref, None);
+        assert!(item.archive_password_required);
+        assert!(item
+            .pipeline_request
+            .as_ref()
+            .expect("request retained")
+            .source
+            .archive_password
+            .is_none());
+        let persisted = serde_json::to_string(&item).expect("serialize prepared CLI item");
+        assert!(!persisted.contains("cli-process-only"));
+        assert!(!persisted.contains("archive_password_ref"));
+    }
+
+    #[test]
+    fn explicit_password_replacement_clears_stale_legacy_migration_authority() {
+        let mut item = item_with_pipeline_request(Some("legacy-process-copy"));
+        item.archive_password_needs_migration = true;
+
+        item.set_archive_password(Some("explicit-replacement".to_string()), None);
+        let report = prepare_archive_passwords_for_persistence(std::slice::from_mut(&mut item))
+            .expect("an explicit replacement remains process-only");
+
+        assert_eq!(report, QueueSecretPersistReport::default());
+        assert_eq!(item.archive_password, None);
+        assert_eq!(item.archive_password_ref, None);
+        assert!(item.archive_password_required);
+        assert!(!item.archive_password_needs_migration);
+        assert!(item
+            .pipeline_request
+            .as_ref()
+            .expect("request retained")
+            .source
+            .archive_password
+            .is_none());
+    }
+
+    #[test]
+    fn persistence_boundary_blocks_deferred_legacy_migration_without_erasing_secret() {
+        let _backend = crate::secret_store::enable_unavailable_test_backend();
+        let mut item = item_with_pipeline_request(Some("legacy-process-copy"));
+
+        let load_report = item.restore_archive_password_after_load();
+        assert!(load_report.rewrite_required);
+        assert!(item.archive_password_needs_migration);
+        assert_eq!(item.archive_password_ref, None);
+
+        let error = prepare_archive_passwords_for_persistence(std::slice::from_mut(&mut item))
+            .expect_err("unavailable backend must block publication of a lossy snapshot");
+
+        assert!(error.contains("could not publish the archive password"));
+        assert!(error.contains("injected unavailable secret backend"));
+        assert_eq!(item.archive_password.as_deref(), Some("legacy-process-copy"));
+        assert_eq!(item.archive_password_ref, None);
+        assert!(item.archive_password_needs_migration);
+        assert!(item.archive_password_required);
+    }
+
+    #[test]
+    fn persistence_boundary_migrates_legacy_cleartext_before_serializing() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let mut item = item_with_pipeline_request(Some("legacy-to-persist"));
+        item.id = "persisted-legacy-id".to_string();
+        item.archive_password_needs_migration = true;
+
+        let report = prepare_archive_passwords_for_persistence(std::slice::from_mut(&mut item))
+            .expect("legacy migration succeeds before publication");
+
+        assert_eq!(report, QueueSecretPersistReport::default());
+        let expected_reference =
+            crate::secret_store::stable_reference("queue-item", "persisted-legacy-id")
+                .expect("stable reference");
+        assert_eq!(item.archive_password_ref.as_deref(), Some(expected_reference.as_str()));
+        assert_eq!(
+            crate::secret_store::get(&expected_reference).as_deref(),
+            Ok("legacy-to-persist")
+        );
+        assert_eq!(item.archive_password, None);
+        assert!(!item.archive_password_needs_migration);
+        assert!(item
+            .pipeline_request
+            .as_ref()
+            .expect("request retained")
+            .source
+            .archive_password
+            .is_none());
+        let persisted = serde_json::to_string(&item).expect("serialize migrated item");
+        assert!(persisted.contains(&expected_reference));
+        assert!(!persisted.contains("legacy-to-persist"));
+    }
+
+    #[test]
     fn legacy_cleartext_queue_secret_migrates_to_reference_and_rehydrates_both_surfaces() {
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let mut value = serde_json::to_value(item_with_pipeline_request(None))
@@ -1328,14 +1723,30 @@ mod cue_sidecar_override_queue_tests {
             Some("legacy-secret")
         );
 
-        assert_eq!(decoded.restore_archive_password_after_load(), Ok(true));
+        assert_eq!(
+            decoded.restore_archive_password_after_load(),
+            QueueSecretLoadReport {
+                rewrite_required: true,
+                retire_references: Vec::new(),
+            }
+        );
         let reference = decoded
             .archive_password_ref
-            .as_deref()
+            .clone()
             .expect("migration stores reference");
-        assert!(crate::secret_store::is_reference(reference));
-        assert_eq!(crate::secret_store::get(reference).as_deref(), Ok("legacy-secret"));
+        assert!(crate::secret_store::is_reference(&reference));
+        assert_eq!(crate::secret_store::get(&reference).as_deref(), Ok("legacy-secret"));
         assert_eq!(decoded.archive_password.as_deref(), Some("legacy-secret"));
+        assert!(decoded
+            .pipeline_request
+            .as_ref()
+            .expect("request")
+            .source
+            .archive_password
+            .is_none());
+        decoded
+            .resolve_archive_password_for_execution()
+            .expect("execution resolves migrated secret");
         assert_eq!(
             decoded
                 .pipeline_request
@@ -1346,7 +1757,7 @@ mod cue_sidecar_override_queue_tests {
         );
 
         let persisted = serde_json::to_string(&decoded).expect("serialize migrated item");
-        assert!(persisted.contains(reference));
+        assert!(persisted.contains(reference.as_str()));
         assert!(!persisted.contains("legacy-secret"));
     }
 
@@ -1356,7 +1767,7 @@ mod cue_sidecar_override_queue_tests {
         let mut first = item_with_pipeline_request(Some("legacy-secret"));
         first.id = "durable-queue-item-id".to_string();
 
-        assert_eq!(first.restore_archive_password_after_load(), Ok(true));
+        assert!(first.restore_archive_password_after_load().rewrite_required);
         let first_reference = first
             .archive_password_ref
             .clone()
@@ -1365,7 +1776,7 @@ mod cue_sidecar_override_queue_tests {
 
         let mut retry = item_with_pipeline_request(Some("legacy-secret"));
         retry.id = "durable-queue-item-id".to_string();
-        assert_eq!(retry.restore_archive_password_after_load(), Ok(true));
+        assert!(retry.restore_archive_password_after_load().rewrite_required);
         let retry_reference = retry
             .archive_password_ref
             .clone()
@@ -1391,12 +1802,15 @@ mod cue_sidecar_override_queue_tests {
             crate::convert::pipeline::SecretString::new("nested-secret".to_string()),
         );
 
+        let report = item.restore_archive_password_after_load();
+        assert!(report.rewrite_required);
+        assert!(!item.is_finished(), "load must not mutate pending status");
         let error = item
-            .restore_archive_password_after_load()
-            .expect_err("disagreeing legacy fields must not choose a password");
+            .resolve_archive_password_for_execution()
+            .expect_err("disagreeing legacy fields must fail at execution");
         assert_eq!(
             error,
-            "Archive password state is ambiguous for resumed queue item '/tmp/album.7z': legacy queue fields disagree. Set the archive password again, then retry."
+            "Archive password state is ambiguous for queue item '/tmp/album.7z': process-local fields disagree. Set the archive password again, then retry."
         );
         assert_eq!(item.archive_password, None);
         assert!(item
@@ -1415,7 +1829,10 @@ mod cue_sidecar_override_queue_tests {
         let mut item = item_with_pipeline_request(Some("stale-process-secret"));
         item.archive_password_ref = Some("archive-password:missing".to_string());
 
-        assert!(item.restore_archive_password_after_load().is_err());
+        let report = item.restore_archive_password_after_load();
+        assert!(report.rewrite_required);
+        assert!(!item.is_finished(), "load must not fail the pending item");
+        assert!(item.resolve_archive_password_for_execution().is_err());
         assert_eq!(item.archive_password, None);
         assert!(item
             .pipeline_request
@@ -1448,16 +1865,44 @@ mod cue_sidecar_override_queue_tests {
             .contains("cli-only-secret"));
 
         let mut resumed: ConversionItem = serde_json::from_value(value).expect("deserialize persisted CLI item");
+        let report = resumed.restore_archive_password_after_load();
+        assert!(!report.rewrite_required);
+        assert!(!resumed.is_finished(), "load must preserve pending status");
         let error = resumed
-            .restore_archive_password_after_load()
-            .expect_err("process-only password must be re-entered after resume");
+            .resolve_archive_password_for_execution()
+            .expect_err("process-only password must be re-entered at execution");
         assert_eq!(
             error,
-            "Archive password unavailable for resumed queue item '/tmp/album.7z': the password was process-only and was not persisted. Set the archive password again, then retry."
+            "Archive password unavailable for queue item '/tmp/album.7z': no persisted or process-local secret is available. Set the archive password again, then retry."
         );
         assert_eq!(resumed.archive_password, None);
         assert!(resumed.archive_password_required);
         assert!(matches!(resumed.status, ConversionStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn terminal_history_never_resolves_secret_or_changes_status_during_load() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let reference = crate::secret_store::stable_reference("queue-item", "terminal-id")
+            .expect("stable reference");
+        crate::secret_store::set(&reference, "history-secret").expect("store secret");
+        let mut item = item_with_pipeline_request(Some("legacy-history-secret"));
+        item.id = "terminal-id".to_string();
+        item.archive_password_ref = Some(reference.clone());
+        item.status = ConversionStatus::Completed {
+            output_path: PathBuf::from("/tmp/output.flac"),
+            log_path: None,
+        };
+        let original_status = item.status.clone();
+
+        let report = item.restore_archive_password_after_load();
+
+        assert_eq!(item.status, original_status);
+        assert_eq!(item.archive_password, None);
+        assert_eq!(item.archive_password_ref, None);
+        assert!(!item.archive_password_required);
+        assert_eq!(report.retire_references, vec![reference]);
+        assert!(report.rewrite_required);
     }
 
     #[test]

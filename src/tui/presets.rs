@@ -196,24 +196,32 @@ impl TuiPreset {
                 | AudioFormat::Tta
         );
 
-        report.record(
-            "sample_rate",
-            Self::select_enabled(&mut format_state.sample_rate, &self.sample_rate),
-        );
+        let sample_rate_applied =
+            Self::select_enabled(&mut format_state.sample_rate, &self.sample_rate);
+        report.record("sample_rate", sample_rate_applied);
+        if sample_rate_applied {
+            format_state.mark_sample_rate_user_policy();
+        }
 
         if pcm_depth_is_meaningful {
             match parse_bit_depth(&self.bit_depth) {
-                Some(value) => report.record(
-                    "bit_depth",
-                    Self::select_enabled(&mut format_state.bit_depth, &value),
-                ),
+                Some(value) => {
+                    let applied = Self::select_enabled(&mut format_state.bit_depth, &value);
+                    report.record("bit_depth", applied);
+                    if applied {
+                        format_state.mark_bit_depth_user_policy();
+                    }
+                }
                 None => report.record("bit_depth", false),
             }
             match parse_dither(&self.dither) {
-                Some(value) => report.record(
-                    "dither",
-                    Self::select_enabled(&mut format_state.dither, &value),
-                ),
+                Some(value) => {
+                    let applied = Self::select_enabled(&mut format_state.dither, &value);
+                    report.record("dither", applied);
+                    if applied {
+                        format_state.dither_overridden = true;
+                    }
+                }
                 None => report.record("dither", false),
             }
         }
@@ -227,10 +235,13 @@ impl TuiPreset {
                 None => report.record("replaygain", false),
             }
             match parse_resampler(&self.resampler) {
-                Some(value) => report.record(
-                    "resampler",
-                    Self::select_enabled(&mut format_state.resampler, &value),
-                ),
+                Some(value) => {
+                    let applied = Self::select_enabled(&mut format_state.resampler, &value);
+                    report.record("resampler", applied);
+                    if applied {
+                        format_state.resampler_overridden = true;
+                    }
+                }
                 None => report.record("resampler", false),
             }
         } else {
@@ -1169,6 +1180,8 @@ merge = "multi-file"
         let mut format = FormatState::new();
         format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
         format.bit_depth.select_value(&BitDepthChoice::Source);
+        format.dither.select_value(&DitherType::Shibata);
+        format.resampler.select_value(&ResamplerChoice::Soxr);
         format.replaygain.select_value(&ReplayGainChoice::BothIfMissing);
         let output = OutputOptionsState::new();
         let metadata = MetadataState::default();
@@ -1188,7 +1201,15 @@ merge = "multi-file"
         assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
         assert_eq!(*restored_format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
         assert_eq!(*restored_format.bit_depth.selected_value(), BitDepthChoice::Source);
+        assert_eq!(*restored_format.dither.selected_value(), DitherType::Shibata);
+        assert_eq!(*restored_format.resampler.selected_value(), ResamplerChoice::Soxr);
         assert_eq!(*restored_format.replaygain.selected_value(), ReplayGainChoice::BothIfMissing);
+        assert!(restored_format.sample_rate_overridden);
+        assert!(restored_format.bit_depth_overridden);
+        assert!(restored_format.dither_overridden);
+        assert!(restored_format.resampler_overridden);
+        assert_eq!(restored_format.source_derived_sample_rate, None);
+        assert_eq!(restored_format.source_derived_bit_depth, None);
     }
 
 }

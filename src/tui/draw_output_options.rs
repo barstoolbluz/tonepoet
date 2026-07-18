@@ -170,13 +170,13 @@ fn register_output_options_pills<T>(
     }
     let y = area.y.saturating_add(row);
     let right = area.x.saturating_add(area.width).saturating_sub(1);
-    let label_width = format!("   {}  ", label).chars().count() as u16;
+    let label_width = super::display_width::width(&format!("   {}  ", label)) as u16;
     let mut x = area.x.saturating_add(1).saturating_add(label_width);
     for (index, option) in state.options.iter().enumerate() {
         if index > 0 {
             x = x.saturating_add(2);
         }
-        let width = option.label.chars().count() as u16 + 2;
+        let width = super::display_width::width(&option.label) as u16 + 2;
         if x >= right {
             break;
         }
@@ -761,6 +761,9 @@ fn estimate_output_size(
         AudioFormat::Dsf | AudioFormat::Dff => {
             let selected_rate = *format.sample_rate.selected_value();
             let dsd_rate = if selected_rate == crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL {
+                if !format.source_is_dsd {
+                    return None;
+                }
                 info.sample_rate as f64
             } else {
                 selected_rate as f64
@@ -847,6 +850,32 @@ mod output_options_companion_render_tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+
+    #[test]
+    fn pcm_source_with_source_relative_dsd_rate_has_no_false_size_estimate() {
+        let info = SourceInfo {
+            format_name: "FLAC".to_string(),
+            codec: "flac".to_string(),
+            bit_depth: Some(24),
+            sample_rate: 96_000,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 60.0,
+            file_size: 10_000_000,
+        };
+        let mut format = FormatState::new();
+        format.source_is_dsd = true;
+        format.format.select_value(&AudioFormat::Dsf);
+        format.apply_format_constraints();
+        assert!(format
+            .sample_rate
+            .select_value(&crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL));
+
+        // Model a source transition from DSD to PCM before the next constraint
+        // pass. The estimator must never interpret 96 kHz PCM as a 1-bit rate.
+        format.source_is_dsd = false;
+        assert_eq!(estimate_output_size(Some(&info), info.file_size, &format), None);
+    }
 
     #[test]
     fn maximized_actions_row_renders_live_pipeline_summary() {

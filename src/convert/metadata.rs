@@ -42,6 +42,21 @@ impl FlacMetadata {
     }
 }
 
+fn parse_canonical_total(
+    canonical: Option<&Vec<String>>,
+    legacy: Option<&Vec<String>>,
+) -> Option<u32> {
+    match canonical {
+        // Canonical presence shadows the alias even when malformed. Falling
+        // through would let stale legacy data override the user's canonical
+        // value and contradict the write-side normalization policy.
+        Some(values) => values.first().and_then(|value| value.parse::<u32>().ok()),
+        None => legacy
+            .and_then(|values| values.first())
+            .and_then(|value| value.parse::<u32>().ok()),
+    }
+}
+
 pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
     let tag = Tag::read_from_path(file_path)
         .with_context(|| format!("Failed to read FLAC metadata from {:?}", file_path))?;
@@ -93,14 +108,10 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
         // Prefer tonepoet's canonical foobar-style spelling. Legacy aliases
         // remain readable, but can never override a conflicting canonical
         // value merely because metaflac checks them first internally.
-        metadata.total_tracks = ["TRACKTOTAL", "TOTALTRACKS"]
-            .into_iter()
-            .find_map(|key| {
-                vorbis
-                    .get(key)
-                    .and_then(|values| values.first())
-                    .and_then(|value| value.parse::<u32>().ok())
-            });
+        metadata.total_tracks = parse_canonical_total(
+            vorbis.get("TRACKTOTAL"),
+            vorbis.get("TOTALTRACKS"),
+        );
 
         if let Some(disc_vec) = vorbis.get("DISCNUMBER") {
             if let Some(disc) = disc_vec.first() {
@@ -110,18 +121,10 @@ pub fn extract_metadata_from_flac(file_path: &Path) -> Result<FlacMetadata> {
             }
         }
 
-        for key in ["DISCTOTAL", "TOTALDISCS"] {
-            if metadata.total_discs.is_some() {
-                break;
-            }
-            if let Some(total_vec) = vorbis.get(key) {
-                if let Some(total) = total_vec.first() {
-                    if let Ok(total_discs) = total.parse::<u32>() {
-                        metadata.total_discs = Some(total_discs);
-                    }
-                }
-            }
-        }
+        metadata.total_discs = parse_canonical_total(
+            vorbis.get("DISCTOTAL"),
+            vorbis.get("TOTALDISCS"),
+        );
 
         // comments are stored in COMMENT field
         if let Some(comment_vec) = vorbis.get("COMMENT") {
@@ -158,6 +161,19 @@ mod tests {
         assert!(metadata.artist.is_none());
         assert!(metadata.album.is_none());
         assert!(metadata.year.is_none());
+    }
+
+    #[test]
+    fn canonical_total_shadows_parseable_legacy_alias_even_when_malformed() {
+        let canonical = vec!["not-a-number".to_string()];
+        let legacy = vec!["12".to_string()];
+        assert_eq!(parse_canonical_total(Some(&canonical), Some(&legacy)), None);
+    }
+
+    #[test]
+    fn legacy_total_is_used_only_when_canonical_is_absent() {
+        let legacy = vec!["12".to_string()];
+        assert_eq!(parse_canonical_total(None, Some(&legacy)), Some(12));
     }
 
     #[test]

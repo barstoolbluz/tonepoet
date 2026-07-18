@@ -78,6 +78,21 @@ fn detail_field(key: impl Into<String>, value: impl Into<String>) -> DetailField
     }
 }
 
+fn sample_rate_detail(sample_rate: u32) -> String {
+    let suffix = tonepoet_pipeline::DsdRate::from_hz(sample_rate)
+        .map(|rate| match rate {
+            tonepoet_pipeline::DsdRate::Dsd64 => "DSD64",
+            tonepoet_pipeline::DsdRate::Dsd128 => "DSD128",
+            tonepoet_pipeline::DsdRate::Dsd256 => "DSD256",
+            tonepoet_pipeline::DsdRate::Dsd512 => "DSD512",
+            tonepoet_pipeline::DsdRate::Dsd1024 => "DSD1024",
+        });
+    match suffix {
+        Some(label) => format!("{sample_rate} Hz ({label})"),
+        None => format!("{sample_rate} Hz"),
+    }
+}
+
 pub fn build_details_view_model(state: &MetadataEditorState) -> DetailsViewModel {
     let display_files = metadata_details_files_for_display(state);
     let mut location = Vec::new();
@@ -128,7 +143,7 @@ pub fn build_details_view_model(state: &MetadataEditorState) -> DetailsViewModel
         general.push(detail_field(
             "Sample rate",
             disc.sample_rate
-                .map(|sample_rate| format!("{} Hz", sample_rate))
+                .map(sample_rate_detail)
                 .unwrap_or_else(|| "—".to_string()),
         ));
         general.push(detail_field("Channels", disc_channels_value(disc)));
@@ -183,7 +198,7 @@ pub fn build_details_view_model(state: &MetadataEditorState) -> DetailsViewModel
             ));
             general.push(detail_field(
                 "Sample rate",
-                same_or_multiple(infos.iter().map(|info| format!("{} Hz", info.sample_rate))),
+                same_or_multiple(infos.iter().map(|info| sample_rate_detail(info.sample_rate))),
             ));
             general.push(detail_field(
                 "Channels",
@@ -1590,6 +1605,12 @@ fn artwork_type_label_from_id3_code(code: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_rate_detail_appends_recognized_dsd_rate() {
+        assert_eq!(sample_rate_detail(11_289_600), "11289600 Hz (DSD256)");
+        assert_eq!(sample_rate_detail(44_100), "44100 Hz");
+    }
 
     fn details_state_for_file(file: MetadataFileDetails) -> MetadataEditorState {
         let path = file.file_facts.path.clone();

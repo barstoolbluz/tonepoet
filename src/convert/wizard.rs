@@ -303,14 +303,18 @@ fn quality_description(settings: &QualitySettings) -> String {
         QualitySettings::Wav {
             bit_depth,
             sample_rate,
-        } => {
-            format!("{}-bit / {} Hz", bit_depth, sample_rate)
         }
-        QualitySettings::Aiff {
+        | QualitySettings::Aiff {
             bit_depth,
             sample_rate,
         } => {
-            format!("{}-bit / {} Hz", bit_depth, sample_rate)
+            let depth = (*bit_depth)
+                .map(|value| format!("{value}-bit"))
+                .unwrap_or_else(|| "source depth".to_string());
+            let rate = (*sample_rate)
+                .map(|value| format!("{value} Hz"))
+                .unwrap_or_else(|| "source rate".to_string());
+            format!("{depth} / {rate}")
         }
         QualitySettings::WavPack {
             compression_mode,

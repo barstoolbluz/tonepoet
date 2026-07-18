@@ -440,8 +440,9 @@ fn apply_quality_settings(settings: &mut PipelineSettings, quality: &QualitySett
         }
         QualitySettings::Wav { bit_depth, sample_rate }
         | QualitySettings::Aiff { bit_depth, sample_rate } => {
-            settings.target_bit_depth = bit_depth_target(Some(u32::from(*bit_depth)))?;
-            settings.target_sample_rate = sample_rate_target_for_format(&settings.target_format, Some(*sample_rate))?;
+            settings.target_bit_depth = bit_depth_target((*bit_depth).map(u32::from))?;
+            settings.target_sample_rate =
+                sample_rate_target_for_format(&settings.target_format, *sample_rate)?;
         }
         QualitySettings::WavPack {
             compression_mode,

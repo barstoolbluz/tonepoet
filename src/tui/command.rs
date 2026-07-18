@@ -4254,7 +4254,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(":gnudb-back only works in the metadata editor");
                 return;
             };
-            let Some(review) = taken.state.gnudb_back.clone() else {
+            let Some(mut review) = taken.state.gnudb_back.clone() else {
                 app.set_status(
                     ":gnudb-back: no gnudb review to return to (run :tags-gnudb first)".to_string(),
                 );
@@ -4262,9 +4262,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 return;
             };
 
-            // Preserve the exact editor, including unsaved values and any
-            // active latch. Accepting or cancelling the review returns to this
-            // parked state rather than rebuilding from disk or dropping it.
+            // Preserve the exact CURRENT editor, including unsaved values and
+            // any save-generation advance since the cached review was first
+            // accepted.  The cached guard belongs to the old invocation; bind
+            // this reopened review to the editor being parked now.
+            review.editor_session = Some(metadata_editor_session_guard(&taken.state));
             app.pending_metadata_editor = Some(taken.state);
             app.active_overlay = super::app::ActiveOverlay::GnudbReview(review);
             app.set_status(":gnudb-back: review per-track values".to_string());
@@ -12518,9 +12520,24 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(r) = rate {
+                let before_format = *app.convert.format.format.selected_value();
+                let before_depth = *app.convert.format.bit_depth.selected_value();
+                let source_bits = app.convert.current_source_bit_depth();
+                let source_rate = app.convert.current_source_sample_rate();
                 if app.convert.format.sample_rate.select_value(&r) {
+                    app.convert.format.after_user_selection(
+                        super::app::FormatField::SampleRate,
+                        before_format,
+                        before_depth,
+                        source_bits,
+                        source_rate,
+                    );
                     app.preset.mark_modified();
-                    app.set_status(format!("rate = {} kHz", value));
+                    if r == crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL {
+                        app.set_status("rate = source");
+                    } else {
+                        app.set_status(format!("rate = {} kHz", value));
+                    }
                 } else {
                     app.set_status(format!(
                         "rate {} is not available for {}",
@@ -12546,7 +12563,18 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(d) = depth {
+                let before_format = *app.convert.format.format.selected_value();
+                let before_depth = *app.convert.format.bit_depth.selected_value();
+                let source_bits = app.convert.current_source_bit_depth();
+                let source_rate = app.convert.current_source_sample_rate();
                 if app.convert.format.bit_depth.select_value(&d) {
+                    app.convert.format.after_user_selection(
+                        super::app::FormatField::BitDepth,
+                        before_format,
+                        before_depth,
+                        source_bits,
+                        source_rate,
+                    );
                     app.preset.mark_modified();
                     app.set_status(format!("depth = {}", value));
                 } else {
@@ -17804,5 +17832,67 @@ mod convert_commit_synthetic_artifact_lifecycle_tests {
             !commit_body.contains("synthetic_cue_artifact_paths_owned_by_manager"),
             "commit must not inspect manager ownership by path after queue side effects"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_relative_set_command_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::convert::simple_wizard::DitherType;
+    use crate::tui::app::{BitDepthChoice, ResamplerChoice, SourceMode};
+    use crate::tui::probe::{SourceInfo, SourceMetadata};
+
+    fn app_with_pcm_source() -> AppState {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.source.mode = SourceMode::Single {
+            path: std::path::PathBuf::from("source.flac"),
+            info: Some(SourceInfo {
+                format_name: "FLAC".to_string(),
+                codec: "flac".to_string(),
+                bit_depth: Some(24),
+                sample_rate: 96_000,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 60.0,
+                file_size: 10_000_000,
+            }),
+            metadata: SourceMetadata::default(),
+            probe_notice: None,
+        };
+        // Model a COMPLETED probe: production applies full source defaults
+        // (cascades + constraints), not just constraint refresh.
+        app.convert.apply_source_defaults();
+        app
+    }
+
+    #[test]
+    fn set_rate_runs_resampler_cascade_and_source_status_is_not_suffixed() {
+        let mut app = app_with_pcm_source();
+
+        execute_set(&mut app, "rate", "48");
+        assert_eq!(*app.convert.format.sample_rate.selected_value(), 48_000);
+        assert_eq!(*app.convert.format.resampler.selected_value(), ResamplerChoice::Soxr);
+
+        execute_set(&mut app, "rate", "source");
+        assert_eq!(
+            *app.convert.format.sample_rate.selected_value(),
+            crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL
+        );
+        assert_eq!(*app.convert.format.resampler.selected_value(), ResamplerChoice::None);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("rate = source")
+        );
+    }
+
+    #[test]
+    fn set_depth_runs_dither_cascade() {
+        let mut app = app_with_pcm_source();
+
+        execute_set(&mut app, "depth", "16");
+
+        assert_eq!(*app.convert.format.bit_depth.selected_value(), BitDepthChoice::Int16);
+        assert_eq!(*app.convert.format.dither.selected_value(), DitherType::Shibata);
     }
 }

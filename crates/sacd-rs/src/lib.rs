@@ -57,21 +57,18 @@ pub mod stream_reader;
 pub(crate) mod test_allocation_counter {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     pub(crate) struct CountingAllocator;
 
-    static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
-
     thread_local! {
-        static COUNT_ALLOCATIONS_ON_THREAD: Cell<bool> = Cell::new(false);
+        static COUNT_ALLOCATIONS_ON_THREAD: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT_ON_THREAD: Cell<usize> = const { Cell::new(0) };
     }
 
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| {
                 if enabled.get() {
-                    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                    ALLOCATION_COUNT_ON_THREAD.with(|count| count.set(count.get() + 1));
                 }
             });
             unsafe { System.alloc(layout) }
@@ -80,7 +77,7 @@ pub(crate) mod test_allocation_counter {
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| {
                 if enabled.get() {
-                    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                    ALLOCATION_COUNT_ON_THREAD.with(|count| count.set(count.get() + 1));
                 }
             });
             unsafe { System.alloc_zeroed(layout) }
@@ -89,7 +86,7 @@ pub(crate) mod test_allocation_counter {
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| {
                 if enabled.get() {
-                    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                    ALLOCATION_COUNT_ON_THREAD.with(|count| count.set(count.get() + 1));
                 }
             });
             unsafe { System.realloc(ptr, layout, new_size) }
@@ -111,9 +108,9 @@ pub(crate) mod test_allocation_counter {
     pub(crate) fn allocation_count_for<T>(f: impl FnOnce() -> T) -> (T, usize) {
         COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| enabled.set(true));
         let _guard = AllocationCounterGuard;
-        ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+        ALLOCATION_COUNT_ON_THREAD.with(|count| count.set(0));
         let result = f();
-        let allocations = ALLOCATION_COUNT.load(Ordering::SeqCst);
+        let allocations = ALLOCATION_COUNT_ON_THREAD.with(Cell::get);
         (result, allocations)
     }
 }

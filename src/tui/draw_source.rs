@@ -659,7 +659,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Shorten a path for display: replace $HOME with ~ and left-truncate
-/// with "..." if it's longer than `max_chars`.
+/// with a display-column-safe ellipsis if it is longer than `max_chars`.
 fn shorten_path(path: &std::path::Path, max_chars: usize) -> String {
     let display = if let Ok(home) = std::env::var("HOME") {
         let home_path = std::path::Path::new(&home);
@@ -680,45 +680,8 @@ fn shorten_path(path: &std::path::Path, max_chars: usize) -> String {
     truncate_left_to_chars(&display, max_chars)
 }
 
-/// Return the terminal-cell display width ratatui will use for this text.
-fn text_width(s: &str) -> usize {
-    Line::from(s).width()
-}
-
-/// Left-truncate to at most `max_width` terminal cells without slicing the
-/// input at a byte offset. Wide Unicode characters and combining marks are
-/// measured using ratatui's display-width calculation.
 fn truncate_left_to_chars(s: &str, max_width: usize) -> String {
-    if text_width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let ellipsis = "...";
-    let ellipsis_width = text_width(ellipsis);
-    if max_width <= ellipsis_width {
-        let mut out = String::new();
-        for ch in s.chars().rev() {
-            let candidate = format!("{}{}", ch, out);
-            if text_width(&candidate) > max_width {
-                break;
-            }
-            out = candidate;
-        }
-        return out;
-    }
-
-    let mut tail = String::new();
-    for ch in s.chars().rev() {
-        let candidate = format!("{}{}", ch, tail);
-        if ellipsis_width + text_width(&candidate) > max_width {
-            break;
-        }
-        tail = candidate;
-    }
-    format!("{}{}", ellipsis, tail)
+    super::display_width::truncate_left(s, max_width)
 }
 
 /// Render the "browse files" pill row, right-aligned inside the source pane.
@@ -743,8 +706,8 @@ fn two_pill_row(
         .bg(theme.purple)
         .add_modifier(ratatui::style::Modifier::BOLD);
 
-    let primary_w = primary_label.chars().count();
-    let analyze_w = ANALYZE_PILL_LABEL.chars().count();
+    let primary_w = super::display_width::width(primary_label);
+    let analyze_w = super::display_width::width(ANALYZE_PILL_LABEL);
     let gap = 2;
     let right_margin = 3;
     let total_pills = analyze_w + gap + primary_w;
@@ -774,7 +737,7 @@ fn pill_row(
         .bg(theme.pill_active_bg)
         .add_modifier(ratatui::style::Modifier::BOLD);
 
-    let pill_w = label.chars().count();
+    let pill_w = super::display_width::width(label);
     let inner_w = width.saturating_sub(2);
     let right_margin = 3;
     let left_pad = inner_w.saturating_sub(pill_w + right_margin);
@@ -988,40 +951,8 @@ fn render_multi_track<'a>(
     lines
 }
 
-/// Right-truncate to at most `max_width` terminal cells without slicing the
-/// input at a byte offset. Wide Unicode characters and combining marks are
-/// measured using ratatui's display-width calculation.
 fn truncate_to(s: &str, max_width: usize) -> String {
-    if text_width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let ellipsis = "...";
-    let ellipsis_width = text_width(ellipsis);
-    if max_width <= ellipsis_width {
-        let mut out = String::new();
-        for ch in s.chars() {
-            let candidate = format!("{}{}", out, ch);
-            if text_width(&candidate) > max_width {
-                break;
-            }
-            out = candidate;
-        }
-        return out;
-    }
-
-    let mut head = String::new();
-    for ch in s.chars() {
-        let candidate = format!("{}{}", head, ch);
-        if text_width(&candidate) + ellipsis_width > max_width {
-            break;
-        }
-        head = candidate;
-    }
-    format!("{}{}", head, ellipsis)
+    super::display_width::truncate_right(s, max_width)
 }
 
 #[cfg(test)]

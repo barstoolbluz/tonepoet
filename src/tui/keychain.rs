@@ -7,16 +7,7 @@
 use std::path::{Path, PathBuf};
 
 pub fn keychain_path() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("tonepoet").join("passwords.toml")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".config")
-            .join("tonepoet")
-            .join("passwords.toml")
-    } else {
-        PathBuf::from("passwords.toml")
-    }
+    crate::config::TonepoetConfig::config_path().with_file_name("passwords.toml")
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -505,16 +496,6 @@ pub async fn test_password(archive: &std::path::Path, password: &str) -> Result<
     Ok(output.status.success())
 }
 
-pub async fn try_keychain(archive: &std::path::Path) -> Result<Option<String>, String> {
-    let passwords = load_keychain()?;
-    for password in &passwords {
-        if test_password(archive, password).await? {
-            promote_password(password)?;
-            return Ok(Some(password.clone()));
-        }
-    }
-    Ok(None)
-}
 
 #[cfg(test)]
 mod tests {
@@ -544,8 +525,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn competing_mru_writer_threads_are_serialized_without_lost_updates_or_secret_revocation() {
-        use std::sync::{Arc, Barrier};
+    fn competing_mru_writer_threads_wait_without_lost_updates_or_secret_revocation() {
+        use std::sync::{mpsc, Arc, Barrier};
 
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -568,30 +549,38 @@ mod tests {
         });
 
         stored.wait();
-        let blocked = add_password_at_path_with_hook(&path, "writer-b", |_| {})
-            .expect_err("second writer must not reconcile another writer's pending journal");
-        let lock_path = temp.path().join(".passwords.toml.save.lock");
-        assert_eq!(
-            blocked,
-            format!(
-                "lock archive-password reference store '{}': store update already in progress: {}",
-                path.display(),
-                lock_path.display()
-            )
+        let second_path = path.clone();
+        let second_reference = Arc::new(std::sync::Mutex::new(None));
+        let captured_second = Arc::clone(&second_reference);
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = add_password_at_path_with_hook(&second_path, "writer-b", move |reference| {
+                *captured_second.lock().expect("capture second reference") =
+                    Some(reference.to_string());
+            });
+            second_done_tx.send(()).expect("signal second completion");
+            result
+        });
+        assert!(
+            second_done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "second MRU writer must wait while the first owns the lock"
         );
+
         release.wait();
         first
             .join()
             .expect("first writer thread")
             .expect("first writer");
+        second_done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("second MRU writer completes after release");
+        second
+            .join()
+            .expect("second writer thread")
+            .expect("second writer");
 
-        let second_reference = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let captured_second = std::sync::Arc::clone(&second_reference);
-        add_password_at_path_with_hook(&path, "writer-b", move |reference| {
-            *captured_second.lock().expect("capture second reference") =
-                Some(reference.to_string());
-        })
-        .expect("retry after first writer releases lock");
         let second_reference = second_reference
             .lock()
             .expect("read second reference")
@@ -609,8 +598,12 @@ mod tests {
         );
         assert_ne!(second_reference, first_reference);
         assert_eq!(
-            resolve_references(file.references.clone()).expect("resolve final references"),
-            vec!["writer-b", "writer-a"]
+            crate::secret_store::get(&first_reference).expect("first secret survives"),
+            "writer-a"
+        );
+        assert_eq!(
+            crate::secret_store::get(&second_reference).expect("second secret survives"),
+            "writer-b"
         );
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 2);
         assert!(!crate::secret_store::pending_publication_path(&path).exists());

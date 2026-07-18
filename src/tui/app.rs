@@ -732,6 +732,20 @@ impl ConvertProbeMetadataSnapshot {
 /// Output-format fields that source probing is allowed to auto-default. The
 /// completion reducer compares this snapshot before applying source-derived
 /// defaults so user choices made during a probe are not reset on completion.
+/// How much the TUI currently knows about the probed source's DSD/PCM
+/// identity. This drives the same-as-source rate pill's availability on DSD
+/// targets: fresh/unstaged state is permissive (presets can stage
+/// source-relative policy with no source loaded), a KNOWN PCM source makes
+/// rate=source invalid for a DSD target (PCM->DSD needs an explicit rate),
+/// and a LOST source retains the deliberate selection disabled until a new
+/// probe revalidates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRateIdentity {
+    Unstaged,
+    Known,
+    Lost,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConvertProbeFormatSnapshot {
     pub format: AudioFormat,
@@ -740,6 +754,11 @@ pub struct ConvertProbeFormatSnapshot {
     pub resampler: ResamplerChoice,
     pub dither: DitherType,
     pub source_is_dsd: bool,
+    pub source_rate_identity: SourceRateIdentity,
+    pub source_derived_sample_rate: Option<u32>,
+    pub source_derived_bit_depth: Option<BitDepthChoice>,
+    pub sample_rate_overridden: bool,
+    pub bit_depth_overridden: bool,
     pub dither_overridden: bool,
     pub resampler_overridden: bool,
 }
@@ -753,6 +772,11 @@ impl ConvertProbeFormatSnapshot {
             resampler: *format.resampler.selected_value(),
             dither: *format.dither.selected_value(),
             source_is_dsd: format.source_is_dsd,
+            source_rate_identity: format.source_rate_identity,
+            source_derived_sample_rate: format.source_derived_sample_rate,
+            source_derived_bit_depth: format.source_derived_bit_depth,
+            sample_rate_overridden: format.sample_rate_overridden,
+            bit_depth_overridden: format.bit_depth_overridden,
             dither_overridden: format.dither_overridden,
             resampler_overridden: format.resampler_overridden,
         }
@@ -950,6 +974,11 @@ pub(crate) fn create_pending_archive_preview(
 pub(crate) fn stored_archive_password(app: &mut AppState) -> Result<Option<String>, String> {
     if let Some(password) = app.config.conversion.archive_password.clone() {
         return Ok(Some(password));
+    }
+    if let Some(reference) = app.config.conversion.archive_password_ref.as_deref() {
+        return crate::secret_store::get(reference)
+            .map(Some)
+            .map_err(|error| format!("cannot resolve configured archive password: {error}"));
     }
     app.keychain
         .ensure_loaded()
@@ -2418,7 +2447,9 @@ mod clamp_pill_tests {
             *format.sample_rate.selected_value(),
             SOURCE_SAMPLE_RATE_SENTINEL
         );
-        // A DELIBERATE source selection survives every format change.
+        // A DELIBERATE source selection survives a DSD target only when the
+        // probed source is itself DSD. PCM -> DSD requires an explicit rate.
+        format.source_is_dsd = true;
         format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
         format.format.select_value(&AudioFormat::Dsf);
         format.apply_format_constraints();
@@ -2426,6 +2457,294 @@ mod clamp_pill_tests {
             *format.sample_rate.selected_value(),
             SOURCE_SAMPLE_RATE_SENTINEL,
             "an explicit source-rate choice must not be clamped away"
+        );
+    }
+
+    #[test]
+    fn source_relative_rate_and_depth_survive_probe_cascades() {
+        use super::{BitDepthChoice, SOURCE_SAMPLE_RATE_SENTINEL};
+        let mut format = FormatState::new();
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.bit_depth.select_value(&BitDepthChoice::Source);
+
+        format.cascade_pcm_source_defaults(96_000, Some(24), false);
+        assert_eq!(*format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
+
+        format.cascade_dsd_source_to_pcm_defaults(11_289_600);
+        assert_eq!(*format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
+        assert_eq!(*format.resampler.selected_value(), super::ResamplerChoice::None);
+    }
+
+    fn assert_source_policy_survives_unknown_source_reset(format: &mut FormatState) {
+        use super::{
+            BitDepthChoice, DitherType, DsdGainMode, ResamplerChoice,
+            SOURCE_SAMPLE_RATE_SENTINEL,
+        };
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.bit_depth.select_value(&BitDepthChoice::Source);
+        format.dither.select_value(&DitherType::Shibata);
+        format.resampler.select_value(&ResamplerChoice::Soxr);
+        format.dither_overridden = true;
+        format.resampler_overridden = true;
+        // Manual gain is only selectable while DSD-to-PCM gain is available;
+        // enable it the way production does before staging explicit policy.
+        format.source_is_dsd = true;
+        format.apply_format_constraints();
+        assert!(
+            format.dsd_gain_mode.select_value(&DsdGainMode::Manual),
+            "fixture must be able to stage Manual gain"
+        );
+        format.dsd_gain_db = 5.5;
+
+        format.clear_source_derived_defaults();
+
+        assert_eq!(*format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert_eq!(*format.resampler.selected_value(), ResamplerChoice::Soxr);
+        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::Manual);
+        assert_eq!(format.dsd_gain_db, 5.5);
+        assert!(format.dither_overridden);
+        assert!(format.resampler_overridden);
+    }
+
+    #[test]
+    fn failed_probe_preserves_deliberate_source_policy_and_explicit_overrides() {
+        let mut format = FormatState::new();
+        assert_source_policy_survives_unknown_source_reset(&mut format);
+    }
+
+    #[test]
+    fn failed_probe_clears_only_automatic_source_derived_decisions() {
+        use super::{DitherType, DsdGainMode, ResamplerChoice};
+        let mut format = FormatState::new();
+        format.dither.select_value(&DitherType::Shibata);
+        format.resampler.select_value(&ResamplerChoice::Soxr);
+        format.dsd_gain_mode.select_value(&DsdGainMode::Auto);
+        format.dsd_gain_db = 6.0;
+        assert!(!format.dither_overridden);
+        assert!(!format.resampler_overridden);
+
+        format.clear_source_derived_defaults();
+
+        assert_eq!(*format.dither.selected_value(), DitherType::None);
+        assert_eq!(*format.resampler.selected_value(), ResamplerChoice::None);
+        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::Disabled);
+        assert_eq!(format.dsd_gain_db, 0.0);
+        assert!(!format.dither_overridden);
+        assert!(!format.resampler_overridden);
+    }
+
+    #[test]
+    fn constrained_source_defaults_remain_automatic_and_clear_when_source_disappears() {
+        use crate::convert::formats::AudioFormat;
+        use super::BitDepthChoice;
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Alac);
+
+        format.cascade_pcm_source_defaults(768_000, Some(32), false);
+        format.apply_format_constraints();
+
+        assert_eq!(*format.sample_rate.selected_value(), 384_000);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert_eq!(format.source_derived_sample_rate, Some(384_000));
+        assert_eq!(format.source_derived_bit_depth, Some(BitDepthChoice::Int24));
+
+        format.clear_source_derived_defaults();
+
+        assert_eq!(*format.sample_rate.selected_value(), 44_100);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int16);
+        assert_eq!(format.source_derived_sample_rate, None);
+        assert_eq!(format.source_derived_bit_depth, None);
+    }
+
+    #[test]
+    fn unresolved_pending_probe_preserves_explicit_scalar_overrides() {
+        use super::{BitDepthChoice, DitherType, ResamplerChoice};
+        let mut format = FormatState::new();
+        format.sample_rate.select_value(&96_000);
+        format.mark_sample_rate_user_policy();
+        format.bit_depth.select_value(&BitDepthChoice::Int24);
+        format.mark_bit_depth_user_policy();
+        format.dither.select_value(&DitherType::Shibata);
+        format.resampler.select_value(&ResamplerChoice::Soxr);
+        format.dither_overridden = true;
+        format.resampler_overridden = true;
+
+        format.clear_source_derived_defaults();
+
+        assert_eq!(*format.sample_rate.selected_value(), 96_000);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert_eq!(*format.resampler.selected_value(), ResamplerChoice::Soxr);
+        assert!(format.dither_overridden);
+        assert!(format.resampler_overridden);
+    }
+
+    #[test]
+    fn valid_probe_preserves_explicit_scalar_rate_and_depth_overrides() {
+        use super::BitDepthChoice;
+        let mut format = FormatState::new();
+        format.sample_rate.select_value(&96_000);
+        format.mark_sample_rate_user_policy();
+        format.bit_depth.select_value(&BitDepthChoice::Int24);
+        format.mark_bit_depth_user_policy();
+
+        format.cascade_pcm_source_defaults(192_000, Some(32), false);
+
+        assert_eq!(*format.sample_rate.selected_value(), 96_000);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert!(format.sample_rate_overridden);
+        assert!(format.bit_depth_overridden);
+        assert_eq!(format.source_derived_sample_rate, None);
+        assert_eq!(format.source_derived_bit_depth, None);
+    }
+
+    #[test]
+    fn mouse_click_on_disabled_rate_pill_preserves_automatic_provenance() {
+        let mut format = FormatState::new();
+        format.cascade_pcm_source_defaults(96_000, Some(24), false);
+        assert_eq!(*format.sample_rate.selected_value(), 96_000);
+        assert!(!format.sample_rate_overridden);
+        assert_eq!(format.source_derived_sample_rate, Some(96_000));
+
+        let disabled = format
+            .sample_rate
+            .options
+            .iter()
+            .position(|option| option.value == 192_000)
+            .expect("192 kHz pill must exist");
+        format.sample_rate.options[disabled].enabled = false;
+
+        assert!(!crate::tui::format_interactions::handle_format_button(
+            &mut format,
+            crate::tui::button_map::TuiButton::RatePill(disabled),
+            Some(24),
+            Some(96_000),
+        ));
+
+        assert_eq!(*format.sample_rate.selected_value(), 96_000);
+        assert!(!format.sample_rate_overridden);
+        assert_eq!(format.source_derived_sample_rate, Some(96_000));
+    }
+
+    #[test]
+    fn mouse_click_on_disabled_depth_pill_preserves_automatic_provenance() {
+        use super::BitDepthChoice;
+
+        let mut format = FormatState::new();
+        format.cascade_pcm_source_defaults(96_000, Some(24), false);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert!(!format.bit_depth_overridden);
+        assert_eq!(
+            format.source_derived_bit_depth,
+            Some(BitDepthChoice::Int24)
+        );
+
+        let disabled = format
+            .bit_depth
+            .options
+            .iter()
+            .position(|option| option.value == BitDepthChoice::Int32)
+            .expect("32-bit pill must exist");
+        format.bit_depth.options[disabled].enabled = false;
+
+        assert!(!crate::tui::format_interactions::handle_format_button(
+            &mut format,
+            crate::tui::button_map::TuiButton::DepthPill(disabled),
+            Some(24),
+            Some(96_000),
+        ));
+
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert!(!format.bit_depth_overridden);
+        assert_eq!(
+            format.source_derived_bit_depth,
+            Some(BitDepthChoice::Int24)
+        );
+    }
+
+    #[test]
+    fn mouse_invalid_pill_index_does_not_create_rate_policy() {
+        let mut format = FormatState::new();
+        format.cascade_pcm_source_defaults(96_000, Some(24), false);
+        let invalid = format.sample_rate.options.len();
+
+        assert!(!crate::tui::format_interactions::handle_format_button(
+            &mut format,
+            crate::tui::button_map::TuiButton::RatePill(invalid),
+            Some(24),
+            Some(96_000),
+        ));
+
+        assert_eq!(*format.sample_rate.selected_value(), 96_000);
+        assert!(!format.sample_rate_overridden);
+        assert_eq!(format.source_derived_sample_rate, Some(96_000));
+    }
+
+    #[test]
+    fn mixed_or_unavailable_source_facts_preserve_source_policy() {
+        let mut format = FormatState::new();
+        assert_source_policy_survives_unknown_source_reset(&mut format);
+        format.cascade_pcm_source_defaults(192_000, Some(32), false);
+        assert_eq!(*format.sample_rate.selected_value(), super::SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(*format.bit_depth.selected_value(), super::BitDepthChoice::Source);
+    }
+
+    #[test]
+    fn source_removal_reset_preserves_source_policy_for_later_batch() {
+        let mut format = FormatState::new();
+        assert_source_policy_survives_unknown_source_reset(&mut format);
+        format.cascade_pcm_source_defaults(44_100, Some(16), false);
+        assert_eq!(*format.sample_rate.selected_value(), super::SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(*format.bit_depth.selected_value(), super::BitDepthChoice::Source);
+    }
+
+    #[test]
+    fn dsd_target_with_unknown_source_keeps_source_rate_selected_but_unavailable() {
+        use crate::convert::formats::AudioFormat;
+        use super::{BitDepthChoice, SOURCE_SAMPLE_RATE_SENTINEL};
+        let mut format = FormatState::new();
+        format.source_is_dsd = true;
+        format.format.select_value(&AudioFormat::Dsf);
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.bit_depth.select_value(&BitDepthChoice::Source);
+        format.apply_format_constraints();
+        assert!(format.sample_rate.options.iter().any(|option| {
+            option.value == SOURCE_SAMPLE_RATE_SENTINEL && option.enabled
+        }));
+
+        format.clear_source_derived_defaults();
+
+        assert_eq!(*format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
+        assert!(format.sample_rate.options.iter().any(|option| {
+            option.value == SOURCE_SAMPLE_RATE_SENTINEL && !option.enabled
+        }));
+    }
+
+    #[test]
+    fn pcm_source_disables_source_rate_for_dsd_target() {
+        use super::SOURCE_SAMPLE_RATE_SENTINEL;
+        let mut format = FormatState::new();
+        // A PROBED PCM source (the production setter records identity as
+        // Known); a raw `source_is_dsd = false` would model the unstaged
+        // fresh state, where the sentinel deliberately stays available.
+        format.set_source_is_dsd(false);
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.format.select_value(&AudioFormat::Dsf);
+        format.apply_format_constraints();
+
+        assert_ne!(*format.sample_rate.selected_value(), SOURCE_SAMPLE_RATE_SENTINEL);
+        assert!(
+            format
+                .sample_rate
+                .options
+                .iter()
+                .find(|option| option.value == SOURCE_SAMPLE_RATE_SENTINEL)
+                .is_some_and(|option| !option.enabled)
         );
     }
 
@@ -2886,12 +3205,27 @@ pub struct FormatState {
     /// Whether the currently previewed source is DSD. Drives visibility and
     /// activation of DSD-to-PCM gain controls so they never appear for PCM sources.
     pub source_is_dsd: bool,
+    /// See [`SourceRateIdentity`]: fresh/known/lost source identity, driving
+    /// the same-as-source rate pill's availability and clamp retention.
+    pub source_rate_identity: SourceRateIdentity,
     pub field_focus: FormatField,
     pub advanced_open: bool,
-    /// False until the user explicitly picks a dither algorithm. Bit-depth changes may update it.
+    /// False until the user or a preset explicitly picks a dither algorithm.
+    /// Automatic source/bit-depth decisions may update the row only while false.
     pub dither_overridden: bool,
-    /// False until the user explicitly picks a resampler. Rate/source changes may reset it.
+    /// False until the user or a preset explicitly picks a resampler.
+    /// Automatic source/rate decisions may update the row only while false.
     pub resampler_overridden: bool,
+    /// True after an explicit keyboard, mouse, command, or preset rate choice.
+    pub sample_rate_overridden: bool,
+    /// True after an explicit keyboard, mouse, command, or preset depth choice.
+    pub bit_depth_overridden: bool,
+    /// Concrete rate most recently installed by a source-default cascade.
+    /// `None` means the selected rate is user/preset policy or the Source sentinel.
+    pub(crate) source_derived_sample_rate: Option<u32>,
+    /// Concrete depth most recently installed by a source-default cascade.
+    /// `None` means the selected depth is user/preset policy or Source.
+    pub(crate) source_derived_bit_depth: Option<BitDepthChoice>,
     /// PCM rate selected before the user switched to a DSD format, so a
     /// DSD round-trip restores the exact prior selection (deliberate
     /// downsamples included) instead of guessing from the source rate.
@@ -3127,10 +3461,15 @@ impl FormatState {
             dsd_gain_db: 0.0,
             dsd_auto_gain_margin_db: 0.15,
             source_is_dsd: false,
+            source_rate_identity: SourceRateIdentity::Unstaged,
             field_focus: FormatField::Format,
             advanced_open: false,
             dither_overridden: false,
             resampler_overridden: false,
+            sample_rate_overridden: false,
+            bit_depth_overridden: false,
+            source_derived_sample_rate: None,
+            source_derived_bit_depth: None,
             pcm_rate_before_dsd: None,
             selected_container_index: 0,
             flac_compression_level: 8,
@@ -3252,6 +3591,7 @@ impl FormatState {
 
     pub fn set_source_is_dsd(&mut self, source_is_dsd: bool) {
         self.source_is_dsd = source_is_dsd;
+        self.source_rate_identity = SourceRateIdentity::Known;
         self.apply_format_constraints();
     }
 
@@ -3271,7 +3611,18 @@ impl FormatState {
         self.dither_overridden = true;
     }
 
+    pub(crate) fn mark_sample_rate_user_policy(&mut self) {
+        self.sample_rate_overridden = true;
+        self.source_derived_sample_rate = None;
+    }
+
+    pub(crate) fn mark_bit_depth_user_policy(&mut self) {
+        self.bit_depth_overridden = true;
+        self.source_derived_bit_depth = None;
+    }
+
     pub fn select_bit_depth(&mut self, bit_depth: BitDepthChoice, source_bits: Option<u32>) {
+        self.mark_bit_depth_user_policy();
         self.bit_depth.select_value(&bit_depth);
         self.apply_auto_dither(source_bits);
         self.apply_format_constraints();
@@ -3453,15 +3804,29 @@ impl FormatState {
     }
 
     /// Select a concrete pill index for mouse handlers and run row-specific side effects.
-    pub fn select_row_index(&mut self, row: FormatField, index: usize, source_bits: Option<u32>, source_rate: Option<u32>) {
+    ///
+    /// A disabled or out-of-range pill is a rejected interaction, not a user
+    /// policy decision.  In particular, it must not clear source-derived
+    /// provenance for the currently selected rate/depth.  Re-clicking an
+    /// enabled, already-selected pill is accepted and therefore may make that
+    /// value explicit.
+    pub fn select_row_index(
+        &mut self,
+        row: FormatField,
+        index: usize,
+        source_bits: Option<u32>,
+        source_rate: Option<u32>,
+    ) -> bool {
         let before_depth = *self.bit_depth.selected_value();
         let before_format = *self.format.selected_value();
         self.field_focus = row;
-        match row {
+        let accepted = match row {
             FormatField::Format => select_enabled_index(&mut self.format, index),
-            FormatField::SampleRate | FormatField::DsdRate => select_enabled_index(&mut self.sample_rate, index),
+            FormatField::SampleRate | FormatField::DsdRate => {
+                select_enabled_index(&mut self.sample_rate, index)
+            }
             FormatField::BitDepth if self.is_lossy_codec_selected() => {
-                self.select_lossy_preset_index(index);
+                self.select_lossy_preset_index(index)
             }
             FormatField::BitDepth => select_enabled_index(&mut self.bit_depth, index),
             FormatField::Resampler => select_enabled_index(&mut self.resampler, index),
@@ -3469,16 +3834,22 @@ impl FormatState {
             FormatField::ReplayGain => select_enabled_index(&mut self.replaygain, index),
             FormatField::NoiseShaper => select_enabled_index(&mut self.noise_shaper, index),
             FormatField::ModulatorOrder => select_enabled_index(&mut self.modulator_order, index),
-            FormatField::ConversionPreset => select_enabled_index(&mut self.conversion_preset, index),
+            FormatField::ConversionPreset => {
+                select_enabled_index(&mut self.conversion_preset, index)
+            }
             FormatField::DsdGain => select_enabled_index(&mut self.dsd_gain_mode, index),
             FormatField::DsdGainDb => {
                 // Clicking/focusing the value row makes Manual explicit;
                 // keyboard left/right then adjusts the staged dB value.
                 self.dsd_gain_mode.select_value(&DsdGainMode::Manual);
                 self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
+                true
             }
+        };
+        if accepted {
+            self.after_user_selection(row, before_format, before_depth, source_bits, source_rate);
         }
-        self.after_user_selection(row, before_format, before_depth, source_bits, source_rate);
+        accepted
     }
 
     pub(crate) fn after_user_selection(
@@ -3489,6 +3860,12 @@ impl FormatState {
         source_bits: Option<u32>,
         source_rate: Option<u32>,
     ) {
+        if matches!(row, FormatField::SampleRate | FormatField::DsdRate) {
+            self.mark_sample_rate_user_policy();
+        }
+        if row == FormatField::BitDepth {
+            self.mark_bit_depth_user_policy();
+        }
         if row == FormatField::Dither {
             self.mark_dither_overridden();
         }
@@ -3613,32 +3990,51 @@ impl FormatState {
         }
     }
 
-    /// Clear source-derived choices when the newly installed source has no
-    /// reliable probe info. This keeps a failed, unresolved, or mixed CUE proxy
-    /// probe from inheriting sample-rate, bit-depth, dither, resampler, or DSD
-    /// source-side effects from the previously viewed source. Codec/container
-    /// choices and explicit codec settings are preserved because they are user
-    /// output preferences, not facts derived from the source.
+    /// Clear only decisions that were derived from source facts when the newly
+    /// installed source has no reliable probe information.
+    ///
+    /// Sample-rate and bit-depth selections are output policy. In particular,
+    /// `source` is a deliberate sentinel that must survive failed, pending,
+    /// mixed, removed, or otherwise unavailable source probes. Explicit scalar
+    /// overrides must survive for the same reason. For a DSD target whose source
+    /// identity is temporarily unknown, the selected `source` rate remains
+    /// selected but disabled by `apply_format_constraints`; that is an honest
+    /// unavailable state, not permission to silently substitute DSD64.
+    ///
+    /// Dither, resampler, and DSD gain are reset only when their current value
+    /// is automatic. Explicit dither/resampler overrides and Manual DSD gain are
+    /// output policy and therefore survive the same source-fact gap.
     pub fn clear_source_derived_defaults(&mut self) {
         self.source_is_dsd = false;
-        self.dither_overridden = false;
-        self.resampler_overridden = false;
-        self.dsd_gain_mode.select_value(&DsdGainMode::Disabled);
-        self.dsd_gain_db = 0.0;
+        self.source_rate_identity = SourceRateIdentity::Lost;
 
-        if self.is_dsd_selected() {
-            self.sample_rate.select_value(&2_822_400);
+        let selected_rate = *self.sample_rate.selected_value();
+        if self.source_derived_sample_rate == Some(selected_rate) {
+            let fallback_rate = if self.is_dsd_selected() { 2_822_400 } else { 44_100 };
+            self.sample_rate.select_value(&fallback_rate);
+        }
+        self.source_derived_sample_rate = None;
+
+        let selected_depth = *self.bit_depth.selected_value();
+        if self.source_derived_bit_depth == Some(selected_depth) {
+            self.bit_depth.select_value(&BitDepthChoice::Int16);
+        }
+        self.source_derived_bit_depth = None;
+
+        if !self.dither_overridden {
             self.dither.select_value(&DitherType::None);
+        }
+        if !self.resampler_overridden {
             self.resampler.select_value(&ResamplerChoice::None);
-            self.apply_format_constraints();
-            self.cascade_dsd_rate_defaults();
-            return;
+        }
+        if *self.dsd_gain_mode.selected_value() != DsdGainMode::Manual {
+            self.dsd_gain_mode.select_value(&DsdGainMode::Disabled);
+            self.dsd_gain_db = 0.0;
         }
 
-        self.sample_rate.select_value(&44_100);
-        self.bit_depth.select_value(&BitDepthChoice::Int16);
-        self.dither.select_value(&DitherType::None);
-        self.resampler.select_value(&ResamplerChoice::None);
+        // Constraints update option availability, but clamp_sample_rate_pill
+        // deliberately retains the source sentinel even while disabled. This
+        // keeps the user's policy visible until a later probe can validate it.
         self.apply_format_constraints();
         self.apply_auto_dither(None);
         self.apply_auto_resampler(None);
@@ -3646,8 +4042,8 @@ impl FormatState {
 
     /// Set PCM output defaults to match a PCM source. Called when a source is
     /// first probed or when the output format is PCM and source info becomes
-    /// available. Selects the closest available sample rate and bit depth pills,
-    /// then applies auto-dither based on the resulting source/target combination.
+    /// available. Selects source-derived defaults only for rows the user has
+    /// not explicitly overridden.
     pub fn cascade_pcm_source_defaults(
         &mut self,
         source_sample_rate: u32,
@@ -3657,10 +4053,32 @@ impl FormatState {
         if self.is_dsd_selected() {
             return;
         }
-        // Match source sample rate if it's in the pill options.
-        self.sample_rate.select_value(&source_sample_rate);
-        // Match source bit depth, preserving float vs integer distinction.
-        if let Some(bits) = source_bit_depth {
+        // A deliberate Source selection or explicit scalar selection is output
+        // policy, not a stale default. Preserve it across probe cascades.
+        if *self.sample_rate.selected_value() == SOURCE_SAMPLE_RATE_SENTINEL
+            || self.sample_rate_overridden
+        {
+            self.source_derived_sample_rate = None;
+        } else if let Some(idx) = self
+            .sample_rate
+            .options
+            .iter()
+            .position(|option| option.value == source_sample_rate)
+        {
+            // Install even when the option is currently disabled: every
+            // production caller follows with apply_format_constraints, whose
+            // clamp moves an out-of-range automatic default to the nearest
+            // allowed scalar (768k -> 384k under ALAC) and whose provenance
+            // sync keeps the clamped value automatic.
+            self.sample_rate.selected = idx;
+            self.source_derived_sample_rate = Some(source_sample_rate);
+        } else {
+            self.source_derived_sample_rate = None;
+        }
+
+        if self.bit_depth.selected_value().is_source() || self.bit_depth_overridden {
+            self.source_derived_bit_depth = None;
+        } else if let Some(bits) = source_bit_depth {
             let depth = if source_is_float {
                 match bits {
                     0..=32 => BitDepthChoice::Float32,
@@ -3673,7 +4091,17 @@ impl FormatState {
                     _ => BitDepthChoice::Int32,
                 }
             };
-            self.bit_depth.select_value(&depth);
+            if let Some(idx) = self
+                .bit_depth
+                .options
+                .iter()
+                .position(|option| option.value == depth)
+            {
+                self.bit_depth.selected = idx;
+            }
+            self.source_derived_bit_depth = Some(depth);
+        } else {
+            self.source_derived_bit_depth = None;
         }
     }
 
@@ -3687,10 +4115,29 @@ impl FormatState {
         let Some(dsd_rate) = tonepoet_pipeline::DsdRate::from_hz(source_sample_rate) else {
             return;
         };
-        let target_hz = dsd_rate.default_pcm_target_hz();
-        self.sample_rate.select_value(&target_hz);
-        self.bit_depth.select_value(&BitDepthChoice::Int24);
-        self.resampler.select_value(&ResamplerChoice::Sox);
+        let preserve_source_rate =
+            *self.sample_rate.selected_value() == SOURCE_SAMPLE_RATE_SENTINEL
+                || self.sample_rate_overridden;
+        if !preserve_source_rate {
+            let target_hz = dsd_rate.default_pcm_target_hz();
+            self.sample_rate.select_value(&target_hz);
+            self.source_derived_sample_rate = Some(target_hz);
+        } else {
+            self.source_derived_sample_rate = None;
+        }
+        if !self.bit_depth.selected_value().is_source() && !self.bit_depth_overridden {
+            self.bit_depth.select_value(&BitDepthChoice::Int24);
+            self.source_derived_bit_depth = Some(BitDepthChoice::Int24);
+        } else {
+            self.source_derived_bit_depth = None;
+        }
+        if !self.resampler_overridden {
+            self.resampler.select_value(if preserve_source_rate {
+                &ResamplerChoice::None
+            } else {
+                &ResamplerChoice::Sox
+            });
+        }
     }
 
     /// Set noise shaper and modulator order to the recommended defaults for the
@@ -3728,7 +4175,15 @@ impl FormatState {
 
         for opt in &mut self.sample_rate.options {
             opt.enabled = if opt.value == SOURCE_SAMPLE_RATE_SENTINEL {
-                true
+                // Valid for every PCM target. For DSD targets it needs a DSD
+                // source — but an UNSTAGED state (no probe yet: fresh screen,
+                // preset staging) stays permissive so source-relative presets
+                // are not coupled to a loaded source. Only a KNOWN PCM source
+                // or LOST facts disable it (Lost keeps a deliberate selection
+                // visible via clamp retention).
+                !is_dsd
+                    || self.source_is_dsd
+                    || self.source_rate_identity == SourceRateIdentity::Unstaged
             } else if is_dsd {
                 opt.value >= DSD_RATE_MIN
             } else {
@@ -3826,6 +4281,22 @@ impl FormatState {
         }
 
         self.clamp_disabled_selections();
+        // Constraint clamping does not change provenance. When a source-derived
+        // 768 kHz/32-bit default is constrained to 384 kHz/24-bit, the clamped
+        // scalar is still automatic and must remain removable if source facts
+        // later disappear.
+        if self.source_derived_sample_rate.is_some() && !self.sample_rate_overridden {
+            let selected = *self.sample_rate.selected_value();
+            if selected != SOURCE_SAMPLE_RATE_SENTINEL {
+                self.source_derived_sample_rate = Some(selected);
+            }
+        }
+        if self.source_derived_bit_depth.is_some() && !self.bit_depth_overridden {
+            let selected = *self.bit_depth.selected_value();
+            if !selected.is_source() {
+                self.source_derived_bit_depth = Some(selected);
+            }
+        }
         if !FormatField::visible_rows(self.is_dsd_selected(), self.dsd_to_pcm_gain_available())
             .contains(&self.field_focus)
         {
@@ -3834,7 +4305,9 @@ impl FormatState {
     }
 
     fn clamp_disabled_selections(&mut self) {
-        clamp_sample_rate_pill(&mut self.sample_rate);
+        let retain_disabled_sentinel =
+            self.source_rate_identity != SourceRateIdentity::Known;
+        clamp_sample_rate_pill(&mut self.sample_rate, retain_disabled_sentinel);
         clamp_pill_excluding(&mut self.bit_depth, |option| option.value.is_source());
         clamp_pill(&mut self.resampler);
         clamp_pill(&mut self.dither);
@@ -3842,7 +4315,12 @@ impl FormatState {
         clamp_pill(&mut self.noise_shaper);
         clamp_pill(&mut self.modulator_order);
         clamp_pill(&mut self.conversion_preset);
-        clamp_pill(&mut self.dsd_gain_mode);
+        // Manual gain is an explicit output-policy override. Keep it selected
+        // while source identity is temporarily unavailable; the disabled option
+        // communicates that it cannot currently be applied without erasing it.
+        clamp_pill_excluding(&mut self.dsd_gain_mode, |option| {
+            option.value == DsdGainMode::Manual
+        });
         self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
     }
 
@@ -3927,11 +4405,16 @@ fn clamp_pill_excluding<T: Clone + PartialEq>(
 /// downward would select 768 kHz and silently arm a large upsample from a
 /// typical 44.1/48 kHz source. Land on the lowest enabled rate instead.
 /// The same-as-source sentinel is never an automatic landing spot.
-fn clamp_sample_rate_pill(pill: &mut PillState<u32>) {
+fn clamp_sample_rate_pill(pill: &mut PillState<u32>, retain_disabled_sentinel: bool) {
     if pill.options[pill.selected].value == SOURCE_SAMPLE_RATE_SENTINEL {
-        // A deliberate source selection is enabled for every format;
-        // nothing to clamp and nothing may clamp it away.
-        return;
+        if pill.options[pill.selected].enabled || retain_disabled_sentinel {
+            // A deliberate source selection remains selected even when LOST
+            // source facts temporarily make it unavailable. Availability is
+            // rendered separately; no fallback scalar may silently replace
+            // pending policy. A KNOWN PCM source is different: rate=source
+            // is then INVALID for a DSD target and must clamp to a real rate.
+            return;
+        }
     }
     if !pill.options[pill.selected].enabled
         && tonepoet_pipeline::DsdRate::from_hz(pill.options[pill.selected].value).is_some()
@@ -3948,12 +4431,15 @@ fn clamp_sample_rate_pill(pill: &mut PillState<u32>) {
     clamp_pill_excluding(pill, |option| option.value == SOURCE_SAMPLE_RATE_SENTINEL);
 }
 
-fn select_enabled_index<T: Clone + PartialEq>(pill: &mut PillState<T>, index: usize) {
-    if let Some(option) = pill.options.get(index) {
-        if option.enabled {
-            pill.selected = index;
-        }
+fn select_enabled_index<T: Clone + PartialEq>(pill: &mut PillState<T>, index: usize) -> bool {
+    let Some(option) = pill.options.get(index) else {
+        return false;
+    };
+    if !option.enabled {
+        return false;
     }
+    pill.selected = index;
+    true
 }
 
 fn selected_global_dither_needs_ssrc_approximation(dither: DitherType) -> bool {
@@ -4534,9 +5020,7 @@ impl ConvertState {
         } else {
             self.format.cascade_pcm_source_defaults(source_rate, source_bits, source_is_float);
         }
-        self.format.dither_overridden = false;
         self.format.apply_auto_dither(source_bits);
-        self.format.resampler_overridden = false;
         self.format.apply_auto_resampler(Some(source_rate));
         self.format.apply_format_constraints();
     }
@@ -4895,6 +5379,10 @@ pub struct GnudbReviewState {
     pub paths: Vec<std::path::PathBuf>,
     /// Original match list for "back" navigation (None for single-match queries).
     pub origin_matches: Option<Vec<crate::tui::gnudb::GnudbMatch>>,
+    /// Exact parked metadata-editor session this review may restore on cancel.
+    /// `None` means the review did not originate from an editor and must never
+    /// consume an unrelated editor that happened to become pending later.
+    pub editor_session: Option<crate::tui::message::MetadataEditorSessionGuard>,
     /// Where this review came from. Drives the overlay title prefix
     /// ("GNUDB Review" vs. "CUE Import Review") so the user can
     /// disambiguate post-:import-cue from a real gnudb match.
@@ -6544,6 +7032,8 @@ pub struct MetadataEditorModel {
     pub tags_mb_in_flight: bool,
     /// Editor-wide mutation generation; every surface save increments it.
     pub editor_save_generation: u64,
+    /// Session-guarded worker progress rendered in the Saving footer.
+    pub metadata_save_progress: Option<String>,
     pub replaygain_cursor: usize,
     pub replaygain_scan_generation: u64,
     pub replaygain_scan: Option<MetadataReplayGainScanState>,
@@ -6585,6 +7075,7 @@ impl Default for MetadataEditorModel {
             gnudb_back: None,
             tags_mb_in_flight: false,
             editor_save_generation: 0,
+            metadata_save_progress: None,
             replaygain_cursor: 0,
             replaygain_scan_generation: 0,
             replaygain_scan: None,
@@ -7605,10 +8096,27 @@ impl MetadataEditorState {
     }
 
     pub fn begin_cancellable_write(&mut self) -> (u64, u64, crate::tui::probe::MetadataWriteCancelFlag) {
+        self.model.metadata_save_progress = None;
         let (session_id, generation) = self.begin_write();
         let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
         self.metadata_write_cancel = Some(cancel.clone());
         (session_id, generation, cancel)
+    }
+
+    pub fn apply_metadata_save_progress(
+        &mut self,
+        session_id: u64,
+        save_generation: u64,
+        detail: String,
+    ) -> bool {
+        if self.phase != MetadataEditorPhase::Saving
+            || self.model.editor_save_generation != save_generation
+            || self.active_surface().technical_details.session_id != session_id
+        {
+            return false;
+        }
+        self.model.metadata_save_progress = Some(detail);
+        true
     }
 
     pub fn cancel_metadata_write(&self) -> bool {
@@ -7707,6 +8215,7 @@ impl MetadataEditorState {
         };
         if summary.is_some() {
             self.clear_metadata_write_cancel();
+            self.model.metadata_save_progress = None;
         }
         summary
     }
@@ -8237,6 +8746,16 @@ pub struct ActiveGnudbOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveCueOperation {
     pub operation_id: crate::tui::message::TagsMbOperationId,
+}
+
+/// One in-flight Browse inline metadata write. The generation and exact path
+/// guard progress/completion messages against stale workers after navigation or
+/// a later edit, while the shared flag gives Esc a cooperative cancellation
+/// handle for DSF/FLAC bounded copy loops.
+pub struct InlineMetadataWriteState {
+    pub operation_id: u64,
+    pub path: std::path::PathBuf,
+    pub cancel: crate::tui::probe::MetadataWriteCancelFlag,
 }
 
 /// State for the MusicBrainz release-selection overlay shown when MB
@@ -9198,6 +9717,8 @@ pub struct AppState {
 
     // Browse screen state
     pub browse: crate::tui::browse::BrowseState,
+    pub inline_metadata_write_generation: u64,
+    pub inline_metadata_write: Option<InlineMetadataWriteState>,
 
     // Queue screen state
     pub queue_focus: QueueFocus,
@@ -10003,7 +10524,19 @@ impl AppState {
                 // Sync the imported items to SQLite.
                 if let Ok(q) = manager.queue.try_read() {
                     let items: Vec<&crate::convert::ConversionItem> = q.all_items();
-                    let _ = db.sync_queue(&items);
+                    if let Err(error) = db.sync_queue(&items) {
+                        log::error!(
+                            "could not import the persisted JSON queue into SQLite: {}",
+                            error
+                        );
+                        let queue_status = format!(
+                            "queue persistence degraded: JSON import was retained because SQLite publication failed: {error}"
+                        );
+                        theme_startup_status = Some(match theme_startup_status.take() {
+                            Some(existing) => format!("{existing}; {queue_status}"),
+                            None => queue_status,
+                        });
+                    }
                 }
             }
         }
@@ -10049,6 +10582,8 @@ impl AppState {
             pending_browse_convert_expansion: None,
             preset: PresetState::default(),
             browse,
+            inline_metadata_write_generation: 0,
+            inline_metadata_write: None,
             queue_focus: QueueFocus::FileList,
             selected_index: 0,
             scroll_offset: 0,
@@ -10208,6 +10743,57 @@ impl AppState {
     pub fn cancel_browse_convert_expansion_for_browse_change(&mut self, reason: &str) -> bool {
         if self.cancel_browse_convert_expansion() {
             self.set_status(format!("folder expansion cancelled: {reason}"));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn begin_inline_metadata_write(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> (u64, crate::tui::probe::MetadataWriteCancelFlag) {
+        if let Some(previous) = self.inline_metadata_write.take() {
+            previous.cancel.cancel();
+        }
+        self.inline_metadata_write_generation =
+            self.inline_metadata_write_generation.saturating_add(1);
+        let operation_id = self.inline_metadata_write_generation;
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        self.inline_metadata_write = Some(InlineMetadataWriteState {
+            operation_id,
+            path,
+            cancel: cancel.clone(),
+        });
+        (operation_id, cancel)
+    }
+
+    pub fn inline_metadata_write_is_current(
+        &self,
+        operation_id: u64,
+        path: &std::path::Path,
+    ) -> bool {
+        self.inline_metadata_write.as_ref().is_some_and(|state| {
+            state.operation_id == operation_id && state.path.as_path() == path
+        })
+    }
+
+    pub fn complete_inline_metadata_write(
+        &mut self,
+        operation_id: u64,
+        path: &std::path::Path,
+    ) -> bool {
+        if self.inline_metadata_write_is_current(operation_id, path) {
+            self.inline_metadata_write = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cancel_inline_metadata_write(&self) -> bool {
+        if let Some(state) = &self.inline_metadata_write {
+            state.cancel.cancel();
             true
         } else {
             false
@@ -10564,8 +11150,12 @@ impl AppState {
         if !self.config.conversion.persist_queue {
             return;
         }
+        let mut errors = Vec::new();
         // Legacy JSON save (kept for backward compat during migration).
-        self.manager.save_queue(true).ok();
+        if let Err(error) = self.manager.save_queue(true) {
+            log::error!("could not persist conversion queue JSON: {}", error);
+            errors.push(format!("JSON: {error}"));
+        }
         // SQLite sync (ACID, transactional).
         if let Ok(q) = self.manager.queue.try_read() {
             let items: Vec<&crate::convert::ConversionItem> = q
@@ -10579,7 +11169,18 @@ impl AppState {
                     )
                 })
                 .collect();
-            let _ = self.db.sync_queue(&items);
+            if let Err(error) = self.db.sync_queue(&items) {
+                log::error!("could not persist conversion queue SQLite state: {}", error);
+                errors.push(format!("SQLite: {error}"));
+            }
+        } else {
+            errors.push("queue is busy".to_string());
+        }
+        if !errors.is_empty() {
+            self.set_status(format!(
+                "Queue persistence degraded; in-memory work is unchanged ({})",
+                errors.join("; ")
+            ));
         }
     }
 
@@ -12903,7 +13504,75 @@ mod source_default_reset_tests {
     }
 
     #[test]
-    fn apply_source_defaults_clears_stale_source_values_when_info_is_absent() {
+    fn apply_source_defaults_preserves_source_sentinels_when_probe_is_unresolved() {
+        let mut convert = ConvertState::new();
+        convert
+            .format
+            .sample_rate
+            .select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        convert
+            .format
+            .bit_depth
+            .select_value(&BitDepthChoice::Source);
+        convert.format.dither.select_value(&DitherType::Shibata);
+        convert.format.resampler.select_value(&ResamplerChoice::Soxr);
+        convert.format.dither_overridden = true;
+        convert.format.resampler_overridden = true;
+        convert.format.source_is_dsd = true;
+        convert.format.apply_format_constraints();
+        assert!(convert
+            .format
+            .dsd_gain_mode
+            .select_value(&DsdGainMode::Manual));
+        convert.format.dsd_gain_db = 4.5;
+        convert.set_source_mode(SourceMode::MultiTrack {
+            path: PathBuf::from("/tmp/pending.cue"),
+            info: None,
+            metadata: SourceMetadata::default(),
+            tracks: vec![MultiTrackEntry {
+                number: 1,
+                title: None,
+                performer: None,
+                duration_display: None,
+            }],
+            area_label: None,
+            album_title: None,
+            album_artist: None,
+            probe_notice: Some("probe pending".to_string()),
+            scroll: 0,
+            cursor: 0,
+            selected: vec![true],
+            archive_preview: None,
+            disc_contents: None,
+            selected_presentation_id: None,
+        });
+
+        convert.apply_source_defaults();
+
+        assert_eq!(
+            *convert.format.sample_rate.selected_value(),
+            SOURCE_SAMPLE_RATE_SENTINEL
+        );
+        assert_eq!(
+            *convert.format.bit_depth.selected_value(),
+            BitDepthChoice::Source
+        );
+        assert_eq!(*convert.format.dither.selected_value(), DitherType::Shibata);
+        assert_eq!(
+            *convert.format.resampler.selected_value(),
+            ResamplerChoice::Soxr
+        );
+        assert!(convert.format.dither_overridden);
+        assert!(convert.format.resampler_overridden);
+        assert_eq!(
+            *convert.format.dsd_gain_mode.selected_value(),
+            DsdGainMode::Manual
+        );
+        assert_eq!(convert.format.dsd_gain_db, 4.5);
+    }
+
+    #[test]
+    fn apply_source_defaults_clears_automatic_source_defaults_when_info_is_absent() {
         let mut convert = ConvertState::new();
         convert.set_source_mode(SourceMode::Single {
             path: PathBuf::from("/tmp/highres.flac"),
@@ -13511,6 +14180,44 @@ mod metadata_presentation_tab_tests {
         assert!(ignored.is_none());
         assert_eq!(state.active_surface().entries[0].per_file_originals[0], "old one");
         assert_eq!(state.active_surface().technical_details.active_save_generation, Some(generation));
+    }
+
+    #[test]
+    fn metadata_save_progress_requires_current_session_generation_and_saving_phase() {
+        let mut state = write_state();
+        let (session_id, generation, _cancel) = state.begin_cancellable_write();
+        state.phase = MetadataEditorPhase::Saving;
+
+        assert!(state.apply_metadata_save_progress(
+            session_id,
+            generation,
+            "Saving 1/2: one.dsf - rewriting 1.0 MiB / 2.0 MiB".to_string(),
+        ));
+        assert_eq!(
+            state.model.metadata_save_progress.as_deref(),
+            Some("Saving 1/2: one.dsf - rewriting 1.0 MiB / 2.0 MiB")
+        );
+
+        assert!(!state.apply_metadata_save_progress(
+            session_id.saturating_add(1),
+            generation,
+            "stale session".to_string(),
+        ));
+        assert!(!state.apply_metadata_save_progress(
+            session_id,
+            generation.saturating_add(1),
+            "stale generation".to_string(),
+        ));
+        state.phase = MetadataEditorPhase::Editing;
+        assert!(!state.apply_metadata_save_progress(
+            session_id,
+            generation,
+            "wrong phase".to_string(),
+        ));
+        assert_eq!(
+            state.model.metadata_save_progress.as_deref(),
+            Some("Saving 1/2: one.dsf - rewriting 1.0 MiB / 2.0 MiB")
+        );
     }
 
     #[test]

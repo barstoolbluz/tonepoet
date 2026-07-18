@@ -34,6 +34,7 @@ uuid = { version = "1.18", features = ["v4"] }
 lofty = "0.21"
 id3 = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+ring = "0.17"
 log = "0.4"
 env_logger = "0.10"
 anyhow = "1"

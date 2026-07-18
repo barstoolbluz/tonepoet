@@ -1858,21 +1858,34 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             return;
         }
         super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
+            let attempted = disc_queries.len();
             let mut all_entries = Vec::new();
+            let mut failures = Vec::new();
             for (label, disc_id, group_paths) in disc_queries {
-                if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
-                    if let Some(m) = matches.first() {
-                        if let Ok(entry) =
-                            super::gnudb::read_gnudb(&m.category, &m.disc_id).await
-                        {
-                            all_entries.push((label, entry, group_paths));
+                match super::gnudb::query_gnudb(&disc_id).await {
+                    Ok(matches) => {
+                        let Some(m) = matches.first() else {
+                            continue;
+                        };
+                        match super::gnudb::read_gnudb(&m.category, &m.disc_id).await {
+                            Ok(entry) => all_entries.push((label, entry, group_paths)),
+                            Err(error) => failures.push(format!(
+                                "{label}: read failed for {}/{}: {error}",
+                                m.category, m.disc_id
+                            )),
                         }
                     }
+                    Err(error) => failures.push(format!(
+                        "{label}: query failed for disc ID {}: {error}",
+                        disc_id.disc_id
+                    )),
                 }
             }
             super::message::AppMessage::GnudbMultiDiscComplete {
                 operation_id,
                 entries: all_entries,
+                failures,
+                attempted,
             }
         });
     }
@@ -1924,19 +1937,34 @@ pub(super) fn launch_multi_single_image_gnudb(
         queries.len(),
     ));
     super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
+        let attempted = queries.len();
         let mut all_entries = Vec::new();
+        let mut failures = Vec::new();
         for (label, disc_id, paths_for_editor) in queries {
-            if let Ok(matches) = super::gnudb::query_gnudb(&disc_id).await {
-                if let Some(m) = matches.first() {
-                    if let Ok(entry) = super::gnudb::read_gnudb(&m.category, &m.disc_id).await {
-                        all_entries.push((label, entry, paths_for_editor));
+            match super::gnudb::query_gnudb(&disc_id).await {
+                Ok(matches) => {
+                    let Some(m) = matches.first() else {
+                        continue;
+                    };
+                    match super::gnudb::read_gnudb(&m.category, &m.disc_id).await {
+                        Ok(entry) => all_entries.push((label, entry, paths_for_editor)),
+                        Err(error) => failures.push(format!(
+                            "{label}: read failed for {}/{}: {error}",
+                            m.category, m.disc_id
+                        )),
                     }
                 }
+                Err(error) => failures.push(format!(
+                    "{label}: query failed for disc ID {}: {error}",
+                    disc_id.disc_id
+                )),
             }
         }
         super::message::AppMessage::GnudbMultiDiscComplete {
             operation_id,
             entries: all_entries,
+            failures,
+            attempted,
         }
     });
 }

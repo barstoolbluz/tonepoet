@@ -912,7 +912,7 @@ impl FileTaskProgressState {
             let marker = if conflict.apply_to_all { "\u{00d7}" } else { " " };
             let checkbox = format!("    [{}] Apply to all remaining conflicts", marker);
             self.render_bordered_text(frame, area, 10, &checkbox, self.theme.progress_text_dim);
-            let width = checkbox.chars().count().min(inner_width) as u16;
+            let width = crate::display_width::width(&checkbox).min(inner_width) as u16;
             let rect = Rect::new(area.x.saturating_add(1), area.y.saturating_add(10), width, 1);
             if let Some(clipped) = intersect_rect(rect, area) {
                 self.hit_regions.push(ProgressHitRegion {
@@ -942,7 +942,7 @@ impl FileTaskProgressState {
         let width = area.width as usize;
         let available_title = width.saturating_sub(6);
         let title = fit_text(title, available_title).0;
-        let title_width = title.chars().count();
+        let title_width = crate::display_width::width(&title);
         let filler = width.saturating_sub(3 + title_width + 1 + 1);
         let line = Line::from(vec![
             Span::styled("\u{250c}\u{2500} ", self.theme.progress_border),
@@ -1006,7 +1006,7 @@ impl FileTaskProgressState {
         value: &str,
     ) {
         let inner_width = area.width.saturating_sub(2) as usize;
-        let label_width = label.chars().count();
+        let label_width = crate::display_width::width(label);
         let value = fit_text(value, inner_width.saturating_sub(label_width)).0;
         self.render_bordered_spans(
             frame,
@@ -1038,7 +1038,7 @@ impl FileTaskProgressState {
         };
         let inner_width = area.width.saturating_sub(2) as usize;
         let prefix = "  ▸ ";
-        let label = fit_text(&label, inner_width.saturating_sub(prefix.chars().count())).0;
+        let label = fit_text(&label, inner_width.saturating_sub(crate::display_width::width(prefix))).0;
         self.render_bordered_spans(
             frame,
             area,
@@ -1083,8 +1083,8 @@ impl FileTaskProgressState {
     ) {
         let inner_width = area.width.saturating_sub(2) as usize;
         let gap = "   ";
-        let button_width: usize = buttons.iter().map(|(label, _, _)| label.chars().count()).sum();
-        let gap_width = gap.chars().count() * buttons.len().saturating_sub(1);
+        let button_width: usize = buttons.iter().map(|(label, _, _)| crate::display_width::width(label)).sum();
+        let gap_width = crate::display_width::width(gap) * buttons.len().saturating_sub(1);
         let group_width = button_width + gap_width;
         let left_padding = inner_width.saturating_sub(group_width) / 2;
         let mut spans = Vec::new();
@@ -1094,9 +1094,9 @@ impl FileTaskProgressState {
         for (idx, (label, action, style)) in buttons.iter().enumerate() {
             if idx > 0 {
                 spans.push(Span::styled(gap, self.theme.progress_text));
-                cursor_x = cursor_x.saturating_add(gap.chars().count() as u16);
+                cursor_x = cursor_x.saturating_add(crate::display_width::width(gap) as u16);
             }
-            let width = label.chars().count() as u16;
+            let width = crate::display_width::width(label) as u16;
             spans.push(Span::styled(label.clone(), *style));
             let rect = Rect::new(cursor_x, area.y.saturating_add(row), width, 1);
             if let Some(clipped) = intersect_rect(rect, area) {
@@ -1162,7 +1162,7 @@ impl FileTaskProgressState {
         let ratio = normalized_ratio(ratio);
         let percent = (ratio * 100.0).round() as u32;
         let percent_text = format!("{}%", percent.min(100));
-        let percent_width = percent_text.chars().count().max(3);
+        let percent_width = crate::display_width::width(&percent_text).max(3);
         let trailing_width = usize::from(percent_width <= 3);
         let fixed_width = 3 + 3 + percent_width + trailing_width;
         let bar_width = inner_width.saturating_sub(fixed_width);
@@ -1175,9 +1175,9 @@ impl FileTaskProgressState {
             Span::styled("░".repeat(unfilled), self.theme.progress_unfilled),
             Span::styled("]  ", self.theme.progress_text_dim),
         ];
-        if percent_width > percent_text.chars().count() {
+        if percent_width > crate::display_width::width(&percent_text) {
             spans.push(Span::styled(
-                " ".repeat(percent_width - percent_text.chars().count()),
+                " ".repeat(percent_width - crate::display_width::width(&percent_text)),
                 self.theme.progress_percent,
             ));
         }
@@ -1291,16 +1291,8 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
 }
 
 fn fit_text(text: &str, max: usize) -> (String, bool) {
-    let count = text.chars().count();
-    if count <= max {
-        return (text.to_string(), false);
-    }
-    if max <= 1 {
-        return ("…".to_string(), true);
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    (out, true)
+    let truncated = crate::display_width::width(text) > max;
+    (crate::display_width::truncate_right(text, max), truncated)
 }
 
 
@@ -1421,7 +1413,7 @@ fn fit_spans(spans: Vec<Span<'static>>, width: usize, pad_style: Style) -> Vec<S
         }
         let style = span.style;
         let text = span.content.into_owned();
-        let len = text.chars().count();
+        let len = crate::display_width::width(&text);
         if len <= remaining {
             out.push(Span::styled(text, style));
             remaining -= len;
@@ -1698,7 +1690,7 @@ mod tests {
         let title_row = buffer_row(buffer, y, dialog_w);
         assert!(title_row.starts_with("┌─ Copying files "));
         assert!(title_row.ends_with("┐"));
-        assert_eq!(title_row.chars().count(), dialog_w as usize);
+        assert_eq!(crate::display_width::width(&title_row), dialog_w as usize);
 
         let from_row = buffer_row(buffer, y + 1, dialog_w);
         assert!(from_row.contains("From:  ~/Documents/Audio"));

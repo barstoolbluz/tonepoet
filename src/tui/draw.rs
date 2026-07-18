@@ -115,11 +115,9 @@ fn wizard_theme_from_tonepoet_theme(theme: super::theme::Theme) -> tonepoet_wiza
 
 /// Draw settings screen showing conversion configuration + password keychain
 fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
-    // Ensure keychain is loaded on first visit. A failed backend access is
-    // surfaced in the keychain pane below via `load_error` (and retried on
-    // the next explicit user action), so the per-frame Result is redundant
-    // here.
-    let _ = app.keychain.ensure_loaded();
+    // Secret-store loading is driven only by explicit user actions. Rendering
+    // must remain side-effect free so an unavailable backend cannot be retried
+    // every frame or repeatedly trigger an unlock prompt.
 
     // Top-level: appearance pane + conversion pane + performance pane + keychain pane + footer
     let chunks = Layout::default()

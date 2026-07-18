@@ -572,39 +572,9 @@ fn bordered_line<'a>(
 }
 
 fn text_width(s: &str) -> usize {
-    Line::from(s).width()
+    super::display_width::width(s)
 }
 
 fn truncate_to(s: &str, max_width: usize) -> String {
-    if text_width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let ellipsis = "…";
-    let ellipsis_width = text_width(ellipsis);
-    if max_width <= ellipsis_width {
-        let mut out = String::new();
-        for ch in s.chars() {
-            let candidate = format!("{}{}", out, ch);
-            if text_width(&candidate) > max_width {
-                break;
-            }
-            out = candidate;
-        }
-        return out;
-    }
-
-    let mut out = String::new();
-    for ch in s.chars() {
-        let candidate = format!("{}{}", out, ch);
-        if text_width(&candidate) + ellipsis_width > max_width {
-            break;
-        }
-        out = candidate;
-    }
-    out.push_str(ellipsis);
-    out
+    super::display_width::truncate_right(s, max_width)
 }

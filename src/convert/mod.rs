@@ -696,41 +696,31 @@ impl ConversionManager {
         let mut admitted_item_ids = Vec::new();
         let mut transferred = HashSet::new();
         let mut transferred_by_item: Vec<(String, PathBuf)> = Vec::new();
-        let mut caller_owned_completed_artifacts_to_cleanup: Vec<PathBuf> = Vec::new();
-        let mut cleaned_after_completed_skip: HashSet<PathBuf> = HashSet::new();
+        let mut replaced_finished_items = Vec::new();
+        let mut replaced_artifact_owner_transfers: Vec<(String, String, PathBuf)> = Vec::new();
+        let mut retired_secret_references = Vec::new();
+        let cleaned_after_completed_skip: HashSet<PathBuf> = HashSet::new();
         let mut skipped_items = Vec::new();
         let mut ownership_error: Option<(PathBuf, String)> = None;
         let mut configuration_error: Option<String> = None;
 
         for (file, format) in detected {
-            if let Some((existing_id, existing_status)) = queue
+            if let Some(existing_id) = queue
                 .all_items()
                 .into_iter()
-                .find(|item| same_path_for_queue(&item.input_path, &file))
-                .map(|item| (item.id.clone(), item.status.clone()))
+                .find(|item| {
+                    !item.is_finished() && same_path_for_queue(&item.input_path, &file)
+                })
+                .map(|item| item.id.clone())
             {
                 outcome.skipped += 1;
                 skipped_items.push(file.clone());
-                if matches!(
-                    existing_status,
-                    ConversionStatus::Completed { .. }
-                        | ConversionStatus::CompletedWithActionErrors { .. }
-                ) {
-                    outcome.previously_converted += 1;
-                }
                 if let Some(artifact) = source_synthetic_cue_artifacts
                     .iter()
                     .find(|artifact| same_path_for_queue(&file, artifact))
                     .cloned()
                 {
-                    if matches!(
-                        existing_status,
-                        ConversionStatus::Completed { .. }
-                            | ConversionStatus::CompletedWithActionErrors { .. }
-                    ) {
-                        caller_owned_completed_artifacts_to_cleanup.push(artifact.clone());
-                        cleaned_after_completed_skip.insert(artifact);
-                    } else if let Err(error) = self.register_synthetic_cue_artifact(&existing_id, &artifact) {
+                    if let Err(error) = self.register_synthetic_cue_artifact(&existing_id, &artifact) {
                         ownership_error = Some((artifact, error));
                         outcome.errors += 1;
                         outcome.last_error = Some(
@@ -743,6 +733,18 @@ impl ConversionManager {
                 }
                 continue;
             }
+
+            let replaced_snapshot = queue
+                .all_items()
+                .into_iter()
+                .find(|item| item.is_finished() && same_path_for_queue(&item.input_path, &file))
+                .map(|item| {
+                    (
+                        item.id.clone(),
+                        item.status.clone(),
+                        item.archive_password_ref.clone(),
+                    )
+                });
 
             let cue_sidecar_override = cue_artifact_audio
                 .iter()
@@ -771,6 +773,57 @@ impl ConversionManager {
             }
             item.status = ConversionStatus::Queued;
             let item_id = item.id.clone();
+
+            if let Some((old_item_id, old_status, old_secret_reference)) = replaced_snapshot {
+                let transferred_owner = match self
+                    .transfer_synthetic_cue_artifact_owner(&old_item_id, &item_id)
+                {
+                    Ok(transferred_owner) => transferred_owner,
+                    Err(error) => {
+                        configuration_error = Some(format!(
+                            "could not replace terminal queue item for {}: {}",
+                            file.display(), error
+                        ));
+                        outcome.errors += 1;
+                        outcome.last_error = Some("terminal queue-item replacement failed".to_string());
+                        break;
+                    }
+                };
+                let Some(removed) = queue.take_finished_item_matching(|candidate| {
+                    candidate.id == old_item_id
+                }) else {
+                    if let Some(path) = transferred_owner.as_deref() {
+                        self.reverse_synthetic_cue_artifact_owner_transfer(
+                            &old_item_id,
+                            &item_id,
+                            path,
+                        );
+                    }
+                    configuration_error = Some(format!(
+                        "terminal queue item '{}' disappeared while replacing {}",
+                        old_item_id,
+                        file.display()
+                    ));
+                    outcome.errors += 1;
+                    outcome.last_error = Some("terminal queue-item replacement failed".to_string());
+                    break;
+                };
+                if matches!(
+                    old_status,
+                    ConversionStatus::Completed { .. }
+                        | ConversionStatus::CompletedWithActionErrors { .. }
+                ) {
+                    outcome.previously_converted += 1;
+                }
+                if let Some(reference) = old_secret_reference {
+                    retired_secret_references.push(reference);
+                }
+                if let Some(path) = transferred_owner {
+                    replaced_artifact_owner_transfers.push((old_item_id, item_id.clone(), path));
+                }
+                replaced_finished_items.push(removed);
+            }
+
             queue.items_mut().push_back(item);
             admitted_item_ids.push(item_id.clone());
             outcome.enqueued += 1;
@@ -814,11 +867,20 @@ impl ConversionManager {
                 .filter(|id| !remaining_ids.contains(id.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
+            for (old_item_id, new_item_id, path) in
+                replaced_artifact_owner_transfers.iter().rev()
+            {
+                self.reverse_synthetic_cue_artifact_owner_transfer(
+                    old_item_id,
+                    new_item_id,
+                    path,
+                );
+            }
+            while let Some(removed) = replaced_finished_items.pop() {
+                queue.restore_finished_item(removed);
+            }
             drop(queue);
 
-            for artifact in &caller_owned_completed_artifacts_to_cleanup {
-                crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
-            }
             // Rollback restores ownership to the caller. Release transferred
             // siblings from the manager registry without deleting them: the
             // retained source batch still references them and must remain
@@ -881,11 +943,20 @@ impl ConversionManager {
                 .filter(|id| !remaining_ids.contains(id.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
+            for (old_item_id, new_item_id, path) in
+                replaced_artifact_owner_transfers.iter().rev()
+            {
+                self.reverse_synthetic_cue_artifact_owner_transfer(
+                    old_item_id,
+                    new_item_id,
+                    path,
+                );
+            }
+            while let Some(removed) = replaced_finished_items.pop() {
+                queue.restore_finished_item(removed);
+            }
             drop(queue);
 
-            for artifact in &caller_owned_completed_artifacts_to_cleanup {
-                crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
-            }
             // Ownership failure is still a retryable Convert-screen rollback.
             // Release any earlier successful registrations from manager
             // ownership, but keep the artifact files themselves because the
@@ -931,9 +1002,9 @@ impl ConversionManager {
         }
         drop(queue);
 
-        for artifact in &caller_owned_completed_artifacts_to_cleanup {
-            crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
-        }
+        crate::convert::queue::retire_queue_owned_secret_references(
+            &retired_secret_references,
+        );
 
         let mut accounted_artifacts = transferred.clone();
         accounted_artifacts.extend(cleaned_after_completed_skip.iter().cloned());
@@ -1253,6 +1324,41 @@ impl ConversionManager {
         let mut artifacts = lock_synthetic_cue_artifact_registry(self.synthetic_cue_artifacts.as_ref())?;
         artifacts.insert(item_id.to_string(), path.to_path_buf());
         Ok(())
+    }
+
+    fn transfer_synthetic_cue_artifact_owner(
+        &self,
+        old_item_id: &str,
+        new_item_id: &str,
+    ) -> Result<Option<PathBuf>, String> {
+        let mut artifacts =
+            lock_synthetic_cue_artifact_registry(self.synthetic_cue_artifacts.as_ref())?;
+        let Some(path) = artifacts.remove(old_item_id) else {
+            return Ok(None);
+        };
+        artifacts.insert(new_item_id.to_string(), path.clone());
+        Ok(Some(path))
+    }
+
+    fn reverse_synthetic_cue_artifact_owner_transfer(
+        &self,
+        old_item_id: &str,
+        new_item_id: &str,
+        expected_path: &Path,
+    ) {
+        let Ok(mut artifacts) =
+            lock_synthetic_cue_artifact_registry(self.synthetic_cue_artifacts.as_ref())
+        else {
+            log::error!(
+                "synthetic CUE artifact registry unavailable while restoring terminal queue item '{}'",
+                old_item_id
+            );
+            return;
+        };
+        if artifacts.get(new_item_id).map(PathBuf::as_path) == Some(expected_path) {
+            artifacts.remove(new_item_id);
+            artifacts.insert(old_item_id.to_string(), expected_path.to_path_buf());
+        }
     }
 
     pub fn synthetic_cue_artifact_paths_owned_by_manager(
@@ -2141,11 +2247,18 @@ impl ConversionManager {
     /// Remove selected items from queue
     pub fn remove_selected(&mut self) -> usize {
         self.try_resolve_pending_synthetic_cue_artifacts();
-        let removed_records = if let Ok(mut queue) = self.queue.try_write() {
-            queue.remove_selected_records()
+        let (removed_records, secret_references) = if let Ok(mut queue) = self.queue.try_write() {
+            let secret_references = queue
+                .all_items()
+                .into_iter()
+                .filter(|item| item.selected)
+                .filter_map(|item| item.archive_password_ref.clone())
+                .collect();
+            (queue.remove_selected_records(), secret_references)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
         let removed = removed_records.len();
         // Never delete a synthetic input a worker is still reading: Processing
         // items keep their registry entries, and the worker's terminal status
@@ -2168,7 +2281,19 @@ impl ConversionManager {
     /// path rather than being deleted based on incomplete bookkeeping.
     pub fn discard_item_without_synthetic_artifact_cleanup(&self, item_id: &str) -> bool {
         if let Ok(mut queue) = self.queue.try_write() {
-            queue.remove_item_by_id(item_id)
+            let secret_reference = queue
+                .all_items()
+                .into_iter()
+                .find(|item| item.id == item_id)
+                .and_then(|item| item.archive_password_ref.clone());
+            let removed = queue.remove_item_by_id(item_id);
+            drop(queue);
+            if removed {
+                if let Some(reference) = secret_reference {
+                    crate::convert::queue::retire_queue_owned_secret_references(&[reference]);
+                }
+            }
+            removed
         } else {
             false
         }
@@ -2189,7 +2314,15 @@ impl ConversionManager {
         }
 
         if let Ok(mut queue) = self.queue.try_write() {
+            let secret_references = queue
+                .all_items()
+                .into_iter()
+                .filter(|item| item_ids.contains(&item.id))
+                .filter_map(|item| item.archive_password_ref.clone())
+                .collect::<Vec<_>>();
             let removed = queue.remove_matching_item_ids(|item| item_ids.contains(&item.id));
+            drop(queue);
+            crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
             return SyntheticCueRollback { removed, deferred: HashSet::new() };
         }
 
@@ -2198,7 +2331,15 @@ impl ConversionManager {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let mut queue = queue.write().await;
+                let secret_references = queue
+                    .all_items()
+                    .into_iter()
+                    .filter(|item| item_ids.contains(&item.id))
+                    .filter_map(|item| item.archive_password_ref.clone())
+                    .collect::<Vec<_>>();
                 let removed = queue.remove_matching_item_ids(|item| item_ids.contains(&item.id));
+                drop(queue);
+                crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
                 if !removed.is_empty() {
                     log::warn!(
                         "deferred rollback removed {} queue item(s) after synthetic CUE artifact ownership registration failed",
@@ -2209,7 +2350,15 @@ impl ConversionManager {
         } else {
             std::thread::spawn(move || {
                 let mut queue = queue.blocking_write();
+                let secret_references = queue
+                    .all_items()
+                    .into_iter()
+                    .filter(|item| item_ids.contains(&item.id))
+                    .filter_map(|item| item.archive_password_ref.clone())
+                    .collect::<Vec<_>>();
                 let removed = queue.remove_matching_item_ids(|item| item_ids.contains(&item.id));
+                drop(queue);
+                crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
                 if !removed.is_empty() {
                     log::warn!(
                         "deferred rollback removed {} queue item(s) after synthetic CUE artifact ownership registration failed",
@@ -2256,12 +2405,26 @@ impl ConversionManager {
             return Vec::new();
         }
         if let Ok(mut queue) = self.queue.try_write() {
-            queue.remove_matching_item_ids(|item| {
+            let secret_references = queue
+                .all_items()
+                .into_iter()
+                .filter(|item| {
+                    !preserve_item_ids.contains(&item.id)
+                        && paths
+                            .iter()
+                            .any(|path| same_path_for_queue(&item.input_path, path))
+                })
+                .filter_map(|item| item.archive_password_ref.clone())
+                .collect::<Vec<_>>();
+            let removed = queue.remove_matching_item_ids(|item| {
                 !preserve_item_ids.contains(&item.id)
                     && paths
                         .iter()
                         .any(|path| same_path_for_queue(&item.input_path, path))
-            })
+            });
+            drop(queue);
+            crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
+            removed
         } else {
             Vec::new()
         }
@@ -2293,21 +2456,35 @@ impl ConversionManager {
     /// removed by this operation and therefore keep owned synthetic inputs.
     pub fn clear_completed(&mut self) {
         self.try_resolve_pending_synthetic_cue_artifacts();
-        let removed_item_ids = if let Ok(mut queue) = self.queue.try_write() {
-            queue.clear_completed()
+        let (removed_item_ids, secret_references) = if let Ok(mut queue) = self.queue.try_write() {
+            let secret_references = queue
+                .all_items()
+                .into_iter()
+                .filter(|item| matches!(item.status, ConversionStatus::Completed { .. } | ConversionStatus::CompletedWithActionErrors { .. }))
+                .filter_map(|item| item.archive_password_ref.clone())
+                .collect();
+            (queue.clear_completed(), secret_references)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
         self.cleanup_synthetic_cue_artifacts_for_item_ids(removed_item_ids);
     }
 
     pub fn clear_finished(&mut self) {
         self.try_resolve_pending_synthetic_cue_artifacts();
-        let removed_item_ids = if let Ok(mut queue) = self.queue.try_write() {
-            queue.clear_finished()
+        let (removed_item_ids, secret_references) = if let Ok(mut queue) = self.queue.try_write() {
+            let secret_references = queue
+                .all_items()
+                .into_iter()
+                .filter(|item| item.is_finished())
+                .filter_map(|item| item.archive_password_ref.clone())
+                .collect();
+            (queue.clear_finished(), secret_references)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
         self.cleanup_synthetic_cue_artifacts_for_item_ids(removed_item_ids);
     }
 
@@ -2316,6 +2493,11 @@ impl ConversionManager {
         let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
             let mut processing = HashSet::new();
             let mut processing_synthetic_inputs = HashSet::new();
+            let secret_references = queue
+                .all_items()
+                .into_iter()
+                .filter_map(|item| item.archive_password_ref.clone())
+                .collect::<Vec<_>>();
             for item in queue.all_items() {
                 if matches!(item.status, ConversionStatus::Processing { .. }) {
                     processing.insert(item.id.clone());
@@ -2325,11 +2507,12 @@ impl ConversionManager {
                 }
             }
             queue.clear();
-            Some((processing, processing_synthetic_inputs))
+            Some((processing, processing_synthetic_inputs, secret_references))
         } else {
             None
         };
-        if let Some((processing, processing_synthetic_inputs)) = cleared_processing {
+        if let Some((processing, processing_synthetic_inputs, secret_references)) = cleared_processing {
+            crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
             // In-flight items keep their artifacts until the worker's terminal
             // status arrives (deferred cleanup in `update_item_status`).
             self.cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
@@ -2377,13 +2560,16 @@ impl ConversionManager {
                         // suspicious row can still contain legacy cleartext,
                         // and filtering it only in memory would leave that
                         // secret in the persisted JSON forever.
-                        let secrets_or_status_changed =
+                        let mut secret_report =
                             crate::convert::queue::restore_archive_passwords_after_load(&mut items);
                         let original_len = items.len();
                         // Validate paths for security (prevent path traversal attacks).
                         items.retain(|item| {
                             let path_str = item.input_path.to_string_lossy();
                             if path_str.contains("..") {
+                                if let Some(reference) = item.archive_password_ref.as_ref() {
+                                    secret_report.retire_references.push(reference.clone());
+                                }
                                 log::warn!(
                                     "Filtered out queue item with suspicious path: {:?}",
                                     item.input_path
@@ -2392,6 +2578,9 @@ impl ConversionManager {
                             }
 
                             if !item.input_path.exists() {
+                                if let Some(reference) = item.archive_password_ref.as_ref() {
+                                    secret_report.retire_references.push(reference.clone());
+                                }
                                 log::info!(
                                     "Filtered out queue item - file no longer exists: {:?}",
                                     item.input_path
@@ -2401,15 +2590,48 @@ impl ConversionManager {
 
                             true
                         });
-                        if secrets_or_status_changed || items.len() != original_len {
-                            if let Ok(json) = serde_json::to_string_pretty(&items) {
-                                let temp_path = queue_path.with_extension("json.tmp");
-                                if let Err(error) = std::fs::write(&temp_path, json)
-                                    .and_then(|_| std::fs::rename(&temp_path, &queue_path))
-                                {
+                        if secret_report.rewrite_required || items.len() != original_len {
+                            let mut persisted_items = items.clone();
+                            match crate::convert::queue::prepare_archive_passwords_for_persistence(
+                                &mut persisted_items,
+                            ) {
+                                Ok(persist_report) => match serde_json::to_vec_pretty(&persisted_items) {
+                                    Ok(json) => match crate::secret_store::atomic_write_private_file(
+                                        &queue_path,
+                                        &json,
+                                    ) {
+                                        Ok(crate::secret_store::PrivateFilePublishOutcome::Durable) => {
+                                            secret_report
+                                                .retire_references
+                                                .extend(persist_report.retire_references);
+                                            crate::convert::queue::retire_queue_owned_secret_references(
+                                                &secret_report.retire_references,
+                                            );
+                                        }
+                                        Ok(crate::secret_store::PrivateFilePublishOutcome::ReplacedButDurabilityUnconfirmed(detail)) => {
+                                            log::error!(
+                                                "Sanitized persisted queue state was replaced but durability is unconfirmed: {}",
+                                                detail
+                                            );
+                                        }
+                                        Err(error) => {
+                                            log::error!(
+                                                "Sanitized persisted queue state but could not rewrite {:?}: {}",
+                                                queue_path,
+                                                error
+                                            );
+                                        }
+                                    },
+                                    Err(error) => {
+                                        log::error!(
+                                            "Sanitized persisted queue state but could not serialize it: {}",
+                                            error
+                                        );
+                                    }
+                                },
+                                Err(error) => {
                                     log::error!(
-                                        "Sanitized persisted queue state but could not rewrite {:?}: {}",
-                                        queue_path,
+                                        "Sanitized persisted queue state was retained in memory but could not be republished without risking archive-password loss: {}",
                                         error
                                     );
                                 }
@@ -2452,40 +2674,51 @@ impl ConversionManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Collect items to save (filter by status)
-        let items_to_save: Vec<ConversionItem> = if let Ok(queue) = self.queue.try_read() {
-            queue
-                .all_items()
-                .iter()
-                .filter(|item| {
-                    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
-                        return false;
+        // Collect items to save (filter by status). Terminal rows omitted by
+        // the historical JSON policy still surrender queue-owned secret
+        // references, but only after the filtered snapshot is durably published.
+        let (mut items_to_save, mut omitted_terminal_references):
+            (Vec<ConversionItem>, Vec<String>) = if let Ok(queue) = self.queue.try_read() {
+                let mut persisted = Vec::new();
+                let mut omitted_terminal_references = Vec::new();
+                for item in queue.all_items() {
+                    if json_queue_item_is_persisted(item) {
+                        persisted.push(item.clone());
+                    } else if let Some(reference) = omitted_terminal_queue_secret_reference(item) {
+                        omitted_terminal_references.push(reference);
                     }
-                    // Save: NotConfigured, Queued, Paused, Completed, Failed
-                    // Don't save: Processing, Cancelled, transient synthetic CUE inputs
-                    matches!(
-                        item.status,
-                        ConversionStatus::NotConfigured
-                            | ConversionStatus::Queued
-                            | ConversionStatus::Paused
-                            | ConversionStatus::Completed { .. }
-                            | ConversionStatus::CompletedWithActionErrors { .. }
-                            | ConversionStatus::Failed { .. }
-                    )
-                })
-                .map(|&item| item.clone())
-                .collect()
-        } else {
-            return Err("Queue is busy".into());
-        };
+                }
+                (persisted, omitted_terminal_references)
+            } else {
+                return Err("Queue is busy".into());
+            };
 
-        // Serialize to JSON
-        let json = serde_json::to_string_pretty(&items_to_save)?;
+        let mut persist_report =
+            crate::convert::queue::prepare_archive_passwords_for_persistence(&mut items_to_save)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+        persist_report
+            .retire_references
+            .append(&mut omitted_terminal_references);
 
-        // Atomic write: write to temp file, then rename
-        let temp_path = queue_path.with_extension("json.tmp");
-        std::fs::write(&temp_path, json)?;
-        std::fs::rename(&temp_path, &queue_path)?;
+        let json = serde_json::to_vec_pretty(&items_to_save)?;
+        match crate::secret_store::atomic_write_private_file(&queue_path, &json)? {
+            crate::secret_store::PrivateFilePublishOutcome::Durable => {
+                crate::convert::queue::retire_queue_owned_secret_references(
+                    &persist_report.retire_references,
+                );
+            }
+            crate::secret_store::PrivateFilePublishOutcome::ReplacedButDurabilityUnconfirmed(
+                detail,
+            ) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "queue file was replaced but parent-directory durability is unconfirmed: {detail}"
+                    ),
+                )
+                .into());
+            }
+        }
 
         Ok(())
     }
@@ -2573,6 +2806,66 @@ fn parse_track_message(message: &str) -> (String, String, f32) {
     }
 
     (core.to_string(), String::new(), tool_pct)
+}
+
+fn json_queue_item_is_persisted(item: &ConversionItem) -> bool {
+    !crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path)
+        && matches!(
+            item.status,
+            ConversionStatus::NotConfigured
+                | ConversionStatus::Queued
+                | ConversionStatus::Paused
+                | ConversionStatus::Completed { .. }
+                | ConversionStatus::CompletedWithActionErrors { .. }
+                | ConversionStatus::Failed { .. }
+        )
+}
+
+fn omitted_terminal_queue_secret_reference(item: &ConversionItem) -> Option<String> {
+    (!json_queue_item_is_persisted(item) && item.is_finished())
+        .then(|| item.archive_password_ref.clone())
+        .flatten()
+}
+
+#[cfg(test)]
+mod queue_json_secret_retirement_tests {
+    use super::*;
+
+    fn item_with_status(status: ConversionStatus) -> ConversionItem {
+        let mut item = ConversionItem::default();
+        item.input_path = PathBuf::from("album/input.dsf");
+        item.status = status;
+        item.archive_password_ref =
+            Some("archive-password:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        item
+    }
+
+    #[test]
+    fn omitted_terminal_rows_surrender_secret_references_only_after_snapshot_publication() {
+        let completed = item_with_status(ConversionStatus::Completed {
+            output_path: PathBuf::from("album/output.dsf"),
+            log_path: None,
+        });
+        assert!(json_queue_item_is_persisted(&completed));
+        assert_eq!(omitted_terminal_queue_secret_reference(&completed), None);
+
+        let cancelled = item_with_status(ConversionStatus::Cancelled);
+        assert!(!json_queue_item_is_persisted(&cancelled));
+        assert_eq!(
+            omitted_terminal_queue_secret_reference(&cancelled).as_deref(),
+            Some("archive-password:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        let processing = item_with_status(ConversionStatus::Processing {
+            progress: 25.0,
+            message: Some("working".to_string()),
+            file_progress: Some((1, 4)),
+            phase: Some(ConversionPhase::Converting),
+            phase_progress: Some(25.0),
+        });
+        assert!(!json_queue_item_is_persisted(&processing));
+        assert_eq!(omitted_terminal_queue_secret_reference(&processing), None);
+    }
 }
 
 #[cfg(test)]
@@ -3730,6 +4023,39 @@ mod per_track_epoch_tests {
     }
 
     #[test]
+    fn clear_completed_retires_queue_owned_archive_password_reference() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let (mut manager, item_id) = test_manager_with_item();
+        let reference = crate::secret_store::stable_reference("queue-item", &item_id)
+            .expect("queue-owned reference");
+        crate::secret_store::set(&reference, "archive-secret").expect("store secret");
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue
+                .items_mut()
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .expect("item exists");
+            item.archive_password_ref = Some(reference.clone());
+            item.status = ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: None,
+            };
+        }
+
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+        manager.clear_completed();
+
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
+        assert!(
+            crate::secret_store::get(&reference)
+                .expect_err("retired reference must be absent")
+                .is_not_found()
+        );
+        assert!(manager.get_items_clone().is_empty());
+    }
+
+    #[test]
     fn clear_queue_preserves_artifacts_when_queue_write_lock_is_busy() {
         let (mut manager, item_id) = test_manager_with_item();
         let (_artifact_dir, artifact) = synthetic_artifact_for(&item_id, "clear-queue-busy");
@@ -4060,18 +4386,22 @@ mod per_track_epoch_tests {
 
 
     #[test]
-    fn commit_batch_completed_skip_cleans_artifact_without_reporting_manager_transfer() {
+    fn commit_batch_replaces_completed_item_and_transfers_artifact_ownership() {
         let manager = ConversionManager::new(ConversionConfig::default());
-        let (_artifact_dir, artifact) = synthetic_artifact_for("completed-skip", "completed-skip");
+        let (_artifact_dir, artifact) = synthetic_artifact_for("completed-replace", "completed-replace");
+        let old_item_id = "completed-replace-existing";
         queued_synthetic_item(
             &manager,
-            "completed-skip-existing",
+            old_item_id,
             &artifact,
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
             },
         );
+        manager
+            .register_synthetic_cue_artifact(old_item_id, &artifact)
+            .expect("register old artifact owner");
 
         let source_artifacts = [artifact.clone()].into_iter().collect::<HashSet<_>>();
         let transaction = manager.commit_batch_with_cue_artifacts(
@@ -4079,19 +4409,108 @@ mod per_track_epoch_tests {
             &HashSet::new(),
             &source_artifacts,
             &ConversionOptions::default(),
-            |_| panic!("skipped completed item must not be configured as a new admission"),
+            |item| {
+                item.pipeline_request = Some(pipeline_request_for(&item.input_path, &item.id));
+            },
+        );
+
+        assert_eq!(transaction.outcome.enqueued, 1);
+        assert_eq!(transaction.outcome.skipped, 0);
+        assert_eq!(transaction.outcome.previously_converted, 1);
+        assert_eq!(transaction.admitted_item_ids.len(), 1);
+        let replacement_id = &transaction.admitted_item_ids[0];
+        assert_ne!(replacement_id, old_item_id);
+        assert!(transaction.artifacts_transferred_to_manager.contains(&artifact));
+        assert!(transaction.artifacts_remaining_caller_owned.is_empty());
+        assert!(transaction.artifacts_cleaned_after_completed_skip.is_empty());
+        assert!(
+            artifact.exists(),
+            "terminal replacement must preserve the synthetic input for the new queued item"
+        );
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let matching = queue
+            .all_items()
+            .into_iter()
+            .filter(|item| same_path_for_queue(&item.input_path, &artifact))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].id, *replacement_id);
+        assert!(matches!(matching[0].status, ConversionStatus::Queued));
+        drop(queue);
+        let registry = manager
+            .synthetic_cue_artifacts
+            .lock()
+            .expect("artifact registry");
+        assert_eq!(registry.get(replacement_id), Some(&artifact));
+        assert!(!registry.contains_key(old_item_id));
+    }
+
+    #[test]
+    fn commit_batch_replaces_failed_item_but_restores_it_on_later_batch_failure() {
+        let manager = ConversionManager::new(ConversionConfig::default());
+        let (_first_dir, first) = synthetic_artifact_for("failed-replace-first", "failed-replace-first");
+        let (_second_dir, second) = synthetic_artifact_for("failed-replace-second", "failed-replace-second");
+        queued_synthetic_item(
+            &manager,
+            "failed-old-first",
+            &first,
+            ConversionStatus::Failed {
+                error: "first failure".to_string(),
+                log_path: None,
+            },
+        );
+        queued_synthetic_item(
+            &manager,
+            "failed-old-second",
+            &second,
+            ConversionStatus::Failed {
+                error: "second failure".to_string(),
+                log_path: None,
+            },
+        );
+
+        let transaction = manager.commit_batch_with_cue_artifacts(
+            &[first.clone(), second.clone()],
+            &HashSet::new(),
+            &HashSet::new(),
+            &ConversionOptions::default(),
+            |item| {
+                if same_path_for_queue(&item.input_path, &first) {
+                    item.pipeline_request = Some(pipeline_request_for(&item.input_path, &item.id));
+                }
+            },
         );
 
         assert_eq!(transaction.outcome.enqueued, 0);
-        assert_eq!(transaction.outcome.skipped, 1);
-        assert_eq!(transaction.outcome.previously_converted, 1);
-        assert!(transaction.artifacts_transferred_to_manager.is_empty());
-        assert!(transaction.artifacts_remaining_caller_owned.is_empty());
-        assert!(transaction.artifacts_cleaned_after_completed_skip.contains(&artifact));
-        assert!(
-            !artifact.exists(),
-            "completed duplicate synthetic artifact should be deleted, not reported as manager-owned"
+        assert_eq!(transaction.outcome.errors, 1);
+        assert_eq!(transaction.outcome.previously_converted, 0);
+        assert!(transaction.rollback.as_ref().is_some_and(|rollback| rollback.completed));
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let first_restored = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == "failed-old-first")
+            .expect("first terminal item restored");
+        let second_untouched = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == "failed-old-second")
+            .expect("second terminal item retained");
+        assert_eq!(
+            first_restored.status,
+            ConversionStatus::Failed {
+                error: "first failure".to_string(),
+                log_path: None,
+            }
         );
+        assert_eq!(
+            second_untouched.status,
+            ConversionStatus::Failed {
+                error: "second failure".to_string(),
+                log_path: None,
+            }
+        );
+        assert_eq!(queue.all_items().len(), 2);
     }
 
     #[test]

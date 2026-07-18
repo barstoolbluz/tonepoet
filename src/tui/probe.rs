@@ -469,20 +469,13 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
 
     // ffmpeg-next reports DSF/DFF dsd_u8 rates in bytes/second. Normalize
     // once at the TUI probe boundary so display and DSD-to-PCM cascades use
-    // the same true-rate facts as the conversion pipeline.
-    let is_dsd = codec_name.starts_with("dsd_");
-    let (sample_rate, _) = crate::convert::pipeline::normalize_dsd_probe_rate(
-        if is_dsd {
-            crate::convert::pipeline::SourceAudioCoding::Dsd
-        } else {
-            crate::convert::pipeline::SourceAudioCoding::Unknown
-        },
+    // the same true-rate facts as the conversion pipeline. Reuse the pipeline
+    // classifier so losslessly compressed DFF/DST is treated as DSD too.
+    let (sample_rate, bit_depth) = normalize_tui_dsd_probe_facts(
+        &codec_name,
         probed_sample_rate,
-        None,
+        bit_depth,
     );
-
-    // For DSD, bit depth is always 1.
-    let bit_depth = if is_dsd { Some(1) } else { bit_depth };
 
     Ok(SourceInfo {
         format_name,
@@ -494,6 +487,29 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
         duration_secs,
         file_size,
     })
+}
+
+fn normalize_tui_dsd_probe_facts(
+    codec_name: &str,
+    probed_sample_rate: u32,
+    probed_bit_depth: Option<u32>,
+) -> (u32, Option<u32>) {
+    let (coding, _) = crate::convert::pipeline::classify_source_audio_probe(
+        Some(codec_name),
+        None,
+        probed_bit_depth,
+    );
+    let (sample_rate, _) = crate::convert::pipeline::normalize_dsd_probe_rate(
+        coding,
+        probed_sample_rate,
+        None,
+    );
+    let bit_depth = if coding == crate::convert::pipeline::SourceAudioCoding::Dsd {
+        Some(1)
+    } else {
+        probed_bit_depth
+    };
+    (sample_rate, bit_depth)
 }
 
 /// Synthesize a `SourceInfo` for a SACD ISO. Defaults to surfacing
@@ -2663,6 +2679,7 @@ mod flac_metadata_writer {
         loop {
             if let Some(cancel) = cancel {
                 if cancel.is_cancelled() {
+                    cancel.record_observation();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "metadata save cancelled during FLAC overflow stream copy",
@@ -5079,24 +5096,52 @@ pub fn write_metadata_field(path: &Path, field: MetadataField, value: &str) -> R
 
 /// Execute an inline metadata edit under one crash-recovery authority.
 ///
-/// Native FLAC writes already own a metadata-region journal and therefore use
-/// the ordinary writer. Every other format is enclosed by the database-backed
-/// full-file transaction; the inner writer is deliberately backup-free so it
-/// cannot retire or replace the transaction's rollback marker independently.
+/// Native FLAC and DSF writes already own format-specific recovery journals and
+/// therefore use the ordinary writer directly. Every other format is enclosed
+/// by the database-backed full-file transaction; the inner writer is
+/// deliberately backup-free so it cannot retire or replace the transaction's
+/// rollback marker independently.
 pub fn write_metadata_field_transactional(
     path: &Path,
     field: MetadataField,
     value: &str,
 ) -> Result<(), String> {
+    write_metadata_field_transactional_with_control(path, field, value, None, None).map(|_| ())
+}
+
+/// Inline metadata write with the same operation-scoped cancellation,
+/// byte-progress, and durability-warning report used by the full metadata
+/// editor. DSF and native-FLAC paths observe cancellation inside their bounded
+/// copy loops. Generic formats retain the database transaction and are checked
+/// before mutation because their third-party writer has no cancellable seam.
+pub fn write_metadata_field_transactional_with_control(
+    path: &Path,
+    field: MetadataField,
+    value: &str,
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+) -> Result<MetadataWriteCommitReport, String> {
     let change = metadata_field_change(field, value)
         .map_err(|error| format!("write failed before mutation: {error}"))?;
-    if uses_native_flac_metadata_journal(path) {
-        return write_all_tags(path, &[change]);
+    reject_unsupported_dff_metadata_write(path, "writing")?;
+    if uses_native_flac_metadata_journal(path) || crate::dsf_tags::is_dsf(path) {
+        return write_all_tags_with_cancel_report_classified(
+            path,
+            &[change],
+            cancel,
+            byte_progress,
+        )
+        .map_err(MetadataWriteFailure::into_message);
     }
+
+    check_metadata_write_cancel(cancel, "before starting inline metadata transaction")?;
 
     let db = crate::db::Database::open()
         .map_err(|error| format!("write failed before mutation: metadata journal unavailable: {error}"))?;
-    write_metadata_field_with_database(&db, path, change)
+    write_metadata_field_with_database(&db, path, change)?;
+    Ok(MetadataWriteCommitReport::clean())
 }
 
 fn write_metadata_field_with_database(
@@ -5104,6 +5149,10 @@ fn write_metadata_field_with_database(
     path: &Path,
     change: (lofty::tag::ItemKey, Option<String>),
 ) -> Result<(), String> {
+    reject_unsupported_dff_metadata_write(path, "writing")?;
+    if crate::dsf_tags::is_dsf(path) {
+        return write_all_tags(path, std::slice::from_ref(&change));
+    }
     db.atomic_metadata_write(path, || {
         write_all_tags_without_full_file_backup(path, std::slice::from_ref(&change))
     })
@@ -5862,6 +5911,12 @@ fn append_distinct_editor_value(current: &mut String, next: &str) {
 /// Collect one logical row per canonical editor key. Vorbis/ID3 aliases are
 /// collapsed before placeholder synthesis, so COMMENT/DESCRIPTION and total
 /// spellings cannot produce competing rows or order-dependent writes.
+///
+/// The editor is intentionally scalar: when a key has multiple stored values,
+/// it renders a joined summary. This is lossy only if that row is explicitly
+/// edited. The save planner emits changes solely for rows whose value changed,
+/// so unrelated edits leave the carrier's original multi-value frames/items
+/// untouched and in their original cardinality.
 fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEditorTagField> {
     use lofty::tag::ItemValue;
     use std::collections::HashMap;
@@ -5893,6 +5948,10 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
     fields
 }
 
+/// DSF uses the same scalar presentation policy as other carriers. Joined
+/// values are display-only until the row itself is edited; an unrelated edit
+/// emits no change for this key, so the ID3 backend preserves all original
+/// frames rather than collapsing them into the joined display string.
 fn canonical_editor_fields_from_dsf(
     snapshot: &crate::dsf_tags::DsfTagSnapshot,
 ) -> Vec<CanonicalEditorTagField> {
@@ -6304,7 +6363,11 @@ fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEn
 /// Returns entries sorted: standard fields first, then alphabetical.
 pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
     if crate::dsf_tags::is_dsf(path) {
-        return crate::dsf_tags::read(path).map(|snapshot| tag_entries_from_dsf_snapshot(&snapshot));
+        let outcome = crate::dsf_tags::read_with_warnings(path)?;
+        for warning in &outcome.warnings {
+            log::warn!("DSF metadata read warning for '{}': {}", path.display(), warning);
+        }
+        return Ok(tag_entries_from_dsf_snapshot(&outcome.snapshot));
     }
     flac_metadata_writer::recover_before_read(path)?;
     let tagged = lofty::read_from_path(path)
@@ -6327,6 +6390,9 @@ pub enum MetadataReadIssueKind {
     UnsupportedFormat,
     /// Lofty recognized the file class but failed while decoding tag data.
     TagRead,
+    /// Audio remains readable, but noncanonical container metadata means the
+    /// editor must remain read-only until the file is repaired or rewritten.
+    ContainerQuirk,
 }
 
 /// Typed per-file metadata read issue produced at the tag I/O boundary.
@@ -6342,6 +6408,24 @@ pub struct MetadataReadIssue {
     pub reason: String,
 }
 
+
+fn dsf_container_quirk_issue(
+    path: &std::path::Path,
+    warnings: &[String],
+) -> Option<MetadataReadIssue> {
+    if warnings.is_empty() {
+        return None;
+    }
+    let reason = format!(
+        "read noncanonical DSF metadata from '{}': {}; metadata writes are blocked until the container is repaired",
+        path.display(),
+        warnings.join("; ")
+    );
+    Some(MetadataReadIssue {
+        kind: MetadataReadIssueKind::ContainerQuirk,
+        reason,
+    })
+}
 impl MetadataReadIssue {
     fn filesystem(path: &std::path::Path, reason: String) -> Self {
         Self {
@@ -6406,8 +6490,11 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
 
     for (file_idx, path) in paths.iter().enumerate() {
         if crate::dsf_tags::is_dsf(path) {
-            let snapshot = crate::dsf_tags::read(path)?;
-            for field in canonical_editor_fields_from_dsf(&snapshot) {
+            let outcome = crate::dsf_tags::read_with_warnings(path)?;
+            for warning in &outcome.warnings {
+                log::warn!("DSF metadata read warning for '{}': {}", path.display(), warning);
+            }
+            for field in canonical_editor_fields_from_dsf(&outcome.snapshot) {
                 let key = field.display_key.clone();
                 if !key_map.contains_key(&key) {
                     key_order.push(key.clone());
@@ -6512,12 +6599,18 @@ pub fn read_all_tags_merged_with_metadata(
     if paths.len() == 1 {
         let path = &paths[0];
         if crate::dsf_tags::is_dsf(path) {
-            return match crate::dsf_tags::read(path) {
-                Ok(snapshot) => Ok(MergedTagsAndMetadata {
-                    entries: tag_entries_from_dsf_snapshot(&snapshot),
-                    metadata: vec![source_metadata_from_dsf(&snapshot)],
-                    metadata_errors: vec![None],
-                }),
+            return match crate::dsf_tags::read_with_warnings(path) {
+                Ok(outcome) => {
+                    for warning in &outcome.warnings {
+                        log::warn!("DSF metadata read warning for '{}': {}", path.display(), warning);
+                    }
+                    let issue = dsf_container_quirk_issue(path, &outcome.warnings);
+                    Ok(MergedTagsAndMetadata {
+                        entries: tag_entries_from_dsf_snapshot(&outcome.snapshot),
+                        metadata: vec![source_metadata_from_dsf(&outcome.snapshot)],
+                        metadata_errors: vec![issue],
+                    })
+                }
                 Err(reason) => Ok(MergedTagsAndMetadata {
                     entries: Vec::new(),
                     metadata: vec![SourceMetadata::default()],
@@ -6567,10 +6660,15 @@ pub fn read_all_tags_merged_with_metadata(
 
     for (file_idx, path) in paths.iter().enumerate() {
         if crate::dsf_tags::is_dsf(path) {
-            match crate::dsf_tags::read(path) {
-                Ok(snapshot) => {
-                    metadata[file_idx] = source_metadata_from_dsf(&snapshot);
-                    for field in canonical_editor_fields_from_dsf(&snapshot) {
+            match crate::dsf_tags::read_with_warnings(path) {
+                Ok(outcome) => {
+                    for warning in &outcome.warnings {
+                        log::warn!("DSF metadata read warning for '{}': {}", path.display(), warning);
+                    }
+                    metadata_errors[file_idx] =
+                        dsf_container_quirk_issue(path, &outcome.warnings);
+                    metadata[file_idx] = source_metadata_from_dsf(&outcome.snapshot);
+                    for field in canonical_editor_fields_from_dsf(&outcome.snapshot) {
                         let key = field.display_key.clone();
                         if !key_map.contains_key(&key) {
                             key_order.push(key.clone());
@@ -6707,6 +6805,9 @@ pub fn apply_audio_tag_changes(
 /// treated as an ordinary writable empty-tag file. If such a file has pending
 /// changes, return an explicit skipped result instead of attempting a write.
 pub type MetadataWriteProgressCallback = std::sync::Arc<dyn Fn(usize, usize, &std::path::Path, &crate::tui::app::MetadataEditorWriteResult) + Send + Sync>;
+pub type MetadataWriteByteProgressCallback = std::sync::Arc<
+    dyn Fn(usize, usize, &std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync,
+>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataWriteCommitReport {
@@ -6739,12 +6840,14 @@ impl MetadataWriteCommitReport {
 #[derive(Clone)]
 pub struct MetadataWriteCancelFlag {
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    observations: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MetadataWriteCancelFlag {
     pub fn new() -> Self {
         Self {
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            observations: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -6758,10 +6861,27 @@ impl MetadataWriteCancelFlag {
 
     fn check(&self, context: &str) -> Result<(), String> {
         if self.is_cancelled() {
+            self.record_observation();
             Err(format!("metadata save cancelled {context}"))
         } else {
             Ok(())
         }
+    }
+
+    fn operation_scope(&self) -> Self {
+        Self {
+            cancelled: std::sync::Arc::clone(&self.cancelled),
+            observations: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn record_observation(&self) {
+        self.observations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn observation_count(&self) -> u64 {
+        self.observations.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -6787,6 +6907,20 @@ fn check_metadata_write_cancel(
         cancel.check(context)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetadataWriteFailure {
+    Cancelled(String),
+    Failed(String),
+}
+
+impl MetadataWriteFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Cancelled(message) | Self::Failed(message) => message,
+        }
+    }
 }
 
 pub fn apply_audio_tag_changes_with_save_blocks(
@@ -6857,6 +6991,7 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
         deleted,
         save_block_reasons,
         progress,
+        None,
         cancel,
         &[],
     )
@@ -6874,12 +7009,14 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
     deleted: &[usize],
     save_block_reasons: &[Option<String>],
     progress: Option<MetadataWriteProgressCallback>,
+    byte_progress: Option<MetadataWriteByteProgressCallback>,
     cancel: Option<MetadataWriteCancelFlag>,
     forced_deletes: &[(usize, lofty::tag::ItemKey)],
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
     #[derive(Debug)]
     struct PlannedWrite {
         original_index: usize,
+        write_ordinal: usize,
         path: std::path::PathBuf,
         changes: Vec<(lofty::tag::ItemKey, Option<String>)>,
     }
@@ -6929,6 +7066,7 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
 
         planned.push(PlannedWrite {
             original_index: file_idx,
+            write_ordinal: 0,
             path: path.clone(),
             changes,
         });
@@ -6940,15 +7078,19 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
     }
 
     let total = planned.len();
+    for (idx, write) in planned.iter_mut().enumerate() {
+        write.write_ordinal = idx + 1;
+    }
     let has_duplicate_targets = {
         let mut seen = std::collections::BTreeSet::new();
         planned.iter().any(|write| !seen.insert(write.path.clone()))
     };
-    let worker_count = if has_duplicate_targets {
-        1
-    } else {
-        metadata_write_parallelism(total)
-    };
+    let has_dsf_targets = planned.iter().any(|write| crate::dsf_tags::is_dsf(&write.path));
+    let worker_count = metadata_write_worker_count(
+        total,
+        has_duplicate_targets,
+        has_dsf_targets,
+    );
     let planned = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(planned)));
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, crate::tui::app::MetadataEditorWriteResult)>::with_capacity(total)));
@@ -6960,6 +7102,7 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
             let completed = std::sync::Arc::clone(&completed);
             let results = std::sync::Arc::clone(&results);
             let progress = progress.clone();
+            let byte_progress = byte_progress.clone();
             let cancel = std::sync::Arc::clone(&cancel);
             scope.spawn(move || loop {
                 if cancel.as_ref().as_ref().is_some_and(|flag| flag.is_cancelled()) {
@@ -6974,15 +7117,28 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
                         "metadata save cancelled before starting this file".to_string(),
                     )
                 } else {
-                    match write_all_tags_with_cancel_report(&write.path, &write.changes, cancel.as_ref().as_ref()) {
+                    let report_byte_progress =
+                        |path: &std::path::Path, update: crate::dsf_tags::DsfWriteProgress| {
+                            if let Some(progress) = byte_progress.as_deref() {
+                                progress(write.write_ordinal, total, path, update);
+                            }
+                        };
+                    match write_all_tags_with_cancel_report_classified(
+                        &write.path,
+                        &write.changes,
+                        cancel.as_ref().as_ref(),
+                        Some(&report_byte_progress),
+                    ) {
                         Ok(report) => crate::tui::app::MetadataEditorWriteResult::saved_with_warnings(
                             write.path.clone(),
                             report.durability_warnings,
                         ),
-                        Err(reason) if reason.contains("metadata save cancelled") => {
+                        Err(MetadataWriteFailure::Cancelled(reason)) => {
                             crate::tui::app::MetadataEditorWriteResult::skipped(write.path.clone(), reason)
                         }
-                        Err(reason) => crate::tui::app::MetadataEditorWriteResult::failed(write.path.clone(), reason),
+                        Err(MetadataWriteFailure::Failed(reason)) => {
+                            crate::tui::app::MetadataEditorWriteResult::failed(write.path.clone(), reason)
+                        }
                     }
                 };
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -7027,6 +7183,48 @@ fn metadata_write_parallelism(write_count: usize) -> usize {
     write_count.min(cpus).min(4).max(1)
 }
 
+fn metadata_write_worker_count(
+    write_count: usize,
+    has_duplicate_targets: bool,
+    has_dsf_targets: bool,
+) -> usize {
+    if has_duplicate_targets || has_dsf_targets {
+        1
+    } else {
+        metadata_write_parallelism(write_count)
+    }
+}
+
+fn is_dff_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dff"))
+}
+
+fn reject_unsupported_dff_metadata_write(
+    path: &std::path::Path,
+    operation: &str,
+) -> Result<(), String> {
+    if is_dff_path(path) {
+        Err(format!(
+            "DFF metadata {operation} is not supported for '{}'; refusing before allocating a full-file rollback backup",
+            path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_unsupported_dff_metadata_batch(
+    paths: &[std::path::PathBuf],
+    operation: &str,
+) -> Result<(), String> {
+    for path in paths {
+        reject_unsupported_dff_metadata_write(path, operation)?;
+    }
+    Ok(())
+}
+
 /// Write a batch of tag changes to an audio file.
 /// Each entry in `changes` is (ItemKey, Option<new_value>).
 /// `None` means delete the tag. Empty string also deletes.
@@ -7042,13 +7240,40 @@ pub fn write_all_tags_with_cancel(
     changes: &[(lofty::tag::ItemKey, Option<String>)],
     cancel: Option<&MetadataWriteCancelFlag>,
 ) -> Result<(), String> {
-    write_all_tags_with_cancel_report(path, changes, cancel).map(|_| ())
+    write_all_tags_with_cancel_report_classified(path, changes, cancel, None)
+        .map(|_| ())
+        .map_err(MetadataWriteFailure::into_message)
+}
+
+fn write_all_tags_with_cancel_report_classified(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
+    let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
+    write_all_tags_with_cancel_report(path, changes, operation_cancel.as_ref(), byte_progress)
+        .map_err(|message| {
+            if operation_cancel
+                .as_ref()
+                .is_some_and(|flag| flag.observation_count() > 0)
+            {
+                MetadataWriteFailure::Cancelled(message)
+            } else {
+                MetadataWriteFailure::Failed(message)
+            }
+        })
 }
 
 fn write_all_tags_with_cancel_report(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
     cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
 ) -> Result<MetadataWriteCommitReport, String> {
     if changes.is_empty() {
         return Ok(MetadataWriteCommitReport::clean());
@@ -7071,22 +7296,47 @@ fn write_all_tags_with_cancel_report(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let warning = crate::dsf_tags::write_with_backup(path, &dsf_changes)?;
+        let is_cancelled = || {
+            cancel.is_some_and(|flag| {
+                let cancelled = flag.is_cancelled();
+                if cancelled {
+                    flag.record_observation();
+                }
+                cancelled
+            })
+        };
+        let report_progress = |update| {
+            if let Some(progress) = byte_progress {
+                progress(path, update);
+            }
+        };
+        let warning = crate::dsf_tags::write_with_control(
+            path,
+            &dsf_changes,
+            &is_cancelled,
+            &report_progress,
+        )?;
         return Ok(MetadataWriteCommitReport::from_warnings(warning.into_iter().collect()));
     }
 
     if flac_metadata_writer::is_probably_flac(path) {
+        let observation_before = cancel.map_or(0, MetadataWriteCancelFlag::observation_count);
         match flac_metadata_writer::write_vorbis_comment_changes(path, changes, cancel) {
             Ok(report) => {
                 return Ok(MetadataWriteCommitReport::from_warnings(report.durability_warnings));
             }
-            Err(native_err) if native_err.contains("metadata save cancelled") => return Err(native_err),
+            Err(native_err)
+                if cancel.is_some_and(|flag| flag.observation_count() > observation_before) =>
+            {
+                return Err(native_err);
+            }
             Err(native_err) => {
                 return Err(native_flac_write_refused_error(path, "tag write", &native_err));
             }
         }
     }
 
+    reject_unsupported_dff_metadata_write(path, "writing")?;
     check_metadata_write_cancel(cancel, "before starting full-file fallback rewrite")?;
     let cleanup_warning = write_all_tags_lofty_with_backup(path, changes)?;
     Ok(MetadataWriteCommitReport::from_warnings(cleanup_warning.into_iter().collect()))
@@ -7101,21 +7351,10 @@ fn write_all_tags_without_full_file_backup(
     }
 
     if crate::dsf_tags::is_dsf(path) {
-        let dsf_changes = changes
-            .iter()
-            .map(|(key, value)| {
-                let canonical_key = match key {
-                    lofty::tag::ItemKey::Unknown(value) => Some(value.as_str()),
-                    _ => key.map_key(lofty::tag::TagType::VorbisComments, true),
-                }
-                .ok_or_else(|| format!("cannot map {:?} to the DSF editor tag canon", key))?;
-                Ok(crate::dsf_tags::DsfTagChange {
-                    canonical_key: canonical_metadata_display_key(canonical_key),
-                    value: value.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        return crate::dsf_tags::write_without_backup(path, &dsf_changes);
+        return Err(format!(
+            "internal transaction error: DSF path '{}' reached the legacy full-file transaction even though DSF owns a native recovery journal",
+            path.display()
+        ));
     }
 
     if flac_metadata_writer::is_probably_flac(path) {
@@ -7125,6 +7364,7 @@ fn write_all_tags_without_full_file_backup(
         ));
     }
 
+    reject_unsupported_dff_metadata_write(path, "writing")?;
     write_all_tags_lofty_in_place(path, changes)
 }
 
@@ -7308,6 +7548,7 @@ fn write_all_tags_lofty_with_backup(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
 ) -> Result<Option<String>, String> {
+    reject_unsupported_dff_metadata_write(path, "writing")?;
     // Non-FLAC formats keep the existing file-scope rollback path until they
     // receive native metadata-region writers. FLACs must not silently enter
     // this path: a native FLAC refusal is returned to the caller as an
@@ -7365,6 +7606,7 @@ pub fn write_artwork_to_files_with_cancel(
     cancel: Option<&MetadataWriteCancelFlag>,
 ) -> Result<ArtworkWriteBatchResult, String> {
     check_metadata_write_cancel(cancel, "before reading artwork image")?;
+    reject_unsupported_dff_metadata_batch(paths, "artwork writing")?;
     let image_bytes = std::fs::read(image_path)
         .map_err(|e| format!("read artwork '{}': {}", image_path.display(), e))?;
     let mime_type = image_mime_type(image_path, &image_bytes)?;
@@ -7397,6 +7639,8 @@ pub fn remove_artwork_from_files_with_cancel(
     picture_type: lofty::picture::PictureType,
     cancel: Option<&MetadataWriteCancelFlag>,
 ) -> Result<ArtworkWriteBatchResult, String> {
+    check_metadata_write_cancel(cancel, "before reading artwork metadata")?;
+    reject_unsupported_dff_metadata_batch(paths, "artwork removal")?;
     let mut metadata_cache = read_artwork_metadata_cache(paths)?;
     let commit = apply_artwork_batch(paths, cancel, |path| remove_artwork_one_file(path, picture_type, cancel))?;
     Ok(ArtworkWriteBatchResult {
@@ -7538,6 +7782,7 @@ fn write_artwork_one_file(
         }
     }
 
+    reject_unsupported_dff_metadata_write(path, "artwork writing")?;
     check_metadata_write_cancel(cancel, "before starting artwork full-file fallback rewrite")?;
     write_artwork_lofty_with_backup(path, image_bytes, lofty_mime_type, picture_type)
         .map(|backup| Some(ArtworkRollbackToken::FullFileBackup { path: path.to_path_buf(), backup }))
@@ -7609,6 +7854,7 @@ fn remove_artwork_one_file(
         }
     }
 
+    reject_unsupported_dff_metadata_write(path, "artwork removal")?;
     check_metadata_write_cancel(cancel, "before starting artwork full-file fallback rewrite")?;
     remove_artwork_lofty_with_backup(path, picture_type)
         .map(|backup| Some(ArtworkRollbackToken::FullFileBackup { path: path.to_path_buf(), backup }))
@@ -7938,13 +8184,118 @@ pub fn recover_flac_metadata_before_read(path: &std::path::Path) -> Result<(), S
 /// in-place metadata write is repaired before Lofty/ffmpeg attempt to parse
 /// a possibly half-written metadata block chain.
 pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec<String> {
-    flac_metadata_writer::recover_metadata_journals_in_directory(dir)
+    let mut messages = flac_metadata_writer::recover_metadata_journals_in_directory(dir);
+    messages.extend(crate::dsf_tags::recover_stale_writes_in_directory(dir));
+    messages
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn metadata_write_worker_policy_serializes_dsf_and_duplicate_targets() {
+        assert_eq!(metadata_write_worker_count(8, false, true), 1);
+        assert_eq!(metadata_write_worker_count(8, true, false), 1);
+        assert_eq!(metadata_write_worker_count(1, false, false), 1);
+    }
+
+    #[test]
+    fn dst_probe_is_normalized_as_one_bit_dsd() {
+        assert_eq!(normalize_tui_dsd_probe_facts("dst", 352_800, Some(8)), (2_822_400, Some(1)));
+        assert_eq!(normalize_tui_dsd_probe_facts("pcm_s24le", 96_000, Some(24)), (96_000, Some(24)));
+    }
+
+    #[test]
+    fn dff_tag_write_is_rejected_before_backup_or_fallback_writer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("unsupported.dff");
+        let original = b"synthetic DFF bytes";
+        std::fs::write(&path, original).expect("write fixture");
+        let fallback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_hook = std::sync::Arc::clone(&fallback_calls);
+
+        let error = with_lofty_fallback_hook(
+            temp.path(),
+            move |_| {
+                calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            || {
+                write_all_tags(
+                    &path,
+                    &[(lofty::tag::ItemKey::TrackTitle, Some("new title".to_string()))],
+                )
+            },
+        )
+        .expect_err("DFF tag writing must be rejected before fallback");
+
+        assert!(error.contains("DFF metadata writing is not supported"));
+        assert!(error.contains("refusing before allocating a full-file rollback backup"));
+        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&path).expect("read unchanged DFF"), original);
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+
+        let db = crate::db::Database::open_memory().expect("memory database");
+        let transactional_error = write_metadata_field_with_database(
+            &db,
+            &path,
+            (lofty::tag::ItemKey::TrackTitle, Some("transactional title".to_string())),
+        )
+        .expect_err("DFF inline transaction must fail before backup allocation");
+        assert!(transactional_error.contains("DFF metadata writing is not supported"));
+        assert_eq!(std::fs::read(&path).expect("read unchanged DFF"), original);
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(db.stale_metadata_writes().expect("read metadata journal").is_empty());
+    }
+
+    #[test]
+    fn dff_artwork_mutations_are_rejected_before_full_file_backup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("unsupported-artwork.dff");
+        let original = b"synthetic DFF bytes";
+        std::fs::write(&path, original).expect("write fixture");
+
+        let write_error = write_artwork_one_file(
+            &path,
+            b"not-decoded-because-preflight-runs-first",
+            &lofty::picture::MimeType::Png,
+            "image/png",
+            lofty::picture::PictureType::CoverFront,
+            None,
+        )
+        .expect_err("DFF artwork write must be rejected before backup");
+        assert!(write_error.contains("DFF metadata artwork writing is not supported"));
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+
+        let remove_error = remove_artwork_one_file(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            None,
+        )
+        .expect_err("DFF artwork removal must be rejected before backup");
+        assert!(remove_error.contains("DFF metadata artwork removal is not supported"));
+        assert_eq!(std::fs::read(&path).expect("read unchanged DFF"), original);
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+
+        let missing_image = temp.path().join("missing.png");
+        let batch_write_error = write_artwork_to_files(
+            std::slice::from_ref(&path),
+            &missing_image,
+            lofty::picture::PictureType::CoverFront,
+        )
+        .expect_err("DFF artwork batch must reject before reading the image");
+        assert!(batch_write_error.contains("DFF metadata artwork writing is not supported"));
+        assert!(!batch_write_error.contains("read artwork"));
+
+        let batch_remove_error = remove_artwork_from_files(
+            std::slice::from_ref(&path),
+            lofty::picture::PictureType::CoverFront,
+        )
+        .expect_err("DFF artwork removal batch must reject before metadata reads");
+        assert!(batch_remove_error.contains("DFF metadata artwork removal is not supported"));
+        assert_eq!(std::fs::read(&path).expect("read unchanged DFF"), original);
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+    }
 
     #[test]
     fn inline_non_flac_writer_uses_one_database_transaction_and_restores_exact_bytes() {
@@ -7963,6 +8314,31 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read restored fixture"), original);
         assert!(!crate::db::Database::backup_path_for(&path).exists());
         assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+    }
+
+    #[test]
+    fn inline_dsf_writer_bypasses_the_legacy_database_transaction() {
+        let db = crate::db::Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("corrupt.dsf");
+        let original = b"not a parseable DSF file";
+        std::fs::write(&path, original).expect("write fixture");
+        let change = metadata_field_change(MetadataField::Title, "New title")
+            .expect("valid title change");
+
+        let error = write_metadata_field_with_database(&db, &path, change)
+            .expect_err("invalid DSF must fail through the native DSF writer");
+
+        assert!(error.starts_with(&format!(
+            "failed to save DSF ID3 tags to '{}':",
+            path.display()
+        )));
+        assert_eq!(std::fs::read(&path).expect("read unchanged fixture"), original);
+        assert!(db.stale_metadata_writes().expect("read journal").is_empty());
+        assert!(std::fs::read_dir(temp.path())
+            .expect("read tempdir")
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".tonepoet-bak.txn-")));
     }
 
     #[test]
@@ -8707,6 +9083,38 @@ mod tests {
         assert_eq!(&bytes[audio_start_after as usize..], audio.as_slice());
         assert!(!crate::db::Database::backup_path_for(&path).exists());
         assert!(!flac_metadata_writer::test_journal_path(&path).exists());
+    }
+
+    #[test]
+    fn unrelated_flac_edit_preserves_distinct_multi_value_items() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("multi-value.flac");
+        let blocks = vec![
+            (0, vec![0u8; 34]),
+            (4, vorbis_block_body(
+                "tonepoet-test",
+                &[
+                    ("TITLE", "Old title"),
+                    ("COMMENT", "first comment"),
+                    ("COMMENT", "second comment"),
+                ],
+            )),
+            (1, vec![0u8; 4096]),
+        ];
+        write_synthetic_flac_with_blocks(&path, &blocks, 16 * 1024);
+
+        write_all_tags(
+            &path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("New title".to_string()))],
+        )
+        .expect("unrelated title edit");
+
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&path, "COMMENT")
+                .expect("comment values"),
+            vec!["first comment".to_string(), "second comment".to_string()],
+            "an unedited multi-value row must retain distinct stored items",
+        );
     }
 
     #[test]
@@ -9830,6 +10238,7 @@ mod tests {
                     &path,
                     &[(lofty::tag::ItemKey::TrackTitle, Some("Committed".to_string()))],
                     None,
+                    None,
                 )
             },
         )
@@ -10177,6 +10586,7 @@ mod tests {
                 &path,
                 &[(lofty::tag::ItemKey::TrackTitle, Some("x".repeat(128 * 1024)))],
                 None,
+                None,
             )
             .expect("post-rename parent-directory fsync failure must not reclassify committed audio mutation as failed"),
         );
@@ -10218,6 +10628,7 @@ mod tests {
                 &path,
                 &[(lofty::tag::ItemKey::TrackTitle, Some("Committed in-place".to_string()))],
                 None,
+                None,
             )
             .expect("post-commit journal-removal parent fsync failure must be a warning, not failed save"),
         );
@@ -10247,6 +10658,7 @@ mod tests {
                 &path,
                 &[(lofty::tag::ItemKey::TrackTitle, Some("Committed despite cleanup warning".to_string()))],
                 None,
+                None,
             )
             .expect("post-commit metadata-journal cleanup failure must be a warning, not failed save"),
         );
@@ -10264,6 +10676,27 @@ mod tests {
             flac_metadata_writer::test_journal_path(&path).exists(),
             "injected cleanup failure intentionally leaves the recovery journal for later/remedial cleanup"
         );
+    }
+
+    #[test]
+    fn metadata_write_cancel_operation_scopes_share_cancellation_but_isolate_observations() {
+        let request = MetadataWriteCancelFlag::new();
+        let first = request.operation_scope();
+        let second = request.operation_scope();
+
+        request.cancel();
+        assert!(first.check("inside first operation").is_err());
+
+        assert!(request.is_cancelled());
+        assert!(second.is_cancelled());
+        assert_eq!(first.observation_count(), 1);
+        assert_eq!(second.observation_count(), 0);
+        assert_eq!(request.observation_count(), 0);
+
+        assert!(second.check("inside second operation").is_err());
+        assert_eq!(first.observation_count(), 1);
+        assert_eq!(second.observation_count(), 1);
+        assert_eq!(request.observation_count(), 0);
     }
 
     #[test]
@@ -11854,4 +12287,41 @@ mod tests {
         assert!(!rollback_path.exists());
     }
 
+}
+
+#[cfg(test)]
+mod tolerant_dsf_editor_read_tests {
+    use super::*;
+    use id3::TagLike;
+
+    #[test]
+    fn noncanonical_dsf_remains_visible_with_typed_write_block_issue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("quirky.dsf");
+        let mut tag = id3::Tag::new();
+        tag.add_frame(id3::Frame::text("TIT2", "Visible title"));
+        let mut metadata = Vec::new();
+        tag.write_to(&mut metadata, id3::Version::Id3v24)
+            .expect("serialize ID3 fixture");
+        crate::dsf_tags::write_test_dsf_fixture(&path, Some(&metadata))
+            .expect("write DSF fixture");
+        let mut bytes = std::fs::read(&path).expect("read DSF fixture");
+        let actual_size = bytes.len() as u64;
+        bytes[12..20].copy_from_slice(&(actual_size + 1).to_le_bytes());
+        std::fs::write(&path, bytes).expect("publish DSF size quirk");
+
+        let merged = read_all_tags_merged_with_metadata(std::slice::from_ref(&path))
+            .expect("quirky DSF should remain readable");
+
+        assert!(merged.entries.iter().any(|entry| {
+            entry.display_key == "TITLE" && entry.value == "Visible title"
+        }));
+        assert_eq!(merged.metadata_errors.len(), 1);
+        let issue = merged.metadata_errors[0]
+            .as_ref()
+            .expect("quirky DSF should carry a typed issue");
+        assert_eq!(issue.kind, MetadataReadIssueKind::ContainerQuirk);
+        assert!(issue.reason.contains("declared file size"));
+        assert!(issue.reason.contains("metadata writes are blocked"));
+    }
 }

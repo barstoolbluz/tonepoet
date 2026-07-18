@@ -791,11 +791,19 @@ pub enum QualitySettings {
     /// FLAC compression level (0-8, where 8 is best compression)
     Flac { compression_level: u8 },
 
-    /// WAV settings
-    Wav { bit_depth: u16, sample_rate: u32 },
+    /// WAV settings. `None` preserves the source-relative policy instead of
+    /// smuggling a guessed scalar through the legacy carrier.
+    Wav {
+        bit_depth: Option<u16>,
+        sample_rate: Option<u32>,
+    },
 
-    /// AIFF settings
-    Aiff { bit_depth: u16, sample_rate: u32 },
+    /// AIFF settings. `None` preserves the source-relative policy instead of
+    /// smuggling a guessed scalar through the legacy carrier.
+    Aiff {
+        bit_depth: Option<u16>,
+        sample_rate: Option<u32>,
+    },
 
     /// WavPack settings
     WavPack {
@@ -997,12 +1005,12 @@ impl AudioFormat {
                 compression_level: 5,
             },
             AudioFormat::Wav => QualitySettings::Wav {
-                bit_depth: 16,
-                sample_rate: 44100,
+                bit_depth: Some(16),
+                sample_rate: Some(44_100),
             },
             AudioFormat::Aiff => QualitySettings::Aiff {
-                bit_depth: 16,
-                sample_rate: 44100,
+                bit_depth: Some(16),
+                sample_rate: Some(44_100),
             },
             AudioFormat::WavPack => QualitySettings::WavPack {
                 compression_mode: WavPackMode::Normal,
@@ -1030,7 +1038,10 @@ impl AudioFormat {
             AudioFormat::Ape | AudioFormat::Shorten | AudioFormat::Ogg | AudioFormat::Tta => {
                 QualitySettings::Flac { compression_level: 0 }
             },
-            AudioFormat::Lpcm => QualitySettings::Wav { bit_depth: 16, sample_rate: 44100 },
+            AudioFormat::Lpcm => QualitySettings::Wav {
+                bit_depth: Some(16),
+                sample_rate: Some(44_100),
+            },
         }
     }
 }

@@ -117,10 +117,10 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState, theme: s
             };
 
             // Build spans: marker + name + gap + parent + gap + age (right-ish)
-            let name_w = name_display.chars().count();
+            let name_w = super::display_width::width(&name_display);
             let name_pad = name_col_w.saturating_sub(name_w);
 
-            let parent_w = parent_display.chars().count();
+            let parent_w = super::display_width::width(&parent_display);
             let parent_pad = path_col_w.saturating_sub(parent_w);
 
             lines.push(Line::from(vec![
@@ -151,29 +151,10 @@ pub fn draw_recent_overlay(f: &mut Frame, state: &mut RecentFilesState, theme: s
 
 /// Truncate to `max` chars, adding an ellipsis at the end if cut.
 fn truncate_middle(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    if max < 2 {
-        return s.chars().take(max).collect();
-    }
-    let take = max - 1;
-    let truncated: String = s.chars().take(take).collect();
-    format!("{}…", truncated)
+    super::display_width::truncate_middle(s, max)
 }
 
 /// Truncate from the LEFT (preserve end), prepending `…`.
 fn truncate_left(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    if max < 2 {
-        let skip = count - max;
-        return s.chars().skip(skip).collect();
-    }
-    let skip = count - (max - 1);
-    let truncated: String = s.chars().skip(skip).collect();
-    format!("…{}", truncated)
+    super::display_width::truncate_left(s, max)
 }

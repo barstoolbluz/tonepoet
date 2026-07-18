@@ -6759,7 +6759,7 @@ mod replaygain_existing_tag_policy_tests {
     use crate::convert::pipeline::tool::{ProcessExit, StubToolRunner, ToolOutput};
     use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
     use tonepoet_pipeline::{
-        ReplayGainExistingTagPolicy, ReplayGainMode,
+        AudioFormat, ReplayGainExistingTagPolicy, ReplayGainMode,
     };
 
     fn tag_with(values: &[(ItemKey, &str)]) -> Tag {
@@ -6968,6 +6968,72 @@ mod replaygain_existing_tag_policy_tests {
     }
 
     #[tokio::test]
+    async fn skip_if_complete_ignores_inherited_tags_after_lossy_encode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let one = temp.path().join("01.flac");
+        write_synthetic_flac(&one, COMPLETE_BOTH);
+        let artifacts = artifacts(&[one]);
+        let mut req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        req.settings.target_format = AudioFormat::Mp3;
+        let runner = StubToolRunner::new();
+        runner.push_output(successful_loudgain_output());
+
+        let record = apply_replaygain(
+            &artifacts,
+            &req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("lossy output must rescan inherited tags");
+
+        assert!(matches!(record.outcome, StageOutcome::Ok));
+        assert_eq!(runner.transcript().len(), 1);
+        assert_eq!(runner.transcript()[0].binary, ToolBinary::Loudgain);
+    }
+
+    #[test]
+    fn inherited_replaygain_policy_trusts_only_signal_equivalent_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        req.settings.target_format = AudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Disabled;
+        req.settings.dsd.dsd_to_pcm_gain_db = None;
+
+        assert_eq!(
+            inherited_replaygain_tag_policy(None, &req.settings),
+            ReplayGainInheritedTagPolicy::Trust,
+            "lossless source-rate/source-depth output with no DSD gain remains signal-equivalent",
+        );
+
+        req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
+        assert_eq!(
+            inherited_replaygain_tag_policy(None, &req.settings),
+            ReplayGainInheritedTagPolicy::Recompute {
+                reason: "sample-rate conversion changes the output signal".to_string(),
+            },
+        );
+
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Auto;
+        assert_eq!(
+            inherited_replaygain_tag_policy(None, &req.settings),
+            ReplayGainInheritedTagPolicy::Recompute {
+                reason: "DSD-to-PCM gain changes output level".to_string(),
+            },
+        );
+    }
+
+    #[tokio::test]
     async fn one_incomplete_output_runs_exactly_one_loudgain_command() {
         let temp = tempfile::tempdir().expect("tempdir");
         let one = temp.path().join("01.flac");
@@ -7126,6 +7192,68 @@ fn all_artifacts_have_complete_replaygain(
     Ok(true)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplayGainInheritedTagPolicy {
+    Trust,
+    Recompute { reason: String },
+}
+
+fn inherited_replaygain_tag_policy(
+    source: Option<&PreparedSource>,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> ReplayGainInheritedTagPolicy {
+    let mut reasons = Vec::new();
+    if settings.target_format.is_lossy() {
+        reasons.push("lossy encoding changes the output signal".to_string());
+    }
+
+    let gain_configured = settings.dsd.dsd_to_pcm_gain_mode
+        != tonepoet_pipeline::DsdToPcmGainMode::Disabled
+        || settings.dsd.dsd_to_pcm_gain_db.is_some();
+    if gain_configured
+        && !settings.target_format.is_dsd()
+        && source.map(source_is_dsd).unwrap_or(true)
+    {
+        reasons.push("DSD-to-PCM gain changes output level".to_string());
+    }
+
+    match settings.target_sample_rate {
+        RateTarget::Source => {
+            if let Some(source) = source {
+                if source.tracks.iter().any(|track| {
+                    match (track.scalar_sample_rate(), resolved_target_rate_hz(track, settings)) {
+                        (Some(source_rate), Some(target_rate)) => source_rate != target_rate,
+                        _ => false,
+                    }
+                }) {
+                    reasons.push("source-relative planning resolves to a different output sample rate".to_string());
+                }
+            }
+        }
+        RateTarget::PcmHz(_) | RateTarget::Dsd(_) => {
+            let changed = source.map_or(true, |source| {
+                source.tracks.iter().any(|track| {
+                    match (track.scalar_sample_rate(), resolved_target_rate_hz(track, settings)) {
+                        (Some(source_rate), Some(target_rate)) => source_rate != target_rate,
+                        _ => true,
+                    }
+                })
+            });
+            if changed {
+                reasons.push("sample-rate conversion changes the output signal".to_string());
+            }
+        }
+    }
+
+    if reasons.is_empty() {
+        ReplayGainInheritedTagPolicy::Trust
+    } else {
+        ReplayGainInheritedTagPolicy::Recompute {
+            reason: reasons.join("; "),
+        }
+    }
+}
+
 /// Apply ReplayGain tags via loudgain.
 pub async fn apply_replaygain(
     artifacts: &ArtifactSet,
@@ -7138,6 +7266,25 @@ pub async fn apply_replaygain(
 
 pub async fn apply_replaygain_with_tool_limits(
     artifacts: &ArtifactSet,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<StageRecord, ReplayGainError> {
+    apply_replaygain_with_source_and_tool_limits(
+        artifacts,
+        None,
+        req,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+}
+
+pub async fn apply_replaygain_with_source_and_tool_limits(
+    artifacts: &ArtifactSet,
+    source: Option<&PreparedSource>,
     req: &PipelineRequest,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -7167,24 +7314,35 @@ pub async fn apply_replaygain_with_tool_limits(
     if req.settings.replay_gain.existing_tags
         == tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete
     {
-        match all_artifacts_have_complete_replaygain(artifacts, mode) {
-            Ok(true) => {
-                log::info!(
-                    "skipping ReplayGain scan for job {}: every output already has the complete {:?} tag set",
-                    req.job_id,
-                    mode
-                );
-                return Ok(StageRecord {
-                    stage: PipelineStage::ReplayGain,
-                    outcome: StageOutcome::Skipped,
-                    dsd_dst_stats: None,
-                });
+        match inherited_replaygain_tag_policy(source, &req.settings) {
+            ReplayGainInheritedTagPolicy::Trust => {
+                match all_artifacts_have_complete_replaygain(artifacts, mode) {
+                    Ok(true) => {
+                        log::info!(
+                            "skipping ReplayGain scan for job {}: output audio is signal-equivalent and every output already has the complete {:?} tag set",
+                            req.job_id,
+                            mode
+                        );
+                        return Ok(StageRecord {
+                            stage: PipelineStage::ReplayGain,
+                            outcome: StageOutcome::Skipped,
+                            dsd_dst_stats: None,
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        // Inspection uncertainty must never be mistaken for complete tags.
+                        // Rescanning is the safe behavior and the degradation is visible.
+                        log::warn!("{err}; ReplayGain scan will run");
+                    }
+                }
             }
-            Ok(false) => {}
-            Err(err) => {
-                // Inspection uncertainty must never be mistaken for complete tags.
-                // Rescanning is the safe behavior and the degradation is visible.
-                log::warn!("{err}; ReplayGain scan will run");
+            ReplayGainInheritedTagPolicy::Recompute { reason } => {
+                log::info!(
+                    "ignoring inherited ReplayGain tags for job {} and rescanning output audio: {}",
+                    req.job_id,
+                    reason
+                );
             }
         }
     }
@@ -21859,8 +22017,9 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
 
     if req.stages.replaygain == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
-        match apply_replaygain_with_tool_limits(
+        match apply_replaygain_with_source_and_tool_limits(
             artifacts.as_ref().expect("artifacts present"),
+            source.as_ref(),
             &req,
             runner,
             cancel,
@@ -22742,8 +22901,9 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
 
     if req.stages.replaygain == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
-        match apply_replaygain_with_tool_limits(
+        match apply_replaygain_with_source_and_tool_limits(
             artifacts.as_ref().expect("artifacts present"),
+            source.as_ref(),
             &req,
             runner,
             cancel,

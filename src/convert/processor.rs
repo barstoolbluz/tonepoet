@@ -49,7 +49,7 @@ use crate::convert::pipeline::stages::{
     disk_staging_parent_for, independent_single_file_album_batch_lifecycle_key,
     pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
 };
-use crate::convert::pipeline::materializer_single::read_track_metadata as read_single_file_track_metadata;
+use crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings;
 #[cfg(test)]
 use crate::convert::pipeline::stages::{
     set_post_materialization_stage_fault_hook_for_test, set_publish_fault_hook_for_test,
@@ -752,7 +752,9 @@ fn dispatch_track_metadata_for_output_planning(
         // A failed tag read yields no planning evidence (None -> the batch
         // stays provisional); the materializer owns the authoritative
         // fail-closed read.
-        SourceKind::SingleFile => read_single_file_track_metadata(&req.container).ok(),
+        SourceKind::SingleFile => read_track_metadata_with_warnings(&req.container)
+            .ok()
+            .map(|(metadata, _warnings)| metadata),
         SourceKind::CueImage => {
             let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(
                 &req.container,
@@ -817,7 +819,7 @@ fn single_file_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
     // The dispatcher only uses these fields as conservative organizational
     // evidence; written metadata still comes from the materialized source and
     // explicit request overrides.
-    let metadata = read_single_file_track_metadata(path).ok()?;
+    let (metadata, _warnings) = read_track_metadata_with_warnings(path).ok()?;
     batch_identity_probe_from_track_metadata(&metadata)
 }
 
@@ -2470,7 +2472,7 @@ async fn run_queue_with_shared_orchestrator(
 }
 
 fn build_initial_work(
-    item: ConversionItem,
+    mut item: ConversionItem,
     pool: &SharedWorkerPool<QueueWorkOutput>,
     terminal: &mut BTreeMap<String, ConversionStatus>,
     job_to_item: &mut BTreeMap<String, String>,
@@ -2489,6 +2491,18 @@ fn build_initial_work(
             item_id.clone(),
             ConversionStatus::Failed {
                 error: format!("Source file not found: {}", item.input_path.display()),
+                log_path: None,
+            },
+        );
+        return None;
+    }
+
+    if let Err(error) = item.resolve_archive_password_for_execution() {
+        pool.metrics().record_job_failed();
+        terminal.insert(
+            item_id.clone(),
+            ConversionStatus::Failed {
+                error,
                 log_path: None,
             },
         );

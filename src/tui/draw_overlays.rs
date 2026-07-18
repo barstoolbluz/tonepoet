@@ -41,19 +41,240 @@ fn pill_gap() -> Span<'static> {
     Span::raw(" ")
 }
 
-/// Values longer than this (in chars) use multiline drop-down editing
+/// Values wider than this (in terminal cells) use multiline drop-down editing
 /// instead of single-line horizontal scrolling.
 pub const MULTILINE_EDIT_THRESHOLD: usize = 96;
 
-/// Truncate a string to at most `max` characters, appending "..." if cut.
-/// Uses char-based (not byte-based) slicing to avoid panics on multi-byte text.
+/// Truncate a string to at most `max` terminal cells with an ellipsis on overflow.
 fn truncate_to_chars(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
+    super::display_width::truncate_right(s, max)
+}
+
+/// Hard-wrap sanitized editor text by terminal display columns while keeping
+/// the cursor expressed as a row plus character index within that row. Wide
+/// glyphs never straddle a row boundary; a glyph that cannot fit even on an
+/// empty one-cell row is represented by an ellipsis rather than overflowing
+/// the overlay border.
+fn wrap_display_rows_with_cursor(
+    text: &str,
+    width: usize,
+    cursor_char_pos: usize,
+) -> (Vec<Vec<char>>, usize, usize) {
+    let width = width.max(1);
+    let mut rows = vec![Vec::new()];
+    let mut row_width = 0usize;
+    let mut cursor = None;
+    let mut char_pos = 0usize;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            if char_pos == cursor_char_pos && cursor.is_none() {
+                cursor = Some((rows.len().saturating_sub(1), rows.last().map_or(0, |row| row.len())));
+            }
+            rows.push(Vec::new());
+            row_width = 0;
+            char_pos += 1;
+            continue;
+        }
+
+        let ch_width = super::display_width::char_width(ch);
+        if ch_width > 0 && row_width > 0 && row_width.saturating_add(ch_width) > width {
+            rows.push(Vec::new());
+            row_width = 0;
+        }
+        if char_pos == cursor_char_pos && cursor.is_none() {
+            cursor = Some((rows.len().saturating_sub(1), rows.last().map_or(0, |row| row.len())));
+        }
+        if let Some(row) = rows.last_mut() {
+            if ch_width > width {
+                row.push('…');
+                row_width = row_width.saturating_add(1);
+            } else {
+                row.push(ch);
+                row_width = row_width.saturating_add(ch_width);
+            }
+        }
+        char_pos += 1;
     }
-    let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
-    format!("{}...", truncated)
+
+    let (cursor_row, cursor_col) = cursor.unwrap_or_else(|| {
+        (
+            rows.len().saturating_sub(1),
+            rows.last().map_or(0, |row| row.len()),
+        )
+    });
+    (rows, cursor_row, cursor_col)
+}
+
+
+fn normalized_text_with_original_boundaries(text: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::with_capacity(text.len());
+    let mut original_boundaries = vec![0usize];
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((byte_index, ch)) = chars.next() {
+        if ch == '\r' {
+            let original_end = if let Some(&(next_index, '\n')) = chars.peek() {
+                chars.next();
+                next_index + '\n'.len_utf8()
+            } else {
+                byte_index + ch.len_utf8()
+            };
+            normalized.push('\n');
+            original_boundaries.push(original_end);
+        } else {
+            normalized.push(ch);
+            original_boundaries.push(byte_index + ch.len_utf8());
+        }
+    }
+
+    (normalized, original_boundaries)
+}
+
+fn display_boundary_positions(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut positions = vec![(0usize, 0usize)];
+    let mut row = 0usize;
+    let mut column = 0usize;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            row = row.saturating_add(1);
+            column = 0;
+            positions.push((row, column));
+            continue;
+        }
+
+        let ch_width = super::display_width::char_width(ch);
+        if ch_width > 0 && column > 0 && column.saturating_add(ch_width) > width {
+            row = row.saturating_add(1);
+            column = 0;
+            if let Some(position_before_char) = positions.last_mut() {
+                *position_before_char = (row, column);
+            }
+        }
+        column = column.saturating_add(if ch_width > width { 1 } else { ch_width });
+        positions.push((row, column));
+    }
+
+    positions
+}
+
+fn multiline_boundary_data(text: &str, width: usize) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let (normalized, original_boundaries) = normalized_text_with_original_boundaries(text);
+    let positions = display_boundary_positions(&normalized, width);
+    debug_assert_eq!(positions.len(), original_boundaries.len());
+    (original_boundaries, positions)
+}
+
+fn multiline_boundary_for_byte(original_boundaries: &[usize], cursor_byte: usize) -> usize {
+    let mut boundary = 0usize;
+    for (index, original_byte) in original_boundaries.iter().copied().enumerate() {
+        if original_byte > cursor_byte {
+            break;
+        }
+        boundary = index;
+    }
+    boundary
+}
+
+pub(crate) fn multiline_display_row_count(text: &str, width: usize) -> usize {
+    let (_, positions) = multiline_boundary_data(text, width);
+    positions.last().map_or(1, |(row, _)| row.saturating_add(1))
+}
+
+pub(crate) fn multiline_cursor_display_position(
+    text: &str,
+    cursor_byte: usize,
+    width: usize,
+) -> (usize, usize) {
+    let (original_boundaries, positions) = multiline_boundary_data(text, width);
+    let boundary = multiline_boundary_for_byte(&original_boundaries, cursor_byte.min(text.len()));
+    positions.get(boundary).copied().unwrap_or((0, 0))
+}
+
+pub(crate) fn multiline_byte_for_display_position(
+    text: &str,
+    target_row: usize,
+    target_column: usize,
+    width: usize,
+) -> usize {
+    let (original_boundaries, positions) = multiline_boundary_data(text, width);
+    let last_row = positions.last().map_or(0, |(row, _)| *row);
+    if target_row > last_row {
+        return text.len();
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+    for (boundary, (row, column)) in positions.iter().copied().enumerate() {
+        if row != target_row || column > target_column {
+            continue;
+        }
+        let is_better = match best {
+            None => true,
+            Some((best_column, best_boundary)) => {
+                column > best_column || (column == best_column && boundary > best_boundary)
+            }
+        };
+        if is_better {
+            best = Some((column, boundary));
+        }
+    }
+    let boundary = best
+        .map(|(_, boundary)| boundary)
+        .or_else(|| positions.iter().position(|(row, _)| *row == target_row))
+        .unwrap_or_else(|| positions.len().saturating_sub(1));
+    original_boundaries.get(boundary).copied().unwrap_or(text.len())
+}
+
+/// Move a byte cursor to the nearest non-overflowing display column on the
+/// adjacent hard-wrapped row. This mirrors `wrap_display_rows_with_cursor`,
+/// including CRLF normalization, wide glyphs, and zero-width combining marks.
+pub(crate) fn move_multiline_cursor_vertical(
+    text: &str,
+    cursor_byte: usize,
+    width: usize,
+    down: bool,
+) -> usize {
+    let (original_boundaries, positions) = multiline_boundary_data(text, width);
+    let clamped_cursor = cursor_byte.min(text.len());
+    let current_boundary = multiline_boundary_for_byte(&original_boundaries, clamped_cursor);
+
+    let (current_row, desired_column) = positions
+        .get(current_boundary)
+        .copied()
+        .unwrap_or((0, 0));
+    let target_row = if down {
+        current_row.saturating_add(1)
+    } else {
+        current_row.saturating_sub(1)
+    };
+    let last_row = positions.last().map_or(0, |(row, _)| *row);
+    if target_row > last_row {
+        return text.len();
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+    for (boundary, (row, column)) in positions.iter().copied().enumerate() {
+        if row != target_row || column > desired_column {
+            continue;
+        }
+        let is_better = match best {
+            None => true,
+            Some((best_column, best_boundary)) => {
+                column > best_column || (column == best_column && boundary > best_boundary)
+            }
+        };
+        if is_better {
+            best = Some((column, boundary));
+        }
+    }
+
+    let target_boundary = best.map_or(current_boundary, |(_, boundary)| boundary);
+    original_boundaries
+        .get(target_boundary)
+        .copied()
+        .unwrap_or(clamped_cursor)
 }
 
 /// Draw any active overlay on top of the main content
@@ -385,8 +606,8 @@ fn render_menu_panel_at(
                     .as_ref()
                     .map(|s| format!("  {}", s))
                     .unwrap_or_default();
-                let label_w = item.label.chars().count();
-                let shortcut_w = shortcut_str.chars().count();
+                let label_w = super::display_width::width(&item.label);
+                let shortcut_w = super::display_width::width(&shortcut_str);
                 let pad = inner_w.saturating_sub(1 + label_w + shortcut_w);
                 Line::from(Span::styled(
                     format!(" {}{}{}", item.label, " ".repeat(pad), shortcut_str),
@@ -415,8 +636,8 @@ fn render_menu_panel_at(
                     Style::default().fg(theme.text_bright)
                 };
                 let indicator = " >";
-                let label_w = label.chars().count();
-                let indicator_w = indicator.chars().count();
+                let label_w = super::display_width::width(&label);
+                let indicator_w = super::display_width::width(&indicator);
                 let pad = inner_w.saturating_sub(1 + label_w + indicator_w);
                 Line::from(Span::styled(
                     format!(" {}{}{}", label, " ".repeat(pad), indicator),
@@ -591,7 +812,7 @@ fn confirmation_mouse_cancel_hint_key(action: &super::app::ConfirmAction) -> Opt
 
 fn confirmation_footer_hints_width(hints: &[super::app::ConfirmationFooterHint]) -> u16 {
     let pill_widths = hints.iter().fold(0u16, |acc, hint| {
-        acc.saturating_add(hint.label.chars().count() as u16)
+        acc.saturating_add(super::display_width::width(&hint.label) as u16)
             .saturating_add(2)
     });
     let gaps = hints.len().saturating_sub(1) as u16;
@@ -1279,7 +1500,7 @@ fn draw_aac_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         prof_spans.push(Span::styled(pill_text, style));
         buttons.record_button(
             TuiButton::FormatSettingsAacProfile(i),
@@ -1312,7 +1533,7 @@ fn draw_aac_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         qual_spans.push(Span::styled(pill_text, style));
         buttons.record_button(
             TuiButton::FormatSettingsAacQuality(i),
@@ -1389,7 +1610,7 @@ fn draw_opus_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         ct_spans.push(Span::styled(pill_text, style));
         buttons.record_button(
             TuiButton::FormatSettingsOpusContentType(i),
@@ -1422,7 +1643,7 @@ fn draw_opus_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         qual_spans.push(Span::styled(pill_text, style));
         buttons.record_button(
             TuiButton::FormatSettingsOpusQuality(i),
@@ -1524,7 +1745,7 @@ fn draw_mp3_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         mode_spans.push(Span::styled(pill_text, style));
         buttons.record_button(
             TuiButton::FormatSettingsMp3Mode(i),
@@ -1585,7 +1806,7 @@ fn draw_mp3_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         preset_spans.push(Span::styled(pill_text, style));
         // Only register click targets when active (not greyed).
         if !is_vbr {
@@ -1670,7 +1891,7 @@ fn draw_wavpack_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         mode_spans.push(Span::styled(pill_text, style));
         buttons.record_button(
             TuiButton::FormatSettingsWavPackMode(i),
@@ -2576,7 +2797,7 @@ fn draw_sox_fields(
             Style::default().fg(theme.text_dim)
         };
         let pill_text = format!(" {} ", label);
-        let pill_w = pill_text.len() as u16;
+        let pill_w = super::display_width::width(&pill_text) as u16;
         sp_spans.push(Span::styled(pill_text, style));
         buttons.record_button(TuiButton::FormatSettingsSoxSincPhase(i), Rect::new(spx, chunks[12].y, pill_w, 1));
         spx += pill_w;
@@ -2701,7 +2922,7 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
             let presets = super::app::AAC_LC_PRESETS;
             let pills_width: usize = presets
                 .iter()
-                .map(|(_, label)| label.len() + 2)
+                .map(|(_, label)| super::display_width::width(label) + 2)
                 .sum::<usize>()
                 + presets.len().saturating_sub(1);
             label_width + pills_width
@@ -2710,7 +2931,7 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
             let presets = super::app::OPUS_PRESETS;
             let pills_width: usize = presets
                 .iter()
-                .map(|(_, label)| label.len() + 2)
+                .map(|(_, label)| super::display_width::width(label) + 2)
                 .sum::<usize>()
                 + presets.len().saturating_sub(1);
             label_width + pills_width
@@ -2719,14 +2940,14 @@ pub fn format_settings_min_width(kind: &FormatSettingsKind) -> u16 {
             let presets = super::app::MP3_BITRATE_PRESETS;
             let pills_width: usize = presets
                 .iter()
-                .map(|(_, label)| label.len() + 2)
+                .map(|(_, label)| super::display_width::width(label) + 2)
                 .sum::<usize>()
                 + presets.len().saturating_sub(1);
             label_width + pills_width
         }
         FormatSettingsKind::WavPack { .. } => {
             let labels = ["fast", "normal", "high", "very high"];
-            let pills_width: usize = labels.iter().map(|l| l.len() + 2).sum::<usize>()
+            let pills_width: usize = labels.iter().map(|label| super::display_width::width(label) + 2).sum::<usize>()
                 + labels.len().saturating_sub(1);
             label_width + pills_width
         }
@@ -2997,27 +3218,12 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState, theme: super::theme:
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            // Truncate names to fit columns (char-safe).
-            let target_chars: usize = target_name.chars().count();
-            let target_display: String = if target_chars > target_w {
-                let truncated: String = target_name
-                    .chars()
-                    .take(target_w.saturating_sub(1))
-                    .collect();
-                format!("{}~", truncated)
-            } else {
-                format!("{:<width$}", target_name, width = target_w)
-            };
-            let source_chars: usize = source_name.chars().count();
-            let source_display: String = if source_chars > source_w {
-                let truncated: String = source_name
-                    .chars()
-                    .take(source_w.saturating_sub(1))
-                    .collect();
-                format!("{}~", truncated)
-            } else {
-                format!("{:<width$}", source_name, width = source_w)
-            };
+            // Fit names in terminal display columns so CJK/fullwidth text
+            // cannot displace the separator or the right border.
+            let target_display =
+                super::display_width::pad_or_truncate(target_name, target_w, false);
+            let source_display =
+                super::display_width::pad_or_truncate(&source_name, source_w, false);
 
             let target_style = match &op.status {
                 OpStatus::Pending => Style::default().fg(theme.text_bright),
@@ -3435,7 +3641,7 @@ fn draw_content_tabs(
                 line2.push('─');
             }
         }
-        for _ in 0..(area.width as usize).saturating_sub(line2.chars().count()) {
+        for _ in 0..(area.width as usize).saturating_sub(super::display_width::width(&line2)) {
             line2.push('─');
         }
         f.render_widget(
@@ -3558,7 +3764,7 @@ fn content_tab_slot(
         1
     };
     let label = truncate_tab_label(tab.label(), label_capacity.max(1));
-    let natural_width = (label.chars().count() + chrome_width) as u16;
+    let natural_width = (super::display_width::width(&label) + chrome_width) as u16;
     let clipped = natural_width > remaining_width;
     let width = if clipped {
         remaining_width.max(1)
@@ -3574,17 +3780,15 @@ fn content_tab_slot(
     }
 }
 
-fn truncate_tab_label(label: &str, max_chars: usize) -> String {
-    let count = label.chars().count();
-    if count <= max_chars {
+fn truncate_tab_label(label: &str, max_columns: usize) -> String {
+    if super::display_width::width(label) <= max_columns {
         return label.to_string();
     }
-    match max_chars {
+    match max_columns {
         0 => String::new(),
-        1 => label.chars().take(1).collect(),
-        2 => label.chars().take(2).collect(),
+        1 | 2 => super::display_width::truncate_right(label, max_columns),
         _ => {
-            let mut out: String = label.chars().take(max_chars.saturating_sub(3)).collect();
+            let mut out = super::display_width::truncate_right(label, max_columns - 3);
             out.push_str("...");
             out
         }
@@ -3620,7 +3824,7 @@ fn draw_metadata_presentation_dropdown_popup(
         .collect();
     let widest = option_labels
         .iter()
-        .map(|label| label.chars().count())
+        .map(|label| super::display_width::width(&label))
         .max()
         .unwrap_or(0);
     let popup_width = content_area
@@ -3738,7 +3942,7 @@ fn metadata_presentation_selector_line_text(
     }
     let body_width = width.saturating_sub(2);
     let body = truncate_to_chars(&body, body_width);
-    let body_chars = body.chars().count();
+    let body_chars = super::display_width::width(&body);
     let pad = width.saturating_sub(body_chars + 1);
     format!("{}{}{}", body, " ".repeat(pad), scroll_glyph.unwrap_or("│"))
 }
@@ -4144,7 +4348,7 @@ fn draw_metadata_editor(
     f.render_widget(block, popup);
 
     if state.shows_presentation_control() {
-        let title_width = editor_title(state).chars().count() as u16;
+        let title_width = super::display_width::width(&editor_title(state)) as u16;
         button_map.record_button(
             super::button_map::TuiButton::MetadataPresentationSelectorToggle,
             Rect::new(
@@ -4202,7 +4406,7 @@ fn draw_metadata_editor(
         return;
     }
 
-    let key_col_w = 22;
+    let key_col_w: usize = 22;
 
     // Build content lines.
     let total_rows = state.active_surface().entries.len() + 1; // +1 for "+ Add field..."
@@ -4221,12 +4425,15 @@ fn draw_metadata_editor(
                     .zip(entry.per_file_originals.iter())
                     .any(|(v, o)| v != o));
 
-        // Key label.
-        let key_display = if entry.display_key.len() > key_col_w - 2 {
-            format!(" {:.width$}", entry.display_key, width = key_col_w - 2)
-        } else {
-            format!(" {:<width$}", entry.display_key, width = key_col_w - 2)
-        };
+        // Key label, fitted in terminal display columns.
+        let key_display = format!(
+            " {}",
+            super::display_width::pad_or_truncate(
+                &entry.display_key,
+                key_col_w.saturating_sub(2),
+                false,
+            )
+        );
 
         let key_style = if is_deleted {
             Style::default()
@@ -4241,101 +4448,26 @@ fn draw_metadata_editor(
         };
 
         // Value — show inline editor if this row is being edited.
-        let key_chars = key_display.chars().count();
+        let key_chars = super::display_width::width(&key_display);
         let val_max = inner_w.saturating_sub(key_chars + 1);
 
         let value_display = if is_cursor && state.phase == MetadataEditorPhase::InlineEdit {
             if let Some(ref input) = state.edit_input {
-                let char_count = input.text.chars().count();
+                let char_count = super::display_width::width(&input.text);
                 let has_newlines = input.text.contains('\n') || input.text.contains('\r');
 
                 if (char_count > MULTILINE_EDIT_THRESHOLD || has_newlines) && val_max > 0 {
                     // ── Multiline drop-down for long/multi-line values ──
-                    // Normalize line endings, split into paragraphs, then
-                    // hard-wrap each paragraph at val_max.
+                    // Normalize line endings and hard-wrap by terminal cells.
                     let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
-                    let mut display_rows: Vec<Vec<char>> = Vec::new();
-                    for paragraph in sanitized.split('\n') {
-                        let pchars: Vec<char> = paragraph.chars().collect();
-                        if pchars.is_empty() {
-                            display_rows.push(Vec::new());
-                        } else {
-                            for chunk in pchars.chunks(val_max) {
-                                display_rows.push(chunk.to_vec());
-                            }
-                        }
-                    }
-
-                    // Map cursor position to (row, col) in display_rows.
-                    // Walk the sanitized text (which matches display_rows)
-                    // but count using sanitized char indices. We need to
-                    // convert cursor_display_col() (which counts chars in
-                    // the original text) to a position in the sanitized text.
-                    let cursor_byte = input.cursor;
-                    // Count chars in original text up to cursor_byte, but
-                    // also track the corresponding position in the sanitized
-                    // version by skipping \r chars (which were removed).
-                    let mut sanitized_pos = 0usize;
-                    {
-                        let mut prev_was_cr = false;
-                        for (byte_idx, c) in input.text.char_indices() {
-                            if byte_idx >= cursor_byte {
-                                break;
-                            }
-                            if c == '\r' {
-                                // Check if next char is \n (CRLF → single \n).
-                                prev_was_cr = true;
-                                continue;
-                            }
-                            if prev_was_cr {
-                                if c == '\n' {
-                                    // \r\n → \n, already counted by the \n
-                                    sanitized_pos += 1;
-                                } else {
-                                    // Standalone \r → \n + current char
-                                    sanitized_pos += 2;
-                                }
-                                prev_was_cr = false;
-                                continue;
-                            }
-                            sanitized_pos += 1;
-                            prev_was_cr = false;
-                        }
-                        if prev_was_cr {
-                            sanitized_pos += 1; // trailing \r → \n
-                        }
-                    }
-
-                    // Now map sanitized_pos to (row, col) in display_rows.
-                    let mut cursor_row = 0usize;
-                    let mut cursor_col_in_row = 0usize;
-                    {
-                        let mut idx = 0usize;
-                        let mut drow = 0usize;
-                        let mut dcol = 0usize;
-                        for c in sanitized.chars() {
-                            if idx == sanitized_pos {
-                                cursor_row = drow;
-                                cursor_col_in_row = dcol;
-                                break;
-                            }
-                            if c == '\n' {
-                                drow += 1;
-                                dcol = 0;
-                            } else {
-                                dcol += 1;
-                                if dcol >= val_max {
-                                    drow += 1;
-                                    dcol = 0;
-                                }
-                            }
-                            idx += 1;
-                        }
-                        if idx == sanitized_pos {
-                            cursor_row = drow;
-                            cursor_col_in_row = dcol;
-                        }
-                    }
+                    let cursor_byte = input.cursor.min(input.text.len());
+                    let sanitized_cursor = input.text[..cursor_byte]
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .chars()
+                        .count();
+                    let (display_rows, cursor_row, cursor_col_in_row) =
+                        wrap_display_rows_with_cursor(&sanitized, val_max, sanitized_cursor);
 
                     let total_rows = display_rows.len();
                     let max_drop_rows = 8usize.min(total_rows).max(1);
@@ -4364,17 +4496,24 @@ fn draw_metadata_editor(
                             let col = cursor_col_in_row;
                             let before: String =
                                 row_chars[..col.min(row_chars.len())].iter().collect();
-                            let cur_ch: String = if col < row_chars.len() {
+                            let raw_cursor: String = if col < row_chars.len() {
                                 row_chars[col].to_string()
                             } else {
                                 " ".to_string()
+                            };
+                            let cur_ch = if super::display_width::width(&raw_cursor) == 0 {
+                                format!("◌{raw_cursor}")
+                            } else {
+                                raw_cursor
                             };
                             let after: String = if col + 1 < row_chars.len() {
                                 row_chars[col + 1..].iter().collect()
                             } else {
                                 String::new()
                             };
-                            let used = before.chars().count() + 1 + after.chars().count();
+                            let used = super::display_width::width(&before)
+                                + super::display_width::width(&cur_ch)
+                                + super::display_width::width(&after);
                             let pad = val_max.saturating_sub(used);
                             lines.push(Line::from(vec![
                                 prefix,
@@ -4390,11 +4529,14 @@ fn draw_metadata_editor(
                             ]));
                         } else {
                             let text: String = row_chars.iter().collect();
-                            let pad = val_max.saturating_sub(row_chars.len());
                             lines.push(Line::from(vec![
                                 prefix,
                                 Span::styled(
-                                    format!("{}{}", text, " ".repeat(pad)),
+                                    super::display_width::pad_or_truncate(
+                                        &text,
+                                        val_max,
+                                        false,
+                                    ),
                                     drop_bg.fg(theme.text_bright),
                                 ),
                             ]));
@@ -4466,7 +4608,7 @@ fn draw_metadata_editor(
             super::probe::MbRevertPill::Revert => " [revert]",
             super::probe::MbRevertPill::UseMb => " [use MB]",
         };
-        let pill_w = pill_text.chars().count();
+        let pill_w = super::display_width::width(&pill_text);
         // Synthetic-preview rows (CUESHEET) surface the full affordance set
         // inline.  The existing MetadataEntryView button kind owns the whole
         // `[view] [edit] [delete]` pill span; the mouse handler dispatches to
@@ -4474,11 +4616,11 @@ fn draw_metadata_editor(
         // required in this partial bundle.
         let cue_actions_text = metadata_cuesheet_affordance_text(entry);
         let view_w = if super::probe::is_synthetic_preview(entry) {
-            cue_actions_text.chars().count()
+            super::display_width::width(&cue_actions_text)
         } else {
             0
         };
-        let cue_actions_w = cue_actions_text.chars().count();
+        let cue_actions_w = super::display_width::width(&cue_actions_text);
         let combined_pill_w = cue_actions_w + pill_w;
         let val_for_pill = val_max.saturating_sub(combined_pill_w);
         let val_truncated = truncate_to_chars(&value_display, val_for_pill);
@@ -4499,7 +4641,7 @@ fn draw_metadata_editor(
         ];
         if combined_pill_w > 0 {
             // Pad value column to right-align the pills at val_max.
-            let val_chars = val_truncated.chars().count();
+            let val_chars = super::display_width::width(&val_truncated);
             let pad = val_for_pill.saturating_sub(val_chars);
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
@@ -4625,7 +4767,14 @@ fn draw_metadata_editor(
             footer_pill("Esc cancel", theme.purple, theme),
         ]),
         MetadataEditorPhase::Saving => Line::from(Span::styled(
-            " Saving... ",
+            format!(
+                " {} ",
+                state
+                    .model
+                    .metadata_save_progress
+                    .as_deref()
+                    .unwrap_or("Saving...")
+            ),
             Style::default().fg(theme.amber),
         )),
         MetadataEditorPhase::DetailEdit => {
@@ -4823,7 +4972,7 @@ fn record_centered_footer_pills(
 ) {
     let pills_width: u16 = pills
         .iter()
-        .map(|(label, _, _)| label.chars().count() as u16 + 2)
+        .map(|(label, _, _)| super::display_width::width(&label) as u16 + 2)
         .sum();
     let gaps = pills.len().saturating_sub(1) as u16;
     let total_width = pills_width.saturating_add(gaps);
@@ -4834,7 +4983,7 @@ fn record_centered_footer_pills(
         if idx > 0 {
             x = x.saturating_add(1);
         }
-        let width = label.chars().count() as u16 + 2;
+        let width = super::display_width::width(&label) as u16 + 2;
         if let Some(button) = button {
             button_map.record_button(*button, Rect::new(x, footer_area.y, width, 1));
         }
@@ -5471,7 +5620,7 @@ fn draw_metadata_detail(
         state.active_surface()
             .file_labels
             .iter()
-            .map(|l| l.chars().count())
+            .map(|l| super::display_width::width(l))
             .max()
             .unwrap_or(6)
     };
@@ -5500,7 +5649,7 @@ fn draw_metadata_detail(
         };
 
         // Inline edit within detail?
-        let label_chars = label_display.chars().count();
+        let label_chars = super::display_width::width(&label_display);
         let detail_val_max = inner_w.saturating_sub(label_chars + 1);
 
         if is_cursor && state.detail_edit.is_some() {
@@ -5622,11 +5771,11 @@ fn draw_metadata_detail(
                 // for click-rect registration.
                 let mut running: u16 = 0;
                 for span in &pills {
-                    running += span.content.chars().count() as u16;
+                    running += super::display_width::width(span.content.as_ref()) as u16;
                 }
                 if let Some((label, bg)) = revert_pill {
                     let span = footer_pill(label, bg, theme);
-                    revert_w_chars = span.content.chars().count() as u16;
+                    revert_w_chars = super::display_width::width(span.content.as_ref()) as u16;
                     revert_offset = Some(running);
                     pills.push(span);
                     running += revert_w_chars;
@@ -5634,7 +5783,7 @@ fn draw_metadata_detail(
                     running += 1;
                 }
                 let restore_span = footer_pill("restore", theme.blue, theme);
-                restore_w_chars = restore_span.content.chars().count() as u16;
+                restore_w_chars = super::display_width::width(restore_span.content.as_ref()) as u16;
                 restore_offset = Some(running);
                 pills.push(restore_span);
             }
@@ -5643,7 +5792,7 @@ fn draw_metadata_detail(
         let total_chars = footer_line
             .spans
             .iter()
-            .map(|s| s.content.chars().count())
+            .map(|s| super::display_width::width(s.content.as_ref()))
             .sum::<usize>() as u16;
         // Center the line manually so we can compute pill rects.
         let render_x = footer_area.x + (footer_area.width.saturating_sub(total_chars)) / 2;
@@ -6113,7 +6262,7 @@ fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange]
         };
         let new_display = truncate_to_chars(
             &change.new_value.replace('\n', "↵"),
-            inner_w.saturating_sub(label_w + old_display.chars().count() + 6),
+            inner_w.saturating_sub(label_w + super::display_width::width(&old_display) + 6),
         );
 
         lines.push(Line::from(vec![
@@ -6359,7 +6508,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
             GnudbRowKind::TrackHeader { track_idx } => {
                 let track = &page.tracks[*track_idx];
                 let header = format!("Track {:02}", track.track_number);
-                let dashes = inner_w.saturating_sub(header.len() + 5);
+                let dashes = inner_w.saturating_sub(super::display_width::width(&header) + 5);
                 lines.push(Line::from(Span::styled(
                     format!(" ── {} {}", header, "─".repeat(dashes)),
                     theme.muted(),
@@ -7159,8 +7308,8 @@ fn draw_cue_preview(
             ),
         ]);
         f.render_widget(Paragraph::new(footer), chunks[3]);
-        let cw = commit_label.chars().count() as u16;
-        let xw = cancel_label.chars().count() as u16;
+        let cw = super::display_width::width(commit_label) as u16;
+        let xw = super::display_width::width(cancel_label) as u16;
         button_map.record_button(
             super::button_map::TuiButton::CuePreviewEditCommit,
             Rect::new(chunks[3].x, chunks[3].y, cw, 1),
@@ -7196,9 +7345,9 @@ fn draw_cue_preview(
             Span::styled(format!("    {}", pos), theme.muted()),
         ]);
         f.render_widget(Paragraph::new(footer), chunks[3]);
-        let cw = close_label.chars().count() as u16;
-        let tw = top_label.chars().count() as u16;
-        let bw = bot_label.chars().count() as u16;
+        let cw = super::display_width::width(close_label) as u16;
+        let tw = super::display_width::width(top_label) as u16;
+        let bw = super::display_width::width(bot_label) as u16;
         // Reuse CuePreviewCancel for the Close pill — semantically
         // "exit the overlay", which is what cancel already does.
         button_map.record_button(
@@ -7245,10 +7394,10 @@ fn draw_cue_preview(
             Span::styled(format!("    {}", pos), theme.muted()),
         ]);
         f.render_widget(Paragraph::new(footer), chunks[3]);
-        let sw = save_label.chars().count() as u16;
-        let xw = cancel_label.chars().count() as u16;
-        let tw = top_label.chars().count() as u16;
-        let bw = bot_label.chars().count() as u16;
+        let sw = super::display_width::width(save_label) as u16;
+        let xw = super::display_width::width(cancel_label) as u16;
+        let tw = super::display_width::width(top_label) as u16;
+        let bw = super::display_width::width(bot_label) as u16;
         button_map.record_button(
             super::button_map::TuiButton::CuePreviewSave,
             Rect::new(chunks[3].x, chunks[3].y, sw, 1),
@@ -7411,9 +7560,9 @@ fn draw_mb_select(
         button_map.record_button(
             super::button_map::TuiButton::MbSelectCancel,
             Rect::new(
-                chunks[5].x + prefix.chars().count() as u16,
+                chunks[5].x + super::display_width::width(prefix) as u16,
                 chunks[5].y,
-                cancel_label.chars().count() as u16,
+                super::display_width::width(cancel_label) as u16,
                 1,
             ),
         );
@@ -7439,8 +7588,8 @@ fn draw_mb_select(
     ]);
     f.render_widget(Paragraph::new(footer), chunks[5]);
     // Register footer pill rects.
-    let accept_w = accept_label.chars().count() as u16;
-    let cancel_w = cancel_label.chars().count() as u16;
+    let accept_w = super::display_width::width(accept_label) as u16;
+    let cancel_w = super::display_width::width(cancel_label) as u16;
     button_map.record_button(
         super::button_map::TuiButton::MbSelectAccept,
         Rect::new(chunks[5].x, chunks[5].y, accept_w, 1),
@@ -8020,5 +8169,79 @@ mod file_picker_overlay_contract_tests {
             session.picker.free_space_bytes().is_some(),
             "tonepoet must pass host-computed free-space status into the std-only picker crate"
         );
+    }
+}
+
+#[cfg(test)]
+mod multiline_display_width_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_rows_and_cursor_are_display_column_safe() {
+        let text = "A・日本e\u{301}Z";
+        let cursor = text.chars().count();
+        let (rows, cursor_row, cursor_col) =
+            wrap_display_rows_with_cursor(text, 4, cursor);
+
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            let rendered: String = row.iter().collect();
+            assert!(super::super::display_width::width(&rendered) <= 4);
+        }
+        assert_eq!(cursor_row, 2);
+        assert_eq!(cursor_col, rows[2].len());
+        assert_eq!(rows[2].iter().collect::<String>(), "e\u{301}Z");
+    }
+
+    #[test]
+    fn multiline_cursor_after_newline_begins_the_next_row() {
+        let (rows, cursor_row, cursor_col) =
+            wrap_display_rows_with_cursor("left\n右", 6, "left\n".chars().count());
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(cursor_row, 1);
+        assert_eq!(cursor_col, 0);
+        assert_eq!(rows[1].iter().collect::<String>(), "右");
+    }
+
+
+    #[test]
+    fn multiline_vertical_cursor_uses_display_columns_across_wraps() {
+        let text = "A・B日本Z";
+        let after_wide_punctuation = "A・".len();
+
+        let down = move_multiline_cursor_vertical(text, after_wide_punctuation, 4, true);
+        assert_eq!(down, "A・B日".len());
+        assert_eq!(move_multiline_cursor_vertical(text, down, 4, false), "A".len());
+    }
+
+    #[test]
+    fn multiline_vertical_cursor_preserves_original_crlf_boundaries() {
+        let text = "ab\r\n右x";
+        let down = move_multiline_cursor_vertical(text, "a".len(), 6, true);
+
+        assert_eq!(down, "ab\r\n".len());
+        assert!(text.is_char_boundary(down));
+    }
+
+
+    #[test]
+    fn multiline_mouse_mapping_uses_display_columns_and_original_byte_boundaries() {
+        let text = "A・B\r\n日e\u{301}Z";
+
+        assert_eq!(multiline_display_row_count(text, 4), 2);
+        assert_eq!(
+            multiline_cursor_display_position(text, "A・".len(), 4),
+            (0, 3)
+        );
+        assert_eq!(
+            multiline_byte_for_display_position(text, 1, 0, 4),
+            "A・B\r\n".len()
+        );
+        assert_eq!(
+            multiline_byte_for_display_position(text, 1, 3, 4),
+            "A・B\r\n日e\u{301}".len()
+        );
+        assert_eq!(multiline_byte_for_display_position(text, 2, 0, 4), text.len());
     }
 }

@@ -468,28 +468,56 @@ impl TextInputState {
         }
     }
 
-    /// Number of display columns from the start of the text to the cursor.
-    /// Assumes 1 col per char (correct for ASCII + most Latin; approximate for CJK).
+    /// Number of terminal display columns from the start of the text to the
+    /// cursor byte offset. Wide glyphs consume two cells and combining marks
+    /// consume zero, matching the renderer's shared width policy.
     pub fn cursor_display_col(&self) -> usize {
-        self.text[..self.cursor].chars().count()
+        crate::tui::display_width::width(&self.text[..self.cursor])
     }
 
     /// Compute a scrolled view of the text for rendering.
     ///
-    /// Returns `(visible_text, cursor_col_in_view)` where `visible_text` is a
-    /// substring of `width` columns that keeps the cursor in view.
+    /// Returns `(visible_text, cursor_col_in_view)` where `visible_text` fits
+    /// within `width` terminal cells and keeps the cursor visible. Scrolling
+    /// never begins in the middle of a wide glyph or with an orphan combining
+    /// mark.
     pub fn view(&self, width: usize) -> (String, u16) {
         if width == 0 {
             return (String::new(), 0);
         }
         let cursor_col = self.cursor_display_col();
+        let desired_start = cursor_col.saturating_sub(width.saturating_sub(1));
 
-        // Scroll so cursor is always visible. When cursor is at col C and width is W,
-        // we want scroll = max(0, C - W + 1) so the cursor sits at the right edge.
-        let scroll = cursor_col.saturating_sub(width.saturating_sub(1));
+        let mut start_byte = 0usize;
+        let mut start_col = 0usize;
+        if desired_start > 0 {
+            let mut col = 0usize;
+            let mut candidate = self.cursor;
+            let mut candidate_col = cursor_col;
+            for (byte, ch) in self.text.char_indices() {
+                let cell_width = crate::tui::display_width::char_width(ch);
+                if col >= desired_start && cell_width > 0 {
+                    candidate = byte;
+                    candidate_col = col;
+                    break;
+                }
+                col = col.saturating_add(cell_width);
+            }
+            start_byte = candidate.min(self.cursor);
+            start_col = candidate_col.min(cursor_col);
+        }
 
-        let visible: String = self.text.chars().skip(scroll).take(width).collect();
-        let cursor_col_in_view = (cursor_col - scroll) as u16;
+        let mut visible = String::new();
+        let mut used = 0usize;
+        for ch in self.text[start_byte..].chars() {
+            let cell_width = crate::tui::display_width::char_width(ch);
+            if used.saturating_add(cell_width) > width {
+                break;
+            }
+            visible.push(ch);
+            used = used.saturating_add(cell_width);
+        }
+        let cursor_col_in_view = cursor_col.saturating_sub(start_col).min(width) as u16;
         (visible, cursor_col_in_view)
     }
 }
@@ -1259,6 +1287,29 @@ mod tests {
 
         assert_eq!(input.text, format!("Music{}Album{}", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR));
         assert_eq!(input.cursor, input.text.len());
+    }
+
+    #[test]
+    fn display_view_counts_wide_and_combining_glyphs_in_terminal_cells() {
+        let mut input = TextInputState::new("A日本e\u{301}Z".to_string());
+        input.cursor_end();
+
+        assert_eq!(input.cursor_display_col(), 7);
+        let (visible, cursor_col) = input.view(4);
+        assert_eq!(crate::tui::display_width::width(&visible), 2);
+        assert_eq!(visible, "e\u{301}Z");
+        assert_eq!(cursor_col, 2);
+    }
+
+    #[test]
+    fn display_view_never_begins_with_orphan_combining_mark() {
+        let mut input = TextInputState::new("界e\u{301}x".to_string());
+        input.cursor_end();
+
+        let (visible, cursor_col) = input.view(2);
+        assert_eq!(visible, "x");
+        assert_eq!(cursor_col, 1);
+        assert!(!visible.starts_with('\u{301}'));
     }
 
     #[test]

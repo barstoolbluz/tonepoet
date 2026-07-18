@@ -1718,6 +1718,15 @@ impl Database {
     /// Full sync: replace all queue rows with the current in-memory state.
     /// Runs in a transaction for atomicity.
     pub fn sync_queue(&self, items: &[&crate::convert::ConversionItem]) -> Result<(), String> {
+        let mut persisted_items = items
+            .iter()
+            .map(|item| (*item).clone())
+            .collect::<Vec<_>>();
+        let persist_report =
+            crate::convert::queue::prepare_archive_passwords_for_persistence(
+                &mut persisted_items,
+            )?;
+
         let tx = self
             .conn
             .unchecked_transaction()
@@ -1726,7 +1735,7 @@ impl Database {
         tx.execute("DELETE FROM conversion_queue", [])
             .map_err(|e| format!("queue clear: {}", e))?;
 
-        for item in items {
+        for item in &persisted_items {
             let json =
                 serde_json::to_string(item).map_err(|e| format!("queue item serialize: {}", e))?;
             tx.execute(
@@ -1737,6 +1746,9 @@ impl Database {
         }
 
         tx.commit().map_err(|e| format!("queue tx commit: {}", e))?;
+        crate::convert::queue::retire_queue_owned_secret_references(
+            &persist_report.retire_references,
+        );
         Ok(())
     }
 
@@ -1777,12 +1789,15 @@ impl Database {
             }
         }
         drop(stmt);
-        let secrets_or_status_changed =
+        let mut secret_report =
             crate::convert::queue::restore_archive_passwords_after_load(&mut items);
         let original_len = items.len();
         items.retain(|item| {
             let path_str = item.input_path.to_string_lossy();
             if path_str.contains("..") {
+                if let Some(reference) = item.archive_password_ref.as_ref() {
+                    secret_report.retire_references.push(reference.clone());
+                }
                 log::warn!(
                     "Filtered queue item with suspicious path: {:?}",
                     item.input_path
@@ -1790,18 +1805,28 @@ impl Database {
                 return false;
             }
             if !item.input_path.exists() {
+                if let Some(reference) = item.archive_password_ref.as_ref() {
+                    secret_report.retire_references.push(reference.clone());
+                }
                 log::info!("Filtered queue item - file gone: {:?}", item.input_path);
                 return false;
             }
             true
         });
-        if discarded_row || secrets_or_status_changed || items.len() != original_len {
+        if discarded_row || secret_report.rewrite_required || items.len() != original_len {
             let refs: Vec<&crate::convert::ConversionItem> = items.iter().collect();
-            if let Err(error) = self.sync_queue(&refs) {
-                log::error!(
-                    "Sanitized SQLite queue state but could not rewrite queue rows: {}",
-                    error
-                );
+            match self.sync_queue(&refs) {
+                Ok(()) => {
+                    crate::convert::queue::retire_queue_owned_secret_references(
+                        &secret_report.retire_references,
+                    );
+                }
+                Err(error) => {
+                    log::error!(
+                        "Sanitized SQLite queue state but could not rewrite queue rows: {}",
+                        error
+                    );
+                }
             }
         }
         items
@@ -2755,13 +2780,32 @@ impl Database {
                 backup.display()
             )
         };
-        let marker_metadata = std::fs::symlink_metadata(backup)
+        let marker_path_metadata = std::fs::symlink_metadata(backup)
             .map_err(|error| restore_error(error.to_string()))?;
-        if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        if marker_path_metadata.file_type().is_symlink() || !marker_path_metadata.is_file() {
             return Err(restore_error("marker is not a regular file".to_string()));
         }
-        let bytes = std::fs::read(backup).map_err(|error| restore_error(error.to_string()))?;
-        let parent = original
+        let mut marker = std::fs::File::open(backup)
+            .map_err(|error| restore_error(error.to_string()))?;
+        let marker_metadata = marker
+            .metadata()
+            .map_err(|error| restore_error(format!("inspect marker: {error}")))?;
+        if !marker_metadata.is_file() {
+            return Err(restore_error("marker is not a regular file".to_string()));
+        }
+        let marker_len = marker_metadata.len();
+        let target = crate::config::resolve_config_save_target(original)
+            .map_err(|error| restore_error(format!("resolve destination authority: {error}")))?;
+        let target_metadata = std::fs::metadata(&target)
+            .map_err(|error| restore_error(format!("inspect destination mode: {error}")))?;
+        if !target_metadata.is_file() {
+            return Err(restore_error(format!(
+                "resolved destination '{}' is not a regular file",
+                target.display()
+            )));
+        }
+        let target_permissions = target_metadata.permissions();
+        let parent = target
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| restore_error("destination has no parent directory".to_string()))?;
@@ -2770,17 +2814,46 @@ impl Database {
             .tempfile_in(parent)
             .map_err(|error| restore_error(format!("create restore temporary: {error}")))?;
         {
-            use std::io::Write;
-            temp.as_file_mut()
-                .write_all(&bytes)
-                .map_err(|error| restore_error(format!("write restore temporary: {error}")))?;
+            use std::io::{Read, Write};
+            const RESTORE_COPY_CHUNK_BYTES: usize = 1024 * 1024;
+            let mut copied = 0u64;
+            let mut buffer = vec![0u8; RESTORE_COPY_CHUNK_BYTES];
+            while copied < marker_len {
+                let wanted = usize::try_from((marker_len - copied).min(buffer.len() as u64))
+                    .expect("bounded rollback-marker copy chunk");
+                let read = marker
+                    .read(&mut buffer[..wanted])
+                    .map_err(|error| restore_error(format!("read rollback marker: {error}")))?;
+                if read == 0 {
+                    return Err(restore_error(format!(
+                        "rollback marker ended after {copied} byte(s); expected {marker_len}"
+                    )));
+                }
+                temp.as_file_mut()
+                    .write_all(&buffer[..read])
+                    .map_err(|error| restore_error(format!("write restore temporary: {error}")))?;
+                copied += read as u64;
+            }
+            let mut trailing = [0u8; 1];
+            if marker
+                .read(&mut trailing)
+                .map_err(|error| restore_error(format!("verify rollback-marker length: {error}")))?
+                != 0
+            {
+                return Err(restore_error(
+                    "rollback marker grew while it was being copied".to_string(),
+                ));
+            }
+            temp.as_file()
+                .set_permissions(target_permissions)
+                .map_err(|error| restore_error(format!("preserve destination permissions: {error}")))?;
             temp.as_file()
                 .sync_all()
                 .map_err(|error| restore_error(format!("sync restore temporary: {error}")))?;
         }
-        temp.persist(original)
+        temp.persist(&target)
             .map_err(|error| restore_error(format!("publish restored bytes: {error}")))?;
-        Self::sync_parent_directory(original).map_err(|error| {
+        Self::sync_parent_directory(&target).map_err(|error| {
             restore_error(format!(
                 "restored bytes were published, but parent-directory durability could not be confirmed: {error}"
             ))
@@ -3582,6 +3655,61 @@ mod tests {
 
         assert_eq!(std::fs::read(&original).expect("read restored destination"), b"original bytes");
         assert!(!backup.exists(), "successful restore must remove rollback marker");
+    }
+
+    #[test]
+    fn restore_backup_streams_multi_chunk_marker_exactly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.dsf");
+        let backup = Database::backup_path_for(&original);
+        let mut expected = vec![0u8; 3 * 1024 * 1024 + 137];
+        for (index, byte) in expected.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        std::fs::write(&original, b"mutated destination").expect("write destination");
+        std::fs::write(&backup, &expected).expect("write multi-chunk marker");
+
+        Database::restore_backup_for(&original, &backup).expect("stream restore marker");
+
+        assert_eq!(std::fs::read(&original).expect("read restored bytes"), expected);
+        assert!(!backup.exists(), "successful streamed restore retires marker");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_backup_preserves_symlink_and_target_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.dsf");
+        let link = temp.path().join("linked.dsf");
+        let backup = Database::backup_path_for(&link);
+        std::fs::write(&target, b"mutated target bytes").expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("set target mode");
+        symlink("target.dsf", &link).expect("create relative symlink");
+        std::fs::write(&backup, b"authoritative backup bytes").expect("write marker");
+
+        Database::restore_backup_for(&link, &backup).expect("restore through symlink");
+
+        assert!(std::fs::symlink_metadata(&link)
+            .expect("inspect link")
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(&link).expect("read link"), std::path::PathBuf::from("target.dsf"));
+        assert_eq!(
+            std::fs::read(&target).expect("read restored target"),
+            b"authoritative backup bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert!(!backup.exists());
     }
 
     #[test]

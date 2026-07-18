@@ -47,15 +47,15 @@ pub fn extract_wizard_settings(
         AudioFormat::Wav | AudioFormat::Aiff => {
             // Extract bit depth from wizard
             let bit_depth = match wizard.bit_depth {
-                Some(16) => 16,
-                Some(24) => 24,
-                Some(32) => 32,
-                Some(0) | None => 0, // 0 means "same as source", pass through to backend
-                Some(other) => other as u16,
+                Some(16) => Some(16),
+                Some(24) => Some(24),
+                Some(32) => Some(32),
+                Some(0) | None => None,
+                Some(other) => Some(other as u16),
             };
 
-            // Extract sample rate
-            let sample_rate = wizard.sample_rate.unwrap_or(44100);
+            // Absence means same-as-source; do not serialize a guessed 44.1 kHz.
+            let sample_rate = wizard.sample_rate.filter(|rate| *rate != 0);
 
             if matches!(format, AudioFormat::Wav) {
                 QualitySettings::Wav {
@@ -470,16 +470,16 @@ pub fn preset_to_conversion_options(
             QualitySettings::Flac { compression_level }
         }
         AudioFormat::Wav => {
-            let bit_depth = settings.bit_depth.unwrap_or(16) as u16;
-            let sample_rate = settings.sample_rate.unwrap_or(44100);
+            let bit_depth = settings.bit_depth.filter(|depth| *depth != 0).map(|depth| depth as u16);
+            let sample_rate = settings.sample_rate.filter(|rate| *rate != 0);
             QualitySettings::Wav {
                 bit_depth,
                 sample_rate,
             }
         }
         AudioFormat::Aiff => {
-            let bit_depth = settings.bit_depth.unwrap_or(16) as u16;
-            let sample_rate = settings.sample_rate.unwrap_or(44100);
+            let bit_depth = settings.bit_depth.filter(|depth| *depth != 0).map(|depth| depth as u16);
+            let sample_rate = settings.sample_rate.filter(|rate| *rate != 0);
             QualitySettings::Aiff {
                 bit_depth,
                 sample_rate,

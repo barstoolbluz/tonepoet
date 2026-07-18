@@ -87,7 +87,7 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState, theme: 
             };
 
             let name_display = truncate_right(&entry.name, name_col_w);
-            let name_w = name_display.chars().count();
+            let name_w = super::display_width::width(&name_display);
             let name_pad = name_col_w.saturating_sub(name_w);
 
             let path_display = {
@@ -220,28 +220,10 @@ fn draw_naming_mode(f: &mut Frame, inner: Rect, naming: &BookmarkNaming, theme: 
 
 /// Truncate to `max` chars, trailing ellipsis if cut.
 fn truncate_right(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    if max < 2 {
-        return s.chars().take(max).collect();
-    }
-    let truncated: String = s.chars().take(max - 1).collect();
-    format!("{}…", truncated)
+    super::display_width::truncate_right(s, max)
 }
 
 /// Truncate from the left (preserve end) with leading ellipsis.
 fn truncate_left(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    if max < 2 {
-        let skip = count - max;
-        return s.chars().skip(skip).collect();
-    }
-    let skip = count - (max - 1);
-    let truncated: String = s.chars().skip(skip).collect();
-    format!("…{}", truncated)
+    super::display_width::truncate_left(s, max)
 }

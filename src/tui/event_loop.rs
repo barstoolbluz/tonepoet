@@ -3443,19 +3443,33 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             }
         }
+        AppMessage::MetadataWriteProgress {
+            operation_id,
+            path,
+            detail,
+        } => {
+            if app.inline_metadata_write_is_current(operation_id, &path) {
+                app.set_status(detail);
+            }
+        }
         AppMessage::MetadataWriteComplete {
+            operation_id,
             path,
             field,
             value,
             result,
         } => {
+            if !app.complete_inline_metadata_write(operation_id, &path) {
+                return;
+            }
             // The blocking writer owns the complete journal/backup lifecycle.
             // The reducer only publishes the result and invalidates caches.
             let path_str = path.display().to_string();
-            let uses_native_flac_journal =
-                crate::tui::probe::uses_native_flac_metadata_journal(&path);
+            let uses_native_journal =
+                crate::tui::probe::uses_native_flac_metadata_journal(&path)
+                    || crate::dsf_tags::is_dsf(&path);
             match result {
-                Ok(()) => {
+                Ok(report) => {
                     app.browse.remove_probe_cache_entry(&path);
                     app.browse.probe_pending.remove(&path);
                     app.browse.invalidate_search_tag_cache_for_metadata_path(&path);
@@ -3489,23 +3503,31 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         }
                     };
                     app.browse.probe_current_with_db(tx, Some(&app.db));
-                    if let Some(err) = staged_tracking_error {
-                        app.set_status(format!(
+                    let base_status = if let Some(err) = staged_tracking_error {
+                        format!(
                             "{}: {} updated, but archive recovery tracking failed: {}",
                             path.file_name().unwrap_or_default().to_string_lossy(),
                             field.label(),
                             err,
-                        ));
+                        )
                     } else {
-                        app.set_status(format!(
+                        format!(
                             "{}: {} updated",
                             path.file_name().unwrap_or_default().to_string_lossy(),
                             field.label(),
+                        )
+                    };
+                    if report.durability_warnings.is_empty() {
+                        app.set_status(base_status);
+                    } else {
+                        app.set_status(format!(
+                            "{base_status}, with durability warning: {}",
+                            report.durability_warnings.join("; ")
                         ));
                     }
                 }
                 Err(error) => {
-                    if uses_native_flac_journal {
+                    if uses_native_journal {
                         app.set_status(format!("write failed: {error}"));
                     } else {
                         // The database-backed transaction returns a complete,
@@ -4139,6 +4161,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 );
             }
         }
+        AppMessage::MetadataEditorWriteProgress {
+            session_id,
+            save_generation,
+            detail,
+        } => {
+            if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
+                let _ = state.apply_metadata_save_progress(
+                    session_id,
+                    save_generation,
+                    detail,
+                );
+            }
+        }
         AppMessage::GnudbQueryComplete {
             operation_id,
             result,
@@ -4214,9 +4249,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         );
                         return;
                     }
+                    let editor_session = app
+                        .active_gnudb_operation
+                        .and_then(|active| active.editor_session);
                     finish_gnudb_operation_if_current(app, operation_id);
                     let mut review = super::gnudb::build_review_state(&entry, paths);
                     review.origin_matches = origin_matches;
+                    review.editor_session = editor_session;
                     app.set_status(format!(
                         "GNUDB: {} / {} ({} tracks) — review and edit",
                         entry.artist,
@@ -4234,13 +4273,31 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         AppMessage::GnudbMultiDiscComplete {
             operation_id,
             entries,
+            failures,
+            attempted,
         } => {
             if !gnudb_operation_is_current(app, operation_id) {
                 return;
             }
+            for failure in &failures {
+                log::warn!("GNUDB multi-disc lookup: {failure}");
+            }
             if entries.is_empty() {
                 retire_gnudb_operation_with_editor_restore(app, operation_id);
-                app.set_status("GNUDB: no matches found for any disc");
+                if failures.is_empty() {
+                    app.set_status("GNUDB: no matches found for any disc");
+                } else if failures.len() == attempted {
+                    app.set_status(format!(
+                        "GNUDB: all {attempted} disc lookups failed: {}",
+                        failures[0]
+                    ));
+                } else {
+                    app.set_status(format!(
+                        "GNUDB: no matches found; {} of {attempted} disc lookups failed: {}",
+                        failures.len(),
+                        failures[0]
+                    ));
+                }
                 return;
             }
             if !gnudb_operation_has_overlay_authority(app, operation_id) {
@@ -4251,16 +4308,26 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 );
                 return;
             }
+            let editor_session = app
+                .active_gnudb_operation
+                .and_then(|active| active.editor_session);
             finish_gnudb_operation_if_current(app, operation_id);
 
-            let review = super::gnudb::build_multi_disc_review_state(&entries);
+            let mut review = super::gnudb::build_multi_disc_review_state(&entries);
+            review.editor_session = editor_session;
             let n_discs = entries.len();
             let n_tracks: usize = entries.iter().map(|(_, e, _)| e.tracks.len()).sum();
+            let failure_suffix = if failures.is_empty() {
+                String::new()
+            } else {
+                format!("; {} of {attempted} disc lookups failed", failures.len())
+            };
             app.set_status(format!(
-                "GNUDB: {} disc{}, {} tracks — review and edit",
+                "GNUDB: {} disc{}, {} tracks — review and edit{}",
                 n_discs,
                 if n_discs == 1 { "" } else { "s" },
                 n_tracks,
+                failure_suffix,
             ));
             app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
         }
@@ -5768,7 +5835,6 @@ pub(super) fn gnudb_operation_is_current(
     operation_id: super::message::TagsMbOperationId,
 ) -> bool {
     operation_id.is_assigned()
-        && app.active_tags_mb_operation.is_none()
         && app
             .active_gnudb_operation
             .is_some_and(|active| active.operation_id == operation_id)
@@ -5779,6 +5845,7 @@ pub(super) fn gnudb_operation_has_overlay_authority(
     operation_id: super::message::TagsMbOperationId,
 ) -> bool {
     if !gnudb_operation_is_current(app, operation_id)
+        || app.active_tags_mb_operation.is_some()
         || !matches!(app.active_overlay, ActiveOverlay::None)
     {
         return false;
@@ -5806,14 +5873,47 @@ pub(super) fn finish_gnudb_operation_if_current(
     true
 }
 
-fn restore_gnudb_editor_if_owned(
+pub(super) fn take_gnudb_review_editor_if_owned(
     app: &mut AppState,
-    active: super::app::ActiveGnudbOperation,
+    guard: Option<super::message::MetadataEditorSessionGuard>,
+) -> Option<Box<super::app::MetadataEditorState>> {
+    let guard = guard?;
+    // A review reopened with `:gnudb-back` owns exactly the editor session
+    // parked for that invocation.  Never consume a different editor merely
+    // because it occupies the shared pending slot.
+    if app.active_tags_mb_operation.is_some() || app.active_cue_operation.is_some() {
+        return None;
+    }
+    let review_owns_guard = matches!(
+        &app.active_overlay,
+        ActiveOverlay::GnudbReview(review) if review.editor_session == Some(guard)
+    );
+    if !review_owns_guard {
+        return None;
+    }
+    let matches = app
+        .pending_metadata_editor
+        .as_deref()
+        .is_some_and(|state| metadata_editor_matches_session_guard(state, guard));
+    if !matches {
+        return None;
+    }
+    app.pending_metadata_editor.take()
+}
+
+pub(super) fn restore_gnudb_review_editor_if_owned(
+    app: &mut AppState,
+    guard: Option<super::message::MetadataEditorSessionGuard>,
 ) -> bool {
-    let Some(guard) = active.editor_session else {
+    let Some(guard) = guard else {
         return false;
     };
-    if !matches!(app.active_overlay, ActiveOverlay::None) {
+    // A different metadata workflow owns the parked editor while active. A
+    // defensive GNUDB retirement must never surface or consume that editor.
+    if app.active_tags_mb_operation.is_some()
+        || app.active_cue_operation.is_some()
+        || !matches!(app.active_overlay, ActiveOverlay::None)
+    {
         return false;
     }
     let matches = app
@@ -5828,6 +5928,13 @@ fn restore_gnudb_editor_if_owned(
         return true;
     }
     false
+}
+
+fn restore_gnudb_editor_if_owned(
+    app: &mut AppState,
+    active: super::app::ActiveGnudbOperation,
+) -> bool {
+    restore_gnudb_review_editor_if_owned(app, active.editor_session)
 }
 
 pub(super) fn cancel_gnudb_operation(
@@ -7051,10 +7158,12 @@ mod metadata_write_completion_tests {
         let path = temp.path().join("track.opus");
         std::fs::write(&path, b"restored original bytes").expect("write destination");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (operation_id, _cancel) = app.begin_inline_metadata_write(path.clone());
 
         handle_message(
             &mut app,
             AppMessage::MetadataWriteComplete {
+                operation_id,
                 path: path.clone(),
                 field: MetadataField::Title,
                 value: "new title".to_string(),
@@ -7085,10 +7194,12 @@ mod metadata_write_completion_tests {
         std::fs::write(&path, b"current FLAC bytes").expect("write destination");
         std::fs::write(&backup, b"unrelated stale backup").expect("write stale backup");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (operation_id, _cancel) = app.begin_inline_metadata_write(path.clone());
 
         handle_message(
             &mut app,
             AppMessage::MetadataWriteComplete {
+                operation_id,
                 path: path.clone(),
                 field: MetadataField::Title,
                 value: "new title".to_string(),
@@ -7105,6 +7216,73 @@ mod metadata_write_completion_tests {
                 .map(|(message, _)| message.as_str()),
             Some("write failed: native writer failure")
         );
+    }
+
+
+    #[test]
+    fn stale_inline_metadata_progress_and_completion_are_ignored() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let current_path = std::path::PathBuf::from("current.dsf");
+        let stale_path = std::path::PathBuf::from("stale.dsf");
+        let (current_id, _cancel) = app.begin_inline_metadata_write(current_path.clone());
+        app.set_status("current operation");
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataWriteProgress {
+                operation_id: current_id.saturating_sub(1),
+                path: stale_path.clone(),
+                detail: "stale progress".to_string(),
+            },
+            &tx(),
+        );
+        handle_message(
+            &mut app,
+            AppMessage::MetadataWriteComplete {
+                operation_id: current_id.saturating_sub(1),
+                path: stale_path,
+                field: MetadataField::Title,
+                value: "stale".to_string(),
+                result: Ok(crate::tui::probe::MetadataWriteCommitReport::default()),
+            },
+            &tx(),
+        );
+
+        assert!(app.inline_metadata_write_is_current(current_id, &current_path));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("current operation")
+        );
+    }
+
+    #[test]
+    fn inline_metadata_completion_surfaces_durability_warning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.dsf");
+        std::fs::write(&path, b"fixture").expect("write fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (operation_id, _cancel) = app.begin_inline_metadata_write(path.clone());
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataWriteComplete {
+                operation_id,
+                path: path.clone(),
+                field: MetadataField::Title,
+                value: "new title".to_string(),
+                result: Ok(crate::tui::probe::MetadataWriteCommitReport {
+                    durability_warnings: vec!["journal retirement could not be confirmed".to_string()],
+                }),
+            },
+            &tx(),
+        );
+
+        let status = app.status_message.as_ref().map(|(message, _)| message.as_str());
+        assert_eq!(
+            status,
+            Some("album.dsf: title updated, with durability warning: journal retirement could not be confirmed")
+        );
+        assert!(app.inline_metadata_write.is_none());
     }
 }
 
@@ -9592,6 +9770,152 @@ mod musicbrainz_completion_dispatch_tests {
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
             Some("GNUDB worker failed: worker panicked; the lookup was retired")
+        );
+    }
+
+    #[test]
+    fn gnudb_operation_identity_remains_current_even_if_mb_state_is_injected() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let editor = single_source_file_editor();
+        let guard = session_guard_for(&editor);
+        app.pending_metadata_editor = Some(editor);
+        let operation_id = begin_gnudb_operation(&mut app).expect("begin GNUDB operation");
+        assert_eq!(
+            app.active_gnudb_operation.and_then(|active| active.editor_session),
+            Some(guard)
+        );
+        app.active_tags_mb_operation = Some(crate::tui::app::ActiveTagsMbOperation {
+            operation_id: crate::tui::message::TagsMbOperationId(operation_id.0 + 100),
+            picker_owned: false,
+            phase: crate::tui::app::TagsMbOperationPhase::Lookup,
+        });
+
+        assert!(gnudb_operation_is_current(&app, operation_id));
+        assert!(!gnudb_operation_has_overlay_authority(&app, operation_id));
+
+        handle_message(
+            &mut app,
+            AppMessage::GnudbReadComplete {
+                operation_id,
+                result: Ok(crate::tui::gnudb::GnudbEntry {
+                    disc_id: "deadbeef".to_string(),
+                    artist: "Artist".to_string(),
+                    album: "Album".to_string(),
+                    year: "2026".to_string(),
+                    genre: "Test".to_string(),
+                    tracks: vec!["Track 1".to_string()],
+                }),
+                paths: vec![std::path::PathBuf::from("track.flac")],
+                origin_matches: None,
+            },
+            &tx(),
+        );
+
+        assert!(app.active_gnudb_operation.is_none());
+        assert!(app.active_tags_mb_operation.is_some());
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app.pending_metadata_editor.is_some());
+        assert_eq!(
+            session_guard_for(app.pending_metadata_editor.as_deref().expect("MB-owned editor retained")),
+            guard
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("GNUDB: read result discarded because another overlay owns the screen; retry the lookup")
+        );
+    }
+
+    #[test]
+    fn gnudb_review_restores_only_the_exact_parked_editor_session() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let editor = single_source_file_editor();
+        let guard = session_guard_for(&editor);
+        app.pending_metadata_editor = Some(editor);
+
+        assert!(restore_gnudb_review_editor_if_owned(&mut app, Some(guard)));
+        assert!(app.pending_metadata_editor.is_none());
+        let ActiveOverlay::MetadataEditor(restored) = &app.active_overlay else {
+            panic!("matching GNUDB review guard must restore the parked editor");
+        };
+        assert_eq!(session_guard_for(restored), guard);
+
+        let mut stale_app = AppState::new_for_test(TonepoetConfig::default());
+        let stale_editor = single_source_file_editor();
+        let stale_guard = session_guard_for(&stale_editor);
+        stale_app.pending_metadata_editor = Some(stale_editor);
+        let wrong_guard = crate::tui::message::MetadataEditorSessionGuard {
+            session_id: stale_guard.session_id.wrapping_add(1),
+            ..stale_guard
+        };
+
+        assert!(!restore_gnudb_review_editor_if_owned(
+            &mut stale_app,
+            Some(wrong_guard)
+        ));
+        assert!(stale_app.pending_metadata_editor.is_some());
+        assert!(matches!(stale_app.active_overlay, ActiveOverlay::None));
+    }
+
+    #[test]
+    fn gnudb_multi_disc_total_failure_is_reported_as_failure_not_no_matches() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let operation_id = begin_gnudb_operation(&mut app).expect("begin GNUDB operation");
+
+        handle_message(
+            &mut app,
+            AppMessage::GnudbMultiDiscComplete {
+                operation_id,
+                entries: Vec::new(),
+                failures: vec![
+                    "Disc 1 query failed: network unavailable".to_string(),
+                    "Disc 2 read failed: timeout".to_string(),
+                ],
+                attempted: 2,
+            },
+            &tx(),
+        );
+
+        assert!(app.active_gnudb_operation.is_none());
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("GNUDB: all 2 disc lookups failed: Disc 1 query failed: network unavailable")
+        );
+    }
+
+    #[test]
+    fn gnudb_multi_disc_partial_failure_opens_review_and_surfaces_degradation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let operation_id = begin_gnudb_operation(&mut app).expect("begin GNUDB operation");
+        let entry = crate::tui::gnudb::GnudbEntry {
+            disc_id: "deadbeef".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            year: "2026".to_string(),
+            genre: "Test".to_string(),
+            tracks: vec!["Track 1".to_string()],
+        };
+
+        handle_message(
+            &mut app,
+            AppMessage::GnudbMultiDiscComplete {
+                operation_id,
+                entries: vec![(
+                    "Disc 1".to_string(),
+                    entry,
+                    vec![std::path::PathBuf::from("disc1-track1.flac")],
+                )],
+                failures: vec!["Disc 2 query failed: timeout".to_string()],
+                attempted: 2,
+            },
+            &tx(),
+        );
+
+        assert!(app.active_gnudb_operation.is_none());
+        assert!(matches!(app.active_overlay, ActiveOverlay::GnudbReview(_)));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("GNUDB: 1 disc, 1 tracks — review and edit; 1 of 2 disc lookups failed")
         );
     }
 

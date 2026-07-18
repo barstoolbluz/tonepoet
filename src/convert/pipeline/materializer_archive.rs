@@ -112,7 +112,15 @@ impl super::stages::Materializer for ArchiveMaterializer {
                 }
             }
             let ordinal = (idx + 1) as u32;
-            let mut metadata = read_track_metadata(path)?;
+            let (mut metadata, metadata_warnings) = read_track_metadata_with_warnings(path)?;
+            super::materializer_single::report_dsf_metadata_warnings(
+                reporter,
+                &req.item_id,
+                path,
+                &metadata_warnings,
+                idx as f32 / audio_files.len().max(1) as f32,
+            )
+            .await;
             if let Some(override_set) =
                 archive_metadata_override_for_track(req, ordinal, path, &extraction_root)
             {
@@ -1763,25 +1771,43 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
 // =========================================================================
 
 /// Read tags from an audio file. Generic Lofty carriers retain the historical
-/// empty-metadata fallback for unrecognised tags; DSF container/ID3 ambiguity
-/// is an explicit materialization error so naming and provenance cannot degrade
-/// silently.
+/// empty-metadata fallback for unrecognised tags. DSF structural identity failures
+/// remain materialization errors; benign metadata-container quirks degrade to
+/// empty or best-effort tags with an explicit pipeline warning.
+#[cfg(test)]
 fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
+    let (metadata, warnings) = read_track_metadata_with_warnings(path)?;
+    for warning in &warnings {
+        log::warn!(
+            "DSF metadata degraded for archived track '{}'; audio conversion will continue: {}",
+            path.display(),
+            warning
+        );
+    }
+    Ok(metadata)
+}
+
+fn read_track_metadata_with_warnings(
+    path: &Path,
+) -> Result<(TrackMetadata, Vec<String>), MaterializeError> {
     if crate::dsf_tags::is_dsf(path) {
-        return crate::dsf_tags::read(path)
-            .map(|snapshot| crate::dsf_tags::to_track_metadata(&snapshot))
-            .map_err(MaterializeError::Parse);
+        let outcome = crate::dsf_tags::read_with_warnings(path)
+            .map_err(MaterializeError::Parse)?;
+        return Ok((
+            crate::dsf_tags::to_track_metadata(&outcome.snapshot),
+            outcome.warnings,
+        ));
     }
     use lofty::prelude::*;
 
     let tagged = match lofty::read_from_path(path) {
         Ok(t) => t,
-        Err(_) => return Ok(TrackMetadata::default()),
+        Err(_) => return Ok((TrackMetadata::default(), Vec::new())),
     };
 
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(t) => t,
-        None => return Ok(TrackMetadata::default()),
+        None => return Ok((TrackMetadata::default(), Vec::new())),
     };
 
     // Store album name in `extra` — TrackMetadata has no dedicated
@@ -1805,7 +1831,7 @@ fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
         }
     }
 
-    Ok(TrackMetadata {
+    Ok((TrackMetadata {
         title: tag.title().map(|s| s.to_string()),
         artist: tag.artist().map(|s| s.to_string()),
         album_artist: tag
@@ -1833,7 +1859,7 @@ fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
         comment: tag.comment().map(|s| s.to_string()),
         pre_emphasis: false,
         extra,
-    })
+    }, Vec::new()))
 }
 
 fn item_key_to_extra_key(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
@@ -1994,27 +2020,40 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn corrupt_extracted_dsf_metadata_is_not_silently_defaulted() {
+    fn corrupt_extracted_dsf_metadata_degrades_to_empty_metadata_for_conversion() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("corrupt.dsf");
         crate::dsf_tags::write_test_dsf_fixture(&path, Some(b"NOT-AN-ID3-TAG"))
             .expect("write DSF with corrupt metadata area");
 
-        let error = read_track_metadata(&path)
-            .expect_err("corrupt extracted DSF metadata must fail closed");
-        match error {
-            MaterializeError::Parse(message) => {
-                assert_eq!(
-                    message,
-                    format!(
-                        "failed to read DSF ID3 tags from '{}': invalid DSF metadata area in '{}': header declares metadata at offset 8284, but no ID3 marker is present",
-                        path.display(),
-                        path.display()
-                    )
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let metadata = read_track_metadata(&path)
+            .expect("unreadable DSF tag bytes must not block audio conversion");
+        // Split across two asserts: 15-element tuples have no PartialEq/Debug.
+        assert_eq!(
+            (
+                metadata.title.as_deref(),
+                metadata.artist.as_deref(),
+                metadata.album_artist.as_deref(),
+                metadata.composer.as_deref(),
+                metadata.performer.as_deref(),
+                metadata.genre.as_deref(),
+                metadata.date.as_deref(),
+                metadata.track_number,
+                metadata.disc_number,
+                metadata.isrc.as_deref(),
+            ),
+            (None, None, None, None, None, None, None, None, None, None),
+        );
+        assert_eq!(
+            (
+                metadata.publisher.as_deref(),
+                metadata.copyright.as_deref(),
+                metadata.comment.as_deref(),
+                metadata.pre_emphasis,
+                metadata.extra.len(),
+            ),
+            (None, None, None, false, 0),
+        );
     }
 
     struct VersionOnlyRunner(HashMap<ToolBinary, String>);

@@ -9,10 +9,7 @@ use crate::convert::formats::{
 use crate::convert::simple_wizard::ReplayGainMode;
 use tonepoet_pipeline::enums as pipeline_enums;
 use tonepoet_pipeline::PipelineSettings;
-use crate::convert::{
-    queue_identity_path, ConversionItem, ConversionStatus, LifecycleEvent, ProgressUpdate,
-};
-use crate::convert::queue_expansion::cue_sidecar_override_for_commit_path;
+use crate::convert::{ConversionStatus, LifecycleEvent, ProgressUpdate};
 
 use super::app::*;
 use super::message::AppMessage;
@@ -167,20 +164,25 @@ pub fn try_pills_to_options(
         AudioFormat::Flac | AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::WavPack | AudioFormat::Alac
     );
 
-    // Use backend bit depth for quality settings when the legacy path still needs it.
-    let backend_depth = if bit_depth.is_source() { 24 } else { bit_depth.to_backend_depth() };
+    // Preserve source-relative policy in the legacy compatibility carrier.
+    // The live TUI path attaches full PipelineSettings, but serialized or test
+    // consumers must never see a guessed 24-bit depth or raw zero rate.
+    let backend_depth = (!bit_depth.is_source()).then_some(bit_depth.to_backend_depth());
+    let legacy_sample_rate = (target_sample_rate
+        != crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL)
+        .then_some(target_sample_rate);
 
     let quality = match output_format {
         AudioFormat::Flac => QualitySettings::Flac {
             compression_level: 5,
         },
         AudioFormat::Wav => QualitySettings::Wav {
-            bit_depth: backend_depth as u16,
-            sample_rate: target_sample_rate,
+            bit_depth: backend_depth.map(|depth| depth as u16),
+            sample_rate: legacy_sample_rate,
         },
         AudioFormat::Aiff => QualitySettings::Aiff {
-            bit_depth: backend_depth as u16,
-            sample_rate: target_sample_rate,
+            bit_depth: backend_depth.map(|depth| depth as u16),
+            sample_rate: legacy_sample_rate,
         },
         AudioFormat::WavPack => QualitySettings::WavPack {
             compression_mode: WavPackMode::Normal,
@@ -234,7 +236,7 @@ pub fn try_pills_to_options(
         None
     };
     let target_bit_depth = if legacy_bit_depth_applies && !is_dsd && !bit_depth.is_source() {
-        Some(backend_depth)
+        backend_depth
     } else {
         None
     };
@@ -534,167 +536,6 @@ fn map_dither(dither: crate::convert::simple_wizard::DitherType) -> pipeline_enu
         UiDitherType::ImprovedEWeighted => pipeline_enums::DitherType::ImprovedEWeighted,
         UiDitherType::Gesemann => pipeline_enums::DitherType::Gesemann,
     }
-}
-
-/// Outcome of a batch commit: counts for the caller to report.
-#[derive(Debug, Default)]
-pub struct CommitOutcome {
-    /// Files successfully added to the queue (new items).
-    pub enqueued: usize,
-    /// Files skipped because they were already in the queue.
-    pub skipped: usize,
-    /// Files that failed to enqueue (e.g. add_file errored).
-    pub errors: usize,
-    /// Files that were previously converted (warning, not blocking).
-    pub previously_converted: usize,
-    /// Last error message (for status display when errors > 0).
-    pub last_error: Option<String>,
-}
-
-/// Commit a batch of paths to the queue with the given conversion options.
-///
-/// Checks each path against the current queue to avoid duplicates (skips
-/// items already queued, processing, or paused). Persists the queue to
-/// disk on completion (if `persist_queue` is enabled).
-///
-/// Returns a `CommitOutcome` with counts; does NOT set any status message
-/// or touch navigation state — that's the caller's job. Also does NOT
-/// start processing; use `start_processing` separately for that.
-///
-/// Works for single-file and multi-file batches uniformly. A single-file
-/// caller can pass `&[path]`.
-pub fn commit_batch(
-    app: &mut AppState,
-    paths: &[std::path::PathBuf],
-    options: &ConversionOptions,
-) -> CommitOutcome {
-    commit_batch_with_cue_artifacts(app, paths, &std::collections::HashSet::new(), options)
-}
-
-fn is_active_commit_item(item: &ConversionItem) -> bool {
-    !matches!(
-        item.status,
-        ConversionStatus::Completed { .. }
-            | ConversionStatus::CompletedWithActionErrors { .. }
-            | ConversionStatus::Failed { .. }
-            | ConversionStatus::Cancelled
-    )
-}
-
-fn active_queue_identity_set(
-    existing: &[ConversionItem],
-) -> std::collections::HashSet<std::path::PathBuf> {
-    existing
-        .iter()
-        .filter(|item| is_active_commit_item(item))
-        .map(|item| queue_identity_path(&item.input_path))
-        .collect()
-}
-
-fn commit_path_already_queued(
-    active_queue_identities: &std::collections::HashSet<std::path::PathBuf>,
-    path: &std::path::Path,
-) -> bool {
-    active_queue_identities.contains(&queue_identity_path(path))
-}
-
-fn options_for_queue_request(options: &ConversionOptions) -> ConversionOptions {
-    let mut queued = options.clone();
-    queued.naming_template = Some(options.effective_naming_template("%NN% - %TITLE%"));
-    queued
-}
-
-/// Commit a batch and mark paths whose sibling CUE was already suppressed by
-/// queue expansion as sidecar-CUE metadata artifacts.
-pub fn commit_batch_with_cue_artifacts(
-    app: &mut AppState,
-    paths: &[std::path::PathBuf],
-    cue_artifact_audio: &std::collections::HashSet<std::path::PathBuf>,
-    options: &ConversionOptions,
-) -> CommitOutcome {
-    let existing = app.manager.get_items_clone();
-    let mut active_queue_identities = active_queue_identity_set(&existing);
-    let mut outcome = CommitOutcome::default();
-    let queued_options = options_for_queue_request(options);
-
-    for path in paths {
-        if commit_path_already_queued(&active_queue_identities, path) {
-            outcome.skipped += 1;
-            continue;
-        }
-        let path_identity = queue_identity_path(path);
-
-        // Check if this file was previously converted (non-blocking warning).
-        if app.db.was_previously_converted(&path.display().to_string()) {
-            outcome.previously_converted += 1;
-        }
-
-        // For encrypted archives, resolve password:
-        // session override → configured reference → keychain MRU → None.
-        let archive_pw = if crate::is_encrypted_archive_ext(path) {
-            match super::app::archive_password_for_path(app, path) {
-                Ok(password) => password,
-                Err(error) => {
-                    outcome.errors = outcome.errors.saturating_add(1);
-                    outcome.last_error = Some(error);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
-        let cue_sidecar_override =
-            cue_sidecar_override_for_commit_path(path, cue_artifact_audio);
-
-        let archive_reference = archive_pw.as_deref().map(super::keychain::reference_for_password);
-        match app.manager.add_file_ready_for_processing_with_cue_sidecar_override(
-            path.clone(),
-            queued_options.clone(),
-            archive_pw.clone(),
-            cue_sidecar_override,
-        ) {
-            Ok(item_id) => {
-                outcome.enqueued += 1;
-                active_queue_identities.insert(path_identity);
-                if let (Some(password), Some(reference_result)) =
-                    (archive_pw.as_deref(), archive_reference)
-                {
-                    match reference_result {
-                        Ok(reference) => {
-                            if let Err(error) = app.manager.attach_archive_password_reference(
-                                &item_id,
-                                password,
-                                reference,
-                            ) {
-                                outcome.last_error = Some(format!(
-                                    "queued {}, but its archive-password reference could not be attached: {}",
-                                    path.display(),
-                                    error
-                                ));
-                            }
-                        }
-                        Err(error) => {
-                            outcome.last_error = Some(format!(
-                                "queued {}, but its archive password is process-only because the OS secret store is unavailable: {}",
-                                path.display(),
-                                error
-                            ));
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                log::warn!("commit failed for {}: {err}", path.display());
-                outcome.errors += 1;
-                outcome.last_error = Some(format!("{err}"));
-            }
-        }
-    }
-
-    app.save_queue();
-
-    outcome
 }
 
 /// Start processing all queued items. Shared between convert screen and queue screen.
@@ -1024,6 +865,34 @@ mod lifecycle_forwarder_tests {
     }
 
     #[test]
+    fn source_relative_pills_remain_honest_in_legacy_and_pipeline_carriers() {
+        use crate::convert::formats::QualitySettings;
+        use crate::tui::app::{BitDepthChoice, SOURCE_SAMPLE_RATE_SENTINEL};
+
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Wav);
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.bit_depth.select_value(&BitDepthChoice::Source);
+        let output = OutputOptionsState::new();
+
+        let options = try_pills_to_options(&format, &output, &TonepoetConfig::default())
+            .expect("source-relative WAV policy is valid");
+
+        assert_eq!(options.target_sample_rate, None);
+        assert_eq!(options.target_bit_depth, None);
+        assert_eq!(
+            options.quality,
+            QualitySettings::Wav {
+                bit_depth: None,
+                sample_rate: None,
+            }
+        );
+        let settings = options.pipeline_settings.expect("pipeline settings attached");
+        assert_eq!(settings.target_sample_rate, pipeline_enums::RateTarget::Source);
+        assert_eq!(settings.target_bit_depth, pipeline_enums::BitDepthTarget::Source);
+    }
+
+    #[test]
     fn pills_to_options_keeps_user_template_raw_until_request_boundary() {
         let format = FormatState::new();
         let mut output = OutputOptionsState::new();
@@ -1043,139 +912,6 @@ mod lifecycle_forwarder_tests {
             "%DISC_FOLDER%/%ARTIST% - %ALBUM%/{%TITLE_EXTRA% }%TRACK% - %TITLE%",
             "disc-folder projection must prepend to the user's arbitrary filename template, not replace it with the default"
         );
-    }
-
-}
-
-#[cfg(test)]
-mod cue_sidecar_commit_metadata_tests {
-    use super::*;
-    use std::collections::HashSet;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            let path = std::env::temp_dir().join(format!(
-                "tonepoet-commit-identity-{name}-{}-{nanos}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).expect("create temp dir");
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn write_minimal_bluray_layout(root: &Path) {
-        let bdmv = root.join("BDMV");
-        fs::create_dir_all(bdmv.join("PLAYLIST")).expect("create PLAYLIST");
-        fs::create_dir_all(bdmv.join("STREAM")).expect("create STREAM");
-        fs::write(bdmv.join("index.bdmv"), b"index").expect("write index.bdmv");
-        fs::write(bdmv.join("MovieObject.bdmv"), b"movie").expect("write MovieObject.bdmv");
-        fs::write(bdmv.join("PLAYLIST").join("00000.mpls"), b"playlist")
-            .expect("write playlist");
-        fs::write(bdmv.join("STREAM").join("00000.m2ts"), b"stream").expect("write stream");
-    }
-
-    fn active_item(path: PathBuf) -> ConversionItem {
-        let mut options = ConversionOptions::default();
-        options.pipeline_settings = Some(PipelineSettings::default());
-        let mut item = ConversionItem::new(path, crate::convert::FileFormat::Archive, options);
-        item.status = ConversionStatus::Queued;
-        item
-    }
-
-    #[test]
-    fn commit_override_is_computed_only_from_current_batch_metadata() {
-        let path = PathBuf::from("/tmp/album/01.flac");
-        let mut artifact_audio = HashSet::new();
-        artifact_audio.insert(path.clone());
-
-        assert_eq!(
-            cue_sidecar_override_for_commit_path(&path, &artifact_audio),
-            Some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly)
-        );
-
-        let later_no_artifact_batch = HashSet::new();
-        assert_eq!(
-            cue_sidecar_override_for_commit_path(&path, &later_no_artifact_batch),
-            None,
-            "a later batch with the same path vector must not inherit stale artifact metadata"
-        );
-    }
-
-
-    #[test]
-    fn queue_request_options_apply_effective_disc_subfolder_template_once() {
-        let mut options = ConversionOptions::default();
-        options.naming_template = Some("%ARTIST%/%TRACK% - %TITLE% {%TITLE_EXTRA%}".to_string());
-        options.create_disc_subfolders = true;
-
-        let queued = options_for_queue_request(&options);
-
-        assert_eq!(
-            queued.naming_template.as_deref(),
-            Some("%DISC_FOLDER%/%ARTIST%/%TRACK% - %TITLE% {%TITLE_EXTRA%}")
-        );
-        assert!(queued.create_disc_subfolders);
-        assert_eq!(
-            options_for_queue_request(&queued).naming_template.as_deref(),
-            Some("%DISC_FOLDER%/%ARTIST%/%TRACK% - %TITLE% {%TITLE_EXTRA%}"),
-            "queue/request normalization must be idempotent and must preserve the user's arbitrary template"
-        );
-    }
-
-    #[test]
-    fn commit_duplicate_detection_skips_bdmv_child_when_disc_root_is_active() {
-        let temp = TempDir::new("root-active");
-        write_minimal_bluray_layout(&temp.path);
-        let bdmv = temp.path.join("BDMV");
-        let existing = vec![active_item(temp.path.clone())];
-        let identities = active_queue_identity_set(&existing);
-
-        assert!(commit_path_already_queued(&identities, &bdmv));
-    }
-
-    #[test]
-    fn commit_duplicate_detection_skips_disc_root_when_bdmv_child_is_active() {
-        let temp = TempDir::new("bdmv-active");
-        write_minimal_bluray_layout(&temp.path);
-        let bdmv = temp.path.join("BDMV");
-        let existing = vec![active_item(bdmv)];
-        let identities = active_queue_identity_set(&existing);
-
-        assert!(commit_path_already_queued(&identities, &temp.path));
-    }
-
-    #[test]
-    fn commit_duplicate_detection_keeps_ordinary_path_identity_semantics() {
-        let temp = TempDir::new("ordinary");
-        let first = temp.path.join("one.flac");
-        let second = temp.path.join("two.flac");
-        fs::write(&first, b"one").expect("write first");
-        fs::write(&second, b"two").expect("write second");
-        let existing = vec![active_item(first.clone())];
-        let identities = active_queue_identity_set(&existing);
-
-        assert!(commit_path_already_queued(
-            &identities,
-            &temp.path.join(".").join("one.flac")
-        ));
-        assert!(!commit_path_already_queued(&identities, &second));
     }
 
 }

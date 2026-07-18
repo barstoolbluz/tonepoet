@@ -237,7 +237,7 @@ impl FilePickerState {
             }
 
             if action.is_none() {
-                let width = label.chars().count() as u16;
+                let width = crate::display_width::width(label) as u16;
                 spans.push(Span::styled(label.clone(), self.theme.border_dim));
                 x = x.saturating_add(width);
                 continue;
@@ -271,10 +271,10 @@ impl FilePickerState {
         let go_label = "Go";
         let go_width = button_width(go_label);
         let label = "Address:";
-        let input_x = area.x.saturating_add(label.chars().count() as u16 + 2);
+        let input_x = area.x.saturating_add(crate::display_width::width(label) as u16 + 2);
         let input_width = area
             .width
-            .saturating_sub(label.chars().count() as u16)
+            .saturating_sub(crate::display_width::width(label) as u16)
             .saturating_sub(go_width)
             .saturating_sub(3);
         let input = if self.address_editing {
@@ -561,8 +561,8 @@ impl FilePickerState {
         };
         let input_width = area
             .width
-            .saturating_sub(label.chars().count() as u16)
-            .saturating_sub(extension_badge.chars().count() as u16)
+            .saturating_sub(crate::display_width::width(label) as u16)
+            .saturating_sub(crate::display_width::width(&extension_badge) as u16)
             .saturating_sub(3) as usize;
         let input = text_with_caret(&self.save_name_buffer, self.save_name_cursor, input_width);
         let line = Line::from(vec![
@@ -572,7 +572,7 @@ impl FilePickerState {
             Span::styled(extension_badge, self.theme.text_dim),
         ]);
         frame.render_widget(Paragraph::new(line), area);
-        let input_x = area.x.saturating_add(label.chars().count() as u16 + 1);
+        let input_x = area.x.saturating_add(crate::display_width::width(label) as u16 + 1);
         let _ = self.record_hit_region_clipped(
             Rect::new(input_x, area.y, input_width as u16, 1),
             area,
@@ -590,7 +590,7 @@ impl FilePickerState {
         let save_label = "↵ Save";
         let save_width = button_width(save_label);
         let hint = "[Tab] list";
-        let available = area.width.saturating_sub(save_width).saturating_sub(hint.chars().count() as u16).saturating_sub(4) as usize;
+        let available = area.width.saturating_sub(save_width).saturating_sub(crate::display_width::width(hint) as u16).saturating_sub(4) as usize;
         let path_text = fit_text_right(&format!("→ {}", path.display()), available);
         let line = Line::from(vec![
             Span::styled(path_text, self.theme.text_dim),
@@ -616,7 +616,7 @@ impl FilePickerState {
         let mut spans = Vec::new();
         let mut x = area.x;
         spans.push(Span::styled(label.to_string(), self.theme.label));
-        x = x.saturating_add(label.chars().count() as u16);
+        x = x.saturating_add(crate::display_width::width(label) as u16);
         spans.push(Span::raw("  "));
         x = x.saturating_add(2);
 
@@ -1005,105 +1005,27 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     )
 }
 
-// The fit_text_* helpers measure DISPLAY COLUMNS (unicode-width), not chars:
-// a CJK glyph occupies two terminal cells, combining marks occupy none. Every
-// helper returns a string that renders to exactly `width` columns (padding
-// with spaces where a wide glyph cannot straddle the boundary), so callers can
-// rely on cell-exact layout.
-
-fn char_display_width(ch: char) -> usize {
-    use unicode_width::UnicodeWidthChar;
-    ch.width().unwrap_or(0)
-}
-
+// All display-column policy lives in `display_width`; these local aliases keep
+// the renderer call sites descriptive without duplicating Unicode logic.
+#[cfg(test)] // production call sites migrated to display_width; tests still assert through it
 fn text_display_width(text: &str) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    text.width()
-}
-
-fn pad_to_width(mut out: String, used: usize, width: usize) -> String {
-    if used < width {
-        out.push_str(&" ".repeat(width - used));
-    }
-    out
+    crate::display_width::width(text)
 }
 
 fn fit_text_left(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let ch_width = char_display_width(ch);
-        if used + ch_width > width {
-            break;
-        }
-        out.push(ch);
-        used += ch_width;
-    }
-    pad_to_width(out, used, width)
+    crate::display_width::fit_prefix(text, width)
 }
 
-/// Fit `text` into `width` keeping its beginning; overflow is marked with a
-/// trailing ellipsis. Use for name-like text where the prefix discriminates.
 fn fit_text_start(text: &str, width: usize) -> String {
-    if text_display_width(text) <= width {
-        return fit_text_left(text, width);
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "\u{2026}".to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let ch_width = char_display_width(ch);
-        if used + ch_width > width - 1 {
-            break;
-        }
-        out.push(ch);
-        used += ch_width;
-    }
-    out.push('\u{2026}');
-    pad_to_width(out, used + 1, width)
+    crate::display_width::fit_start(text, width)
 }
 
-/// Fit `text` into `width` keeping its end; overflow is marked with a leading
-/// ellipsis. Use for path-like text where the tail discriminates.
 fn fit_text_right(text: &str, width: usize) -> String {
-    if text_display_width(text) <= width {
-        return fit_text_left(text, width);
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "\u{2026}".to_string();
-    }
-    let mut tail: Vec<char> = Vec::new();
-    let mut used = 0;
-    for ch in text.chars().rev() {
-        let ch_width = char_display_width(ch);
-        if used + ch_width > width - 1 {
-            break;
-        }
-        tail.push(ch);
-        used += ch_width;
-    }
-    // Reverse iteration takes a combining mark before its base glyph; if the
-    // base then failed to fit, the kept suffix would start with an orphaned
-    // zero-width mark that visually attaches to the ellipsis. Drop such marks
-    // (they sit at the END of the reversed buffer = start of the suffix).
-    while tail.last().is_some_and(|ch| char_display_width(*ch) == 0) {
-        tail.pop();
-    }
-    let mut out = String::from('\u{2026}');
-    out.extend(tail.into_iter().rev());
-    pad_to_width(out, used + 1, width)
+    crate::display_width::fit_end(text, width)
 }
 
 fn button_width(label: &str) -> u16 {
-    label.chars().count().saturating_add(2) as u16
+    crate::display_width::width(label).saturating_add(2) as u16
 }
 
 fn button_span(label: &str, style: ratatui::style::Style) -> Span<'static> {
@@ -1210,8 +1132,8 @@ fn distribute_status(left: &str, center: &str, right: &str, width: usize) -> Str
         return fit_text_left(&leading, width);
     }
 
-    let leading_len = leading.chars().count();
-    let right_len = right.chars().count();
+    let leading_len = crate::display_width::width(&leading);
+    let right_len = crate::display_width::width(right);
     let minimum_gap = 3;
     if leading_len + minimum_gap + right_len > width {
         return fit_text_left(&format!("{leading}  |  {right}"), width);
@@ -1663,8 +1585,20 @@ mod tests {
     }
 
     fn find_text_last(buffer: &Buffer, text: &str, width: u16, height: u16) -> Option<(u16, u16)> {
-        let symbols = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
-        let text_width = u16::try_from(symbols.len()).ok()?;
+        let mut symbols: Vec<(usize, String)> = Vec::new();
+        let mut offset = 0usize;
+        for ch in text.chars() {
+            let ch_width = crate::display_width::char_width(ch);
+            if ch_width == 0 {
+                if let Some((_, symbol)) = symbols.last_mut() {
+                    symbol.push(ch);
+                }
+                continue;
+            }
+            symbols.push((offset, ch.to_string()));
+            offset = offset.saturating_add(ch_width);
+        }
+        let text_width = u16::try_from(offset).ok()?;
         if text_width == 0 || text_width > width {
             return None;
         }
@@ -1672,8 +1606,12 @@ mod tests {
             for x in 0..=width.saturating_sub(text_width) {
                 if symbols
                     .iter()
-                    .enumerate()
-                    .all(|(offset, symbol)| buffer.get(x.saturating_add(offset as u16), y).symbol() == symbol.as_str())
+                    .all(|(offset, symbol)| {
+                        buffer
+                            .get(x.saturating_add(*offset as u16), y)
+                            .symbol()
+                            == symbol.as_str()
+                    })
                 {
                     return Some((x, y));
                 }
@@ -1683,8 +1621,20 @@ mod tests {
     }
 
     fn find_text(buffer: &Buffer, text: &str, width: u16, height: u16) -> Option<(u16, u16)> {
-        let symbols = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
-        let text_width = u16::try_from(symbols.len()).ok()?;
+        let mut symbols: Vec<(usize, String)> = Vec::new();
+        let mut offset = 0usize;
+        for ch in text.chars() {
+            let ch_width = crate::display_width::char_width(ch);
+            if ch_width == 0 {
+                if let Some((_, symbol)) = symbols.last_mut() {
+                    symbol.push(ch);
+                }
+                continue;
+            }
+            symbols.push((offset, ch.to_string()));
+            offset = offset.saturating_add(ch_width);
+        }
+        let text_width = u16::try_from(offset).ok()?;
         if text_width == 0 || text_width > width {
             return None;
         }
@@ -1692,8 +1642,12 @@ mod tests {
             for x in 0..=width.saturating_sub(text_width) {
                 if symbols
                     .iter()
-                    .enumerate()
-                    .all(|(offset, symbol)| buffer.get(x.saturating_add(offset as u16), y).symbol() == symbol.as_str())
+                    .all(|(offset, symbol)| {
+                        buffer
+                            .get(x.saturating_add(*offset as u16), y)
+                            .symbol()
+                            == symbol.as_str()
+                    })
                 {
                     return Some((x, y));
                 }

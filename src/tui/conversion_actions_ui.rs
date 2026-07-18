@@ -38,31 +38,15 @@ use crate::tui::message::AppMessage;
 
 
 fn cell_width(value: &str) -> u16 {
-    Line::from(value.to_string()).width().min(u16::MAX as usize) as u16
+    super::display_width::width(value).min(u16::MAX as usize) as u16
 }
 
 fn truncate_to_cells(value: &str, max_width: u16) -> String {
-    let mut out = String::new();
-    let mut used = 0u16;
-    for ch in value.chars() {
-        let mut buf = [0u8; 4];
-        let rendered = ch.encode_utf8(&mut buf);
-        let width = cell_width(rendered);
-        if used.saturating_add(width) > max_width {
-            break;
-        }
-        out.push(ch);
-        used = used.saturating_add(width);
-    }
-    out
+    super::display_width::truncate_right(value, max_width as usize)
 }
 
-fn pad_to_cells(mut value: String, width: u16) -> String {
-    let used = cell_width(&value);
-    if used < width {
-        value.push_str(&" ".repeat(width.saturating_sub(used) as usize));
-    }
-    value
+fn pad_to_cells(value: String, width: u16) -> String {
+    super::display_width::pad_or_truncate(&value, width as usize, false)
 }
 
 fn fit_to_cells(value: &str, width: u16) -> String {
@@ -84,7 +68,7 @@ fn wrap_to_visual_rows(value: &str, width: u16) -> Vec<String> {
         for ch in raw.chars() {
             let mut buf = [0u8; 4];
             let rendered = ch.encode_utf8(&mut buf);
-            let width_for_char = cell_width(rendered).max(1);
+            let width_for_char = cell_width(rendered);
             if used > 0 && used.saturating_add(width_for_char) > width {
                 rows.push(fit_to_cells(&current, width));
                 current.clear();
