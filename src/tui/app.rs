@@ -3601,10 +3601,14 @@ impl FormatState {
     /// Record a DSD/PCM HINT for a source whose identity is not probe-proven
     /// (Empty mode, or a pending-probe placeholder where only the file
     /// extension is known). The hint drives row visibility, but the identity
-    /// is deliberately NOT promoted to Known: a fresh Unstaged state stays
-    /// permissive (presets can stage source-relative policy), and anything
-    /// else becomes Lost so a deliberate same-as-source selection is retained
-    /// disabled until a completed probe revalidates it.
+    /// is deliberately NOT promoted to Known. The guarantee this buys is
+    /// RETENTION: a deliberate same-as-source selection survives (disabled
+    /// under Lost) until a completed probe revalidates it, instead of being
+    /// clamped away by a guess. Note the Unstaged branch is narrow in
+    /// practice — staging paths run apply_source_defaults immediately after,
+    /// whose info-less arm degrades to Lost — so mid-probe preset staging of
+    /// a DSD source-rate still refuses until the probe completes; Unstaged
+    /// permissiveness holds only on a screen that never staged a source.
     pub fn set_pending_source_hint(&mut self, source_is_dsd_hint: bool) {
         self.source_is_dsd = source_is_dsd_hint;
         if self.source_rate_identity != SourceRateIdentity::Unstaged {

@@ -30421,10 +30421,13 @@ mod phase4_tests {
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
         let (tx, _rx) = mpsc::channel(4);
 
+        // ScrollUp specifically: with detail_cursor = 1, an UNGUARDED arm
+        // moves to 0 (ScrollDown at the last entry is refused by the bounds
+        // check even without the guard, so it cannot detect a regression).
         handle_metadata_editor_mouse(
             &mut app,
             crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::ScrollDown,
+                kind: crossterm::event::MouseEventKind::ScrollUp,
                 column: 5,
                 row: 5,
                 modifiers: KeyModifiers::NONE,
@@ -30478,6 +30481,41 @@ mod phase4_tests {
     }
 
     #[test]
+    fn import_cue_refuses_over_a_parked_editor_session() {
+        // Typing `:` inside the editor PARKS the session and clears the
+        // overlay before the command executes — the overlay-only guard let
+        // this route install a review that orphaned the parked dirty
+        // session. The guard must refuse on pending_metadata_editor too.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let state =
+            single_image_state(vec![entry("TITLE", ItemKey::TrackTitle, &["One"], &["Orig"])]);
+        app.pending_metadata_editor = Some(Box::new(state));
+        app.active_overlay = ActiveOverlay::None; // command-input Enter shape
+        let (tx, _rx) = mpsc::channel(4);
+
+        super::super::command::execute_command(
+            &mut app,
+            super::super::command::Command::ImportCue,
+            &tx,
+        );
+
+        assert!(
+            matches!(app.active_overlay, ActiveOverlay::None),
+            "no review may be installed over a parked session"
+        );
+        let parked = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("the parked session must survive");
+        assert!(parked.active_surface().dirty, "unsaved edits preserved");
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(message, _)| message.starts_with("import-cue:")),
+        );
+    }
+
+    #[test]
     fn review_click_commit_lands_on_the_row_the_edit_was_opened_on() {
         // Audit E-finding: a row click moved the review cursor under an open
         // inline edit, so Enter wrote the buffer to the NEW row. The click
@@ -30503,14 +30541,35 @@ mod phase4_tests {
             "New Album".to_string(),
         ));
 
-        commit_gnudb_review_edit_to_row(&mut state, 0);
-        state.cursor = 4;
+        // Drive the REAL mouse path (not the helper directly): headless
+        // terminal size falls back to 80x24, so the single-page review popup
+        // is 68x20 at (6,2); content starts at y=3 and visual row 4 (track
+        // 1's Title) is screen row 7.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::GnudbReview(Box::new(state));
+        let (tx, _rx) = mpsc::channel(4);
+        handle_generic_overlay_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: 10,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
 
+        let ActiveOverlay::GnudbReview(state) = &app.active_overlay else {
+            panic!("review must remain open");
+        };
         assert_eq!(
             state.pages[0].album, "New Album",
             "the buffer must land on the row the edit was opened on"
         );
-        assert!(state.edit_input.is_none());
+        assert!(state.edit_input.is_none(), "single click commits, not reseeds");
+        assert_eq!(state.cursor, 4, "the cursor moves to the clicked row");
         assert_eq!(
             state.pages[0].tracks[0].title, "T1",
             "the newly clicked row must be untouched"

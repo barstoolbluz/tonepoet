@@ -5355,7 +5355,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             // unsaved edit (and target files the editor never showed). Refuse
             // instead of parking: the designed editor<->review round-trip is
             // the :gnudb-back flow, which ImportCue does not implement.
-            if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+            //
+            // TWO shapes must refuse: the editor overlay itself, AND a parked
+            // editor session — typing `:` inside the editor parks the session
+            // into pending_metadata_editor and clears the overlay BEFORE this
+            // command executes, so checking only the overlay let the typed
+            // route install a review that orphaned the parked dirty session.
+            if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_))
+                || app.pending_metadata_editor.is_some()
+            {
                 app.set_status(
                     "import-cue: close the metadata editor first — unsaved edits are preserved",
                 );
@@ -12720,13 +12728,7 @@ fn expand_path(path: &str) -> String {
 /// Build a list of proposed changes by comparing CUE sheet metadata
 /// against the current tags in the metadata editor.
 /// CUE fields that can be imported, mapped to their tag display keys.
-const CUE_IMPORTABLE_FIELDS: &[&str] = &["TITLE", "ARTIST", "ALBUM", "TRACKNUMBER"];
 
-/// Check if a tag field has corresponding CUE data.
-pub fn is_cue_importable(field: &str) -> bool {
-    let upper = field.to_ascii_uppercase();
-    CUE_IMPORTABLE_FIELDS.iter().any(|&f| f == upper) || upper == "PERFORMER"
-}
 
 #[allow(dead_code)] // Legacy CUE diff flow; will be removed in cleanup.
 fn build_cue_diff(
