@@ -872,7 +872,8 @@ mod tests {
             expected_samples: Some(1_000),
             sample_rate: Some(2_822_400),
             bit_depth: None,
-        source_audio: SourceAudioDescriptor::default(),
+            source_audio: SourceAudioDescriptor::default(),
+            warnings: Vec::new(),
         }
     }
 

@@ -27,10 +27,96 @@ pub fn render_inline_text_field(
 ) -> Vec<Span<'static>> {
     let label_style = if focused { theme.bright() } else { theme.muted() };
     let value_width = width.saturating_sub(super::display_width::width(label));
-    vec![
-        Span::styled(label.to_string(), label_style),
-        render_inline_value(value, editing, input, focused, value_width, theme),
-    ]
+    let mut spans = vec![Span::styled(label.to_string(), label_style)];
+    spans.extend(render_inline_value(
+        value,
+        editing,
+        input,
+        focused,
+        value_width,
+        theme,
+    ));
+    spans
+}
+
+fn selection_style(theme: super::theme::Theme) -> Style {
+    // Deliberate inverse-video pair. `text_bright` is the selection surface,
+    // not the row-selection color, so selected text remains distinct from both
+    // the field background and its own background in light and dark palettes.
+    Style::default().fg(theme.bg).bg(theme.text_bright)
+}
+
+fn push_text(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
+        last.content.to_mut().push_str(text);
+    } else {
+        spans.push(Span::styled(text.to_string(), style));
+    }
+}
+
+fn render_editing_spans(
+    input: &TextInputState,
+    width: usize,
+    theme: super::theme::Theme,
+    embedded_cursor: bool,
+) -> Vec<Span<'static>> {
+    let width = width.max(1);
+    let (visible, cursor_col) = input.view(width);
+    let cursor_col = cursor_col as usize;
+    let cursor_absolute_col = input.cursor_display_col();
+    let scroll = cursor_absolute_col.saturating_sub(cursor_col);
+    let selection_cols = input.selection_range().map(|range| {
+        let start = super::display_width::width(&input.text[..range.start]);
+        let end = super::display_width::width(&input.text[..range.end]);
+        (start.saturating_sub(scroll), end.saturating_sub(scroll))
+    });
+    let normal = Style::default()
+        .fg(theme.text_bright)
+        .bg(theme.input_focused_bg);
+    let selected = selection_style(theme);
+    let cursor_style = selection_style(theme);
+
+    let mut spans = Vec::new();
+    let mut cell_col = 0usize;
+    for source_ch in visible.chars() {
+        let rendered_ch = if source_ch == '\n' || source_ch == '\r' {
+            '↵'
+        } else {
+            source_ch
+        };
+        let ch_width = super::display_width::char_width(rendered_ch);
+        if cell_col.saturating_add(ch_width) > width {
+            break;
+        }
+        let selected_cell = selection_cols.is_some_and(|(start, end)| {
+            ch_width > 0 && cell_col < end && cell_col.saturating_add(ch_width) > start
+        });
+        let cursor_cell = embedded_cursor
+            && ch_width > 0
+            && cursor_col >= cell_col
+            && cursor_col < cell_col.saturating_add(ch_width);
+        let style = if cursor_cell {
+            cursor_style
+        } else if selected_cell {
+            selected
+        } else {
+            normal
+        };
+        let mut encoded = [0u8; 4];
+        push_text(&mut spans, rendered_ch.encode_utf8(&mut encoded), style);
+        cell_col = cell_col.saturating_add(ch_width);
+    }
+
+    while cell_col < width {
+        let style = if embedded_cursor && cell_col == cursor_col {
+            cursor_style
+        } else {
+            normal
+        };
+        push_text(&mut spans, " ", style);
+        cell_col += 1;
+    }
+    spans
 }
 
 /// Render only the editable/display value portion of an inline field.
@@ -41,26 +127,17 @@ pub fn render_inline_value(
     focused: bool,
     width: usize,
     theme: super::theme::Theme,
-) -> Span<'static> {
-    let display = if editing {
-        let (view, _) = input.view(width.max(1));
-        pad_to_width(&view, width.max(1))
-    } else if value.is_empty() {
+) -> Vec<Span<'static>> {
+    if editing {
+        return render_editing_spans(input, width, theme, false);
+    }
+    let display = if value.is_empty() {
         truncate_to("(empty)", width)
     } else {
         truncate_to(value, width)
     };
-
-    let style = if editing {
-        Style::default()
-            .fg(theme.text_bright)
-            .bg(theme.input_focused_bg)
-    } else if focused {
-        theme.bright()
-    } else {
-        theme.text_style()
-    };
-    Span::styled(display, style)
+    let style = if focused { theme.bright() } else { theme.text_style() };
+    vec![Span::styled(display, style)]
 }
 
 
@@ -77,70 +154,7 @@ pub fn render_inline_value_with_embedded_cursor(
     width: usize,
     theme: super::theme::Theme,
 ) -> Vec<Span<'static>> {
-    let width = width.max(1);
-    let (visible, cursor_col) = input.view(width);
-    let cursor_col = cursor_col as usize;
-    let cursor_absolute_col = input.cursor_display_col();
-    let scroll = cursor_absolute_col.saturating_sub(cursor_col);
-    let selection_cols = input.selection_range().map(|range| {
-        let start = super::display_width::width(&input.text[..range.start]);
-        let end = super::display_width::width(&input.text[..range.end]);
-        (start.saturating_sub(scroll), end.saturating_sub(scroll))
-    });
-
-    let normal = Style::default()
-        .fg(theme.text_bright)
-        .bg(theme.input_focused_bg);
-    let selected = Style::default()
-        .fg(theme.bg)
-        .bg(theme.selection_bg);
-    let cursor_style = Style::default().fg(theme.bg).bg(theme.text_bright);
-
-    fn push_text(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
-        if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
-            last.content.to_mut().push_str(text);
-        } else {
-            spans.push(Span::styled(text.to_string(), style));
-        }
-    }
-
-    let mut spans = Vec::new();
-    let mut cell_col = 0usize;
-    for source_ch in visible.chars() {
-        let rendered_ch = if source_ch == '\n' || source_ch == '\r' {
-            '↵'
-        } else {
-            source_ch
-        };
-        let ch_width = super::display_width::char_width(rendered_ch);
-        if cell_col.saturating_add(ch_width) > width {
-            break;
-        }
-        let style = if ch_width > 0
-            && cursor_col >= cell_col
-            && cursor_col < cell_col.saturating_add(ch_width)
-        {
-            cursor_style
-        } else if let Some((start, end)) = selection_cols {
-            if ch_width > 0 && cell_col < end && cell_col.saturating_add(ch_width) > start {
-                selected
-            } else {
-                normal
-            }
-        } else {
-            normal
-        };
-        let mut encoded = [0u8; 4];
-        push_text(&mut spans, rendered_ch.encode_utf8(&mut encoded), style);
-        cell_col = cell_col.saturating_add(ch_width);
-    }
-
-    while cell_col < width {
-        let style = if cell_col == cursor_col { cursor_style } else { normal };
-        push_text(&mut spans, " ", style);
-        cell_col += 1;
-    }
-    spans
+    render_editing_spans(input, width, theme, true)
 }
 
 /// Render a complete labelled inline row with an embedded cursor cell.
@@ -167,10 +181,6 @@ fn truncate_to(s: &str, max_chars: usize) -> String {
     super::display_width::truncate_right(s, max_chars)
 }
 
-fn pad_to_width(s: &str, width: usize) -> String {
-    super::display_width::pad_or_truncate(s, width, false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,16 +189,18 @@ mod tests {
     fn editing_value_is_padded_to_keep_cursor_cell_visible() {
         let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
         let input = TextInputState::new("abc".to_string());
-        let span = render_inline_value("ignored", true, &input, true, 5, theme);
-        assert_eq!(span.content.as_ref(), "abc  ");
+        let spans = render_inline_value("ignored", true, &input, true, 5, theme);
+        let rendered = spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert_eq!(rendered, "abc  ");
     }
 
     #[test]
     fn empty_nonediting_value_is_explicit() {
         let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
         let input = TextInputState::empty();
-        let span = render_inline_value("", false, &input, false, 20, theme);
-        assert_eq!(span.content.as_ref(), "(empty)");
+        let spans = render_inline_value("", false, &input, false, 20, theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "(empty)");
     }
 
     #[test]
@@ -225,4 +237,56 @@ mod tests {
             .expect("cursor cell should be rendered with inverted style");
         assert_eq!(cursor_span.content.as_ref(), " ");
     }
+    fn relative_luminance(color: ratatui::style::Color) -> f64 {
+        let (r, g, b) = crate::tui::theme::rgb_tuple(color);
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+
+    fn contrast(left: ratatui::style::Color, right: ratatui::style::Color) -> f64 {
+        let left = relative_luminance(left);
+        let right = relative_luminance(right);
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
+    #[test]
+    fn inverse_selection_pair_clears_contrast_thresholds_in_every_builtin_theme() {
+        for palette in crate::tui::theme::palettes() {
+            let theme = crate::tui::theme::Theme::from_palette(palette);
+            assert!(
+                contrast(theme.bg, theme.text_bright) >= 4.5,
+                "{} selected text contrast was {}",
+                palette.slug,
+                contrast(theme.bg, theme.text_bright)
+            );
+            assert!(
+                contrast(theme.text_bright, theme.input_focused_bg) >= 3.0,
+                "{} selection surface contrast was {}",
+                palette.slug,
+                contrast(theme.text_bright, theme.input_focused_bg)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cursor_inline_renderer_paints_select_all() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let input = TextInputState::new_selected("replace me".to_string());
+        let spans = render_inline_value("replace me", true, &input, true, 12, theme);
+        assert!(spans.iter().any(|span| {
+            span.content.contains("replace me")
+                && span.style.fg == Some(theme.bg)
+                && span.style.bg == Some(theme.text_bright)
+        }));
+    }
+
 }

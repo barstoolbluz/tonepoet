@@ -378,7 +378,8 @@ fn build_page_rows(tracks: &[super::app::GnudbReviewTrack]) -> Vec<super::app::G
 pub fn populate_editor_from_review(
     state: &mut super::app::MetadataEditorState,
     review: &super::app::GnudbReviewState,
-) {
+) -> super::probe::MetadataMutationReport {
+    let before_entries = state.active_surface().entries.clone();
     let n = state.active_surface().paths.len();
 
     // Single-image detection: one file, one page (no multi-disc), more
@@ -422,6 +423,8 @@ pub fn populate_editor_from_review(
             original: String::new(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![String::new(); dim],
             per_file_originals: vec![String::new(); dim],
             mb_proposed_value: None,
@@ -459,7 +462,11 @@ pub fn populate_editor_from_review(
 
     if per_track_populate {
         state.active_surface_mut().entries[title_idx].row_scope = super::probe::RowScope::Track;
+        state.active_surface_mut().entries[title_idx]
+            .clear_stored_value_provenance();
         state.active_surface_mut().entries[artist_idx].row_scope = super::probe::RowScope::Track;
+        state.active_surface_mut().entries[artist_idx]
+            .clear_stored_value_provenance();
         super::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[title_idx], track_dim);
         super::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[artist_idx], track_dim);
     }
@@ -546,6 +553,10 @@ pub fn populate_editor_from_review(
     }
 
     state.active_surface_mut().dirty = true;
+    super::probe::MetadataMutationReport::between(
+        &before_entries,
+        &state.active_surface().entries,
+    )
 }
 
 /// Group audio file paths by parent directory (disc detection).
@@ -789,6 +800,8 @@ mod gnudb_per_track_tests {
             original: String::new(),
             is_binary: true,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![text.to_string()],
             per_file_originals: vec![String::new()],
             mb_proposed_value: None,
@@ -966,6 +979,51 @@ mod gnudb_per_track_tests {
             album.per_file_values,
             vec!["Disc 1", "Disc 1", "Disc 2", "Disc 2"]
         );
+    }
+
+    #[test]
+    fn gnudb_population_reports_multi_value_carrier_loss_positionally() {
+        let (mut state, _td) = empty_state(2);
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
+            display_key: "ARTIST".to_string(),
+            item_key: lofty::tag::ItemKey::TrackArtist,
+            value: "<multiple values>".to_string(),
+            original: "<multiple values>".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2, 1],
+            per_file_values: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            per_file_originals: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+        let r = review(
+            vec![page(
+                "Album",
+                "",
+                "",
+                vec![
+                    track(1, "T1", "New Artist", 0),
+                    track(2, "T2", "New Scalar", 1),
+                ],
+            )],
+            state.active_surface().paths.clone(),
+        );
+
+        let report = populate_editor_from_review(&mut state, &r);
+
+        let artist = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ARTIST")
+            .expect("ARTIST entry");
+        assert_eq!(artist.per_file_values, vec!["New Artist", "New Scalar"]);
+        assert_eq!(report.collapsed_carrier_count(), 1);
+        assert_eq!(report.collapsed_fields[0].display_key, "ARTIST");
+        assert_eq!(report.collapsed_fields[0].slots, vec![0]);
     }
 
     #[test]

@@ -2392,6 +2392,7 @@ fn append_title_tracks(
             sample_rate: audio_facts.sample_rate,
             source_audio,
             bit_depth: audio_facts.bit_depth.map(u32::from),
+            warnings: Vec::new(),
         });
     }
     Ok(())
@@ -2576,6 +2577,7 @@ fn prepared_track_from_samg_track(
         sample_rate: audio_facts.sample_rate,
         source_audio,
         bit_depth: audio_facts.bit_depth.map(u32::from),
+        warnings: Vec::new(),
     })
 }
 
@@ -4293,6 +4295,7 @@ mod tests {
                 Some(SourceAudioCoding::DvdaUnknown),
             ),
             bit_depth: Some(24),
+            warnings: Vec::new(),
         }
     }
 
@@ -7244,6 +7247,7 @@ mod tests {
             sample_rate: None,
             source_audio: SourceAudioDescriptor::default(),
             bit_depth: None,
+            warnings: Vec::new(),
         }
     }
 

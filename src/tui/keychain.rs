@@ -19,37 +19,46 @@ struct KeychainFile {
     passwords: Vec<String>,
 }
 
-pub fn load_keychain() -> Result<Vec<String>, String> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeychainLoadResult {
+    pub passwords: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+pub fn load_keychain_with_warnings() -> Result<KeychainLoadResult, String> {
     load_keychain_from_path(&keychain_path())
 }
 
-fn load_keychain_from_path(path: &Path) -> Result<Vec<String>, String> {
+fn load_keychain_from_path(path: &Path) -> Result<KeychainLoadResult, String> {
     let (_lock, target_path) = crate::config::StoreFileLock::acquire_for_path(path)
         .map_err(|error| format!("lock archive-password reference store '{}': {error}", path.display()))?;
     load_keychain_from_locked_path(&target_path)
 }
 
-fn load_keychain_from_locked_path(path: &Path) -> Result<Vec<String>, String> {
+fn load_keychain_from_locked_path(path: &Path) -> Result<KeychainLoadResult, String> {
     let mut file = load_reconciled_file(path)?;
     if !file.passwords.is_empty() {
         file = migrate_legacy_file(path, file)?;
     }
 
-    resolve_references(file.references)
+    Ok(resolve_references(file.references))
 }
 
-fn resolve_references(references: Vec<String>) -> Result<Vec<String>, String> {
-    let mut passwords = Vec::with_capacity(references.len());
+fn resolve_references(references: Vec<String>) -> KeychainLoadResult {
+    let mut result = KeychainLoadResult {
+        passwords: Vec::with_capacity(references.len()),
+        warnings: Vec::new(),
+    };
     for reference in references {
-        let password = crate::secret_store::get(&reference).map_err(|error| {
-            format!(
-                "archive-password reference '{}' could not be resolved: {}",
+        match crate::secret_store::get(&reference) {
+            Ok(password) => result.passwords.push(password),
+            Err(error) => result.warnings.push(format!(
+                "Skipped archive-password reference '{}': {}",
                 reference, error
-            )
-        })?;
-        passwords.push(password);
+            )),
+        }
     }
-    Ok(passwords)
+    result
 }
 
 fn load_file(path: &Path) -> Result<KeychainFile, String> {
@@ -503,24 +512,26 @@ mod tests {
 
 
     #[test]
-    fn reference_file_with_unavailable_secret_is_an_explicit_load_error() {
+    fn reference_file_skips_only_the_unavailable_secret() {
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("passwords.toml");
+        let valid = crate::secret_store::allocate_reference();
+        crate::secret_store::set(&valid, "available-secret").expect("store valid secret");
         std::fs::write(
             &path,
-            r#"references = ["archive-password:missing-mru-reference"]
-"#,
+            format!(
+                "references = [\"{}\", \"archive-password:missing-mru-reference\"]\n",
+                valid
+            ),
         )
         .expect("write reference file");
 
-        let error = load_keychain_from_path(&path)
-            .expect_err("unavailable MRU reference must not become an empty list");
+        let result = load_keychain_from_path(&path).expect("valid references remain usable");
 
-        assert_eq!(
-            error,
-            "archive-password reference 'archive-password:missing-mru-reference' could not be resolved: archive-password secret store read failed: reference 'archive-password:missing-mru-reference' is unavailable in the opt-in test backend. No cleartext fallback was used"
-        );
+        assert_eq!(result.passwords, vec!["available-secret"]);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("archive-password:missing-mru-reference"));
     }
 
     #[cfg(unix)]
@@ -623,17 +634,16 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_reference_is_an_explicit_error_not_an_empty_mru() {
+    fn unavailable_reference_is_a_visible_per_entry_warning() {
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let reference = "archive-password:missing-reference".to_string();
 
-        let error = resolve_references(vec![reference.clone()])
-            .expect_err("missing reference must fail closed");
+        let result = resolve_references(vec![reference.clone()]);
 
-        assert_eq!(
-            error,
-            "archive-password reference 'archive-password:missing-reference' could not be resolved: archive-password secret store read failed: reference 'archive-password:missing-reference' is unavailable in the opt-in test backend. No cleartext fallback was used"
-        );
+        assert!(result.passwords.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains(&reference));
+        assert!(result.warnings[0].contains("No cleartext fallback was used"));
     }
 
     #[test]
@@ -800,7 +810,8 @@ mod tests {
         let passwords = load_keychain_from_path(&path)
             .expect("reconcile orphan and retry migration");
 
-        assert_eq!(passwords, vec!["legacy-after-crash"]);
+        assert_eq!(passwords.passwords, vec!["legacy-after-crash"]);
+        assert!(passwords.warnings.is_empty());
         assert!(crate::secret_store::get(&orphan).is_err());
         let migrated = load_file(&path).expect("parse migrated reference file");
         assert_eq!(migrated.references.len(), 1);

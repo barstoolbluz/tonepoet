@@ -1740,6 +1740,10 @@ fn draw_browse_list(
     ));
 
     let mut rename_cursor: Option<(usize, u16)> = None;
+    let create_input = inline_edit.and_then(|state| match &state.target {
+        BrowseInlineEditTarget::Create { dir, .. } if dir == &browse.current_dir => Some(&state.input),
+        _ => None,
+    });
 
     if let Some(err) = &browse.error {
         lines.push(bordered_line(
@@ -1753,21 +1757,38 @@ fn draw_browse_list(
             lines.push(empty_bordered_line(border_color, w, theme));
         }
     } else if browse.entries.is_empty() {
-        let msg = if browse.scan_pending.is_some() {
-            "   Loading..."
+        if let Some(input) = create_input {
+            rename_cursor = Some((0, inline_cursor_col(input, name_w)));
+            lines.push(render_browse_create_line(
+                border_color,
+                w,
+                name_w,
+                input,
+                theme,
+            ));
         } else {
-            "   (empty)"
-        };
-        lines.push(bordered_line(
-            border_color,
-            w,
-            vec![Span::styled(msg, theme.muted())], theme));
+            let msg = if browse.scan_pending.is_some() {
+                "   Loading..."
+            } else {
+                "   (empty)"
+            };
+            lines.push(bordered_line(
+                border_color,
+                w,
+                vec![Span::styled(msg, theme.muted())],
+                theme,
+            ));
+        }
         for _ in 1..content_height {
             lines.push(empty_bordered_line(border_color, w, theme));
         }
     } else {
         let start = browse.scroll_offset;
-        let end = (start + content_height).min(browse.entries.len());
+        // A create prompt is an active editor, not optional decoration. Reserve
+        // one list row so it remains visible even when the directory fills the
+        // viewport; otherwise typing would edit an off-screen field.
+        let entry_capacity = content_height.saturating_sub(usize::from(create_input.is_some()));
+        let end = (start + entry_capacity).min(browse.entries.len());
 
         for i in start..end {
             let entry = &browse.entries[i];
@@ -1796,7 +1817,20 @@ fn draw_browse_list(
                 is_hovered, theme));
         }
 
-        let rendered = end - start;
+        let mut rendered = end - start;
+        if let Some(input) = create_input {
+            if rendered < content_height {
+                rename_cursor = Some((rendered, inline_cursor_col(input, name_w)));
+                lines.push(render_browse_create_line(
+                    border_color,
+                    w,
+                    name_w,
+                    input,
+                    theme,
+                ));
+                rendered += 1;
+            }
+        }
         for _ in rendered..content_height {
             lines.push(empty_bordered_line(border_color, w, theme));
         }
@@ -1844,6 +1878,23 @@ fn draw_browse_list(
         let cursor_y = browse_entry_y_start(area, browse.search.active) + row as u16;
         f.set_cursor(cursor_x, cursor_y);
     }
+}
+
+
+fn render_browse_create_line(
+    border_color: ratatui::style::Color,
+    width: usize,
+    name_width: usize,
+    input: &TextInputState,
+    theme: super::theme::Theme,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(ROW_PREFIX))];
+    spans.extend(render_inline_value_with_embedded_cursor(
+        input,
+        name_width,
+        theme,
+    ));
+    bordered_line(border_color, width, spans, theme)
 }
 
 /// Render the column header row with sort indicator (▲/▼) on the active column.
@@ -4336,9 +4387,11 @@ mod path_field_render_tests {
 
         assert!(rendered.starts_with(" path: Music/Album"));
         assert_eq!(cursor_col, crate::tui::display_width::width(" path: Music/Al") as u16);
+        // P1-1 selection contrast: the inverse-video pair (theme.bg text on
+        // a text_bright surface), not the old low-contrast selection_bg.
         assert!(spans.iter().any(|span| {
             span.content.as_ref().contains("Al")
-                && span.style.bg == Some(theme.selection_bg)
+                && span.style.bg == Some(theme.text_bright)
                 && span.style.fg == Some(theme.bg)
         }));
     }

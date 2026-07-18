@@ -348,18 +348,38 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
         ];
         f.render_widget(Paragraph::new(error_lines), kc_inner);
     } else if app.keychain.passwords.is_empty() {
-        let empty_lines = vec![
-            Line::from(Span::styled("  No saved passwords", theme.muted())),
-            Line::from(Span::styled(
+        let mut empty_lines = Vec::new();
+        if let Some(warning) = app.keychain.load_warning.as_ref() {
+            empty_lines.push(Line::from(Span::styled(
+                format!("  Warning: {warning}"),
+                Style::default().fg(theme.amber),
+            )));
+        }
+        empty_lines.push(Line::from(Span::styled("  No saved passwords", theme.muted())));
+        if empty_lines.len() < kc_inner.height as usize {
+            empty_lines.push(Line::from(Span::styled(
                 "  Press 'a' to add a password",
                 theme.muted(),
-            )),
-        ];
+            )));
+        }
         f.render_widget(Paragraph::new(empty_lines), kc_inner);
     } else {
-        let visible_rows = kc_inner.height as usize;
+        let warning_rows = usize::from(app.keychain.load_warning.is_some());
+        let visible_rows = (kc_inner.height as usize).saturating_sub(warning_rows).max(1);
         let total = app.keychain.passwords.len();
         let selected = app.keychain.selected.min(total.saturating_sub(1));
+
+        if let Some(warning) = app.keychain.load_warning.as_ref() {
+            let warning_area = ratatui::layout::Rect::new(kc_inner.x, kc_inner.y, kc_inner.width, 1);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("  Warning: {warning}"),
+                    Style::default().fg(theme.amber),
+                )),
+                warning_area,
+            );
+        }
+        let row_offset = warning_rows as u16;
 
         // Simple scroll to keep selected in view.
         let scroll = if selected >= visible_rows {
@@ -392,7 +412,7 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
             };
 
             let row_area =
-                ratatui::layout::Rect::new(kc_inner.x, kc_inner.y + row as u16, kc_inner.width, 1);
+                ratatui::layout::Rect::new(kc_inner.x, kc_inner.y + row_offset + row as u16, kc_inner.width, 1);
             f.render_widget(Paragraph::new(Span::styled(display, style)), row_area);
         }
     }

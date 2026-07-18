@@ -237,6 +237,7 @@ impl Materializer for CueImageMaterializer {
                     probe.bit_depth,
                     Some(probe.coding),
                 ),
+                warnings: Vec::new(),
             });
         }
 

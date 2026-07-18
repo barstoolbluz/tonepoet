@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use super::button_map::{ButtonRenderMap, TuiButton};
+use super::inline_edit::render_inline_value;
 use super::text_input::{handle_text_input_key, TextInputState};
 use super::theme::{
     self, BuilderSlot, ColorDepth, NamedSwatch, ThemeApplyOptions, ThemeDraftSource,
@@ -1838,7 +1839,7 @@ fn draw_edit_card(f: &mut Frame, area: Rect, state: &ThemeBuilderState, button_m
         Line::raw(""),
         swatch_summary_line(color, Some((r, g, b)), theme),
         Line::raw(""),
-        hex_line("Hex", &state.hex_input.text, state.editor_focus == BuilderEditorFocus::Hex, true, theme),
+        hex_line("Hex", &state.hex_input, state.editor_focus == BuilderEditorFocus::Hex, true, theme),
         slider_line("R", state.rgb_values[0], 0, state.editor_focus == BuilderEditorFocus::Red, true, theme),
         slider_line("G", state.rgb_values[1], 1, state.editor_focus == BuilderEditorFocus::Green, true, theme),
         slider_line("B", state.rgb_values[2], 2, state.editor_focus == BuilderEditorFocus::Blue, true, theme),
@@ -1913,7 +1914,7 @@ fn draw_derived_card(f: &mut Frame, area: Rect, state: &ThemeBuilderState, butto
         Line::raw(""),
         swatch_summary_line(color, None, theme),
         Line::raw(""),
-        hex_line("Hex", &state.derived_hex_input.text, state.editor_focus == BuilderEditorFocus::Hex, locked, theme),
+        hex_line("Hex", &state.derived_hex_input, state.editor_focus == BuilderEditorFocus::Hex, locked, theme),
         slider_line("R", r, 0, state.editor_focus == BuilderEditorFocus::Red, locked, theme),
         slider_line("G", g, 1, state.editor_focus == BuilderEditorFocus::Green, locked, theme),
         slider_line("B", b, 2, state.editor_focus == BuilderEditorFocus::Blue, locked, theme),
@@ -1950,13 +1951,38 @@ fn framed_swatch(color: Color, theme: theme::Theme) -> Vec<Span<'static>> {
     ]
 }
 
-fn hex_line(label: &str, text: &str, focused: bool, editable: bool, theme: theme::Theme) -> Line<'static> {
-    let style = if editable { input_style(focused, theme) } else { Style::default().fg(theme.text_dim).bg(theme.input_disabled_bg) };
-    Line::from(vec![
+fn hex_line(
+    label: &str,
+    input: &TextInputState,
+    focused: bool,
+    editable: bool,
+    theme: theme::Theme,
+) -> Line<'static> {
+    let mut spans = vec![
         focus_mark(focused && editable, theme),
         Span::styled(format!("{label:<4}"), Style::default().fg(theme.label)),
-        Span::styled(format!("[ {:<7} ]", text), style),
-    ])
+        Span::styled("[ ", if editable { input_style(focused, theme) } else { Style::default().fg(theme.text_dim).bg(theme.input_disabled_bg) }),
+    ];
+    if editable {
+        spans.extend(render_inline_value(
+            &input.text,
+            focused,
+            input,
+            focused,
+            7,
+            theme,
+        ));
+    } else {
+        spans.push(Span::styled(
+            format!("{:<7}", input.text),
+            Style::default().fg(theme.text_dim).bg(theme.input_disabled_bg),
+        ));
+    }
+    spans.push(Span::styled(
+        " ]",
+        if editable { input_style(focused, theme) } else { Style::default().fg(theme.text_dim).bg(theme.input_disabled_bg) },
+    ));
+    Line::from(spans)
 }
 
 fn slider_line(label: &str, value: u8, channel: usize, focused: bool, editable: bool, theme: theme::Theme) -> Line<'static> {
@@ -1984,10 +2010,16 @@ fn swatches_inline_row(state: &ThemeBuilderState, theme: theme::Theme) -> Line<'
     let mut spans = vec![Span::styled("  Swatches ", Style::default().fg(theme.label))];
     if state.swatch_naming_active {
         spans.push(Span::styled("Name ", Style::default().fg(theme.text_dim)));
-        spans.push(Span::styled(
-            format!("[ {:<18} ]", truncate_chars(&state.swatch_name_input.text, 18)),
-            input_style(true, theme),
+        spans.push(Span::styled("[ ", input_style(true, theme)));
+        spans.extend(render_inline_value(
+            &state.swatch_name_input.text,
+            true,
+            &state.swatch_name_input,
+            true,
+            18,
+            theme,
         ));
+        spans.push(Span::styled(" ]", input_style(true, theme)));
         spans.push(Span::styled(" Enter save · Esc cancel", Style::default().fg(theme.text_dim)));
         return Line::from(spans);
     }
@@ -2130,13 +2162,29 @@ fn draw_gallery_overlay(f: &mut Frame, state: &ThemeBuilderState, button_map: &m
         .split(inner);
     let built_in_count = state.theme_library.iter().filter(|choice| choice.built_in).count();
     let custom_count = state.theme_library.len().saturating_sub(built_in_count);
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(format!("Mode {} Dark  {} Light", if state.gallery_dark { LOCK_MARK } else { AUTO_MARK }, if state.gallery_dark { AUTO_MARK } else { LOCK_MARK }), Style::default().fg(theme.warning)),
         Span::raw("      "),
         Span::styled(format!("{built_in_count} built-in · {custom_count} custom"), Style::default().fg(theme.text_dim)),
         Span::raw("      "),
-        Span::styled(format!("/ {}", state.gallery_filter_input.text), if state.gallery_filter_active { input_style(true, theme) } else { Style::default().fg(theme.text_dim) }),
-    ]);
+        Span::styled("/ ", if state.gallery_filter_active { input_style(true, theme) } else { Style::default().fg(theme.text_dim) }),
+    ];
+    if state.gallery_filter_active {
+        header_spans.extend(render_inline_value(
+            &state.gallery_filter_input.text,
+            true,
+            &state.gallery_filter_input,
+            true,
+            18,
+            theme,
+        ));
+    } else {
+        header_spans.push(Span::styled(
+            state.gallery_filter_input.text.clone(),
+            Style::default().fg(theme.text_dim),
+        ));
+    }
+    let header = Line::from(header_spans);
     f.render_widget(Paragraph::new(vec![header, Line::raw("")]), chunks[0]);
     record_rect(button_map, TuiButton::ThemeBuilderGalleryMode, chunks[0].x, chunks[0].y, 22, 1);
     record_rect(button_map, TuiButton::ThemeBuilderGalleryFilter, chunks[0].x.saturating_add(chunks[0].width.saturating_sub(20)), chunks[0].y, 20, 1);
@@ -2319,10 +2367,22 @@ fn draw_theme_file_dialog(
     let lines = vec![
         Line::from(Span::styled(help, Style::default().fg(theme.text_dim))),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(format!("{label:<12} "), Style::default().fg(theme.label)),
-            Span::styled(format!("[ {} ]", truncate_chars(&input.text, max_path)), input_style(true, theme)),
-        ]),
+        {
+            let mut spans = vec![
+                Span::styled(format!("{label:<12} "), Style::default().fg(theme.label)),
+                Span::styled("[ ", input_style(true, theme)),
+            ];
+            spans.extend(render_inline_value(
+                &input.text,
+                true,
+                input,
+                true,
+                max_path,
+                theme,
+            ));
+            spans.push(Span::styled(" ]", input_style(true, theme)));
+            Line::from(spans)
+        },
         Line::raw(""),
         Line::from(vec![chip(action, theme.progress_dialog_button_bg, theme), Span::raw(" "), chip("Esc Cancel", theme.chip_dismiss, theme)]),
     ];

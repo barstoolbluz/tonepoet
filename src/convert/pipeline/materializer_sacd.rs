@@ -109,6 +109,7 @@ impl Materializer for SacdIsoMaterializer {
                     Some(SourceAudioCoding::Dsd),
                 ),
                 bit_depth: None,
+                warnings: Vec::new(),
             });
         }
 
@@ -593,6 +594,7 @@ pub(crate) mod test_support {
                     Some(SourceAudioCoding::Dsd),
                 ),
                 bit_depth: None,
+                warnings: Vec::new(),
             })
             .collect();
         apply_track_selection(tracks, &selection).map(|tracks| {

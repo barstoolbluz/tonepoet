@@ -86,6 +86,7 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 probe.bit_depth,
                 Some(probe.coding),
             ),
+            warnings: metadata_warnings,
         };
 
         let tracks = apply_track_selection(vec![track], &req.source.track_selection)?;
@@ -280,20 +281,59 @@ pub(crate) fn read_track_metadata_with_warnings(
         extra.insert("disctotal".to_string(), total.to_string());
     }
 
+    // Preserve every source text item with explicit provenance. The plain
+    // lowercased entry remains available to naming templates; the reserved
+    // marker lets the metadata writer distinguish user tags from derived
+    // pipeline extras and reproduce arbitrary custom keys without renaming.
+    let tag_type = tag.tag_type();
+    for item in tag.items() {
+        if let lofty::tag::ItemValue::Text(text) = item.value() {
+            let key = item_key_to_extra_key(item.key(), tag_type);
+            insert_source_text_tag(&mut extra, &key, text);
+        }
+    }
+    let pre_emphasis = source_text_tags_indicate_pre_emphasis(&extra);
+
     Ok((TrackMetadata {
         title: tag.title().map(|value| value.to_string()),
         artist: tag.artist().map(|value| value.to_string()),
         album_artist: tag
             .get_string(&lofty::tag::ItemKey::AlbumArtist)
             .map(|value| value.to_string()),
+        composer: tag
+            .get_string(&lofty::tag::ItemKey::Composer)
+            .map(|value| value.to_string()),
+        performer: tag
+            .get_string(&lofty::tag::ItemKey::Performer)
+            .map(|value| value.to_string()),
         genre: tag.genre().map(|value| value.to_string()),
         date: tag.year().map(|value| value.to_string()),
         track_number: tag.track().map(|value| value as u32),
         disc_number: tag.disk().map(|value| value as u32),
+        isrc: tag
+            .get_string(&lofty::tag::ItemKey::Isrc)
+            .map(|value| value.to_string()),
+        publisher: tag
+            .get_string(&lofty::tag::ItemKey::Publisher)
+            .map(|value| value.to_string()),
+        copyright: tag
+            .get_string(&lofty::tag::ItemKey::CopyrightMessage)
+            .map(|value| value.to_string()),
         comment: tag.comment().map(|value| value.to_string()),
+        pre_emphasis,
         extra,
-        ..TrackMetadata::default()
     }, Vec::new()))
+}
+
+fn item_key_to_extra_key(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
+    if let Some(mapped) = key.map_key(tag_type, true) {
+        return mapped.to_lowercase();
+    }
+
+    match key {
+        lofty::tag::ItemKey::Unknown(value) => value.to_lowercase(),
+        _ => format!("{key:?}").to_lowercase(),
+    }
 }
 
 fn apply_track_selection(
@@ -374,6 +414,50 @@ mod tests {
     }
 
     #[test]
+    fn source_text_items_preserve_custom_tag_provenance_and_promote_pre_emphasis() {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("source.flac");
+        std::fs::write(&path, include_bytes!("../../../tests/fixtures/silence.flac"))
+            .expect("write FLAC fixture");
+        let mut tagged = lofty::read_from_path(&path).expect("read FLAC fixture");
+        if tagged.primary_tag().is_none() {
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+        }
+        let tag = tagged.primary_tag_mut().expect("primary FLAC tag");
+        for (key, value) in [("PRE_EMPHASIS", "1"), ("MY_NOTE", "keep me")] {
+            let key = ItemKey::Unknown(key.to_string());
+            tag.remove_key(&key);
+            tag.insert_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+        tagged
+            .save_to_path(&path, WriteOptions::default())
+            .expect("save FLAC fixture tags");
+
+        let metadata = read_track_metadata(&path).expect("read source metadata");
+        assert!(metadata.pre_emphasis);
+        assert_eq!(metadata.extra.get("my_note").map(String::as_str), Some("keep me"));
+        assert_eq!(
+            metadata
+                .extra
+                .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}my_note"))
+                .map(String::as_str),
+            Some("keep me")
+        );
+        assert_eq!(
+            metadata
+                .extra
+                .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}pre_emphasis"))
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn corrupt_dsf_metadata_degrades_to_empty_metadata_for_conversion() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("corrupt.dsf");
@@ -425,6 +509,7 @@ mod tests {
             sample_rate: Some(44_100),
             bit_depth: Some(16),
             source_audio: SourceAudioDescriptor::default(),
+            warnings: Vec::new(),
         }
     }
 

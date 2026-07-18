@@ -442,7 +442,7 @@ impl StoreFileLock {
     }
 
     fn acquire(parent: &Path, target_path: &Path) -> anyhow::Result<Self> {
-        let lock_path = config_sidecar_path(parent, target_path, "save.lock");
+        let lock_path = store_lock_path(parent, target_path);
         validate_lock_path_before_open(&lock_path)?;
 
         let file = match open_store_lock(&lock_path, true) {
@@ -902,12 +902,45 @@ fn config_file_mode(_target_path: &Path) -> std::io::Result<u32> {
     Ok(0)
 }
 
-fn config_sidecar_path(parent: &Path, target_path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn native_os_str_sha256_hex(domain: &[u8], value: &std::ffi::OsStr) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        digest.update(value.as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in value.encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        digest.update(value.to_string_lossy().as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn store_lock_path(parent: &Path, target_path: &Path) -> PathBuf {
     let file_name = target_path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    parent.join(format!(".{file_name}.{suffix}"))
+        .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"));
+    let digest = native_os_str_sha256_hex(b"tonepoet-store-lock-path-v1\0", file_name);
+    parent.join(format!(".tonepoet-store-lock-{digest}.save.lock"))
+}
+
+pub(crate) fn store_lock_authority_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let target_path = resolve_config_save_target(path)?;
+    let parent = target_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(store_lock_path(parent, &target_path))
 }
 
 #[derive(Debug)]
@@ -1504,15 +1537,16 @@ fn reconcile_config_secret_publication_for_load_locked(
         &published_references,
     ) {
         Ok(()) => Ok(published_references),
-        Err(error) if error.is_backend_unavailable() => {
+        Err(error) => {
+            let journal = crate::secret_store::pending_publication_path(config_path);
             log::warn!(
-                "configuration loaded without reconciling archive-password publication journal '{}': {}; secret resolution remains lazy",
-                crate::secret_store::pending_publication_path(config_path).display(),
+                "configuration '{}' loaded without reconciling archive-password publication journal '{}': {}. To recover, repair or restore the config file, then retry; on a headless host use `tonepoet config --retire-secret-journal` to retire only the journal while accepting that unreachable secret entries may remain orphaned",
+                config_path.display(),
+                journal.display(),
                 error
             );
             Ok(published_references)
         }
-        Err(error) => Err(anyhow::Error::new(error)),
     }
 }
 
@@ -2613,7 +2647,7 @@ append_lineage_to_comment = false
                 .expect("subprocess ready marker"),
         );
         let parent = target.parent().expect("lock target parent");
-        let lock_path = config_sidecar_path(parent, &target, "save.lock");
+        let lock_path = store_lock_path(parent, &target);
         let file = open_store_lock(&lock_path, true).expect("create empty lock sidecar");
         fs2::FileExt::lock_exclusive(&file).expect("lock empty sidecar");
         std::fs::write(&ready, lock_path.to_string_lossy().as_bytes())
@@ -2667,7 +2701,7 @@ append_lineage_to_comment = false
             panic!("independent lock holder did not publish readiness");
         }
 
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
         let blocked = StoreFileLock::acquire_for_path(&target)
             .expect_err("independent holder must exclude this process")
             .to_string();
@@ -2694,7 +2728,7 @@ append_lineage_to_comment = false
     fn store_lock_marker_is_created_once_and_existing_marker_is_not_rewritten() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("config.toml");
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
 
         {
             let (_lock, resolved) = StoreFileLock::acquire_for_path(&target)
@@ -2723,7 +2757,7 @@ append_lineage_to_comment = false
     fn store_lock_adopts_an_unlocked_empty_sidecar_after_creator_death() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("config.toml");
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
         std::fs::File::create(&lock_path).expect("create abandoned empty sidecar");
 
         let (_lock, resolved) = StoreFileLock::acquire_for_path(&target)
@@ -2742,7 +2776,7 @@ append_lineage_to_comment = false
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("config.toml");
         let ready = temp.path().join("empty-child-ready");
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
         let executable = std::env::current_exe().expect("current test executable");
         let mut child = std::process::Command::new(executable)
             .arg("--ignored")
@@ -2808,7 +2842,7 @@ append_lineage_to_comment = false
     fn failed_new_lock_marker_initialization_retains_one_lock_inode() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("config.toml");
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
         TEST_LOCK_MARKER_SYNC_FAILURE.with(|slot| {
             *slot.borrow_mut() = Some("synthetic lock-parent sync failure".to_string());
         });
@@ -2843,7 +2877,7 @@ append_lineage_to_comment = false
     fn store_lock_rejects_unrecognized_regular_file_without_rewriting_it() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("config.toml");
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
         std::fs::write(&lock_path, b"unrelated regular-file bytes")
             .expect("write unrelated lock-path object");
 
@@ -2869,7 +2903,7 @@ append_lineage_to_comment = false
 
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("config.toml");
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
         let victim = temp.path().join("victim.txt");
         std::fs::write(&victim, b"authoritative victim bytes").expect("write victim");
         symlink(&victim, &lock_path).expect("create hostile lock symlink");
@@ -2895,7 +2929,7 @@ append_lineage_to_comment = false
     fn store_lock_rejects_hard_link_without_touching_its_other_name() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("config.toml");
-        let lock_path = temp.path().join(".config.toml.save.lock");
+        let lock_path = store_lock_path(temp.path(), &target);
         let victim = temp.path().join("victim.txt");
         std::fs::write(&victim, b"hard-linked victim bytes").expect("write victim");
         std::fs::hard_link(&victim, &lock_path).expect("create hostile lock hard link");
@@ -3015,6 +3049,27 @@ append_lineage_to_comment = false
             loaded.conversion.archive_password_ref.as_deref(),
             Some("archive-password:missing-config-reference")
         );
+    }
+
+    #[test]
+    fn config_load_degrades_on_malformed_pending_secret_journal_and_retains_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let config = TonepoetConfig::default();
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .expect("write config");
+        let journal = crate::secret_store::pending_publication_path(&path);
+        std::fs::write(&journal, b"{malformed").expect("write malformed journal");
+
+        let loaded = TonepoetConfig::load_from_path(&path)
+            .expect("load must degrade rather than brick startup");
+
+        assert_eq!(loaded.conversion.archive_password, None);
+        assert_eq!(loaded.conversion.archive_password_ref, None);
+        assert_eq!(std::fs::read(&journal).expect("journal retained"), b"{malformed");
     }
 
     #[test]
@@ -3624,7 +3679,7 @@ append_lineage_to_comment = false
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("config.toml");
         let stale_tmp = temp.path().join(".config.toml.tmp.crashed.1");
-        let lock = temp.path().join(".config.toml.save.lock");
+        let lock = store_lock_path(temp.path(), &path);
         std::fs::write(&stale_tmp, b"archive_password = secret\n").expect("stale temp");
         let legacy_marker = format!("pid=4242 target={}\n", path.display());
         std::fs::write(&lock, legacy_marker.as_bytes())
@@ -3661,7 +3716,7 @@ append_lineage_to_comment = false
             error.to_string(),
             format!(
                 "timed out after 2000 ms waiting for store update lock: {}",
-                temp.path().join(".config.toml.save.lock").display()
+                store_lock_path(temp.path(), &path).display()
             )
         );
         assert!(active_tmp.exists(), "must not clean active temp files while another saver owns the OS lock");

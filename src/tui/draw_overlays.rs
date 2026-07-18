@@ -7673,6 +7673,8 @@ mod tests {
             original: value.to_string(),
             is_binary: false,
             is_mixed: per_file_values.len() > 1,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: per_file_values.iter().map(|v| (*v).to_string()).collect(),
             per_file_originals: per_file_values.iter().map(|v| (*v).to_string()).collect(),
             mb_proposed_value: None,

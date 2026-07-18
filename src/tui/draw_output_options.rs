@@ -273,22 +273,16 @@ pub fn draw_output_options_pane(
         .unwrap_or_default();
     let dest_label_style = if is_dest_focused { theme.bright() } else { theme.muted() };
     let dest_value_w = w.saturating_sub(2 + "   dest        ".len());
-    let dest_row = bordered_line(
-        border_color,
-        w,
-        vec![
-            Span::styled("   dest        ", dest_label_style),
-            render_inline_value(
-                &dest_display,
-                is_editing(OutputOptionsField::DestPath),
-                &opts.edit_input,
-                is_dest_focused,
-                dest_value_w,
-                theme,
-            ),
-        ],
+    let mut dest_spans = vec![Span::styled("   dest        ", dest_label_style)];
+    dest_spans.extend(render_inline_value(
+        &dest_display,
+        is_editing(OutputOptionsField::DestPath),
+        &opts.edit_input,
+        is_dest_focused,
+        dest_value_w,
         theme,
-    );
+    ));
+    let dest_row = bordered_line(border_color, w, dest_spans, theme);
 
     // Folder template
     let folder_label_style = if is_folder_focused { theme.bright() } else { theme.muted() };
@@ -522,15 +516,11 @@ fn field_row<'a>(
 ) -> Line<'a> {
     let label_style = if focused { theme.bright() } else { theme.muted() };
     let value_w = width.saturating_sub(2 + label.len());
-    bordered_line(
-        border_color,
-        width,
-        vec![
-            Span::styled(label, label_style),
-            render_inline_value(value, editing, input, focused, value_w, theme),
-        ],
-        theme,
-    )
+    let mut spans = vec![Span::styled(label, label_style)];
+    spans.extend(render_inline_value(
+        value, editing, input, focused, value_w, theme,
+    ));
+    bordered_line(border_color, width, spans, theme)
 }
 
 pub fn output_options_actions_summary(
@@ -711,7 +701,7 @@ fn template_row_with_value_span<'a>(
     border_color: ratatui::style::Color,
     width: usize,
     label: &'a str,
-    value_span: Span<'static>,
+    value_spans: Vec<Span<'static>>,
     label_style: Style,
     load_pill: Span<'a>,
     build_pill: Span<'a>,
@@ -723,8 +713,8 @@ fn template_row_with_value_span<'a>(
     let mut spans = vec![
         Span::styled("│", theme.border(border_color)),
         Span::styled(label, label_style),
-        value_span,
     ];
+    spans.extend(value_spans);
 
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
     let pills_total = load_w + 1 + build_w; // pills + gap

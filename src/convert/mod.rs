@@ -1099,8 +1099,13 @@ impl ConversionManager {
         Ok(())
     }
 
-    /// Add a file that's already configured and ready for processing
-    /// Used for download+convert workflows and presets where settings are pre-configured
+    /// Add a file that's already configured and ready for processing.
+    ///
+    /// Unlike interactive Convert-screen commit, this low-level admission API
+    /// intentionally does not deduplicate by input path: download/automation
+    /// callers may enqueue the same source more than once with different fully
+    /// resolved settings or destinations. Callers that want browse-style
+    /// deduplication and terminal-item replacement must use the batch commit API.
     pub fn add_file_ready_for_processing(
         &mut self,
         file: std::path::PathBuf,
@@ -1294,6 +1299,11 @@ impl ConversionManager {
         let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
             let mut processing = HashSet::new();
             let mut processing_synthetic_inputs = HashSet::new();
+            let secret_references = queue
+                .all_items()
+                .into_iter()
+                .filter_map(|item| item.archive_password_ref.clone())
+                .collect::<Vec<_>>();
             for item in queue.all_items() {
                 if matches!(item.status, ConversionStatus::Processing { .. }) {
                     processing.insert(item.id.clone());
@@ -1303,11 +1313,12 @@ impl ConversionManager {
                 }
             }
             queue.clear();
-            Some((processing, processing_synthetic_inputs))
+            Some((processing, processing_synthetic_inputs, secret_references))
         } else {
             None
         };
-        if let Some((processing, processing_synthetic_inputs)) = cleared_processing {
+        if let Some((processing, processing_synthetic_inputs, secret_references)) = cleared_processing {
+            crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
             // In-flight items keep their artifacts until the worker's terminal
             // status arrives (deferred cleanup in `update_item_status`).
             self.cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
@@ -4045,6 +4056,35 @@ mod per_track_epoch_tests {
 
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
         manager.clear_completed();
+
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
+        assert!(
+            crate::secret_store::get(&reference)
+                .expect_err("retired reference must be absent")
+                .is_not_found()
+        );
+        assert!(manager.get_items_clone().is_empty());
+    }
+
+    #[test]
+    fn clear_queue_retires_queue_owned_archive_password_reference() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let (mut manager, item_id) = test_manager_with_item();
+        let reference = crate::secret_store::stable_reference("queue-item", &item_id)
+            .expect("queue-owned reference");
+        crate::secret_store::set(&reference, "archive-secret").expect("store secret");
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue
+                .items_mut()
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .expect("item exists");
+            item.archive_password_ref = Some(reference.clone());
+        }
+
+        assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
+        manager.clear_queue();
 
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
         assert!(

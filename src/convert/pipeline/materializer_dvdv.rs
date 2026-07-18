@@ -197,6 +197,7 @@ impl Materializer for DvdVideoMaterializer {
                     source_audio_coding(audio_coding),
                 ),
                 bit_depth: stream.bit_depth,
+                warnings: Vec::new(),
             });
         }
 

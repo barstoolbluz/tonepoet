@@ -1736,6 +1736,8 @@ mod tests {
             original: "-1.0 dB".to_string(),
             is_binary: false,
             is_mixed: true,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![
                 "-1.0 dB".to_string(),
                 "-2.0 dB".to_string(),

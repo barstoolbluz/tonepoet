@@ -2,8 +2,8 @@
 //!
 //! All direct `id3` crate calls are isolated in `backend`. The crate supplies
 //! generic ID3 stream parsing and serialization but no DSF container adapter,
-//! so this module validates the DSF metadata pointer and performs same-directory
-//! atomic container replacement itself.
+//! so this module validates the DSF metadata pointer and owns the crash-safe
+//! container mutation paths itself.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -13,6 +13,11 @@ use std::path::{Path, PathBuf};
 pub struct DsfTagSnapshot {
     /// Canonical editor display key -> ordered, distinct values.
     pub fields: BTreeMap<String, Vec<String>>,
+    /// Canonical editor display key -> number of stored source frames/items.
+    /// This can exceed `fields[key].len()` when duplicate frames carry the
+    /// same scalar text; the editor needs the carrier count to warn before a
+    /// scalar replacement collapses those frames.
+    pub stored_value_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +52,14 @@ impl DsfTagSnapshot {
 
     pub fn parsed_u32(&self, key: &str) -> Option<u32> {
         self.first(key)?.trim().parse().ok()
+    }
+
+    pub fn stored_value_count(&self, key: &str) -> usize {
+        self.stored_value_counts
+            .get(key)
+            .copied()
+            .or_else(|| self.fields.get(key).map(Vec::len))
+            .unwrap_or(0)
     }
 }
 
@@ -91,15 +104,33 @@ pub struct DsfLegacyBackupInspection {
     pub byte_identical: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsfTailJournalInspection {
+    pub target: PathBuf,
+    pub journal: PathBuf,
+    pub state: &'static str,
+    pub operation: &'static str,
+    pub original_file_size: u64,
+    pub committed_file_size: u64,
+}
+
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
+const REWRITE_PADDING_BYTES: u64 = 1024 * 1024;
 const MAX_IN_PLACE_TAIL_BYTES: u64 = 64 * 1024 * 1024;
-const TAIL_JOURNAL_MAGIC: &[u8; 8] = b"TPDSFJ02";
+const TAIL_JOURNAL_MAGIC_V2: &[u8; 8] = b"TPDSFJ02";
+const TAIL_JOURNAL_MAGIC_V3: &[u8; 8] = b"TPDSFJ03";
 const TAIL_JOURNAL_PREPARED: u8 = 0;
 const TAIL_JOURNAL_COMMITTED: u8 = 1;
+const TAIL_JOURNAL_KIND_REPLACE_TAIL: u8 = 0;
+const TAIL_JOURNAL_KIND_APPEND_TAG: u8 = 1;
 const TAIL_JOURNAL_IDENTITY_LEN: usize = 32;
-const TAIL_JOURNAL_HEADER_LEN: usize = 8 + 1 + 8 + 8 + TAIL_JOURNAL_IDENTITY_LEN;
+const TAIL_JOURNAL_V2_HEADER_LEN: usize = 8 + 1 + 8 + 8 + TAIL_JOURNAL_IDENTITY_LEN;
+const TAIL_JOURNAL_V3_HEADER_LEN: usize =
+    8 + 1 + 1 + 8 + 8 + 8 + 8 + TAIL_JOURNAL_IDENTITY_LEN;
 const RECOVERY_IDENTITY_SAMPLE_BYTES: usize = 64 * 1024;
 const TAIL_JOURNAL_STATE_OFFSET: u64 = 8;
+const DSF_HEADER_PATCH_OFFSET: u64 = 12;
+const DSF_HEADER_PATCH_LEN: u64 = 16;
 
 #[cfg(test)]
 thread_local! {
@@ -118,9 +149,11 @@ pub fn to_track_metadata(snapshot: &DsfTagSnapshot) -> crate::convert::pipeline:
     let mut extra = BTreeMap::new();
     for (key, values) in &snapshot.fields {
         if let Some(value) = values.iter().find(|value| !value.trim().is_empty()) {
-            extra.insert(key.to_ascii_lowercase(), value.clone());
+            crate::convert::pipeline::insert_source_text_tag(&mut extra, key, value);
         }
     }
+    let pre_emphasis =
+        crate::convert::pipeline::source_text_tags_indicate_pre_emphasis(&extra);
     crate::convert::pipeline::TrackMetadata {
         title: snapshot.first("TITLE").map(ToOwned::to_owned),
         artist: snapshot.first("ARTIST").map(ToOwned::to_owned),
@@ -135,6 +168,7 @@ pub fn to_track_metadata(snapshot: &DsfTagSnapshot) -> crate::convert::pipeline:
         publisher: snapshot.first("LABEL").map(ToOwned::to_owned),
         copyright: snapshot.first("COPYRIGHT").map(ToOwned::to_owned),
         comment: snapshot.first("COMMENT").map(ToOwned::to_owned),
+        pre_emphasis,
         extra,
         ..crate::convert::pipeline::TrackMetadata::default()
     }
@@ -538,6 +572,105 @@ fn validate_dsf_audio_chunks(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct DsfArtworkSnapshot {
+    original_location: DsfMetadataLocation,
+    original_encoded_tag: Vec<u8>,
+    original_header_patch: Option<[u8; DSF_HEADER_PATCH_LEN as usize]>,
+}
+
+/// Replace one APIC picture type through the same journaled DSF tail writer
+/// used for text metadata. The returned snapshot supports batch rollback.
+pub fn write_artwork_with_control(
+    path: &Path,
+    picture_type_code: u8,
+    mime_type: &str,
+    image_bytes: &[u8],
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(DsfWriteProgress),
+) -> Result<(DsfArtworkSnapshot, Option<String>), String> {
+    progress(DsfWriteProgress {
+        phase: DsfWriteProgressPhase::Preparing,
+        bytes_done: 0,
+        bytes_total: 0,
+    });
+    if is_cancelled() {
+        return Err("metadata save cancelled before preparing DSF artwork".to_string());
+    }
+    reject_symlinked_write_path(path)?;
+    let (_write_lock, target_path) = acquire_dsf_write_lock(path)?;
+    let path = target_path.as_path();
+    preflight_dsf_write_artifacts(path)?;
+    let (snapshot, encoded) = backend::prepare_artwork_replace(
+        path,
+        picture_type_code,
+        mime_type,
+        image_bytes,
+    )?;
+    let warning = write_prepared(path, snapshot.original_location, &encoded, is_cancelled, progress)?;
+    Ok((snapshot, warning))
+}
+
+/// Remove one APIC picture type through the journaled DSF tail writer.
+/// `Ok(None)` means the file had no matching picture and was not changed.
+pub fn remove_artwork_with_control(
+    path: &Path,
+    picture_type_code: u8,
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(DsfWriteProgress),
+) -> Result<Option<(DsfArtworkSnapshot, Option<String>)>, String> {
+    progress(DsfWriteProgress {
+        phase: DsfWriteProgressPhase::Preparing,
+        bytes_done: 0,
+        bytes_total: 0,
+    });
+    if is_cancelled() {
+        return Err("metadata save cancelled before preparing DSF artwork removal".to_string());
+    }
+    reject_symlinked_write_path(path)?;
+    let (_write_lock, target_path) = acquire_dsf_write_lock(path)?;
+    let path = target_path.as_path();
+    preflight_dsf_write_artifacts(path)?;
+    let Some((snapshot, encoded)) = backend::prepare_artwork_remove(path, picture_type_code)? else {
+        return Ok(None);
+    };
+    let warning = write_prepared(path, snapshot.original_location, &encoded, is_cancelled, progress)?;
+    Ok(Some((snapshot, warning)))
+}
+
+/// Restore the exact pre-artwork metadata state through the journaled tail writer.
+/// Existing ID3 tails are restored in place. An originally untagged DSF is
+/// returned byte-for-byte to its original header and length through a PREPARED
+/// append journal, so batch rollback never leaves a synthetic empty tag behind.
+pub fn restore_artwork_snapshot(
+    path: &Path,
+    snapshot: &DsfArtworkSnapshot,
+) -> Result<Option<String>, String> {
+    reject_symlinked_write_path(path)?;
+    let (_write_lock, target_path) = acquire_dsf_write_lock(path)?;
+    let path = target_path.as_path();
+    preflight_dsf_write_artifacts(path)?;
+    match snapshot.original_location {
+        DsfMetadataLocation::Id3 { .. } => {
+            let current = inspect_dsf_metadata_location(path)?;
+            write_prepared(
+                path,
+                current,
+                &snapshot.original_encoded_tag,
+                &|| false,
+                &|_| {},
+            )
+        }
+        DsfMetadataLocation::Untagged { file_size } => {
+            let original_header_patch = snapshot.original_header_patch.ok_or_else(|| {
+                "DSF artwork rollback snapshot is missing its original untagged header patch"
+                    .to_string()
+            })?;
+            restore_untagged_artwork_snapshot(path, file_size, &original_header_patch)
+        }
+    }
+}
+
 pub fn write_with_backup(path: &Path, changes: &[DsfTagChange]) -> Result<Option<String>, String> {
     write_with_control(path, changes, &|| false, &|_| {})
 }
@@ -546,9 +679,9 @@ pub fn write_with_backup(path: &Path, changes: &[DsfTagChange]) -> Result<Option
 ///
 /// The historical name `write_with_backup` remains as the compatibility
 /// wrapper, but ordinary DSF writes no longer allocate a full-file backup.
-/// Existing-tail writes use a bounded, durable tail journal; growth/untagged
-/// writes use same-directory temp+rename so the original inode remains the
-/// rollback authority until publication.
+/// Existing-tail writes use a bounded, durable tail journal. First tags append
+/// under a header-patch journal. Only metadata growth beyond the available
+/// tail allocation uses same-directory temp+rename.
 pub fn write_with_control(
     path: &Path,
     changes: &[DsfTagChange],
@@ -610,6 +743,19 @@ fn acquire_dsf_write_lock(
     })
 }
 
+fn read_dsf_header_patch(
+    path: &Path,
+) -> Result<[u8; DSF_HEADER_PATCH_LEN as usize], String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open DSF header source '{}': {error}", path.display()))?;
+    file.seek(SeekFrom::Start(DSF_HEADER_PATCH_OFFSET))
+        .map_err(|error| format!("seek DSF header patch '{}': {error}", path.display()))?;
+    let mut patch = [0u8; DSF_HEADER_PATCH_LEN as usize];
+    file.read_exact(&mut patch)
+        .map_err(|error| format!("read DSF header patch '{}': {error}", path.display()))?;
+    Ok(patch)
+}
+
 fn write_prepared(
     path: &Path,
     location: DsfMetadataLocation,
@@ -617,26 +763,39 @@ fn write_prepared(
     is_cancelled: &dyn Fn() -> bool,
     progress: &dyn Fn(DsfWriteProgress),
 ) -> Result<Option<String>, String> {
-    if let DsfMetadataLocation::Id3 {
-        offset,
-        tag_end,
-        file_size,
-    } = location
-    {
-        if tag_end != file_size {
-            return Err(format!(
-                "refusing to replace DSF ID3 metadata in '{}': {} trailing byte(s) follow the declared tag, so their ownership is ambiguous",
-                path.display(),
-                file_size - tag_end
-            ));
+    match location {
+        DsfMetadataLocation::Id3 {
+            offset,
+            tag_end,
+            file_size,
+        } => {
+            if tag_end != file_size {
+                return Err(format!(
+                    "refusing to replace DSF ID3 metadata in '{}': {} trailing byte(s) follow the declared tag, so their ownership is ambiguous",
+                    path.display(),
+                    file_size - tag_end
+                ));
+            }
+            let allocation = file_size - offset;
+            if encoded_tag.len() as u64 <= allocation && allocation <= MAX_IN_PLACE_TAIL_BYTES {
+                let padded = pad_id3_to_allocation(encoded_tag, allocation)?;
+                return write_tail_in_place(path, offset, &padded, is_cancelled, progress);
+            }
+            let padded = pad_id3_with_rewrite_reserve(encoded_tag)?;
+            rewrite_container(path, location, &padded, is_cancelled, progress)
         }
-        let allocation = file_size - offset;
-        if encoded_tag.len() as u64 <= allocation && allocation <= MAX_IN_PLACE_TAIL_BYTES {
-            let padded = pad_id3_to_allocation(encoded_tag, allocation)?;
-            return write_tail_in_place(path, offset, &padded, is_cancelled, progress);
+        DsfMetadataLocation::Untagged { file_size } => {
+            let padded = pad_id3_with_rewrite_reserve(encoded_tag)?;
+            append_tag_in_place(path, file_size, &padded, is_cancelled, progress)
         }
     }
-    rewrite_container(path, location, encoded_tag, is_cancelled, progress)
+}
+
+fn pad_id3_with_rewrite_reserve(encoded: &[u8]) -> Result<Vec<u8>, String> {
+    let allocation = (encoded.len() as u64)
+        .checked_add(REWRITE_PADDING_BYTES)
+        .ok_or_else(|| "DSF ID3 rewrite allocation overflows".to_string())?;
+    pad_id3_to_allocation(encoded, allocation)
 }
 
 fn pad_id3_to_allocation(encoded: &[u8], allocation: u64) -> Result<Vec<u8>, String> {
@@ -669,17 +828,99 @@ fn pad_id3_to_allocation(encoded: &[u8], allocation: u64) -> Result<Vec<u8>, Str
 fn tail_journal_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("audio.dsf"));
+    let digest = crate::config::native_os_str_sha256_hex(
+        b"tonepoet-dsf-tail-journal-path-v1\0",
+        name,
+    );
+    path.with_file_name(format!(".tonepoet-dsf-tail-{digest}.journal"))
+}
+
+fn legacy_tail_journal_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("audio.dsf");
     path.with_file_name(format!(".{name}.tonepoet-dsf-tail.journal"))
 }
 
+pub(crate) fn write_authority_paths(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let lock = crate::config::store_lock_authority_path(path).map_err(|error| {
+        format!(
+            "derive metadata-write lock authority for '{}': {error}",
+            path.display()
+        )
+    })?;
+    let mut authorities = vec![tail_journal_path(path), lock];
+    let legacy = legacy_tail_journal_path(path);
+    if legacy.exists() {
+        authorities.push(legacy);
+    }
+    Ok(authorities)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailJournalKind {
+    ReplaceTail,
+    AppendTag,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TailJournalHeader {
     state: u8,
+    kind: TailJournalKind,
     offset: u64,
     original_len: u64,
+    original_file_size: u64,
+    committed_file_size: u64,
     recovery_identity: [u8; TAIL_JOURNAL_IDENTITY_LEN],
+    payload_offset: u64,
+}
+
+impl TailJournalHeader {
+    fn replace_tail(
+        state: u8,
+        offset: u64,
+        original_len: u64,
+        file_size: u64,
+        recovery_identity: [u8; TAIL_JOURNAL_IDENTITY_LEN],
+    ) -> Self {
+        Self {
+            state,
+            kind: TailJournalKind::ReplaceTail,
+            offset,
+            original_len,
+            original_file_size: file_size,
+            committed_file_size: file_size,
+            recovery_identity,
+            payload_offset: TAIL_JOURNAL_V3_HEADER_LEN as u64,
+        }
+    }
+
+    fn append_tag(
+        state: u8,
+        original_file_size: u64,
+        committed_file_size: u64,
+        recovery_identity: [u8; TAIL_JOURNAL_IDENTITY_LEN],
+    ) -> Self {
+        Self {
+            state,
+            kind: TailJournalKind::AppendTag,
+            offset: DSF_HEADER_PATCH_OFFSET,
+            original_len: DSF_HEADER_PATCH_LEN,
+            original_file_size,
+            committed_file_size,
+            recovery_identity,
+            payload_offset: TAIL_JOURNAL_V3_HEADER_LEN as u64,
+        }
+    }
+
+    fn identity_boundary(self) -> u64 {
+        match self.kind {
+            TailJournalKind::ReplaceTail => self.offset,
+            TailJournalKind::AppendTag => self.original_file_size,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -695,13 +936,21 @@ enum TailJournalCommitOutcome {
     DurabilityUncertain(String),
 }
 
-fn encode_tail_journal_header(header: TailJournalHeader) -> [u8; TAIL_JOURNAL_HEADER_LEN] {
-    let mut bytes = [0u8; TAIL_JOURNAL_HEADER_LEN];
-    bytes[..8].copy_from_slice(TAIL_JOURNAL_MAGIC);
+fn encode_tail_journal_header(
+    header: TailJournalHeader,
+) -> [u8; TAIL_JOURNAL_V3_HEADER_LEN] {
+    let mut bytes = [0u8; TAIL_JOURNAL_V3_HEADER_LEN];
+    bytes[..8].copy_from_slice(TAIL_JOURNAL_MAGIC_V3);
     bytes[8] = header.state;
-    bytes[9..17].copy_from_slice(&header.offset.to_le_bytes());
-    bytes[17..25].copy_from_slice(&header.original_len.to_le_bytes());
-    bytes[25..].copy_from_slice(&header.recovery_identity);
+    bytes[9] = match header.kind {
+        TailJournalKind::ReplaceTail => TAIL_JOURNAL_KIND_REPLACE_TAIL,
+        TailJournalKind::AppendTag => TAIL_JOURNAL_KIND_APPEND_TAG,
+    };
+    bytes[10..18].copy_from_slice(&header.offset.to_le_bytes());
+    bytes[18..26].copy_from_slice(&header.original_len.to_le_bytes());
+    bytes[26..34].copy_from_slice(&header.original_file_size.to_le_bytes());
+    bytes[34..42].copy_from_slice(&header.committed_file_size.to_le_bytes());
+    bytes[42..].copy_from_slice(&header.recovery_identity);
     bytes
 }
 
@@ -712,15 +961,58 @@ fn encode_tail_journal(
     recovery_identity: &[u8; TAIL_JOURNAL_IDENTITY_LEN],
     state: u8,
 ) -> Vec<u8> {
-    let header = encode_tail_journal_header(TailJournalHeader {
+    let file_size = offset + original.len() as u64;
+    let header = encode_tail_journal_header(TailJournalHeader::replace_tail(
         state,
         offset,
-        original_len: original.len() as u64,
-        recovery_identity: *recovery_identity,
-    });
-    let mut bytes = Vec::with_capacity(TAIL_JOURNAL_HEADER_LEN + original.len());
+        original.len() as u64,
+        file_size,
+        *recovery_identity,
+    ));
+    let mut bytes = Vec::with_capacity(TAIL_JOURNAL_V3_HEADER_LEN + original.len());
     bytes.extend_from_slice(&header);
     bytes.extend_from_slice(original);
+    bytes
+}
+
+#[cfg(test)]
+fn encode_legacy_tail_journal(
+    offset: u64,
+    original: &[u8],
+    recovery_identity: &[u8; TAIL_JOURNAL_IDENTITY_LEN],
+    state: u8,
+) -> Vec<u8> {
+    let mut header = [0u8; TAIL_JOURNAL_V2_HEADER_LEN];
+    header[..8].copy_from_slice(TAIL_JOURNAL_MAGIC_V2);
+    header[8] = state;
+    header[9..17].copy_from_slice(&offset.to_le_bytes());
+    header[17..25].copy_from_slice(&(original.len() as u64).to_le_bytes());
+    header[25..].copy_from_slice(recovery_identity);
+    let mut bytes = Vec::with_capacity(TAIL_JOURNAL_V2_HEADER_LEN + original.len());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(original);
+    bytes
+}
+
+#[cfg(test)]
+fn encode_append_journal(
+    original_header_patch: &[u8; DSF_HEADER_PATCH_LEN as usize],
+    original_file_size: u64,
+    committed_file_size: u64,
+    recovery_identity: &[u8; TAIL_JOURNAL_IDENTITY_LEN],
+    state: u8,
+) -> Vec<u8> {
+    let header = encode_tail_journal_header(TailJournalHeader::append_tag(
+        state,
+        original_file_size,
+        committed_file_size,
+        *recovery_identity,
+    ));
+    let mut bytes = Vec::with_capacity(
+        TAIL_JOURNAL_V3_HEADER_LEN + original_header_patch.len(),
+    );
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(original_header_patch);
     bytes
 }
 
@@ -732,7 +1024,7 @@ fn read_tail_journal_header(
         .metadata()
         .map_err(|error| format!("stat DSF tail journal '{}': {error}", journal.display()))?
         .len();
-    if file_len < TAIL_JOURNAL_HEADER_LEN as u64 {
+    if file_len < TAIL_JOURNAL_V2_HEADER_LEN as u64 {
         return Err(format!(
             "DSF tail journal '{}' has an invalid header",
             journal.display()
@@ -740,44 +1032,152 @@ fn read_tail_journal_header(
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("seek DSF tail journal '{}': {error}", journal.display()))?;
-    let mut bytes = [0u8; TAIL_JOURNAL_HEADER_LEN];
-    file.read_exact(&mut bytes)
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)
         .map_err(|error| format!("read DSF tail journal header '{}': {error}", journal.display()))?;
-    if &bytes[..8] != TAIL_JOURNAL_MAGIC {
+
+    let header = if &magic == TAIL_JOURNAL_MAGIC_V2 {
+        let mut rest = vec![0u8; TAIL_JOURNAL_V2_HEADER_LEN - magic.len()];
+        file.read_exact(&mut rest).map_err(|error| {
+            format!("read DSF tail journal header '{}': {error}", journal.display())
+        })?;
+        let state = rest[0];
+        let offset = u64::from_le_bytes(
+            rest[1..9]
+                .try_into()
+                .expect("fixed legacy journal offset slice"),
+        );
+        let original_len = u64::from_le_bytes(
+            rest[9..17]
+                .try_into()
+                .expect("fixed legacy journal length slice"),
+        );
+        let recovery_identity = rest[17..]
+            .try_into()
+            .expect("fixed legacy DSF recovery identity slice");
+        let file_size = offset.checked_add(original_len).ok_or_else(|| {
+            format!("DSF tail journal '{}' range overflows", journal.display())
+        })?;
+        TailJournalHeader {
+            state,
+            kind: TailJournalKind::ReplaceTail,
+            offset,
+            original_len,
+            original_file_size: file_size,
+            committed_file_size: file_size,
+            recovery_identity,
+            payload_offset: TAIL_JOURNAL_V2_HEADER_LEN as u64,
+        }
+    } else if &magic == TAIL_JOURNAL_MAGIC_V3 {
+        if file_len < TAIL_JOURNAL_V3_HEADER_LEN as u64 {
+            return Err(format!(
+                "DSF tail journal '{}' has an invalid v3 header",
+                journal.display()
+            ));
+        }
+        let mut rest = vec![0u8; TAIL_JOURNAL_V3_HEADER_LEN - magic.len()];
+        file.read_exact(&mut rest).map_err(|error| {
+            format!("read DSF tail journal header '{}': {error}", journal.display())
+        })?;
+        let state = rest[0];
+        let kind = match rest[1] {
+            TAIL_JOURNAL_KIND_REPLACE_TAIL => TailJournalKind::ReplaceTail,
+            TAIL_JOURNAL_KIND_APPEND_TAG => TailJournalKind::AppendTag,
+            other => {
+                return Err(format!(
+                    "DSF tail journal '{}' has unknown operation kind {other}",
+                    journal.display()
+                ))
+            }
+        };
+        let offset = u64::from_le_bytes(
+            rest[2..10]
+                .try_into()
+                .expect("fixed journal offset slice"),
+        );
+        let original_len = u64::from_le_bytes(
+            rest[10..18]
+                .try_into()
+                .expect("fixed journal length slice"),
+        );
+        let original_file_size = u64::from_le_bytes(
+            rest[18..26]
+                .try_into()
+                .expect("fixed journal original-size slice"),
+        );
+        let committed_file_size = u64::from_le_bytes(
+            rest[26..34]
+                .try_into()
+                .expect("fixed journal committed-size slice"),
+        );
+        let recovery_identity = rest[34..]
+            .try_into()
+            .expect("fixed DSF recovery identity slice");
+        TailJournalHeader {
+            state,
+            kind,
+            offset,
+            original_len,
+            original_file_size,
+            committed_file_size,
+            recovery_identity,
+            payload_offset: TAIL_JOURNAL_V3_HEADER_LEN as u64,
+        }
+    } else {
         return Err(format!(
             "DSF tail journal '{}' has an invalid header",
             journal.display()
         ));
-    }
-    let state = bytes[8];
-    if !matches!(state, TAIL_JOURNAL_PREPARED | TAIL_JOURNAL_COMMITTED) {
+    };
+
+    if !matches!(header.state, TAIL_JOURNAL_PREPARED | TAIL_JOURNAL_COMMITTED) {
         return Err(format!(
-            "DSF tail journal '{}' has unknown state {state}",
-            journal.display()
+            "DSF tail journal '{}' has unknown state {}",
+            journal.display(),
+            header.state
         ));
     }
-    let offset = u64::from_le_bytes(bytes[9..17].try_into().expect("fixed journal offset slice"));
-    let original_len =
-        u64::from_le_bytes(bytes[17..25].try_into().expect("fixed journal length slice"));
-    let recovery_identity = bytes[25..]
-        .try_into()
-        .expect("fixed DSF recovery identity slice");
-    let expected_len = (TAIL_JOURNAL_HEADER_LEN as u64)
-        .checked_add(original_len)
+    match header.kind {
+        TailJournalKind::ReplaceTail => {
+            let expected_size = header.offset.checked_add(header.original_len).ok_or_else(|| {
+                format!("DSF tail journal '{}' range overflows", journal.display())
+            })?;
+            if header.original_file_size != expected_size
+                || header.committed_file_size != expected_size
+            {
+                return Err(format!(
+                    "DSF tail journal '{}' has inconsistent replacement bounds",
+                    journal.display()
+                ));
+            }
+        }
+        TailJournalKind::AppendTag => {
+            if header.offset != DSF_HEADER_PATCH_OFFSET
+                || header.original_len != DSF_HEADER_PATCH_LEN
+                || header.original_file_size
+                    < DSF_HEADER_PATCH_OFFSET + DSF_HEADER_PATCH_LEN
+                || header.committed_file_size <= header.original_file_size
+            {
+                return Err(format!(
+                    "DSF tail journal '{}' has inconsistent append bounds",
+                    journal.display()
+                ));
+            }
+        }
+    }
+    let expected_len = header
+        .payload_offset
+        .checked_add(header.original_len)
         .ok_or_else(|| format!("DSF tail journal '{}' length overflows", journal.display()))?;
     if file_len != expected_len {
         return Err(format!(
-            "DSF tail journal '{}' declares {original_len} original byte(s), but contains {}",
+            "DSF tail journal '{}' declares {} original byte(s), but contains {}",
             journal.display(),
-            file_len.saturating_sub(TAIL_JOURNAL_HEADER_LEN as u64)
+            header.original_len,
+            file_len.saturating_sub(header.payload_offset)
         ));
     }
-    Ok(TailJournalHeader {
-        state,
-        offset,
-        original_len,
-        recovery_identity,
-    })
+    Ok(header)
 }
 
 fn open_tail_journal_for_read(journal: &Path) -> Result<Option<std::fs::File>, String> {
@@ -817,6 +1217,35 @@ fn dsf_recovery_identity(
     metadata_offset: u64,
     file_size: u64,
 ) -> Result<[u8; TAIL_JOURNAL_IDENTITY_LEN], String> {
+    dsf_recovery_identity_with_domain(
+        file,
+        metadata_offset,
+        file_size,
+        b"tonepoet-dsf-tail-recovery-v2\0",
+        false,
+    )
+}
+
+fn dsf_append_recovery_identity(
+    file: &mut std::fs::File,
+    original_file_size: u64,
+) -> Result<[u8; TAIL_JOURNAL_IDENTITY_LEN], String> {
+    dsf_recovery_identity_with_domain(
+        file,
+        original_file_size,
+        original_file_size,
+        b"tonepoet-dsf-append-recovery-v3\0",
+        true,
+    )
+}
+
+fn dsf_recovery_identity_with_domain(
+    file: &mut std::fs::File,
+    metadata_offset: u64,
+    file_size: u64,
+    domain: &[u8],
+    mask_mutable_header_patch: bool,
+) -> Result<[u8; TAIL_JOURNAL_IDENTITY_LEN], String> {
     use sha2::{Digest, Sha256};
 
     if metadata_offset > file_size {
@@ -830,21 +1259,40 @@ fn dsf_recovery_identity(
         .map_err(|error| format!("seek DSF recovery identity prefix: {error}"))?;
     file.read_exact(&mut first)
         .map_err(|error| format!("read DSF recovery identity prefix: {error}"))?;
+    if mask_mutable_header_patch {
+        mask_recovery_identity_header_patch(&mut first, 0);
+    }
 
+    let last_offset = metadata_offset - sample_len as u64;
     let mut last = vec![0u8; sample_len];
-    file.seek(SeekFrom::Start(metadata_offset - sample_len as u64))
+    file.seek(SeekFrom::Start(last_offset))
         .map_err(|error| format!("seek DSF recovery identity suffix: {error}"))?;
     file.read_exact(&mut last)
         .map_err(|error| format!("read DSF recovery identity suffix: {error}"))?;
+    if mask_mutable_header_patch {
+        mask_recovery_identity_header_patch(&mut last, last_offset);
+    }
 
     let mut digest = Sha256::new();
-    digest.update(b"tonepoet-dsf-tail-recovery-v2\0");
+    digest.update(domain);
     digest.update(file_size.to_le_bytes());
     digest.update(metadata_offset.to_le_bytes());
     digest.update((sample_len as u64).to_le_bytes());
     digest.update(&first);
     digest.update(&last);
     Ok(digest.finalize().into())
+}
+
+fn mask_recovery_identity_header_patch(sample: &mut [u8], sample_offset: u64) {
+    let sample_end = sample_offset.saturating_add(sample.len() as u64);
+    let patch_end = DSF_HEADER_PATCH_OFFSET + DSF_HEADER_PATCH_LEN;
+    let overlap_start = sample_offset.max(DSF_HEADER_PATCH_OFFSET);
+    let overlap_end = sample_end.min(patch_end);
+    if overlap_start < overlap_end {
+        let start = (overlap_start - sample_offset) as usize;
+        let end = (overlap_end - sample_offset) as usize;
+        sample[start..end].fill(0);
+    }
 }
 
 fn write_tail_in_place(
@@ -882,12 +1330,13 @@ fn write_tail_in_place(
         path,
         &journal,
         &mut file,
-        TailJournalHeader {
-            state: TAIL_JOURNAL_PREPARED,
+        TailJournalHeader::replace_tail(
+            TAIL_JOURNAL_PREPARED,
             offset,
-            original_len: replacement.len() as u64,
+            replacement.len() as u64,
+            actual_size,
             recovery_identity,
-        },
+        ),
         is_cancelled,
         progress,
     )?;
@@ -991,6 +1440,247 @@ fn write_tail_in_place(
     }
 }
 
+fn append_tag_in_place(
+    path: &Path,
+    original_file_size: u64,
+    replacement: &[u8],
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(DsfWriteProgress),
+) -> Result<Option<String>, String> {
+    if is_cancelled() {
+        return Err("metadata save cancelled before DSF append journaling".to_string());
+    }
+    let committed_file_size = original_file_size
+        .checked_add(replacement.len() as u64)
+        .ok_or_else(|| format!("appended DSF size overflows for '{}'", path.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("open untagged DSF for append '{}': {error}", path.display()))?;
+    let actual_size = file
+        .metadata()
+        .map_err(|error| format!("stat untagged DSF source '{}': {error}", path.display()))?
+        .len();
+    if actual_size != original_file_size {
+        return Err(format!(
+            "DSF source '{}' changed during metadata preparation: expected {original_file_size} bytes, found {actual_size}",
+            path.display()
+        ));
+    }
+    let recovery_identity = dsf_append_recovery_identity(&mut file, original_file_size)
+        .map_err(|error| {
+            format!(
+                "bind DSF append recovery journal for '{}': {error}",
+                path.display()
+            )
+        })?;
+    let journal = tail_journal_path(path);
+    publish_tail_journal_streaming(
+        path,
+        &journal,
+        &mut file,
+        TailJournalHeader::append_tag(
+            TAIL_JOURNAL_PREPARED,
+            original_file_size,
+            committed_file_size,
+            recovery_identity,
+        ),
+        is_cancelled,
+        progress,
+    )?;
+
+    let rollback_after_error = |primary: String,
+                                file: &mut std::fs::File|
+     -> Result<Option<String>, String> {
+        match restore_tail_from_journal(path, &journal, file, progress) {
+            Ok(()) => match remove_journal_durably(&journal) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(format!(
+                    "{primary}; rollback succeeded, but journal cleanup failed: {cleanup}"
+                )),
+            },
+            Err(rollback) => Err(format!(
+                "{primary}; rollback failed and PREPARED journal '{}' was retained for startup recovery: {rollback}",
+                journal.display()
+            )),
+        }
+    };
+
+    if let Err(error) = file.seek(SeekFrom::Start(original_file_size)) {
+        let primary = format!("seek to DSF append offset in '{}': {error}", path.display());
+        return rollback_after_error(primary, &mut file);
+    }
+    let mut written = 0usize;
+    while written < replacement.len() {
+        if is_cancelled() {
+            return rollback_cancelled_tail(path, &journal, &mut file, progress);
+        }
+        let end = (written + COPY_CHUNK_BYTES).min(replacement.len());
+        if let Err(error) = file.write_all(&replacement[written..end]) {
+            let primary = format!("append DSF metadata tag '{}': {error}", path.display());
+            return rollback_after_error(primary, &mut file);
+        }
+        written = end;
+        progress(DsfWriteProgress {
+            phase: DsfWriteProgressPhase::WritingTail,
+            bytes_done: written as u64,
+            bytes_total: replacement.len() as u64,
+        });
+    }
+    if let Err(error) = file.sync_all() {
+        let primary = format!("fsync appended DSF metadata '{}': {error}", path.display());
+        return rollback_after_error(primary, &mut file);
+    }
+    if is_cancelled() {
+        return rollback_cancelled_tail(path, &journal, &mut file, progress);
+    }
+
+    let mut header_patch = [0u8; DSF_HEADER_PATCH_LEN as usize];
+    header_patch[..8].copy_from_slice(&committed_file_size.to_le_bytes());
+    header_patch[8..].copy_from_slice(&original_file_size.to_le_bytes());
+    if let Err(error) = file.seek(SeekFrom::Start(DSF_HEADER_PATCH_OFFSET)) {
+        let primary = format!("seek to DSF header patch in '{}': {error}", path.display());
+        return rollback_after_error(primary, &mut file);
+    }
+    if let Err(error) = file.write_all(&header_patch) {
+        let primary = format!("patch DSF size and metadata pointer '{}': {error}", path.display());
+        return rollback_after_error(primary, &mut file);
+    }
+    if let Err(error) = file.sync_all() {
+        let primary = format!("fsync DSF header patch '{}': {error}", path.display());
+        return rollback_after_error(primary, &mut file);
+    }
+    if is_cancelled() {
+        return rollback_cancelled_tail(path, &journal, &mut file, progress);
+    }
+
+    match mark_tail_journal_committed(&journal) {
+        TailJournalCommitOutcome::Durable => {}
+        TailJournalCommitOutcome::StateUnchanged(error) => {
+            let primary = format!(
+                "could not commit DSF append journal for '{}': {error}",
+                path.display()
+            );
+            return rollback_after_error(primary, &mut file);
+        }
+        TailJournalCommitOutcome::DurabilityUncertain(error) => {
+            progress(DsfWriteProgress {
+                phase: DsfWriteProgressPhase::Publishing,
+                bytes_done: replacement.len() as u64,
+                bytes_total: replacement.len() as u64,
+            });
+            return Ok(Some(format!(
+                "DSF metadata for '{}' was appended and its header was fsynced, but journal commit durability is uncertain: {error}. Journal '{}' was retained; recovery will keep the append if COMMITTED is durable or restore the original untagged file if PREPARED is durable",
+                path.display(),
+                journal.display()
+            )));
+        }
+    }
+    progress(DsfWriteProgress {
+        phase: DsfWriteProgressPhase::Publishing,
+        bytes_done: replacement.len() as u64,
+        bytes_total: replacement.len() as u64,
+    });
+    match remove_journal_durably(&journal) {
+        Ok(()) => Ok(None),
+        Err(error) => Ok(Some(format!(
+            "DSF metadata append for '{}' committed, but its committed journal could not be retired durably: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn publish_file_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // The source and destination are in the same directory. Creating a hard
+    // link is an atomic create-if-absent operation on the supported local
+    // filesystems: an existing journal is never replaced. The private source
+    // name may survive a failed unlink, but both names then identify the same
+    // fully fsynced journal and startup cleanup can retire the extra name.
+    std::fs::hard_link(source, destination)?;
+    let _ = std::fs::remove_file(source);
+    Ok(())
+}
+
+fn publish_tail_journal_bytes(
+    journal: &Path,
+    header: TailJournalHeader,
+    payload: &[u8],
+) -> Result<(), String> {
+    if payload.len() as u64 != header.original_len {
+        return Err(format!(
+            "DSF tail journal payload has {} byte(s), expected {}",
+            payload.len(),
+            header.original_len
+        ));
+    }
+    let parent = journal.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = journal
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tonepoet-dsf-tail.journal");
+    let (temporary_path, mut temporary) = allocate_private_temp(parent, file_name)?;
+    let mut published = false;
+    let result = (|| {
+        temporary
+            .write_all(&encode_tail_journal_header(header))
+            .and_then(|()| temporary.write_all(payload))
+            .map_err(|error| {
+                format!(
+                    "write DSF tail journal temporary '{}': {error}",
+                    temporary_path.display()
+                )
+            })?;
+        temporary.sync_all().map_err(|error| {
+            format!(
+                "sync DSF tail journal temporary '{}': {error}",
+                temporary_path.display()
+            )
+        })?;
+        drop(temporary);
+        publish_file_noreplace(&temporary_path, journal).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "refusing to replace unresolved DSF tail journal '{}' while publishing from '{}'",
+                    journal.display(),
+                    temporary_path.display()
+                )
+            } else {
+                format!(
+                    "atomically publish DSF tail journal '{}' from '{}' without replacement: {error}",
+                    journal.display(),
+                    temporary_path.display()
+                )
+            }
+        })?;
+        published = true;
+        crate::config::sync_parent_dir(parent).map_err(|error| {
+            format!(
+                "sync parent after publishing DSF tail journal '{}': {error}",
+                journal.display()
+            )
+        })
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(primary) if published => Err(primary),
+        Err(primary) => match std::fs::remove_file(&temporary_path) {
+            Ok(()) => match crate::config::sync_parent_dir(parent) {
+                Ok(()) => Err(primary),
+                Err(error) => Err(format!(
+                    "{primary}; unpublished DSF tail-journal temp '{}' was removed, but parent-directory durability could not be confirmed: {error}",
+                    temporary_path.display()
+                )),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(primary),
+            Err(error) => Err(format!(
+                "{primary}; additionally could not remove unpublished DSF tail-journal temp '{}': {error}",
+                temporary_path.display()
+            )),
+        },
+    }
+}
+
 fn publish_tail_journal_streaming(
     path: &Path,
     journal: &Path,
@@ -999,21 +1689,6 @@ fn publish_tail_journal_streaming(
     is_cancelled: &dyn Fn() -> bool,
     progress: &dyn Fn(DsfWriteProgress),
 ) -> Result<(), String> {
-    match std::fs::symlink_metadata(journal) {
-        Ok(_) => {
-            return Err(format!(
-                "refusing to replace unresolved DSF tail journal '{}'",
-                journal.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "inspect DSF tail journal path '{}': {error}",
-                journal.display()
-            ))
-        }
-    }
     let parent = journal.parent().unwrap_or_else(|| Path::new("."));
     let file_name = journal
         .file_name()
@@ -1071,12 +1746,20 @@ fn publish_tail_journal_streaming(
             return Err("metadata save cancelled before publishing DSF tail journal".to_string());
         }
         drop(temporary);
-        std::fs::rename(&temporary_path, journal).map_err(|error| {
-            format!(
-                "publish DSF tail journal '{}' from '{}': {error}",
-                journal.display(),
-                temporary_path.display()
-            )
+        publish_file_noreplace(&temporary_path, journal).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "refusing to replace unresolved DSF tail journal '{}' while publishing from '{}'",
+                    journal.display(),
+                    temporary_path.display()
+                )
+            } else {
+                format!(
+                    "atomically publish DSF tail journal '{}' from '{}' without replacement: {error}",
+                    journal.display(),
+                    temporary_path.display()
+                )
+            }
         })?;
         published = true;
         crate::config::sync_parent_dir(parent).map_err(|error| {
@@ -1146,6 +1829,72 @@ fn allocate_private_temp(parent: &Path, file_name: &str) -> Result<(PathBuf, std
     ))
 }
 
+fn restore_untagged_artwork_snapshot(
+    path: &Path,
+    original_file_size: u64,
+    original_header_patch: &[u8; DSF_HEADER_PATCH_LEN as usize],
+) -> Result<Option<String>, String> {
+    let current = inspect_dsf_metadata_location(path)?;
+    let DsfMetadataLocation::Id3 {
+        offset,
+        tag_end,
+        file_size,
+    } = current
+    else {
+        return match current {
+            DsfMetadataLocation::Untagged { file_size } if file_size == original_file_size => Ok(None),
+            DsfMetadataLocation::Untagged { file_size } => Err(format!(
+                "refusing DSF artwork rollback for '{}': expected original size {original_file_size}, found untagged size {file_size}",
+                path.display()
+            )),
+            DsfMetadataLocation::Id3 { .. } => unreachable!("matched above"),
+        };
+    };
+    if offset != original_file_size || tag_end != file_size {
+        return Err(format!(
+            "refusing DSF artwork rollback for '{}': current tag occupies {offset}..{tag_end} in a {file_size}-byte file, expected an appended tag beginning at {original_file_size}",
+            path.display()
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("open DSF artwork rollback target '{}': {error}", path.display()))?;
+    let recovery_identity = dsf_append_recovery_identity(&mut file, original_file_size)
+        .map_err(|error| {
+            format!(
+                "bind DSF artwork rollback journal for '{}': {error}",
+                path.display()
+            )
+        })?;
+    let journal = tail_journal_path(path);
+    publish_tail_journal_bytes(
+        &journal,
+        TailJournalHeader::append_tag(
+            TAIL_JOURNAL_PREPARED,
+            original_file_size,
+            file_size,
+            recovery_identity,
+        ),
+        original_header_patch,
+    )?;
+    match restore_tail_from_journal(path, &journal, &mut file, &|_| {}) {
+        Ok(()) => match remove_journal_durably(&journal) {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(format!(
+                "DSF artwork rollback for '{}' restored the exact untagged file, but its journal could not be retired durably: {error}",
+                path.display()
+            ))),
+        },
+        Err(error) => Err(format!(
+            "DSF artwork rollback failed for '{}' and journal '{}' was retained for startup recovery: {error}",
+            path.display(),
+            journal.display()
+        )),
+    }
+}
+
 fn rollback_cancelled_tail(
     path: &Path,
     journal: &Path,
@@ -1171,34 +1920,90 @@ fn rollback_cancelled_tail(
     }
 }
 
-fn verify_tail_journal_target(
+fn tail_journal_target_mismatch(
     path: &Path,
     file: &mut std::fs::File,
     header: TailJournalHeader,
-) -> Result<(), String> {
-    let expected = header
-        .offset
-        .checked_add(header.original_len)
-        .ok_or_else(|| format!("DSF tail journal range overflows for '{}'", path.display()))?;
+) -> Result<Option<String>, String> {
     let actual = file
         .metadata()
-        .map_err(|error| format!("stat DSF target during journal recovery '{}': {error}", path.display()))?
+        .map_err(|error| {
+            format!(
+                "stat DSF target during journal recovery '{}': {error}",
+                path.display()
+            )
+        })?
         .len();
-    if actual != expected {
-        return Err(format!(
-            "refusing DSF tail-journal recovery for '{}': journal expects {expected} bytes, target has {actual}",
-            path.display()
-        ));
+    match header.kind {
+        TailJournalKind::ReplaceTail if actual != header.original_file_size => {
+            return Ok(Some(format!(
+                "journal expects {} bytes, target has {actual}",
+                header.original_file_size
+            )));
+        }
+        TailJournalKind::AppendTag => {
+            let size_matches = if header.state == TAIL_JOURNAL_COMMITTED {
+                actual == header.committed_file_size
+            } else {
+                actual >= header.original_file_size && actual <= header.committed_file_size
+            };
+            if !size_matches {
+                return Ok(Some(format!(
+                    "append journal permits {}..={} bytes in PREPARED state and requires {} bytes in COMMITTED state, target has {actual}",
+                    header.original_file_size,
+                    header.committed_file_size,
+                    header.committed_file_size
+                )));
+            }
+        }
+        _ => {}
     }
-    let actual_identity = dsf_recovery_identity(file, header.offset, actual).map_err(|error| {
+
+    let actual_identity = match header.kind {
+        TailJournalKind::ReplaceTail => dsf_recovery_identity(
+            file,
+            header.identity_boundary(),
+            header.original_file_size,
+        ),
+        TailJournalKind::AppendTag => dsf_append_recovery_identity(file, header.original_file_size),
+    }
+    .map_err(|error| {
         format!(
             "verify DSF target identity during journal recovery '{}': {error}",
             path.display()
         )
     })?;
     if actual_identity != header.recovery_identity {
+        return Ok(Some(
+            "the bounded audio-prefix identity no longer matches the journal authority".to_string(),
+        ));
+    }
+
+    if header.kind == TailJournalKind::AppendTag && header.state == TAIL_JOURNAL_COMMITTED {
+        let facts_match = matches!(
+            inspect_dsf_metadata_location(path)?,
+            DsfMetadataLocation::Id3 { offset, tag_end, file_size }
+                if offset == header.original_file_size
+                    && tag_end == header.committed_file_size
+                    && file_size == header.committed_file_size
+        );
+        if !facts_match {
+            return Ok(Some(
+                "published container facts do not match the committed append journal".to_string(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn verify_tail_journal_target(
+    path: &Path,
+    file: &mut std::fs::File,
+    header: TailJournalHeader,
+) -> Result<(), String> {
+    if let Some(reason) = tail_journal_target_mismatch(path, file, header)? {
         return Err(format!(
-            "refusing DSF tail-journal recovery for '{}': the bounded audio-prefix identity no longer matches the journal authority",
+            "refusing DSF tail-journal recovery for '{}': {reason}",
             path.display()
         ));
     }
@@ -1227,8 +2032,13 @@ fn restore_tail_from_journal(
     }
     verify_tail_journal_target(path, file, header)?;
     journal_file
-        .seek(SeekFrom::Start(TAIL_JOURNAL_HEADER_LEN as u64))
-        .map_err(|error| format!("seek DSF tail journal payload '{}': {error}", journal.display()))?;
+        .seek(SeekFrom::Start(header.payload_offset))
+        .map_err(|error| {
+            format!(
+                "seek DSF tail journal payload '{}': {error}",
+                journal.display()
+            )
+        })?;
     file.seek(SeekFrom::Start(header.offset))
         .map_err(|error| format!("seek for DSF tail rollback: {error}"))?;
     let mut copied = 0u64;
@@ -1238,9 +2048,9 @@ fn restore_tail_from_journal(
             .expect("bounded DSF rollback copy chunk");
         journal_file
             .read_exact(&mut buffer[..wanted])
-            .map_err(|error| format!("read original DSF metadata tail from journal: {error}"))?;
+            .map_err(|error| format!("read original DSF metadata bytes from journal: {error}"))?;
         file.write_all(&buffer[..wanted])
-            .map_err(|error| format!("restore original DSF metadata tail: {error}"))?;
+            .map_err(|error| format!("restore original DSF metadata bytes: {error}"))?;
         copied += wanted as u64;
         progress(DsfWriteProgress {
             phase: DsfWriteProgressPhase::Recovering,
@@ -1248,8 +2058,12 @@ fn restore_tail_from_journal(
             bytes_total: header.original_len,
         });
     }
+    if header.kind == TailJournalKind::AppendTag {
+        file.set_len(header.original_file_size)
+            .map_err(|error| format!("truncate appended DSF metadata during rollback: {error}"))?;
+    }
     file.sync_all()
-        .map_err(|error| format!("fsync restored DSF metadata tail: {error}"))
+        .map_err(|error| format!("fsync restored DSF metadata state: {error}"))
 }
 
 fn mark_tail_journal_committed(journal: &Path) -> TailJournalCommitOutcome {
@@ -1355,8 +2169,7 @@ fn rewrite_container(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("audio.dsf");
+        .unwrap_or_else(|| std::ffi::OsStr::new("audio.dsf"));
     let (temporary_path, mut temporary) = allocate_temp(parent, file_name, &source_metadata)?;
     let total = metadata_offset.saturating_add(encoded_tag.len() as u64);
     let mut published = false;
@@ -1447,12 +2260,16 @@ fn rewrite_container(
 
 fn allocate_temp(
     parent: &Path,
-    file_name: &str,
+    file_name: &std::ffi::OsStr,
     source_metadata: &std::fs::Metadata,
 ) -> Result<(PathBuf, std::fs::File), String> {
+    let digest = crate::config::native_os_str_sha256_hex(
+        b"tonepoet-dsf-rewrite-temp-path-v1\0",
+        file_name,
+    );
     for _ in 0..128 {
         let path = parent.join(format!(
-            ".{file_name}.tonepoet-id3-{}.tmp",
+            ".tonepoet-dsf-rewrite-{digest}-{}.tmp",
             uuid::Uuid::new_v4()
         ));
         #[cfg(unix)]
@@ -1487,41 +2304,166 @@ fn allocate_temp(
     ))
 }
 
-fn recover_tail_journal(path: &Path) -> Result<bool, String> {
-    let journal = tail_journal_path(path);
-    let Some(mut journal_file) = open_tail_journal_for_read(&journal)? else {
+fn recover_tail_journal_at(path: &Path, journal: &Path) -> Result<bool, String> {
+    let Some(mut journal_file) = open_tail_journal_for_read(journal)? else {
         return Ok(false);
     };
-    let header = read_tail_journal_header(&journal, &mut journal_file)?;
+    let header = read_tail_journal_header(journal, &mut journal_file)?;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(header.state == TAIL_JOURNAL_PREPARED)
         .open(path)
-        .map_err(|error| format!("open DSF target for journal recovery '{}': {error}", path.display()))?;
-    verify_tail_journal_target(path, &mut file, header)?;
+        .map_err(|error| {
+            format!(
+                "open DSF target for journal recovery '{}': {error}",
+                path.display()
+            )
+        })?;
     if header.state == TAIL_JOURNAL_PREPARED {
-        journal_file
-            .seek(SeekFrom::Start(TAIL_JOURNAL_HEADER_LEN as u64))
-            .map_err(|error| format!("seek DSF tail journal payload '{}': {error}", journal.display()))?;
-        file.seek(SeekFrom::Start(header.offset))
-            .map_err(|error| format!("seek for DSF tail rollback: {error}"))?;
-        let mut copied = 0u64;
-        let mut buffer = vec![0u8; COPY_CHUNK_BYTES];
-        while copied < header.original_len {
-            let wanted = usize::try_from((header.original_len - copied).min(buffer.len() as u64))
-                .expect("bounded DSF recovery copy chunk");
-            journal_file
-                .read_exact(&mut buffer[..wanted])
-                .map_err(|error| format!("read original DSF metadata tail from journal: {error}"))?;
-            file.write_all(&buffer[..wanted])
-                .map_err(|error| format!("restore original DSF metadata tail: {error}"))?;
-            copied += wanted as u64;
-        }
-        file.sync_all()
-            .map_err(|error| format!("fsync restored DSF metadata tail: {error}"))?;
+        restore_tail_from_journal(path, journal, &mut file, &|_| {})?;
+    } else {
+        verify_tail_journal_target(path, &mut file, header)?;
     }
-    remove_journal_durably(&journal)?;
+    remove_journal_durably(journal)?;
     Ok(true)
+}
+
+fn tail_journal_matches_target(journal: &Path, path: &Path) -> Result<bool, String> {
+    let Some(mut journal_file) = open_tail_journal_for_read(journal)? else {
+        return Ok(false);
+    };
+    let header = read_tail_journal_header(journal, &mut journal_file)?;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "open candidate DSF target '{}' while attributing journal '{}': {error}",
+                path.display(),
+                journal.display()
+            ));
+        }
+    };
+    Ok(tail_journal_target_mismatch(path, &mut file, header)?.is_none())
+}
+
+fn dsf_targets_in_directory(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("scan DSF recovery directory '{}': {error}", dir.display()))?;
+    let mut targets = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("read DSF recovery directory entry in '{}': {error}", dir.display())
+        })?;
+        let path = entry.path();
+        if !is_dsf(&path) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            targets.push(path);
+        }
+    }
+    Ok(targets)
+}
+
+fn hashed_tail_journal_name(name: &str) -> bool {
+    let Some(digest) = name
+        .strip_prefix(".tonepoet-dsf-tail-")
+        .and_then(|name| name.strip_suffix(".journal"))
+    else {
+        return false;
+    };
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn legacy_tail_journal_name(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(".tonepoet-dsf-tail.journal")
+}
+
+fn journal_authority_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    if hashed_tail_journal_name(name) || legacy_tail_journal_name(name) {
+        Some(name)
+    } else {
+        tail_journal_temp_authority_name(name)
+    }
+}
+
+fn resolve_tail_journal_target(
+    journal: &Path,
+    candidates: &[PathBuf],
+) -> Result<Option<PathBuf>, String> {
+    let authority_name = journal_authority_name(journal).ok_or_else(|| {
+        format!(
+            "refusing unrecognized DSF tail-journal artifact '{}'",
+            journal.display()
+        )
+    })?;
+
+    if hashed_tail_journal_name(authority_name) {
+        let mut path_matches = candidates.iter().filter(|candidate| {
+            tail_journal_path(candidate)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(authority_name)
+        });
+        let Some(target) = path_matches.next() else {
+            return Ok(None);
+        };
+        if path_matches.next().is_some() {
+            return Err(format!(
+                "refusing ambiguous DSF tail-journal authority '{}': multiple current DSF targets derive the same SHA-256 authority pathname",
+                journal.display()
+            ));
+        }
+        return if tail_journal_matches_target(journal, target)? {
+            Ok(Some(target.clone()))
+        } else {
+            Ok(None)
+        };
+    }
+
+    let mut identity_matches = Vec::new();
+    for candidate in candidates {
+        if tail_journal_matches_target(journal, candidate)? {
+            identity_matches.push(candidate.clone());
+        }
+    }
+    match identity_matches.len() {
+        0 => Ok(None),
+        1 => Ok(identity_matches.pop()),
+        _ => Err(format!(
+            "refusing ambiguous legacy DSF tail journal '{}': its embedded generation identity matches multiple current DSF targets",
+            journal.display()
+        )),
+    }
+}
+
+fn recover_tail_journal(path: &Path) -> Result<bool, String> {
+    let journal = tail_journal_path(path);
+    if journal.exists() {
+        return recover_tail_journal_at(path, &journal);
+    }
+
+    let legacy = legacy_tail_journal_path(path);
+    if !legacy.exists() {
+        return Ok(false);
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let candidates = dsf_targets_in_directory(parent)?;
+    match resolve_tail_journal_target(&legacy, &candidates)? {
+        Some(target) if target == path => recover_tail_journal_at(path, &legacy),
+        Some(_) => Ok(false),
+        None => Err(format!(
+            "unresolved legacy DSF tail journal '{}' cannot be attributed to a current DSF target; inspect the directory at startup or run `tonepoet dsf-recover status '{}'` before retrying the write",
+            legacy.display(),
+            path.display()
+        )),
+    }
 }
 
 fn preflight_dsf_write_artifacts(path: &Path) -> Result<(), String> {
@@ -1553,6 +2495,117 @@ fn preflight_dsf_write_artifacts(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Inspect a generation-bound DSF tail journal for one target without changing
+/// either artifact. The same per-target lock used by writes prevents recovery
+/// status from racing a live mutation.
+pub fn inspect_tail_journal(path: &Path) -> Result<Option<DsfTailJournalInspection>, String> {
+    let (_lock, target) = acquire_dsf_write_lock(path)?;
+    inspect_tail_journal_locked(&target)
+}
+
+fn inspect_tail_journal_locked(
+    target: &Path,
+) -> Result<Option<DsfTailJournalInspection>, String> {
+    let hashed = tail_journal_path(target);
+    let journal = if hashed.exists() {
+        hashed
+    } else {
+        let legacy = legacy_tail_journal_path(target);
+        if !legacy.exists() {
+            return Ok(None);
+        }
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let candidates = dsf_targets_in_directory(parent)?;
+        match resolve_tail_journal_target(&legacy, &candidates)? {
+            Some(candidate) if candidate == target => legacy,
+            Some(candidate) => {
+                return Err(format!(
+                    "DSF tail journal '{}' belongs to '{}', not '{}'",
+                    legacy.display(),
+                    candidate.display(),
+                    target.display()
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "DSF tail journal '{}' cannot be attributed to '{}'",
+                    legacy.display(),
+                    target.display()
+                ))
+            }
+        }
+    };
+
+    let mut journal_file = open_tail_journal_for_read(&journal)?.ok_or_else(|| {
+        format!(
+            "DSF tail journal '{}' disappeared during inspection",
+            journal.display()
+        )
+    })?;
+    let header = read_tail_journal_header(&journal, &mut journal_file)?;
+    let mut target_file = std::fs::File::open(target).map_err(|error| {
+        format!(
+            "open DSF target for tail-journal inspection '{}': {error}",
+            target.display()
+        )
+    })?;
+    verify_tail_journal_target(target, &mut target_file, header)?;
+
+    Ok(Some(DsfTailJournalInspection {
+        target: target.to_path_buf(),
+        journal,
+        state: if header.state == TAIL_JOURNAL_PREPARED {
+            "prepared"
+        } else {
+            "committed"
+        },
+        operation: match header.kind {
+            TailJournalKind::ReplaceTail => "replace-tail",
+            TailJournalKind::AppendTag => "append-tag",
+        },
+        original_file_size: header.original_file_size,
+        committed_file_size: header.committed_file_size,
+    }))
+}
+
+/// Recover or retire the generation-bound tail journal for one DSF target. A
+/// PREPARED journal restores the exact pre-write state; a COMMITTED journal is
+/// verified against the published container and then retired. Inspection and
+/// recovery remain under one per-target lock, so the returned description is
+/// the exact journal generation that was resolved.
+pub fn recover_tail_journal_for_target(
+    path: &Path,
+) -> Result<Option<DsfTailJournalInspection>, String> {
+    let (_lock, target) = acquire_dsf_write_lock(path)?;
+    let Some(inspection) = inspect_tail_journal_locked(&target)? else {
+        return Ok(None);
+    };
+    if !recover_tail_journal_at(&target, &inspection.journal)? {
+        return Err(format!(
+            "DSF tail journal '{}' disappeared while its target lock was held",
+            inspection.journal.display()
+        ));
+    }
+    Ok(Some(inspection))
+}
+
+/// Inspect a legacy `.tonepoet-bak` marker if present. Absence is not an error,
+/// which lets the recovery CLI report tail and legacy authority independently.
+pub fn inspect_legacy_backup_if_present(
+    path: &Path,
+) -> Result<Option<DsfLegacyBackupInspection>, String> {
+    let (_lock, target) = acquire_dsf_write_lock(path)?;
+    let marker = crate::db::Database::backup_path_for(&target);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => inspect_legacy_backup_locked(&target, &marker).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "inspect legacy DSF rollback marker '{}': {error}",
+            marker.display()
+        )),
+    }
+}
+
 /// Inspect a legacy `.tonepoet-bak` marker under the same bounded per-target
 /// lock used by DSF writes. Comparison is streaming and uses fixed memory.
 pub fn inspect_legacy_backup(path: &Path) -> Result<DsfLegacyBackupInspection, String> {
@@ -1573,6 +2626,7 @@ pub fn resolve_legacy_backup(
     let inspection = inspect_legacy_backup_locked(&target, &marker)?;
     match resolution {
         DsfLegacyBackupResolution::RestoreBackup => {
+            require_dsf_header(&marker, "legacy DSF rollback marker")?;
             crate::db::Database::restore_backup_for(&target, &marker)?;
         }
         DsfLegacyBackupResolution::KeepCurrent => {
@@ -1580,6 +2634,21 @@ pub fn resolve_legacy_backup(
         }
     }
     Ok(inspection)
+}
+
+fn require_dsf_header(path: &Path, label: &str) -> Result<(), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open {label} '{}': {error}", path.display()))?;
+    let mut marker = [0u8; 4];
+    file.read_exact(&mut marker)
+        .map_err(|error| format!("read {label} header '{}': {error}", path.display()))?;
+    if &marker != b"DSD " {
+        return Err(format!(
+            "refusing to restore {label} '{}': expected DSF DSD chunk marker",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn inspect_legacy_backup_locked(
@@ -1656,7 +2725,11 @@ fn remove_legacy_backup_marker_durably(marker: &Path) -> Result<(), String> {
 
 fn remove_orphaned_dsf_temps_for_target(path: &Path) -> Result<usize, String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let target_name = path.file_name().and_then(|name| name.to_str());
+    let target_name = path.file_name();
+    let rewrite_digest = crate::config::native_os_str_sha256_hex(
+        b"tonepoet-dsf-rewrite-temp-path-v1\0",
+        target_name.unwrap_or_else(|| std::ffi::OsStr::new("audio.dsf")),
+    );
     let entries = std::fs::read_dir(parent)
         .map_err(|error| format!("scan DSF rewrite temporaries in '{}': {error}", parent.display()))?;
     let mut removed = 0usize;
@@ -1667,25 +2740,32 @@ fn remove_orphaned_dsf_temps_for_target(path: &Path) -> Result<usize, String> {
         let Some(name) = artifact.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(original_name) = dsf_temp_original_name(name)
-            .or_else(|| tail_journal_temp_original_name(name))
-        else {
-            continue;
+        let belongs_to_target = if rewrite_temp_digest(name).is_some_and(|value| value == rewrite_digest) {
+            true
+        } else if let Some(original_name) = legacy_dsf_temp_original_name(name) {
+            target_name
+                .and_then(|name| name.to_str())
+                .is_some_and(|target| target == original_name)
+        } else if let Some(journal_name) = tail_journal_temp_authority_name(name) {
+            // Unpublished journal temps attribute by NAME: publication is an
+            // atomic hard-link of a complete, fsynced journal, so a surviving
+            // temp is torn by contract and must not be content-parsed.
+            tail_journal_path(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(journal_name)
+                || legacy_tail_journal_path(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(journal_name)
+        } else {
+            false
         };
-        match target_name {
-            Some(target_name) if original_name != target_name => continue,
-            Some(_) => {}
-            None if original_name == "audio.dsf" => {
-                return Err(format!(
-                    "cannot safely attribute orphan DSF temporary artifact '{}' to non-UTF-8 target '{}'; explicit inspection is required",
-                    artifact.display(),
-                    path.display()
-                ));
-            }
-            None => continue,
+        if !belongs_to_target {
+            continue;
         }
         let metadata = std::fs::symlink_metadata(&artifact)
-            .map_err(|error| format!("inspect DSF rewrite temp '{}': {error}", artifact.display()))?;
+            .map_err(|error| format!("inspect DSF temporary '{}': {error}", artifact.display()))?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(format!(
                 "refusing to remove ambiguous DSF temporary artifact '{}': expected a regular file",
@@ -1707,7 +2787,21 @@ fn remove_orphaned_dsf_temps_for_target(path: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
-fn dsf_temp_original_name(name: &str) -> Option<&str> {
+fn rewrite_temp_digest(name: &str) -> Option<&str> {
+    let stem = name
+        .strip_prefix(".tonepoet-dsf-rewrite-")?
+        .strip_suffix(".tmp")?;
+    let digest = stem.get(..64)?;
+    let uuid = stem.get(64..)?.strip_prefix('-')?;
+    uuid::Uuid::parse_str(uuid).ok()?;
+    if digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(digest)
+    } else {
+        None
+    }
+}
+
+fn legacy_dsf_temp_original_name(name: &str) -> Option<&str> {
     let (prefix, suffix) = name.rsplit_once(".tonepoet-id3-")?;
     let original = prefix.strip_prefix('.')?;
     if !original.to_ascii_lowercase().ends_with(".dsf") {
@@ -1718,22 +2812,73 @@ fn dsf_temp_original_name(name: &str) -> Option<&str> {
     Some(original)
 }
 
-fn tail_journal_temp_original_name(name: &str) -> Option<&str> {
+/// Attribute an UNPUBLISHED tail-journal temp to a current target by NAME
+/// alone. Publication is an atomic hard-link of a complete, fsynced journal,
+/// so a surviving `.tmp` is dead weight by contract — its content may be
+/// arbitrarily torn and must not be parsed for attribution. Removal still
+/// acquires the target's write lock (cleanup_stale_dsf_temp), so this can
+/// never race a live publication.
+fn resolve_tail_journal_temp_target(
+    journal_name: &str,
+    candidates: &[PathBuf],
+) -> Result<Option<PathBuf>, String> {
+    let mut matches = candidates.iter().filter(|candidate| {
+        tail_journal_path(candidate)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(journal_name)
+            || legacy_tail_journal_path(candidate)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(journal_name)
+    });
+    let Some(target) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "refusing ambiguous DSF tail-journal temp authority '{journal_name}': multiple current DSF targets derive the same journal name"
+        ));
+    }
+    Ok(Some(target.clone()))
+}
+
+fn tail_journal_temp_authority_name(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".tmp")?;
     let (journal_name, uuid) = stem.rsplit_once('.')?;
     uuid::Uuid::parse_str(uuid).ok()?;
-    let original = journal_name
-        .strip_prefix('.')?
-        .strip_suffix(".tonepoet-dsf-tail.journal")?;
-    if !original.to_ascii_lowercase().ends_with(".dsf") {
-        return None;
+    if hashed_tail_journal_name(journal_name) || legacy_tail_journal_name(journal_name) {
+        Some(journal_name)
+    } else {
+        None
     }
-    Some(original)
 }
+
 
 #[cfg(test)]
 fn is_dsf_temp_name(name: &str) -> bool {
-    dsf_temp_original_name(name).is_some()
+    rewrite_temp_digest(name).is_some() || legacy_dsf_temp_original_name(name).is_some()
+}
+
+fn cleanup_stale_dsf_temp(
+    artifact: &Path,
+    target: &Path,
+    label: &str,
+    dir: &Path,
+) -> String {
+    match acquire_dsf_write_lock(target) {
+        Ok((_lock, _target)) => match std::fs::remove_file(artifact) {
+            Ok(()) => match crate::config::sync_parent_dir(dir) {
+                Ok(()) => format!("Removed stale {label} {}", artifact.display()),
+                Err(error) => format!(
+                    "Removed stale {label} {}, but directory durability is unconfirmed: {error}",
+                    artifact.display()
+                ),
+            },
+            Err(error) => format!("{label} cleanup failed for {}: {error}", artifact.display()),
+        },
+        Err(error) => format!("{label} cleanup deferred for {}: {error}", artifact.display()),
+    }
 }
 
 /// Recover generation-bound DSF tail journals, report unversioned legacy
@@ -1742,6 +2887,13 @@ fn is_dsf_temp_name(name: &str) -> bool {
 /// surface; failures remain visible and leave their authority artifacts intact.
 pub fn recover_stale_writes_in_directory(dir: &Path) -> Vec<String> {
     let mut messages = Vec::new();
+    let candidates = match dsf_targets_in_directory(dir) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            messages.push(error);
+            return messages;
+        }
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return messages;
     };
@@ -1750,72 +2902,53 @@ pub fn recover_stale_writes_in_directory(dir: &Path) -> Vec<String> {
         let Some(name) = artifact.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if let Some(original_name) = name
-            .strip_prefix('.')
-            .and_then(|name| name.strip_suffix(".tonepoet-dsf-tail.journal"))
-            .filter(|name| name.to_ascii_lowercase().ends_with(".dsf"))
-        {
-            let original = artifact.with_file_name(original_name);
-            match acquire_dsf_write_lock(&original) {
-                Ok((_lock, target)) => match recover_tail_journal(&target) {
-                    Ok(true) => messages.push(format!(
-                        "Recovered DSF metadata tail journal for {}",
-                        target.display()
-                    )),
-                    Ok(false) => {}
-                    Err(error) => messages.push(format!(
-                        "DSF metadata tail-journal recovery failed for {}: {error}",
-                        target.display()
-                    )),
-                },
-                Err(error) => messages.push(format!(
-                    "DSF metadata tail-journal recovery deferred for {}: {error}",
-                    original.display()
-                )),
-            }
-            continue;
-        }
-        if let Some(original_name) = tail_journal_temp_original_name(name) {
-            let original = artifact.with_file_name(original_name);
-            if original_name == "audio.dsf" && !original.exists() {
-                messages.push(format!(
-                    "DSF tail-journal temp '{}' was retained because its fallback name cannot be safely attributed to a non-UTF-8 or removed target",
-                    artifact.display()
-                ));
-                continue;
-            }
-            if !original.exists() {
-                messages.push(format!(
-                    "DSF tail-journal temp '{}' was retained because its target '{}' is missing",
-                    artifact.display(),
-                    original.display()
-                ));
-                continue;
-            }
-            match acquire_dsf_write_lock(&original) {
-                Ok((_lock, _target)) => match std::fs::remove_file(&artifact) {
-                    Ok(()) => match crate::config::sync_parent_dir(dir) {
-                        Ok(()) => messages.push(format!(
-                            "Removed stale DSF tail-journal temp {}",
-                            artifact.display()
+
+        if hashed_tail_journal_name(name) || legacy_tail_journal_name(name) {
+            match resolve_tail_journal_target(&artifact, &candidates) {
+                Ok(Some(original)) => match acquire_dsf_write_lock(&original) {
+                    Ok((_lock, target)) => match recover_tail_journal_at(&target, &artifact) {
+                        Ok(true) => messages.push(format!(
+                            "Recovered DSF metadata tail journal for {}",
+                            target.display()
                         )),
+                        Ok(false) => {}
                         Err(error) => messages.push(format!(
-                            "Removed stale DSF tail-journal temp {}, but directory durability is unconfirmed: {error}",
-                            artifact.display()
+                            "DSF metadata tail-journal recovery failed for {}: {error}",
+                            target.display()
                         )),
                     },
                     Err(error) => messages.push(format!(
-                        "DSF tail-journal temp cleanup failed for {}: {error}",
-                        artifact.display()
+                        "DSF metadata tail-journal recovery deferred for {}: {error}",
+                        original.display()
                     )),
                 },
-                Err(error) => messages.push(format!(
-                    "DSF tail-journal temp cleanup deferred for {}: {error}",
-                    artifact.display()
+                Ok(None) => messages.push(format!(
+                    "DSF tail journal '{}' was retained because its embedded generation identity does not match any current DSF target in '{}'",
+                    artifact.display(),
+                    dir.display()
                 )),
+                Err(error) => messages.push(error),
             }
             continue;
         }
+
+        if let Some(journal_name) = tail_journal_temp_authority_name(name) {
+            match resolve_tail_journal_temp_target(journal_name, &candidates) {
+                Ok(Some(original)) => messages.push(cleanup_stale_dsf_temp(
+                    &artifact,
+                    &original,
+                    "DSF tail-journal temp",
+                    dir,
+                )),
+                Ok(None) => messages.push(format!(
+                    "DSF tail-journal temp '{}' was retained because it cannot be attributed to a current target",
+                    artifact.display()
+                )),
+                Err(error) => messages.push(error),
+            }
+            continue;
+        }
+
         if let Some(original_name) = name
             .strip_suffix(".tonepoet-bak")
             .filter(|name| name.to_ascii_lowercase().ends_with(".dsf"))
@@ -1853,45 +2986,39 @@ pub fn recover_stale_writes_in_directory(dir: &Path) -> Vec<String> {
             }
             continue;
         }
-        if let Some(original_name) = dsf_temp_original_name(name) {
+
+        let rewrite_target = if let Some(digest) = rewrite_temp_digest(name) {
+            let mut matches = candidates.iter().filter(|candidate| {
+                candidate.file_name().is_some_and(|file_name| {
+                    crate::config::native_os_str_sha256_hex(
+                        b"tonepoet-dsf-rewrite-temp-path-v1\0",
+                        file_name,
+                    ) == digest
+                })
+            });
+            let first = matches.next().cloned();
+            if matches.next().is_some() {
+                messages.push(format!(
+                    "DSF rewrite temp '{}' was retained because its target digest is ambiguous",
+                    artifact.display()
+                ));
+                None
+            } else {
+                first
+            }
+        } else if let Some(original_name) = legacy_dsf_temp_original_name(name) {
             let original = artifact.with_file_name(original_name);
-            if original_name == "audio.dsf" && !original.exists() {
-                messages.push(format!(
-                    "DSF rewrite temp '{}' was retained because its fallback name cannot be safely attributed to a non-UTF-8 or removed target",
-                    artifact.display()
-                ));
-                continue;
-            }
-            if !original.exists() {
-                messages.push(format!(
-                    "DSF rewrite temp '{}' was retained because its target '{}' is missing",
-                    artifact.display(),
-                    original.display()
-                ));
-                continue;
-            }
-            match acquire_dsf_write_lock(&original) {
-                Ok((_lock, _target)) => match std::fs::remove_file(&artifact) {
-                    Ok(()) => match crate::config::sync_parent_dir(dir) {
-                        Ok(()) => messages.push(format!(
-                            "Removed stale DSF rewrite temp {}",
-                            artifact.display()
-                        )),
-                        Err(error) => messages.push(format!(
-                            "Removed stale DSF rewrite temp {}, but directory durability is unconfirmed: {error}",
-                            artifact.display()
-                        )),
-                    },
-                    Err(error) => messages.push(format!(
-                        "DSF rewrite temp cleanup failed for {}: {error}",
-                        artifact.display()
-                    )),
-                },
-                Err(error) => messages.push(format!(
-                    "DSF rewrite temp cleanup deferred for {}: {error}",
-                    artifact.display()
-                )),
-            }
+            original.exists().then_some(original)
+        } else {
+            None
+        };
+        if let Some(original) = rewrite_target {
+            messages.push(cleanup_stale_dsf_temp(
+                &artifact,
+                &original,
+                "DSF rewrite temp",
+                dir,
+            ));
         }
     }
     messages
@@ -1922,7 +3049,17 @@ fn append_distinct(values: &mut Vec<String>, value: String) {
 
 fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
     let mut fields = BTreeMap::<String, Vec<String>>::new();
+    let mut stored_value_counts = BTreeMap::<String, usize>::new();
+    let raw_counts = raw.stored_value_counts;
     let entries = raw.fields.into_iter().collect::<Vec<_>>();
+
+    for (key, values) in &entries {
+        let count = raw_counts
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| values.iter().filter(|value| !value.trim().is_empty()).count());
+        *stored_value_counts.entry(canonicalize_key(key)).or_default() += count;
+    }
 
     // Canonical spellings win deterministically even though the raw snapshot is
     // key-sorted. A second pass appends distinct legacy-alias values only after
@@ -1940,7 +3077,10 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
             }
         }
     }
-    DsfTagSnapshot { fields }
+    DsfTagSnapshot {
+        fields,
+        stored_value_counts,
+    }
 }
 
 fn resolve_changes(changes: &[DsfTagChange]) -> Result<Vec<DsfTagChange>, String> {
@@ -1992,7 +3132,7 @@ fn resolve_changes(changes: &[DsfTagChange]) -> Result<Vec<DsfTagChange>, String
 /// Direct dependency seam. Keep every crate-specific type and method here.
 mod backend {
     use super::{DsfMetadataLocation, DsfTagChange, DsfTagSnapshot};
-    use id3::frame::{Comment, Content, ExtendedText};
+    use id3::frame::{Comment, Content, ExtendedText, Picture, PictureType};
     use id3::{Tag, TagLike, Version};
     use std::collections::BTreeMap;
     use std::io::{Seek, SeekFrom};
@@ -2021,6 +3161,102 @@ mod backend {
             return Err("ID3 backend produced bytes without an ID3 marker".to_string());
         }
         Ok((location, encoded))
+    }
+
+    pub(super) fn prepare_artwork_replace(
+        path: &Path,
+        picture_type_code: u8,
+        mime_type: &str,
+        image_bytes: &[u8],
+    ) -> Result<(super::DsfArtworkSnapshot, Vec<u8>), String> {
+        let location = super::inspect_dsf_metadata_location(path)?;
+        let mut tag = read_tag(path, location)?;
+        let original_encoded_tag = encode_tag(&tag)?;
+        let picture_type = picture_type_from_code(picture_type_code);
+        tag.remove_picture_by_type(picture_type);
+        tag.add_frame(Picture {
+            mime_type: mime_type.to_string(),
+            picture_type,
+            description: String::new(),
+            data: image_bytes.to_vec(),
+        });
+        let encoded = encode_tag(&tag)?;
+        Ok((
+            super::DsfArtworkSnapshot {
+                original_location: location,
+                original_encoded_tag,
+                original_header_patch: matches!(location, DsfMetadataLocation::Untagged { .. })
+                    .then(|| super::read_dsf_header_patch(path))
+                    .transpose()?,
+            },
+            encoded,
+        ))
+    }
+
+    pub(super) fn prepare_artwork_remove(
+        path: &Path,
+        picture_type_code: u8,
+    ) -> Result<Option<(super::DsfArtworkSnapshot, Vec<u8>)>, String> {
+        let location = super::inspect_dsf_metadata_location(path)?;
+        let mut tag = read_tag(path, location)?;
+        let picture_type = picture_type_from_code(picture_type_code);
+        if !tag.pictures().any(|picture| picture.picture_type == picture_type) {
+            return Ok(None);
+        }
+        let original_encoded_tag = encode_tag(&tag)?;
+        tag.remove_picture_by_type(picture_type);
+        let encoded = encode_tag(&tag)?;
+        Ok(Some((
+            super::DsfArtworkSnapshot {
+                original_location: location,
+                original_encoded_tag,
+                original_header_patch: matches!(location, DsfMetadataLocation::Untagged { .. })
+                    .then(|| super::read_dsf_header_patch(path))
+                    .transpose()?,
+            },
+            encoded,
+        )))
+    }
+
+    fn encode_tag(tag: &Tag) -> Result<Vec<u8>, String> {
+        let mut encoded = Vec::new();
+        tag.write_to(&mut encoded, Version::Id3v24)
+            .map_err(|error| format!("encode ID3v2.4 tag: {error}"))?;
+        if !encoded.starts_with(b"ID3") {
+            return Err("ID3 backend produced bytes without an ID3 marker".to_string());
+        }
+        Ok(encoded)
+    }
+
+    /// Convert the ID3v2 APIC picture-type byte without relying on a reverse
+    /// `From<u8>` implementation that id3 1.17.0 does not provide. Keep the
+    /// registry mapping explicit so every standardized code and every unknown
+    /// extension value has deterministic round-trip behavior.
+    pub(super) fn picture_type_from_code(code: u8) -> PictureType {
+        match code {
+            0x00 => PictureType::Other,
+            0x01 => PictureType::Icon,
+            0x02 => PictureType::OtherIcon,
+            0x03 => PictureType::CoverFront,
+            0x04 => PictureType::CoverBack,
+            0x05 => PictureType::Leaflet,
+            0x06 => PictureType::Media,
+            0x07 => PictureType::LeadArtist,
+            0x08 => PictureType::Artist,
+            0x09 => PictureType::Conductor,
+            0x0a => PictureType::Band,
+            0x0b => PictureType::Composer,
+            0x0c => PictureType::Lyricist,
+            0x0d => PictureType::RecordingLocation,
+            0x0e => PictureType::DuringRecording,
+            0x0f => PictureType::DuringPerformance,
+            0x10 => PictureType::ScreenCapture,
+            0x11 => PictureType::BrightFish,
+            0x12 => PictureType::Illustration,
+            0x13 => PictureType::BandLogo,
+            0x14 => PictureType::PublisherLogo,
+            unknown => PictureType::Undefined(unknown),
+        }
     }
 
     fn read_tag(path: &Path, location: DsfMetadataLocation) -> Result<Tag, String> {
@@ -2099,7 +3335,14 @@ mod backend {
                 push_owned(&mut fields, key, value.to_string());
             }
         }
-        DsfTagSnapshot { fields }
+        let stored_value_counts = fields
+            .iter()
+            .map(|(key, values)| (key.clone(), values.len()))
+            .collect();
+        DsfTagSnapshot {
+            fields,
+            stored_value_counts,
+        }
     }
 
     pub(super) fn apply_changes_to_tag(tag: &mut Tag, changes: &[DsfTagChange]) {
@@ -2286,6 +3529,31 @@ pub(crate) fn write_test_dsf_fixture(
 mod tests {
     use super::*;
     use id3::TagLike;
+
+    #[test]
+    fn dsf_snapshot_promotes_pre_emphasis_and_preserves_custom_tag_provenance() {
+        let snapshot = DsfTagSnapshot {
+            fields: BTreeMap::from([
+                ("PRE_EMPHASIS".to_string(), vec!["1".to_string()]),
+                ("MY_NOTE".to_string(), vec!["keep me".to_string()]),
+            ]),
+            ..DsfTagSnapshot::default()
+        };
+
+        let metadata = to_track_metadata(&snapshot);
+        assert!(metadata.pre_emphasis);
+        assert_eq!(metadata.extra.get("my_note").map(String::as_str), Some("keep me"));
+        assert_eq!(
+            metadata
+                .extra
+                .get(&format!(
+                    "{}my_note",
+                    crate::convert::pipeline::SOURCE_TEXT_TAG_EXTRA_PREFIX
+                ))
+                .map(String::as_str),
+            Some("keep me")
+        );
+    }
 
     #[test]
     fn id3_mapping_seam_round_trips_number_pairs_comments_and_custom_text() {
@@ -2733,6 +4001,131 @@ mod tests {
     }
 
     #[test]
+    fn compact_tag_growth_rewrites_once_then_reuses_seeded_padding_in_place() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("compact.dsf");
+        let mut tag = id3::Tag::new();
+        tag.add_frame(id3::Frame::text("TIT2", "compact"));
+        let mut metadata = Vec::new();
+        tag.write_to(&mut metadata, id3::Version::Id3v24)
+            .expect("serialize compact fixture tag");
+        write_test_dsf_fixture(&path, Some(&metadata)).expect("write compact tagged fixture");
+        let original = std::fs::read(&path).expect("read compact fixture");
+        let metadata_offset = u64::from_le_bytes(
+            original[20..28].try_into().expect("metadata pointer"),
+        );
+        assert_eq!(original.len() as u64 - metadata_offset, metadata.len() as u64);
+
+        let first_progress = std::sync::Mutex::new(Vec::new());
+        write_with_control(
+            &path,
+            &[DsfTagChange {
+                canonical_key: "TITLE".into(),
+                value: Some("a".repeat(64 * 1024)),
+            }],
+            &|| false,
+            &|update| first_progress.lock().expect("first progress lock").push(update.phase),
+        )
+        .expect("first growing edit rewrites once");
+        let after_first = std::fs::read(&path).expect("read first rewrite");
+        // The header's declared-file-size field (bytes 12..20) MUST change —
+        // the rewrite grows the file by the new tag + seeded reserve. Every
+        // other prefix byte (magic/header, metadata pointer, fmt/data chunks,
+        // audio) must be preserved.
+        assert_eq!(&after_first[..12], &original[..12]);
+        assert_eq!(
+            u64::from_le_bytes(after_first[12..20].try_into().expect("size field")),
+            after_first.len() as u64,
+            "header must declare the grown file size",
+        );
+        assert_eq!(
+            &after_first[20..metadata_offset as usize],
+            &original[20..metadata_offset as usize],
+            "the one-time rewrite must preserve the metadata pointer and every audio byte",
+        );
+        let first_allocation = after_first.len() as u64 - metadata_offset;
+        assert!(
+            first_allocation >= REWRITE_PADDING_BYTES + 64 * 1024,
+            "rewrite must seed at least 1 MiB of reusable metadata allocation"
+        );
+        let first_phases = first_progress.into_inner().expect("first progress values");
+        assert!(first_phases.contains(&DsfWriteProgressPhase::CopyingPrefix));
+        assert!(!first_phases.contains(&DsfWriteProgressPhase::Journaling));
+
+        let second_progress = std::sync::Mutex::new(Vec::new());
+        write_with_control(
+            &path,
+            &[DsfTagChange {
+                canonical_key: "TITLE".into(),
+                value: Some("b".repeat(96 * 1024)),
+            }],
+            &|| false,
+            &|update| second_progress.lock().expect("second progress lock").push(update.phase),
+        )
+        .expect("second growing edit fits seeded allocation");
+        let after_second = std::fs::read(&path).expect("read in-place update");
+        assert_eq!(
+            &after_second[..metadata_offset as usize],
+            &after_first[..metadata_offset as usize],
+            "the follow-up edit must not rewrite container/audio bytes",
+        );
+        assert_eq!(after_second.len(), after_first.len());
+        let expected_title = "b".repeat(96 * 1024);
+        assert_eq!(
+            read(&path).expect("read second title").first("TITLE"),
+            Some(expected_title.as_str())
+        );
+        let second_phases = second_progress.into_inner().expect("second progress values");
+        assert!(second_phases.contains(&DsfWriteProgressPhase::Journaling));
+        assert!(second_phases.contains(&DsfWriteProgressPhase::WritingTail));
+        assert!(!second_phases.contains(&DsfWriteProgressPhase::CopyingPrefix));
+    }
+
+    #[test]
+    fn untagged_first_tag_appends_padded_id3_without_moving_audio_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("untagged.dsf");
+        write_test_dsf_fixture(&path, None).expect("write untagged fixture");
+        let original = std::fs::read(&path).expect("read untagged fixture");
+        let original_size = original.len() as u64;
+        let progress = std::sync::Mutex::new(Vec::new());
+
+        write_with_control(
+            &path,
+            &[DsfTagChange {
+                canonical_key: "MY_NOTE".into(),
+                value: Some("first tag".into()),
+            }],
+            &|| false,
+            &|update| progress.lock().expect("progress lock").push(update.phase),
+        )
+        .expect("append first DSF tag");
+
+        let after = std::fs::read(&path).expect("read appended fixture");
+        assert_eq!(
+            u64::from_le_bytes(after[20..28].try_into().expect("metadata pointer")),
+            original_size
+        );
+        assert_eq!(
+            u64::from_le_bytes(after[12..20].try_into().expect("declared size")),
+            after.len() as u64
+        );
+        assert_eq!(&after[28..original.len()], &original[28..]);
+        assert_eq!(&after[original.len()..original.len() + 3], b"ID3");
+        assert!(after.len() as u64 >= original_size + REWRITE_PADDING_BYTES);
+        assert_eq!(
+            read(&path).expect("read appended tag").first("MY_NOTE"),
+            Some("first tag")
+        );
+        let phases = progress.into_inner().expect("progress values");
+        assert!(phases.contains(&DsfWriteProgressPhase::Journaling));
+        assert!(phases.contains(&DsfWriteProgressPhase::WritingTail));
+        assert!(phases.contains(&DsfWriteProgressPhase::Publishing));
+        assert!(!phases.contains(&DsfWriteProgressPhase::CopyingPrefix));
+        assert!(!tail_journal_path(&path).exists());
+    }
+
+    #[test]
     fn cancelling_bounded_tail_write_restores_exact_original_bytes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
@@ -2861,12 +4254,13 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_full_rewrite_preserves_original_and_removes_temp() {
+    fn cancelling_untagged_append_restores_exact_original_without_prefix_copy() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("untagged.dsf");
         write_test_dsf_fixture(&path, None).expect("write untagged fixture");
         let original = std::fs::read(&path).expect("read original fixture");
         let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let phases = std::sync::Mutex::new(Vec::new());
 
         let error = write_with_control(
             &path,
@@ -2876,17 +4270,25 @@ mod tests {
             }],
             &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
             &|update| {
-                if update.phase == DsfWriteProgressPhase::CopyingPrefix
-                    && update.bytes_done > 0
+                phases.lock().expect("phase lock").push(update.phase);
+                if update.phase == DsfWriteProgressPhase::WritingTail
+                    && update.bytes_done >= COPY_CHUNK_BYTES as u64
                 {
                     cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             },
         )
-        .expect_err("mid-rewrite cancellation must abort");
+        .expect_err("mid-append cancellation must abort");
 
-        assert_eq!(error, "metadata save cancelled during DSF tag copy");
+        assert!(error.contains("metadata save cancelled while writing DSF metadata tail"));
+        assert!(error.contains("original tail was restored"));
         assert_eq!(std::fs::read(&path).expect("read unchanged fixture"), original);
+        let phases = phases.into_inner().expect("phase values");
+        assert!(phases.contains(&DsfWriteProgressPhase::Journaling));
+        assert!(phases.contains(&DsfWriteProgressPhase::WritingTail));
+        assert!(phases.contains(&DsfWriteProgressPhase::Recovering));
+        assert!(!phases.contains(&DsfWriteProgressPhase::CopyingPrefix));
+        assert!(!tail_journal_path(&path).exists());
         assert!(
             std::fs::read_dir(temp.path())
                 .expect("read tempdir")
@@ -2922,7 +4324,7 @@ mod tests {
         std::fs::write(&path, &torn).expect("write torn target");
         std::fs::write(
             &journal,
-            encode_tail_journal(
+            encode_legacy_tail_journal(
                 offset,
                 &original_tail,
                 &recovery_identity,
@@ -2930,7 +4332,16 @@ mod tests {
             ),
         )
         .expect("write prepared journal");
-        assert!(recover_tail_journal(&path).expect("recover prepared journal"));
+        let inspection = inspect_tail_journal(&path)
+            .expect("inspect prepared journal")
+            .expect("prepared journal present");
+        assert_eq!(inspection.state, "prepared");
+        assert_eq!(inspection.operation, "replace-tail");
+        assert_eq!(inspection.original_file_size, original.len() as u64);
+        assert_eq!(inspection.committed_file_size, original.len() as u64);
+        assert!(recover_tail_journal_for_target(&path)
+            .expect("recover prepared journal")
+            .is_some());
         assert_eq!(std::fs::read(&path).expect("read recovered target"), original);
         assert!(!journal.exists());
 
@@ -2947,8 +4358,125 @@ mod tests {
             ),
         )
         .expect("write committed journal");
-        assert!(recover_tail_journal(&path).expect("clean committed journal"));
+        let inspection = inspect_tail_journal(&path)
+            .expect("inspect committed journal")
+            .expect("committed journal present");
+        assert_eq!(inspection.state, "committed");
+        assert_eq!(inspection.operation, "replace-tail");
+        assert!(recover_tail_journal_for_target(&path)
+            .expect("clean committed journal")
+            .is_some());
         assert_eq!(std::fs::read(&path).expect("read committed target"), committed);
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn prepared_append_journal_restores_header_and_truncates_while_committed_keeps_tag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("append-recovery.dsf");
+        write_test_dsf_fixture(&path, None).expect("write untagged fixture");
+        let original = std::fs::read(&path).expect("read original fixture");
+        let original_size = original.len() as u64;
+        let original_header_patch: [u8; DSF_HEADER_PATCH_LEN as usize] = original
+            [DSF_HEADER_PATCH_OFFSET as usize
+                ..(DSF_HEADER_PATCH_OFFSET + DSF_HEADER_PATCH_LEN) as usize]
+            .try_into()
+            .expect("original DSF header patch");
+        let mut tag = id3::Tag::new();
+        tag.add_frame(id3::Frame::text("TIT2", "Recovered append"));
+        let mut encoded = Vec::new();
+        tag.write_to(&mut encoded, id3::Version::Id3v24)
+            .expect("serialize append tag");
+        let padded = pad_id3_with_rewrite_reserve(&encoded).expect("pad append tag");
+        let committed_size = original_size + padded.len() as u64;
+        let mut identity_file = std::fs::File::open(&path).expect("open identity fixture");
+        let recovery_identity = dsf_append_recovery_identity(
+            &mut identity_file,
+            original_size,
+        )
+        .expect("compute append recovery identity");
+        let journal = tail_journal_path(&path);
+
+        std::fs::write(
+            &journal,
+            encode_append_journal(
+                &original_header_patch,
+                original_size,
+                committed_size,
+                &recovery_identity,
+                TAIL_JOURNAL_PREPARED,
+            ),
+        )
+        .expect("write prepared append journal");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open prepared append target");
+            file.seek(SeekFrom::Start(original_size))
+                .expect("seek partial append");
+            file.write_all(&padded[..padded.len() / 2])
+                .expect("write partial append");
+            file.seek(SeekFrom::Start(DSF_HEADER_PATCH_OFFSET))
+                .expect("seek partial header patch");
+            file.write_all(&committed_size.to_le_bytes())
+                .expect("write only declared size");
+        }
+        let inspection = inspect_tail_journal(&path)
+            .expect("inspect prepared append journal")
+            .expect("prepared append journal present");
+        assert_eq!(inspection.state, "prepared");
+        assert_eq!(inspection.operation, "append-tag");
+        assert_eq!(inspection.original_file_size, original_size);
+        assert_eq!(inspection.committed_file_size, committed_size);
+        assert!(recover_tail_journal_for_target(&path)
+            .expect("recover prepared append")
+            .is_some());
+        assert_eq!(std::fs::read(&path).expect("read restored target"), original);
+        assert!(!journal.exists());
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open committed append target");
+            file.seek(SeekFrom::Start(original_size))
+                .expect("seek full append");
+            file.write_all(&padded).expect("write full append");
+            file.seek(SeekFrom::Start(DSF_HEADER_PATCH_OFFSET))
+                .expect("seek header patch");
+            file.write_all(&committed_size.to_le_bytes())
+                .expect("write declared size");
+            file.write_all(&original_size.to_le_bytes())
+                .expect("write metadata pointer");
+        }
+        std::fs::write(
+            &journal,
+            encode_append_journal(
+                &original_header_patch,
+                original_size,
+                committed_size,
+                &recovery_identity,
+                TAIL_JOURNAL_COMMITTED,
+            ),
+        )
+        .expect("write committed append journal");
+        let committed = std::fs::read(&path).expect("read committed append");
+        let inspection = inspect_tail_journal(&path)
+            .expect("inspect committed append journal")
+            .expect("committed append journal present");
+        assert_eq!(inspection.state, "committed");
+        assert_eq!(inspection.operation, "append-tag");
+        assert!(recover_tail_journal_for_target(&path)
+            .expect("retire committed append journal")
+            .is_some());
+        assert_eq!(std::fs::read(&path).expect("read retained append"), committed);
+        assert_eq!(
+            read(&path).expect("read retained append tag").first("TITLE"),
+            Some("Recovered append")
+        );
         assert!(!journal.exists());
     }
 
@@ -3185,24 +4713,72 @@ mod tests {
     fn explicit_legacy_resolution_supports_keep_current_and_restore_backup() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
-        std::fs::write(&path, b"current generation").expect("write current");
         let backup = crate::db::Database::backup_path_for(&path);
-        std::fs::write(&backup, b"older generation").expect("write backup");
+
+        let mut current_tag = id3::Tag::new();
+        current_tag.add_frame(id3::Frame::text("TIT2", "Current generation"));
+        let mut current_metadata = Vec::new();
+        current_tag
+            .write_to(&mut current_metadata, id3::Version::Id3v24)
+            .expect("encode current tag");
+        write_test_dsf_fixture(&path, Some(&current_metadata)).expect("write current DSF");
+        let current = std::fs::read(&path).expect("read current DSF");
+
+        let mut older_tag = id3::Tag::new();
+        older_tag.add_frame(id3::Frame::text("TIT2", "Older generation"));
+        let mut older_metadata = Vec::new();
+        older_tag
+            .write_to(&mut older_metadata, id3::Version::Id3v24)
+            .expect("encode older tag");
+        write_test_dsf_fixture(&backup, Some(&older_metadata)).expect("write older backup DSF");
+        let older = std::fs::read(&backup).expect("read older backup DSF");
 
         let inspection = inspect_legacy_backup(&path).expect("inspect marker");
-        assert_eq!(inspection.target_bytes, 18);
-        assert_eq!(inspection.marker_bytes, 16);
+        assert_eq!(inspection.target_bytes, current.len() as u64);
+        assert_eq!(inspection.marker_bytes, older.len() as u64);
         assert!(!inspection.byte_identical);
         resolve_legacy_backup(&path, DsfLegacyBackupResolution::KeepCurrent)
             .expect("keep current");
-        assert_eq!(std::fs::read(&path).expect("read current"), b"current generation");
+        assert_eq!(std::fs::read(&path).expect("read current"), current);
         assert!(!backup.exists());
 
-        std::fs::write(&backup, b"restored generation").expect("write replacement backup");
+        let mut restored_tag = id3::Tag::new();
+        restored_tag.add_frame(id3::Frame::text("TIT2", "Restored generation"));
+        let mut restored_metadata = Vec::new();
+        restored_tag
+            .write_to(&mut restored_metadata, id3::Version::Id3v24)
+            .expect("encode restored tag");
+        write_test_dsf_fixture(&backup, Some(&restored_metadata))
+            .expect("write replacement backup DSF");
+        let restored = std::fs::read(&backup).expect("read replacement backup DSF");
         resolve_legacy_backup(&path, DsfLegacyBackupResolution::RestoreBackup)
             .expect("restore backup");
-        assert_eq!(std::fs::read(&path).expect("read restored"), b"restored generation");
+        assert_eq!(std::fs::read(&path).expect("read restored"), restored);
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn restore_backup_refuses_non_dsf_marker_without_mutating_either_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.dsf");
+        write_test_dsf_fixture(&path, None).expect("write current DSF");
+        let current = std::fs::read(&path).expect("read current DSF");
+        let backup = crate::db::Database::backup_path_for(&path);
+        let invalid = b"not a DSF rollback generation";
+        std::fs::write(&backup, invalid).expect("write invalid backup");
+
+        let error = resolve_legacy_backup(&path, DsfLegacyBackupResolution::RestoreBackup)
+            .expect_err("non-DSF backup must be refused");
+
+        assert_eq!(
+            error,
+            format!(
+                "refusing to restore legacy DSF rollback marker '{}': expected DSF DSD chunk marker",
+                backup.display()
+            )
+        );
+        assert_eq!(std::fs::read(&path).expect("read untouched target"), current);
+        assert_eq!(std::fs::read(&backup).expect("read retained marker"), invalid);
     }
 
     #[test]
@@ -3236,6 +4812,312 @@ mod tests {
                 .first("TITLE"),
             Some("Replacement")
         );
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn native_filename_authority_paths_are_collision_free() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join(OsString::from_vec(b"first-\xff.dsf".to_vec()));
+        let second = temp.path().join(OsString::from_vec(b"second-\xfe.dsf".to_vec()));
+        let literal = temp.path().join("audio.dsf");
+        for path in [&first, &second, &literal] {
+            write_test_dsf_fixture(path, None).expect("write DSF fixture");
+        }
+
+        assert_ne!(tail_journal_path(&first), tail_journal_path(&second));
+        assert_ne!(tail_journal_path(&first), tail_journal_path(&literal));
+        assert_ne!(tail_journal_path(&second), tail_journal_path(&literal));
+        assert_ne!(
+            crate::config::store_lock_authority_path(&first).expect("first lock"),
+            crate::config::store_lock_authority_path(&second).expect("second lock")
+        );
+        assert_ne!(
+            crate::config::store_lock_authority_path(&first).expect("first lock"),
+            crate::config::store_lock_authority_path(&literal).expect("literal lock")
+        );
+        assert_eq!(
+            legacy_tail_journal_path(&first),
+            legacy_tail_journal_path(&literal),
+            "the compatibility path collision is intentional and must never be used for new journals"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashed_journal_resolves_by_native_filename_before_generation_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join(OsString::from_vec(b"one-\xff.dsf".to_vec()));
+        let second = temp.path().join(OsString::from_vec(b"two-\xfe.dsf".to_vec()));
+        write_test_dsf_fixture(&first, None).expect("write first DSF");
+        std::fs::copy(&first, &second).expect("make byte-identical second DSF");
+
+        let original = std::fs::read(&first).expect("read original DSF");
+        let mut identity_file = std::fs::File::open(&first).expect("open identity target");
+        let identity = dsf_append_recovery_identity(&mut identity_file, original.len() as u64)
+            .expect("compute append identity");
+        let journal = tail_journal_path(&first);
+        let committed_size = original.len() as u64 + 10;
+        let header = TailJournalHeader::append_tag(
+            TAIL_JOURNAL_PREPARED,
+            original.len() as u64,
+            committed_size,
+            identity,
+        );
+        // An AppendTag journal carries its 16-byte original header patch as
+        // payload; a header-only journal is (correctly) rejected as torn.
+        let mut journal_bytes = encode_tail_journal_header(header).to_vec();
+        journal_bytes.extend_from_slice(&original[12..28]);
+        std::fs::write(&journal, journal_bytes).expect("write hashed append journal");
+
+        let candidates = dsf_targets_in_directory(temp.path()).expect("enumerate targets");
+        assert_eq!(
+            resolve_tail_journal_target(&journal, &candidates).expect("resolve hashed journal"),
+            Some(first),
+            "byte-identical targets must not make a filename-bound hashed authority ambiguous",
+        );
+        assert_ne!(journal, tail_journal_path(&second));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_publication_is_atomic_and_never_replaces_an_existing_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join(".tonepoet-dsf-tail-authority.journal");
+        let first = temp.path().join("first.tmp");
+        let second = temp.path().join("second.tmp");
+        std::fs::write(&first, b"first authority").expect("write first source");
+        std::fs::write(&second, b"second authority").expect("write second source");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |source: PathBuf| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let destination = destination.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                publish_file_noreplace(&source, &destination)
+            })
+        };
+        let first_thread = spawn(first.clone());
+        let second_thread = spawn(second.clone());
+        barrier.wait();
+        let first_result = first_thread.join().expect("first publisher");
+        let second_result = second_thread.join().expect("second publisher");
+
+        assert_eq!(usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()), 1);
+        let loser = if let Err(error) = first_result {
+            error
+        } else {
+            second_result.expect_err("second publisher must lose")
+        };
+        assert_eq!(loser.kind(), std::io::ErrorKind::AlreadyExists);
+        let published = std::fs::read(&destination).expect("read published authority");
+        assert!(published == b"first authority" || published == b"second authority");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_non_utf8_and_literal_dsf_writes_keep_independent_authority() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let non_utf = temp.path().join(OsString::from_vec(b"track-\xff.dsf".to_vec()));
+        let literal = temp.path().join("audio.dsf");
+        write_test_dsf_fixture(&non_utf, None).expect("write non-UTF DSF");
+        write_test_dsf_fixture(&literal, None).expect("write literal DSF");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |path: PathBuf, title: &'static str| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                write_with_backup(
+                    &path,
+                    &[DsfTagChange {
+                        canonical_key: "TITLE".to_string(),
+                        value: Some(title.to_string()),
+                    }],
+                )
+                .map(|warning| (path, warning))
+            })
+        };
+        let first = spawn(non_utf.clone(), "Non-UTF title");
+        let second = spawn(literal.clone(), "Literal title");
+        barrier.wait();
+        let (first_path, first_warning) = first.join().expect("non-UTF writer").expect("non-UTF save");
+        let (second_path, second_warning) = second.join().expect("literal writer").expect("literal save");
+
+        assert_eq!(first_path, non_utf);
+        assert_eq!(second_path, literal);
+        assert!(first_warning.is_none());
+        assert!(second_warning.is_none());
+        assert_eq!(read(&non_utf).expect("read non-UTF result").first("TITLE"), Some("Non-UTF title"));
+        assert_eq!(read(&literal).expect("read literal result").first("TITLE"), Some("Literal title"));
+        assert!(!tail_journal_path(&non_utf).exists());
+        assert!(!tail_journal_path(&literal).exists());
+        assert!(!legacy_tail_journal_path(&non_utf).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_fallback_journal_is_attributed_by_embedded_identity_not_filename() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join(OsString::from_vec(b"nonutf-\xff.dsf".to_vec()));
+        let literal = temp.path().join("audio.dsf");
+        let mut target_tag = id3::Tag::new();
+        target_tag.add_frame(id3::Frame::text("TIT2", "non-UTF target"));
+        let mut target_metadata = Vec::new();
+        target_tag
+            .write_to(&mut target_metadata, id3::Version::Id3v24)
+            .expect("encode target tag");
+        let mut literal_tag = id3::Tag::new();
+        literal_tag.add_frame(id3::Frame::text("TIT2", "literal audio"));
+        let mut literal_metadata = Vec::new();
+        literal_tag
+            .write_to(&mut literal_metadata, id3::Version::Id3v24)
+            .expect("encode literal tag");
+        write_test_dsf_fixture(&target, Some(&target_metadata)).expect("write target");
+        write_test_dsf_fixture(&literal, Some(&literal_metadata)).expect("write literal");
+        let original_target = std::fs::read(&target).expect("read target");
+        let original_literal = std::fs::read(&literal).expect("read literal");
+        let offset = u64::from_le_bytes(original_target[20..28].try_into().expect("metadata pointer"));
+        let original_tail = original_target[offset as usize..].to_vec();
+        let mut identity_file = std::fs::File::open(&target).expect("open identity target");
+        let identity = dsf_recovery_identity(&mut identity_file, offset, original_target.len() as u64)
+            .expect("compute target identity");
+        let legacy = legacy_tail_journal_path(&target);
+        assert_eq!(legacy, legacy_tail_journal_path(&literal));
+        std::fs::write(
+            &legacy,
+            encode_tail_journal(offset, &original_tail, &identity, TAIL_JOURNAL_PREPARED),
+        )
+        .expect("write fallback journal");
+        let mut torn = original_target.clone();
+        torn[offset as usize..].fill(0xa5);
+        std::fs::write(&target, torn).expect("tear target tail");
+
+        let messages = recover_stale_writes_in_directory(temp.path());
+
+        assert_eq!(std::fs::read(&target).expect("read recovered target"), original_target);
+        assert_eq!(std::fs::read(&literal).expect("read untouched literal"), original_literal);
+        assert!(!legacy.exists());
+        assert!(messages.iter().any(|message| message.contains("Recovered DSF metadata tail journal")));
+    }
+
+    #[test]
+    fn id3_picture_type_byte_mapping_round_trips_every_value() {
+        for code in u8::MIN..=u8::MAX {
+            assert_eq!(
+                u8::from(backend::picture_type_from_code(code)),
+                code,
+                "APIC picture-type code {code:#04x} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn dsf_artwork_uses_tail_journal_and_rolls_back_without_full_file_backup() {
+        use std::io::{Seek, SeekFrom};
+
+        fn picture_count(path: &Path, code: u8) -> usize {
+            let DsfMetadataLocation::Id3 { offset, .. } = inspect_dsf_metadata_location(path)
+                .expect("inspect DSF metadata")
+            else {
+                return 0;
+            };
+            let mut file = std::fs::File::open(path).expect("open DSF tag");
+            file.seek(SeekFrom::Start(offset)).expect("seek DSF tag");
+            let tag = id3::Tag::read_from2(&mut file).expect("read DSF tag");
+            tag.pictures()
+                .filter(|picture| picture.picture_type == backend::picture_type_from_code(code))
+                .count()
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("artwork.dsf");
+        write_test_dsf_fixture(&path, None).expect("write untagged fixture");
+        let original = std::fs::read(&path).expect("read original fixture");
+        let audio_end = original.len();
+        let phases = std::sync::Mutex::new(Vec::new());
+        let (snapshot, warning) = write_artwork_with_control(
+            &path,
+            3,
+            "image/png",
+            b"synthetic-png-payload",
+            &|| false,
+            &|update| phases.lock().expect("phase lock").push(update.phase),
+        )
+        .expect("write DSF artwork");
+
+        assert!(warning.is_none());
+        // The append patches header bytes 12..28 (declared size + metadata
+        // pointer) by design; every other original byte must be preserved.
+        let tagged = std::fs::read(&path).expect("read artwork fixture");
+        assert_eq!(&tagged[..12], &original[..12]);
+        assert_eq!(&tagged[28..audio_end], &original[28..]);
+        assert_eq!(
+            u64::from_le_bytes(tagged[12..20].try_into().expect("size field")),
+            tagged.len() as u64,
+        );
+        assert_eq!(
+            u64::from_le_bytes(tagged[20..28].try_into().expect("pointer field")),
+            audio_end as u64,
+        );
+        assert_eq!(picture_count(&path, 3), 1);
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(!tail_journal_path(&path).exists());
+        let phases = phases.into_inner().expect("phase values");
+        assert!(phases.contains(&DsfWriteProgressPhase::Journaling));
+        assert!(phases.contains(&DsfWriteProgressPhase::WritingTail));
+        assert!(!phases.contains(&DsfWriteProgressPhase::CopyingPrefix));
+
+        restore_artwork_snapshot(&path, &snapshot).expect("rollback artwork snapshot");
+        assert_eq!(std::fs::read(&path).expect("read rolled-back artwork fixture"), original);
+        assert_eq!(picture_count(&path, 3), 0);
+        assert!(!tail_journal_path(&path).exists());
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+    }
+
+    #[test]
+    fn cancelling_dsf_artwork_append_restores_exact_original() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("cancel-artwork.dsf");
+        write_test_dsf_fixture(&path, None).expect("write untagged fixture");
+        let original = std::fs::read(&path).expect("read original fixture");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let image = vec![0x5a; 2 * 1024 * 1024];
+
+        let error = write_artwork_with_control(
+            &path,
+            3,
+            "image/jpeg",
+            &image,
+            &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            &|update| {
+                if update.phase == DsfWriteProgressPhase::WritingTail
+                    && update.bytes_done >= COPY_CHUNK_BYTES as u64
+                {
+                    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .expect_err("mid-write cancellation must roll back artwork append");
+
+        assert!(error.contains("metadata save cancelled while writing DSF metadata tail"));
+        assert_eq!(std::fs::read(&path).expect("read restored fixture"), original);
+        assert!(!tail_journal_path(&path).exists());
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
     }
 
     #[test]

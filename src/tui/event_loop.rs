@@ -8,7 +8,9 @@ use crossterm::event::{self, Event};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
-use super::app::{ActiveOverlay, AppScreen, AppState, TextEditTarget};
+use super::app::{
+    ActiveOverlay, AppScreen, AppState, CompletionOperationKind, TextEditTarget,
+};
 use super::browse::BrowseDeferredWorkFlags;
 use crate::convert::classify::EntryKind;
 use super::draw::draw_ui;
@@ -22,6 +24,19 @@ use super::text_input::TextInputState;
 /// unbounded reducer batch.
 const MAX_ASYNC_MESSAGES_PER_FRAME: usize = 32;
 
+/// Recover database-owned full-file rollback transactions before scanning the
+/// browse directory for standalone FLAC/DSF sidecars. A byte-identical legacy
+/// DSF `.tonepoet-bak` may still be the authoritative marker for a PREPARED DB
+/// entry; retiring it first would strand that transaction as unrecoverable.
+fn startup_metadata_recovery_messages(
+    db: &crate::db::Database,
+    dir: &std::path::Path,
+) -> Vec<String> {
+    let mut messages = db.recover_stale_metadata_writes();
+    messages.extend(super::probe::recover_stale_flac_metadata_journals_in_dir(dir));
+    messages
+}
+
 /// Run the main TUI event loop
 pub async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -33,13 +48,11 @@ pub async fn run_app(
     // spawn async scans. Must happen before the event loop starts.
     app.browse.set_tx(tx.clone());
     app.tui_tx = Some(tx.clone());
-    // Recover both explicit metadata-write models at startup. Native FLAC
-    // writes use sidecar metadata-region journals; legacy non-FLAC writes use
-    // DB entries that point at full-file `.tonepoet-bak` backups.
-    for message in super::probe::recover_stale_flac_metadata_journals_in_dir(&app.browse.current_dir) {
-        app.set_status(message);
-    }
-    for message in app.db.recover_stale_metadata_writes() {
+    // Recover both explicit metadata-write models at startup. Database-owned
+    // PREPARED entries must run first because their authoritative backup can
+    // look byte-identical to the current DSF and must not be retired by the
+    // standalone directory scanner before the DB transaction consumes it.
+    for message in startup_metadata_recovery_messages(&app.db, &app.browse.current_dir) {
         app.set_status(message);
     }
     let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
@@ -749,6 +762,8 @@ fn metadata_editor_upsert_per_file_entry(
             original: value,
             is_binary: false,
             is_mixed,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values.clone(),
             per_file_originals: values,
             mb_proposed_value: None,
@@ -1100,21 +1115,38 @@ fn dsd_source_rate_sentinel_selected(app: &AppState) -> bool {
             == super::app::SOURCE_SAMPLE_RATE_SENTINEL
 }
 
-/// Report a completed probe clamping away a deliberate same-as-source rate.
-/// The clamp itself is correct — rate=source is invalid for a DSD target
-/// once the source is KNOWN to be PCM — but a deliberately staged pill must
-/// never change value silently. Runs after the reducer's own status set so
-/// the more specific message wins.
-fn report_source_rate_sentinel_clamp(app: &mut AppState, was_sentinel_selected: bool) {
+/// Return the user-visible consequence of clamping a deliberate
+/// same-as-source rate. The clamp is correct once a PCM source is known, but
+/// it must be composed with the current probe result rather than silently
+/// overwriting a degradation warning.
+fn source_rate_sentinel_clamp_message(
+    app: &AppState,
+    was_sentinel_selected: bool,
+) -> Option<String> {
     if !was_sentinel_selected {
-        return;
+        return None;
     }
     let selected = *app.convert.format.sample_rate.selected_value();
-    if selected != super::app::SOURCE_SAMPLE_RATE_SENTINEL {
-        let target = app.convert.format.format.selected_label().to_string();
-        app.set_status(format!(
-            "rate 'source' is invalid for {target} with a PCM source; set to {selected} Hz"
-        ));
+    if selected == super::app::SOURCE_SAMPLE_RATE_SENTINEL {
+        return None;
+    }
+    let target = app.convert.format.format.selected_label();
+    Some(format!(
+        "rate 'source' is invalid for {target} with a PCM source; set to {selected} Hz"
+    ))
+}
+
+fn publish_probe_status_with_sentinel_clamp(
+    app: &mut AppState,
+    base_status: Option<String>,
+    was_sentinel_selected: bool,
+) {
+    let clamp = source_rate_sentinel_clamp_message(app, was_sentinel_selected);
+    match (base_status, clamp) {
+        (Some(base), Some(clamp)) => app.set_status(format!("{base}; {clamp}")),
+        (Some(base), None) => app.set_status(base),
+        (None, Some(clamp)) => app.set_status(clamp),
+        (None, None) => {}
     }
 }
 
@@ -1176,12 +1208,10 @@ fn handle_convert_source_probe_result(
         // may now have discovered that the source is actually a CUE/SACD/DVD/
         // Blu-ray multi-track source, so replace the whole mode with the fully
         // realized result rather than just filling info/metadata slots.
-        if format_unchanged {
-            app.convert.set_source_mode(source_mode);
-        } else {
-            app.convert
-                .set_source_mode_preserving_format_selection(source_mode);
-        }
+        // Installing source facts always preserves the current format
+        // selection. The reducer below applies defaults only when its captured
+        // format baseline still matches.
+        app.convert.set_source_mode(source_mode);
         applied = true;
     }
 
@@ -1208,15 +1238,15 @@ fn handle_convert_source_probe_result(
     }
 
 
-    if let Some(notice) = probe_notice {
-        app.set_status(format!("Probe warning: {}", notice));
+    let status = if let Some(notice) = probe_notice {
+        format!("Probe warning: {notice}")
     } else {
-        app.set_status(format!(
+        format!(
             "Loaded: {}",
             path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    }
-    report_source_rate_sentinel_clamp(app, was_sentinel_selected);
+        )
+    };
+    publish_probe_status_with_sentinel_clamp(app, Some(status), was_sentinel_selected);
 }
 
 fn handle_archive_preview_progress(
@@ -1286,12 +1316,10 @@ fn handle_archive_preview_result(
             let detected_info_for_defaults = source_mode.current_info().cloned();
             let detected_metadata = source_mode.current_metadata();
 
-            if format_unchanged {
-                app.convert.set_source_mode(source_mode);
-            } else {
-                app.convert
-                    .set_source_mode_preserving_format_selection(source_mode);
-            }
+            // Installing source facts always preserves the current format
+            // selection. The reducer below applies defaults only when its
+            // captured format baseline still matches.
+            app.convert.set_source_mode(source_mode);
 
             if metadata_unchanged {
                 super::app::apply_source_metadata_to_convert(&mut app.convert, &detected_metadata);
@@ -1311,12 +1339,16 @@ fn handle_archive_preview_result(
                     .refresh_source_constraints_preserving_format_selection();
             }
 
-            app.set_status(format!(
+            let status = format!(
                 "Archive preview loaded: {} track{}",
                 track_count,
                 if track_count == 1 { "" } else { "s" }
-            ));
-            report_source_rate_sentinel_clamp(app, was_sentinel_selected);
+            );
+            publish_probe_status_with_sentinel_clamp(
+                app,
+                Some(status),
+                was_sentinel_selected,
+            );
         }
         Err(err) => {
             if super::app::looks_like_archive_password_error(&err) {
@@ -2520,10 +2552,8 @@ fn handle_convert_audio_probe_complete(
     }
 
 
-    if let Some(notice) = probe_notice {
-        app.set_status(format!("Probe warning: {}", notice));
-    }
-    report_source_rate_sentinel_clamp(app, was_sentinel_selected);
+    let status = probe_notice.map(|notice| format!("Probe warning: {notice}"));
+    publish_probe_status_with_sentinel_clamp(app, status, was_sentinel_selected);
 }
 
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
@@ -3164,14 +3194,22 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::AnalysisComplete { result } => {
+        AppMessage::AnalysisComplete {
+            operation_id,
+            result,
+        } => {
+            let kind = CompletionOperationKind::Analysis;
+            if !completion_operation_is_current(app, kind, operation_id) {
+                return;
+            }
             app.analysis_pending = app.analysis_pending.saturating_sub(1);
-            // Clean up single-image temp dir when all analysis tasks complete.
-            if app.analysis_pending == 0 {
+            let finished = app.analysis_pending == 0;
+            if finished {
                 if let Some(tmp_dir) = app.analysis_temp_dir.take() {
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                 }
             }
+
             match result {
                 Ok(result) => {
                     // Persist to SQLite analysis cache for cross-session reuse.
@@ -3190,70 +3228,118 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         }
                     }
 
-                    // Update probe cache with HDCD info only when the
-                    // cached row still matches the file identity observed at
-                    // completion time. AnalysisComplete does not carry a launch
-                    // token in this bundle, so never refresh a stale path-only
-                    // row from it.
+                    // Refresh only the probe row whose launch-independent file
+                    // identity still matches the completed path.
                     if result.hdcd_detected == Some(true) {
                         if let Ok(meta) = std::fs::metadata(&result.path) {
-                            let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(&meta);
-                            app.browse.update_valid_probe_for_identity(&result.path, identity, |cached| {
-                                cached.metadata.hdcd_detail = result.hdcd_detail.clone();
-                            });
+                            let identity =
+                                crate::tui::browse::ProbeCacheIdentity::from_metadata(&meta);
+                            app.browse.update_valid_probe_for_identity(
+                                &result.path,
+                                identity,
+                                |cached| {
+                                    cached.metadata.hdcd_detail = result.hdcd_detail.clone();
+                                },
+                            );
                         } else {
                             app.browse.remove_probe_cache_entry(&result.path);
                         }
                     }
 
-                    if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
-                        state.apply_analysis_result(&result);
-                    }
-                    if let Some(state) = app.pending_metadata_editor.as_mut() {
-                        state.apply_analysis_result(&result);
-                    }
-                    app.analysis_results.push(*result);
-                    if app.analysis_pending == 0 {
-                        // Sort results by disc/track for logical display order.
-                        {
-                            let mut result_paths: Vec<std::path::PathBuf> = app
-                                .analysis_results
-                                .iter()
-                                .map(|r| r.path.clone())
-                                .collect();
-                            crate::tui::probe::sort_paths_by_track(&mut result_paths);
-                            app.analysis_results.sort_by(|a, b| {
-                                let ai = result_paths
-                                    .iter()
-                                    .position(|p| *p == a.path)
-                                    .unwrap_or(usize::MAX);
-                                let bi = result_paths
-                                    .iter()
-                                    .position(|p| *p == b.path)
-                                    .unwrap_or(usize::MAX);
-                                ai.cmp(&bi)
-                            });
+                    // Enrich only the exact editor captured at dispatch. A
+                    // completion may never mutate whichever editor happens to
+                    // occupy the slot later.
+                    if let Some(guard) =
+                        completion_operation_editor_session(app, kind, operation_id)
+                    {
+                        if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
+                            if metadata_editor_matches_session_guard(state, guard) {
+                                state.apply_analysis_result(&result);
+                            }
                         }
-                        let count = app.analysis_results.len();
-                        let last = &app.analysis_results[count - 1];
-                        let name = last
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        app.set_status(format!(
-                            "Analyzed: {} — DR{} ({})",
-                            name,
-                            last.dr_value,
-                            super::analyze::dr_label(last.dr_value),
-                        ));
-                        app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+                        if let Some(state) = app.pending_metadata_editor.as_mut() {
+                            if metadata_editor_matches_session_guard(state, guard) {
+                                state.apply_analysis_result(&result);
+                            }
+                        }
+                    }
+
+                    app.analysis_results.push(*result);
+                    if finished {
+                        let mut result_paths: Vec<std::path::PathBuf> = app
+                            .analysis_results
+                            .iter()
+                            .map(|result| result.path.clone())
+                            .collect();
+                        crate::tui::probe::sort_paths_by_track(&mut result_paths);
+                        app.analysis_results.sort_by(|a, b| {
+                            let ai = result_paths
+                                .iter()
+                                .position(|path| *path == a.path)
+                                .unwrap_or(usize::MAX);
+                            let bi = result_paths
+                                .iter()
+                                .position(|path| *path == b.path)
+                                .unwrap_or(usize::MAX);
+                            ai.cmp(&bi)
+                        });
+
+                        let status = app
+                            .analysis_results
+                            .last()
+                            .map(|last| {
+                                let name = last
+                                    .path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                format!(
+                                    "Analyzed: {} — DR{} ({})",
+                                    name,
+                                    last.dr_value,
+                                    super::analyze::dr_label(last.dr_value),
+                                )
+                            })
+                            .unwrap_or_else(|| "Analysis completed without usable results".to_string());
+                        let may_publish =
+                            completion_operation_has_overlay_authority(app, kind, operation_id);
+                        retire_completion_operation(app, kind, operation_id);
+                        if may_publish && !app.analysis_results.is_empty() {
+                            app.active_overlay = ActiveOverlay::Analysis { scroll: 0 };
+                            app.set_status(status);
+                        } else if app.analysis_results.is_empty() {
+                            app.set_status(status);
+                        } else {
+                            app.set_status(format!(
+                                "{}; current editor or overlay preserved",
+                                status
+                            ));
+                        }
                     }
                 }
-                Err(e) => {
-                    app.set_status(format!("Analysis failed: {}", e));
-                    if app.analysis_pending == 0 && !app.analysis_results.is_empty() {
-                        app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+                Err(error) => {
+                    let status = format!("Analysis failed: {}", error);
+                    if finished {
+                        let may_publish = !app.analysis_results.is_empty()
+                            && completion_operation_has_overlay_authority(
+                                app,
+                                kind,
+                                operation_id,
+                            );
+                        retire_completion_operation(app, kind, operation_id);
+                        if may_publish {
+                            app.active_overlay = ActiveOverlay::Analysis { scroll: 0 };
+                            app.set_status(status);
+                        } else if app.analysis_results.is_empty() {
+                            app.set_status(status);
+                        } else {
+                            app.set_status(format!(
+                                "{}; current editor or overlay preserved",
+                                status
+                            ));
+                        }
+                    } else {
+                        app.set_status(status);
                     }
                 }
             }
@@ -4377,35 +4463,45 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             app.set_status(format!("GNUDB worker failed: {detail}; the lookup was retired"));
         }
 
-        AppMessage::CtdbComplete { mut pages } => {
-            // Drain freshly computed parity matrices into the cache before
-            // the pages move into the long-lived overlay state. Each
-            // `parity_cache_write` carries (cache_key, ~376 KB matrix);
-            // taking it ensures the matrix is dropped after the DB write
-            // and never propagates through CtdbVerifyState clones.
+        AppMessage::CtdbComplete {
+            operation_id,
+            mut pages,
+        } => {
+            let kind = CompletionOperationKind::Ctdb;
+            if !completion_operation_is_current(app, kind, operation_id) {
+                return;
+            }
+
+            // Persist newly computed parity only for the current operation.
             for page in pages.iter_mut() {
                 if let Some((key, parity)) = page.result.parity_cache_write.take() {
-                    if let Err(e) = app.db.store_ctdb_parity(&key, 16, &parity) {
-                        log::warn!("CTDB parity cache store failed: {}", e);
+                    if let Err(error) = app.db.store_ctdb_parity(&key, 16, &parity) {
+                        log::warn!("CTDB parity cache store failed: {}", error);
                     }
                 }
             }
-            if pages.len() == 1 {
+
+            if pages.is_empty() {
+                app.auto_repair_on_ctdb_complete = false;
+                retire_completion_operation(app, kind, operation_id);
+                app.set_status("CUETools DB: no disc could be verified");
+                return;
+            }
+
+            let status = if pages.len() == 1 {
                 let summary = crate::tui::ctdb::format_ctdb_summary(&pages[0].result);
-                app.set_status(format!("CUETools DB: {}", summary));
+                format!("CUETools DB: {}", summary)
             } else {
-                let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
-                // Both byte-exact `Verified` and RS-equivalent `VerifiedRs` count
-                // as verified, consistent with format_ctdb_summary.
+                let total: usize = pages.iter().map(|page| page.result.tracks.len()).sum();
                 let verified: usize = pages
                     .iter()
-                    .map(|p| {
-                        p.result
+                    .map(|page| {
+                        page.result
                             .tracks
                             .iter()
-                            .filter(|t| {
+                            .filter(|track| {
                                 matches!(
-                                    t.status,
+                                    track.status,
                                     crate::tui::ctdb::CtdbTrackStatus::Verified
                                         | crate::tui::ctdb::CtdbTrackStatus::VerifiedRs
                                 )
@@ -4413,33 +4509,39 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             .count()
                     })
                     .sum();
-                app.set_status(format!(
+                format!(
                     "CUETools DB: {} discs, {}/{} tracks verified",
                     pages.len(),
                     verified,
                     total,
-                ));
-            }
+                )
+            };
 
-            // If a context-menu / direct :ctdb-repair invoked us, find the
-            // first page that actually has something to repair (mismatches
-            // AND parity) and start the overlay there so the subsequent
-            // :ctdb-repair re-dispatch operates on a repairable disc.
             let auto_repair = std::mem::replace(&mut app.auto_repair_on_ctdb_complete, false);
             let active_page = if auto_repair {
                 pages
                     .iter()
-                    .position(|p| {
-                        p.result.parity_url.is_some()
-                            && p.result
-                                .tracks
-                                .iter()
-                                .any(|t| t.status == crate::tui::ctdb::CtdbTrackStatus::Mismatch)
+                    .position(|page| {
+                        page.result.parity_url.is_some()
+                            && page.result.tracks.iter().any(|track| {
+                                track.status == crate::tui::ctdb::CtdbTrackStatus::Mismatch
+                            })
                     })
                     .unwrap_or(0)
             } else {
                 0
             };
+
+            let may_publish =
+                completion_operation_has_overlay_authority(app, kind, operation_id);
+            retire_completion_operation(app, kind, operation_id);
+            if !may_publish {
+                app.set_status(format!(
+                    "{}; current editor or overlay preserved",
+                    status
+                ));
+                return;
+            }
 
             app.active_overlay =
                 ActiveOverlay::CtdbVerify(Box::new(crate::tui::app::CtdbVerifyState {
@@ -4447,56 +4549,92 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     active_page,
                     scroll: 0,
                 }));
+            app.set_status(status);
 
             if auto_repair {
-                // Re-enter Command::CtdbRepair now that the overlay is up.
-                // The handler will validate parity/mismatches/CRCs and
-                // either pop the confirmation dialog, defer to AR, or
-                // emit a status message ("No mismatches detected", etc.).
                 super::command::execute_command(app, super::command::Command::CtdbRepair, tx);
             }
         }
-        AppMessage::ArBatchComplete { result } => {
+        AppMessage::ArBatchComplete {
+            operation_id,
+            result,
+        } => {
+            let kind = CompletionOperationKind::ArBatch;
+            if !completion_operation_is_current(app, kind, operation_id) {
+                return;
+            }
             let total = result.albums.len();
             let verified = result
                 .albums
                 .iter()
-                .filter(|a| a.verified == a.total_tracks && a.total_tracks > 0 && !a.not_in_db)
+                .filter(|album| {
+                    album.verified == album.total_tracks
+                        && album.total_tracks > 0
+                        && !album.not_in_db
+                })
                 .count();
-            let report_msg = result
+            let report_message = result
                 .report_path
                 .as_ref()
-                .map(|p| format!(" — report: {}", p.display()))
+                .map(|path| format!(" — report: {}", path.display()))
                 .unwrap_or_default();
-            app.set_status(format!(
+            let status = format!(
                 "Batch AR: {}/{} albums verified{}",
-                verified, total, report_msg,
-            ));
-            app.active_overlay = ActiveOverlay::ArBatchReport { result, scroll: 0 };
+                verified, total, report_message,
+            );
+            let may_publish =
+                completion_operation_has_overlay_authority(app, kind, operation_id);
+            retire_completion_operation(app, kind, operation_id);
+            if may_publish {
+                app.active_overlay = ActiveOverlay::ArBatchReport { result, scroll: 0 };
+                app.set_status(status);
+            } else {
+                app.set_status(format!(
+                    "{}; current editor or overlay preserved",
+                    status
+                ));
+            }
         }
-        AppMessage::OffsetCorrectionComplete { result } => {
+        AppMessage::OffsetCorrectionComplete {
+            operation_id,
+            result,
+        } => {
+            let kind = CompletionOperationKind::OffsetCorrection;
+            if !completion_operation_is_current(app, kind, operation_id) {
+                return;
+            }
+            retire_completion_operation(app, kind, operation_id);
             match result {
                 Ok(summary) => {
                     app.set_status(summary);
-                    app.active_overlay = ActiveOverlay::None;
-                    // Refresh browse listing since files were replaced.
+                    // Never null the overlay slot: retirement restores the
+                    // exact parked editor when it still owns that session.
                     app.browse.refresh_with_search(Some(tx));
                 }
-                Err(e) => {
-                    app.set_status(format!("Offset correction failed: {}", e));
+                Err(error) => {
+                    app.set_status(format!("Offset correction failed: {}", error));
                 }
             }
         }
-        AppMessage::CtdbRepairComplete { result } => match result {
-            Ok(summary) => {
-                app.set_status(summary);
-                app.active_overlay = ActiveOverlay::None;
-                app.browse.refresh_with_search(Some(tx));
+        AppMessage::CtdbRepairComplete {
+            operation_id,
+            result,
+        } => {
+            let kind = CompletionOperationKind::CtdbRepair;
+            if !completion_operation_is_current(app, kind, operation_id) {
+                return;
             }
-            Err(e) => {
-                app.set_status(format!("CTDB repair failed: {}", e));
+            retire_completion_operation(app, kind, operation_id);
+            match result {
+                Ok(summary) => {
+                    app.set_status(summary);
+                    app.browse.refresh_with_search(Some(tx));
+                }
+                Err(error) => {
+                    app.set_status(format!("CTDB repair failed: {}", error));
+                }
             }
-        },
+        }
         AppMessage::CueWriteComplete { result, refresh_browse } => {
             match result {
                 Ok(message) => {
@@ -4740,147 +4878,165 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::AccurateRipComplete { pages } => {
-            // Aggregate summary across all discs.
-            let total: usize = pages.iter().map(|p| p.result.tracks.len()).sum();
+        AppMessage::AccurateRipComplete {
+            operation_id,
+            pages,
+        } => {
+            let kind = CompletionOperationKind::AccurateRip;
+            if !completion_operation_is_current(app, kind, operation_id) {
+                return;
+            }
+
+            if pages.is_empty() {
+                app.auto_fix_on_complete = false;
+                app.pending_ctdb_repair = None;
+                retire_completion_operation(app, kind, operation_id);
+                app.set_status("AccurateRip: no disc could be verified");
+                return;
+            }
+
+            let total: usize = pages.iter().map(|page| page.result.tracks.len()).sum();
             let verified: usize = pages
                 .iter()
-                .map(|p| {
-                    p.result
+                .map(|page| {
+                    page.result
                         .tracks
                         .iter()
-                        .filter(|t| t.status == crate::tui::accuraterip::ArTrackStatus::Verified)
+                        .filter(|track| {
+                            track.status == crate::tui::accuraterip::ArTrackStatus::Verified
+                        })
                         .count()
                 })
                 .sum();
-            if pages.len() == 1 {
-                let summary = crate::tui::accuraterip::format_summary(&pages[0].result);
-                app.set_status(format!("AccurateRip: {}", summary));
+            let mut status = if pages.len() == 1 {
+                format!(
+                    "AccurateRip: {}",
+                    crate::tui::accuraterip::format_summary(&pages[0].result)
+                )
             } else {
-                app.set_status(format!(
+                format!(
                     "AccurateRip: {} discs, {}/{} tracks verified",
                     pages.len(),
                     verified,
                     total,
-                ));
-            }
-            // Cache AR results per track (each track keyed by its own path).
+                )
+            };
+
+            // Persist current-operation results even when another surface now
+            // owns the overlay slot; authority controls UI publication, not the
+            // value of a completed verification cache entry.
             for page in &pages {
-                for t in &page.result.tracks {
-                    if let Ok(meta) = std::fs::metadata(&t.path) {
+                for track in &page.result.tracks {
+                    if let Ok(meta) = std::fs::metadata(&track.path) {
                         let mtime = meta
                             .modified()
                             .map(crate::db::systemtime_to_unix)
                             .unwrap_or(0);
-                        if let Err(e) = app.db.store_ar(
-                            &t.path.display().to_string(),
+                        if let Err(error) = app.db.store_ar(
+                            &track.path.display().to_string(),
                             mtime,
                             meta.len(),
-                            std::slice::from_ref(t),
+                            std::slice::from_ref(track),
                             &page.result.disc_id_str,
                         ) {
-                            log::error!("AR cache store failed: {}", e);
+                            log::error!("AR cache store failed: {}", error);
                         }
                     }
                 }
             }
 
-            // If a CTDB repair was deferred awaiting AR offset detection,
-            // and these AR results target the same disc, resolve the offset
-            // and open the repair confirmation dialog. Takes priority over
-            // auto_fix_on_complete when matched.
-            //
-            // Match the AR page whose first track path equals the pending
-            // repair's first path. If no match, leave pending intact —
-            // these AR results are unrelated (e.g. the user ran `:ar`
-            // manually for a different selection while the deferred repair
-            // was still waiting on its own AR run); pending will be
-            // consumed when its own AR run completes.
             let matched_page_idx = app
                 .pending_ctdb_repair
                 .as_ref()
-                .and_then(|p| p.paths.first().cloned())
+                .and_then(|pending| pending.paths.first().cloned())
                 .and_then(|target| {
-                    pages
-                        .iter()
-                        .position(|p| p.result.tracks.first().map(|t| &t.path) == Some(&target))
+                    pages.iter().position(|page| {
+                        page.result.tracks.first().map(|track| &track.path) == Some(&target)
+                    })
                 });
-            if let Some(idx) = matched_page_idx {
-                let pending = app.pending_ctdb_repair.take().unwrap();
-                let page = &pages[idx];
 
-                // Extract a uniform offset from the AR result.
-                // Unlike `detect_uniform_offset`, we DO accept offset 0
-                // as a verified value (AR confirmed offset 0 is a valid
-                // result for our use case — we just need the right
-                // offset for the RS repair, not necessarily a non-zero
-                // one). Returns None only when the AR data is
-                // inconclusive (mixed offsets, unverified tracks,
-                // disc not in DB).
-                let resolved_offset: Option<i32> = {
+            let may_publish =
+                completion_operation_has_overlay_authority(app, kind, operation_id);
+            if !may_publish {
+                app.auto_fix_on_complete = false;
+                if matched_page_idx.is_some() {
+                    app.pending_ctdb_repair = None;
+                }
+                retire_completion_operation(app, kind, operation_id);
+                app.set_status(format!(
+                    "{}; current editor or overlay preserved",
+                    status
+                ));
+                return;
+            }
+
+            if let Some(index) = matched_page_idx {
+                let Some(pending) = app.pending_ctdb_repair.take() else {
+                    retire_completion_operation(app, kind, operation_id);
+                    app.set_status(
+                        "AccurateRip: deferred CTDB repair state disappeared before completion",
+                    );
+                    return;
+                };
+                let page = &pages[index];
+                let resolved_offset = {
                     let tracks = &page.result.tracks;
                     if tracks.is_empty() {
                         None
                     } else {
-                        let mut common: Option<i32> = None;
-                        let mut all_ok = true;
-                        for t in tracks {
-                            if t.status != crate::tui::accuraterip::ArTrackStatus::Verified {
-                                all_ok = false;
+                        let mut common = None;
+                        let mut all_verified = true;
+                        for track in tracks {
+                            if track.status
+                                != crate::tui::accuraterip::ArTrackStatus::Verified
+                            {
+                                all_verified = false;
                                 break;
                             }
-                            let off = match t.offset {
-                                Some(o) => o,
-                                None => {
-                                    all_ok = false;
-                                    break;
-                                }
+                            let Some(offset) = track.offset else {
+                                all_verified = false;
+                                break;
                             };
                             match common {
-                                Some(prev) if prev != off => {
-                                    all_ok = false;
+                                Some(previous) if previous != offset => {
+                                    all_verified = false;
                                     break;
                                 }
-                                None => common = Some(off),
+                                None => common = Some(offset),
                                 _ => {}
                             }
                         }
-                        if all_ok {
-                            common
-                        } else {
-                            None
-                        }
+                        all_verified.then_some(common).flatten()
                     }
                 };
-
                 let (offset, offset_note) = match resolved_offset {
-                    Some(n) => (n, format!("offset: {:+} samples (from AR verification)", n)),
+                    Some(offset) => (
+                        offset,
+                        format!("offset: {:+} samples (from AR verification)", offset),
+                    ),
                     None => (
                         0,
-                        "offset: +0 (AR could not determine a drive offset — \
-                                 proceeding at +0 may produce incorrect repairs if \
-                                 your drive has a real read offset)"
+                        "offset: +0 (AR could not determine a drive offset — proceeding at +0 may produce incorrect repairs if your drive has a real read offset)"
                             .to_string(),
                     ),
                 };
-
-                let n_tracks = pending.paths.len();
                 let message = format!(
                     "Apply CTDB Reed-Solomon repair to {} tracks?\n\
                      Parity: {} symbols, {}\n\
                      Files will be re-encoded and verified before replacing originals.",
-                    n_tracks, pending.npar, offset_note,
+                    pending.paths.len(),
+                    pending.npar,
+                    offset_note,
                 );
-
                 let action = match pending.single_image {
-                    Some(info) => crate::tui::app::ConfirmAction::CtdbRepairSingleImage {
+                    Some(info) => super::app::ConfirmAction::CtdbRepairSingleImage {
                         info,
                         parity_url: pending.parity_url,
                         npar: pending.npar,
                         offset,
                         expected_crcs: pending.expected_crcs,
                     },
-                    None => crate::tui::app::ConfirmAction::CtdbRepair {
+                    None => super::app::ConfirmAction::CtdbRepair {
                         paths: pending.paths,
                         parity_url: pending.parity_url,
                         npar: pending.npar,
@@ -4888,49 +5044,51 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         expected_crcs: pending.expected_crcs,
                     },
                 };
-
+                retire_completion_operation(app, kind, operation_id);
                 app.active_overlay = ActiveOverlay::Confirmation { message, action };
+                app.set_status(status);
                 return;
             }
 
-            // If auto-fix was requested (context menu "Fix offset"),
-            // check for a fixable offset and go straight to confirmation.
             if app.auto_fix_on_complete {
                 app.auto_fix_on_complete = false;
-                for page in &pages {
-                    if let Some(offset) =
-                        crate::tui::accuraterip::detect_uniform_offset(&page.result)
-                    {
-                        let paths: Vec<std::path::PathBuf> =
-                            page.result.tracks.iter().map(|t| t.path.clone()).collect();
-                        let n = paths.len();
-                        app.active_overlay = ActiveOverlay::Confirmation {
-                            message: format!(
-                                "Apply offset correction ({:+} samples) to {} tracks?\n\
-                                 Files will be re-encoded to FLAC and verified at offset +0\n\
-                                 before replacing originals.",
-                                offset, n,
-                            ),
-                            action: crate::tui::app::ConfirmAction::OffsetCorrection {
-                                paths,
-                                offset,
-                            },
-                        };
-                        return;
-                    }
+                if let Some((paths, offset)) = pages.iter().find_map(|page| {
+                    crate::tui::accuraterip::detect_uniform_offset(&page.result).map(|offset| {
+                        (
+                            page.result
+                                .tracks
+                                .iter()
+                                .map(|track| track.path.clone())
+                                .collect::<Vec<_>>(),
+                            offset,
+                        )
+                    })
+                }) {
+                    let message = format!(
+                        "Apply offset correction ({:+} samples) to {} tracks?\n\
+                         Files will be re-encoded to FLAC and verified at offset +0\n\
+                         before replacing originals.",
+                        offset,
+                        paths.len(),
+                    );
+                    retire_completion_operation(app, kind, operation_id);
+                    app.active_overlay = ActiveOverlay::Confirmation {
+                        message,
+                        action: super::app::ConfirmAction::OffsetCorrection { paths, offset },
+                    };
+                    app.set_status(status);
+                    return;
                 }
-                // No fixable offset — show results normally.
-                app.set_status(
-                    "No offset correction needed — showing verification results".to_string(),
-                );
+                status = "No offset correction needed — showing verification results".to_string();
             }
 
-            app.active_overlay =
-                ActiveOverlay::AccurateRipVerify(Box::new(crate::tui::app::ArVerifyState {
-                    pages,
-                    active_page: 0,
-                    scroll: 0,
-                }));
+            retire_completion_operation(app, kind, operation_id);
+            app.active_overlay = ActiveOverlay::AccurateRipVerify(Box::new(super::app::ArVerifyState {
+                pages,
+                active_page: 0,
+                scroll: 0,
+            }));
+            app.set_status(status);
         }
     }
 }
@@ -5031,13 +5189,21 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 if state.phase == MetadataEditorPhase::DetailEdit {
                     let field_idx = state.detail_field_idx;
                     if field_idx < state.active_surface().entries.len() {
+                        let display_key = state.active_surface().entries[field_idx]
+                            .display_key
+                            .clone();
                         state.detail_edit = None;
-                        match super::keybindings::metadata_editor_apply_detail_paste(&mut state, field_idx, &text) {
-                            Ok(applied) => app.set_status(format!(
-                                "Pasted {} value{}",
-                                applied,
-                                if applied == 1 { "" } else { "s" },
-                            )),
+                        match super::keybindings::metadata_editor_apply_detail_paste(
+                            &mut state,
+                            field_idx,
+                            &text,
+                        ) {
+                            Ok(result) => app.set_status(
+                                super::keybindings::metadata_editor_detail_paste_status(
+                                    &display_key,
+                                    &result,
+                                ),
+                            ),
                             Err(reason) => app.set_status(reason),
                         }
                     }
@@ -5056,6 +5222,67 @@ fn handle_paste(app: &mut AppState, text: &str) {
         _ => {
             // Paste ignored outside text-entry contexts.
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_detail_paste_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState, MetadataTechnicalDetails};
+    use crate::tui::probe::{RowScope, TagEntry};
+    use lofty::tag::ItemKey;
+
+    #[test]
+    fn detail_paste_status_keeps_cardinality_warning() {
+        let entry = TagEntry {
+            row_scope: RowScope::File,
+            display_key: "ARTIST".to_string(),
+            item_key: ItemKey::TrackArtist,
+            value: "<multiple values>".to_string(),
+            original: "<multiple values>".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2, 1],
+            per_file_values: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            per_file_originals: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        };
+        let mut state = MetadataEditorState::for_files(
+            vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
+            vec![entry],
+            vec!["a".to_string(), "b".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        handle_paste(&mut app, "Solo\nDelta");
+
+        assert_eq!(
+            app.status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some(
+                "Pasted 2 values; warning: 1 carrier for ARTIST collapsed multiple stored values into one value"
+            ),
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("metadata editor should remain open");
+        };
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            vec!["Solo", "Delta"],
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_stored_value_counts,
+            vec![2, 1],
+            "paste must retain source-cardinality provenance until save reduction",
+        );
     }
 }
 
@@ -5819,6 +6046,123 @@ fn metadata_editor_session_guard(
         save_generation: details.save_generation,
         editor_generation: state.model.editor_save_generation,
     }
+}
+
+pub(super) fn begin_completion_operation(
+    app: &mut AppState,
+    kind: super::app::CompletionOperationKind,
+    label: &str,
+) -> Result<super::message::TagsMbOperationId, String> {
+    if app.active_completion_operations.contains_key(&kind) {
+        return Err(format!(
+            "{label}: another operation in this completion family is still active"
+        ));
+    }
+    let generation = app
+        .tags_mb_operation_generation
+        .checked_add(1)
+        .ok_or_else(|| {
+            format!(
+                "{label}: operation identity space exhausted; restart Tonepoet before retrying"
+            )
+        })?;
+    app.tags_mb_operation_generation = generation;
+    let operation_id = super::message::TagsMbOperationId(generation);
+    let editor_session = app
+        .pending_metadata_editor
+        .as_deref()
+        .or_else(|| match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => Some(state.as_ref()),
+            _ => None,
+        })
+        .map(metadata_editor_session_guard);
+    app.active_completion_operations.insert(
+        kind,
+        super::app::ActiveCompletionOperation {
+            operation_id,
+            editor_session,
+        },
+    );
+    Ok(operation_id)
+}
+
+pub(super) fn completion_operation_is_current(
+    app: &AppState,
+    kind: super::app::CompletionOperationKind,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    operation_id.is_assigned()
+        && app
+            .active_completion_operations
+            .get(&kind)
+            .is_some_and(|active| active.operation_id == operation_id)
+}
+
+pub(super) fn completion_operation_editor_session(
+    app: &AppState,
+    kind: super::app::CompletionOperationKind,
+    operation_id: super::message::TagsMbOperationId,
+) -> Option<super::message::MetadataEditorSessionGuard> {
+    app.active_completion_operations
+        .get(&kind)
+        .filter(|active| active.operation_id == operation_id)
+        .and_then(|active| active.editor_session)
+}
+
+pub(super) fn completion_operation_has_overlay_authority(
+    app: &AppState,
+    kind: super::app::CompletionOperationKind,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    let Some(active) = app.active_completion_operations.get(&kind) else {
+        return false;
+    };
+    active.operation_id == operation_id
+        && active.editor_session.is_none()
+        && matches!(app.active_overlay, ActiveOverlay::None)
+        && app.pending_metadata_editor.is_none()
+        && app.pending_cue_preview.is_none()
+        && app.pending_mb_select.is_none()
+        && app.active_tags_mb_operation.is_none()
+        && app.active_gnudb_operation.is_none()
+        && app.active_cue_operation.is_none()
+}
+
+pub(super) fn retire_completion_operation(
+    app: &mut AppState,
+    kind: super::app::CompletionOperationKind,
+    operation_id: super::message::TagsMbOperationId,
+) -> bool {
+    let Some(active) = app.active_completion_operations.get(&kind).copied() else {
+        return false;
+    };
+    if active.operation_id != operation_id {
+        return false;
+    }
+    app.active_completion_operations.remove(&kind);
+
+    let Some(guard) = active.editor_session else {
+        return true;
+    };
+    if app.active_tags_mb_operation.is_some()
+        || app.active_gnudb_operation.is_some()
+        || app.active_cue_operation.is_some()
+        || app.pending_cue_preview.is_some()
+        || app.pending_mb_select.is_some()
+        || !matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        return true;
+    }
+    let matches = app
+        .pending_metadata_editor
+        .as_deref()
+        .is_some_and(|state| metadata_editor_matches_session_guard(state, guard));
+    if matches {
+        if let Some(editor) = app.pending_metadata_editor.take() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+        }
+    }
+    true
 }
 
 pub(super) fn begin_gnudb_operation(
@@ -6970,16 +7314,22 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
     }
     let per_group_apply =
         metadata_editor_tags_mb_context_is_proper_track_prefix(&state, &paths);
+    let mut split_cue_mb_report = None;
     if !split_cue_mb_populated
         && state.cue_surface_tabs
         && state.presentation_tabs.len() > 1
         && metadata_editor_paths_match_tags_mb_context(&state, &paths)
     {
-        split_cue_mb_populated = super::keybindings::populate_split_cue_metadata_editor_from_mb_release(
-            &mut state,
-            release,
-            !per_group_apply,
-        );
+        if let Some(report) =
+            super::keybindings::populate_split_cue_metadata_editor_from_mb_release(
+                &mut state,
+                release,
+                !per_group_apply,
+            )
+        {
+            split_cue_mb_populated = true;
+            split_cue_mb_report = Some(report);
+        }
     }
     // The potentially blocking per-track guard was computed before this
     // reducer ran. Reuse it for status text and population so the event loop
@@ -7008,15 +7358,35 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
     // apply has already populated every tab by concatenated track position;
     // applying the whole release to the active tab here would collapse side B
     // back into side A's shape.
-    if !split_cue_mb_populated {
-        super::musicbrainz::populate_editor_from_mb_scoped(
+    let mb_mutation_report = if !split_cue_mb_populated {
+        let report = super::musicbrainz::populate_editor_from_mb_scoped(
             &mut state,
             release,
             &decision,
             !per_group_apply,
         );
         state.active_surface_mut().dirty = true;
-    }
+        report
+    } else if let Some(report) = split_cue_mb_report {
+        report
+    } else {
+        // Some split-CUE construction paths populate the fresh editor before
+        // this reducer receives it. Reconstruct the provider delta from the
+        // MB proposal + original-value provenance across every presentation.
+        let mut report = super::probe::MetadataMutationReport::default();
+        if state.presentation_tabs.is_empty() {
+            report.merge(super::probe::MetadataMutationReport::from_musicbrainz_entries(
+                &state.active_surface().entries,
+            ));
+        } else {
+            for tab in &state.presentation_tabs {
+                report.merge(super::probe::MetadataMutationReport::from_musicbrainz_entries(
+                    &tab.entries,
+                ));
+            }
+        }
+        report
+    };
     let dvdv_duration_warning = if split_cue_mb_populated {
         None
     } else {
@@ -7042,6 +7412,7 @@ pub(super) fn apply_editor_with_mb_release_decision_guarded(
     if let Some(warn) = dvdv_duration_warning {
         msg.push_str(&format!(" [{}]", warn));
     }
+    mb_mutation_report.append_provider_summary("MusicBrainz", &mut msg);
     // Cache release list for :mb-back when there's more than
     // one to choose from. Single-match has nothing to go back
     // to (re-opening the picker with one entry is pointless).
@@ -7177,6 +7548,49 @@ fn handle_cue_fill_complete(
 
 
 #[cfg(test)]
+mod startup_recovery_order_tests {
+    use super::*;
+
+    #[test]
+    fn database_prepared_recovery_consumes_byte_identical_dsf_marker_before_scan() {
+        let db = crate::db::Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("album.dsf");
+        let backup = crate::db::Database::backup_path_for(&target);
+        let original = b"DSD synthetic original bytes";
+        std::fs::write(&target, original).expect("write target");
+        std::fs::write(&backup, original).expect("write byte-identical backup");
+        db.begin_metadata_write(
+            &target.display().to_string(),
+            &backup.display().to_string(),
+        )
+        .expect("record prepared metadata write");
+
+        let messages = startup_metadata_recovery_messages(&db, temp.path());
+
+        assert!(
+            messages.iter().any(|message| message.starts_with("Recovered:")),
+            "database recovery must consume the marker first: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("rollback marker is missing")),
+            "standalone scanning must not strand the prepared transaction: {messages:?}"
+        );
+        assert!(!backup.exists());
+        assert!(db
+            .stale_metadata_writes()
+            .expect("read metadata journal")
+            .is_empty());
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            original.to_vec()
+        );
+    }
+}
+
+#[cfg(test)]
 mod sentinel_clamp_status_tests {
     use super::*;
     use crate::config::TonepoetConfig;
@@ -7221,7 +7635,7 @@ mod sentinel_clamp_status_tests {
                 file_size: 1_000,
             }),
             metadata: crate::tui::probe::SourceMetadata::default(),
-            probe_notice: None,
+            probe_notice: Some("tolerant metadata read".to_string()),
         };
         handle_convert_source_probe_result(&mut app, generation, path, realized, baseline);
 
@@ -7237,8 +7651,12 @@ mod sentinel_clamp_status_tests {
             .map(|(message, _)| message.clone())
             .expect("clamp must set a status");
         assert!(
-            status.starts_with("rate 'source' is invalid for"),
-            "unexpected status: {status}"
+            status.contains("Probe warning: tolerant metadata read"),
+            "probe warning was overwritten: {status}"
+        );
+        assert!(
+            status.contains("rate 'source' is invalid for"),
+            "clamp status is missing: {status}"
         );
     }
 }
@@ -8037,6 +8455,8 @@ mod musicbrainz_completion_dispatch_tests {
             original: value.to_string(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![value.to_string(); n_paths],
             per_file_originals: vec![value.to_string(); n_paths],
             mb_proposed_value: None,
@@ -8342,6 +8762,79 @@ mod musicbrainz_completion_dispatch_tests {
             status,
             Some(":tags-mb: TOC lookup failed: synthetic lookup failure")
         );
+    }
+
+    #[test]
+    fn musicbrainz_apply_completion_preserves_provider_cardinality_warning() {
+        let editor_paths = paths(2);
+        let mut artist = tag("ARTIST", "<multiple values>", 2);
+        artist.item_key = ItemKey::TrackArtist;
+        artist.is_mixed = true;
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2, 1];
+        artist.per_file_values = vec!["Alpha; Beta".to_string(), "Gamma".to_string()];
+        artist.per_file_originals = artist.per_file_values.clone();
+
+        let editor = Box::new(MetadataEditorState::for_files(
+            editor_paths.clone(),
+            vec![artist],
+            vec!["Track 01".to_string(), "Track 02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        ));
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+        let operation_id = begin_tags_mb_lookup_operation(&mut app, true)
+            .expect("MusicBrainz operation should start");
+        let release = crate::tui::musicbrainz::MbRelease {
+            release_id: "provider-cardinality".to_string(),
+            title: "Replacement Album".to_string(),
+            artist: "Replacement Artist".to_string(),
+            tracks: vec![
+                crate::tui::musicbrainz::MbTrack {
+                    position: 1,
+                    title: "Track 01".to_string(),
+                    artist: "New Artist".to_string(),
+                    ..Default::default()
+                },
+                crate::tui::musicbrainz::MbTrack {
+                    position: 2,
+                    title: "Track 02".to_string(),
+                    artist: "New Scalar".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let tx = tx();
+
+        complete_tags_mb_apply_operation(
+            &mut app,
+            &tx,
+            operation_id,
+            vec![release],
+            0,
+            editor_paths,
+            None,
+            crate::tui::musicbrainz::PerTrackDecision::default(),
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("MusicBrainz populated"));
+        assert!(status.contains("warning: 1 carrier"));
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("MusicBrainz completion must reopen the metadata editor");
+        };
+        let artist = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ARTIST")
+            .expect("ARTIST row");
+        assert_eq!(artist.per_file_values, vec!["New Artist", "New Scalar"]);
     }
 
     #[test]
@@ -9816,6 +10309,135 @@ mod musicbrainz_completion_dispatch_tests {
             first_status,
             "duplicate completion must be a total no-op"
         );
+    }
+
+    fn completion_test_app(
+        kind: CompletionOperationKind,
+    ) -> (
+        AppState,
+        crate::tui::message::TagsMbOperationId,
+        crate::tui::message::MetadataEditorSessionGuard,
+    ) {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = single_source_file_editor();
+        editor.active_surface_mut().dirty = true;
+        let guard = session_guard_for(&editor);
+        app.pending_metadata_editor = Some(editor);
+        let operation_id =
+            begin_completion_operation(&mut app, kind, "test").expect("begin completion operation");
+        (app, operation_id, guard)
+    }
+
+    fn assert_completion_restored_dirty_editor(
+        app: &AppState,
+        kind: CompletionOperationKind,
+        guard: crate::tui::message::MetadataEditorSessionGuard,
+    ) {
+        assert!(
+            !app.active_completion_operations.contains_key(&kind),
+            "matching completion must retire its authority"
+        );
+        assert!(app.pending_metadata_editor.is_none());
+        let ActiveOverlay::MetadataEditor(editor) = &app.active_overlay else {
+            panic!("matching completion must restore the parked editor");
+        };
+        assert!(editor.active_surface().dirty);
+        assert_eq!(session_guard_for(editor), guard);
+    }
+
+    #[test]
+    fn analysis_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::Analysis;
+        let (mut app, operation_id, guard) = completion_test_app(kind);
+        app.analysis_pending = 1;
+        handle_message(
+            &mut app,
+            AppMessage::AnalysisComplete {
+                operation_id,
+                result: Err("fixture failure".to_string()),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+    }
+
+    #[test]
+    fn accuraterip_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::AccurateRip;
+        let (mut app, operation_id, guard) = completion_test_app(kind);
+        handle_message(
+            &mut app,
+            AppMessage::AccurateRipComplete {
+                operation_id,
+                pages: Vec::new(),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+    }
+
+    #[test]
+    fn ctdb_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::Ctdb;
+        let (mut app, operation_id, guard) = completion_test_app(kind);
+        handle_message(
+            &mut app,
+            AppMessage::CtdbComplete {
+                operation_id,
+                pages: Vec::new(),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+    }
+
+    #[test]
+    fn ar_batch_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::ArBatch;
+        let (mut app, operation_id, guard) = completion_test_app(kind);
+        handle_message(
+            &mut app,
+            AppMessage::ArBatchComplete {
+                operation_id,
+                result: Box::new(crate::tui::accuraterip::ArBatchResult {
+                    albums: Vec::new(),
+                    scan_dir: std::path::PathBuf::from("/tmp"),
+                    report_path: None,
+                }),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+    }
+
+    #[test]
+    fn offset_correction_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::OffsetCorrection;
+        let (mut app, operation_id, guard) = completion_test_app(kind);
+        handle_message(
+            &mut app,
+            AppMessage::OffsetCorrectionComplete {
+                operation_id,
+                result: Err("fixture failure".to_string()),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+    }
+
+    #[test]
+    fn ctdb_repair_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::CtdbRepair;
+        let (mut app, operation_id, guard) = completion_test_app(kind);
+        handle_message(
+            &mut app,
+            AppMessage::CtdbRepairComplete {
+                operation_id,
+                result: Err("fixture failure".to_string()),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
     }
 
     #[test]

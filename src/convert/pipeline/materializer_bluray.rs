@@ -809,6 +809,7 @@ fn build_prepared_bluray_source(
                 source_audio_coding(selection.stream.coding),
             ),
             bit_depth,
+            warnings: Vec::new(),
         });
     }
 

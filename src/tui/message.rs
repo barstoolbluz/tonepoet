@@ -315,6 +315,7 @@ pub enum AppMessage {
     /// Result of an async audio analysis (DR, peak, RMS, etc.).
     /// `result` is Ok on success, Err(message) on failure.
     AnalysisComplete {
+        operation_id: TagsMbOperationId,
         result: Result<Box<crate::tui::analyze::AnalysisResult>, String>,
     },
     /// Result of an async file integrity verification.
@@ -529,20 +530,29 @@ pub enum AppMessage {
     },
     /// Result of an async AccurateRip verification (one or more discs).
     AccurateRipComplete {
+        operation_id: TagsMbOperationId,
         pages: Vec<crate::tui::app::ArVerifyPage>,
     },
     /// Result of an async CTDB verification (one or more discs).
     CtdbComplete {
+        operation_id: TagsMbOperationId,
         pages: Vec<crate::tui::app::CtdbVerifyPage>,
     },
     /// Result of an async AR batch verification.
     ArBatchComplete {
+        operation_id: TagsMbOperationId,
         result: Box<crate::tui::accuraterip::ArBatchResult>,
     },
     /// Result of an async AR offset correction.
-    OffsetCorrectionComplete { result: Result<String, String> },
+    OffsetCorrectionComplete {
+        operation_id: TagsMbOperationId,
+        result: Result<String, String>,
+    },
     /// Result of an async CTDB Reed-Solomon repair.
-    CtdbRepairComplete { result: Result<String, String> },
+    CtdbRepairComplete {
+        operation_id: TagsMbOperationId,
+        result: Result<String, String>,
+    },
     /// Result of an async MusicBrainz disc-TOC lookup driving `:cue-mb`.
     /// `outcome` is `Err` when transport/parse failed; `Ok(None)` means
     /// no release matched. `paths`, `output_dir`, `single_image` carry

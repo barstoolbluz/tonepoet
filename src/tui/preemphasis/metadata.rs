@@ -369,10 +369,7 @@ fn log_block_applies_to_audio(
 }
 
 fn is_affirmative_preemphasis_value(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "yes" | "true" | "on" | "y"
-    )
+    crate::convert::pipeline::is_affirmative_preemphasis_value(value)
 }
 
 fn comment_has_positive_preemphasis(comment: &str) -> bool {

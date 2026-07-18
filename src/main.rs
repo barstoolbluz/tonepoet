@@ -28,6 +28,7 @@ struct Cli {
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum DsfRecoveryAction {
     Status,
+    RecoverTail,
     RestoreBackup,
     KeepCurrent,
 }
@@ -221,9 +222,13 @@ enum Commands {
         /// Show config file path
         #[arg(long)]
         path: bool,
+
+        /// Retire a validated pending secret journal without contacting the secret backend.
+        #[arg(long)]
+        retire_secret_journal: bool,
     },
 
-    /// Inspect or resolve an unversioned legacy DSF rollback marker.
+    /// Inspect or resolve DSF tail journals and legacy rollback markers.
     /// This command does not load the ordinary tonepoet configuration, so it
     /// remains available during configuration or secret-store recovery.
     DsfRecover {
@@ -375,13 +380,48 @@ fn require_startup_config(
 fn run_dsf_recovery(action: DsfRecoveryAction, path: &std::path::Path) -> anyhow::Result<()> {
     match action {
         DsfRecoveryAction::Status => {
-            let inspection = tonepoet::dsf_tags::inspect_legacy_backup(path)
+            let tail = tonepoet::dsf_tags::inspect_tail_journal(path)
                 .map_err(anyhow::Error::msg)?;
-            println!("target: {}", inspection.target.display());
-            println!("marker: {}", inspection.marker.display());
-            println!("target bytes: {}", inspection.target_bytes);
-            println!("marker bytes: {}", inspection.marker_bytes);
-            println!("byte-identical: {}", inspection.byte_identical);
+            let legacy = tonepoet::dsf_tags::inspect_legacy_backup_if_present(path)
+                .map_err(anyhow::Error::msg)?;
+            if tail.is_none() && legacy.is_none() {
+                return Err(anyhow::anyhow!(
+                    "no DSF tail journal or legacy rollback marker exists for '{}'",
+                    path.display()
+                ));
+            }
+            if let Some(inspection) = tail {
+                println!("tail target: {}", inspection.target.display());
+                println!("tail journal: {}", inspection.journal.display());
+                println!("tail state: {}", inspection.state);
+                println!("tail operation: {}", inspection.operation);
+                println!("tail original bytes: {}", inspection.original_file_size);
+                println!("tail committed bytes: {}", inspection.committed_file_size);
+            }
+            if let Some(inspection) = legacy {
+                println!("legacy target: {}", inspection.target.display());
+                println!("legacy marker: {}", inspection.marker.display());
+                println!("legacy target bytes: {}", inspection.target_bytes);
+                println!("legacy marker bytes: {}", inspection.marker_bytes);
+                println!("legacy byte-identical: {}", inspection.byte_identical);
+            }
+        }
+        DsfRecoveryAction::RecoverTail => {
+            let inspection = tonepoet::dsf_tags::recover_tail_journal_for_target(path)
+                .map_err(anyhow::Error::msg)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no DSF tail journal exists for '{}'",
+                        path.display()
+                    )
+                })?;
+            println!(
+                "resolved {} {} DSF tail journal '{}' for '{}'",
+                inspection.state,
+                inspection.operation,
+                inspection.journal.display(),
+                inspection.target.display()
+            );
         }
         DsfRecoveryAction::RestoreBackup => {
             let inspection = tonepoet::dsf_tags::resolve_legacy_backup(
@@ -418,6 +458,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     if let Commands::DsfRecover { action, path } = &cli.command {
         run_dsf_recovery(*action, path)?;
+        return Ok(());
+    }
+    if let Commands::Config {
+        retire_secret_journal: true,
+        ..
+    } = &cli.command
+    {
+        let config_path = TonepoetConfig::config_path();
+        let at_risk = tonepoet::secret_store::retire_pending_publication_journal_headless(&config_path)
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "Retired pending secret journal '{}'; {} referenced secret {} may remain orphaned.",
+            tonepoet::secret_store::pending_publication_path(&config_path).display(),
+            at_risk,
+            if at_risk == 1 { "entry" } else { "entries" }
+        );
         return Ok(());
     }
 
@@ -502,7 +558,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Commands::CheckTools => {
             run_check_tools();
         }
-        Commands::Config { show, reset, path } => {
+        Commands::Config { show, reset, path, retire_secret_journal: _ } => {
             run_config(show, reset, path, &config)?;
         }
         Commands::DsfRecover { .. } => unreachable!("handled before config load"),
@@ -715,6 +771,8 @@ fn parse_cli_bit_depth(value: &str) -> Result<u32, String> {
 
 #[cfg(test)]
 mod startup_config_tests {
+    use clap::Parser;
+
     #[test]
     fn startup_config_failure_is_returned_instead_of_defaulting() {
         let error = super::require_startup_config(Err(anyhow::anyhow!(
@@ -726,6 +784,30 @@ mod startup_config_tests {
             error.to_string(),
             "failed to load tonepoet configuration; archive-password secret migration or secret-store access may require user action: keyring backend unavailable: Secret Service is locked"
         );
+    }
+
+    #[test]
+    fn config_retire_secret_journal_flag_parses_as_headless_recovery() {
+        let cli = super::Cli::try_parse_from([
+            "tonepoet",
+            "config",
+            "--retire-secret-journal",
+        ])
+        .expect("parse headless journal retirement");
+
+        let super::Commands::Config {
+            show,
+            reset,
+            path,
+            retire_secret_journal,
+        } = cli.command
+        else {
+            panic!("expected config command");
+        };
+        assert!(!show);
+        assert!(!reset);
+        assert!(!path);
+        assert!(retire_secret_journal);
     }
 }
 
@@ -1132,7 +1214,17 @@ async fn run_convert(
             needs_archive_password,
             &archive_password,
             config,
-            tonepoet::tui::keychain::load_keychain,
+            // Per-entry tolerant MRU load: surface skipped references on
+            // stderr (CLI equivalent of the keychain pane warning) and
+            // hand the resolver only the usable passwords.
+            || {
+                tonepoet::tui::keychain::load_keychain_with_warnings().map(|loaded| {
+                    for warning in &loaded.warnings {
+                        eprintln!("Warning: {warning}");
+                    }
+                    loaded.passwords
+                })
+            },
         ) {
             Ok(password) => password,
             Err(error) => {
@@ -2292,7 +2384,12 @@ async fn run_tags_mb(
     if let Some(warn) = musicbrainz::track_count_mismatch_message(&state, &release) {
         err!("tags-mb: {}", warn);
     }
-    musicbrainz::populate_editor_from_mb(&mut state, &release);
+    let mb_mutation_report = musicbrainz::populate_editor_from_mb(&mut state, &release);
+    if mb_mutation_report.collapsed_carrier_count() > 0 {
+        let mut warning = "tags-mb".to_string();
+        mb_mutation_report.append_collapse_warning(&mut warning);
+        err!("{}", warning);
+    }
 
     if matches!(kind, PathKind::Audio(_)) {
         if let Err(e) = tonepoet::tui::keybindings::regenerate_cuesheet_for_save(&mut state) {
@@ -3792,6 +3889,7 @@ mod dsf_recovery_cli_tests {
     fn dsf_recover_subcommand_parses_all_explicit_resolution_actions() {
         for (raw, expected) in [
             ("status", DsfRecoveryAction::Status),
+            ("recover-tail", DsfRecoveryAction::RecoverTail),
             ("restore-backup", DsfRecoveryAction::RestoreBackup),
             ("keep-current", DsfRecoveryAction::KeepCurrent),
         ] {

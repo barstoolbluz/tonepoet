@@ -143,6 +143,7 @@ impl super::stages::Materializer for ArchiveMaterializer {
                     probe.coding,
                 ),
                 bit_depth: probe.bit_depth,
+                warnings: metadata_warnings,
             });
         }
 
@@ -1825,11 +1826,11 @@ fn read_track_metadata_with_warnings(
     for item in tag.items() {
         if let lofty::tag::ItemValue::Text(text) = item.value() {
             let key = item_key_to_extra_key(item.key(), tag_type);
-            if !key.is_empty() {
-                extra.entry(key).or_insert_with(|| text.clone());
-            }
+            insert_source_text_tag(&mut extra, &key, text);
         }
     }
+
+    let pre_emphasis = source_text_tags_indicate_pre_emphasis(&extra);
 
     Ok((TrackMetadata {
         title: tag.title().map(|s| s.to_string()),
@@ -1857,7 +1858,7 @@ fn read_track_metadata_with_warnings(
             .get_string(&lofty::tag::ItemKey::CopyrightMessage)
             .map(|s| s.to_string()),
         comment: tag.comment().map(|s| s.to_string()),
-        pre_emphasis: false,
+        pre_emphasis,
         extra,
     }, Vec::new()))
 }
@@ -2018,6 +2019,43 @@ mod tests {
     use std::io::Write;
     use std::process::Command;
     use std::sync::Mutex;
+
+    #[test]
+    fn archived_source_text_items_preserve_custom_tag_provenance_and_promote_pre_emphasis() {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("archived-source.flac");
+        std::fs::write(&path, include_bytes!("../../../tests/fixtures/silence.flac"))
+            .expect("write FLAC fixture");
+        let mut tagged = lofty::read_from_path(&path).expect("read FLAC fixture");
+        if tagged.primary_tag().is_none() {
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+        }
+        let tag = tagged.primary_tag_mut().expect("primary FLAC tag");
+        for (key, value) in [("PRE_EMPHASIS", "1"), ("MY_NOTE", "keep me")] {
+            let key = ItemKey::Unknown(key.to_string());
+            tag.remove_key(&key);
+            tag.insert_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+        tagged
+            .save_to_path(&path, WriteOptions::default())
+            .expect("save FLAC fixture tags");
+
+        let metadata = read_track_metadata(&path).expect("read archived source metadata");
+        assert!(metadata.pre_emphasis);
+        assert_eq!(metadata.extra.get("my_note").map(String::as_str), Some("keep me"));
+        assert_eq!(
+            metadata
+                .extra
+                .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}my_note"))
+                .map(String::as_str),
+            Some("keep me")
+        );
+    }
 
     #[test]
     fn corrupt_extracted_dsf_metadata_degrades_to_empty_metadata_for_conversion() {
@@ -3415,6 +3453,7 @@ mod tests {
                 Some(SourceAudioCoding::Pcm),
             ),
             bit_depth: Some(24),
+            warnings: Vec::new(),
         };
 
         let tracks = vec![
@@ -3463,6 +3502,7 @@ mod tests {
                 Some(SourceAudioCoding::Pcm),
             ),
             bit_depth: Some(24),
+            warnings: Vec::new(),
         };
 
         let tracks = vec![make_track(1, "USSM17100001"), make_track(2, "USSM17100002")];

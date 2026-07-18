@@ -5008,20 +5008,6 @@ impl ConvertState {
         self.refresh_source_constraints_preserving_format_selection();
     }
 
-    /// Replace the source mode after an async probe while preserving every
-    /// output-format selection. Used when the user changed format controls
-    /// during the probe: source facts should update, but constraint/default
-    /// cascades must not rewrite the user's choices.
-    pub fn set_source_mode_preserving_format_selection(&mut self, mode: SourceMode) {
-        self.clear_pending_archive_preview();
-        self.source.mode.cleanup_archive_preview_staging();
-        let retained_paths = mode.all_paths();
-        self.source.cleanup_synthetic_cue_artifacts_not_in(&retained_paths);
-        self.reset_metadata_file_list_state();
-        self.source.mode = mode;
-        self.refresh_source_constraints_preserving_format_selection();
-    }
-
     pub fn sync_archive_preview_cursor_metadata_and_defaults(&mut self) {
         let Some((info, metadata)) = self.source.mode.sync_archive_preview_cursor_state() else {
             return;
@@ -7292,6 +7278,11 @@ pub struct MetadataEditorState {
     pub model: MetadataEditorModel,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MusicBrainzPresentationApplyResult {
+    pub changed_presentations: usize,
+    pub mutation_report: crate::tui::probe::MetadataMutationReport,
+}
 
 fn read_only_max_scroll(total_lines: usize, visible_rows: usize) -> usize {
     total_lines.saturating_sub(visible_rows.max(1))
@@ -8092,20 +8083,23 @@ impl MetadataEditorState {
         }
     }
 
-    pub fn apply_active_musicbrainz_values_to_matching_presentations(&mut self) -> usize {
+    pub fn apply_active_musicbrainz_values_to_matching_presentations(
+        &mut self,
+    ) -> MusicBrainzPresentationApplyResult {
+        let mut result = MusicBrainzPresentationApplyResult::default();
         if self.presentation_tabs.len() <= 1 {
-            return 0;
+            return result;
         }
         let Some(active) = self.presentation_tabs.get(self.active_tab).cloned() else {
-            return 0;
+            return result;
         };
         let track_count = active.paths.len();
         let active_tab = self.active_tab;
-        let mut changed_tabs = 0usize;
         for (idx, tab) in self.presentation_tabs.iter_mut().enumerate() {
             if idx == active_tab || tab.paths.len() != track_count {
                 continue;
             }
+            let before_entries = tab.entries.clone();
             let copied = copy_musicbrainz_entries_preserving_originals(
                 &active.entries,
                 &mut tab.entries,
@@ -8114,11 +8108,17 @@ impl MetadataEditorState {
             if copied == 0 {
                 continue;
             }
+            result.mutation_report.merge(
+                crate::tui::probe::MetadataMutationReport::between(
+                    &before_entries,
+                    &tab.entries,
+                ),
+            );
             tab.deleted.clear();
             tab.dirty = true;
-            changed_tabs += 1;
+            result.changed_presentations += 1;
         }
-        changed_tabs
+        result
     }
 
     pub fn apply_details_probe_results(
@@ -8274,7 +8274,35 @@ fn mark_presentation_tab_saved(tab: &mut PresentationTab) {
     tab.deleted.clear();
 }
 
+fn scalar_stored_value_count(value: &str) -> usize {
+    if value.trim().is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+fn refresh_stored_value_summary(entry: &mut crate::tui::probe::TagEntry) {
+    if !entry.per_file_stored_value_counts.is_empty() {
+        entry.has_multiple_stored_values = entry
+            .per_file_stored_value_counts
+            .iter()
+            .any(|count| *count > 1);
+    }
+}
+
 fn mark_tag_entry_saved(entry: &mut crate::tui::probe::TagEntry) {
+    if entry.per_file_stored_value_counts.len() == entry.per_file_values.len()
+        && entry.per_file_originals.len() == entry.per_file_values.len()
+    {
+        for idx in 0..entry.per_file_values.len() {
+            if entry.per_file_values[idx] != entry.per_file_originals[idx] {
+                entry.per_file_stored_value_counts[idx] =
+                    scalar_stored_value_count(&entry.per_file_values[idx]);
+            }
+        }
+        refresh_stored_value_summary(entry);
+    }
     entry.per_file_originals = entry.per_file_values.clone();
     entry.original = entry.value.clone();
     entry.mb_proposed_value = None;
@@ -8552,6 +8580,9 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
                 if saved_slots.contains(&idx) {
                     entry.per_file_values[idx].clear();
                     entry.per_file_originals[idx].clear();
+                    if entry.per_file_stored_value_counts.len() == path_count {
+                        entry.per_file_stored_value_counts[idx] = 0;
+                    }
                 } else {
                     // Convert the row-level pending delete into a per-file
                     // empty-value change for the unsaved slot. `write_all_tags`
@@ -8563,11 +8594,18 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
         } else {
             for &idx in saved_slots {
                 if idx < path_count {
+                    let changed =
+                        entry.per_file_values[idx] != entry.per_file_originals[idx];
                     entry.per_file_originals[idx] = entry.per_file_values[idx].clone();
+                    if changed && entry.per_file_stored_value_counts.len() == path_count {
+                        entry.per_file_stored_value_counts[idx] =
+                            scalar_stored_value_count(&entry.per_file_values[idx]);
+                    }
                 }
             }
         }
 
+        refresh_stored_value_summary(entry);
         recompute_tag_entry_display(entry);
         if deleted.contains(&entry_idx)
             && entry.per_file_values.iter().all(|value| value.trim().is_empty())
@@ -8664,6 +8702,9 @@ fn copy_musicbrainz_entries_preserving_originals(
                 let dst = &mut dst_entries[i];
                 dst.item_key = src.item_key.clone();
                 dst.row_scope = src.row_scope;
+                if dst.row_scope == crate::tui::probe::RowScope::Track {
+                    dst.clear_stored_value_provenance();
+                }
                 dst.value = src.value.clone();
                 dst.is_binary = src.is_binary;
                 dst.is_mixed = src.is_mixed;
@@ -8677,6 +8718,11 @@ fn copy_musicbrainz_entries_preserving_originals(
             None => {
                 let values = normalize_entry_values_for_track_count(src, track_count);
                 let mut entry = src.clone();
+                // This row is synthetic in the destination presentation. The
+                // source row's stored-item counts describe different files and
+                // must not be inherited by a destination that had no carrier
+                // for this field.
+                entry.clear_stored_value_provenance();
                 entry.per_file_values = values.clone();
                 entry.per_file_originals = vec![String::new(); values.len()];
                 entry.value = src.value.clone();
@@ -8790,6 +8836,30 @@ pub struct ActiveGnudbOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveCueOperation {
     pub operation_id: crate::tui::message::TagsMbOperationId,
+}
+
+/// Completion families whose workers may publish a result overlay or retire a
+/// confirmation-owned mutation. Each family has independent authority so, for
+/// example, an analysis and an AccurateRip verification may coexist without
+/// allowing either completion to supersede the other's surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CompletionOperationKind {
+    Analysis,
+    AccurateRip,
+    Ctdb,
+    ArBatch,
+    OffsetCorrection,
+    CtdbRepair,
+}
+
+/// Operation-scoped authority for asynchronous completion handlers that can
+/// otherwise replace an unrelated overlay. `editor_session` records the exact
+/// metadata editor present at dispatch; such operations may enrich that same
+/// editor but never replace it with a result overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveCompletionOperation {
+    pub operation_id: crate::tui::message::TagsMbOperationId,
+    pub editor_session: Option<crate::tui::message::MetadataEditorSessionGuard>,
 }
 
 /// One in-flight Browse inline metadata write. The generation and exact path
@@ -9137,10 +9207,20 @@ pub struct CompletionState {
     pub prefix_start: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseCreateKind {
+    File,
+    Folder,
+}
+
 /// Which browse-surface field is being edited inline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrowseInlineEditTarget {
     Rename { path: std::path::PathBuf },
+    Create {
+        dir: std::path::PathBuf,
+        kind: BrowseCreateKind,
+    },
     Metadata {
         path: std::path::PathBuf,
         field: crate::tui::probe::MetadataField,
@@ -9297,6 +9377,8 @@ pub struct KeychainState {
     /// Last explicit load/migration/backend failure. Callers must surface this
     /// rather than treating an unavailable secret store as an empty MRU.
     pub load_error: Option<String>,
+    /// Non-fatal per-reference resolution failures. Valid entries remain usable.
+    pub load_warning: Option<String>,
 }
 
 impl Default for KeychainState {
@@ -9308,6 +9390,7 @@ impl Default for KeychainState {
             focused: false,
             loaded: false,
             load_error: None,
+            load_warning: None,
         }
     }
 }
@@ -9331,9 +9414,13 @@ impl KeychainState {
     /// next explicit user action retries so unlocking the platform keychain can
     /// recover without restarting tonepoet.
     pub fn ensure_loaded(&mut self) -> Result<(), String> {
-        self.ensure_loaded_with(crate::tui::keychain::load_keychain)
+        if self.loaded {
+            return Ok(());
+        }
+        self.reload()
     }
 
+    #[cfg(test)] // production loading routes through load_keychain_with_warnings; the injectable pair remains for the retry-semantics pins
     fn ensure_loaded_with<F>(&mut self, load: F) -> Result<(), String>
     where
         F: FnOnce() -> Result<Vec<String>, String>,
@@ -9346,18 +9433,12 @@ impl KeychainState {
 
     /// Reload from disk (e.g., after add/remove).
     pub fn reload(&mut self) -> Result<(), String> {
-        self.reload_with(crate::tui::keychain::load_keychain)
-    }
-
-    fn reload_with<F>(&mut self, load: F) -> Result<(), String>
-    where
-        F: FnOnce() -> Result<Vec<String>, String>,
-    {
-        match load() {
-            Ok(passwords) => {
-                self.passwords = passwords;
+        match crate::tui::keychain::load_keychain_with_warnings() {
+            Ok(result) => {
+                self.passwords = result.passwords;
                 self.loaded = true;
                 self.load_error = None;
+                self.load_warning = (!result.warnings.is_empty()).then(|| result.warnings.join("; "));
                 if self.selected >= self.passwords.len() && !self.passwords.is_empty() {
                     self.selected = self.passwords.len() - 1;
                 }
@@ -9367,6 +9448,34 @@ impl KeychainState {
                 self.passwords.clear();
                 self.selected = 0;
                 self.loaded = false;
+                self.load_warning = None;
+                self.load_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn reload_with<F>(&mut self, load: F) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<Vec<String>, String>,
+    {
+        match load() {
+            Ok(passwords) => {
+                self.passwords = passwords;
+                self.loaded = true;
+                self.load_error = None;
+                self.load_warning = None;
+                if self.selected >= self.passwords.len() && !self.passwords.is_empty() {
+                    self.selected = self.passwords.len() - 1;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.passwords.clear();
+                self.selected = 0;
+                self.loaded = false;
+                self.load_warning = None;
                 self.load_error = Some(error.clone());
                 Err(error)
             }
@@ -9896,6 +10005,10 @@ pub struct AppState {
     pub active_gnudb_operation: Option<ActiveGnudbOperation>,
     /// Currently authoritative asynchronous CUE/split-CUE overlay workflow.
     pub active_cue_operation: Option<ActiveCueOperation>,
+    /// Independent operation authority for async analysis/verification/repair
+    /// completion families that may publish or dismiss overlays.
+    pub active_completion_operations:
+        std::collections::BTreeMap<CompletionOperationKind, ActiveCompletionOperation>,
 
     // Status
     pub status_message: Option<(String, std::time::Instant)>,
@@ -10664,6 +10777,7 @@ impl AppState {
             active_tags_mb_operation: None,
             active_gnudb_operation: None,
             active_cue_operation: None,
+            active_completion_operations: std::collections::BTreeMap::new(),
             status_message: theme_startup_status.map(|message| (message, std::time::Instant::now())),
             processing_active: false,
             should_quit: false,
@@ -13802,6 +13916,8 @@ mod metadata_presentation_tab_tests {
             original: value.to_string(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: per_file_values.iter().map(|v| (*v).to_string()).collect(),
             per_file_originals: per_file_values.iter().map(|v| (*v).to_string()).collect(),
             mb_proposed_value: None,
@@ -13835,6 +13951,26 @@ mod metadata_presentation_tab_tests {
 
     fn state_with_tabs(tabs: Vec<PresentationTab>, active_tab: usize) -> MetadataEditorState {
         MetadataEditorState::for_disc_presentations(tabs, active_tab)
+    }
+
+    #[test]
+    fn saved_cardinality_updates_only_slots_that_were_rewritten() {
+        let mut changed = tag("ARTIST", "<multiple values>", vec!["Alpha; Beta", "Gamma"]);
+        changed.is_mixed = true;
+        changed.has_multiple_stored_values = true;
+        changed.per_file_stored_value_counts = vec![2, 1];
+        changed.per_file_values[0] = "Solo".to_string();
+        mark_tag_entry_saved(&mut changed);
+        assert_eq!(changed.per_file_stored_value_counts, vec![1, 1]);
+        assert!(!changed.has_multiple_stored_values);
+
+        let mut untouched = tag("ARTIST", "<multiple values>", vec!["Alpha; Beta", "Gamma"]);
+        untouched.is_mixed = true;
+        untouched.has_multiple_stored_values = true;
+        untouched.per_file_stored_value_counts = vec![2, 1];
+        mark_tag_entry_saved(&mut untouched);
+        assert_eq!(untouched.per_file_stored_value_counts, vec![2, 1]);
+        assert!(untouched.has_multiple_stored_values);
     }
 
     #[test]
@@ -14026,9 +14162,9 @@ mod metadata_presentation_tab_tests {
         ];
         let mut state = state_with_tabs(tabs, 0);
 
-        let copied = state.apply_active_musicbrainz_values_to_matching_presentations();
+        let result = state.apply_active_musicbrainz_values_to_matching_presentations();
 
-        assert_eq!(copied, 1);
+        assert_eq!(result.changed_presentations, 1);
         assert_eq!(
             state.presentation_tabs[1].entries[0].per_file_values,
             vec!["MB 01".to_string(), "MB 02".to_string()]
@@ -14041,7 +14177,87 @@ mod metadata_presentation_tab_tests {
         assert_eq!(state.presentation_tabs[2].entries[0].value, "bonus");
     }
 
+    #[test]
+    fn apply_active_musicbrainz_values_reports_sibling_cardinality_loss() {
+        let active_artist = mb_tag(
+            "ARTIST",
+            "<multiple values>",
+            vec!["New Artist", "New Scalar"],
+        );
+        let mut destination_artist = tag(
+            "ARTIST",
+            "<multiple values>",
+            vec!["Alpha; Beta", "Gamma"],
+        );
+        destination_artist.is_mixed = true;
+        destination_artist.has_multiple_stored_values = true;
+        destination_artist.per_file_stored_value_counts = vec![2, 1];
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![active_artist],
+                2,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![destination_artist],
+                2,
+            ),
+        ];
+        let mut state = state_with_tabs(tabs, 0);
 
+        let result = state.apply_active_musicbrainz_values_to_matching_presentations();
+
+        assert_eq!(result.changed_presentations, 1);
+        assert_eq!(result.mutation_report.collapsed_carrier_count(), 1);
+        assert_eq!(result.mutation_report.collapsed_fields.len(), 1);
+        assert_eq!(result.mutation_report.collapsed_fields[0].display_key, "ARTIST");
+        assert_eq!(result.mutation_report.collapsed_fields[0].slots, vec![0]);
+    }
+
+    #[test]
+    fn apply_active_musicbrainz_values_clears_provenance_for_new_sibling_row() {
+        let mut active_artist = mb_tag(
+            "ARTIST",
+            "<multiple values>",
+            vec!["New Artist", "New Scalar"],
+        );
+        active_artist.is_mixed = true;
+        active_artist.has_multiple_stored_values = true;
+        active_artist.per_file_stored_value_counts = vec![2, 1];
+        let tabs = vec![
+            tab(
+                PresentationId::DvdAudioGroup(1),
+                "Group 1",
+                vec![active_artist],
+                2,
+            ),
+            tab(
+                PresentationId::DvdAudioGroup(2),
+                "Group 2",
+                vec![tag("TITLE", "Sibling title", vec!["One", "Two"])],
+                2,
+            ),
+        ];
+        let mut state = state_with_tabs(tabs, 0);
+
+        let result = state.apply_active_musicbrainz_values_to_matching_presentations();
+
+        assert_eq!(result.changed_presentations, 1);
+        assert_eq!(result.mutation_report.collapsed_carrier_count(), 0);
+        let created = state.presentation_tabs[1]
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("ARTIST"))
+            .expect("MusicBrainz ARTIST row should be created in matching sibling");
+        assert!(!created.has_multiple_stored_values);
+        assert!(created.per_file_stored_value_counts.is_empty());
+        assert!(created
+            .stored_value_collapse_slots([(0, "Manual Artist")])
+            .is_empty());
+    }
 
     #[test]
     fn presentation_selector_always_uses_dropdown_when_present() {
@@ -14216,9 +14432,9 @@ mod metadata_presentation_tab_tests {
         ];
         let mut state = state_with_tabs(tabs, 0);
 
-        let copied = state.apply_active_musicbrainz_values_to_matching_presentations();
+        let result = state.apply_active_musicbrainz_values_to_matching_presentations();
 
-        assert_eq!(copied, 1);
+        assert_eq!(result.changed_presentations, 1);
         let dest_entries = &state.presentation_tabs[1].entries;
         let by_key = |key: &str| {
             dest_entries
@@ -14523,6 +14739,8 @@ mod metadata_presentation_tab_tests {
                 original: "old synthetic sheet".to_string(),
                 is_binary: true,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()],
                 per_file_originals: vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()],
                 mb_proposed_value: None,
@@ -14615,6 +14833,8 @@ mod metadata_presentation_tab_tests {
                 original: "old synthetic sheet".to_string(),
                 is_binary: true,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()],
                 per_file_originals: vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()],
                 mb_proposed_value: None,

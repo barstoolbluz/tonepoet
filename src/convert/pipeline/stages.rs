@@ -2752,6 +2752,7 @@ fn prepared_source_from_dispatch_metadata(
             sample_rate: None,
             source_audio: SourceAudioDescriptor::default(),
             bit_depth: None,
+            warnings: Vec::new(),
         }],
         album_metadata: AlbumMetadata {
             album,
@@ -4003,6 +4004,17 @@ pub async fn apply_metadata_with_tool_limits(
                     )
                     .await?;
                 }
+                if let Some(meta) = meta {
+                    apply_m4a_freeform_tags(
+                        &artifact.staged_path,
+                        meta,
+                        &source.album_metadata,
+                        runner,
+                        cancel,
+                        tool_concurrency_limits.as_ref(),
+                    )
+                    .await?;
+                }
             }
         }
         AudioArtifacts::Merged(merged) => {
@@ -4033,6 +4045,15 @@ pub async fn apply_metadata_with_tool_limits(
                 )
                 .await?;
             }
+            apply_m4a_freeform_tags(
+                &merged.staged_path,
+                &album_as_track,
+                &source.album_metadata,
+                runner,
+                cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await?;
         }
     }
 
@@ -4086,7 +4107,36 @@ fn is_internal_metadata_extra_key(key: &str) -> bool {
         || key == CUE_ARTWORK_MIME_EXTRA_KEY
         || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
         || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
+        || key.starts_with(SOURCE_TEXT_TAG_EXTRA_PREFIX)
         || key == "image_metadata_source"
+}
+
+fn source_text_tag_output_key(key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty()
+        || key
+            .bytes()
+            .any(|byte| !(0x20..=0x7e).contains(&byte) || byte == b'=')
+    {
+        return None;
+    }
+    Some(key.to_ascii_uppercase())
+}
+
+fn source_text_tag_is_writer_owned(key: &str, pre_emphasis: bool) -> bool {
+    let key = normalize_metadata_key(key);
+    if matches!(key.as_str(), "PRE_EMPHASIS" | "CUE_FLAGS") {
+        return pre_emphasis;
+    }
+    AUTHORITATIVE_CUE_MANAGED_TAG_KEYS.contains(&key.as_str())
+}
+
+fn source_text_extra_keys(extra: &BTreeMap<String, String>) -> BTreeSet<String> {
+    extra
+        .iter()
+        .filter_map(|(key, value)| source_text_tag_key_from_extra(extra, key, value))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn album_extra_real_tag_key(key: &str) -> Option<&'static str> {
@@ -4104,6 +4154,8 @@ fn album_extra_real_tag_key(key: &str) -> Option<&'static str> {
 
 fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> Vec<(String, String)> {
     let mut tags: Vec<(String, String)> = Vec::new();
+    let source_track_keys = source_text_extra_keys(&meta.extra);
+    let source_album_keys = source_text_extra_keys(&album.extra);
     if let Some(ref v) = meta.title {
         push_tag_value(&mut tags, "TITLE", v);
     }
@@ -4195,8 +4247,42 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
     if let Some(v) = album.extra.get("catalog") {
         push_tag_value(&mut tags, "CATALOG", v);
     }
+
+    // Re-emit user-originated text tags under their raw source keys. Canonical
+    // fields remain writer-owned, so source copies cannot override an explicit
+    // metadata edit. PRE_EMPHASIS/CUE_FLAGS are owned only when the materializer
+    // promoted affirmative source evidence to TrackMetadata.pre_emphasis.
+    for (key, value) in &meta.extra {
+        let Some(source_key) = source_text_tag_key_from_extra(&meta.extra, key, value) else {
+            continue;
+        };
+        if source_text_tag_is_writer_owned(source_key, meta.pre_emphasis) {
+            continue;
+        }
+        if let Some(tag_key) = source_text_tag_output_key(source_key) {
+            push_tag_value(&mut tags, &tag_key, value);
+        }
+    }
+    // Album materializers promote text tags shared by every track. Re-emit
+    // those provenance markers as a fallback for album-only metadata models;
+    // track-level values win because push_tag_value is first-writer-wins.
     for (key, value) in &album.extra {
-        if is_internal_metadata_extra_key(key) || key == "catalog" {
+        let Some(source_key) = source_text_tag_key_from_extra(&album.extra, key, value) else {
+            continue;
+        };
+        if source_text_tag_is_writer_owned(source_key, meta.pre_emphasis) {
+            continue;
+        }
+        if let Some(tag_key) = source_text_tag_output_key(source_key) {
+            push_tag_value(&mut tags, &tag_key, value);
+        }
+    }
+
+    for (key, value) in &album.extra {
+        if is_internal_metadata_extra_key(key)
+            || key == "catalog"
+            || source_album_keys.contains(key)
+        {
             continue;
         }
         if let Some(tag_key) = album_extra_real_tag_key(key) {
@@ -4207,7 +4293,7 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
         push_tag_value(&mut tags, &tag_key, value);
     }
     for (key, value) in &meta.extra {
-        if is_internal_metadata_extra_key(key) {
+        if is_internal_metadata_extra_key(key) || source_track_keys.contains(key) {
             continue;
         }
         let tag_key = cue_extra_tag_key("TRACK", key);
@@ -4547,8 +4633,89 @@ fn ffmpeg_metadata_rewrite_args(
     }
     args.push("-c".into());
     args.push("copy".into());
+    // NOTE: no `-movflags +use_metadata_tags` here. On ffmpeg 7.1 that flag
+    // and an attached picture are mutually exclusive in ONE mov/ipod mux
+    // (verified empirically: the flag stores arbitrary keys but silently
+    // DROPS the attached_pic stream; without it the picture survives and
+    // the muxer's atom allowlist drops the custom keys instead). Custom
+    // keys for m4a/mp4 therefore ride a follow-up AtomicParsley freeform
+    // pass (`apply_m4a_freeform_tags`) that runs AFTER artwork embedding.
     args.push(tmp.display().to_string());
     args
+}
+
+/// MOV/MP4 atom keys ffmpeg's muxer maps natively; every other authoritative
+/// pair is written as an iTunes freeform atom by AtomicParsley.
+const M4A_NATIVE_FFMPEG_KEYS: &[&str] = &[
+    "title",
+    "artist",
+    "album",
+    "album_artist",
+    "genre",
+    "date",
+    "track",
+    "disc",
+    "composer",
+    "comment",
+    "copyright",
+    "lyrics",
+    "description",
+];
+
+fn m4a_freeform_tag_pairs(tags: &[(String, String)]) -> Vec<(String, String)> {
+    ffmpeg_authoritative_metadata_tags(tags)
+        .into_iter()
+        .filter(|(key, _)| !M4A_NATIVE_FFMPEG_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.to_ascii_uppercase(), value))
+        .collect()
+}
+
+/// Write the non-native authoritative keys as iTunes freeform atoms
+/// (`----:com.apple.iTunes:<KEY>`). Runs AFTER the ffmpeg rewrite AND after
+/// any artwork embed: every mov re-mux strips freeform atoms (allowlist), so
+/// this must be the last writer to touch the container. Convergence holds
+/// because the next run's rewrite (`-map_metadata -1`) wipes all prior
+/// freeform atoms before this re-adds the current set.
+async fn apply_m4a_freeform_tags(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), MetadataError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "m4a" | "mp4") {
+        return Ok(());
+    }
+    let pairs = m4a_freeform_tag_pairs(&authoritative_metadata_tags(meta, album));
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec![path.display().to_string()];
+    for (key, value) in &pairs {
+        args.push("--rDNSatom".into());
+        args.push(value.clone());
+        args.push(format!("name={key}"));
+        args.push("domain=com.apple.iTunes".into());
+    }
+    args.push("--overWrite".into());
+    let cmd = ToolCommand {
+        binary: ToolBinary::AtomicParsley,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(60),
+    };
+    run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
+        .await
+        .map_err(MetadataError::Tool)?;
+    Ok(())
 }
 
 fn metadata_tag_command(
@@ -4561,7 +4728,7 @@ fn metadata_tag_command(
         "flac" => (ToolBinary::Metaflac, metaflac_tag_args(path, tags, existing_keys), None),
         "opus" | "ogg" => (ToolBinary::Opustags, opustags_tag_args(path, tags, existing_keys), None),
         "wv" => (ToolBinary::Wvtag, wvtag_tag_args(path, tags, existing_keys), None),
-        "mp3" | "m4a" | "aac" | "wav" | "aiff" | "aif" => {
+        "mp3" | "m4a" | "wav" | "aiff" | "aif" => {
             let tmp = metadata_rewrite_temp_path(path)?;
             let args = ffmpeg_metadata_rewrite_args(path, &tmp, tags);
             (ToolBinary::Ffmpeg, args, Some(tmp))
@@ -4888,6 +5055,143 @@ mod metadata_writer_command_tests {
         assert!(tags.contains(&("PERFORMER".to_string(), "Cue Performer".to_string())));
         assert!(tags.contains(&("PRE_EMPHASIS".to_string(), "1".to_string())));
         assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn source_custom_tags_remain_raw_and_converge_across_writer_matrix() {
+        fn assert_source_tags(tags: &[(String, String)]) {
+            assert_eq!(
+                tags.iter()
+                    .filter(|(key, value)| key == "PRE_EMPHASIS" && value == "1")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                tags.iter()
+                    .filter(|(key, value)| key == "MY_NOTE" && value == "keep me")
+                    .count(),
+                1
+            );
+            assert!(!tags.iter().any(|(key, _)| {
+                key == "TONEPOET_TRACK_MY_NOTE"
+                    || key == "TONEPOET_ALBUM_MY_NOTE"
+                    || key.contains("SOURCE_TEXT_TAG")
+            }));
+        }
+
+        let (mut track, mut album) = sample_metadata();
+        insert_source_text_tag(&mut track.extra, "PRE_EMPHASIS", "1");
+        insert_source_text_tag(&mut track.extra, "MY_NOTE", "keep me");
+        track.pre_emphasis = source_text_tags_indicate_pre_emphasis(&track.extra);
+        album.extra = track.extra.clone();
+        let single_file_tags = authoritative_metadata_tags(&track, &album);
+        assert_source_tags(&single_file_tags);
+
+        let mut album_only = AlbumMetadata::default();
+        insert_source_text_tag(&mut album_only.extra, "PRE_EMPHASIS", "1");
+        insert_source_text_tag(&mut album_only.extra, "MY_NOTE", "keep me");
+        let album_tags = authoritative_metadata_tags(&TrackMetadata::default(), &album_only);
+        assert_source_tags(&album_tags);
+
+        let existing = BTreeSet::from([
+            "PRE_EMPHASIS".to_string(),
+            "MY_NOTE".to_string(),
+            "TONEPOET_TRACK_STALE".to_string(),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (scope, tags) in [("single", &single_file_tags), ("album", &album_tags)] {
+            for ext in ["flac", "opus", "wv", "mp3", "m4a"] {
+                let path = temp.path().join(format!("{scope}-output.{ext}"));
+                let (command, temporary) =
+                    metadata_tag_command(&path, ext, tags, &existing).expect("metadata command");
+                match ext {
+                    "flac" => {
+                        assert!(command.args.contains(&"--remove-tag=MY_NOTE".to_string()));
+                        assert!(command.args.contains(&"--set-tag=MY_NOTE=keep me".to_string()));
+                        assert!(command.args.contains(&"--set-tag=PRE_EMPHASIS=1".to_string()));
+                        assert!(temporary.is_none());
+                    }
+                    "opus" => {
+                        assert_pair(&command.args, "--delete", "MY_NOTE");
+                        assert_pair(&command.args, "-s", "MY_NOTE=keep me");
+                        assert_pair(&command.args, "-s", "PRE_EMPHASIS=1");
+                        assert!(temporary.is_none());
+                    }
+                    "wv" => {
+                        assert_pair(&command.args, "-d", "MY_NOTE");
+                        assert_pair(&command.args, "-w", "MY_NOTE=keep me");
+                        assert_pair(&command.args, "-w", "PRE_EMPHASIS=1");
+                        assert!(temporary.is_none());
+                    }
+                    "mp3" | "m4a" => {
+                        assert_pair(&command.args, "-map_metadata", "-1");
+                        assert_pair(&command.args, "-metadata", "my_note=keep me");
+                        assert_pair(&command.args, "-metadata", "pre_emphasis=1");
+                        // No use_metadata_tags anywhere: on ffmpeg 7.1 the
+                        // flag and an attached picture are mutually exclusive
+                        // in one mov mux, so m4a custom keys ride the
+                        // AtomicParsley freeform pass instead.
+                        assert!(!command.args.iter().any(|arg| arg == "-movflags"));
+                        if ext == "m4a" {
+                            let freeform = m4a_freeform_tag_pairs(tags);
+                            assert!(freeform
+                                .iter()
+                                .any(|(key, value)| key == "PRE_EMPHASIS" && value == "1"));
+                            assert!(freeform
+                                .iter()
+                                .any(|(key, value)| key == "MY_NOTE" && value == "keep me"));
+                            assert!(
+                                !freeform.iter().any(|(key, _)| key == "TITLE"),
+                                "native atoms stay with the ffmpeg rewrite"
+                            );
+                        }
+                        assert!(temporary.is_some());
+                    }
+                    _ => unreachable!("fixed metadata writer matrix"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_aac_metadata_writes_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("unsupported.aac");
+        let error = metadata_tag_command(
+            &path,
+            "aac",
+            &[("MY_NOTE".to_string(), "keep me".to_string())],
+            &BTreeSet::new(),
+        )
+        .expect_err("raw AAC cannot satisfy arbitrary metadata requirements");
+        assert!(matches!(error, MetadataError::UnsupportedTagFormat(ref ext) if ext == "aac"));
+    }
+
+    #[test]
+    fn visible_legacy_marker_prefix_and_suffix_key_both_round_trip() {
+        let source_key = "tonepoet_source_text_tag:user_note";
+        let mut track = TrackMetadata::default();
+        insert_source_text_tag(&mut track.extra, "USER_NOTE", "ordinary value");
+        insert_source_text_tag(&mut track.extra, source_key, "prefix-shaped value");
+
+        let tags = authoritative_metadata_tags(&track, &AlbumMetadata::default());
+        assert_eq!(tag_value(&tags, "USER_NOTE"), Some("ordinary value"));
+        assert_eq!(
+            tag_value(&tags, "TONEPOET_SOURCE_TEXT_TAG:USER_NOTE"),
+            Some("prefix-shaped value")
+        );
+        assert_eq!(
+            tags.iter()
+                .filter(|(key, _)| key == "USER_NOTE")
+                .count(),
+            1
+        );
+        assert_eq!(
+            tags.iter()
+                .filter(|(key, _)| key == "TONEPOET_SOURCE_TEXT_TAG:USER_NOTE")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5825,6 +6129,7 @@ mod cue_real_output_matrix_tests {
 
     fn cue_matrix_strict_mode() -> bool {
         env_flag_enabled(std::env::var("TONEPOET_CUE_MATRIX_STRICT").ok().as_deref())
+            || env_flag_enabled(std::env::var("TONEPOET_REQUIRE_TOOLS").ok().as_deref())
     }
 
     fn case_unavailability_reasons(case: &MatrixCase) -> Vec<String> {
@@ -6139,7 +6444,7 @@ FILE "album.flac" WAVE
             .expect("ffprobe should expose duration")
     }
 
-    fn assert_container_codec_duration_and_metadata(case: &MatrixCase, path: &Path, probe: &Value) {
+    fn assert_container_and_codec(case: &MatrixCase, path: &Path, probe: &Value) {
         assert!(path.exists(), "{} output should exist: {}", case.name, path.display());
         assert_eq!(
             path.extension().and_then(|value| value.to_str()),
@@ -6165,6 +6470,11 @@ FILE "album.flac" WAVE
             "{} audio codec mismatch",
             case.name
         );
+    }
+
+    fn assert_container_codec_duration_and_metadata(case: &MatrixCase, path: &Path, probe: &Value) {
+        assert_container_and_codec(case, path, probe);
+        let audio = audio_stream(probe);
         assert_matrix_duration_or_sample_count(case, audio, probe);
 
         let tags = format_tag_map(probe);
@@ -6187,6 +6497,38 @@ FILE "album.flac" WAVE
             actual.as_str() == expected || actual.split('/').next() == Some(expected),
             "{case_name} metadata key {key} mismatch: expected {expected:?}, got {actual:?}"
         );
+    }
+
+    fn custom_tag_target(case: &MatrixCase) -> bool {
+        matches!(
+            &case.format,
+            tonepoet_pipeline::AudioFormat::Flac
+                | tonepoet_pipeline::AudioFormat::Opus
+                | tonepoet_pipeline::AudioFormat::WavPack
+                | tonepoet_pipeline::AudioFormat::Mp3
+                | tonepoet_pipeline::AudioFormat::Aac
+        )
+    }
+
+    fn seed_custom_track_tags(source: &mut PreparedSource) {
+        let track = source
+            .tracks
+            .first_mut()
+            .expect("custom-tag matrix source should contain one track");
+        insert_source_text_tag(&mut track.metadata.extra, "PRE_EMPHASIS", "1");
+        insert_source_text_tag(&mut track.metadata.extra, "MY_NOTE", "keep me");
+        track.metadata.pre_emphasis = source_text_tags_indicate_pre_emphasis(&track.metadata.extra);
+        assert!(track.metadata.pre_emphasis, "PRE_EMPHASIS=1 should promote to the first-class flag");
+    }
+
+    fn assert_custom_tag_values(case: &MatrixCase, probe: &Value, pass: &str) {
+        if !custom_tag_target(case) {
+            return;
+        }
+        let tags = format_tag_map(probe);
+        let context = format!("{} {pass}", case.name);
+        assert_tag_value(&tags, "PRE_EMPHASIS", "1", &context);
+        assert_tag_value(&tags, "MY_NOTE", "keep me", &context);
     }
 
     fn assert_any_tag_value(
@@ -6242,16 +6584,16 @@ FILE "album.flac" WAVE
             tonepoet_pipeline::AudioFormat::Flac => {
                 let stdout = run_output("metaflac", &["--export-tags-to=-".to_string(), path.display().to_string()]);
                 let counts = key_value_line_counts(&stdout);
-                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER"]);
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER", "PRE_EMPHASIS", "MY_NOTE"]);
             }
             tonepoet_pipeline::AudioFormat::Opus => {
                 let stdout = run_output("opustags", &[path.display().to_string()]);
                 let counts = key_value_line_counts(&stdout);
-                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER"]);
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER", "PRE_EMPHASIS", "MY_NOTE"]);
             }
             tonepoet_pipeline::AudioFormat::WavPack => {
                 let counts = apev2_item_key_counts(&std::fs::read(path).expect("read WavPack output"));
-                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER"]);
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER", "PRE_EMPHASIS", "MY_NOTE"]);
             }
             tonepoet_pipeline::AudioFormat::Mp3 => {
                 let counts = id3v2_frame_counts(&std::fs::read(path).expect("read MP3 output"));
@@ -6627,12 +6969,13 @@ FILE "album.flac" WAVE
             let runner = RealToolRunner::new(HashMap::new());
             let cancel = CancellationToken::new();
 
-            let source = CueImageMaterializer
+            let mut source = CueImageMaterializer
                 .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
                 .await
                 .unwrap_or_else(|err| panic!("{} CUE materialization failed: {err}", case.name));
             assert_eq!(source.kind, SourceKind::CueImage);
             assert_eq!(source.tracks.len(), 1);
+            seed_custom_track_tags(&mut source);
             assert!(
                 source.album_metadata.extra.contains_key(CUE_ARTWORK_PATH_EXTRA_KEY),
                 "{} should extract original image artwork as a sidecar",
@@ -6675,10 +7018,13 @@ FILE "album.flac" WAVE
                 .await
                 .unwrap_or_else(|err| panic!("{} first metadata/artwork stage failed: {err}", case.name));
             let first_probe = ffprobe_json(&output_path);
+            assert_container_and_codec(&case, &output_path, &first_probe);
+            assert_custom_tag_values(&case, &first_probe, "first metadata pass");
             apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
                 .await
                 .unwrap_or_else(|err| panic!("{} second metadata/artwork stage failed: {err}", case.name));
             let second_probe = ffprobe_json(&output_path);
+            assert_custom_tag_values(&case, &second_probe, "second metadata pass");
 
             assert_container_codec_duration_and_metadata(&case, &output_path, &second_probe);
             assert_artwork_behavior(&case, &output_path, &second_probe);
@@ -6715,6 +7061,162 @@ FILE "album.flac" WAVE
             );
         }
         eprintln!("exercised real CUE matrix cases: {exercised:?}");
+    }
+
+    fn create_single_flac_with_custom_tags(dir: &Path) -> PathBuf {
+        let source = dir.join("single-source.flac");
+        run_checked(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                format!("sine=frequency=880:sample_rate=44100:duration={EXPECTED_DURATION_SECONDS}"),
+                "-c:a".to_string(),
+                "flac".to_string(),
+                "-sample_fmt".to_string(),
+                "s16".to_string(),
+                "-metadata".to_string(),
+                "TITLE=Single Track".to_string(),
+                "-metadata".to_string(),
+                "ARTIST=Single Artist".to_string(),
+                "-metadata".to_string(),
+                "ALBUM=Single Album".to_string(),
+                "-metadata".to_string(),
+                "TRACKNUMBER=1".to_string(),
+                "-metadata".to_string(),
+                "PRE_EMPHASIS=1".to_string(),
+                "-metadata".to_string(),
+                "MY_NOTE=keep me".to_string(),
+                source.display().to_string(),
+            ],
+        );
+        source
+    }
+
+    #[tokio::test]
+    async fn single_file_custom_tags_survive_real_writer_matrix_and_converge() {
+        let strict = cue_matrix_strict_mode();
+        if !executable_on_path("ffmpeg") || !executable_on_path("ffprobe") {
+            let message = "real single-file custom-tag validation requires ffmpeg and ffprobe";
+            if strict {
+                panic!("{message}; strict tool mode forbids skipping required matrix infrastructure");
+            }
+            eprintln!("skipping real single-file custom-tag validation; {message}");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = create_single_flac_with_custom_tags(temp.path());
+        let cases: Vec<_> = matrix_cases().into_iter().filter(custom_tag_target).collect();
+        let required_case_count = cases.len();
+        let mut exercised = Vec::new();
+        let mut skipped = Vec::new();
+
+        for case in cases {
+            let unavailable = case_unavailability_reasons(&case);
+            if !unavailable.is_empty() {
+                let reason = format!("{}: {}", case.name, unavailable.join(", "));
+                if strict {
+                    skipped.push(reason);
+                } else {
+                    eprintln!("skipping {reason}");
+                }
+                continue;
+            }
+
+            let case_root = temp.path().join(format!("single-{}", case.name));
+            std::fs::create_dir_all(case_root.join("out")).expect("case output root");
+            std::fs::create_dir_all(case_root.join("logs")).expect("case log root");
+            let mut req = request_for_case(&case_root, &source_path, &case);
+            req.job_id = format!("single-matrix-{}", case.name);
+            req.item_id = req.job_id.clone();
+            req.settings.metadata.preserve_artwork = false;
+            let staging = StagingDir::new(case_root.join("staging"), req.job_id.clone());
+            let runner = RealToolRunner::new(HashMap::new());
+            let cancel = CancellationToken::new();
+
+            let source = SingleFileMaterializer
+                .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("{} single-file materialization failed: {err}", case.name));
+            assert_eq!(source.kind, SourceKind::SingleFile);
+            assert_eq!(source.tracks.len(), 1);
+            let source_track = &source.tracks[0].metadata;
+            assert!(source_track.pre_emphasis, "{} should promote PRE_EMPHASIS=1 during materialization", case.name);
+            assert_eq!(
+                source_track.extra.get("my_note").map(String::as_str),
+                Some("keep me"),
+                "{} should retain the plain custom source key",
+                case.name
+            );
+            assert_eq!(
+                source_track
+                    .extra
+                    .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}my_note"))
+                    .map(String::as_str),
+                Some("keep me"),
+                "{} should retain custom-tag provenance",
+                case.name
+            );
+
+            let plan = plan_outputs(&source, &req)
+                .unwrap_or_else(|err| panic!("{} output planning failed: {err}", case.name));
+            let converted = convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+            assert!(
+                matches!(converted.record.outcome, StageOutcome::Ok),
+                "{} conversion stage failed: {:?}",
+                case.name,
+                converted.tracks
+            );
+            let AudioArtifacts::Tracks(track_artifacts) = &converted.artifacts.audio else {
+                panic!("{} should produce per-track artifacts", case.name);
+            };
+            assert_eq!(track_artifacts.len(), 1, "{} should produce one converted track", case.name);
+            let output_path = track_artifacts[0].staged_path.clone();
+
+            apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("{} first metadata stage failed: {err}", case.name));
+            let first_probe = ffprobe_json(&output_path);
+            assert_container_and_codec(&case, &output_path, &first_probe);
+            assert_custom_tag_values(&case, &first_probe, "first metadata pass");
+
+            apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("{} second metadata stage failed: {err}", case.name));
+            let second_probe = ffprobe_json(&output_path);
+            assert_custom_tag_values(&case, &second_probe, "second metadata pass");
+            assert_eq!(
+                format_tag_map(&first_probe),
+                format_tag_map(&second_probe),
+                "{} repeated single-file metadata stage should be semantically idempotent",
+                case.name
+            );
+            exercised.push(case.name);
+        }
+
+        if strict {
+            assert!(
+                skipped.is_empty(),
+                "strict single-file custom-tag matrix requires every target case; skipped cases: {skipped:?}"
+            );
+            assert_eq!(
+                exercised.len(),
+                required_case_count,
+                "strict single-file custom-tag matrix requires all target cases to pass"
+            );
+        } else {
+            assert!(
+                !exercised.is_empty(),
+                "real single-file custom-tag matrix did not exercise any target format"
+            );
+        }
     }
 
     #[test]
@@ -6810,7 +7312,11 @@ mod replaygain_existing_tag_policy_tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"fLaC");
         bytes.extend_from_slice(&flac_block(0, false, &streaminfo));
-        bytes.extend_from_slice(&flac_block(4, true, &vorbis_block_body(comments)));
+        bytes.extend_from_slice(&flac_block(4, false, &vorbis_block_body(comments)));
+        // Terminal PADDING block: real-world FLAC shape, and lofty's
+        // missing-padding splice path panics on a padding-less synthetic
+        // file when a WRITE (stale-album-tag removal) rewrites it.
+        bytes.extend_from_slice(&flac_block(1, true, &[0u8; 256]));
         std::fs::write(path, bytes).expect("write synthetic ReplayGain FLAC");
     }
 
@@ -7161,6 +7667,201 @@ mod replaygain_existing_tag_policy_tests {
         assert!(matches!(record.outcome, StageOutcome::Ok));
         assert_eq!(runner.transcript().len(), 1);
     }
+
+
+    #[test]
+    fn inherited_replaygain_policy_recomputes_for_depth_reduction_float_to_int_and_unknown_rate() {
+        let mut source = super::pipeline_test_helpers::log_test_source();
+        let mut req = replaygain_request(
+            Path::new("/tmp"),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        req.settings.target_format = AudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Disabled;
+        req.settings.dsd.dsd_to_pcm_gain_db = None;
+
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        assert!(matches!(
+            inherited_replaygain_tag_policy(Some(&source), &req.settings),
+            ReplayGainInheritedTagPolicy::Recompute { reason }
+                if reason.contains("bit-depth reduction")
+        ));
+
+        for track in &mut source.tracks {
+            track.bit_depth = Some(320);
+            track.source_audio = SourceAudioDescriptor::from_scalar(
+                track.sample_rate,
+                Some(320),
+                Some(SourceAudioCoding::Pcm),
+            );
+        }
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        assert!(matches!(
+            inherited_replaygain_tag_policy(Some(&source), &req.settings),
+            ReplayGainInheritedTagPolicy::Recompute { reason }
+                if reason.contains("floating-point to integer")
+        ));
+
+        for track in &mut source.tracks {
+            track.sample_rate = None;
+            track.source_audio = SourceAudioDescriptor::from_scalar(
+                None,
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            );
+            track.bit_depth = Some(24);
+        }
+        req.settings.target_bit_depth = BitDepthTarget::Source;
+        assert!(matches!(
+            inherited_replaygain_tag_policy(Some(&source), &req.settings),
+            ReplayGainInheritedTagPolicy::Recompute { reason }
+                if reason.contains("source-relative planning")
+        ));
+    }
+
+    #[tokio::test]
+    async fn clipping_prevention_flag_controls_loudgain_k_argument() {
+        for (prevent_clipping, expected) in [(true, true), (false, false)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let one = temp.path().join("01.flac");
+            write_synthetic_flac(&one, &[]);
+            let artifacts = artifacts(&[one]);
+            let mut req = replaygain_request(
+                temp.path(),
+                ReplayGainMode::Both,
+                ReplayGainExistingTagPolicy::Rescan,
+            );
+            req.settings.replay_gain.prevent_clipping = prevent_clipping;
+            let runner = StubToolRunner::new();
+            runner.push_output(successful_loudgain_output());
+
+            apply_replaygain(&artifacts, &req, &runner, &CancellationToken::new())
+                .await
+                .expect("ReplayGain command");
+
+            let transcript = runner.transcript();
+            assert_eq!(transcript.len(), 1);
+            assert_eq!(transcript[0].sanitized_args.iter().any(|arg| arg == "-k"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn track_only_replaygain_removes_stale_album_tags_after_scan() {
+        use lofty::file::TaggedFileExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let one = temp.path().join("01.flac");
+        write_synthetic_flac(&one, COMPLETE_BOTH);
+        let artifacts = artifacts(std::slice::from_ref(&one));
+        let req = replaygain_request(
+            temp.path(),
+            ReplayGainMode::Track,
+            ReplayGainExistingTagPolicy::Rescan,
+        );
+        let runner = StubToolRunner::new();
+        runner.push_output(successful_loudgain_output());
+
+        apply_replaygain(&artifacts, &req, &runner, &CancellationToken::new())
+            .await
+            .expect("track-only ReplayGain");
+
+        let tagged = lofty::read_from_path(&one).expect("read updated ReplayGain tags");
+        let tag = tagged.primary_tag().or_else(|| tagged.first_tag()).expect("primary tag");
+        assert!(replaygain_value_present(tag, ItemKey::ReplayGainTrackGain));
+        assert!(replaygain_value_present(tag, ItemKey::ReplayGainTrackPeak));
+        assert!(!replaygain_value_present(tag, ItemKey::ReplayGainAlbumGain));
+        assert!(!replaygain_value_present(tag, ItemKey::ReplayGainAlbumPeak));
+    }
+
+    #[test]
+    fn conversion_log_records_replaygain_policy_reason_and_clipping_setting() {
+        let source = super::pipeline_test_helpers::log_test_source();
+        let mut req = replaygain_request(
+            Path::new("/tmp"),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        req.settings.target_format = AudioFormat::Flac;
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        req.settings.replay_gain.prevent_clipping = false;
+        let mut log = String::new();
+
+        append_conversion_settings_section(
+            &mut log,
+            &source,
+            &req,
+            &[],
+            Some(&StageOutcome::Ok),
+            false,
+            true,
+            true,
+        );
+
+        assert!(log.contains("ReplayGain policy: recomputed:"));
+        assert!(log.contains("bit-depth reduction"));
+        // yes_no() capitalizes ("Yes"/"No") — the log's house style.
+        assert!(log.contains("ReplayGain clipping prevention: No"));
+    }
+
+    #[test]
+    fn conversion_log_distinguishes_trusted_disabled_and_no_output_replaygain() {
+        let source = super::pipeline_test_helpers::log_test_source();
+        let mut req = replaygain_request(
+            Path::new("/tmp"),
+            ReplayGainMode::Both,
+            ReplayGainExistingTagPolicy::SkipIfComplete,
+        );
+        req.settings.target_format = AudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.target_bit_depth = BitDepthTarget::Source;
+        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Disabled;
+        req.settings.dsd.dsd_to_pcm_gain_db = None;
+        let record = super::pipeline_test_helpers::ok_record();
+
+        let mut trusted = String::new();
+        append_conversion_settings_section(
+            &mut trusted,
+            &source,
+            &req,
+            &[&record],
+            Some(&StageOutcome::Skipped),
+            false,
+            false,
+            false,
+        );
+        assert!(trusted.contains("ReplayGain policy: trusted inherited tags:"));
+        assert!(!trusted.contains("skipped: no successful output audio"));
+
+        let mut no_outputs = String::new();
+        append_conversion_settings_section(
+            &mut no_outputs,
+            &source,
+            &req,
+            &[],
+            Some(&StageOutcome::Skipped),
+            false,
+            false,
+            false,
+        );
+        assert!(no_outputs.contains("ReplayGain policy: skipped: no successful output audio"));
+
+        req.stages.replaygain = StageRequirement::Disabled;
+        let mut disabled = String::new();
+        append_conversion_settings_section(
+            &mut disabled,
+            &source,
+            &req,
+            &[&record],
+            Some(&StageOutcome::Skipped),
+            false,
+            false,
+            false,
+        );
+        assert!(disabled.contains("ReplayGain policy: disabled by pipeline settings"));
+        assert!(!disabled.contains("trusted inherited tags"));
+    }
 }
 
 fn artifact_audio_paths(artifacts: &ArtifactSet) -> Vec<&Path> {
@@ -7223,7 +7924,7 @@ fn inherited_replaygain_tag_policy(
                 if source.tracks.iter().any(|track| {
                     match (track.scalar_sample_rate(), resolved_target_rate_hz(track, settings)) {
                         (Some(source_rate), Some(target_rate)) => source_rate != target_rate,
-                        _ => false,
+                        _ => true,
                     }
                 }) {
                     reasons.push("source-relative planning resolves to a different output sample rate".to_string());
@@ -7245,12 +7946,152 @@ fn inherited_replaygain_tag_policy(
         }
     }
 
+    if !settings.target_format.is_dsd() {
+        let depth_changed = source.map_or(
+            settings.target_bit_depth != BitDepthTarget::Source,
+            |source| {
+                source.tracks.iter().any(|track| {
+                    let source_depth = super::plan_bridge::resolve_source_pcm_depth(track);
+                    let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+                        .or_else(|| {
+                            source_default_pcm_depth_for_track(track, settings)
+                                .map(|(depth, _)| depth)
+                        });
+                    match (source_depth, target_depth) {
+                        (Some(source_depth), Some(target_depth)) => {
+                            (source_depth.is_float() && !target_depth.is_float())
+                                || target_depth.bits() < source_depth.bits()
+                        }
+                        (None, Some(_))
+                            if settings.target_bit_depth != BitDepthTarget::Source =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    }
+                })
+            },
+        );
+        if depth_changed {
+            reasons.push(
+                "bit-depth reduction or floating-point to integer conversion changes peak quantization"
+                    .to_string(),
+            );
+        }
+    }
+
     if reasons.is_empty() {
         ReplayGainInheritedTagPolicy::Trust
     } else {
         ReplayGainInheritedTagPolicy::Recompute {
             reason: reasons.join("; "),
         }
+    }
+}
+
+fn remove_stale_album_replaygain_tags(artifacts: &ArtifactSet) -> Result<(), ReplayGainError> {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::ItemKey;
+
+    let paths: Vec<&Path> = match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => tracks.iter().map(|track| track.staged_path.as_path()).collect(),
+        AudioArtifacts::Merged(merged) => vec![merged.staged_path.as_path()],
+    };
+    for path in paths {
+        let mut tagged = lofty::read_from_path(path).map_err(|error| {
+            ReplayGainError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("read ReplayGain output '{}': {error}", path.display()),
+            ))
+        })?;
+        let Some(tag) = tagged.primary_tag_mut() else {
+            continue;
+        };
+        tag.remove_key(&ItemKey::ReplayGainAlbumGain);
+        tag.remove_key(&ItemKey::ReplayGainAlbumPeak);
+        tagged.save_to_path(path, WriteOptions::default()).map_err(|error| {
+            ReplayGainError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("remove stale album ReplayGain tags from '{}': {error}", path.display()),
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn replaygain_request_policy_log_label(req: &PipelineRequest) -> String {
+    if req.stages.replaygain == StageRequirement::Disabled {
+        return "disabled by pipeline settings".to_string();
+    }
+    if req.settings.replay_gain.existing_tags
+        == tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan
+    {
+        return "recompute: explicit rescan policy".to_string();
+    }
+    "conditional: trust only a complete inherited tag set on signal-equivalent output; otherwise recompute"
+        .to_string()
+}
+
+fn replaygain_policy_log_label(
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    successful_output_count: usize,
+    stage_outcome: Option<&StageOutcome>,
+) -> String {
+    if req.stages.replaygain == StageRequirement::Disabled {
+        return "disabled by pipeline settings".to_string();
+    }
+
+    let planned_policy = if req.settings.replay_gain.existing_tags
+        == tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan
+    {
+        ReplayGainInheritedTagPolicy::Recompute {
+            reason: "explicit rescan policy".to_string(),
+        }
+    } else {
+        inherited_replaygain_tag_policy(Some(source), &req.settings)
+    };
+
+    match stage_outcome {
+        Some(StageOutcome::Ok) => match planned_policy {
+            ReplayGainInheritedTagPolicy::Recompute { reason } => {
+                format!("recomputed: {reason}")
+            }
+            ReplayGainInheritedTagPolicy::Trust => {
+                "recomputed: inherited requested tag set was absent, incomplete, or unreadable on signal-equivalent output"
+                    .to_string()
+            }
+        },
+        Some(StageOutcome::Skipped) if successful_output_count == 0 => {
+            "skipped: no successful output audio".to_string()
+        }
+        Some(StageOutcome::Skipped) => match planned_policy {
+            ReplayGainInheritedTagPolicy::Trust => {
+                "trusted inherited tags: output is signal-equivalent and every successful output has the complete requested tag set"
+                    .to_string()
+            }
+            ReplayGainInheritedTagPolicy::Recompute { reason } => {
+                format!("skipped unexpectedly despite recompute policy: {reason}")
+            }
+        },
+        Some(StageOutcome::Failed(reason)) => match planned_policy {
+            ReplayGainInheritedTagPolicy::Trust => format!(
+                "failed before provenance decision completed: {reason}; planned to trust only complete inherited tags on signal-equivalent output"
+            ),
+            ReplayGainInheritedTagPolicy::Recompute { reason: policy_reason } => format!(
+                "failed while recomputing ({policy_reason}): {reason}"
+            ),
+        },
+        None => match planned_policy {
+            ReplayGainInheritedTagPolicy::Trust => {
+                "outcome unavailable: policy would trust only complete inherited tags on signal-equivalent output"
+                    .to_string()
+            }
+            ReplayGainInheritedTagPolicy::Recompute { reason } => {
+                format!("outcome unavailable: policy requires recompute ({reason})")
+            }
+        },
     }
 }
 
@@ -7360,7 +8201,9 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
             if matches!(mode, tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both) {
                 args.push("-a".to_string());
             }
-            args.push("-k".to_string());
+            if req.settings.replay_gain.prevent_clipping {
+                args.push("-k".to_string());
+            }
             args.push("-s".to_string());
             args.push("i".to_string());
             for t in tracks {
@@ -7371,7 +8214,9 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
             if matches!(mode, tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both) {
                 args.push("-a".to_string());
             }
-            args.push("-k".to_string());
+            if req.settings.replay_gain.prevent_clipping {
+                args.push("-k".to_string());
+            }
             args.push("-s".to_string());
             args.push("i".to_string());
             args.push(merged.staged_path.display().to_string());
@@ -7389,6 +8234,9 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits.as_ref())
         .await
         .map_err(ReplayGainError::Tool)?;
+    if mode == tonepoet_pipeline::ReplayGainMode::Track {
+        remove_stale_album_replaygain_tags(artifacts)?;
+    }
     Ok(StageRecord {
         stage: PipelineStage::ReplayGain,
         outcome: StageOutcome::Ok,
@@ -7983,6 +8831,16 @@ fn append_request_only_conversion_settings_section(log: &mut String, req: &Pipel
     append_target_format_settings(log, settings);
     push_kv_line(log, "Metadata", stage_requirement_label(req.stages.metadata));
     push_kv_line(log, "ReplayGain", stage_requirement_label(req.stages.replaygain));
+    push_kv_line(
+        log,
+        "ReplayGain policy",
+        replaygain_request_policy_log_label(req),
+    );
+    push_kv_line(
+        log,
+        "ReplayGain clipping prevention",
+        yes_no(settings.replay_gain.prevent_clipping),
+    );
     push_kv_line(log, "Features", stage_requirement_label(req.stages.features));
     match &req.naming.folder_template {
         Some(template) => push_kv_line(log, "Folder template", template),
@@ -8090,6 +8948,7 @@ fn build_conversion_log_at_with_runner(
         source,
         req,
         &tracks,
+        replaygain_stage_outcome(outcome),
         resampling_applies,
         bit_depth_change_applies,
         dithering_applies,
@@ -8799,6 +9658,7 @@ fn build_conversion_log_common_fragment_with_runner(
         source,
         req,
         &tracks,
+        replaygain_stage_outcome(outcome),
         resampling_applies_for_source(source, &req.settings),
         bit_depth_change_applies_for_source(source, &req.settings),
         dithering_applies_for_source(source, &req.settings),
@@ -14223,6 +15083,9 @@ fn append_track_log(
             "  Conversion",
             conversion_summary(track, req, record.verified_output_bit_depth),
         );
+        for warning in &track.warnings {
+            push_kv_line(log, "  Warning", warning);
+        }
     }
 
     if let Some(pipeline) = planned_pipeline_label(&record.commands)
@@ -14418,6 +15281,7 @@ fn append_conversion_settings_section(
     source: &PreparedSource,
     req: &PipelineRequest,
     tracks: &[&TrackRecord],
+    replaygain_stage_result: Option<&StageOutcome>,
     resampling_applies: bool,
     bit_depth_change_applies: bool,
     dithering_applies: bool,
@@ -14455,6 +15319,25 @@ fn append_conversion_settings_section(
 
     push_kv_line(log, "Metadata", stage_requirement_label(req.stages.metadata));
     push_kv_line(log, "ReplayGain", stage_requirement_label(req.stages.replaygain));
+    let successful_output_count = tracks
+        .iter()
+        .filter(|track| matches!(track.outcome, TrackOutcome::Ok))
+        .count();
+    push_kv_line(
+        log,
+        "ReplayGain policy",
+        replaygain_policy_log_label(
+            source,
+            req,
+            successful_output_count,
+            replaygain_stage_result,
+        ),
+    );
+    push_kv_line(
+        log,
+        "ReplayGain clipping prevention",
+        yes_no(settings.replay_gain.prevent_clipping),
+    );
     push_kv_line(log, "Features", stage_requirement_label(req.stages.features));
     match &req.naming.folder_template {
         Some(template) => push_kv_line(log, "Folder template", template),
@@ -14646,13 +15529,21 @@ fn append_dsd_settings(
 ) {
     if source_is_dsd(source) && !settings.target_format.is_dsd() {
         push_kv_line(log, "DSD gain mode", dsd_gain_mode_label(settings.dsd.dsd_to_pcm_gain_mode));
-        push_kv_line(
-            log,
-            "DSD auto gain margin",
-            format!("{} dB", decimal_label(settings.dsd.dsd_to_pcm_auto_gain_margin_db)),
-        );
-        if let Some(gain) = settings.dsd.dsd_to_pcm_gain_db {
-            push_kv_line(log, "DSD manual gain", format!("{} dB", decimal_label(gain)));
+        if settings.dsd.dsd_to_pcm_gain_mode
+            == tonepoet_pipeline::DsdToPcmGainMode::Auto
+        {
+            push_kv_line(
+                log,
+                "DSD auto gain margin",
+                format!("{} dB", decimal_label(settings.dsd.dsd_to_pcm_auto_gain_margin_db)),
+            );
+        }
+        if settings.dsd.dsd_to_pcm_gain_mode
+            == tonepoet_pipeline::DsdToPcmGainMode::Manual
+        {
+            if let Some(gain) = settings.dsd.dsd_to_pcm_gain_db {
+                push_kv_line(log, "DSD manual gain", format!("{} dB", decimal_label(gain)));
+            }
         }
         push_kv_line(
             log,
@@ -15592,6 +16483,13 @@ fn metadata_stage_outcome(outcome: &AlbumOutcome) -> Option<&StageOutcome> {
     outcome_stage_records(outcome)
         .iter()
         .find(|stage| stage.stage == PipelineStage::Metadata)
+        .map(|stage| &stage.outcome)
+}
+
+fn replaygain_stage_outcome(outcome: &AlbumOutcome) -> Option<&StageOutcome> {
+    outcome_stage_records(outcome)
+        .iter()
+        .find(|stage| stage.stage == PipelineStage::ReplayGain)
         .map(|stage| &stage.outcome)
 }
 
@@ -27536,6 +28434,7 @@ mod companion_copy_hardening_tests {
             sample_rate: Some(44_100),
             source_audio: SourceAudioDescriptor::default(),
             bit_depth: Some(16),
+            warnings: Vec::new(),
         }
     }
 
@@ -31892,6 +32791,7 @@ pub(crate) fn conversion_action_destination_preview(
                 sample_rate: None,
                 source_audio: SourceAudioDescriptor::default(),
                 bit_depth: None,
+                warnings: Vec::new(),
             }
         })
         .collect();
@@ -35954,6 +36854,7 @@ mod pipeline_test_helpers {
                         Some(SourceAudioCoding::Pcm),
                     ),
                     bit_depth: Some(24),
+                    warnings: Vec::new(),
                 },
                 PreparedTrack {
                     id: TrackId {
@@ -35976,6 +36877,7 @@ mod pipeline_test_helpers {
                         Some(SourceAudioCoding::Pcm),
                     ),
                     bit_depth: Some(24),
+                    warnings: Vec::new(),
                 },
             ],
             album_metadata: AlbumMetadata {
@@ -36206,6 +37108,7 @@ mod build_cue_sheet_tests {
                         Some(SourceAudioCoding::Pcm),
                     ),
                     bit_depth: Some(16),
+                    warnings: Vec::new(),
                 },
                 PreparedTrack {
                     id: TrackId { source_ordinal: 1, disc_number: None, track_number: 2 },
@@ -36223,6 +37126,7 @@ mod build_cue_sheet_tests {
                         Some(SourceAudioCoding::Pcm),
                     ),
                     bit_depth: Some(16),
+                    warnings: Vec::new(),
                 },
             ],
             album_metadata: AlbumMetadata::default(),
@@ -36569,8 +37473,12 @@ mod conversion_log_tests {
     }
 
     #[test]
-    fn per_track_details_include_sizes_duration_and_command_info() {
-        let source = log_test_source();
+    fn per_track_details_include_sizes_duration_command_info_and_materializer_warnings() {
+        let mut source = log_test_source();
+        source.tracks[0].warnings = vec![
+            "declared DSF file size differed from the actual size; metadata was read tolerantly"
+                .to_string(),
+        ];
         let req = log_test_request();
         let outcome = AlbumOutcome::Complete {
             tracks: vec![ok_record()],
@@ -36582,6 +37490,9 @@ mod conversion_log_tests {
         assert!(log.contains("Source audio: 44.1kHz, 24-bit, 44100 expected samples"));
         assert!(log.contains("Size: 2.0 KB -> 1.0 KB (50.0% smaller)"));
         assert!(log.contains("Encode duration: 1m 5s"));
+        assert!(log.contains(
+            "Warning: declared DSF file size differed from the actual size; metadata was read tolerantly"
+        ));
         assert!(log.contains("ffmpeg -i '/tmp/in file.wav' /tmp/out.flac [1m 5s; exit 0]"));
         assert!(!log.contains("ignored stdout"));
         assert!(!log.contains("ignored stderr"));
@@ -36727,8 +37638,22 @@ mod conversion_log_tests {
         assert!(dsd_log.contains("DSD gain mode: auto"));
         assert!(dsd_log.contains("DSD auto gain margin"));
         assert!(dsd_log.contains("DSD→PCM lowpass method"));
+        assert!(!dsd_log.contains("DSD manual gain"));
         assert!(!dsd_log.contains("DSD filter preset"));
         assert!(!dsd_log.contains("PCM→DSD filter preset"));
+
+        dsd_req.settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
+        dsd_req.settings.dsd.dsd_to_pcm_gain_db = Some(6.0);
+        let disabled_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(disabled_log.contains("DSD gain mode: disabled"));
+        assert!(!disabled_log.contains("DSD auto gain margin"));
+        assert!(!disabled_log.contains("DSD manual gain"));
+
+        dsd_req.settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
+        let manual_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(manual_log.contains("DSD gain mode: manual"));
+        assert!(!manual_log.contains("DSD auto gain margin"));
+        assert!(manual_log.contains("DSD manual gain: 6 dB"));
     }
 
     #[test]
@@ -37402,6 +38327,7 @@ mod naming_template_tests {
                     Some(SourceAudioCoding::Pcm),
                 ),
                 bit_depth: Some(24),
+                warnings: Vec::new(),
             }],
             album_metadata: AlbumMetadata {
                 album: Some("A Tribute to Jack Johnson".to_string()),
@@ -39567,6 +40493,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                     Some(SourceAudioCoding::Pcm),
                 ),
                 bit_depth: Some(16),
+                warnings: Vec::new(),
             })
             .collect::<Vec<_>>();
 
@@ -46278,6 +47205,7 @@ mod validate_encoded_output_tests {
                 Some(SourceAudioCoding::DvdaUnknown),
             ),
             bit_depth: Some(24),
+            warnings: Vec::new(),
         }
     }
 

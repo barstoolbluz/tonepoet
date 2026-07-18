@@ -3752,6 +3752,7 @@ mod tests {
                     Some(SourceAudioCoding::Pcm),
                 ),
                 bit_depth: Some(16),
+                warnings: Vec::new(),
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Scratch Retry Album".to_string()),
@@ -4030,6 +4031,7 @@ mod tests {
                         Some(SourceAudioCoding::Pcm),
                     ),
                     bit_depth: Some(16),
+                    warnings: Vec::new(),
                 });
                 plan_entries.push(PlannedTrackOutput {
                     track_id: track_id.clone(),
@@ -4341,6 +4343,7 @@ mod tests {
                     Some(SourceAudioCoding::Pcm),
                 ),
                 bit_depth: Some(16),
+                warnings: Vec::new(),
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Output Capacity Album".to_string()),
@@ -5719,7 +5722,8 @@ FILE "disc2.flac" WAVE
             expected_samples: Some(44_100),
             sample_rate: Some(44_100),
             bit_depth: Some(16),
-        source_audio: SourceAudioDescriptor::default(),
+            source_audio: SourceAudioDescriptor::default(),
+            warnings: Vec::new(),
         }
     }
 

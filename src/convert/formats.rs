@@ -274,7 +274,10 @@ impl AudioFormat {
             ],
             Self::Aac => &[
                 ContainerOption { extension: "m4a", display_name: "M4A", ffmpeg_flags: &[], enabled: true },
-                ContainerOption { extension: "aac", display_name: "AAC (raw)", ffmpeg_flags: &[], enabled: true },
+                // Raw ADTS AAC has no reliable arbitrary-tag container. Keep it
+                // visible for product honesty but fail closed until metadata
+                // requirements can be satisfied; M4A/MP4 remain supported AAC outputs.
+                ContainerOption { extension: "aac", display_name: "AAC (raw, no metadata)", ffmpeg_flags: &[], enabled: false },
                 ContainerOption { extension: "mp4", display_name: "MP4", ffmpeg_flags: &[], enabled: true },
                 ContainerOption { extension: "m4b", display_name: "M4B", ffmpeg_flags: &[], enabled: true },
                 ContainerOption { extension: "mka", display_name: "MKA", ffmpeg_flags: &[], enabled: true },

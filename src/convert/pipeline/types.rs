@@ -1631,6 +1631,66 @@ pub const CUE_ARTWORK_MIME_EXTRA_KEY: &str = "tonepoet_cue_artwork_mime";
 pub const CUE_ARTWORK_SOURCE_EXTRA_KEY: &str = "tonepoet_cue_artwork_source";
 pub const CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY: &str = "tonepoet_cue_artwork_unsupported";
 
+/// Reserved TrackMetadata.extra prefix recording that a value came from an
+/// actual source text tag rather than from a pipeline-derived naming hint.
+/// The leading NUL keeps this internal namespace disjoint from every source
+/// key eligible for output (printable ASCII excluding `=`). The ordinary
+/// lowercased key remains alongside this marker for templates, and writers
+/// additionally require the paired plain key to carry the same value.
+pub const SOURCE_TEXT_TAG_EXTRA_PREFIX: &str = "\0tonepoet_source_text_tag:";
+
+pub fn insert_source_text_tag(
+    extra: &mut BTreeMap<String, String>,
+    key: &str,
+    value: &str,
+) {
+    let key = key.trim().to_ascii_lowercase();
+    if key.is_empty() || value.trim().is_empty() {
+        return;
+    }
+    let retained_value = extra
+        .entry(key.clone())
+        .or_insert_with(|| value.to_string())
+        .clone();
+    extra
+        .entry(format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}{key}"))
+        .or_insert(retained_value);
+}
+
+pub fn source_text_tag_key_from_extra<'a>(
+    extra: &BTreeMap<String, String>,
+    marker_key: &'a str,
+    marker_value: &str,
+) -> Option<&'a str> {
+    let source_key = marker_key
+        .strip_prefix(SOURCE_TEXT_TAG_EXTRA_PREFIX)
+        .filter(|source_key| !source_key.is_empty())?;
+    extra
+        .get(source_key)
+        .is_some_and(|source_value| source_value == marker_value)
+        .then_some(source_key)
+}
+
+pub fn is_affirmative_preemphasis_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "yes" | "true" | "on" | "y"
+    )
+}
+
+pub fn source_text_tags_indicate_pre_emphasis(extra: &BTreeMap<String, String>) -> bool {
+    extra.iter().any(|(key, value)| {
+        source_text_tag_key_from_extra(extra, key, value).is_some_and(|source_key| {
+            let normalized = source_key
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .map(|character| character.to_ascii_lowercase())
+                .collect::<String>();
+            normalized == "preemphasis" && is_affirmative_preemphasis_value(value)
+        })
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionProvenance {
     pub source_kind: SourceKind,
@@ -1870,6 +1930,10 @@ pub struct PreparedTrack {
     /// not the representation of the staged segment WAV carrier. For DVD-Audio
     /// this mirrors `source_audio.bit_depth` only when one scalar depth is known.
     pub bit_depth: Option<u32>,
+    /// Non-fatal metadata/container degradations accepted during materialization.
+    /// These warnings are persisted in the conversion log for auditability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl PreparedTrack {

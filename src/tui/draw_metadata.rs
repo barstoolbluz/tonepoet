@@ -228,22 +228,19 @@ fn render_album_artist_override_row<'a>(
     let label = "   album artist ";
     let value_w = w.saturating_sub(2 + label.len());
     let focused = pane_focused && metadata.field_focus == ConvertMetadataField::AlbumArtist;
-    bordered_line(
-        border_color,
-        w,
-        vec![
-            Span::styled(label, if focused { theme.bright() } else { theme.muted() }),
-            render_inline_value(
-                metadata.album_artist_for_conversion.as_deref().unwrap_or(""),
-                metadata.editing == Some(ConvertMetadataField::AlbumArtist),
-                &metadata.edit_input,
-                focused,
-                value_w,
-                theme,
-            ),
-        ],
+    let mut spans = vec![Span::styled(
+        label,
+        if focused { theme.bright() } else { theme.muted() },
+    )];
+    spans.extend(render_inline_value(
+        metadata.album_artist_for_conversion.as_deref().unwrap_or(""),
+        metadata.editing == Some(ConvertMetadataField::AlbumArtist),
+        &metadata.edit_input,
+        focused,
+        value_w,
         theme,
-    )
+    ));
+    bordered_line(border_color, w, spans, theme)
 }
 
 fn render_single_metadata<'a>(
@@ -259,25 +256,23 @@ fn render_single_metadata<'a>(
 
     let title_label = "   title   ";
     let title_value_w = w.saturating_sub(2 + title_label.len());
-    let title_row = bordered_line(
-        border_color,
-        w,
-        vec![
-            Span::styled(
-                title_label,
-                if is_focused(ConvertMetadataField::Title) { theme.bright() } else { theme.muted() },
-            ),
-            render_inline_value(
-                value(&metadata.title),
-                is_editing(ConvertMetadataField::Title),
-                &metadata.edit_input,
-                is_focused(ConvertMetadataField::Title),
-                title_value_w,
-                theme,
-            ),
-        ],
+    let mut title_spans = vec![Span::styled(
+        title_label,
+        if is_focused(ConvertMetadataField::Title) {
+            theme.bright()
+        } else {
+            theme.muted()
+        },
+    )];
+    title_spans.extend(render_inline_value(
+        value(&metadata.title),
+        is_editing(ConvertMetadataField::Title),
+        &metadata.edit_input,
+        is_focused(ConvertMetadataField::Title),
+        title_value_w,
         theme,
-    );
+    ));
+    let title_row = bordered_line(border_color, w, title_spans, theme);
 
     let content_w = w.saturating_sub(2);
     let half_w = content_w / 2;
@@ -287,38 +282,42 @@ fn render_single_metadata<'a>(
     let album_value_w = content_w
         .saturating_sub(half_w + album_label.len())
         .max(1);
-    let row2 = bordered_line(
-        border_color,
-        w,
-        vec![
-            Span::styled(
-                artist_label,
-                if is_focused(ConvertMetadataField::Artist) { theme.bright() } else { theme.muted() },
-            ),
-            render_inline_value(
-                value(&metadata.artist),
-                is_editing(ConvertMetadataField::Artist),
-                &metadata.edit_input,
-                is_focused(ConvertMetadataField::Artist),
-                artist_value_w,
-                theme,
-            ),
-            Span::raw(" ".repeat(content_w.saturating_sub(half_w + artist_label.len() + artist_value_w))),
-            Span::styled(
-                album_label,
-                if is_focused(ConvertMetadataField::Album) { theme.bright() } else { theme.muted() },
-            ),
-            render_inline_value(
-                value(&metadata.album),
-                is_editing(ConvertMetadataField::Album),
-                &metadata.edit_input,
-                is_focused(ConvertMetadataField::Album),
-                album_value_w,
-                theme,
-            ),
-        ],
+    let mut row2_spans = vec![Span::styled(
+        artist_label,
+        if is_focused(ConvertMetadataField::Artist) {
+            theme.bright()
+        } else {
+            theme.muted()
+        },
+    )];
+    row2_spans.extend(render_inline_value(
+        value(&metadata.artist),
+        is_editing(ConvertMetadataField::Artist),
+        &metadata.edit_input,
+        is_focused(ConvertMetadataField::Artist),
+        artist_value_w,
         theme,
-    );
+    ));
+    row2_spans.push(Span::raw(
+        " ".repeat(content_w.saturating_sub(half_w + artist_label.len() + artist_value_w)),
+    ));
+    row2_spans.push(Span::styled(
+        album_label,
+        if is_focused(ConvertMetadataField::Album) {
+            theme.bright()
+        } else {
+            theme.muted()
+        },
+    ));
+    row2_spans.extend(render_inline_value(
+        value(&metadata.album),
+        is_editing(ConvertMetadataField::Album),
+        &metadata.edit_input,
+        is_focused(ConvertMetadataField::Album),
+        album_value_w,
+        theme,
+    ));
+    let row2 = bordered_line(border_color, w, row2_spans, theme);
 
     let genre_label = "   genre   ";
     let year_label = "year   ";
@@ -326,60 +325,62 @@ fn render_single_metadata<'a>(
     let year_value_w = content_w
         .saturating_sub(half_w + year_label.len())
         .max(1);
-    let row3 = bordered_line(
-        border_color,
-        w,
-        vec![
-            Span::styled(
-                genre_label,
-                if is_focused(ConvertMetadataField::Genre) { theme.bright() } else { theme.muted() },
-            ),
-            render_inline_value(
-                value(&metadata.genre),
-                is_editing(ConvertMetadataField::Genre),
-                &metadata.edit_input,
-                is_focused(ConvertMetadataField::Genre),
-                genre_value_w,
-                theme,
-            ),
-            Span::raw(" ".repeat(content_w.saturating_sub(half_w + genre_label.len() + genre_value_w))),
-            Span::styled(
-                year_label,
-                if is_focused(ConvertMetadataField::Year) { theme.bright() } else { theme.muted() },
-            ),
-            render_inline_value(
-                value(&metadata.year),
-                is_editing(ConvertMetadataField::Year),
-                &metadata.edit_input,
-                is_focused(ConvertMetadataField::Year),
-                year_value_w,
-                theme,
-            ),
-        ],
+    let mut row3_spans = vec![Span::styled(
+        genre_label,
+        if is_focused(ConvertMetadataField::Genre) {
+            theme.bright()
+        } else {
+            theme.muted()
+        },
+    )];
+    row3_spans.extend(render_inline_value(
+        value(&metadata.genre),
+        is_editing(ConvertMetadataField::Genre),
+        &metadata.edit_input,
+        is_focused(ConvertMetadataField::Genre),
+        genre_value_w,
         theme,
-    );
+    ));
+    row3_spans.push(Span::raw(
+        " ".repeat(content_w.saturating_sub(half_w + genre_label.len() + genre_value_w)),
+    ));
+    row3_spans.push(Span::styled(
+        year_label,
+        if is_focused(ConvertMetadataField::Year) {
+            theme.bright()
+        } else {
+            theme.muted()
+        },
+    ));
+    row3_spans.extend(render_inline_value(
+        value(&metadata.year),
+        is_editing(ConvertMetadataField::Year),
+        &metadata.edit_input,
+        is_focused(ConvertMetadataField::Year),
+        year_value_w,
+        theme,
+    ));
+    let row3 = bordered_line(border_color, w, row3_spans, theme);
 
     let album_artist_label = "   album artist ";
     let album_artist_value_w = w.saturating_sub(2 + album_artist_label.len());
-    let row4 = bordered_line(
-        border_color,
-        w,
-        vec![
-            Span::styled(
-                album_artist_label,
-                if is_focused(ConvertMetadataField::AlbumArtist) { theme.bright() } else { theme.muted() },
-            ),
-            render_inline_value(
-                value(&metadata.album_artist_for_conversion),
-                is_editing(ConvertMetadataField::AlbumArtist),
-                &metadata.edit_input,
-                is_focused(ConvertMetadataField::AlbumArtist),
-                album_artist_value_w,
-                theme,
-            ),
-        ],
+    let mut row4_spans = vec![Span::styled(
+        album_artist_label,
+        if is_focused(ConvertMetadataField::AlbumArtist) {
+            theme.bright()
+        } else {
+            theme.muted()
+        },
+    )];
+    row4_spans.extend(render_inline_value(
+        value(&metadata.album_artist_for_conversion),
+        is_editing(ConvertMetadataField::AlbumArtist),
+        &metadata.edit_input,
+        is_focused(ConvertMetadataField::AlbumArtist),
+        album_artist_value_w,
         theme,
-    );
+    ));
+    let row4 = bordered_line(border_color, w, row4_spans, theme);
 
     vec![title_row, row2, row3, row4]
 }

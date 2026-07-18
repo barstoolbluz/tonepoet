@@ -97,6 +97,10 @@ pub enum ContextAction {
     SelectInverse,
     /// Clear multi-selection.
     Deselect,
+    /// Create a file in the current browse directory.
+    NewFile,
+    /// Create a folder in the current browse directory.
+    NewFolder,
     /// Rename the selected file (`:rename` or context menu).
     RenameEntry,
     /// Permanently delete selected filesystem path(s).
@@ -757,6 +761,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let _ = app; // used in future for conditional items
     vec![
+        item("New file", ContextAction::NewFile),
+        item("New folder", ContextAction::NewFolder),
+        separator(),
         item("Select All", ContextAction::SelectAll),
         item("Select Inverse", ContextAction::SelectInverse),
         item("Deselect", ContextAction::Deselect),
@@ -1132,6 +1139,12 @@ pub fn execute_context_action(
                 }
             }
         }
+        ContextAction::NewFile => {
+            super::keybindings::begin_browse_create(app, super::app::BrowseCreateKind::File);
+        }
+        ContextAction::NewFolder => {
+            super::keybindings::begin_browse_create(app, super::app::BrowseCreateKind::Folder);
+        }
         ContextAction::RenameEntry => {
             if app.browse.is_in_archive() {
                 let can_rename = app
@@ -1264,8 +1277,22 @@ pub fn execute_context_action(
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let cursor = state.cursor;
                 if let Some(entry) = state.active_surface_mut().entries.get_mut(cursor) {
-                    super::probe::toggle_mb_revert(entry);
+                    let mutation_report = super::probe::toggle_mb_revert(entry);
+                    let mut status = match super::probe::mb_pill_state(entry) {
+                        super::probe::MbRevertPill::Revert => format!(
+                            "MusicBrainz values applied to {}",
+                            entry.display_key
+                        ),
+                        super::probe::MbRevertPill::UseMb => {
+                            format!("{} reverted to file values", entry.display_key)
+                        }
+                        super::probe::MbRevertPill::None => {
+                            format!("{} unchanged", entry.display_key)
+                        }
+                    };
+                    mutation_report.append_collapse_warning(&mut status);
                     state.recompute_active_dirty();
+                    app.set_status(status);
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -1353,8 +1380,22 @@ pub fn execute_context_action(
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let idx = state.detail_field_idx;
                 if let Some(entry) = state.active_surface_mut().entries.get_mut(idx) {
-                    super::probe::toggle_mb_revert_field(entry);
+                    let mutation_report = super::probe::toggle_mb_revert_field(entry);
+                    let mut status = match super::probe::mb_pill_state_field(entry) {
+                        super::probe::MbRevertPill::Revert => format!(
+                            "MusicBrainz values applied to {}",
+                            entry.display_key
+                        ),
+                        super::probe::MbRevertPill::UseMb => {
+                            format!("{} reverted to file values", entry.display_key)
+                        }
+                        super::probe::MbRevertPill::None => {
+                            format!("{} unchanged", entry.display_key)
+                        }
+                    };
+                    mutation_report.append_collapse_warning(&mut status);
                     state.recompute_active_dirty();
+                    app.set_status(status);
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -1363,8 +1404,14 @@ pub fn execute_context_action(
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let idx = state.detail_field_idx;
                 if let Some(entry) = state.active_surface_mut().entries.get_mut(idx) {
-                    super::probe::restore_mb_proposed(entry);
+                    let mutation_report = super::probe::restore_mb_proposed(entry);
+                    let mut status = format!(
+                        "{} restored to MusicBrainz values",
+                        entry.display_key
+                    );
+                    mutation_report.append_collapse_warning(&mut status);
                     state.recompute_active_dirty();
+                    app.set_status(status);
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
@@ -2666,6 +2713,8 @@ mod tests {
                 original: "x".into(),
                 is_binary: false,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["x".into()],
                 per_file_originals: vec!["x".into()],
                 mb_proposed_value: None,
@@ -2679,6 +2728,8 @@ mod tests {
                 original: "".into(),
                 is_binary: true,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["FILE \"a.flac\" FLAC\n".into()],
                 per_file_originals: vec!["".into()],
                 mb_proposed_value: None,
@@ -2727,5 +2778,106 @@ mod tests {
             has_nested,
             "expected nested submenu inside Disk Tools (AccurateRip / CUETools DB)"
         );
+    }
+
+    fn mb_cardinality_entry(current: &str, proposed: &str) -> crate::tui::probe::TagEntry {
+        crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
+            display_key: "ARTIST".to_string(),
+            item_key: lofty::tag::ItemKey::TrackArtist,
+            value: current.to_string(),
+            original: "Alpha; Beta".to_string(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2],
+            per_file_values: vec![current.to_string()],
+            per_file_originals: vec!["Alpha; Beta".to_string()],
+            mb_proposed_value: Some(proposed.to_string()),
+            mb_proposed_per_file: Some(vec![proposed.to_string()]),
+        }
+    }
+
+    #[test]
+    fn metadata_row_context_use_mb_preserves_cardinality_warning() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let state = crate::tui::app::MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            vec![mb_cardinality_entry("Alpha; Beta", "New Artist")],
+            vec!["a".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_context_action(&mut app, ContextAction::MetadataRevertMb, &tx, false);
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("MusicBrainz values applied to ARTIST"));
+        assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn metadata_detail_context_use_mb_preserves_cardinality_warning() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            vec![mb_cardinality_entry("Alpha; Beta", "New Artist")],
+            vec!["a".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_context_action(
+            &mut app,
+            ContextAction::MetadataDetailToggleRevert,
+            &tx,
+            false,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("MusicBrainz values applied to ARTIST"));
+        assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn metadata_detail_context_restore_preserves_cardinality_warning() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            vec![mb_cardinality_entry("Manual Artist", "New Artist")],
+            vec!["a".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_context_action(
+            &mut app,
+            ContextAction::MetadataDetailRestore,
+            &tx,
+            false,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("ARTIST restored to MusicBrainz values"));
+        assert!(status.contains("warning: 1 carrier"));
     }
 }

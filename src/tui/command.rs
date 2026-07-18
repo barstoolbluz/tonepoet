@@ -1975,6 +1975,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "sortdir",
     "filter",
     "refresh",
+    "new-file",
+    "new-folder",
     "rename",
     "del",
     "delete",
@@ -2235,6 +2237,10 @@ pub enum Command {
     Filter(Option<String>),
     /// Refresh the current browse directory from the filesystem.
     Refresh,
+    /// Create a file in the current browse directory. Empty opens an inline prompt.
+    NewFile(Option<String>),
+    /// Create a folder in the current browse directory. Empty opens an inline prompt.
+    NewFolder(Option<String>),
     /// Rename the current browse selection to the given name.
     /// Empty arg opens the rename overlay seeded with the current name.
     Rename(String),
@@ -2466,6 +2472,8 @@ impl std::fmt::Debug for Command {
             Command::SortDir => f.write_str("SortDir"),
             Command::Filter(arg) => f.debug_tuple("Filter").field(arg).finish(),
             Command::Refresh => f.write_str("Refresh"),
+            Command::NewFile(arg) => f.debug_tuple("NewFile").field(arg).finish(),
+            Command::NewFolder(arg) => f.debug_tuple("NewFolder").field(arg).finish(),
             Command::Rename(arg) => f.debug_tuple("Rename").field(arg).finish(),
             Command::Delete => f.write_str("Delete"),
             Command::Copy { dest, force } => f
@@ -2691,6 +2699,8 @@ pub fn parse_command(input: &str) -> Command {
             Command::Filter(arg)
         }
         "refresh" => Command::Refresh,
+        "new-file" => Command::NewFile((!args.is_empty()).then(|| args.to_string())),
+        "new-folder" => Command::NewFolder((!args.is_empty()).then(|| args.to_string())),
         "del" | "delete" => Command::Delete,
         "rename" => Command::Rename(args.to_string()),
         "cp" | "copy" => Command::Copy {
@@ -3446,6 +3456,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
         Command::Delete => {
             execute_delete(app, tx);
         }
+        Command::NewFile(name) => {
+            execute_browse_create_command(app, super::app::BrowseCreateKind::File, name, tx);
+        }
+        Command::NewFolder(name) => {
+            execute_browse_create_command(app, super::app::BrowseCreateKind::Folder, name, tx);
+        }
         Command::Rename(new_name) => {
             execute_rename(app, &new_name, tx);
         }
@@ -3523,6 +3539,21 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 if let Some(ref dir) = dir {
                     if let Some(info) = super::cue_parser::detect_single_image(dir) {
                         let n = info.track_boundaries.len();
+                        if n == 0 {
+                            app.set_status("Analysis: the single-image CUE contains no tracks");
+                            return;
+                        }
+                        let operation_id = match super::event_loop::begin_completion_operation(
+                            app,
+                            CompletionOperationKind::Analysis,
+                            "Analysis",
+                        ) {
+                            Ok(operation_id) => operation_id,
+                            Err(message) => {
+                                app.set_status(message);
+                                return;
+                            }
+                        };
                         let can_seek = super::cue_parser::can_ffmpeg_read(&info.audio_path);
                         app.set_status(format!("Analyzing {} tracks (single image)...", n,));
                         app.analysis_results.clear();
@@ -3607,6 +3638,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                     };
                                     let _ = tx
                                         .send(AppMessage::AnalysisComplete {
+                                            operation_id,
                                             result: final_result,
                                         })
                                         .await;
@@ -3623,6 +3655,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                     for _ in 0..n {
                                         let _ = tx
                                             .send(AppMessage::AnalysisComplete {
+                                                operation_id,
                                                 result: Err(format!("temp dir failed: {}", e)),
                                             })
                                             .await;
@@ -3650,6 +3683,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                         for _ in 0..n {
                                             let _ = tx
                                                 .send(AppMessage::AnalysisComplete {
+                                                    operation_id,
                                                     result: Err(msg.clone()),
                                                 })
                                                 .await;
@@ -3706,6 +3740,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                         };
                                         let _ = tx
                                             .send(AppMessage::AnalysisComplete {
+                                                operation_id,
                                                 result: final_result,
                                             })
                                             .await;
@@ -3720,6 +3755,17 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             if paths.is_empty() {
                 app.set_status("No audio files to analyze");
             } else {
+                let operation_id = match super::event_loop::begin_completion_operation(
+                    app,
+                    CompletionOperationKind::Analysis,
+                    "Analysis",
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(message) => {
+                        app.set_status(message);
+                        return;
+                    }
+                };
                 app.analysis_results.clear();
 
                 // Check DB cache for each path; only spawn analysis for misses.
@@ -3749,7 +3795,32 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
 
                 if to_analyze.is_empty() {
-                    // All results served from cache — show overlay immediately.
+                    // All results served from cache. Enrich only the exact
+                    // editor captured at dispatch, matching async completion
+                    // semantics before deciding whether an overlay may publish.
+                    if let Some(guard) = super::event_loop::completion_operation_editor_session(
+                        app,
+                        CompletionOperationKind::Analysis,
+                        operation_id,
+                    ) {
+                        let cached_results = app.analysis_results.clone();
+                        if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
+                            if super::event_loop::metadata_editor_matches_session_guard(state, guard)
+                            {
+                                for result in &cached_results {
+                                    state.apply_analysis_result(result);
+                                }
+                            }
+                        }
+                        if let Some(state) = app.pending_metadata_editor.as_mut() {
+                            if super::event_loop::metadata_editor_matches_session_guard(state, guard)
+                            {
+                                for result in &cached_results {
+                                    state.apply_analysis_result(result);
+                                }
+                            }
+                        }
+                    }
                     let count = app.analysis_results.len();
                     let last = &app.analysis_results[count - 1];
                     let name = last
@@ -3757,13 +3828,28 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    app.set_status(format!(
+                    let status = format!(
                         "Analyzed: {} — DR{} ({}) [cached]",
                         name,
                         last.dr_value,
                         super::analyze::dr_label(last.dr_value),
-                    ));
-                    app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+                    );
+                    let may_publish = super::event_loop::completion_operation_has_overlay_authority(
+                        app,
+                        CompletionOperationKind::Analysis,
+                        operation_id,
+                    );
+                    super::event_loop::retire_completion_operation(
+                        app,
+                        CompletionOperationKind::Analysis,
+                        operation_id,
+                    );
+                    if may_publish {
+                        app.active_overlay = super::app::ActiveOverlay::Analysis { scroll: 0 };
+                        app.set_status(status);
+                    } else {
+                        app.set_status(format!("{}; current editor or overlay preserved", status));
+                    }
                 } else {
                     app.analysis_pending = to_analyze.len();
                     for path in to_analyze {
@@ -3827,6 +3913,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             };
                             let _ = tx
                                 .send(AppMessage::AnalysisComplete {
+                                    operation_id,
                                     result: final_result,
                                 })
                                 .await;
@@ -4099,7 +4186,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             ":revert: field was not changed by MusicBrainz, or has manual edits",
                         );
                     } else {
-                        super::probe::toggle_mb_revert_field(entry);
+                        let mutation_report = super::probe::toggle_mb_revert_field(entry);
                         let after = super::probe::mb_pill_state_field(entry);
                         let display_key = entry.display_key.clone();
                         state.recompute_active_dirty();
@@ -4108,14 +4195,16 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             super::probe::MbRevertPill::UseMb => "reverted to file values",
                             super::probe::MbRevertPill::None => "no change",
                         };
-                        app.set_status(format!(":revert: {} ({})", display_key, label));
+                        let mut status = format!(":revert: {} ({})", display_key, label);
+                        mutation_report.append_collapse_warning(&mut status);
+                        app.set_status(status);
                     }
                 } else {
                     let pill_before = super::probe::mb_pill_state(entry);
                     if matches!(pill_before, super::probe::MbRevertPill::None) {
                         app.set_status(":revert: cursor row was not changed by MusicBrainz");
                     } else {
-                        super::probe::toggle_mb_revert(entry);
+                        let mutation_report = super::probe::toggle_mb_revert(entry);
                         let after = super::probe::mb_pill_state(entry);
                         let display_key = entry.display_key.clone();
                         state.recompute_active_dirty();
@@ -4124,7 +4213,9 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             super::probe::MbRevertPill::UseMb => "reverted to file value",
                             super::probe::MbRevertPill::None => "no change",
                         };
-                        app.set_status(format!(":revert: {} ({})", display_key, label));
+                        let mut status = format!(":revert: {} ({})", display_key, label);
+                        mutation_report.append_collapse_warning(&mut status);
+                        app.set_status(status);
                     }
                 }
             }
@@ -4148,10 +4239,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 if !super::probe::entry_has_mb_proposed(entry) {
                     app.set_status(":restore: field was not populated from MusicBrainz");
                 } else {
-                    super::probe::restore_mb_proposed(entry);
+                    let mutation_report = super::probe::restore_mb_proposed(entry);
                     let display_key = entry.display_key.clone();
                     state.recompute_active_dirty();
-                    app.set_status(format!(":restore: {} (snapped to MB values)", display_key));
+                    let mut status = format!(":restore: {} (snapped to MB values)", display_key);
+                    mutation_report.append_collapse_warning(&mut status);
+                    app.set_status(status);
                 }
             }
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
@@ -5544,18 +5637,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 if result.changed_values > 0 {
                     state.active_surface_mut().dirty = true;
                 }
-                let mut msg = format!(
-                    "Capitalization applied ({} values changed",
-                    result.changed_values
-                );
-                if result.skipped_deleted > 0 {
-                    msg.push_str(&format!(
-                        "; {} deleted entries skipped",
-                        result.skipped_deleted
-                    ));
-                }
-                msg.push(')');
-                app.set_status(msg);
+                app.set_status(result.status_message());
             } else {
                 app.set_status(":fix-caps only works in the metadata editor");
             }
@@ -5573,6 +5655,13 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 BulkGuardCommand::AccurateRip { force },
                 &guard_paths,
             ) {
+                return;
+            }
+            if app
+                .active_completion_operations
+                .contains_key(&CompletionOperationKind::AccurateRip)
+            {
+                app.set_status("AccurateRip: another verification is still active");
                 return;
             }
 
@@ -5596,6 +5685,19 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 if let Some(ref dir) = dir {
                     if let Some(info) = super::cue_parser::detect_single_image(dir) {
                         let n = info.track_boundaries.len();
+                        let operation_id = match super::event_loop::begin_completion_operation(
+                            app,
+                            CompletionOperationKind::AccurateRip,
+                            "AccurateRip",
+                        ) {
+                            Ok(operation_id) => operation_id,
+                            Err(message) => {
+                                app.auto_fix_on_complete = false;
+                                app.pending_ctdb_repair = None;
+                                app.set_status(message);
+                                return;
+                            }
+                        };
                         let full_scan = force;
                         let tx = tx.clone();
                         app.set_status(format!(
@@ -5607,6 +5709,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                 super::accuraterip::verify_single_image(&info, full_scan).await;
                             let _ = tx
                                 .send(AppMessage::AccurateRipComplete {
+                                    operation_id,
                                     pages: vec![super::app::ArVerifyPage {
                                         label: String::new(),
                                         result,
@@ -5619,8 +5722,23 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
             }
             if paths.is_empty() {
+                app.auto_fix_on_complete = false;
+                app.pending_ctdb_repair = None;
                 app.set_status("No audio files for AccurateRip verification");
             } else {
+                let operation_id = match super::event_loop::begin_completion_operation(
+                    app,
+                    CompletionOperationKind::AccurateRip,
+                    "AccurateRip",
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(message) => {
+                        app.auto_fix_on_complete = false;
+                        app.pending_ctdb_repair = None;
+                        app.set_status(message);
+                        return;
+                    }
+                };
                 let groups = super::gnudb::group_by_disc(&paths);
                 let n_groups = groups.len();
                 let n_tracks: usize = groups.iter().map(|(_, p)| p.len()).sum();
@@ -5633,6 +5751,13 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     let sample_data = super::accuraterip::collect_sample_counts(&group_paths);
                     match sample_data {
                         Err(e) => {
+                            app.auto_fix_on_complete = false;
+                            app.pending_ctdb_repair = None;
+                            super::event_loop::retire_completion_operation(
+                                app,
+                                CompletionOperationKind::AccurateRip,
+                                operation_id,
+                            );
                             app.set_status(format!("AccurateRip: {}", e));
                         }
                         Ok((sample_counts, sample_rate)) => {
@@ -5650,6 +5775,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                 .await;
                                 let _ = tx
                                     .send(AppMessage::AccurateRipComplete {
+                                        operation_id,
                                         pages: vec![super::app::ArVerifyPage {
                                             label: String::new(),
                                             result,
@@ -5686,9 +5812,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                 }
                             }
                         }
-                        if !pages.is_empty() {
-                            let _ = tx.send(AppMessage::AccurateRipComplete { pages }).await;
-                        }
+                        let _ = tx
+                            .send(AppMessage::AccurateRipComplete {
+                                operation_id,
+                                pages,
+                            })
+                            .await;
                     });
                 }
             }
@@ -5732,6 +5861,13 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
             } else {
                 // No overlay open — run verification first, then auto-fix.
+                if app
+                    .active_completion_operations
+                    .contains_key(&CompletionOperationKind::AccurateRip)
+                {
+                    app.set_status("AccurateRip: another verification is still active");
+                    return;
+                }
                 // A confirmed fix-offset bulk guard already covers the
                 // verification pass it must run to discover the offset, so
                 // suppress a duplicate count prompt for the nested AR verify.
@@ -5750,6 +5886,13 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 BulkGuardCommand::Ctdb,
                 &guard_paths,
             ) {
+                return;
+            }
+            if app
+                .active_completion_operations
+                .contains_key(&CompletionOperationKind::Ctdb)
+            {
+                app.set_status("CUETools DB: another verification is still active");
                 return;
             }
 
@@ -5773,6 +5916,18 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 if let Some(ref dir) = dir {
                     if let Some(info) = super::cue_parser::detect_single_image(dir) {
                         let n = info.track_boundaries.len();
+                        let operation_id = match super::event_loop::begin_completion_operation(
+                            app,
+                            CompletionOperationKind::Ctdb,
+                            "CUETools DB",
+                        ) {
+                            Ok(operation_id) => operation_id,
+                            Err(message) => {
+                                app.auto_repair_on_ctdb_complete = false;
+                                app.set_status(message);
+                                return;
+                            }
+                        };
                         let tx = tx.clone();
                         app.set_status(format!(
                             "CUETools DB: verifying {} tracks (single image)...",
@@ -5793,6 +5948,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             .await;
                             let _ = tx
                                 .send(AppMessage::CtdbComplete {
+                                    operation_id,
                                     pages: vec![super::app::CtdbVerifyPage {
                                         label: String::new(),
                                         result,
@@ -5805,8 +5961,21 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 }
             }
             if paths.is_empty() {
+                app.auto_repair_on_ctdb_complete = false;
                 app.set_status("No audio files for CTDB verification");
             } else {
+                let operation_id = match super::event_loop::begin_completion_operation(
+                    app,
+                    CompletionOperationKind::Ctdb,
+                    "CUETools DB",
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(message) => {
+                        app.auto_repair_on_ctdb_complete = false;
+                        app.set_status(message);
+                        return;
+                    }
+                };
                 let groups = super::gnudb::group_by_disc(&paths);
                 let n_groups = groups.len();
                 let n_tracks: usize = groups.iter().map(|(_, p)| p.len()).sum();
@@ -5818,6 +5987,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     let sample_data = super::accuraterip::collect_sample_counts(&group_paths);
                     match sample_data {
                         Err(e) => {
+                            app.auto_repair_on_ctdb_complete = false;
+                            super::event_loop::retire_completion_operation(
+                                app,
+                                CompletionOperationKind::Ctdb,
+                                operation_id,
+                            );
                             app.set_status(format!("CTDB: {}", e));
                         }
                         Ok((sample_counts, sample_rate)) => {
@@ -5841,6 +6016,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                                 .await;
                                 let _ = tx
                                     .send(AppMessage::CtdbComplete {
+                                        operation_id,
                                         pages: vec![super::app::CtdbVerifyPage {
                                             label: String::new(),
                                             result,
@@ -5915,9 +6091,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
 
                             pages.push(super::app::CtdbVerifyPage { label, result });
                         }
-                        if !pages.is_empty() {
-                            let _ = tx.send(AppMessage::CtdbComplete { pages }).await;
-                        }
+                        let _ = tx
+                            .send(AppMessage::CtdbComplete {
+                                operation_id,
+                                pages,
+                            })
+                            .await;
                     });
                 }
             }
@@ -6039,6 +6218,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     None => {
                         // No usable AR cache — defer the repair until AR
                         // verification completes and gives us an offset.
+                        if app
+                            .active_completion_operations
+                            .contains_key(&CompletionOperationKind::AccurateRip)
+                        {
+                            app.set_status(
+                                "CTDB repair: AccurateRip verification is already active; retry after it completes",
+                            );
+                            return;
+                        }
                         app.pending_ctdb_repair = Some(super::app::PendingCtdbRepair {
                             paths,
                             parity_url,
@@ -6056,6 +6244,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 // No CTDB overlay open (e.g. invoked from the "CUETools DB
                 // repair" context menu, or directly via :ctdb-repair). Run
                 // CTDB verify first; the auto-repair flag tells the
+                if app
+                    .active_completion_operations
+                    .contains_key(&CompletionOperationKind::Ctdb)
+                {
+                    app.set_status(
+                        "CTDB repair: verification is already active; retry after it completes",
+                    );
+                    return;
+                }
                 // CtdbComplete handler to re-dispatch :ctdb-repair once
                 // the verification overlay is installed.
                 app.auto_repair_on_ctdb_complete = true;
@@ -6089,6 +6286,17 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             ) {
                 return;
             }
+            let operation_id = match super::event_loop::begin_completion_operation(
+                app,
+                CompletionOperationKind::ArBatch,
+                "AccurateRip batch",
+            ) {
+                Ok(operation_id) => operation_id,
+                Err(message) => {
+                    app.set_status(message);
+                    return;
+                }
+            };
             app.set_status(format!(
                 "AccurateRip batch: scanning {}...",
                 scan_dir.display()
@@ -6097,7 +6305,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             let tx = tx.clone();
             tokio::spawn(async move {
                 let result = super::accuraterip::batch_verify(&scan_dir, tx.clone()).await;
-                let _ = tx.send(AppMessage::ArBatchComplete { result }).await;
+                let _ = tx
+                    .send(AppMessage::ArBatchComplete {
+                        operation_id,
+                        result,
+                    })
+                    .await;
             });
         }
         Command::ViewFile(path) => {
@@ -8886,6 +9099,8 @@ fn dvdv_upsert_editor_entry(
         original: value,
         is_binary: false,
         is_mixed,
+        has_multiple_stored_values: false,
+        per_file_stored_value_counts: Vec::new(),
         per_file_originals: per_file_values.clone(),
         per_file_values,
         mb_proposed_value: None,
@@ -9913,6 +10128,8 @@ fn bluray_upsert_editor_entry(
         original: value,
         is_binary: false,
         is_mixed,
+        has_multiple_stored_values: false,
+        per_file_stored_value_counts: Vec::new(),
         per_file_originals: per_file_values.clone(),
         per_file_values,
         mb_proposed_value: None,
@@ -12403,6 +12620,23 @@ fn execute_expand(app: &mut AppState) {
 /// - With no argument: opens a TextEdit overlay seeded with the current name
 ///   so the user can edit and press Enter to commit.
 /// - With an argument: commits the rename directly.
+fn execute_browse_create_command(
+    app: &mut AppState,
+    kind: super::app::BrowseCreateKind,
+    name: Option<String>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match name {
+        Some(name) => {
+            let dir = app.browse.current_dir.clone();
+            super::keybindings::commit_browse_create(app, dir, kind, &name, tx);
+        }
+        None => {
+            super::keybindings::begin_browse_create(app, kind);
+        }
+    }
+}
+
 fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessage>) {
     if app.current_screen != AppScreen::Browse {
         app.set_status(":rename only works on the browse screen");
@@ -12841,6 +13075,8 @@ pub fn apply_cue_changes(
                     original: String::new(),
                     is_binary: false,
                     is_mixed: false,
+                    has_multiple_stored_values: false,
+                    per_file_stored_value_counts: Vec::new(),
                     per_file_values: vec![String::new(); n],
                     per_file_originals: vec![String::new(); n],
                     mb_proposed_value: None,
@@ -13030,6 +13266,26 @@ mod completion_tests {
     }
 
     #[test]
+    fn browse_create_commands_parse_prompt_and_direct_forms() {
+        assert!(matches!(parse_command("new-file"), Command::NewFile(None)));
+        assert!(matches!(
+            parse_command("new-file liner notes.txt"),
+            Command::NewFile(Some(name)) if name == "liner notes.txt"
+        ));
+        assert!(matches!(parse_command("new-folder"), Command::NewFolder(None)));
+        assert!(matches!(
+            parse_command("new-folder Artwork Scans"),
+            Command::NewFolder(Some(name)) if name == "Artwork Scans"
+        ));
+
+        let completion = compute_completion("new-", 4).expect("browse create completions");
+        assert_eq!(
+            completion.candidates,
+            vec!["new-file".to_string(), "new-folder".to_string()]
+        );
+    }
+
+    #[test]
     fn command_completion_uppercase_q_no_match() {
         // Case-sensitive: "Q" doesn't match "quit" (lowercase).
         let got = compute_completion("Q", 1);
@@ -13154,6 +13410,8 @@ mod dvdv_sidecar_idempotency_tests {
             original: String::new(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: per_file_values.into_iter().map(str::to_string).collect(),
             per_file_originals: Vec::new(),
             mb_proposed_value: None,
@@ -14579,6 +14837,8 @@ MUSICBRAINZ_TRACKID = "recording-id"
             original: value.to_string(),
             is_binary: false,
             is_mixed: per_file_values.windows(2).any(|w| w[0] != w[1]),
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_originals: per_file_values.iter().map(|value| (*value).to_string()).collect(),
             per_file_values: per_file_values.iter().map(|value| (*value).to_string()).collect(),
             mb_proposed_value: None,
@@ -15493,6 +15753,8 @@ mod sacd_seed_tests {
                 original: String::new(),
                 is_binary: false,
                 is_mixed: mixed,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec![v.to_string()],
                 per_file_originals: vec![v.to_string()],
                 mb_proposed_value: None,
@@ -17909,5 +18171,117 @@ mod source_relative_set_command_tests {
 
         assert_eq!(*app.convert.format.bit_depth.selected_value(), BitDepthChoice::Int16);
         assert_eq!(*app.convert.format.dither.selected_value(), DitherType::Shibata);
+    }
+}
+
+#[cfg(test)]
+mod mb_cardinality_command_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{MetadataEditorPhase, MetadataEditorState, MetadataTechnicalDetails};
+    use crate::tui::probe::{RowScope, TagEntry};
+    use lofty::tag::ItemKey;
+    use tokio::sync::mpsc;
+
+    fn mb_entry(current: &str, proposed: &str) -> TagEntry {
+        TagEntry {
+            row_scope: RowScope::File,
+            display_key: "ARTIST".to_string(),
+            item_key: ItemKey::TrackArtist,
+            value: current.to_string(),
+            original: "Alpha; Beta".to_string(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2],
+            per_file_values: vec![current.to_string()],
+            per_file_originals: vec!["Alpha; Beta".to_string()],
+            mb_proposed_value: Some(proposed.to_string()),
+            mb_proposed_per_file: Some(vec![proposed.to_string()]),
+        }
+    }
+
+    fn app_with_pending_entry(entry: TagEntry) -> AppState {
+        let state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            vec![entry],
+            vec!["a".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        app
+    }
+
+    #[test]
+    fn revert_command_use_mb_preserves_cardinality_warning() {
+        let mut app = app_with_pending_entry(mb_entry("Alpha; Beta", "New Artist"));
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_command(&mut app, Command::MbRevert, &tx);
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains(":revert: ARTIST (applied MB value)"));
+        assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn detail_revert_command_use_mb_preserves_cardinality_warning() {
+        let mut app = app_with_pending_entry(mb_entry("Alpha; Beta", "New Artist"));
+        if let Some(state) = app.pending_metadata_editor.as_mut() {
+            state.phase = MetadataEditorPhase::DetailEdit;
+            state.detail_field_idx = 0;
+        }
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_command(&mut app, Command::MbRevert, &tx);
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains(":revert: ARTIST (applied MB values)"));
+        assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn revert_command_to_original_does_not_emit_false_cardinality_warning() {
+        let mut app = app_with_pending_entry(mb_entry("New Artist", "New Artist"));
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_command(&mut app, Command::MbRevert, &tx);
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains(":revert: ARTIST (reverted to file value)"));
+        assert!(!status.contains("warning:"));
+    }
+
+    #[test]
+    fn restore_command_preserves_cardinality_warning() {
+        let mut app = app_with_pending_entry(mb_entry("Manual Artist", "New Artist"));
+        if let Some(state) = app.pending_metadata_editor.as_mut() {
+            state.phase = MetadataEditorPhase::DetailEdit;
+            state.detail_field_idx = 0;
+        }
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_command(&mut app, Command::MbRestore, &tx);
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains(":restore: ARTIST (snapped to MB values)"));
+        assert!(status.contains("warning: 1 carrier"));
     }
 }

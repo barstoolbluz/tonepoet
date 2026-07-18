@@ -5216,8 +5216,18 @@ pub struct TagEntry {
     pub is_binary: bool,
     /// True if files have different values for this key.
     pub is_mixed: bool,
+    /// Compatibility summary: true when at least one source carrier stored
+    /// more than one item for this logical key. Per-slot decisions must use
+    /// `per_file_stored_value_counts`; this aggregate cannot identify which
+    /// file would lose cardinality.
+    pub has_multiple_stored_values: bool,
     /// The semantic dimension of the positional value vectors.
     pub row_scope: RowScope,
+    /// Stored item/frame cardinality for each position in `per_file_values`.
+    /// A value greater than one means replacing that scalar display value
+    /// collapses multiple source items into one. Empty is allowed for
+    /// synthetic/derived rows that have no source-carrier provenance.
+    pub per_file_stored_value_counts: Vec<usize>,
     /// Current values in the row's declared positional dimension.
     pub per_file_values: Vec<String>,
     /// Per-file original values at read time (for per-file write diff).
@@ -5246,6 +5256,231 @@ impl TagEntry {
 
     pub fn is_track_scoped(&self, file_count: usize) -> bool {
         self.effective_row_scope(file_count) == RowScope::Track
+    }
+
+    /// Return the original stored-item cardinality for one positional slot.
+    /// Legacy/synthetic rows may not carry a vector. The aggregate flag is a
+    /// safe fallback only for a single-slot row; using it for a mixed row
+    /// would warn against the wrong file.
+    pub fn stored_value_count_for_slot(&self, slot: usize) -> usize {
+        self.per_file_stored_value_counts
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| {
+                if self.per_file_values.len() == 1 && self.has_multiple_stored_values {
+                    2
+                } else if self.per_file_values.get(slot).is_some() {
+                    1
+                } else {
+                    0
+                }
+            })
+    }
+
+    pub fn slot_has_multiple_stored_values(&self, slot: usize) -> bool {
+        self.stored_value_count_for_slot(slot) > 1
+    }
+
+    /// Return positional carriers that would lose stored-item cardinality if
+    /// the supplied scalar replacements were applied.
+    ///
+    /// A carrier is reported only when all three conditions hold:
+    /// - the source stored more than one item/frame for the logical key;
+    /// - the replacement differs from the current scalar projection, so the
+    ///   mutation actually changes text; and
+    /// - the replacement differs from the original scalar projection, so a
+    ///   revert does not produce a false warning.
+    ///
+    /// All interactive scalar-edit paths must use this detector before
+    /// replacing `per_file_values`; cardinality provenance is positional and
+    /// cannot be inferred from the row-wide compatibility summary.
+    pub fn stored_value_collapse_slots<'a, I>(&self, replacements: I) -> Vec<usize>
+    where
+        I: IntoIterator<Item = (usize, &'a str)>,
+    {
+        let mut slots = replacements
+            .into_iter()
+            .filter_map(|(slot, replacement)| {
+                let current = self.per_file_values.get(slot)?;
+                let original = self.per_file_originals.get(slot)?;
+                (self.slot_has_multiple_stored_values(slot)
+                    && current.as_str() != replacement
+                    && original.as_str() != replacement)
+                    .then_some(slot)
+            })
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    /// Return source carriers whose current scalar projection already differs
+    /// from the original multi-item representation. This is the snapshot-free
+    /// form of `stored_value_collapse_slots`, used only when provider
+    /// population happened while constructing an editor before the event-loop
+    /// reducer could retain a pre-mutation snapshot.
+    pub fn current_stored_value_collapse_slots(&self) -> Vec<usize> {
+        let mut slots = self
+            .per_file_values
+            .iter()
+            .zip(self.per_file_originals.iter())
+            .enumerate()
+            .filter_map(|(slot, (current, original))| {
+                (self.slot_has_multiple_stored_values(slot) && current != original)
+                    .then_some(slot)
+            })
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    /// Discard source-carrier cardinality when a file-scoped row is repurposed
+    /// as a synthetic or track-scoped row. Both representations must be reset
+    /// together so the single-slot compatibility fallback cannot emit a stale
+    /// warning.
+    pub fn clear_stored_value_provenance(&mut self) {
+        self.per_file_stored_value_counts.clear();
+        self.has_multiple_stored_values = false;
+    }
+}
+
+/// One logical metadata field whose scalar replacement would collapse one or
+/// more source carriers that originally stored multiple values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataStoredValueCollapse {
+    pub display_key: String,
+    pub slots: Vec<usize>,
+}
+
+/// Structured result for multi-field metadata mutations that replace scalar
+/// projections. Provider population and MB revert/restore controls use this
+/// report while sharing the same positional detector used by typed edits,
+/// paste, and capitalization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataMutationReport {
+    pub changed_fields: usize,
+    pub collapsed_fields: Vec<MetadataStoredValueCollapse>,
+}
+
+impl MetadataMutationReport {
+    /// Compare complete entry snapshots before and after a mutation. Entries
+    /// are matched by their case-insensitive display key because the editor
+    /// maintains one row per logical key but may re-sort rows after provider
+    /// population.
+    pub fn between(before: &[TagEntry], after: &[TagEntry]) -> Self {
+        let mut report = Self::default();
+
+        for after_entry in after {
+            let before_entry = before.iter().find(|entry| {
+                entry
+                    .display_key
+                    .eq_ignore_ascii_case(&after_entry.display_key)
+            });
+
+            let changed = match before_entry {
+                Some(entry) => entry.per_file_values != after_entry.per_file_values,
+                None => after_entry.per_file_values.iter().any(|value| !value.is_empty()),
+            };
+            if !changed {
+                continue;
+            }
+            report.changed_fields += 1;
+
+            let Some(before_entry) = before_entry else {
+                continue;
+            };
+            let mut slots = before_entry.stored_value_collapse_slots(
+                after_entry
+                    .per_file_values
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, replacement)| (slot, replacement.as_str())),
+            );
+
+            // A provider may intentionally repurpose a file-scoped row as a
+            // track-scoped projection. In that case the post-mutation entry
+            // clears source-carrier provenance; do not attribute the old file
+            // cardinality to unrelated track positions.
+            slots.retain(|&slot| after_entry.slot_has_multiple_stored_values(slot));
+            if !slots.is_empty() {
+                report.collapsed_fields.push(MetadataStoredValueCollapse {
+                    display_key: after_entry.display_key.clone(),
+                    slots,
+                });
+            }
+        }
+
+        report
+    }
+
+    pub fn for_entry(before: &TagEntry, after: &TagEntry) -> Self {
+        Self::between(std::slice::from_ref(before), std::slice::from_ref(after))
+    }
+
+    /// Derive the current MusicBrainz population delta from durable editor
+    /// provenance. This is used when a provider-populated editor was built
+    /// before the completion reducer obtained a pre-mutation snapshot (for
+    /// example, split-CUE editor construction).
+    pub fn from_musicbrainz_entries(entries: &[TagEntry]) -> Self {
+        let mut report = Self::default();
+
+        for entry in entries {
+            if entry.mb_proposed_value.is_none() && entry.mb_proposed_per_file.is_none() {
+                continue;
+            }
+            if entry.per_file_values == entry.per_file_originals {
+                continue;
+            }
+
+            report.changed_fields += 1;
+            let slots = entry.current_stored_value_collapse_slots();
+            if !slots.is_empty() {
+                report.collapsed_fields.push(MetadataStoredValueCollapse {
+                    display_key: entry.display_key.clone(),
+                    slots,
+                });
+            }
+        }
+
+        report
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.changed_fields = self.changed_fields.saturating_add(other.changed_fields);
+        self.collapsed_fields.extend(other.collapsed_fields);
+    }
+
+    pub fn collapsed_carrier_count(&self) -> usize {
+        self.collapsed_fields
+            .iter()
+            .map(|field| field.slots.len())
+            .sum()
+    }
+
+    pub fn append_collapse_warning(&self, status: &mut String) {
+        let carriers = self.collapsed_carrier_count();
+        if carriers == 0 {
+            return;
+        }
+        status.push_str(&format!(
+            "; warning: {} carrier{} across {} field{} collapsed multiple stored values \
+             into one value",
+            carriers,
+            if carriers == 1 { "" } else { "s" },
+            self.collapsed_fields.len(),
+            if self.collapsed_fields.len() == 1 { "" } else { "s" },
+        ));
+    }
+
+    pub fn append_provider_summary(&self, provider: &str, status: &mut String) {
+        status.push_str(&format!(
+            "; {} populated {} field{}",
+            provider,
+            self.changed_fields,
+            if self.changed_fields == 1 { "" } else { "s" },
+        ));
+        self.append_collapse_warning(status);
     }
 }
 
@@ -5300,6 +5535,11 @@ pub fn ensure_dim_replicate(entry: &mut TagEntry, target_dim: usize) {
         .unwrap_or_default();
     entry.per_file_values.resize(target_dim, pad_v);
     entry.per_file_originals.resize(target_dim, pad_o);
+    // This helper converts a single-carrier file row into a track-scoped
+    // proposal vector. Source-file cardinality no longer maps to those track
+    // positions, so retaining or broadcasting it would warn against the wrong
+    // detail slot.
+    entry.clear_stored_value_provenance();
 }
 
 pub fn metadata_editor_has_changes(state: &super::app::MetadataEditorState) -> bool {
@@ -5372,14 +5612,15 @@ pub fn mb_pill_state(entry: &TagEntry) -> MbRevertPill {
 ///
 /// Touches `value`, `per_file_values`, and `is_mixed`. `original` and
 /// `mb_proposed_*` are preserved so the toggle can flip again.
-pub fn toggle_mb_revert(entry: &mut TagEntry) {
+pub fn toggle_mb_revert(entry: &mut TagEntry) -> MetadataMutationReport {
+    let before = entry.clone();
     let proposed = match &entry.mb_proposed_value {
         Some(p) => p.clone(),
-        None => return,
+        None => return MetadataMutationReport::default(),
     };
     let proposed_per_file = match &entry.mb_proposed_per_file {
         Some(p) => p.clone(),
-        None => return,
+        None => return MetadataMutationReport::default(),
     };
 
     if entry.value == proposed {
@@ -5392,7 +5633,7 @@ pub fn toggle_mb_revert(entry: &mut TagEntry) {
         entry.per_file_values = proposed_per_file;
     } else {
         // Manual edit; toggle is ambiguous. No-op.
-        return;
+        return MetadataMutationReport::default();
     }
 
     let n = entry.per_file_values.len();
@@ -5401,6 +5642,7 @@ pub fn toggle_mb_revert(entry: &mut TagEntry) {
     if entry.is_mixed {
         entry.value = "<multiple values>".to_string();
     }
+    MetadataMutationReport::for_entry(&before, entry)
 }
 
 /// Field-level pill state for the metadata-editor *detail* overlay.
@@ -5436,9 +5678,10 @@ pub fn mb_pill_state_field(entry: &TagEntry) -> MbRevertPill {
 /// MB-proposed set and the pre-MB originals, recomputing `value` and
 /// `is_mixed`. No-op when MB never touched this field, or the user has
 /// manually edited (state isn't either endpoint).
-pub fn toggle_mb_revert_field(entry: &mut TagEntry) {
+pub fn toggle_mb_revert_field(entry: &mut TagEntry) -> MetadataMutationReport {
+    let before = entry.clone();
     let Some(ref proposed) = entry.mb_proposed_value else {
-        return;
+        return MetadataMutationReport::default();
     };
     let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
         Some(v) => v.clone(),
@@ -5450,19 +5693,21 @@ pub fn toggle_mb_revert_field(entry: &mut TagEntry) {
     } else if entry.per_file_values == entry.per_file_originals {
         entry.per_file_values = proposed_per_file;
     } else {
-        return;
+        return MetadataMutationReport::default();
     }
 
     recompute_aggregate_value(entry);
+    MetadataMutationReport::for_entry(&before, entry)
 }
 
 /// Restore action for the detail overlay: discard any per-file user
 /// edits and snap `per_file_values` back to the as-retrieved MB
 /// proposal. Broadcasts `mb_proposed_value` when `mb_proposed_per_file`
 /// is None. No-op when MB never touched the field.
-pub fn restore_mb_proposed(entry: &mut TagEntry) {
+pub fn restore_mb_proposed(entry: &mut TagEntry) -> MetadataMutationReport {
+    let before = entry.clone();
     let Some(ref proposed) = entry.mb_proposed_value else {
-        return;
+        return MetadataMutationReport::default();
     };
     let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
         Some(v) => v.clone(),
@@ -5470,6 +5715,7 @@ pub fn restore_mb_proposed(entry: &mut TagEntry) {
     };
     entry.per_file_values = proposed_per_file;
     recompute_aggregate_value(entry);
+    MetadataMutationReport::for_entry(&before, entry)
 }
 
 /// True when MB populated this field, so the detail overlay should
@@ -5710,8 +5956,24 @@ fn apply_paths_entries_permutation(
                 .iter()
                 .map(|&i| entry.per_file_originals[i].clone())
                 .collect();
+            let sc = (entry.per_file_stored_value_counts.len() == n).then(|| {
+                perm.iter()
+                    .map(|&i| entry.per_file_stored_value_counts[i])
+                    .collect::<Vec<_>>()
+            });
             entry.per_file_values = sv;
             entry.per_file_originals = so;
+            if let Some(sc) = sc {
+                entry.per_file_stored_value_counts = sc;
+            } else if entry.has_multiple_stored_values
+                || !entry.per_file_stored_value_counts.is_empty()
+            {
+                // A non-aligned aggregate cannot identify a carrier after the
+                // path permutation. Retire it rather than risk warning against
+                // the wrong file. Production readers always provide an aligned
+                // vector; this is a fail-safe for legacy/synthetic rows.
+                entry.clear_stored_value_provenance();
+            }
         }
         // Per-track entries (len != n, single-image rips with embedded
         // CUESHEET) are indexed by MB-track position, not file position,
@@ -5879,6 +6141,7 @@ struct CanonicalEditorTagField {
     item_key: lofty::tag::ItemKey,
     value: String,
     is_binary: bool,
+    stored_value_count: usize,
 }
 
 fn canonical_editor_item_key(
@@ -5933,6 +6196,11 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
         };
         if let Some(index) = indexes.get(&display_key).copied() {
             let field: &mut CanonicalEditorTagField = &mut fields[index];
+            // A second stored carrier is cardinality information even when
+            // its text duplicates the first value. Keep display de-duplicated,
+            // but retain the fact that an explicit scalar edit will collapse
+            // more than one stored item.
+            field.stored_value_count += 1;
             append_distinct_editor_value(&mut field.value, &value);
             field.is_binary |= is_binary;
             continue;
@@ -5943,6 +6211,7 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
             display_key,
             value,
             is_binary,
+            stored_value_count: 1,
         });
     }
     fields
@@ -5960,6 +6229,7 @@ fn canonical_editor_fields_from_dsf(
         .iter()
         .map(|(display_key, values)| {
             let display_key = canonical_metadata_display_key(display_key);
+            let stored_value_count = snapshot.stored_value_count(&display_key);
             CanonicalEditorTagField {
                 item_key: canonical_editor_item_key(
                     &display_key,
@@ -5968,6 +6238,7 @@ fn canonical_editor_fields_from_dsf(
                 display_key,
                 value: values.join("; "),
                 is_binary: false,
+                stored_value_count,
             }
         })
         .collect()
@@ -6008,6 +6279,8 @@ fn tag_entries_from_dsf_snapshot(snapshot: &crate::dsf_tags::DsfTagSnapshot) -> 
             original: field.value.clone(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: field.stored_value_count > 1,
+            per_file_stored_value_counts: vec![field.stored_value_count],
             per_file_values: vec![field.value.clone()],
             per_file_originals: vec![field.value],
             mb_proposed_value: None,
@@ -6083,6 +6356,8 @@ pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usiz
                 original: String::new(),
                 is_binary: false,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: vec![0; n_files],
                 per_file_values: vec![String::new(); n_files],
                 per_file_originals: vec![String::new(); n_files],
                 mb_proposed_value: None,
@@ -6342,6 +6617,8 @@ fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEn
             original: field.value.clone(),
             is_binary: field.is_binary,
             is_mixed: false,
+            has_multiple_stored_values: field.stored_value_count > 1,
+            per_file_stored_value_counts: vec![field.stored_value_count],
             per_file_values: vec![field.value.clone()],
             per_file_originals: vec![field.value],
             mb_proposed_value: None,
@@ -6481,6 +6758,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
     struct KeyData {
         item_key: lofty::tag::ItemKey,
         is_binary: bool,
+        stored_value_counts: Vec<usize>,
         values: Vec<String>,
     }
 
@@ -6503,12 +6781,14 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
                         KeyData {
                             item_key: field.item_key.clone(),
                             is_binary: false,
+                            stored_value_counts: vec![0; n],
                             values: vec![String::new(); n],
                         },
                     );
                 }
                 if let Some(data) = key_map.get_mut(&key) {
                     data.values[file_idx] = field.value;
+                    data.stored_value_counts[file_idx] = field.stored_value_count;
                 }
             }
             continue;
@@ -6529,6 +6809,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
                     KeyData {
                         item_key: field.item_key.clone(),
                         is_binary: field.is_binary,
+                        stored_value_counts: vec![0; n],
                         values: vec![String::new(); n],
                     },
                 );
@@ -6536,6 +6817,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             if let Some(data) = key_map.get_mut(&key) {
                 data.values[file_idx] = field.value;
                 data.is_binary |= field.is_binary;
+                data.stored_value_counts[file_idx] = field.stored_value_count;
             }
         }
     }
@@ -6560,6 +6842,11 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             original: display_value,
             is_binary: data.is_binary,
             is_mixed,
+            has_multiple_stored_values: data
+                .stored_value_counts
+                .iter()
+                .any(|count| *count > 1),
+            per_file_stored_value_counts: data.stored_value_counts,
             per_file_values: data.values.clone(),
             per_file_originals: data.values,
             mb_proposed_value: None,
@@ -6650,6 +6937,7 @@ pub fn read_all_tags_merged_with_metadata(
     struct KeyData {
         item_key: lofty::tag::ItemKey,
         is_binary: bool,
+        stored_value_counts: Vec<usize>,
         values: Vec<String>,
     }
 
@@ -6677,12 +6965,14 @@ pub fn read_all_tags_merged_with_metadata(
                                 KeyData {
                                     item_key: field.item_key.clone(),
                                     is_binary: false,
+                                    stored_value_counts: vec![0; n],
                                     values: vec![String::new(); n],
                                 },
                             );
                         }
                         if let Some(data) = key_map.get_mut(&key) {
                             data.values[file_idx] = field.value;
+                            data.stored_value_counts[file_idx] = field.stored_value_count;
                         }
                     }
                 }
@@ -6719,6 +7009,7 @@ pub fn read_all_tags_merged_with_metadata(
                     KeyData {
                         item_key: field.item_key.clone(),
                         is_binary: field.is_binary,
+                        stored_value_counts: vec![0; n],
                         values: vec![String::new(); n],
                     },
                 );
@@ -6726,6 +7017,7 @@ pub fn read_all_tags_merged_with_metadata(
             if let Some(data) = key_map.get_mut(&key) {
                 data.values[file_idx] = field.value;
                 data.is_binary |= field.is_binary;
+                data.stored_value_counts[file_idx] = field.stored_value_count;
             }
         }
     }
@@ -6750,6 +7042,11 @@ pub fn read_all_tags_merged_with_metadata(
             original: display_value,
             is_binary: data.is_binary,
             is_mixed,
+            has_multiple_stored_values: data
+                .stored_value_counts
+                .iter()
+                .any(|count| *count > 1),
+            per_file_stored_value_counts: data.stored_value_counts,
             per_file_values: data.values.clone(),
             per_file_originals: data.values,
             mb_proposed_value: None,
@@ -7081,16 +7378,10 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
     for (idx, write) in planned.iter_mut().enumerate() {
         write.write_ordinal = idx + 1;
     }
-    let has_duplicate_targets = {
-        let mut seen = std::collections::BTreeSet::new();
-        planned.iter().any(|write| !seen.insert(write.path.clone()))
-    };
-    let has_dsf_targets = planned.iter().any(|write| crate::dsf_tags::is_dsf(&write.path));
-    let worker_count = metadata_write_worker_count(
-        total,
-        has_duplicate_targets,
-        has_dsf_targets,
+    let requires_serialization = metadata_write_targets_require_serialization(
+        planned.iter().map(|write| write.path.as_path()),
     );
+    let worker_count = metadata_write_worker_count(total, requires_serialization);
     let planned = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(planned)));
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, crate::tui::app::MetadataEditorWriteResult)>::with_capacity(total)));
@@ -7183,12 +7474,48 @@ fn metadata_write_parallelism(write_count: usize) -> usize {
     write_count.min(cpus).min(4).max(1)
 }
 
-fn metadata_write_worker_count(
-    write_count: usize,
-    has_duplicate_targets: bool,
-    has_dsf_targets: bool,
-) -> usize {
-    if has_duplicate_targets || has_dsf_targets {
+fn metadata_write_targets_require_serialization<'a>(
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
+) -> bool {
+    let mut pathnames = std::collections::BTreeSet::new();
+    let mut authority_paths = std::collections::BTreeSet::new();
+    let mut identities = Vec::<same_file::Handle>::new();
+    for path in paths {
+        if !pathnames.insert(path.to_path_buf()) {
+            return true;
+        }
+        if crate::dsf_tags::is_dsf(path) {
+            let identity = match same_file::Handle::from_path(path) {
+                Ok(identity) => identity,
+                // DSF writes are destructive. If file identity cannot be
+                // established, fail closed to the serial scheduler rather than
+                // assuming two pathnames cannot name the same inode/file object.
+                Err(_) => return true,
+            };
+            if identities.iter().any(|existing| existing == &identity) {
+                return true;
+            }
+            identities.push(identity);
+            let authorities = match crate::dsf_tags::write_authority_paths(path) {
+                Ok(authorities) => authorities,
+                Err(_) => return true,
+            };
+            if authorities
+                .into_iter()
+                .any(|authority| !authority_paths.insert(authority))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn metadata_write_worker_count(write_count: usize, requires_serialization: bool) -> usize {
+    // Distinct DSF targets may run concurrently only when their pathnames,
+    // file identities, hashed journals, legacy journals, and store-lock
+    // authority paths are all disjoint. Any derivation failure serializes.
+    if requires_serialization {
         1
     } else {
         metadata_write_parallelism(write_count)
@@ -7661,6 +7988,11 @@ enum ArtworkRollbackToken {
         journal: std::path::PathBuf,
         _write_claim: flac_metadata_writer::FlacWriteClaim,
     },
+    Dsf {
+        path: std::path::PathBuf,
+        snapshot: crate::dsf_tags::DsfArtworkSnapshot,
+        commit_warning: Option<String>,
+    },
     FullFileBackup {
         path: std::path::PathBuf,
         backup: std::path::PathBuf,
@@ -7782,6 +8114,23 @@ fn write_artwork_one_file(
         }
     }
 
+    if crate::dsf_tags::is_dsf(path) {
+        let cancelled = || cancel.is_some_and(MetadataWriteCancelFlag::is_cancelled);
+        let (snapshot, commit_warning) = crate::dsf_tags::write_artwork_with_control(
+            path,
+            picture_type.as_u8(),
+            flac_mime_type,
+            image_bytes,
+            &cancelled,
+            &|_| {},
+        )?;
+        return Ok(Some(ArtworkRollbackToken::Dsf {
+            path: path.to_path_buf(),
+            snapshot,
+            commit_warning,
+        }));
+    }
+
     reject_unsupported_dff_metadata_write(path, "artwork writing")?;
     check_metadata_write_cancel(cancel, "before starting artwork full-file fallback rewrite")?;
     write_artwork_lofty_with_backup(path, image_bytes, lofty_mime_type, picture_type)
@@ -7852,6 +8201,23 @@ fn remove_artwork_one_file(
                 return Err(native_flac_write_refused_error(path, "artwork removal", &native_err));
             }
         }
+    }
+
+    if crate::dsf_tags::is_dsf(path) {
+        let cancelled = || cancel.is_some_and(MetadataWriteCancelFlag::is_cancelled);
+        let Some((snapshot, commit_warning)) = crate::dsf_tags::remove_artwork_with_control(
+            path,
+            picture_type.as_u8(),
+            &cancelled,
+            &|_| {},
+        )? else {
+            return Ok(None);
+        };
+        return Ok(Some(ArtworkRollbackToken::Dsf {
+            path: path.to_path_buf(),
+            snapshot,
+            commit_warning,
+        }));
     }
 
     reject_unsupported_dff_metadata_write(path, "artwork removal")?;
@@ -7973,6 +8339,16 @@ fn rollback_artwork_tokens(tokens: &mut [ArtworkRollbackToken]) -> Vec<String> {
                     issues.push(warning);
                 }
             }
+            ArtworkRollbackToken::Dsf { path, snapshot, .. } => {
+                match crate::dsf_tags::restore_artwork_snapshot(path, snapshot) {
+                    Ok(Some(warning)) => issues.push(warning),
+                    Ok(None) => {}
+                    Err(error) => issues.push(format!(
+                        "restore DSF artwork metadata '{}' failed: {error}; any retained DSF journal remains authoritative for startup recovery",
+                        path.display()
+                    )),
+                }
+            }
             ArtworkRollbackToken::FullFileBackup { path, backup } => {
                 if backup.exists() {
                     if let Err(error) = crate::db::Database::restore_backup_for(path, backup) {
@@ -8015,6 +8391,11 @@ fn cleanup_artwork_tokens(tokens: &mut [ArtworkRollbackToken]) -> ArtworkCleanup
                     )),
                 }
                 if let Some(warning) = _write_claim.release_with_warning("FLAC common write lock removal after committed artwork batch") {
+                    report.committed_warnings.push(warning);
+                }
+            }
+            ArtworkRollbackToken::Dsf { commit_warning, .. } => {
+                if let Some(warning) = commit_warning.take() {
                     report.committed_warnings.push(warning);
                 }
             }
@@ -8194,10 +8575,106 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_write_worker_policy_serializes_dsf_and_duplicate_targets() {
-        assert_eq!(metadata_write_worker_count(8, false, true), 1);
-        assert_eq!(metadata_write_worker_count(8, true, false), 1);
-        assert_eq!(metadata_write_worker_count(1, false, false), 1);
+    fn metadata_write_worker_policy_parallelizes_distinct_dsf_targets() {
+        assert_eq!(metadata_write_worker_count(8, true), 1);
+        assert_eq!(metadata_write_worker_count(1, false), 1);
+        assert_eq!(
+            metadata_write_worker_count(8, false),
+            metadata_write_parallelism(8)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_write_worker_policy_serializes_hard_link_aliases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.dsf");
+        let alias = temp.path().join("alias.dsf");
+        std::fs::write(&target, b"fixture").expect("write target");
+        std::fs::hard_link(&target, &alias).expect("create hard-link alias");
+
+        assert!(metadata_write_targets_require_serialization([
+            target.as_path(),
+            alias.as_path(),
+        ]));
+    }
+
+    #[test]
+    fn metadata_write_worker_policy_parallelizes_distinct_file_identities() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.dsf");
+        let second = temp.path().join("second.dsf");
+        std::fs::write(&first, b"first").expect("write first target");
+        std::fs::write(&second, b"second").expect("write second target");
+
+        assert!(!metadata_write_targets_require_serialization([
+            first.as_path(),
+            second.as_path(),
+        ]));
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_write_worker_policy_parallelizes_distinct_non_utf8_authorities() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join(OsString::from_vec(b"one-\xff.dsf".to_vec()));
+        let second = temp.path().join(OsString::from_vec(b"two-\xfe.dsf".to_vec()));
+        crate::dsf_tags::write_test_dsf_fixture(&first, None).expect("write first DSF");
+        crate::dsf_tags::write_test_dsf_fixture(&second, None).expect("write second DSF");
+
+        assert!(!metadata_write_targets_require_serialization([
+            first.as_path(),
+            second.as_path(),
+        ]));
+        assert_eq!(
+            metadata_write_worker_count(2, false),
+            metadata_write_parallelism(2),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_write_worker_policy_parallelizes_non_utf8_and_literal_audio_dsf() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let non_utf = temp.path().join(OsString::from_vec(b"track-\xff.dsf".to_vec()));
+        let literal = temp.path().join("audio.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&non_utf, None).expect("write non-UTF DSF");
+        crate::dsf_tags::write_test_dsf_fixture(&literal, None).expect("write literal DSF");
+
+        assert!(!metadata_write_targets_require_serialization([
+            non_utf.as_path(),
+            literal.as_path(),
+        ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_write_worker_policy_serializes_shared_legacy_fallback_authority() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let non_utf = temp.path().join(OsString::from_vec(b"track-\xff.dsf".to_vec()));
+        let literal = temp.path().join("audio.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&non_utf, None).expect("write non-UTF DSF");
+        crate::dsf_tags::write_test_dsf_fixture(&literal, None).expect("write literal DSF");
+        std::fs::write(
+            temp.path().join(".audio.dsf.tonepoet-dsf-tail.journal"),
+            b"legacy authority fixture",
+        )
+        .expect("write legacy authority");
+
+        assert!(metadata_write_targets_require_serialization([
+            non_utf.as_path(),
+            literal.as_path(),
+        ]));
     }
 
     #[test]
@@ -8528,6 +9005,8 @@ mod tests {
             original: "legacy comment".to_string(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec!["legacy comment".to_string()],
             per_file_originals: vec!["legacy comment".to_string()],
             mb_proposed_value: None,
@@ -8542,6 +9021,102 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(logical_comments.len(), 1);
         assert_eq!(logical_comments[0].value, "legacy comment");
+    }
+
+    #[test]
+    fn canonical_editor_fields_mark_distinct_multi_value_carriers() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tag = Tag::new(TagType::VorbisComments);
+        // push() APPENDS duplicate-key items; insert_unchecked() REPLACES
+        // same-key items and would leave only the last value.
+        tag.push(TagItem::new(
+            ItemKey::TrackArtist,
+            ItemValue::Text("Alpha".to_string()),
+        ));
+        tag.push(TagItem::new(
+            ItemKey::TrackArtist,
+            ItemValue::Text("Alpha".to_string()),
+        ));
+        tag.push(TagItem::new(
+            ItemKey::TrackArtist,
+            ItemValue::Text("Beta".to_string()),
+        ));
+
+        let field = canonical_editor_fields_from_tag(&tag)
+            .into_iter()
+            .find(|field| field.display_key == "ARTIST")
+            .expect("canonical artist field");
+        assert_eq!(field.value, "Alpha; Beta");
+        assert_eq!(field.stored_value_count, 3);
+    }
+
+    #[test]
+    fn merged_dsf_rows_preserve_per_file_stored_value_counts() {
+        use id3::frame::Comment;
+        use id3::TagLike;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let multi_path = temp.path().join("multi.dsf");
+        let scalar_path = temp.path().join("scalar.dsf");
+
+        let mut multi_tag = id3::Tag::new();
+        multi_tag.add_frame(Comment {
+            lang: "eng".to_string(),
+            description: "first".to_string(),
+            text: "Alpha".to_string(),
+        });
+        multi_tag.add_frame(Comment {
+            lang: "eng".to_string(),
+            description: "duplicate".to_string(),
+            text: "Alpha".to_string(),
+        });
+        multi_tag.add_frame(Comment {
+            lang: "eng".to_string(),
+            description: "second".to_string(),
+            text: "Beta".to_string(),
+        });
+        let mut multi_metadata = Vec::new();
+        multi_tag
+            .write_to(&mut multi_metadata, id3::Version::Id3v24)
+            .expect("serialize multi-value ID3 fixture");
+        crate::dsf_tags::write_test_dsf_fixture(&multi_path, Some(&multi_metadata))
+            .expect("write multi-value DSF fixture");
+
+        let mut scalar_tag = id3::Tag::new();
+        scalar_tag.add_frame(Comment {
+            lang: "eng".to_string(),
+            description: "only".to_string(),
+            text: "Gamma".to_string(),
+        });
+        let mut scalar_metadata = Vec::new();
+        scalar_tag
+            .write_to(&mut scalar_metadata, id3::Version::Id3v24)
+            .expect("serialize scalar ID3 fixture");
+        crate::dsf_tags::write_test_dsf_fixture(&scalar_path, Some(&scalar_metadata))
+            .expect("write scalar DSF fixture");
+
+        let paths = vec![multi_path, scalar_path];
+        let merged = read_all_tags_merged(&paths).expect("merge DSF tags");
+        let comment = merged
+            .iter()
+            .find(|entry| entry.display_key == "COMMENT")
+            .expect("merged COMMENT row");
+        assert_eq!(
+            comment.per_file_values,
+            vec!["Alpha; Beta".to_string(), "Gamma".to_string()]
+        );
+        assert_eq!(comment.per_file_stored_value_counts, vec![3, 1]);
+        assert!(comment.has_multiple_stored_values);
+
+        let album = read_all_tags_merged_with_metadata(&paths)
+            .expect("merge DSF tags with album metadata");
+        let album_comment = album
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "COMMENT")
+            .expect("album COMMENT row");
+        assert_eq!(album_comment.per_file_stored_value_counts, vec![3, 1]);
     }
 
     #[test]
@@ -8603,6 +9178,8 @@ mod tests {
             original: "A".to_string(),
             is_binary: false,
             is_mixed: true,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec!["A".to_string(), "B".to_string(), "C".to_string()],
             per_file_originals: vec!["A".to_string(), "B".to_string(), "C".to_string()],
             mb_proposed_value: None,
@@ -11078,6 +11655,8 @@ mod tests {
             original: "<multiple values>".to_string(),
             is_binary: false,
             is_mixed: true,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2, 1],
             per_file_values: vec!["2".to_string(), "1".to_string()],
             per_file_originals: vec!["2".to_string(), "1".to_string()],
             mb_proposed_value: None,
@@ -11098,6 +11677,8 @@ mod tests {
 
         assert_eq!(paths[0].file_name().and_then(|s| s.to_str()), Some("01 - First.flac"));
         assert_eq!(entries[0].per_file_values, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(entries[0].per_file_stored_value_counts, vec![1, 2]);
+        assert!(entries[0].has_multiple_stored_values);
         assert_eq!(metadata[0].title.as_deref(), Some("First"));
         assert_eq!(metadata[1].title.as_deref(), Some("Second"));
     }
@@ -11111,6 +11692,8 @@ mod tests {
             original: original.to_string(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![proposed.to_string(); per_file_count],
             per_file_originals: vec![original.to_string(); per_file_count],
             mb_proposed_value: Some(proposed.to_string()),
@@ -11150,6 +11733,8 @@ mod tests {
             original: "x".into(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec!["x".into()],
             per_file_originals: vec!["x".into()],
             mb_proposed_value: None,
@@ -11188,6 +11773,161 @@ mod tests {
         assert_eq!(e.per_file_values, vec!["MB", "MB", "MB"]);
     }
 
+    fn multi_value_mb_entry(current: &[&str], proposed: &[&str]) -> TagEntry {
+        let current_values = current.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
+        let proposed_values = proposed.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
+        let mixed = current_values.windows(2).any(|pair| pair[0] != pair[1]);
+        TagEntry {
+            row_scope: RowScope::File,
+            display_key: "ARTIST".to_string(),
+            item_key: lofty::tag::ItemKey::TrackArtist,
+            value: if mixed {
+                "<multiple values>".to_string()
+            } else {
+                current_values.first().cloned().unwrap_or_default()
+            },
+            original: if mixed {
+                "<multiple values>".to_string()
+            } else {
+                current_values.first().cloned().unwrap_or_default()
+            },
+            is_binary: false,
+            is_mixed: mixed,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2, 1],
+            per_file_values: current_values.clone(),
+            per_file_originals: current_values,
+            mb_proposed_value: Some("<multiple values>".to_string()),
+            mb_proposed_per_file: Some(proposed_values),
+        }
+    }
+
+    #[test]
+    fn musicbrainz_snapshot_report_recovers_prepopulated_editor_loss() {
+        let mut entry = multi_value_mb_entry(
+            &["New Artist", "New Scalar"],
+            &["New Artist", "New Scalar"],
+        );
+        entry.per_file_originals = vec!["Alpha; Beta".to_string(), "Gamma".to_string()];
+
+        let report = MetadataMutationReport::from_musicbrainz_entries(&[entry]);
+
+        assert_eq!(report.changed_fields, 1);
+        assert_eq!(report.collapsed_carrier_count(), 1);
+        assert_eq!(report.collapsed_fields[0].display_key, "ARTIST");
+        assert_eq!(report.collapsed_fields[0].slots, vec![0]);
+    }
+
+    #[test]
+    fn mutation_report_merge_aggregates_provider_tabs() {
+        let mut first = MetadataMutationReport {
+            changed_fields: 2,
+            collapsed_fields: vec![MetadataStoredValueCollapse {
+                display_key: "ARTIST".to_string(),
+                slots: vec![0],
+            }],
+        };
+        first.merge(MetadataMutationReport {
+            changed_fields: 3,
+            collapsed_fields: vec![MetadataStoredValueCollapse {
+                display_key: "COMPOSER".to_string(),
+                slots: vec![1, 2],
+            }],
+        });
+
+        assert_eq!(first.changed_fields, 5);
+        assert_eq!(first.collapsed_carrier_count(), 3);
+        assert_eq!(first.collapsed_fields.len(), 2);
+    }
+
+    #[test]
+    fn provider_summary_composes_population_and_cardinality_loss() {
+        let report = MetadataMutationReport {
+            changed_fields: 8,
+            collapsed_fields: vec![MetadataStoredValueCollapse {
+                display_key: "ARTIST".to_string(),
+                slots: vec![0, 2],
+            }],
+        };
+        let mut status = "MusicBrainz complete".to_string();
+
+        report.append_provider_summary("MusicBrainz", &mut status);
+
+        assert_eq!(
+            status,
+            "MusicBrainz complete; MusicBrainz populated 8 fields; warning: 2 carriers across 1 field collapsed multiple stored values into one value"
+        );
+    }
+
+    #[test]
+    fn provider_completion_paths_preserve_structured_cardinality_reports() {
+        let event_loop = include_str!("event_loop.rs");
+        let keybindings = include_str!("keybindings.rs");
+        let main = include_str!("../main.rs");
+
+        assert!(event_loop.contains(
+            "mb_mutation_report.append_provider_summary(\"MusicBrainz\", &mut msg)"
+        ));
+        assert!(keybindings.contains(
+            "mutation_report.append_provider_summary(\"GNUDB\", &mut status)"
+        ));
+        assert!(keybindings.contains(
+            "apply_active_musicbrainz_values_to_matching_presentations"
+        ));
+        assert!(keybindings.contains("apply_result.changed_presentations"));
+        assert!(main.contains(
+            "mb_mutation_report.append_collapse_warning(&mut warning)"
+        ));
+    }
+
+    #[test]
+    fn use_mb_values_reports_only_the_multi_value_carrier() {
+        let mut entry = multi_value_mb_entry(
+            &["Alpha; Beta", "Gamma"],
+            &["New Artist", "New Scalar"],
+        );
+
+        let report = toggle_mb_revert_field(&mut entry);
+
+        assert_eq!(entry.per_file_values, vec!["New Artist", "New Scalar"]);
+        assert_eq!(report.changed_fields, 1);
+        assert_eq!(report.collapsed_carrier_count(), 1);
+        assert_eq!(report.collapsed_fields[0].display_key, "ARTIST");
+        assert_eq!(report.collapsed_fields[0].slots, vec![0]);
+    }
+
+    #[test]
+    fn reverting_mb_values_to_original_reports_no_cardinality_loss() {
+        let mut entry = multi_value_mb_entry(
+            &["Alpha; Beta", "Gamma"],
+            &["New Artist", "New Scalar"],
+        );
+        entry.per_file_values = vec!["New Artist".to_string(), "New Scalar".to_string()];
+        recompute_aggregate_value(&mut entry);
+
+        let report = toggle_mb_revert_field(&mut entry);
+
+        assert_eq!(entry.per_file_values, vec!["Alpha; Beta", "Gamma"]);
+        assert_eq!(report.changed_fields, 1);
+        assert_eq!(report.collapsed_carrier_count(), 0);
+    }
+
+    #[test]
+    fn restoring_mb_values_after_manual_edit_reports_cardinality_loss() {
+        let mut entry = multi_value_mb_entry(
+            &["Alpha; Beta", "Gamma"],
+            &["New Artist", "New Scalar"],
+        );
+        entry.per_file_values = vec!["Manual Artist".to_string(), "Gamma".to_string()];
+        recompute_aggregate_value(&mut entry);
+
+        let report = restore_mb_proposed(&mut entry);
+
+        assert_eq!(entry.per_file_values, vec!["New Artist", "New Scalar"]);
+        assert_eq!(report.collapsed_carrier_count(), 1);
+        assert_eq!(report.collapsed_fields[0].slots, vec![0]);
+    }
+
     #[test]
     fn metadata_editor_has_changes_true_with_pending_deletion() {
         use crate::tui::app::MetadataEditorState;
@@ -11202,6 +11942,8 @@ mod tests {
                 original: "x".into(),
                 is_binary: false,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["x".into()],
                 per_file_originals: vec!["x".into()],
                 mb_proposed_value: None,
@@ -11337,6 +12079,8 @@ mod tests {
             original: "y".into(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec!["x".into()],
             per_file_originals: vec!["y".into()],
             mb_proposed_value: None,
@@ -12006,7 +12750,10 @@ mod tests {
         .expect("rollback token");
         let journal = match &rollback {
             ArtworkRollbackToken::Flac { journal, .. } => journal.clone(),
-            ArtworkRollbackToken::FullFileBackup { .. } => panic!("expected native FLAC rollback token"),
+            ArtworkRollbackToken::FullFileBackup { .. }
+            | ArtworkRollbackToken::Dsf { .. } => {
+                panic!("expected native FLAC rollback token")
+            }
         };
         let hook_path = path.clone();
 

@@ -949,7 +949,8 @@ mod tests {
             expected_samples: Some(1_000),
             sample_rate: Some(2_822_400),
             bit_depth: None,
-        source_audio: SourceAudioDescriptor::default(),
+            source_audio: SourceAudioDescriptor::default(),
+            warnings: Vec::new(),
         }
     }
 
@@ -2017,6 +2018,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
             sample_rate: Some(44_100),
             bit_depth: Some(16),
             source_audio: SourceAudioDescriptor::default(),
+            warnings: Vec::new(),
         }
     }
 

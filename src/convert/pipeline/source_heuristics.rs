@@ -423,7 +423,8 @@ mod tests {
                 expected_samples: None,
                 sample_rate: Some(96000),
                 bit_depth: Some(24),
-            source_audio: SourceAudioDescriptor::default(),
+                source_audio: SourceAudioDescriptor::default(),
+                warnings: Vec::new(),
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Bloody Tourists (UK)".into()),
@@ -521,7 +522,8 @@ mod tests {
                 expected_samples: None,
                 sample_rate: Some(96000),
                 bit_depth: Some(24),
-            source_audio: SourceAudioDescriptor::default(),
+                source_audio: SourceAudioDescriptor::default(),
+                warnings: Vec::new(),
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Album (UK)".into()),

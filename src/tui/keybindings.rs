@@ -1871,6 +1871,11 @@ enum BrowseInlineCommit {
         path: std::path::PathBuf,
         value: String,
     },
+    Create {
+        dir: std::path::PathBuf,
+        kind: BrowseCreateKind,
+        value: String,
+    },
     Metadata {
         path: std::path::PathBuf,
         field: crate::tui::probe::MetadataField,
@@ -1882,6 +1887,9 @@ fn browse_inline_commit_from_state(state: BrowseInlineEditState) -> BrowseInline
     let value = state.input.text;
     match state.target {
         BrowseInlineEditTarget::Rename { path } => BrowseInlineCommit::Rename { path, value },
+        BrowseInlineEditTarget::Create { dir, kind } => {
+            BrowseInlineCommit::Create { dir, kind, value }
+        }
         BrowseInlineEditTarget::Metadata { path, field } => {
             BrowseInlineCommit::Metadata { path, field, value }
         }
@@ -1895,6 +1903,9 @@ fn commit_browse_inline_edit(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) 
     let committed = match browse_inline_commit_from_state(state.clone()) {
         BrowseInlineCommit::Rename { path, value } => {
             commit_browse_rename(app, path, value.trim(), tx)
+        }
+        BrowseInlineCommit::Create { dir, kind, value } => {
+            commit_browse_create(app, dir, kind, value.trim(), tx)
         }
         BrowseInlineCommit::Metadata { path, field, value } => {
             apply_text_edit(
@@ -2027,6 +2038,8 @@ mod metadata_auto_populate_alignment_tests {
             original: String::new(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values.iter().map(|v| v.to_string()).collect(),
             per_file_originals: values.iter().map(|v| v.to_string()).collect(),
             mb_proposed_value: None,
@@ -2878,6 +2891,143 @@ mod inline_edit_behavior_tests {
             1,
             None,
         )
+    }
+
+    #[test]
+    fn browse_create_file_and_folder_refresh_and_select_created_entry() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+
+        assert!(commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::File,
+            "notes.txt",
+            &tx,
+        ));
+        let file = temp.path().join("notes.txt");
+        assert!(file.is_file());
+        assert_eq!(
+            app.browse.selected_entry().map(|entry| entry.path.clone()),
+            Some(file)
+        );
+
+        assert!(commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::Folder,
+            "artwork",
+            &tx,
+        ));
+        let folder = temp.path().join("artwork");
+        assert!(folder.is_dir());
+        assert_eq!(
+            app.browse.selected_entry().map(|entry| entry.path.clone()),
+            Some(folder)
+        );
+    }
+
+    #[test]
+    fn browse_create_refuses_overwrite_dot_components_and_path_separators() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let existing = temp.path().join("existing.txt");
+        std::fs::write(&existing, b"original").expect("existing fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+
+        assert!(!commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::File,
+            "existing.txt",
+            &tx,
+        ));
+        assert_eq!(std::fs::read(&existing).expect("existing retained"), b"original");
+        for invalid in [".", "..", "nested/name", "nested\\name", ""] {
+            assert!(
+                !commit_browse_create(
+                    &mut app,
+                    temp.path().to_path_buf(),
+                    BrowseCreateKind::File,
+                    invalid,
+                    &tx,
+                ),
+                "invalid component {invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn browse_create_refuses_archive_mode_without_touching_filesystem() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive fixture").expect("archive fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.enter_archive(
+            crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive,
+                format: "zip".to_string(),
+                physical_size: 15,
+                entries: Vec::new(),
+            },
+            None,
+        );
+
+        assert!(!commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::File,
+            "must-not-exist.txt",
+            &tx,
+        ));
+        assert!(!temp.path().join("must-not-exist.txt").exists());
+        assert!(!begin_browse_create(&mut app, BrowseCreateKind::Folder));
+        assert!(app.browse_inline_edit.is_none());
+    }
+
+    #[test]
+    fn browse_empty_space_context_menu_ignores_existing_selection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let selected = temp.path().join("selected.flac");
+        std::fs::write(&selected, b"fixture").expect("selected fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(selected)];
+        app.browse.selected_index = 0;
+        app.button_map
+            .record_button(TuiButton::BrowseList, Rect::new(2, 2, 40, 12));
+        app.button_map
+            .record_button(TuiButton::BrowseEntry(0), Rect::new(2, 3, 40, 1));
+
+        open_context_menu(&mut app, 5, 10);
+
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("expected context menu");
+        };
+        let entries = &levels[0].entries;
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if matches!(&item.action, crate::tui::context_menu::ContextAction::NewFile)
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if matches!(&item.action, crate::tui::context_menu::ContextAction::NewFolder)
+        )));
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if matches!(&item.action, crate::tui::context_menu::ContextAction::RenameEntry)
+        )));
     }
 
     #[tokio::test]
@@ -4718,14 +4868,23 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             target,
             label,
         } => {
+            let restore_parked_metadata_editor =
+                matches!(&target, TextEditTarget::ArchivePassword(_));
             match key.code {
                 KeyCode::Enter => {
                     let text = input.text.clone();
                     apply_text_edit(app, target, &text, tx);
                     // apply_text_edit may set its own overlay (e.g. BulkRenameLine
-                    // restores BulkRename). Only clear if it didn't.
+                    // restores BulkRename). Only clear if it did not.
                     if matches!(app.active_overlay, ActiveOverlay::TextEdit { .. }) {
                         app.active_overlay = ActiveOverlay::None;
+                    }
+                    if restore_parked_metadata_editor
+                        && matches!(app.active_overlay, ActiveOverlay::None)
+                    {
+                        if let Some(editor) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+                        }
                     }
                 }
                 KeyCode::Esc => {
@@ -4740,10 +4899,14 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         }
                     }
                     app.active_overlay = ActiveOverlay::None;
+                    if restore_parked_metadata_editor {
+                        if let Some(editor) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+                        }
+                    }
                 }
                 _ => {
                     super::text_input::handle_text_input_key(&mut input, &key);
-                    // Only reach here when input was modified (no consuming ops).
                     app.active_overlay = ActiveOverlay::TextEdit {
                         input,
                         target,
@@ -5198,7 +5361,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         if let ActiveOverlay::MetadataEditor(ref mut editor_state) =
                             app.active_overlay
                         {
-                            super::gnudb::populate_editor_from_review(editor_state, &state);
+                            let mutation_report =
+                                super::gnudb::populate_editor_from_review(editor_state, &state);
                             // Cache the review state for `:gnudb-back`
                             // — user can return to the per-track edit
                             // surface preserving their edits, no
@@ -5210,13 +5374,15 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                                 .first()
                                 .map(|t| t.artist.as_str())
                                 .unwrap_or("?");
-                            app.set_status(format!(
+                            let mut status = format!(
                                 "Tags loaded — {} / {} ({} disc{})",
                                 artist,
                                 first_page.album,
                                 state.pages.len(),
                                 if state.pages.len() == 1 { "" } else { "s" },
-                            ));
+                            );
+                            mutation_report.append_provider_summary("GNUDB", &mut status);
+                            app.set_status(status);
                         }
                     }
                     (KeyCode::Char('c'), _) => {
@@ -6065,11 +6231,16 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
 
     let entries = match app.current_screen {
         AppScreen::Browse => {
-            // If there's a selected entry, build entry menu; else empty-space menu.
-            if app.browse.selected_entry().is_some() {
-                build_browse_entry_menu(app)
-            } else {
-                build_browse_empty_menu(app)
+            // Entry hit targets are registered after BrowseList and therefore
+            // win reverse hit-testing. A click on the remaining list area is
+            // true empty space even when another row remains selected.
+            match app.button_map.find_button_at(x, y) {
+                Some(TuiButton::BrowseEntry(_)) | Some(TuiButton::BrowseEntryGutter(_)) => {
+                    build_browse_entry_menu(app)
+                }
+                Some(TuiButton::BrowseList) => build_browse_empty_menu(app),
+                _ if app.browse.selected_entry().is_some() => build_browse_entry_menu(app),
+                _ => build_browse_empty_menu(app),
             }
         }
         AppScreen::Convert => build_convert_menu(app),
@@ -7783,7 +7954,10 @@ mod progress_dialog_theme_tests {
         let config_path = TonepoetConfig::config_path();
         let parent = config_path.parent().expect("config parent");
         std::fs::create_dir_all(parent).expect("create config parent");
-        let lock_path = parent.join(".config.toml.save.lock");
+        // Store locks live at SHA-256 authority names now; derive the real
+        // path so the invalid-marker induction actually intercepts the save.
+        let lock_path = crate::config::store_lock_authority_path(&config_path)
+            .expect("derive store-lock authority path");
         std::fs::write(&lock_path, b"not a tonepoet lock marker")
             .expect("install invalid lock marker");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -7816,7 +7990,10 @@ mod progress_dialog_theme_tests {
         let config_path = TonepoetConfig::config_path();
         let parent = config_path.parent().expect("config parent");
         std::fs::create_dir_all(parent).expect("create config parent");
-        let lock_path = parent.join(".config.toml.save.lock");
+        // Store locks live at SHA-256 authority names now; derive the real
+        // path so the invalid-marker induction actually intercepts the save.
+        let lock_path = crate::config::store_lock_authority_path(&config_path)
+            .expect("derive store-lock authority path");
         std::fs::write(&lock_path, b"not a tonepoet lock marker")
             .expect("install invalid lock marker");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -8850,13 +9027,42 @@ fn metadata_editor_commit_inline_edit(
         return false;
     };
     let new_value = input.text;
+    let collapse_warning = state
+        .active_surface()
+        .entries
+        .get(state.cursor)
+        .and_then(|entry| {
+            let file_dim = !entry.is_track_scoped(state.active_surface().paths.len())
+                && entry.per_file_values.len() == state.active_surface().paths.len();
+            let collapsed_slots = entry.stored_value_collapse_slots(
+                entry
+                    .per_file_values
+                    .iter()
+                    .enumerate()
+                    .filter(|(slot, _)| {
+                        !file_dim || metadata_editor_slot_is_writable(state, *slot)
+                    })
+                    .map(|(slot, _)| (slot, new_value.as_str())),
+            );
+            (!collapsed_slots.is_empty()).then(|| entry.display_key.clone())
+        });
     let updated = if state.cursor < state.active_surface().entries.len() {
-        metadata_editor_apply_inline_value_to_writable_slots(state, state.cursor, new_value)
+        metadata_editor_apply_inline_value_to_writable_slots(
+            state,
+            state.cursor,
+            new_value,
+        )
     } else {
         0
     };
     if updated == 0 && state.cursor < state.active_surface().entries.len() {
         app.set_status("metadata editor: edit ignored — no writable file slots for this field");
+    } else if updated > 0 {
+        if let Some(key) = collapse_warning {
+            app.set_status(format!(
+                "metadata editor: editing {key} collapsed multiple stored values into one value"
+            ));
+        }
     }
     state.phase = super::app::MetadataEditorPhase::Editing;
     recalc_dirty(state);
@@ -8887,8 +9093,27 @@ fn metadata_editor_commit_detail_edit(
         recalc_dirty(state);
         return false;
     }
-    state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor] = input.text;
+    let new_value = input.text;
+    let collapse_warning = state
+        .active_surface()
+        .entries
+        .get(field_idx)
+        .and_then(|entry| {
+            (!entry
+                .stored_value_collapse_slots(std::iter::once((
+                    detail_cursor,
+                    new_value.as_str(),
+                )))
+                .is_empty())
+            .then(|| entry.display_key.clone())
+        });
+    state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor] = new_value;
     metadata_editor_recompute_entry_display(&mut state.active_surface_mut().entries[field_idx]);
+    if let Some(key) = collapse_warning {
+        app.set_status(format!(
+            "metadata editor: editing {key} for this file collapsed multiple stored values into one value"
+        ));
+    }
     recalc_dirty(state);
     true
 }
@@ -9412,6 +9637,8 @@ fn handle_metadata_editor_key(
                             original: String::new(),
                             is_binary: false,
                             is_mixed: false,
+                            has_multiple_stored_values: false,
+                            per_file_stored_value_counts: Vec::new(),
                             per_file_values: vec![String::new(); n],
                             per_file_originals: vec![String::new(); n],
                             mb_proposed_value: None,
@@ -10134,6 +10361,8 @@ fn upsert_cuesheet_text_for_metadata_surface(
         original: summary,
         is_binary: true,
         is_mixed: false,
+        has_multiple_stored_values: false,
+        per_file_stored_value_counts: Vec::new(),
         per_file_values: vec![cue_text.to_string()],
         per_file_originals: vec![cue_text.to_string()],
         mb_proposed_value: None,
@@ -10291,6 +10520,8 @@ fn cue_album_upsert_album_entry(
             original: value,
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values.clone(),
             per_file_originals: values,
             mb_proposed_value: None,
@@ -10312,6 +10543,7 @@ fn cue_album_upsert_per_track_entry(
     if let Some(idx) = cue_album_entry_index(entries, display_key) {
         let entry = &mut entries[idx];
         entry.row_scope = crate::tui::probe::RowScope::Track;
+        entry.clear_stored_value_provenance();
         entry.item_key = item_key;
         entry.value = display.clone();
         entry.original = display;
@@ -10330,6 +10562,8 @@ fn cue_album_upsert_per_track_entry(
             original: display,
             is_binary: false,
             is_mixed: mixed,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values.clone(),
             per_file_originals: values,
             mb_proposed_value: None,
@@ -10781,6 +11015,8 @@ fn cue_album_update_cuesheet_entry(
             original: summary,
             is_binary: true,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values,
             per_file_originals: originals,
             mb_proposed_value: None,
@@ -10802,6 +11038,8 @@ fn cue_album_merge_warning_entry(warnings: Vec<String>) -> Option<super::probe::
         original: value.clone(),
         is_binary: true,
         is_mixed: false,
+        has_multiple_stored_values: false,
+        per_file_stored_value_counts: Vec::new(),
         per_file_values: vec![value.clone()],
         per_file_originals: vec![value],
         mb_proposed_value: None,
@@ -11127,14 +11365,14 @@ pub(super) fn populate_split_cue_metadata_editor_from_mb_release(
     state: &mut super::app::MetadataEditorState,
     release: &super::musicbrainz::MbRelease,
     apply_album_fields: bool,
-) -> bool {
+) -> Option<super::probe::MetadataMutationReport> {
     if state.presentation_tabs.len() <= 1 {
-        return false;
+        return None;
     }
 
     let original_tab = state.active_tab;
     let mut offset = 0usize;
-    let mut populated = false;
+    let mut report = super::probe::MetadataMutationReport::default();
     for tab_idx in 0..state.presentation_tabs.len() {
         state.active_tab = tab_idx;
         let local_track_count = state.active_surface().file_labels.len().max(1);
@@ -11174,19 +11412,19 @@ pub(super) fn populate_split_cue_metadata_editor_from_mb_release(
             per_track_populate: local_release.tracks.len() > 1,
             skip_reason: None,
         };
-        super::musicbrainz::populate_editor_from_mb_scoped(
+        let tab_report = super::musicbrainz::populate_editor_from_mb_scoped(
             state,
             &local_release,
             &decision,
             apply_album_fields,
         );
+        report.merge(tab_report);
         state.active_surface_mut().dirty = true;
-        populated = true;
         offset += local_track_count;
     }
     state.active_tab = original_tab.min(state.presentation_tabs.len().saturating_sub(1));
     state.phase = super::app::MetadataEditorPhase::Editing;
-    populated
+    Some(report)
 }
 
 pub(super) fn build_metadata_editor_for_cue_surfaces_with_mb_release(
@@ -11404,6 +11642,8 @@ pub fn inject_sidecar_cuesheet_if_present(
         original: String::new(),
         is_binary: true,
         is_mixed: false,
+        has_multiple_stored_values: false,
+        per_file_stored_value_counts: Vec::new(),
         per_file_values: vec![text],
         per_file_originals: vec![String::new()],
         mb_proposed_value: None,
@@ -11798,6 +12038,8 @@ fn replace_cuesheet_row_with_sidecar_text(
                 original: summary,
                 is_binary: true,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec![sidecar_text.to_string()],
                 per_file_originals: vec![sidecar_text.to_string()],
                 mb_proposed_value: None,
@@ -12098,6 +12340,8 @@ fn cue_album_stage_album_entry_from_cuesheet_edit(
             original: String::new(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values,
             per_file_originals: vec![String::new(); n_paths],
             mb_proposed_value: None,
@@ -12116,6 +12360,7 @@ fn cue_album_stage_per_track_entry_from_cuesheet_edit(
     if let Some(idx) = cue_album_entry_index(entries, display_key) {
         let entry = &mut entries[idx];
         entry.row_scope = crate::tui::probe::RowScope::Track;
+        entry.clear_stored_value_provenance();
         entry.item_key = item_key;
         entry.value = display.clone();
         entry.is_binary = false;
@@ -12137,6 +12382,8 @@ fn cue_album_stage_per_track_entry_from_cuesheet_edit(
             original: String::new(),
             is_binary: false,
             is_mixed: mixed,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values.clone(),
             per_file_originals: vec![String::new(); values.len()],
             mb_proposed_value: None,
@@ -12505,6 +12752,7 @@ fn grow_or_create_per_track(
     {
         let entry = &mut entries[idx];
         entry.row_scope = crate::tui::probe::RowScope::Track;
+        entry.clear_stored_value_provenance();
         entry.per_file_values = values.clone();
         entry.per_file_originals = values;
         entry.is_mixed = is_mixed;
@@ -12519,6 +12767,8 @@ fn grow_or_create_per_track(
             original: display_value,
             is_binary: false,
             is_mixed,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values.clone(),
             per_file_originals: values,
             mb_proposed_value: None,
@@ -12527,11 +12777,67 @@ fn grow_or_create_per_track(
     }
 }
 
-/// Result of a `:fix-caps` pass — counts so the status message can
-/// explain what happened.
+/// One logical metadata row and the positional carriers whose stored-item
+/// cardinality would be reduced by a scalar mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StoredValueCollapse {
+    pub display_key: String,
+    pub slots: Vec<usize>,
+}
+
+impl StoredValueCollapse {
+    pub fn carrier_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+/// Result of a `:fix-caps` pass — counts and positional cardinality
+/// losses so the status message can explain the whole mutation.
 pub(super) struct FixCapsResult {
     pub changed_values: usize,
     pub skipped_deleted: usize,
+    pub collapsed_carriers: Vec<StoredValueCollapse>,
+}
+
+impl FixCapsResult {
+    pub fn collapsed_carrier_count(&self) -> usize {
+        self.collapsed_carriers
+            .iter()
+            .map(StoredValueCollapse::carrier_count)
+            .sum()
+    }
+
+    pub fn status_message(&self) -> String {
+        let mut message = format!(
+            "Capitalization applied ({} values changed",
+            self.changed_values
+        );
+        if self.skipped_deleted > 0 {
+            message.push_str(&format!(
+                "; {} deleted entries skipped",
+                self.skipped_deleted
+            ));
+        }
+        let collapsed = self.collapsed_carrier_count();
+        if collapsed > 0 {
+            let keys = self
+                .collapsed_carriers
+                .iter()
+                .map(|collapse| collapse.display_key.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!(
+                "; warning: {} carrier{} for {} collapsed multiple stored values into one value",
+                collapsed,
+                if collapsed == 1 { "" } else { "s" },
+                keys,
+            ));
+        }
+        message.push(')');
+        message
+    }
 }
 
 /// Apply capitalization rules to TITLE / ARTIST / ALBUM / ALBUMARTIST
@@ -12564,6 +12870,7 @@ pub(super) fn fix_caps_for_state(
     let mut result = FixCapsResult {
         changed_values: 0,
         skipped_deleted: 0,
+        collapsed_carriers: Vec::new(),
     };
 
     let indices: Vec<usize> = match focus {
@@ -12582,20 +12889,41 @@ pub(super) fn fix_caps_for_state(
             continue;
         }
 
-        let entry = &mut state.active_surface_mut().entries[i];
-        let key_upper = entry.display_key.to_ascii_uppercase();
+        let key_upper = state.active_surface().entries[i]
+            .display_key
+            .to_ascii_uppercase();
         let cap_fn: fn(&str) -> String = match key_upper.as_str() {
             "TITLE" => capitalize_title,
             "ARTIST" | "ALBUM" | "ALBUMARTIST" | "PERFORMER" => capitalize_section,
             _ => continue,
         };
-        for v in &mut entry.per_file_values {
-            if !v.is_empty() {
-                let new_val = cap_fn(v);
-                if new_val != *v {
-                    *v = new_val;
-                    result.changed_values += 1;
-                }
+        let replacements = state.active_surface().entries[i]
+            .per_file_values
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| !value.is_empty())
+            .filter_map(|(slot, value)| {
+                let replacement = cap_fn(value);
+                (replacement.as_str() != value.as_str()).then_some((slot, replacement))
+            })
+            .collect::<Vec<_>>();
+        let collapsed_slots = state.active_surface().entries[i].stored_value_collapse_slots(
+            replacements
+                .iter()
+                .map(|(slot, replacement)| (*slot, replacement.as_str())),
+        );
+        if !collapsed_slots.is_empty() {
+            result.collapsed_carriers.push(StoredValueCollapse {
+                display_key: state.active_surface().entries[i].display_key.clone(),
+                slots: collapsed_slots,
+            });
+        }
+
+        let entry = &mut state.active_surface_mut().entries[i];
+        for (slot, replacement) in replacements {
+            if let Some(value) = entry.per_file_values.get_mut(slot) {
+                *value = replacement;
+                result.changed_values += 1;
             }
         }
         // Recompute is_mixed using the entry's OWN dim, not paths.len().
@@ -12657,6 +12985,7 @@ fn overlay_per_track_values(
         // Keeps len(values) == len(originals) invariant.
         let entry = &mut entries[idx];
         entry.row_scope = crate::tui::probe::RowScope::Track;
+        entry.clear_stored_value_provenance();
         let pad = entry
             .per_file_originals
             .first()
@@ -12678,6 +13007,8 @@ fn overlay_per_track_values(
             original: String::new(),
             is_binary: false,
             is_mixed,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values,
             per_file_originals: vec![String::new(); dim],
             mb_proposed_value: None,
@@ -12767,6 +13098,8 @@ pub(super) fn reload_from_sidecar_cue(
             original: String::new(),
             is_binary: true,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![text.clone()],
             per_file_originals: vec![String::new()],
             mb_proposed_value: None,
@@ -14952,6 +15285,8 @@ fn ensure_and_auto_populate_track_title_entries(
                     original: String::new(),
                     is_binary: false,
                     is_mixed: false,
+                    has_multiple_stored_values: false,
+                    per_file_stored_value_counts: Vec::new(),
                     per_file_values: vec![String::new(); n],
                     per_file_originals: vec![String::new(); n],
                     mb_proposed_value: None,
@@ -16002,6 +16337,8 @@ pub fn build_dvda_editor_state(
             original: value,
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vals.clone(),
             per_file_originals: vals,
             mb_proposed_value: None,
@@ -16027,7 +16364,9 @@ pub fn build_dvda_editor_state(
             original: value,
             is_binary: false,
             is_mixed: !all_same,
+            has_multiple_stored_values: false,
             per_file_originals: values.clone(),
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values,
             mb_proposed_value: None,
             mb_proposed_per_file: None,
@@ -17005,6 +17344,8 @@ fn push_dvdv_album_entry(
         original: value.clone(),
         is_binary: false,
         is_mixed: false,
+        has_multiple_stored_values: false,
+        per_file_stored_value_counts: Vec::new(),
         per_file_values: vec![value.clone(); n_tracks],
         per_file_originals: vec![value; n_tracks],
         mb_proposed_value: None,
@@ -17036,6 +17377,8 @@ fn push_dvdv_track_entry(
         original: value,
         is_binary: false,
         is_mixed: !all_same && values.len() > 1,
+        has_multiple_stored_values: false,
+        per_file_stored_value_counts: Vec::new(),
         per_file_values: values.clone(),
         per_file_originals: values,
         mb_proposed_value: None,
@@ -17612,6 +17955,8 @@ pub fn build_sacd_editor_state(
                 original: value,
                 is_binary: false,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vals.clone(),
                 per_file_originals: vals,
                 mb_proposed_value: None,
@@ -17704,7 +18049,9 @@ pub fn build_sacd_editor_state(
                 original: value,
                 is_binary: false,
                 is_mixed: !all_same,
+                has_multiple_stored_values: false,
                 per_file_originals: values.clone(),
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: values,
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
@@ -18594,6 +18941,15 @@ fn handle_generic_overlay_mouse(
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
     let area = crossterm::terminal::size().unwrap_or((80, 24));
+    handle_generic_overlay_mouse_in_area(app, mouse, tx, area)
+}
+
+fn handle_generic_overlay_mouse_in_area(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    tx: &mpsc::Sender<AppMessage>,
+    area: (u16, u16),
+) -> bool {
     let mx = mouse.column;
     let my = mouse.row;
 
@@ -19112,6 +19468,7 @@ fn handle_generic_overlay_mouse(
                         // Pills are rendered as: "  [disc 01] [disc 02] ..."
                         // Each pill: " {label} " (label.len() + 2) + 1 gap.
                         let mut x_pos = 2usize; // leading "  "
+                        let mut clicked_page = None;
                         for (i, pg) in state.pages.iter().enumerate() {
                             let label = if pg.label.is_empty() {
                                 format!("disc {}", i + 1)
@@ -19120,13 +19477,21 @@ fn handle_generic_overlay_mouse(
                             };
                             let pill_w = label.len() + 2; // " label "
                             if click_x >= x_pos && click_x < x_pos + pill_w {
-                                state.active_page = i;
-                                state.cursor = 0;
-                                state.scroll = 0;
-                                state.edit_input = None;
+                                clicked_page = Some(i);
                                 break;
                             }
                             x_pos += pill_w + 1; // pill + gap
+                        }
+                        if let Some(page) = clicked_page {
+                            // A page switch is a navigation action, not a
+                            // cancellation. Commit the buffer to the row and
+                            // page where editing began before changing
+                            // active-page authority.
+                            let previous_row = state.cursor;
+                            commit_gnudb_review_edit_to_row(&mut state, previous_row);
+                            state.active_page = page;
+                            state.cursor = 0;
+                            state.scroll = 0;
                         }
                     } else if visual_row >= row_offset {
                         let clicked_row = (visual_row - row_offset) + state.scroll;
@@ -21024,15 +21389,24 @@ fn handle_metadata_editor_mouse(
     mouse: MouseEvent,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    let (terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
+    handle_metadata_editor_mouse_in_area(
+        app,
+        mouse,
+        tx,
+        Rect::new(0, 0, terminal_width, terminal_height),
+    );
+}
+
+fn handle_metadata_editor_mouse_in_area(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    tx: &mpsc::Sender<AppMessage>,
+    area: Rect,
+) {
     use super::app::MetadataEditorPhase;
 
-    let (terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(
-        0,
-        0,
-        terminal_width,
-        terminal_height,
-    ));
+    let layout = super::draw_overlays::metadata_editor_layout_for_area(area);
     let popup_x = layout.popup.x;
     let popup_y = layout.popup.y;
     let w = layout.popup.width;
@@ -21373,10 +21747,28 @@ fn handle_metadata_editor_mouse(
                     match app.button_map.find_button_at(mx, my) {
                         Some(super::button_map::TuiButton::MetadataEntryRevert(idx)) => {
                             if state.active_surface().entries.get(idx).is_some() {
-                                super::probe::toggle_mb_revert(&mut state.active_surface_mut().entries[idx]);
+                                let mutation_report = super::probe::toggle_mb_revert(
+                                    &mut state.active_surface_mut().entries[idx],
+                                );
+                                let entry = &state.active_surface().entries[idx];
+                                let mut status = match super::probe::mb_pill_state(entry) {
+                                    super::probe::MbRevertPill::Revert => format!(
+                                        "MusicBrainz values applied to {}",
+                                        entry.display_key
+                                    ),
+                                    super::probe::MbRevertPill::UseMb => format!(
+                                        "{} reverted to file values",
+                                        entry.display_key
+                                    ),
+                                    super::probe::MbRevertPill::None => {
+                                        format!("{} unchanged", entry.display_key)
+                                    }
+                                };
+                                mutation_report.append_collapse_warning(&mut status);
                                 state.recompute_active_dirty();
                                 state.cursor = idx;
                                 ensure_cursor_visible(&mut state);
+                                app.set_status(status);
                                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                 return;
                             }
@@ -21774,19 +22166,52 @@ fn handle_metadata_editor_mouse(
                         match app.button_map.find_button_at(mx, my) {
                             Some(super::button_map::TuiButton::MetadataDetailRevert) => {
                                 let field_idx = state.detail_field_idx;
-                                if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
-                                    super::probe::toggle_mb_revert_field(entry);
+                                let mut status = None;
+                                if let Some(entry) =
+                                    state.active_surface_mut().entries.get_mut(field_idx)
+                                {
+                                    let mutation_report =
+                                        super::probe::toggle_mb_revert_field(entry);
+                                    let mut message =
+                                        match super::probe::mb_pill_state_field(entry) {
+                                        super::probe::MbRevertPill::Revert => format!(
+                                            "MusicBrainz values applied to {}",
+                                            entry.display_key
+                                        ),
+                                        super::probe::MbRevertPill::UseMb => format!(
+                                            "{} reverted to file values",
+                                            entry.display_key
+                                        ),
+                                        super::probe::MbRevertPill::None => {
+                                            format!("{} unchanged", entry.display_key)
+                                        }
+                                    };
+                                    mutation_report.append_collapse_warning(&mut message);
+                                    status = Some(message);
                                 }
                                 state.recompute_active_dirty();
+                                if let Some(status) = status {
+                                    app.set_status(status);
+                                }
                                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                 return;
                             }
                             Some(super::button_map::TuiButton::MetadataDetailRestore) => {
                                 let field_idx = state.detail_field_idx;
+                                let mut status = None;
                                 if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
-                                    super::probe::restore_mb_proposed(entry);
+                                    let mutation_report = super::probe::restore_mb_proposed(entry);
+                                    let mut message = format!(
+                                        "{} restored to MusicBrainz values",
+                                        entry.display_key
+                                    );
+                                    mutation_report.append_collapse_warning(&mut message);
+                                    status = Some(message);
                                 }
                                 state.recompute_active_dirty();
+                                if let Some(status) = status {
+                                    app.set_status(status);
+                                }
                                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                 return;
                             }
@@ -22175,11 +22600,41 @@ fn metadata_editor_detail_value_edit_refusal(
         .map(|reason| format!("metadata editor: slot is not editable — {}", reason))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DetailPasteResult {
+    pub applied: usize,
+    pub collapsed_slots: Vec<usize>,
+}
+
+pub(super) fn metadata_editor_detail_paste_status(
+    display_key: &str,
+    result: &DetailPasteResult,
+) -> String {
+    let mut status = format!(
+        "Pasted {} value{}",
+        result.applied,
+        if result.applied == 1 { "" } else { "s" },
+    );
+    if !result.collapsed_slots.is_empty() {
+        status.push_str(&format!(
+            "; warning: {} carrier{} for {} collapsed multiple stored values into one value",
+            result.collapsed_slots.len(),
+            if result.collapsed_slots.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            display_key,
+        ));
+    }
+    status
+}
+
 pub(super) fn metadata_editor_apply_detail_paste(
     state: &mut super::app::MetadataEditorState,
     entry_idx: usize,
     text: &str,
-) -> Result<usize, String> {
+) -> Result<DetailPasteResult, String> {
     if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, entry_idx) {
         return Err(reason);
     }
@@ -22190,7 +22645,10 @@ pub(super) fn metadata_editor_apply_detail_paste(
         .map(|entry| entry.per_file_values.len())
         .ok_or_else(|| "metadata editor: selected field is no longer available".to_string())?;
     if dim == 0 {
-        return Ok(0);
+        return Ok(DetailPasteResult {
+            applied: 0,
+            collapsed_slots: Vec::new(),
+        });
     }
     let lines: Vec<String> = text
         .replace("\r\n", "\n")
@@ -22199,7 +22657,10 @@ pub(super) fn metadata_editor_apply_detail_paste(
         .map(|line| line.trim_end().to_string())
         .collect();
     if lines.is_empty() {
-        return Ok(0);
+        return Ok(DetailPasteResult {
+            applied: 0,
+            collapsed_slots: Vec::new(),
+        });
     }
 
     // Replication rules mirror the pre-existing paste semantics: only the
@@ -22233,6 +22694,11 @@ pub(super) fn metadata_editor_apply_detail_paste(
             return Err(reason);
         }
     }
+    let collapsed_slots = state.active_surface().entries[entry_idx].stored_value_collapse_slots(
+        targets
+            .iter()
+            .map(|(slot, replacement)| (*slot, replacement.as_str())),
+    );
     let Some(entry) = state.active_surface_mut().entries.get_mut(entry_idx) else {
         return Err("metadata editor: selected field is no longer available".to_string());
     };
@@ -22243,7 +22709,10 @@ pub(super) fn metadata_editor_apply_detail_paste(
     }
     metadata_editor_recompute_entry_display(entry);
     state.active_surface_mut().dirty = true;
-    Ok(targets.len())
+    Ok(DetailPasteResult {
+        applied: targets.len(),
+        collapsed_slots,
+    })
 }
 
 fn metadata_editor_entry_edit_block_reason(
@@ -27367,6 +27836,119 @@ fn start_browse_archive_entry_rename(
     Ok(())
 }
 
+fn validate_browse_create_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("name cannot be empty");
+    }
+    if name == "." || name == ".." {
+        return Err("name cannot be . or ..");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("name cannot contain path separators");
+    }
+    Ok(())
+}
+
+fn unique_browse_create_name(dir: &std::path::Path, kind: BrowseCreateKind) -> String {
+    let base = match kind {
+        BrowseCreateKind::File => "New File",
+        BrowseCreateKind::Folder => "New Folder",
+    };
+    for suffix in 1usize..=10_000 {
+        let name = if suffix == 1 {
+            base.to_string()
+        } else {
+            format!("{base} {suffix}")
+        };
+        if !dir.join(&name).exists() {
+            return name;
+        }
+    }
+    loop {
+        let name = format!("{base} {}", uuid::Uuid::new_v4());
+        if !dir.join(&name).exists() {
+            return name;
+        }
+    }
+}
+
+pub(super) fn begin_browse_create(app: &mut AppState, kind: BrowseCreateKind) -> bool {
+    if app.current_screen != AppScreen::Browse {
+        app.set_status("create: available only on the browse screen");
+        return false;
+    }
+    if app.browse.is_in_archive() {
+        app.set_status("create: unavailable inside archive listings");
+        return false;
+    }
+    let dir = app.browse.current_dir.clone();
+    let initial = unique_browse_create_name(&dir, kind);
+    app.browse_inline_edit = Some(BrowseInlineEditState {
+        target: BrowseInlineEditTarget::Create { dir, kind },
+        input: super::text_input::TextInputState::new_selected(initial),
+    });
+    true
+}
+
+pub(super) fn commit_browse_create(
+    app: &mut AppState,
+    dir: std::path::PathBuf,
+    kind: BrowseCreateKind,
+    name: &str,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    if app.current_screen != AppScreen::Browse {
+        app.set_status("create: available only on the browse screen");
+        return false;
+    }
+    if app.browse.is_in_archive() {
+        app.set_status("create: unavailable inside archive listings");
+        return false;
+    }
+    if let Err(reason) = validate_browse_create_name(name) {
+        app.set_status(format!("create: {reason}"));
+        return false;
+    }
+    let target = dir.join(name);
+    let result = match kind {
+        BrowseCreateKind::File => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map(|_| ()),
+        BrowseCreateKind::Folder => std::fs::create_dir(&target),
+    };
+    match result {
+        Ok(()) => {
+            app.browse.cursor_restore_target = Some(name.to_string());
+            app.browse.refresh_with_search(Some(tx));
+            if let Some(index) = app.browse.entries.iter().position(|entry| entry.path == target) {
+                app.browse.selected_index = index;
+                app.browse.ensure_visible();
+                app.browse.cursor_restore_target = None;
+            }
+            app.browse.probe_current_with_db(tx, Some(&app.db));
+            app.set_status(format!(
+                "created {}: {}",
+                match kind {
+                    BrowseCreateKind::File => "file",
+                    BrowseCreateKind::Folder => "folder",
+                },
+                name
+            ));
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            app.set_status(format!("create: target already exists: {name}"));
+            false
+        }
+        Err(error) => {
+            app.set_status(format!("create failed: {error}"));
+            false
+        }
+    }
+}
+
 /// Commit a rename for a browse entry: validates the new name, constructs the
 /// target path from the original path's parent, calls fs::rename, refreshes the
 /// browse listing, and repositions the cursor on the renamed entry.
@@ -28214,12 +28796,16 @@ fn execute_confirm_action(
         ConfirmAction::ApplyMbToAllPresentations(state) => {
             app.pending_metadata_editor = None;
             let mut state = (**state).clone();
-            let copied = state.apply_active_musicbrainz_values_to_matching_presentations();
-            app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
-            app.set_status(format!(
+            let apply_result = state.apply_active_musicbrainz_values_to_matching_presentations();
+            let mut status = format!(
                 ":tags-mb: applied MusicBrainz values to {} matching presentation(s)",
-                copied,
-            ));
+                apply_result.changed_presentations,
+            );
+            apply_result
+                .mutation_report
+                .append_collapse_warning(&mut status);
+            app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+            app.set_status(status);
         }
         ConfirmAction::DiscardMetadataEditorChanges => {
             let quit_after_resolution = app.quit_after_browse_archive_metadata_resolution;
@@ -28445,6 +29031,22 @@ fn execute_confirm_action(
             app.set_status(parts.join(", "));
         }
         ConfirmAction::OffsetCorrection { paths, offset } => {
+            let operation_id = match super::event_loop::begin_completion_operation(
+                app,
+                CompletionOperationKind::OffsetCorrection,
+                "Offset correction",
+            ) {
+                Ok(operation_id) => operation_id,
+                Err(message) => {
+                    if matches!(app.active_overlay, ActiveOverlay::None) {
+                        if let Some(editor) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+                        }
+                    }
+                    app.set_status(message);
+                    return;
+                }
+            };
             let paths = paths.clone();
             let offset = *offset;
             let tx = tx.clone();
@@ -28453,7 +29055,10 @@ fn execute_confirm_action(
                 let result =
                     super::accuraterip::apply_offset_correction(&paths, offset, tx.clone()).await;
                 let _ = tx
-                    .send(AppMessage::OffsetCorrectionComplete { result })
+                    .send(AppMessage::OffsetCorrectionComplete {
+                        operation_id,
+                        result,
+                    })
                     .await;
             });
         }
@@ -28464,6 +29069,22 @@ fn execute_confirm_action(
             offset,
             expected_crcs,
         } => {
+            let operation_id = match super::event_loop::begin_completion_operation(
+                app,
+                CompletionOperationKind::CtdbRepair,
+                "CTDB repair",
+            ) {
+                Ok(operation_id) => operation_id,
+                Err(message) => {
+                    if matches!(app.active_overlay, ActiveOverlay::None) {
+                        if let Some(editor) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+                        }
+                    }
+                    app.set_status(message);
+                    return;
+                }
+            };
             let paths = paths.clone();
             let parity_url = parity_url.clone();
             let npar = *npar;
@@ -28481,7 +29102,12 @@ fn execute_confirm_action(
                     tx.clone(),
                 )
                 .await;
-                let _ = tx.send(AppMessage::CtdbRepairComplete { result }).await;
+                let _ = tx
+                    .send(AppMessage::CtdbRepairComplete {
+                        operation_id,
+                        result,
+                    })
+                    .await;
             });
         }
         ConfirmAction::CtdbRepairSingleImage {
@@ -28491,6 +29117,22 @@ fn execute_confirm_action(
             offset,
             expected_crcs,
         } => {
+            let operation_id = match super::event_loop::begin_completion_operation(
+                app,
+                CompletionOperationKind::CtdbRepair,
+                "CTDB repair",
+            ) {
+                Ok(operation_id) => operation_id,
+                Err(message) => {
+                    if matches!(app.active_overlay, ActiveOverlay::None) {
+                        if let Some(editor) = app.pending_metadata_editor.take() {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+                        }
+                    }
+                    app.set_status(message);
+                    return;
+                }
+            };
             let info = info.clone();
             let parity_url = parity_url.clone();
             let npar = *npar;
@@ -28508,7 +29150,12 @@ fn execute_confirm_action(
                     tx.clone(),
                 )
                 .await;
-                let _ = tx.send(AppMessage::CtdbRepairComplete { result }).await;
+                let _ = tx
+                    .send(AppMessage::CtdbRepairComplete {
+                        operation_id,
+                        result,
+                    })
+                    .await;
             });
         }
     }
@@ -28527,6 +29174,68 @@ fn conversion_options_from_current_convert_output(app: &AppState) -> ConversionO
 
 fn manual_file_input_admits_path(path: &std::path::Path) -> bool {
     crate::convert::source_admission::is_direct_queue_source_path(path)
+}
+
+#[cfg(test)]
+mod archive_password_parking_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    fn app_with_parked_editor() -> AppState {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = Box::new(MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/track.flac")],
+            Vec::new(),
+            vec!["track.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        ));
+        editor.active_surface_mut().dirty = true;
+        app.pending_metadata_editor = Some(editor);
+        app.active_overlay = ActiveOverlay::TextEdit {
+            input: super::super::text_input::TextInputState::empty(),
+            target: TextEditTarget::ArchivePassword(std::path::PathBuf::from(
+                "/tmp/album.7z",
+            )),
+            label: "archive password".to_string(),
+        };
+        app
+    }
+
+    fn assert_dirty_editor_restored(app: &AppState) {
+        assert!(app.pending_metadata_editor.is_none());
+        let ActiveOverlay::MetadataEditor(editor) = &app.active_overlay else {
+            panic!("archive password text edit must restore the parked editor");
+        };
+        assert!(editor.active_surface().dirty);
+        assert_eq!(
+            editor.active_surface().paths,
+            vec![std::path::PathBuf::from("/tmp/track.flac")]
+        );
+    }
+
+    #[test]
+    fn archive_password_submit_restores_parked_editor() {
+        let mut app = app_with_parked_editor();
+        let (tx, _rx) = mpsc::channel(1);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_dirty_editor_restored(&app);
+    }
+
+    #[test]
+    fn archive_password_cancel_restores_parked_editor() {
+        let mut app = app_with_parked_editor();
+        let (tx, _rx) = mpsc::channel(1);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_dirty_editor_restored(&app);
+    }
 }
 
 #[cfg(test)]
@@ -29983,11 +30692,32 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 cancel_confirm_action(app, action.as_ref());
             }
             TuiButton::MetadataEntryRevert(idx) => {
+                let mut status_to_set = None;
                 if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
                     if state.active_surface().entries.get(idx).is_some() {
-                        super::probe::toggle_mb_revert(&mut state.active_surface_mut().entries[idx]);
+                        let mutation_report = super::probe::toggle_mb_revert(
+                            &mut state.active_surface_mut().entries[idx],
+                        );
+                        let entry = &state.active_surface().entries[idx];
+                        let mut status = match super::probe::mb_pill_state(entry) {
+                            super::probe::MbRevertPill::Revert => format!(
+                                "MusicBrainz values applied to {}",
+                                entry.display_key
+                            ),
+                            super::probe::MbRevertPill::UseMb => {
+                                format!("{} reverted to file values", entry.display_key)
+                            }
+                            super::probe::MbRevertPill::None => {
+                                format!("{} unchanged", entry.display_key)
+                            }
+                        };
+                        mutation_report.append_collapse_warning(&mut status);
                         state.active_surface_mut().dirty = super::probe::metadata_editor_has_changes(state);
+                        status_to_set = Some(status);
                     }
+                }
+                if let Some(status) = status_to_set {
+                    app.set_status(status);
                 }
             }
             // MbSelect / CuePreview / MetadataEditor-detail buttons are
@@ -30385,11 +31115,426 @@ mod phase4_tests {
             original,
             is_binary: key.eq_ignore_ascii_case("CUESHEET"),
             is_mixed: v.len() > 1 && !all_same,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: v,
             per_file_originals: o,
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
+    }
+
+    #[test]
+    fn inline_edit_warns_before_collapsing_multiple_stored_values() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut multi = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta"],
+            &["Alpha; Beta"],
+        );
+        multi.has_multiple_stored_values = true;
+        multi.per_file_stored_value_counts = vec![2];
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            vec![multi],
+            vec!["a".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.cursor = 0;
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.edit_input = Some(crate::tui::text_input::TextInputState::new(
+            "Solo Artist".to_string(),
+        ));
+
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        assert_eq!(state.active_surface().entries[0].value, "Solo Artist");
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("metadata editor: editing ARTIST collapsed multiple stored values into one value")
+        );
+    }
+
+    #[test]
+    fn detail_edit_warns_only_for_the_multi_value_file_slot() {
+        let make_state = || {
+            let mut artist = entry(
+                "ARTIST",
+                ItemKey::TrackArtist,
+                &["Alpha; Beta", "Gamma"],
+                &["Alpha; Beta", "Gamma"],
+            );
+            artist.has_multiple_stored_values = true;
+            artist.per_file_stored_value_counts = vec![2, 1];
+            artist.original = artist.value.clone();
+            let mut state = MetadataEditorState::for_files(
+                vec![
+                    std::path::PathBuf::from("/tmp/a.flac"),
+                    std::path::PathBuf::from("/tmp/b.flac"),
+                ],
+                vec![artist],
+                vec!["a".to_string(), "b".to_string()],
+                crate::tui::app::MetadataTechnicalDetails::default(),
+            );
+            state.phase = MetadataEditorPhase::DetailEdit;
+            state.detail_field_idx = 0;
+            state
+        };
+
+        let untouched = make_state();
+        assert_eq!(
+            untouched.active_surface().entries[0].per_file_stored_value_counts,
+            vec![2, 1]
+        );
+        assert!(!crate::tui::probe::metadata_editor_has_changes(&untouched));
+        let untouched_snapshot = metadata_editor_entries_snapshot_for_save(&untouched);
+        assert_eq!(untouched_snapshot[0].2, untouched_snapshot[0].3);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut multi_state = make_state();
+        multi_state.detail_cursor = 0;
+        multi_state.detail_edit = Some(crate::tui::text_input::TextInputState::new(
+            "Solo".to_string(),
+        ));
+        assert!(metadata_editor_commit_detail_edit(&mut app, &mut multi_state));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some(
+                "metadata editor: editing ARTIST for this file collapsed multiple stored values into one value"
+            )
+        );
+        assert_eq!(
+            multi_state.active_surface().entries[0].per_file_stored_value_counts,
+            vec![2, 1],
+            "editing must not erase the source-cardinality provenance"
+        );
+
+        let mut scalar_app = AppState::new_for_test(TonepoetConfig::default());
+        let mut scalar_state = make_state();
+        scalar_state.detail_cursor = 1;
+        scalar_state.detail_edit = Some(crate::tui::text_input::TextInputState::new(
+            "Delta".to_string(),
+        ));
+        assert!(metadata_editor_commit_detail_edit(
+            &mut scalar_app,
+            &mut scalar_state,
+        ));
+        assert!(
+            scalar_app
+                .status_message
+                .as_ref()
+                .map(|(message, _)| !message.contains("collapsed multiple stored values"))
+                .unwrap_or(true),
+            "the scalar carrier must not receive a false collapse warning"
+        );
+
+        let mut revert_app = AppState::new_for_test(TonepoetConfig::default());
+        let mut revert_state = make_state();
+        revert_state.active_surface_mut().entries[0].per_file_values[0] = "Solo".to_string();
+        metadata_editor_recompute_entry_display(&mut revert_state.active_surface_mut().entries[0]);
+        revert_state.detail_cursor = 0;
+        revert_state.detail_edit = Some(crate::tui::text_input::TextInputState::new(
+            "Alpha; Beta".to_string(),
+        ));
+        assert!(metadata_editor_commit_detail_edit(
+            &mut revert_app,
+            &mut revert_state,
+        ));
+        assert!(
+            revert_app
+                .status_message
+                .as_ref()
+                .map(|(message, _)| !message.contains("collapsed multiple stored values"))
+                .unwrap_or(true),
+            "restoring the original scalar representation performs no write and must not warn"
+        );
+        assert!(!crate::tui::probe::metadata_editor_has_changes(&revert_state));
+    }
+
+    #[test]
+    fn metadata_row_use_mb_pill_preserves_cardinality_warning() {
+        let mut artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta"],
+            &["Alpha; Beta"],
+        );
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2];
+        artist.mb_proposed_value = Some("New Artist".to_string());
+        artist.mb_proposed_per_file = Some(vec!["New Artist".to_string()]);
+
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            vec![artist],
+            vec!["a".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::Editing;
+
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        let button_rect = ratatui::layout::Rect::new(
+            layout.content_area.x.saturating_add(2),
+            layout.content_area.y,
+            8,
+            1,
+        );
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.button_map.record_button(
+            crate::tui::button_map::TuiButton::MetadataEntryRevert(0),
+            button_rect,
+        );
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: button_rect.x,
+                row: button_rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+            area,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("MusicBrainz values applied to ARTIST"));
+        assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn metadata_detail_use_mb_pill_preserves_cardinality_warning() {
+        let mut artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta", "Gamma"],
+            &["Alpha; Beta", "Gamma"],
+        );
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2, 1];
+        artist.mb_proposed_value = Some("<multiple values>".to_string());
+        artist.mb_proposed_per_file = Some(vec![
+            "New Artist".to_string(),
+            "New Scalar".to_string(),
+        ]);
+
+        let mut state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![artist],
+            vec!["a".to_string(), "b".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        state.detail_edit = None;
+
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        let button_rect = ratatui::layout::Rect::new(
+            layout.content_area.x.saturating_add(2),
+            layout.footer_area.y, // detail pills dispatch on the footer row (in_footer gate)
+            8,
+            1,
+        );
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.button_map.record_button(
+            crate::tui::button_map::TuiButton::MetadataDetailRevert,
+            button_rect,
+        );
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: button_rect.x,
+                row: button_rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+            area,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("MusicBrainz values applied to ARTIST"));
+        assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn metadata_detail_restore_pill_preserves_cardinality_warning() {
+        let mut artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Manual Artist", "Gamma"],
+            &["Alpha; Beta", "Gamma"],
+        );
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2, 1];
+        artist.mb_proposed_value = Some("<multiple values>".to_string());
+        artist.mb_proposed_per_file = Some(vec![
+            "New Artist".to_string(),
+            "New Scalar".to_string(),
+        ]);
+
+        let mut state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![artist],
+            vec!["a".to_string(), "b".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        state.detail_edit = None;
+
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        let button_rect = ratatui::layout::Rect::new(
+            layout.content_area.x.saturating_add(2),
+            layout.footer_area.y, // detail pills dispatch on the footer row (in_footer gate)
+            8,
+            1,
+        );
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.button_map.record_button(
+            crate::tui::button_map::TuiButton::MetadataDetailRestore,
+            button_rect,
+        );
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: button_rect.x,
+                row: button_rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+            area,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("ARTIST restored to MusicBrainz values"));
+        assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn detail_paste_reports_positional_cardinality_loss_without_false_positives() {
+        let mut artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta", "Gamma"],
+            &["Alpha; Beta", "Gamma"],
+        );
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2, 1];
+        let mut state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![artist],
+            vec!["a".to_string(), "b".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+
+        let result = metadata_editor_apply_detail_paste(&mut state, 0, "Solo\nDelta")
+            .expect("detail paste");
+        assert_eq!(result.applied, 2);
+        assert_eq!(result.collapsed_slots, vec![0]);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            vec!["Solo", "Delta"],
+        );
+        assert_eq!(
+            metadata_editor_detail_paste_status("ARTIST", &result),
+            "Pasted 2 values; warning: 1 carrier for ARTIST collapsed multiple stored values into one value",
+        );
+
+        let mut scalar = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha", "Gamma"],
+            &["Alpha", "Gamma"],
+        );
+        scalar.per_file_stored_value_counts = vec![1, 1];
+        let mut scalar_state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![scalar],
+            vec!["a".to_string(), "b".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let scalar_result =
+            metadata_editor_apply_detail_paste(&mut scalar_state, 0, "Solo\nDelta")
+                .expect("scalar detail paste");
+        assert!(scalar_result.collapsed_slots.is_empty());
+        assert_eq!(
+            metadata_editor_detail_paste_status("ARTIST", &scalar_result),
+            "Pasted 2 values",
+        );
+    }
+
+    #[test]
+    fn album_scoped_detail_paste_reports_every_multi_value_carrier() {
+        let mut album = entry(
+            "ALBUM",
+            ItemKey::AlbumTitle,
+            &["Alpha; Beta", "Gamma", "Delta; Epsilon"],
+            &["Alpha; Beta", "Gamma", "Delta; Epsilon"],
+        );
+        album.has_multiple_stored_values = true;
+        album.per_file_stored_value_counts = vec![2, 1, 3];
+        let mut state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+                std::path::PathBuf::from("/tmp/c.flac"),
+            ],
+            vec![album],
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+
+        let result = metadata_editor_apply_detail_paste(&mut state, 0, "Unified Album")
+            .expect("replicated album paste");
+        assert_eq!(result.applied, 3);
+        assert_eq!(result.collapsed_slots, vec![0, 2]);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            vec!["Unified Album", "Unified Album", "Unified Album"],
+        );
     }
 
     #[test]
@@ -30575,24 +31720,33 @@ mod phase4_tests {
             "New Album".to_string(),
         ));
 
-        // Drive the REAL mouse path (not the helper directly): headless
-        // terminal size falls back to 80x24, so the single-page review popup
-        // is 68x20 at (6,2); content starts at y=3 and visual row 4 (track
-        // 1's Title) is screen row 7.
+        // Drive the real reducer against an injected terminal area. The
+        // test must not depend on whether the host has a TTY or on the
+        // production 80x24 fallback.
+        let area: (u16, u16) = (100, 40);
+        let popup_w = ((area.0 as usize) * 85 / 100)
+            .max(50)
+            .min(area.0 as usize - 2) as u16;
+        let popup_h = ((area.1 as usize) * 85 / 100)
+            .max(14)
+            .min(area.1 as usize - 2) as u16;
+        let popup_x = (area.0.saturating_sub(popup_w)) / 2;
+        let popup_y = (area.1.saturating_sub(popup_h)) / 2;
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::GnudbReview(Box::new(state));
         let (tx, _rx) = mpsc::channel(4);
-        handle_generic_overlay_mouse(
+        handle_generic_overlay_mouse_in_area(
             &mut app,
             crossterm::event::MouseEvent {
                 kind: crossterm::event::MouseEventKind::Down(
                     crossterm::event::MouseButton::Left,
                 ),
-                column: 10,
-                row: 7,
+                column: popup_x + 2,
+                row: popup_y + 1 + 4,
                 modifiers: KeyModifiers::NONE,
             },
             &tx,
+            area,
         );
 
         let ActiveOverlay::GnudbReview(state) = &app.active_overlay else {
@@ -30608,6 +31762,69 @@ mod phase4_tests {
             state.pages[0].tracks[0].title, "T1",
             "the newly clicked row must be untouched"
         );
+    }
+
+    #[test]
+    fn review_disc_pill_commits_edit_before_switching_pages() {
+        let entry = super::super::gnudb::GnudbEntry {
+            disc_id: "x".to_string(),
+            artist: "Artist".to_string(),
+            album: "Old Album".to_string(),
+            year: "1971".to_string(),
+            genre: "Rock".to_string(),
+            tracks: vec!["T1".to_string()],
+        };
+        let mut state = super::super::gnudb::build_review_state(
+            &entry,
+            vec![std::path::PathBuf::from("/disc1.flac")],
+        );
+        state.pages[0].label = "disc 01".to_string();
+        let mut second = state.pages[0].clone();
+        second.label = "disc 02".to_string();
+        second.album = "Second Album".to_string();
+        state.pages.push(second);
+        state.cursor = 0;
+        state.edit_input = Some(crate::tui::text_input::TextInputState::new(
+            "Committed Album".to_string(),
+        ));
+
+        let area: (u16, u16) = (100, 40);
+        let popup_w = ((area.0 as usize) * 85 / 100)
+            .max(50)
+            .min(area.0 as usize - 2) as u16;
+        let popup_h = ((area.1 as usize) * 85 / 100)
+            .max(14)
+            .min(area.1 as usize - 2) as u16;
+        let popup_x = (area.0.saturating_sub(popup_w)) / 2;
+        let popup_y = (area.1.saturating_sub(popup_h)) / 2;
+        let inner_x = popup_x + 1;
+        // Leading two spaces, first nine-column pill, one-column gap,
+        // then the interior of the second " disc 02 " pill.
+        let second_pill_x = inner_x + 13;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::GnudbReview(Box::new(state));
+        let (tx, _rx) = mpsc::channel(4);
+        handle_generic_overlay_mouse_in_area(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: second_pill_x,
+                row: popup_y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+            area,
+        );
+
+        let ActiveOverlay::GnudbReview(state) = &app.active_overlay else {
+            panic!("review must remain open");
+        };
+        assert_eq!(state.pages[0].album, "Committed Album");
+        assert_eq!(state.pages[1].album, "Second Album");
+        assert_eq!(state.active_page, 1);
+        assert_eq!(state.cursor, 0);
+        assert!(state.edit_input.is_none());
     }
 
     /// Build a minimal MetadataEditorState with paths.len() == 1.
@@ -31152,13 +32369,7 @@ mod phase4_tests {
 
 
     fn metadata_editor_test_layout() -> crate::tui::draw_overlays::MetadataEditorLayout {
-        let (terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
-        crate::tui::draw_overlays::metadata_editor_layout_for_area(Rect::new(
-            0,
-            0,
-            terminal_width,
-            terminal_height,
-        ))
+        crate::tui::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, 100, 40))
     }
 
     fn footer_close_mouse_event() -> MouseEvent {
@@ -31222,7 +32433,12 @@ mod phase4_tests {
         ])));
         let (tx, _rx) = mpsc::channel(1);
 
-        handle_mouse(&mut app, footer_close_mouse_event(), &tx);
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            footer_close_mouse_event(),
+            &tx,
+            Rect::new(0, 0, 100, 40),
+        );
 
         // With the OK/Apply semantics, clicking close with dirty state
         // initiates a save (transitions to Saving phase) rather than
@@ -31523,6 +32739,75 @@ mod phase4_tests {
     }
 
     #[test]
+    fn gnudb_review_accept_preserves_provider_cardinality_warning() {
+        let mut artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta"],
+            &["Alpha; Beta"],
+        );
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2];
+        let parked = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/album.flac")],
+            vec![artist],
+            vec!["album".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let details = &parked.active_surface().technical_details;
+        let guard = crate::tui::message::MetadataEditorSessionGuard {
+            session_id: details.session_id,
+            save_generation: details.save_generation,
+            editor_generation: parked.model.editor_save_generation,
+        };
+        let mut review = gnudb_review_with_guard(Some(guard));
+        review.pages[0].tracks = vec![crate::tui::app::GnudbReviewTrack {
+            title: "Track 01".to_string(),
+            artist: "New Artist".to_string(),
+            track_number: 1,
+            file_index: 0,
+        }];
+        review.pages[0].rows = vec![
+            crate::tui::app::GnudbRowKind::AlbumField("Album"),
+            crate::tui::app::GnudbRowKind::TrackHeader { track_idx: 0 },
+            crate::tui::app::GnudbRowKind::TrackField {
+                track_idx: 0,
+                field: "Artist",
+            },
+        ];
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(parked));
+        app.active_overlay = ActiveOverlay::GnudbReview(Box::new(review));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &tx,
+        );
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("GNUDB populated"));
+        assert!(status.contains("warning: 1 carrier"));
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("GNUDB acceptance must restore the metadata editor");
+        };
+        let artist = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ARTIST")
+            .expect("ARTIST row");
+        assert_eq!(artist.per_file_values, vec!["New Artist"]);
+        assert!(app.pending_metadata_editor.is_none());
+    }
+
+    #[test]
     fn gnudb_review_accept_does_not_consume_unowned_parked_editor() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut parked = clean_active_dirty_sibling_state();
@@ -31564,13 +32849,15 @@ mod phase4_tests {
 
 
 
+    const TEST_OVERLAY_AREA: (u16, u16) = (100, 40);
+
     fn outside_centered_popup_left_click(
         width_percent: usize,
         height_percent: usize,
         min_width: usize,
         min_height: usize,
     ) -> MouseEvent {
-        let area = crossterm::terminal::size().unwrap_or((80, 24));
+        let area = TEST_OVERLAY_AREA;
         let width = ((area.0 as usize) * width_percent / 100)
             .max(min_width)
             .min(area.0 as usize - 2) as u16;
@@ -31621,7 +32908,12 @@ mod phase4_tests {
             ActiveOverlay::GnudbReview(Box::new(gnudb_review_with_guard(Some(guard))));
         let (tx, _rx) = mpsc::channel(1);
 
-        handle_mouse(&mut app, gnudb_review_outside_click(), &tx);
+        handle_generic_overlay_mouse_in_area(
+            &mut app,
+            gnudb_review_outside_click(),
+            &tx,
+            TEST_OVERLAY_AREA,
+        );
 
         assert!(app.pending_metadata_editor.is_none());
         match &app.active_overlay {
@@ -31654,7 +32946,12 @@ mod phase4_tests {
         };
         let (tx, _rx) = mpsc::channel(1);
 
-        handle_mouse(&mut app, gnudb_select_outside_click(), &tx);
+        handle_generic_overlay_mouse_in_area(
+            &mut app,
+            gnudb_select_outside_click(),
+            &tx,
+            TEST_OVERLAY_AREA,
+        );
 
         assert!(app.active_gnudb_operation.is_none());
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
@@ -31691,7 +32988,12 @@ mod phase4_tests {
         };
         let (tx, _rx) = mpsc::channel(1);
 
-        handle_mouse(&mut app, gnudb_select_outside_click(), &tx);
+        handle_generic_overlay_mouse_in_area(
+            &mut app,
+            gnudb_select_outside_click(),
+            &tx,
+            TEST_OVERLAY_AREA,
+        );
 
         assert!(app.active_gnudb_operation.is_none());
         assert!(app.pending_metadata_editor.is_none());
@@ -33480,6 +34782,69 @@ mod phase4_tests {
             .unwrap();
         assert_eq!(album.per_file_values, vec!["dark side"]);
         assert_eq!(result.skipped_deleted, 0);
+    }
+
+    #[test]
+    fn fix_caps_reports_multi_value_carriers_that_change() {
+        let mut artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["alpha; beta", "gamma"],
+            &["alpha; beta", "gamma"],
+        );
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2, 1];
+        let mut state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![artist],
+            vec!["a".to_string(), "b".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+
+        let result = fix_caps_for_state(&mut state, None);
+        assert_eq!(result.changed_values, 2);
+        assert_eq!(result.collapsed_carrier_count(), 1);
+        assert_eq!(
+            result.collapsed_carriers,
+            vec![StoredValueCollapse {
+                display_key: "ARTIST".to_string(),
+                slots: vec![0],
+            }],
+        );
+        assert_eq!(
+            result.status_message(),
+            "Capitalization applied (2 values changed; warning: 1 carrier for ARTIST collapsed multiple stored values into one value)",
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            vec!["Alpha; Beta", "Gamma"],
+        );
+    }
+
+    #[test]
+    fn fix_caps_no_textual_change_reports_no_cardinality_loss() {
+        let mut artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta"],
+            &["Alpha; Beta"],
+        );
+        artist.has_multiple_stored_values = true;
+        artist.per_file_stored_value_counts = vec![2];
+        let mut state = single_image_state(vec![artist]);
+
+        let result = fix_caps_for_state(&mut state, None);
+        assert_eq!(result.changed_values, 0);
+        assert_eq!(result.collapsed_carrier_count(), 0);
+        assert!(result.collapsed_carriers.is_empty());
+        assert_eq!(
+            result.status_message(),
+            "Capitalization applied (0 values changed)",
+        );
+        assert!(!crate::tui::probe::metadata_editor_has_changes(&state));
     }
 
     #[test]
@@ -35747,6 +37112,8 @@ mod single_image_metadata_editor_regression_tests {
             original: crate::tui::probe::cue_summary_string(original),
             is_binary: true,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![value.to_string()],
             per_file_originals: vec![original.to_string()],
             mb_proposed_value: None,
@@ -35763,6 +37130,8 @@ mod single_image_metadata_editor_regression_tests {
             original: values.first().copied().unwrap_or_default().to_string(),
             is_binary: false,
             is_mixed: values.len() > 1,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: values.iter().map(|v| v.to_string()).collect(),
             per_file_originals: values.iter().map(|v| v.to_string()).collect(),
             mb_proposed_value: None,
@@ -35995,6 +37364,8 @@ mod single_image_metadata_editor_regression_tests {
                 original: "".to_string(),
                 is_binary: false,
                 is_mixed: true,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["GBAYE0300334".to_string(), "".to_string()],
                 per_file_originals: vec!["GBAYE0300334".to_string(), "".to_string()],
                 mb_proposed_value: None,
@@ -36008,6 +37379,8 @@ mod single_image_metadata_editor_regression_tests {
                 original: "1".to_string(),
                 is_binary: false,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["1".to_string(), "2".to_string()],
                 per_file_originals: vec!["1".to_string(), "2".to_string()],
                 mb_proposed_value: None,
@@ -36078,6 +37451,8 @@ mod single_image_metadata_editor_regression_tests {
                 original: "album-artist-id".to_string(),
                 is_binary: false,
                 is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["album-artist-id".to_string(), "album-artist-id".to_string()],
                 per_file_originals: vec!["album-artist-id".to_string(), "album-artist-id".to_string()],
                 mb_proposed_value: None,
@@ -36091,6 +37466,8 @@ mod single_image_metadata_editor_regression_tests {
                 original: "foreign".to_string(),
                 is_binary: false,
                 is_mixed: true,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()],
                 per_file_originals: vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()],
                 mb_proposed_value: None,
@@ -36988,6 +38365,8 @@ mod single_image_metadata_editor_regression_tests {
             original: "Composer 1".to_string(),
             is_binary: false,
             is_mixed: true,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
             per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
             mb_proposed_value: None,
@@ -37040,6 +38419,8 @@ mod single_image_metadata_editor_regression_tests {
             original: "Composer 1".to_string(),
             is_binary: false,
             is_mixed: true,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
             per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
             mb_proposed_value: None,
@@ -37089,6 +38470,8 @@ mod single_image_metadata_editor_regression_tests {
             original: "Composer 1".to_string(),
             is_binary: false,
             is_mixed: true,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
             per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
             mb_proposed_value: None,
@@ -37121,13 +38504,8 @@ mod single_image_metadata_editor_regression_tests {
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
         let (tx, _rx) = mpsc::channel(1);
 
-        let (terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
-        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(Rect::new(
-            0,
-            0,
-            terminal_width,
-            terminal_height,
-        ));
+        let area = Rect::new(0, 0, 100, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: layout.inner.x.saturating_add(1),
@@ -37135,8 +38513,8 @@ mod single_image_metadata_editor_regression_tests {
             modifiers: KeyModifiers::empty(),
         };
 
-        handle_metadata_editor_mouse(&mut app, click, &tx);
-        handle_metadata_editor_mouse(&mut app, click, &tx);
+        handle_metadata_editor_mouse_in_area(&mut app, click, &tx, area);
+        handle_metadata_editor_mouse_in_area(&mut app, click, &tx, area);
 
         let status = app
             .status_message
@@ -38446,6 +39824,8 @@ mod single_image_metadata_editor_regression_tests {
             original: String::new(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![base_sheet("side-a.flac"), base_sheet("side-b.flac")],
             per_file_originals: vec![base_sheet("side-a.flac"), base_sheet("side-b.flac")],
             mb_proposed_value: None,
@@ -39033,6 +40413,8 @@ mod metadata_cuesheet_pill_click_tests {
             original: "[CUE sheet · 1 track]".to_string(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec!["TITLE \"Album\"\nFILE \"a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string()],
             per_file_originals: vec!["TITLE \"Album\"\nFILE \"a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string()],
             mb_proposed_value: None,
@@ -39091,6 +40473,8 @@ mod mb_picker_verification_lifecycle_tests {
             original: value.to_string(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![value.to_string()],
             per_file_originals: vec![value.to_string()],
             mb_proposed_value: None,
@@ -39308,6 +40692,8 @@ mod metadata_editor_inline_navigation_tests {
             original: value,
             is_binary: false,
             is_mixed: mixed,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_originals: per_file_values.clone(),
             per_file_values,
             mb_proposed_value: None,

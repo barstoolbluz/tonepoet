@@ -467,6 +467,54 @@ pub fn reconcile_pending_publication_classified(
     })
 }
 
+/// Retire a pending publication journal without contacting the secret backend.
+///
+/// This is an explicit headless recovery escape hatch. The journal is parsed
+/// and validated before removal, but unpublished references are not revoked;
+/// callers must surface that orphan risk to the user.
+pub fn retire_pending_publication_journal_headless(
+    publication_path: &Path,
+) -> Result<usize, String> {
+    let (_lock, publication_path) = crate::config::StoreFileLock::acquire_for_path(publication_path)
+        .map_err(|error| {
+            format!(
+                "lock publication target '{}' before retiring its pending secret journal: {error}",
+                publication_path.display()
+            )
+        })?;
+    let journal_path = pending_publication_path(&publication_path);
+    let bytes = match std::fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(format!(
+                "read pending secret-publication journal '{}': {error}",
+                journal_path.display()
+            ))
+        }
+    };
+    let journal: PendingSecretPublication = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "parse pending secret-publication journal '{}': {error}",
+            journal_path.display()
+        )
+    })?;
+    validate_pending_publication(&journal_path, &journal)?;
+    let at_risk = journal
+        .references
+        .iter()
+        .chain(journal.retire_after_publish.iter())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    remove_durable_file(&journal_path).map_err(|error| {
+        format!(
+            "retire pending secret-publication journal '{}': {error}",
+            journal_path.display()
+        )
+    })?;
+    Ok(at_risk)
+}
+
 pub fn begin_pending_publication(
     publication_path: &Path,
     references: &[String],
@@ -1523,6 +1571,45 @@ mod tests {
         assert_eq!(get(&retained).as_deref(), Ok("retained-secret"));
         delete_many_if_present(&[first, second]).expect("repeat delete is idempotent");
         assert_eq!(insecure_test_secret_count(), 1);
+    }
+
+    #[test]
+    fn headless_pending_publication_retirement_validates_then_reports_orphan_risk() {
+        let _backend = enable_insecure_test_backend();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let publication = temp.path().join("config.toml");
+        let unpublished = stable_reference("config-a", "unpublished").expect("reference");
+        let superseded = stable_reference("config-b", "superseded").expect("reference");
+        set(&unpublished, "new-secret").expect("store unpublished secret");
+        set(&superseded, "old-secret").expect("store superseded secret");
+        begin_pending_publication_with_retirement(
+            &publication,
+            std::slice::from_ref(&unpublished),
+            std::slice::from_ref(&superseded),
+        )
+        .expect("publish pending journal");
+
+        let at_risk = retire_pending_publication_journal_headless(&publication)
+            .expect("headless retirement");
+
+        assert_eq!(at_risk, 2);
+        assert!(!pending_publication_path(&publication).exists());
+        assert_eq!(get(&unpublished).as_deref(), Ok("new-secret"));
+        assert_eq!(get(&superseded).as_deref(), Ok("old-secret"));
+    }
+
+    #[test]
+    fn headless_pending_publication_retirement_refuses_malformed_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let publication = temp.path().join("config.toml");
+        let journal = pending_publication_path(&publication);
+        std::fs::write(&journal, b"{not-json").expect("write malformed journal");
+
+        let error = retire_pending_publication_journal_headless(&publication)
+            .expect_err("malformed journal must remain authoritative");
+
+        assert!(error.contains(&format!("parse pending secret-publication journal '{}'", journal.display())));
+        assert_eq!(std::fs::read(&journal).expect("journal retained"), b"{not-json");
     }
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

@@ -1281,6 +1281,8 @@ pub fn populate_editor_mb_supplemental_scoped(
             original: String::new(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![String::new(); dim],
             per_file_originals: vec![String::new(); dim],
             mb_proposed_value: None,
@@ -1351,7 +1353,9 @@ pub fn populate_editor_mb_supplemental_scoped(
     };
     if let Some(idx) = isrc_idx {
         if unified || per_track_populate {
-            state.active_surface_mut().entries[idx].row_scope = crate::tui::probe::RowScope::Track;
+            let entry = &mut state.active_surface_mut().entries[idx];
+            entry.row_scope = crate::tui::probe::RowScope::Track;
+            entry.clear_stored_value_provenance();
         }
     }
     let recording_idx = if any_recording {
@@ -1770,6 +1774,8 @@ fn upsert_dvdv_duration_warning_entry(
             original: String::new(),
             is_binary: false,
             is_mixed: !all_same && n > 1,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values,
             per_file_originals: vec![String::new(); n],
             mb_proposed_value: None,
@@ -1901,9 +1907,9 @@ fn recompute_and_stamp_mb_proposed(entry: &mut crate::tui::probe::TagEntry, _n: 
 pub fn populate_editor_from_mb(
     state: &mut crate::tui::app::MetadataEditorState,
     release: &MbRelease,
-) {
+) -> crate::tui::probe::MetadataMutationReport {
     let decision = compute_per_track_decision_blocking(&state.active_surface().paths, release);
-    populate_editor_from_mb_with_per_track_decision(state, release, &decision);
+    populate_editor_from_mb_with_per_track_decision(state, release, &decision)
 }
 
 /// Populate a metadata editor state with values from a MusicBrainz release
@@ -1919,8 +1925,8 @@ pub fn populate_editor_from_mb_with_per_track_decision(
     state: &mut crate::tui::app::MetadataEditorState,
     release: &MbRelease,
     decision: &PerTrackDecision,
-) {
-    populate_editor_from_mb_scoped(state, release, decision, true);
+) -> crate::tui::probe::MetadataMutationReport {
+    populate_editor_from_mb_scoped(state, release, decision, true)
 }
 
 /// Populate a release into the editor while optionally preserving all
@@ -1931,8 +1937,10 @@ pub fn populate_editor_from_mb_scoped(
     release: &MbRelease,
     decision: &PerTrackDecision,
     apply_album_fields: bool,
-) {
+) -> crate::tui::probe::MetadataMutationReport {
     use lofty::tag::ItemKey;
+
+    let before_entries = state.active_surface().entries.clone();
 
     populate_editor_mb_supplemental_scoped(
         state,
@@ -1976,6 +1984,8 @@ pub fn populate_editor_from_mb_scoped(
             original: String::new(),
             is_binary: false,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![String::new(); dim],
             per_file_originals: vec![String::new(); dim],
             mb_proposed_value: None,
@@ -2054,7 +2064,9 @@ pub fn populate_editor_from_mb_scoped(
 
     if unified || per_track_populate {
         for idx in [title_idx, artist_idx].into_iter().flatten() {
-            state.active_surface_mut().entries[idx].row_scope = crate::tui::probe::RowScope::Track;
+            let entry = &mut state.active_surface_mut().entries[idx];
+            entry.row_scope = crate::tui::probe::RowScope::Track;
+            entry.clear_stored_value_provenance();
         }
     }
 
@@ -2254,6 +2266,10 @@ pub fn populate_editor_from_mb_scoped(
     }
     state.active_surface_mut().deleted = remapped_deleted;
     state.active_surface_mut().dirty = true;
+    crate::tui::probe::MetadataMutationReport::between(
+        &before_entries,
+        &state.active_surface().entries,
+    )
 }
 
 /// Tolerance (ms) for the file-duration vs MB-track-sum check used by
@@ -3258,6 +3274,48 @@ mod tests {
     }
 
     #[test]
+    fn musicbrainz_population_reports_multi_value_carrier_loss_positionally() {
+        let (mut state, _td) = empty_editor_state(2);
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
+            display_key: "ARTIST".to_string(),
+            item_key: lofty::tag::ItemKey::TrackArtist,
+            value: "<multiple values>".to_string(),
+            original: "<multiple values>".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2, 1],
+            per_file_values: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            per_file_originals: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+        let release = rel(
+            "rid",
+            vec![
+                trk(1, "Track 1", "New Artist", None),
+                trk(2, "Track 2", "New Scalar", None),
+            ],
+        );
+
+        let report = populate_editor_from_mb(&mut state, &release);
+
+        let artist = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ARTIST")
+            .expect("ARTIST entry");
+        assert_eq!(artist.per_file_values, vec!["New Artist", "New Scalar"]);
+        assert_eq!(report.collapsed_carrier_count(), 1);
+        assert_eq!(report.collapsed_fields.len(), 1);
+        assert_eq!(report.collapsed_fields[0].display_key, "ARTIST");
+        assert_eq!(report.collapsed_fields[0].slots, vec![0]);
+        assert!(report.changed_fields >= 2, "TITLE and ARTIST must both be counted");
+    }
+
+    #[test]
     fn populate_supplemental_writes_isrc_catalog_and_mb_only_fields() {
         let (mut state, _td) = empty_editor_state(2);
         let mut release = rel(
@@ -4061,6 +4119,8 @@ mod tests {
             original: String::new(),
             is_binary: true,
             is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
             per_file_values: vec![pre_existing.to_string()],
             per_file_originals: vec![String::new()],
             mb_proposed_value: None,
