@@ -4471,6 +4471,40 @@ fn handle_wizard_key(app: &mut AppState, key: KeyEvent) {
 
 // ── Overlay keybindings ──────────────────────────────────────────────
 
+/// Commit a GNUDB review's in-flight inline edit (if any) to the row the
+/// edit was OPENED on. Every caller that moves the cursor or seeds a new
+/// edit must commit to the PRE-move row first — routing the buffer through
+/// whatever the cursor points at when Enter fires writes the text to the
+/// wrong track (the wrong-row corruption class).
+fn commit_gnudb_review_edit_to_row(state: &mut super::app::GnudbReviewState, row: usize) {
+    use super::app::GnudbRowKind;
+    let Some(input) = state.edit_input.take() else {
+        return;
+    };
+    let new_val = input.text;
+    let page = &mut state.pages[state.active_page];
+    let Some(kind) = page.rows.get(row).cloned() else {
+        return;
+    };
+    match kind {
+        GnudbRowKind::AlbumField(field) => match field {
+            "Album" => page.album = new_val,
+            "Year" => page.year = new_val,
+            "Genre" => page.genre = new_val,
+            _ => {}
+        },
+        GnudbRowKind::TrackField { track_idx, field } => {
+            let track = &mut page.tracks[track_idx];
+            match field {
+                "Title" => track.title = new_val,
+                "Artist" => track.artist = new_val,
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     let overlay = app.active_overlay.clone();
     match overlay {
@@ -4945,28 +4979,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
                     KeyCode::Enter => {
-                        if let Some(ref input) = state.edit_input {
-                            let new_val = input.text.clone();
-                            let page = &mut state.pages[state.active_page];
-                            match &page.rows[state.cursor] {
-                                GnudbRowKind::AlbumField(field) => match *field {
-                                    "Album" => page.album = new_val,
-                                    "Year" => page.year = new_val,
-                                    "Genre" => page.genre = new_val,
-                                    _ => {}
-                                },
-                                GnudbRowKind::TrackField { track_idx, field } => {
-                                    let track = &mut page.tracks[*track_idx];
-                                    match *field {
-                                        "Title" => track.title = new_val,
-                                        "Artist" => track.artist = new_val,
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        state.edit_input = None;
+                        let row = state.cursor;
+                        commit_gnudb_review_edit_to_row(&mut state, row);
                         app.active_overlay = ActiveOverlay::GnudbReview(state);
                     }
                     _ => {
@@ -19133,6 +19147,13 @@ fn handle_generic_overlay_mouse(
                                 })
                                 .unwrap_or(false);
 
+                            // Commit any in-flight inline edit to the row
+                            // it was opened on BEFORE the cursor moves; a
+                            // later Enter (or the double-click reseed below)
+                            // must never route the typed text to this newly
+                            // clicked row.
+                            let previous_row = state.cursor;
+                            commit_gnudb_review_edit_to_row(&mut state, previous_row);
                             state.cursor = clicked_row;
 
                             if is_double {
@@ -21233,13 +21254,24 @@ fn handle_metadata_editor_mouse(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
 
-            // Detail overlay: scroll navigates per-file entries.
-            MouseEventKind::ScrollUp if state.phase == MetadataEditorPhase::DetailEdit => {
+            // Detail overlay: scroll navigates per-file entries — but never
+            // while an inline edit is open. Enter commits to
+            // `per_file_values[detail_cursor]`, so an unguarded wheel notch
+            // would silently retarget the typed text to a different track
+            // (keyboard Up/Down are swallowed into the text input for the
+            // same reason; a deliberate CLICK elsewhere commits first).
+            MouseEventKind::ScrollUp
+                if state.phase == MetadataEditorPhase::DetailEdit
+                    && state.detail_edit.is_none() =>
+            {
                 state.detail_cursor = state.detail_cursor.saturating_sub(1);
                 ensure_detail_visible(&mut state);
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
-            MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::DetailEdit => {
+            MouseEventKind::ScrollDown
+                if state.phase == MetadataEditorPhase::DetailEdit
+                    && state.detail_edit.is_none() =>
+            {
                 let n = state.active_surface()
                     .entries
                     .get(state.detail_field_idx)
@@ -21761,18 +21793,13 @@ fn handle_metadata_editor_mouse(
                             _ => {}
                         }
                     }
-                    // Dynamic pills: [:import-cue (FIELD)] if CUE-compatible,
-                    // [:fix-caps] if the field is a capitalize-applicable
-                    // text key, Enter, Esc. Pills are only added in
-                    // browsing mode (not while inline-editing a value).
-                    let cue_label: String;
+                    // Dynamic pills: [:fix-caps] if the field is a
+                    // capitalize-applicable text key, Enter, Esc. Pills are
+                    // only added in browsing mode (not while inline-editing
+                    // a value). :import-cue was removed from both footers —
+                    // it rebuilds a GnudbReview with no editor session and
+                    // the command refuses while the editor is open.
                     let mut pills: Vec<(&str, &str)> = Vec::new();
-                    if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
-                        if super::command::is_cue_importable(&entry.display_key) {
-                            cue_label = format!(":import-cue ({})", entry.display_key);
-                            pills.push((&cue_label, ":import-cue"));
-                        }
-                    }
                     if state.detail_edit.is_some() {
                         pills.extend_from_slice(&[
                             ("Enter confirm", "enter"),
@@ -21789,12 +21816,11 @@ fn handle_metadata_editor_mouse(
                     // The renderer appends extra pills (revert/restore +
                     // a 4-char gap) after the dynamic pills when the
                     // focused entry has MB-proposed values. Width-match
-                    // here so the click hit-test centers identically.
-                    // Without this, clicks on (e.g.) :fix-caps would
-                    // land in :import-cue's range due to the misaligned
-                    // start_x. revert/restore themselves are click-
-                    // handled via button_map (above), not via this
-                    // hit-test.
+                    // here so the click hit-test centers identically —
+                    // otherwise clicks on one pill land in a neighbor's
+                    // range due to the misaligned start_x. revert/restore
+                    // themselves are click-handled via button_map (above),
+                    // not via this hit-test.
                     let extra_width = if state.detail_edit.is_none() {
                         if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
                             if super::probe::entry_has_mb_proposed(entry) {
@@ -30364,6 +30390,131 @@ mod phase4_tests {
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
+    }
+
+    #[test]
+    fn wheel_scroll_never_retargets_an_inflight_detail_edit() {
+        // Audit H3: an unguarded wheel notch moved detail_cursor under an
+        // open inline edit, so Enter committed the typed text to a
+        // DIFFERENT track.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["One", "Two"],
+                &["One", "Two"],
+            )],
+            vec!["a".to_string(), "b".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        state.detail_cursor = 1;
+        state.detail_edit = Some(crate::tui::text_input::TextInputState::new(
+            "typed".to_string(),
+        ));
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_metadata_editor_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("editor must remain open");
+        };
+        assert_eq!(
+            state.detail_cursor, 1,
+            "a wheel notch must not move an in-flight edit's commit target"
+        );
+        assert_eq!(
+            state.detail_edit.as_ref().map(|input| input.text.as_str()),
+            Some("typed"),
+            "the in-flight edit buffer must survive"
+        );
+    }
+
+    #[test]
+    fn import_cue_refuses_while_the_metadata_editor_is_open() {
+        // Audit H4: ImportCue replaced the editor with a GnudbReview that
+        // carries no editor session, destroying every unsaved edit.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let state =
+            single_image_state(vec![entry("TITLE", ItemKey::TrackTitle, &["One"], &["Orig"])]);
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(4);
+
+        super::super::command::execute_command(
+            &mut app,
+            super::super::command::Command::ImportCue,
+            &tx,
+        );
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("the editor session must survive an import-cue attempt");
+        };
+        assert!(
+            state.active_surface().dirty,
+            "unsaved edits must be preserved"
+        );
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(message, _)| message.starts_with("import-cue:")),
+            "the refusal must be visible"
+        );
+    }
+
+    #[test]
+    fn review_click_commit_lands_on_the_row_the_edit_was_opened_on() {
+        // Audit E-finding: a row click moved the review cursor under an open
+        // inline edit, so Enter wrote the buffer to the NEW row. The click
+        // path now commits to the pre-move row via this helper.
+        let entry = super::super::gnudb::GnudbEntry {
+            disc_id: "x".to_string(),
+            artist: "Artist".to_string(),
+            album: "Old Album".to_string(),
+            year: "1971".to_string(),
+            genre: "Rock".to_string(),
+            tracks: vec!["T1".to_string(), "T2".to_string()],
+        };
+        let mut state = super::super::gnudb::build_review_state(
+            &entry,
+            vec![
+                std::path::PathBuf::from("/a.flac"),
+                std::path::PathBuf::from("/b.flac"),
+            ],
+        );
+        // Row 0 is AlbumField("Album"); row 4 is track 1's Title.
+        state.cursor = 0;
+        state.edit_input = Some(crate::tui::text_input::TextInputState::new(
+            "New Album".to_string(),
+        ));
+
+        commit_gnudb_review_edit_to_row(&mut state, 0);
+        state.cursor = 4;
+
+        assert_eq!(
+            state.pages[0].album, "New Album",
+            "the buffer must land on the row the edit was opened on"
+        );
+        assert!(state.edit_input.is_none());
+        assert_eq!(
+            state.pages[0].tracks[0].title, "T1",
+            "the newly clicked row must be untouched"
+        );
     }
 
     /// Build a minimal MetadataEditorState with paths.len() == 1.

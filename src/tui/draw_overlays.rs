@@ -5711,22 +5711,15 @@ fn draw_metadata_detail(
 
     // Footer.
     let footer = if state.detail_edit.is_some() {
-        // Currently editing a per-file value.
-        let mut pills = Vec::new();
-        if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
-            if super::command::is_cue_importable(&entry.display_key) {
-                pills.push(footer_pill(
-                    &format!(":import-cue ({})", entry.display_key),
-                    theme.blue, theme));
-                pills.push(pill_gap());
-            }
-        }
-        pills.extend_from_slice(&[
+        // Currently editing a per-file value. No :import-cue pill here:
+        // ImportCue rebuilds a GnudbReview with no editor session, so
+        // running it from inside the editor would destroy unsaved edits
+        // (the command itself also refuses while the editor is open).
+        Line::from(vec![
             footer_pill("Enter confirm", theme.green, theme),
             pill_gap(),
             footer_pill("Esc cancel", theme.purple, theme),
-        ]);
-        Line::from(pills)
+        ])
     } else {
         // Browsing per-file values. Append [revert]/[use MB] +
         // [restore] pills when MB populated this field, so the
@@ -5736,12 +5729,6 @@ fn draw_metadata_detail(
         let mut pills = Vec::new();
         let entry_opt = state.active_surface().entries.get(state.detail_field_idx);
         if let Some(entry) = entry_opt {
-            if super::command::is_cue_importable(&entry.display_key) {
-                pills.push(footer_pill(
-                    &format!(":import-cue ({})", entry.display_key),
-                    theme.blue, theme));
-                pills.push(pill_gap());
-            }
             if super::keybindings::is_fix_caps_applicable(&entry.display_key) {
                 pills.push(footer_pill(":fix-caps", theme.blue, theme));
                 pills.push(pill_gap());

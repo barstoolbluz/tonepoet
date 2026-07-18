@@ -1090,6 +1090,34 @@ fn close_matching_file_picker(
     matched
 }
 
+/// True when a deliberate same-as-source rate is selected on a DSD target —
+/// captured BEFORE a probe result is installed, because the clamp can fire
+/// inside `set_source_mode` (identity promotion to Known runs constraints),
+/// not only in the defaults block.
+fn dsd_source_rate_sentinel_selected(app: &AppState) -> bool {
+    app.convert.format.is_dsd_selected()
+        && *app.convert.format.sample_rate.selected_value()
+            == super::app::SOURCE_SAMPLE_RATE_SENTINEL
+}
+
+/// Report a completed probe clamping away a deliberate same-as-source rate.
+/// The clamp itself is correct — rate=source is invalid for a DSD target
+/// once the source is KNOWN to be PCM — but a deliberately staged pill must
+/// never change value silently. Runs after the reducer's own status set so
+/// the more specific message wins.
+fn report_source_rate_sentinel_clamp(app: &mut AppState, was_sentinel_selected: bool) {
+    if !was_sentinel_selected {
+        return;
+    }
+    let selected = *app.convert.format.sample_rate.selected_value();
+    if selected != super::app::SOURCE_SAMPLE_RATE_SENTINEL {
+        let target = app.convert.format.format.selected_label().to_string();
+        app.set_status(format!(
+            "rate 'source' is invalid for {target} with a PCM source; set to {selected} Hz"
+        ));
+    }
+}
+
 fn handle_convert_source_probe_result(
     app: &mut AppState,
     generation: u64,
@@ -1100,6 +1128,7 @@ fn handle_convert_source_probe_result(
     if generation != app.probe_generation {
         return;
     }
+    let was_sentinel_selected = dsd_source_rate_sentinel_selected(app);
 
     let metadata_unchanged = app.convert.metadata.editing.is_none()
         && super::app::ConvertProbeMetadataSnapshot::capture(&app.convert.metadata)
@@ -1187,6 +1216,7 @@ fn handle_convert_source_probe_result(
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
     }
+    report_source_rate_sentinel_clamp(app, was_sentinel_selected);
 }
 
 fn handle_archive_preview_progress(
@@ -1233,6 +1263,8 @@ fn handle_archive_preview_result(
         }
         return;
     }
+
+    let was_sentinel_selected = dsd_source_rate_sentinel_selected(app);
 
     // The completed preview now owns the staging directory. Disarm the pending
     // handle before installing the completed SourceMode so set_source_mode()
@@ -1284,6 +1316,7 @@ fn handle_archive_preview_result(
                 track_count,
                 if track_count == 1 { "" } else { "s" }
             ));
+            report_source_rate_sentinel_clamp(app, was_sentinel_selected);
         }
         Err(err) => {
             if super::app::looks_like_archive_password_error(&err) {
@@ -2437,6 +2470,7 @@ fn handle_convert_audio_probe_complete(
     if generation != app.probe_generation {
         return;
     }
+    let was_sentinel_selected = dsd_source_rate_sentinel_selected(app);
 
     let format_unchanged =
         super::app::ConvertProbeFormatSnapshot::capture(&app.convert.format) == baseline.format;
@@ -2489,6 +2523,7 @@ fn handle_convert_audio_probe_complete(
     if let Some(notice) = probe_notice {
         app.set_status(format!("Probe warning: {}", notice));
     }
+    report_source_rate_sentinel_clamp(app, was_sentinel_selected);
 }
 
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
@@ -7140,6 +7175,73 @@ fn handle_cue_fill_complete(
     app.set_status(summary);
 }
 
+
+#[cfg(test)]
+mod sentinel_clamp_status_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    #[test]
+    fn pcm_probe_over_staged_dsd_sentinel_reports_the_clamp() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        // Probe-proven DSD source, DSF target, deliberate rate=source.
+        app.convert.format.set_source_is_dsd(true);
+        app.convert
+            .format
+            .format
+            .select_value(&crate::convert::formats::AudioFormat::Dsf);
+        app.convert.format.apply_format_constraints();
+        assert!(app
+            .convert
+            .format
+            .sample_rate
+            .select_value(&super::super::app::SOURCE_SAMPLE_RATE_SENTINEL));
+
+        // Production shape: placeholder install, baseline capture, dispatch.
+        let path = std::path::PathBuf::from("/library/track.flac");
+        app.convert.set_source_mode(super::super::app::SourceMode::Single {
+            path: path.clone(),
+            info: None,
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: None,
+        });
+        let baseline = super::super::app::ConvertProbeBaseline::capture(&app.convert);
+        let generation = app.probe_generation;
+
+        let realized = super::super::app::SourceMode::Single {
+            path: path.clone(),
+            info: Some(crate::tui::probe::SourceInfo {
+                format_name: "FLAC".to_string(),
+                codec: "flac".to_string(),
+                bit_depth: Some(24),
+                sample_rate: 96_000,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 10.0,
+                file_size: 1_000,
+            }),
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: None,
+        };
+        handle_convert_source_probe_result(&mut app, generation, path, realized, baseline);
+
+        // The clamp itself is correct (rate=source is invalid for a DSD
+        // target with a KNOWN PCM source) — the pin is that it is REPORTED.
+        assert_ne!(
+            *app.convert.format.sample_rate.selected_value(),
+            super::super::app::SOURCE_SAMPLE_RATE_SENTINEL
+        );
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.clone())
+            .expect("clamp must set a status");
+        assert!(
+            status.starts_with("rate 'source' is invalid for"),
+            "unexpected status: {status}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod metadata_write_completion_tests {

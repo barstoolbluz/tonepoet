@@ -5349,6 +5349,18 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             }
         }
         Command::ImportCue => {
+            // The importer reads the BROWSE selection and replaces the active
+            // overlay with a GnudbReview that carries no editor session — run
+            // from inside the metadata editor it would silently destroy every
+            // unsaved edit (and target files the editor never showed). Refuse
+            // instead of parking: the designed editor<->review round-trip is
+            // the :gnudb-back flow, which ImportCue does not implement.
+            if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+                app.set_status(
+                    "import-cue: close the metadata editor first — unsaved edits are preserved",
+                );
+                return;
+            }
             // Collect audio paths from current browse selection.
             let mut paths: Vec<std::path::PathBuf> = match app.current_screen {
                 AppScreen::Browse => {

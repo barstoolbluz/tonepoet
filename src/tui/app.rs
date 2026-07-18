@@ -3589,9 +3589,27 @@ impl FormatState {
         }
     }
 
+    /// Record a COMPLETED probe's DSD/PCM identity. Only real probe facts may
+    /// promote to Known — guesses and emptiness go through
+    /// [`Self::set_pending_source_hint`] instead.
     pub fn set_source_is_dsd(&mut self, source_is_dsd: bool) {
         self.source_is_dsd = source_is_dsd;
         self.source_rate_identity = SourceRateIdentity::Known;
+        self.apply_format_constraints();
+    }
+
+    /// Record a DSD/PCM HINT for a source whose identity is not probe-proven
+    /// (Empty mode, or a pending-probe placeholder where only the file
+    /// extension is known). The hint drives row visibility, but the identity
+    /// is deliberately NOT promoted to Known: a fresh Unstaged state stays
+    /// permissive (presets can stage source-relative policy), and anything
+    /// else becomes Lost so a deliberate same-as-source selection is retained
+    /// disabled until a completed probe revalidates it.
+    pub fn set_pending_source_hint(&mut self, source_is_dsd_hint: bool) {
+        self.source_is_dsd = source_is_dsd_hint;
+        if self.source_rate_identity != SourceRateIdentity::Unstaged {
+            self.source_rate_identity = SourceRateIdentity::Lost;
+        }
         self.apply_format_constraints();
     }
 
@@ -4899,23 +4917,37 @@ impl ConvertState {
         self.dest_path_last_click = None;
     }
 
-    fn current_source_is_dsd(&self) -> bool {
-        self.source
-            .mode
-            .current_info()
-            .map(source_info_is_dsd)
-            .or_else(|| self.source.mode.current_path().map(|path| source_path_is_dsd(path)))
-            .unwrap_or(false)
-    }
-
     /// Recompute source-dependent format constraints without selecting source
     /// defaults. This is the safe path for late async probe completions when
     /// the user has already changed output controls: facts such as "source is
     /// DSD" still affect enabled/disabled state, but sample-rate, bit-depth,
     /// dither, and resampler selections are not cascaded from the source.
+    ///
+    /// Source-identity policy lives here — this is the single choke point for
+    /// every mode install (`set_source_mode*` both route through it). Only a
+    /// COMPLETED probe (`current_info()` = Some) may promote the identity to
+    /// Known; an Empty source or a pending-probe placeholder supplies at most
+    /// an extension HINT for row visibility and demotes the identity instead.
+    /// Promoting a guess to Known clamped away deliberate same-as-source
+    /// selections at exactly the moments the retention design exists for
+    /// (emptying the batch; staging an .iso whose DSD-ness the probe has not
+    /// yet discovered).
     pub fn refresh_source_constraints_preserving_format_selection(&mut self) {
-        let source_is_dsd = self.current_source_is_dsd();
-        self.format.set_source_is_dsd(source_is_dsd);
+        match self.source.mode.current_info() {
+            Some(info) => {
+                let source_is_dsd = source_info_is_dsd(info);
+                self.format.set_source_is_dsd(source_is_dsd);
+            }
+            None => {
+                let hint = self
+                    .source
+                    .mode
+                    .current_path()
+                    .map(|path| source_path_is_dsd(path))
+                    .unwrap_or(false);
+                self.format.set_pending_source_hint(hint);
+            }
+        }
         self.format.apply_format_constraints();
     }
 
@@ -5020,9 +5052,17 @@ impl ConvertState {
         } else {
             self.format.cascade_pcm_source_defaults(source_rate, source_bits, source_is_float);
         }
+        // Constraints must run BEFORE the auto rules: cascades deliberately
+        // force-install out-of-range automatic defaults (768k/Int32) that the
+        // constraint pass clamps to the nearest allowed scalar (384k/Int24).
+        // The auto rules read the SELECTED rate/depth — run against unclamped
+        // values they armed a real 768->384 resample with resampler=None and
+        // a 32->24 truncation with dither=None. The auto rules only select
+        // values (never enablement) and cannot pick disabled options, so no
+        // trailing constraints pass is needed.
+        self.format.apply_format_constraints();
         self.format.apply_auto_dither(source_bits);
         self.format.apply_auto_resampler(Some(source_rate));
-        self.format.apply_format_constraints();
     }
 
     /// Apply source-aware format pane defaults after a probe completes.
@@ -13489,6 +13529,100 @@ PERFORMER "Nobody"
 #[cfg(test)]
 mod source_default_reset_tests {
     use super::*;
+
+    #[test]
+    fn emptying_the_source_preserves_a_deliberate_source_rate() {
+        // Audit H1: set_source_mode(Empty) used to promote identity to
+        // Known(PCM) and clamp away a retained same-as-source selection.
+        let mut convert = ConvertState::new();
+        convert.format.set_source_is_dsd(true); // probe-proven DSD source
+        convert.format.format.select_value(&crate::convert::formats::AudioFormat::Dsf);
+        convert.format.apply_format_constraints();
+        assert!(convert
+            .format
+            .sample_rate
+            .select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+
+        convert.set_source_mode(SourceMode::Empty);
+
+        assert_eq!(
+            *convert.format.sample_rate.selected_value(),
+            SOURCE_SAMPLE_RATE_SENTINEL,
+            "emptying the batch must not clamp deliberate source-rate policy"
+        );
+        assert_eq!(
+            convert.format.source_rate_identity,
+            SourceRateIdentity::Lost
+        );
+    }
+
+    #[test]
+    fn pending_probe_placeholder_does_not_clamp_a_staged_source_rate() {
+        // Audit H2: a placeholder install (info: None) used to promote the
+        // file-extension guess to Known — staging an .iso transiently
+        // clamped a DSD source-rate selection before the probe could prove
+        // the source is DSD.
+        let mut convert = ConvertState::new();
+        convert.format.set_source_is_dsd(true);
+        convert.format.format.select_value(&crate::convert::formats::AudioFormat::Dsf);
+        convert.format.apply_format_constraints();
+        assert!(convert
+            .format
+            .sample_rate
+            .select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+
+        convert.set_source_mode(SourceMode::Single {
+            path: std::path::PathBuf::from("/library/album.iso"),
+            info: None,
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: None,
+        });
+
+        assert_eq!(
+            *convert.format.sample_rate.selected_value(),
+            SOURCE_SAMPLE_RATE_SENTINEL,
+            "an extension guess must not clamp deliberate source-rate policy"
+        );
+        assert_eq!(
+            convert.format.source_rate_identity,
+            SourceRateIdentity::Lost
+        );
+
+        // The probe completes and proves DSD: the sentinel is valid again.
+        convert.format.set_source_is_dsd(true);
+        assert!(convert.format.sample_rate.options.iter().any(|option| {
+            option.value == SOURCE_SAMPLE_RATE_SENTINEL && option.enabled
+        }));
+    }
+
+    #[test]
+    fn clamped_automatic_defaults_still_get_resampler_and_dither() {
+        // Audit M7: the auto rules used to run BEFORE constraints clamped a
+        // force-installed 768k/Int32 automatic default, arming a real
+        // 768->384 resample with resampler=None and a 32->24 truncation
+        // with dither=None.
+        let mut convert = ConvertState::new();
+        convert
+            .format
+            .format
+            .select_value(&crate::convert::formats::AudioFormat::Alac);
+        convert.format.apply_format_constraints();
+
+        convert.apply_source_info_defaults(&source_info(768_000, Some(32)));
+
+        assert_eq!(*convert.format.sample_rate.selected_value(), 384_000);
+        assert_eq!(*convert.format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert_ne!(
+            *convert.format.resampler.selected_value(),
+            ResamplerChoice::None,
+            "a clamped 768->384 conversion must arm a resampler"
+        );
+        assert_ne!(
+            *convert.format.dither.selected_value(),
+            DitherType::None,
+            "a clamped 32->24 reduction must arm dither"
+        );
+    }
 
     fn source_info(sample_rate: u32, bit_depth: Option<u32>) -> SourceInfo {
         SourceInfo {
