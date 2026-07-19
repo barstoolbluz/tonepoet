@@ -147,11 +147,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1772048624,
-        "narHash": "sha256-4PTQpCaRKrhfx5re3fo/tDE0Suz5SSsOUxIgNkxo/HQ=",
+        "lastModified": 1784474918,
+        "narHash": "sha256-LjGx+yaWi5EcZsXhTmdRaf9utFXcCXASMmjRtm6vUc8=",
         "owner": "barstoolbluz",
         "repo": "sox_ng",
-        "rev": "482801f768d5075fcef1ec81968fd57a85433627",
+        "rev": "324b8cf873fd7836e8848bd87f7a90d8faa6f849",
         "type": "github"
       },
       "original": {

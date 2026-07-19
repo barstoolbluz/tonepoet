@@ -94,9 +94,12 @@ corrected form reproduces the evidence profile exactly (v5: unity at 25 kHz,
 −6.02 dB at 30 kHz, stopband from 35 kHz). Directive: derive the argv
 frequency as `PB + TW/2` for every profile (B3→`-30000`, B4→`-37500`,
 B4W→`-42500`, B5→`-59000`, B6→`-114100`), state this rule and the measured
-basis in the brief, re-confirm under the pinned 14.8.0.1 identity as part of
-qualification, and make the §6.2 #3 response qualification assert the
+basis in the brief, and make the §6.2 #3 response qualification assert the
 *profile* (flat point, −6 dB point, stopband edge), not merely the argv.
+Status update: the flake now pins SoX-ng 14.8.0.1
+(`barstoolbluz/sox_ng@324b8cf`), and both measurements above were re-run
+identically against that exact build — the qualification suite still
+re-asserts the profile, but the semantics are no longer in question.
 Your §4.7 example (`-t 15000 -30000` for a "30 kHz" filter) already follows
 the −6 dB-point convention; align the profile table's rendering rule with it.
 
@@ -169,10 +172,11 @@ brief **to yourself** for the P0 scope above, derived from
 1. Restate the exact P0 surface (supported cells, rejected cells with error
    text, gain modes, targets, DST front-end) so implementation needs no
    reference back to out-of-scope design sections.
-2. Resolve D1 (state the verified sinc semantics and the final frozen argv
-   derivation rule; if you cannot verify empirically without the pinned
-   binary, specify the decision procedure the implementation round runs
-   FIRST and both argv outcomes).
+2. Apply D1: the sinc semantics are measured and closed (frequency argument
+   = −6 dB point on the pinned 14.8.0.1 build). Carry the `freq = PB + TW/2`
+   derivation rule and the corrected per-profile frequencies into the frozen
+   argv tables, and keep the §6.2 #3 qualification asserting the profile
+   response.
 3. Specify the P0 type/settings subset actually built (including which
    deferred fields ship as typed-but-rejected vs. omitted) and the exact
    forward-compatibility contract for Manual and lossy delivery.
