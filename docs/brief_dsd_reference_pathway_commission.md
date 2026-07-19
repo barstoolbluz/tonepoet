@@ -8,7 +8,7 @@ again) will implement. We are deliberately splitting design from implementation
 because the Manual/Expert workflow system is an architecture problem, and the
 designer should be the implementer.
 
-Two evidence documents ship in this bundle at the repository root:
+Two evidence documents ship in this bundle under `docs/`:
 
 - `tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md` — the product policy
   (Reference chain, reconstruction profiles B1–B6, headroom rule, gain
@@ -125,7 +125,7 @@ Verified surface map (agent-swept, then spot-verified):
   shown when `dsd_to_pcm_gain_available()` (source DSD, target PCM) —
   `src/tui/draw_output.rs:164-179`, `src/tui/app.rs:3538-3542`. The TUI builds
   `DsdSettings::default()` and overrides *only* the gain fields
-  (`src/tui/convert_actions.rs:374-400`). The margin has no UI control.
+  (`src/tui/convert_actions.rs:375-400`). The margin has no UI control.
 - Therefore `DsdLowpassMethod::Sinc` — which *is* implemented
   (`plugins.rs:1622-1639`: user FIR from `dsd.sinc` pre-rate, then `rate -I`)
   — is **dead in practice**: nothing in the program ever sets
@@ -215,7 +215,7 @@ Specific decisions your design must make and justify:
   or scope it out explicitly with rationale.
 - **Log/documentation wording** (v9 "Stopband-rejection wording"): the
   conversion log currently prints the lowpass method
-  (`src/convert/pipeline/stages.rs:16387-16391`); extend it to record profile,
+  (`src/convert/pipeline/stages.rs:16883-16887`); extend it to record profile,
   headroom, measured peak, applied gain, and the qualified-rejection phrasing —
   never a "−180 dBFS noise floor" claim.
 
