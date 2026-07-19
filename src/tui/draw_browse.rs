@@ -164,7 +164,11 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     }
 
     draw_browse_list(f, list_area, &mut app.browse, inline_edit.as_ref(), hover, theme);
-    register_browse_buttons(&mut app.button_map, list_area, &app.browse);
+    let create_row_active = matches!(
+        app.browse_inline_edit.as_ref().map(|state| &state.target),
+        Some(crate::tui::app::BrowseInlineEditTarget::Create { dir, .. }) if dir == &app.browse.current_dir
+    );
+    register_browse_buttons(&mut app.button_map, list_area, &app.browse, create_row_active);
     // The Browse pane is maximized/restored by double-clicking its title.
     // Do not also register the title glyph as a single-click toggle: Browse
     // never collapses, and a destructive single-click here violates the
@@ -1405,7 +1409,12 @@ mod search_panel_geometry_tests {
 
 /// Register mouse click targets for the browse list: column headers,
 /// individual entry rows, and a catch-all list area for scroll wheel routing.
-fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &BrowseState) {
+fn register_browse_buttons(
+    buttons: &mut ButtonRenderMap,
+    area: Rect,
+    browse: &BrowseState,
+    create_row_active: bool,
+) {
     if area.height < 4 || area.width < 20 {
         return;
     }
@@ -1464,10 +1473,20 @@ fn register_browse_buttons(buttons: &mut ButtonRenderMap, area: Rect, browse: &B
     }
 
     // Entry rows: below header (and search panel if active), above bottom border.
+    // Mirror the renderer: an active create prompt reserves one list row, so
+    // no entry button may be registered where the create editor is drawn.
     let entry_y_start = browse_entry_y_start(area, browse.search.active);
     let content_height = (area.height as usize).saturating_sub(3 + search_rows as usize);
+    let entry_capacity = content_height.saturating_sub(usize::from(create_row_active));
     let start = browse.scroll_offset;
-    let end = (start + content_height).min(browse.entries.len());
+    let end = (start + entry_capacity).min(browse.entries.len());
+    if create_row_active && content_height > 0 {
+        let create_row = (end - start).min(content_height - 1) as u16;
+        buttons.record_button(
+            TuiButton::BrowseCreateRow,
+            Rect::new(area.x + 1, entry_y_start + create_row, inner_w as u16, 1),
+        );
+    }
     for (row, i) in (start..end).enumerate() {
         let y = entry_y_start + row as u16;
         let row_rect = Rect::new(area.x + 1, y, inner_w as u16, 1);

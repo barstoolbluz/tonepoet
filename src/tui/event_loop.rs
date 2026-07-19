@@ -3780,12 +3780,26 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         app.pending_archive_recovery_resume_conflicted = false;
                     }
                     if super::app::looks_like_archive_password_error(&e) {
-                        app.active_overlay = ActiveOverlay::TextEdit {
-                            input: TextInputState::empty(),
-                            target: TextEditTarget::ArchivePassword(archive_path.clone()),
-                            label: "archive password".to_string(),
-                        };
-                        app.set_status(format!("Archive error: {}; enter password", e));
+                        // Overlay-slot authority: the wrong-password Enter
+                        // path may already have RESTORED a parked dirty
+                        // metadata editor into the slot before this failure
+                        // arrives — installing the re-prompt over it would
+                        // drop unsaved edits. Prompt only into an empty
+                        // slot; otherwise surface the retry path in the
+                        // status instead of clobbering.
+                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                            app.active_overlay = ActiveOverlay::TextEdit {
+                                input: TextInputState::empty(),
+                                target: TextEditTarget::ArchivePassword(archive_path.clone()),
+                                label: "archive password".to_string(),
+                            };
+                            app.set_status(format!("Archive error: {}; enter password", e));
+                        } else {
+                            app.set_status(format!(
+                                "Archive error: {}; close the current overlay and use :password to retry",
+                                e
+                            ));
+                        }
                     } else {
                         app.set_status(format!("Archive error: {}", e));
                     }
@@ -7586,6 +7600,76 @@ mod startup_recovery_order_tests {
         assert_eq!(
             std::fs::read(&target).expect("read target"),
             original.to_vec()
+        );
+    }
+}
+
+#[cfg(test)]
+mod archive_listing_overlay_authority_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    #[tokio::test]
+    async fn wrong_password_relisting_does_not_clobber_an_occupied_overlay() {
+        // Audit HIGH: the wrong-password Enter path can RESTORE a parked
+        // dirty metadata editor into the slot before the listing failure
+        // arrives; the re-prompt used to overwrite (and drop) it.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let archive = std::path::PathBuf::from("/library/album.7z");
+        let (id, _cancel) = app.begin_archive_listing(archive.clone());
+        let editor = crate::tui::app::MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            Vec::new(),
+            vec!["a".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(editor));
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_message(
+            &mut app,
+            AppMessage::ArchiveListingComplete {
+                id,
+                archive_path: archive.clone(),
+                cache_key: None,
+                result: Box::new(Err("Wrong password?".to_string())),
+                password: Some("wrong".to_string()),
+            },
+            &tx,
+        );
+
+        assert!(
+            matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)),
+            "the occupied overlay must survive the failed relisting"
+        );
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains(":password to retry")));
+
+        // The empty-slot case still prompts.
+        let (id, _cancel) = app.begin_archive_listing(archive.clone());
+        app.active_overlay = ActiveOverlay::None;
+        handle_message(
+            &mut app,
+            AppMessage::ArchiveListingComplete {
+                id,
+                archive_path: archive,
+                cache_key: None,
+                result: Box::new(Err("Wrong password?".to_string())),
+                password: Some("wrong".to_string()),
+            },
+            &tx,
+        );
+        assert!(
+            matches!(
+                app.active_overlay,
+                ActiveOverlay::TextEdit {
+                    target: super::super::app::TextEditTarget::ArchivePassword(_),
+                    ..
+                }
+            ),
+            "an empty slot still receives the password prompt"
         );
     }
 }

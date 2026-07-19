@@ -6072,7 +6072,9 @@ mod cue_real_output_matrix_tests {
                 container_contains: &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
                 codec: "aac",
                 required_encoder: Some("libfdk_aac"),
-                required_taggers: &[],
+                // The metadata stage now unconditionally runs the
+                // AtomicParsley freeform pass for m4a outputs.
+                required_taggers: &["AtomicParsley"],
                 artwork_supported: ArtworkExpectation::EmbeddedPicture,
                 supports_album_artist: true,
             },
@@ -37079,6 +37081,162 @@ mod pipeline_test_helpers {
             ]),
             sidecars: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod m4a_freeform_invocation_tests {
+    use super::*;
+    use super::chunk_2_1_3_postprocessing_gate_and_phase_tests::{request, stage_policy};
+    use crate::convert::pipeline::tool::{ProcessExit, StubToolRunner, ToolOutput};
+    use crate::convert::pipeline::types::insert_source_text_tag;
+
+    fn stub_ok(binary: ToolBinary) -> ToolOutput {
+        ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(1),
+            command: CommandRecord {
+                description: None,
+                binary,
+                sanitized_args: Vec::new(),
+                cwd: None,
+                env_keys: Vec::new(),
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::from_millis(1),
+            },
+        }
+    }
+
+    /// Stub runner that materializes the ffmpeg rewrite's temp output (the
+    /// replace step validates a non-empty regular file) while recording the
+    /// transcript like StubToolRunner.
+    struct TempWritingRunner {
+        inner: StubToolRunner,
+    }
+
+    #[async_trait]
+    impl ToolRunner for TempWritingRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            if cmd.binary == ToolBinary::Ffmpeg {
+                if let Some(output_path) = cmd.args.last() {
+                    let _ = std::fs::write(output_path, b"rewritten m4a bytes");
+                }
+            }
+            self.inner.run(cmd, cancel).await
+        }
+    }
+
+    /// Invocation-level pin for the AtomicParsley freeform pass: the real-file
+    /// matrix that exercises it end-to-end skips without libfdk_aac, so
+    /// deleting the apply_m4a_freeform_tags call sites must fail HERMETICALLY.
+    #[tokio::test]
+    async fn m4a_metadata_stage_invokes_the_atomicparsley_freeform_pass() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("01 - Track.m4a");
+        std::fs::write(&staged, b"m4a placeholder").expect("staged artifact");
+
+        let mut metadata = TrackMetadata {
+            title: Some("Track".to_string()),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+        insert_source_text_tag(&mut metadata.extra, "MY_NOTE", "keep me");
+        let track_id = TrackId {
+            source_ordinal: 1,
+            disc_number: None,
+            track_number: 1,
+        };
+        let source = PreparedSource {
+            container: temp.path().join("album.cue"),
+            kind: SourceKind::CueImage,
+            tracks: vec![PreparedTrack {
+                id: track_id.clone(),
+                source_ref: TrackSourceRef::StagedFile(staged.clone()),
+                metadata,
+                expected_samples: None,
+                sample_rate: Some(44_100),
+                bit_depth: Some(16),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(44_100),
+                    Some(16),
+                    Some(SourceAudioCoding::Pcm),
+                ),
+                warnings: Vec::new(),
+            }],
+            album_metadata: AlbumMetadata::default(),
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::CueImage,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                track_id,
+                staged_path: staged.clone(),
+                final_path: staged.clone(),
+                samples: None,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                metadata_required: PlannedMetadataSatisfaction::none(),
+                planned_command_hash: None,
+            }]),
+            sidecars: Vec::new(),
+        };
+        let req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = TempWritingRunner {
+            inner: StubToolRunner::new(),
+        };
+        runner.inner.push_output(stub_ok(ToolBinary::Ffmpeg));
+        runner.inner.push_output(stub_ok(ToolBinary::AtomicParsley));
+        let cancel = CancellationToken::new();
+
+        apply_metadata(&artifacts, &source, &req, &runner, &cancel)
+            .await
+            .expect("metadata stage");
+
+        let transcript = runner.inner.transcript();
+        let freeform = transcript
+            .iter()
+            .find(|record| record.binary == ToolBinary::AtomicParsley)
+            .expect("the m4a freeform pass must run AtomicParsley");
+        assert!(
+            freeform
+                .sanitized_args
+                .iter()
+                .any(|arg| arg == "--rDNSatom"),
+            "freeform atoms must be written via --rDNSatom: {:?}",
+            freeform.sanitized_args
+        );
+        assert!(
+            freeform.sanitized_args.iter().any(|arg| arg == "name=MY_NOTE"),
+            "the user's custom key rides the freeform pass: {:?}",
+            freeform.sanitized_args
+        );
+        assert!(
+            freeform.sanitized_args.iter().any(|arg| arg == "--overWrite"),
+            "rerun convergence requires --overWrite"
+        );
+        // The ffmpeg rewrite must NOT carry use_metadata_tags (it drops the
+        // attached picture on ffmpeg 7.1).
+        let rewrite = transcript
+            .iter()
+            .find(|record| record.binary == ToolBinary::Ffmpeg)
+            .expect("m4a rewrite runs ffmpeg");
+        assert!(!rewrite.sanitized_args.iter().any(|arg| arg == "-movflags"));
     }
 }
 

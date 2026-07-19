@@ -204,6 +204,8 @@ pub enum TuiButton {
     BrowseEntryGutter(usize),
     BrowseColumn(crate::tui::browse::BrowseColumn),
     BrowseList, // catch-all region for scroll wheel routing
+    /// The Browse pane's inline create-name row (focus-preserving click target).
+    BrowseCreateRow,
     BrowseBreadcrumb, // click to edit path
     BrowseToolbarBack,
     BrowseToolbarForward,
@@ -517,6 +519,7 @@ impl TuiButton {
             | Self::BrowseEntryGutter(_)
             | Self::BrowseColumn(_)
             | Self::BrowseList
+            | Self::BrowseCreateRow
             | Self::BrowseBreadcrumb
             | Self::BrowseToolbarBack
             | Self::BrowseToolbarForward

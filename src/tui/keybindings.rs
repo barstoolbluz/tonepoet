@@ -1049,6 +1049,13 @@ fn active_inline_edit_matches_button(app: &AppState, button: Option<&TuiButton>)
             .unwrap_or(false),
         (
             Some(BrowseInlineEditState {
+                target: BrowseInlineEditTarget::Create { dir, .. },
+                ..
+            }),
+            TuiButton::BrowseCreateRow,
+        ) => *dir == app.browse.current_dir,
+        (
+            Some(BrowseInlineEditState {
                 target: BrowseInlineEditTarget::Metadata { path, field },
                 ..
             }),
@@ -30670,6 +30677,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::BrowseBreadcrumb => {
                 app.browse.open_path_input();
             }
+            // A click on the inline create-name row is focus-preserving: the
+            // blur gate (active_inline_edit_matches_button) already consumed
+            // it; reaching here without an active create editor is a stale
+            // rect and deliberately does nothing.
+            TuiButton::BrowseCreateRow => {}
 
             // ── Overlay buttons ──
             TuiButton::OverlayConfirm => {
@@ -31535,6 +31547,54 @@ mod phase4_tests {
             state.active_surface().entries[0].per_file_values,
             vec!["Unified Album", "Unified Album", "Unified Album"],
         );
+    }
+
+    #[test]
+    fn create_row_click_is_focus_preserving_for_the_active_create_editor() {
+        // Audit MEDIUM: clicking the inline create row used to blur-commit
+        // and create "New File" instantly (no Create arm in the matcher).
+        use crate::tui::app::{BrowseCreateKind, BrowseInlineEditState, BrowseInlineEditTarget};
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let dir = app.browse.current_dir.clone();
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Create {
+                dir: dir.clone(),
+                kind: BrowseCreateKind::File,
+            },
+            input: crate::tui::text_input::TextInputState::new_selected(
+                "untitled.txt".to_string(),
+            ),
+        });
+
+        assert!(
+            active_inline_edit_matches_button(
+                &app,
+                Some(&crate::tui::button_map::TuiButton::BrowseCreateRow)
+            ),
+            "a click on the create row must preserve the editor"
+        );
+        assert!(
+            !active_inline_edit_matches_button(
+                &app,
+                Some(&crate::tui::button_map::TuiButton::BrowseEntry(0))
+            ),
+            "clicks elsewhere still blur-commit"
+        );
+
+        // A stale create editor for a DIFFERENT directory is not preserved.
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Create {
+                dir: dir.join("elsewhere"),
+                kind: BrowseCreateKind::File,
+            },
+            input: crate::tui::text_input::TextInputState::new_selected(
+                "untitled.txt".to_string(),
+            ),
+        });
+        assert!(!active_inline_edit_matches_button(
+            &app,
+            Some(&crate::tui::button_map::TuiButton::BrowseCreateRow)
+        ));
     }
 
     #[test]

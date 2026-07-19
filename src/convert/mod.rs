@@ -111,6 +111,11 @@ pub struct ConversionManager {
     /// responsibility without blocking on the queue lock or destructively
     /// cleaning artifacts whose item-id ownership has not yet been observed.
     pending_synthetic_cue_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Archive-password references owned by items that were CLEARED from the
+    /// queue while still Processing. Their workers may still need the secret,
+    /// so retirement is deferred to the worker's terminal status (or manager
+    /// drop). Key: queue item id; value: the opaque reference.
+    cleared_processing_secret_refs: Arc<Mutex<HashMap<String, String>>>,
     /// Cancellation token for the active conversion run. Triggered by
     /// `stop_all_conversions()` to kill in-flight child processes.
     cancel_token: tokio_util::sync::CancellationToken,
@@ -518,6 +523,7 @@ impl ConversionManager {
             stop_requested: false,
             synthetic_cue_artifacts: Arc::new(Mutex::new(HashMap::new())),
             pending_synthetic_cue_artifacts: Arc::new(Mutex::new(HashSet::new())),
+            cleared_processing_secret_refs: Arc::new(Mutex::new(HashMap::new())),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             conversion_run_generation: Arc::new(AtomicU64::new(0)),
             active_conversion_items: Arc::new(Mutex::new(HashMap::new())),
@@ -1299,9 +1305,15 @@ impl ConversionManager {
         let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
             let mut processing = HashSet::new();
             let mut processing_synthetic_inputs = HashSet::new();
+            // Only NON-processing items' secrets may be retired here: a
+            // Processing worker that has not yet opened its encrypted
+            // archive still needs its password. In-flight items follow the
+            // same deferred-cleanup path as their artifacts (the worker's
+            // terminal status), so their references are not orphaned.
             let secret_references = queue
                 .all_items()
                 .into_iter()
+                .filter(|item| !matches!(item.status, ConversionStatus::Processing { .. }))
                 .filter_map(|item| item.archive_password_ref.clone())
                 .collect::<Vec<_>>();
             for item in queue.all_items() {
@@ -1309,6 +1321,14 @@ impl ConversionManager {
                     processing.insert(item.id.clone());
                     if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
                         processing_synthetic_inputs.insert(item.input_path.clone());
+                    }
+                    // Defer this ref: the worker may not have opened its
+                    // encrypted archive yet; retirement happens at the
+                    // worker's terminal status (or manager drop).
+                    if let Some(reference) = item.archive_password_ref.clone() {
+                        if let Ok(mut pending) = self.cleared_processing_secret_refs.lock() {
+                            pending.insert(item.id.clone(), reference);
+                        }
                     }
                 }
             }
@@ -1893,6 +1913,21 @@ impl ConversionManager {
                 | ConversionStatus::Partial { .. }
                 | ConversionStatus::Cancelled
         );
+        if terminal {
+            // The item may have been CLEARED from the queue mid-flight; its
+            // deferred archive-password reference is only safe to retire now
+            // that the worker reached a terminal state.
+            let deferred = self
+                .cleared_processing_secret_refs
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(id));
+            if let Some(reference) = deferred {
+                crate::convert::queue::retire_queue_owned_secret_references(
+                    std::slice::from_ref(&reference),
+                );
+            }
+        }
         if updated
             && matches!(
                 status,
@@ -2766,6 +2801,14 @@ impl ConversionManager {
 impl Drop for ConversionManager {
     fn drop(&mut self) {
         self.cleanup_all_synthetic_cue_artifacts();
+        // Workers die with the manager; deferred cleared-while-Processing
+        // references can never be retired by a terminal status now.
+        if let Ok(mut pending) = self.cleared_processing_secret_refs.lock() {
+            if !pending.is_empty() {
+                let references: Vec<String> = pending.drain().map(|(_, r)| r).collect();
+                crate::convert::queue::retire_queue_owned_secret_references(&references);
+            }
+        }
     }
 }
 
@@ -4067,6 +4110,50 @@ mod per_track_epoch_tests {
     }
 
     #[test]
+    fn clear_queue_defers_processing_item_secret_retirement_to_terminal_status() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let (mut manager, item_id) = test_manager_with_item();
+        let reference = crate::secret_store::stable_reference("queue-item", &item_id)
+            .expect("queue-owned reference");
+        crate::secret_store::set(&reference, "archive-secret").expect("store secret");
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue
+                .items_mut()
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .expect("item exists");
+            item.archive_password_ref = Some(reference.clone());
+            item.status = ConversionStatus::Processing {
+                progress: 0.5,
+                phase: None,
+                file_progress: None,
+                message: None,
+                phase_progress: None,
+            };
+        }
+
+        manager.clear_queue();
+
+        // The in-flight worker may not have opened its encrypted archive yet:
+        // the secret must SURVIVE the clear...
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            1,
+            "a Processing item's secret must not be retired by clear_queue"
+        );
+
+        // ...and be retired when the worker reaches a terminal state, even
+        // though the item is no longer in the queue.
+        manager.update_item_status(&item_id, ConversionStatus::Cancelled, 0.0);
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            0,
+            "the deferred reference is retired at the worker's terminal status"
+        );
+    }
+
+    #[test]
     fn clear_queue_retires_queue_owned_archive_password_reference() {
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let (mut manager, item_id) = test_manager_with_item();
@@ -4081,6 +4168,10 @@ mod per_track_epoch_tests {
                 .find(|item| item.id == item_id)
                 .expect("item exists");
             item.archive_password_ref = Some(reference.clone());
+            // A NON-processing item: idle items retire immediately on clear.
+            // Processing items defer to the worker's terminal status (see
+            // clear_queue_defers_processing_item_secret_retirement...).
+            item.status = ConversionStatus::Queued;
         }
 
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
