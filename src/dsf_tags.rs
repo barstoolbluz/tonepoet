@@ -3024,7 +3024,11 @@ pub fn recover_stale_writes_in_directory(dir: &Path) -> Vec<String> {
     messages
 }
 
-fn canonicalize_key(key: &str) -> String {
+/// Canonical metadata-key identity shared by the DSF backend and metadata
+/// editor. The DSF reader applies this mapping while constructing its
+/// snapshot; editor consumers must use the snapshot keys as-is rather than
+/// canonicalizing them a second time.
+pub(crate) fn canonical_metadata_key(key: &str) -> String {
     let squashed = key
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
@@ -3036,6 +3040,14 @@ fn canonicalize_key(key: &str) -> String {
         "TOTALTRACKS" => "TRACKTOTAL".to_string(),
         "TOTALDISCS" => "DISCTOTAL".to_string(),
         "DESCRIPTION" => "COMMENT".to_string(),
+        "MUSICBRAINZALBUMID" => "MUSICBRAINZ_ALBUMID".to_string(),
+        "MUSICBRAINZALBUMARTISTID" => "MUSICBRAINZ_ALBUMARTISTID".to_string(),
+        "MUSICBRAINZRELEASEGROUPID" => "MUSICBRAINZ_RELEASEGROUPID".to_string(),
+        "MUSICBRAINZTRACKID" | "MUSICBRAINZRECORDINGID" => {
+            "MUSICBRAINZ_TRACKID".to_string()
+        }
+        "MUSICBRAINZRELEASETRACKID" => "MUSICBRAINZ_RELEASETRACKID".to_string(),
+        "MUSICBRAINZARTISTID" => "MUSICBRAINZ_ARTISTID".to_string(),
         _ => key.trim().to_ascii_uppercase(),
     }
 }
@@ -3058,7 +3070,9 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
             .get(key)
             .copied()
             .unwrap_or_else(|| values.iter().filter(|value| !value.trim().is_empty()).count());
-        *stored_value_counts.entry(canonicalize_key(key)).or_default() += count;
+        *stored_value_counts
+            .entry(canonical_metadata_key(key))
+            .or_default() += count;
     }
 
     // Canonical spellings win deterministically even though the raw snapshot is
@@ -3066,7 +3080,7 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
     // the canonical values for the group.
     for canonical_pass in [true, false] {
         for (key, values) in &entries {
-            let canonical_key = canonicalize_key(key);
+            let canonical_key = canonical_metadata_key(key);
             let normalized_key = key.trim().to_ascii_uppercase();
             if (normalized_key == canonical_key) != canonical_pass {
                 continue;
@@ -3086,7 +3100,7 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
 fn resolve_changes(changes: &[DsfTagChange]) -> Result<Vec<DsfTagChange>, String> {
     let mut resolved = BTreeMap::<String, Option<String>>::new();
     for change in changes {
-        let key = canonicalize_key(&change.canonical_key);
+        let key = canonical_metadata_key(&change.canonical_key);
         let value = change
             .value
             .as_ref()
@@ -3430,7 +3444,7 @@ mod backend {
             .frames()
             .filter(|frame| match frame.content() {
                 Content::ExtendedText(text) => {
-                    super::canonicalize_key(&text.description) != canonical_key
+                    super::canonical_metadata_key(&text.description) != canonical_key
                 }
                 _ => true,
             })
@@ -3893,6 +3907,34 @@ mod tests {
         let snapshot = canonicalize_snapshot(raw);
         assert_eq!(snapshot.fields["TRACKTOTAL"], vec!["10", "9"]);
         assert_eq!(snapshot.fields["COMMENT"], vec!["canonical", "legacy"]);
+    }
+
+    #[test]
+    fn canonicalization_merges_musicbrainz_alias_values_and_carrier_counts() {
+        let raw = DsfTagSnapshot {
+            fields: BTreeMap::from([
+                (
+                    "MUSICBRAINZ_ALBUMID".to_string(),
+                    vec!["canonical-id".to_string()],
+                ),
+                (
+                    "MusicBrainz Album Id".to_string(),
+                    vec!["picard-id".to_string()],
+                ),
+            ]),
+            stored_value_counts: BTreeMap::from([
+                ("MUSICBRAINZ_ALBUMID".to_string(), 1),
+                ("MusicBrainz Album Id".to_string(), 2),
+            ]),
+        };
+
+        let snapshot = canonicalize_snapshot(raw);
+        assert_eq!(snapshot.fields.len(), 1);
+        assert_eq!(
+            snapshot.fields["MUSICBRAINZ_ALBUMID"],
+            vec!["canonical-id", "picard-id"]
+        );
+        assert_eq!(snapshot.stored_value_count("MUSICBRAINZ_ALBUMID"), 3);
     }
 
     #[test]

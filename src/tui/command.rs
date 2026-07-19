@@ -3937,16 +3937,33 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             if paths.is_empty() {
                 app.set_status("No audio files to verify");
             } else {
+                let total = paths.len();
+                let operation_id = match super::event_loop::begin_counted_completion_operation(
+                    app,
+                    CompletionOperationKind::Verify,
+                    "verify",
+                    total,
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(error) => {
+                        app.set_status(error);
+                        return;
+                    }
+                };
                 app.verify_results.clear();
-                app.verify_pending = paths.len();
                 for path in paths {
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let result = super::verify::verify_file(path).await;
-                        let _ = tx.send(AppMessage::VerifyComplete { result }).await;
+                        let _ = tx
+                            .send(AppMessage::VerifyComplete {
+                                operation_id,
+                                result,
+                            })
+                            .await;
                     });
                 }
-                app.set_status(format!("Verifying {} file(s)...", app.verify_pending));
+                app.set_status(format!("Verifying {total} file(s)..."));
             }
         }
         Command::GenerateCue { single_image } => {
@@ -5173,7 +5190,12 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     app.set_status("No audio files selected for comparison");
                 } else {
                     super::probe::sort_paths_by_track(&mut targets);
-                    let refs = &app.compare_reference;
+                    // Snapshot the reference set before allocating operation
+                    // authority. Keeping a borrow into `app` across the
+                    // `&mut AppState` authority call would reject the build and
+                    // would also let a later UI mutation change the dispatched
+                    // pair set.
+                    let refs = app.compare_reference.clone();
                     if refs.len() != targets.len() {
                         app.set_status(format!(
                             "Reference has {} file(s) but target has {} — counts must match",
@@ -5181,18 +5203,35 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             targets.len(),
                         ));
                     } else {
+                        let total = refs.len();
+                        let operation_id = match super::event_loop::begin_counted_completion_operation(
+                            app,
+                            CompletionOperationKind::Compare,
+                            "compare",
+                            total,
+                        ) {
+                            Ok(operation_id) => operation_id,
+                            Err(error) => {
+                                app.set_status(error);
+                                return;
+                            }
+                        };
                         app.compare_results.clear();
-                        app.compare_pending = refs.len();
                         for (ref_path, target_path) in refs.iter().zip(targets.iter()) {
                             let tx = tx.clone();
                             let rp = ref_path.clone();
                             let tp = target_path.clone();
                             tokio::spawn(async move {
                                 let result = super::bit_compare::compare_files(rp, tp).await;
-                                let _ = tx.send(AppMessage::CompareComplete { result }).await;
+                                let _ = tx
+                                    .send(AppMessage::CompareComplete {
+                                        operation_id,
+                                        result,
+                                    })
+                                    .await;
                             });
                         }
-                        app.set_status(format!("Comparing {} pair(s)...", app.compare_pending,));
+                        app.set_status(format!("Comparing {total} pair(s)..."));
                     }
                 }
             }
@@ -5205,12 +5244,28 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             } else if !p2.exists() {
                 app.set_status(format!("compare: not found: {}", path2));
             } else {
+                let operation_id = match super::event_loop::begin_counted_completion_operation(
+                    app,
+                    CompletionOperationKind::Compare,
+                    "compare",
+                    1,
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(error) => {
+                        app.set_status(error);
+                        return;
+                    }
+                };
                 app.compare_results.clear();
-                app.compare_pending = 1;
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let result = super::bit_compare::compare_files(p1, p2).await;
-                    let _ = tx.send(AppMessage::CompareComplete { result }).await;
+                    let _ = tx
+                        .send(AppMessage::CompareComplete {
+                            operation_id,
+                            result,
+                        })
+                        .await;
                 });
                 app.set_status("Comparing...");
             }
@@ -5230,18 +5285,34 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             if paths.is_empty() {
                 app.set_status("No audio files for pre-emphasis detection");
             } else {
+                let total = paths.len();
+                let operation_id = match super::event_loop::begin_counted_completion_operation(
+                    app,
+                    CompletionOperationKind::Preemphasis,
+                    "pre-emphasis",
+                    total,
+                ) {
+                    Ok(operation_id) => operation_id,
+                    Err(error) => {
+                        app.set_status(error);
+                        return;
+                    }
+                };
                 app.preemph_results.clear();
-                app.preemph_pending = paths.len();
                 for path in paths {
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let result = super::preemphasis::detect_preemphasis_metadata_catalog_async(path).await;
-                        let _ = tx.send(AppMessage::PreemphasisComplete { result }).await;
+                        let _ = tx
+                            .send(AppMessage::PreemphasisComplete {
+                                operation_id,
+                                result,
+                            })
+                            .await;
                     });
                 }
                 app.set_status(format!(
-                    "Detecting pre-emphasis on {} file(s)...",
-                    app.preemph_pending,
+                    "Detecting pre-emphasis on {total} file(s)..."
                 ));
             }
         }

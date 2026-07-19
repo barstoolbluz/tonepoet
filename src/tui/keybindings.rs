@@ -7475,21 +7475,41 @@ fn metadata_editor_start_replaygain_scan(
         app.set_status("metadata editor: no files available for ReplayGain scan");
         return;
     }
+    let prevent_clipping = match super::convert_actions::format_state_to_pipeline_settings(
+        &app.convert.format,
+    ) {
+        Ok(settings) => settings.replay_gain.prevent_clipping,
+        Err(error) => {
+            app.set_status(format!(
+                "metadata editor: cannot resolve ReplayGain policy from Output Options: {error}"
+            ));
+            return;
+        }
+    };
     let (session_id, generation) = state.begin_replaygain_scan(mode, paths.len());
     let tx = tx.clone();
     let worker_paths = paths.clone();
     let tool_paths = app.manager.config.tool_paths.clone();
     tokio::spawn(async move {
-        let cmd = metadata_replaygain_tool_command(mode, &worker_paths);
+        let cmd = metadata_replaygain_tool_command(mode, prevent_clipping, &worker_paths);
         let cancel = tokio_util::sync::CancellationToken::new();
         let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
         let result = match crate::convert::pipeline::tool::ToolRunner::run(&runner, cmd, &cancel).await {
             Ok(_) => tokio::task::spawn_blocking({
                 let worker_paths = worker_paths.clone();
-                move || super::probe::read_all_tags_merged_with_metadata(&worker_paths).map(|read| read.metadata)
+                move || {
+                    if mode == crate::tui::app::MetadataReplayGainScanMode::Track {
+                        crate::convert::replaygain::remove_stale_album_tags(&worker_paths)
+                            .map_err(|error| format!(
+                                "ReplayGain track scan succeeded, but stale album-tag cleanup failed: {error}"
+                            ))?;
+                    }
+                    super::probe::read_all_tags_merged_with_metadata(&worker_paths)
+                        .map(|read| read.metadata)
+                }
             })
             .await
-            .unwrap_or_else(|err| Err(format!("ReplayGain tag re-read task failed: {err}"))),
+            .unwrap_or_else(|err| Err(format!("ReplayGain tag post-processing task failed: {err}"))),
             Err(err) => Err(format!("loudgain failed: {err}")),
         };
         let _ = tx
@@ -7513,26 +7533,25 @@ fn metadata_editor_start_replaygain_scan(
 
 fn metadata_replaygain_tool_args(
     mode: crate::tui::app::MetadataReplayGainScanMode,
+    prevent_clipping: bool,
     paths: &[std::path::PathBuf],
 ) -> Vec<String> {
-    let mut args = Vec::new();
-    if mode == crate::tui::app::MetadataReplayGainScanMode::Album {
-        args.push("-a".to_string());
-    }
-    args.push("-k".to_string());
-    args.push("-s".to_string());
-    args.push("i".to_string());
-    args.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
-    args
+    let grouping = if mode == crate::tui::app::MetadataReplayGainScanMode::Album {
+        crate::convert::replaygain::LoudgainGrouping::Album
+    } else {
+        crate::convert::replaygain::LoudgainGrouping::Track
+    };
+    crate::convert::replaygain::loudgain_args(grouping, prevent_clipping, paths)
 }
 
 fn metadata_replaygain_tool_command(
     mode: crate::tui::app::MetadataReplayGainScanMode,
+    prevent_clipping: bool,
     paths: &[std::path::PathBuf],
 ) -> crate::convert::pipeline::tool::ToolCommand {
     crate::convert::pipeline::tool::ToolCommand {
         binary: crate::convert::pipeline::tool::ToolBinary::Loudgain,
-        args: metadata_replaygain_tool_args(mode, paths),
+        args: metadata_replaygain_tool_args(mode, prevent_clipping, paths),
         secret_args: Vec::new(),
         cwd: None,
         env: Vec::new(),
@@ -36579,6 +36598,7 @@ mod phase4_tests {
         ];
         let cmd = metadata_replaygain_tool_command(
             crate::tui::app::MetadataReplayGainScanMode::Album,
+            true,
             &paths,
         );
 
@@ -36596,10 +36616,11 @@ mod phase4_tests {
         let paths = vec![std::path::PathBuf::from("/music/01.flac")];
         let args = metadata_replaygain_tool_args(
             crate::tui::app::MetadataReplayGainScanMode::Track,
+            false,
             &paths,
         );
 
-        assert_eq!(args, vec!["-k".to_string(), "-s".to_string(), "i".to_string(), "/music/01.flac".to_string()]);
+        assert_eq!(args, vec!["-s".to_string(), "i".to_string(), "/music/01.flac".to_string()]);
     }
 
 }

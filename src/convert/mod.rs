@@ -20,6 +20,7 @@ pub mod cap_fs;
 pub mod cue_parser;
 pub mod formats;
 pub mod queue_expansion;
+pub(crate) mod replaygain;
 pub mod split_cue_album;
 pub mod source_admission;
 pub mod sacd;

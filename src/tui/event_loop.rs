@@ -283,6 +283,7 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
         | AppMessage::SearchComplete { .. }
         | AppMessage::ArchiveListingComplete { .. }
         | AppMessage::MetadataWriteComplete { .. }
+        | AppMessage::OffsetCorrectionComplete { .. }
         | AppMessage::CtdbRepairComplete { .. } => true,
         AppMessage::CueWriteComplete { refresh_browse, .. } => *refresh_browse,
         AppMessage::FilePickerComplete { purpose, .. } => matches!(
@@ -753,6 +754,13 @@ fn metadata_editor_upsert_per_file_entry(
     } else {
         values.first().cloned().unwrap_or_default()
     };
+    // loudgain rewrites each ReplayGain key as at most one text carrier per
+    // file. Refresh the carrier counts with the values instead of retaining
+    // stale duplicate-frame counts from the pre-scan editor snapshot.
+    let stored_value_counts = values
+        .iter()
+        .map(|value| if value.trim().is_empty() { 0 } else { 1 })
+        .collect::<Vec<_>>();
     if idx == surface.entries.len() {
         surface.entries.push(super::probe::TagEntry {
             row_scope: crate::tui::probe::RowScope::File,
@@ -763,7 +771,7 @@ fn metadata_editor_upsert_per_file_entry(
             is_binary: false,
             is_mixed,
             has_multiple_stored_values: false,
-            per_file_stored_value_counts: Vec::new(),
+            per_file_stored_value_counts: stored_value_counts,
             per_file_values: values.clone(),
             per_file_originals: values,
             mb_proposed_value: None,
@@ -774,6 +782,8 @@ fn metadata_editor_upsert_per_file_entry(
         entry.original = value;
         entry.is_binary = false;
         entry.is_mixed = is_mixed;
+        entry.has_multiple_stored_values = false;
+        entry.per_file_stored_value_counts = stored_value_counts;
         entry.per_file_values = values.clone();
         entry.per_file_originals = values;
         entry.mb_proposed_value = None;
@@ -1273,6 +1283,16 @@ fn handle_archive_preview_progress(
     }
 }
 
+fn prompt_overlay_slot_is_unobstructed(app: &AppState) -> bool {
+    matches!(app.active_overlay, ActiveOverlay::None)
+        && app.pending_metadata_editor.is_none()
+        && app.pending_cue_preview.is_none()
+        && app.pending_mb_select.is_none()
+        && app.active_tags_mb_operation.is_none()
+        && app.active_gnudb_operation.is_none()
+        && app.active_cue_operation.is_none()
+}
+
 fn handle_archive_preview_result(
     app: &mut AppState,
     generation: u64,
@@ -1364,16 +1384,22 @@ fn handle_archive_preview_result(
                         );
                     }
                 }
-                app.active_overlay = ActiveOverlay::TextEdit {
-                    input: TextInputState::empty(),
-                    target: TextEditTarget::ArchivePasswordForConvertPreview(
-                        archive_path.clone(),
-                    ),
-                    label: "archive password".to_string(),
-                };
-                app.set_status(format!(
-                    "Archive preview needs a password: {err}; enter password"
-                ));
+                if prompt_overlay_slot_is_unobstructed(app) {
+                    app.active_overlay = ActiveOverlay::TextEdit {
+                        input: TextInputState::empty(),
+                        target: TextEditTarget::ArchivePasswordForConvertPreview(
+                            archive_path.clone(),
+                        ),
+                        label: "archive password".to_string(),
+                    };
+                    app.set_status(format!(
+                        "Archive preview needs a password: {err}; enter password"
+                    ));
+                } else {
+                    app.set_status(format!(
+                        "Archive preview needs a password, but the current editor or overlay was preserved: {err}; retry preview after closing it"
+                    ));
+                }
                 let _ = tx;
                 return;
             }
@@ -1569,20 +1595,26 @@ fn handle_archive_metadata_editor_prepared(
                     && !deferred_archive_exit
                     && super::app::looks_like_archive_password_error(&err)
                 {
-                    app.active_overlay = ActiveOverlay::TextEdit {
-                        input: TextInputState::empty(),
-                        target: TextEditTarget::ArchivePasswordForMetadataEdit {
-                            archive_path: archive_path.clone(),
-                            target_inner_paths: pending_snapshot
-                                .as_ref()
-                                .and_then(|pending| pending.target_inner_paths.clone()),
-                        },
-                        label: "archive password".to_string(),
-                    };
                     app.pending_browse_archive_metadata = None;
-                    app.set_status(format!(
-                        "archive metadata editor needs archive password: {err}; enter password"
-                    ));
+                    if prompt_overlay_slot_is_unobstructed(app) {
+                        app.active_overlay = ActiveOverlay::TextEdit {
+                            input: TextInputState::empty(),
+                            target: TextEditTarget::ArchivePasswordForMetadataEdit {
+                                archive_path: archive_path.clone(),
+                                target_inner_paths: pending_snapshot
+                                    .as_ref()
+                                    .and_then(|pending| pending.target_inner_paths.clone()),
+                            },
+                            label: "archive password".to_string(),
+                        };
+                        app.set_status(format!(
+                            "archive metadata editor needs archive password: {err}; enter password"
+                        ));
+                    } else {
+                        app.set_status(format!(
+                            "archive metadata editor needs a password, but the current editor or overlay was preserved: {err}; retry metadata edit after closing it"
+                        ));
+                    }
                     return;
                 }
                 if let Some(target) = app.deferred_browse_archive_screen_switch.take() {
@@ -1728,9 +1760,11 @@ fn start_browse_archive_repackage_inner(
             .map(|parent| parent.display().to_string()),
     });
     let session = super::app::FileTaskProgressSession::new(progress, control_tx);
+    let progress_session_id = session.session_id;
     app.active_overlay = super::app::ActiveOverlay::FileTaskProgress(session);
     clear_preserved_editor_archive_repackage_context(app, &context);
     app.browse_archive_repackage = Some(context);
+    app.browse_archive_repackage_progress_session_id = Some(progress_session_id);
     app.set_status(format!("Saving archive changes: {archive_label}"));
 
     tokio::spawn(async move {
@@ -1771,6 +1805,7 @@ fn start_browse_archive_repackage_inner(
                 let _ = progress_tx.try_send(AppMessage::ArchiveRepackageProgress {
                     archive_path: archive_for_progress.clone(),
                     staging_dir: staging_for_progress.clone(),
+                    progress_session_id,
                     snapshot,
                 });
             },
@@ -1782,6 +1817,7 @@ fn start_browse_archive_repackage_inner(
             .send(AppMessage::ArchiveRepackageResult {
                 archive_path,
                 staging_dir,
+                progress_session_id,
                 result,
             })
             .await;
@@ -1833,25 +1869,40 @@ fn handle_archive_repackage_progress(
     app: &mut AppState,
     archive_path: std::path::PathBuf,
     staging_dir: std::path::PathBuf,
+    progress_session_id: u64,
     snapshot: crate::convert::pipeline::materializer_archive::ArchiveRepackageProgressSnapshot,
 ) {
-    let pending_matches = app
-        .browse_archive_repackage
-        .as_ref()
-        .is_some_and(|context| {
-            context.archive_path == archive_path && context.staging_dir == staging_dir
-        });
+    let pending_matches = app.browse_archive_repackage_progress_session_id
+        == Some(progress_session_id)
+        && app
+            .browse_archive_repackage
+            .as_ref()
+            .is_some_and(|context| {
+                context.archive_path == archive_path && context.staging_dir == staging_dir
+            });
     if !pending_matches {
         return;
     }
 
     let status = snapshot.status.clone();
-    if let super::app::ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
-        session
-            .progress
-            .apply_update(archive_repackage_file_task_update(snapshot));
+    let expected_session_id = Some(progress_session_id);
+    let owns_progress_surface = if let super::app::ActiveOverlay::FileTaskProgress(session) =
+        &mut app.active_overlay
+    {
+        if Some(session.session_id) == expected_session_id {
+            session
+                .progress
+                .apply_update(archive_repackage_file_task_update(snapshot));
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if owns_progress_surface {
+        app.set_status(status);
     }
-    app.set_status(status);
 }
 
 fn archive_repackage_file_task_update(
@@ -1914,9 +1965,13 @@ fn archive_repackage_file_task_update(
     }
 }
 
-fn current_archive_repackage_totals(app: &AppState) -> tui_file_picker::ProgressTotals {
+fn current_archive_repackage_totals(
+    app: &AppState,
+    expected_session_id: Option<u64>,
+) -> tui_file_picker::ProgressTotals {
     match &app.active_overlay {
-        super::app::ActiveOverlay::FileTaskProgress(session) => session.progress.totals,
+        super::app::ActiveOverlay::FileTaskProgress(session)
+            if Some(session.session_id) == expected_session_id => session.progress.totals,
         _ => tui_file_picker::ProgressTotals {
             items_done: 0,
             items_total: Some(1),
@@ -1939,10 +1994,13 @@ fn current_archive_repackage_totals(app: &AppState) -> tui_file_picker::Progress
 
 fn apply_archive_repackage_terminal_update(
     app: &mut AppState,
+    expected_session_id: Option<u64>,
     update: tui_file_picker::FileTaskProgressUpdate,
 ) {
     if let super::app::ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
-        session.progress.apply_update(update);
+        if Some(session.session_id) == expected_session_id {
+            session.progress.apply_update(update);
+        }
     }
 }
 
@@ -2002,31 +2060,41 @@ fn handle_archive_repackage_result(
     app: &mut AppState,
     archive_path: std::path::PathBuf,
     staging_dir: std::path::PathBuf,
+    progress_session_id: u64,
     result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    let pending_matches = app
-        .browse_archive_repackage
-        .as_ref()
-        .is_some_and(|context| {
-            context.archive_path == archive_path && context.staging_dir == staging_dir
-        });
+    let pending_matches = app.browse_archive_repackage_progress_session_id
+        == Some(progress_session_id)
+        && app
+            .browse_archive_repackage
+            .as_ref()
+            .is_some_and(|context| {
+                context.archive_path == archive_path && context.staging_dir == staging_dir
+            });
     if !pending_matches {
-        // Do not delete staging for a stale completion. A stale result can race
-        // with retry/cancel flows, and the staged directory may still be the
-        // only copy of accumulated archive edits.
-        app.set_status("archive save: ignored stale repackage result; staged edits were preserved");
+        // A stale result can target the same archive and staging directory as a
+        // newer retry. Session authority must be checked before any status,
+        // overlay, deferred-action, or staging mutation.
         return;
     }
 
     let Some(context) = app.browse_archive_repackage.take() else {
-        app.set_status("archive save: missing repackage context; staged edits were preserved");
         return;
     };
+    let editor_owns_staging = context.editor_owns_staging;
+    let expected_progress_session_id = Some(progress_session_id);
+    app.browse_archive_repackage_progress_session_id = None;
+    let owns_prompt_slot = matches!(
+        &app.active_overlay,
+        super::app::ActiveOverlay::FileTaskProgress(session)
+            if Some(session.session_id) == expected_progress_session_id
+    );
     let quit_after_repackage = app.quit_after_browse_archive_repackage;
     app.quit_after_browse_archive_repackage = false;
 
-    let mut terminal_totals = current_archive_repackage_totals(app);
+    let mut terminal_totals =
+        current_archive_repackage_totals(app, expected_progress_session_id);
 
     match result {
         Ok(report) => {
@@ -2037,6 +2105,7 @@ fn handle_archive_repackage_result(
             }
             apply_archive_repackage_terminal_update(
                 app,
+                expected_progress_session_id,
                 tui_file_picker::FileTaskProgressUpdate::Finished {
                     status: "Archive repackaged".to_string(),
                     totals: terminal_totals,
@@ -2104,6 +2173,7 @@ fn handle_archive_repackage_result(
                 .saturating_sub(terminal_totals.items_done);
             apply_archive_repackage_terminal_update(
                 app,
+                expected_progress_session_id,
                 tui_file_picker::FileTaskProgressUpdate::Aborted {
                     status: "Archive repackage cancelled; staged edits preserved".to_string(),
                     totals: terminal_totals,
@@ -2113,55 +2183,78 @@ fn handle_archive_repackage_result(
             app.deferred_browse_archive_screen_switch = None;
             app.quit_after_browse_archive_repackage = false;
             app.should_quit = false;
-            if context.editor_owns_staging {
+            if editor_owns_staging {
                 preserve_editor_owned_archive_repackage_context(app, &context);
-                app.active_overlay = super::app::ActiveOverlay::Confirmation {
-                    message: format!(
-                        "Archive save was cancelled for {}.\n\nYour staged metadata edits are still preserved in this session and in the recovery database. Y retries the save. D discards the staged edits. N/Esc keeps them for later retry.",
-                        archive_path.display()
-                    ),
-                    action: super::app::ConfirmAction::ArchiveRepackageFailure {
-                        context,
-                        error: "archive save cancelled".to_string(),
-                    },
-                };
+                if owns_prompt_slot {
+                    app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                        message: format!(
+                            "Archive save was cancelled for {}.\n\nYour staged metadata edits are still preserved in this session and in the recovery database. Y retries the save. D discards the staged edits. N/Esc keeps them for later retry.",
+                            archive_path.display()
+                        ),
+                        action: super::app::ConfirmAction::ArchiveRepackageFailure {
+                            context,
+                            error: "archive save cancelled".to_string(),
+                        },
+                    };
+                }
             }
-            app.set_status(format!(
-                "archive save cancelled for {}; staged edits preserved for retry/discard",
-                archive_path.display()
-            ));
+            if owns_prompt_slot || !editor_owns_staging {
+                app.set_status(format!(
+                    "archive save cancelled for {}; staged edits preserved for retry/discard",
+                    archive_path.display()
+                ));
+            } else {
+                app.set_status(format!(
+                    "archive save cancelled for {}; staged edits preserved and the current editor or overlay was not replaced",
+                    archive_path.display()
+                ));
+            }
         }
         Err(err) => {
             terminal_totals.errors = 1;
             apply_archive_repackage_terminal_update(
                 app,
+                expected_progress_session_id,
                 tui_file_picker::FileTaskProgressUpdate::Failed {
                     status: format!("Archive save failed: {err}"),
                     totals: terminal_totals,
                 },
             );
             preserve_editor_owned_archive_repackage_context(app, &context);
-            let message = format!(
-                "Archive save failed for {}.\n\nY retries the save. D discards your staged edits. N/Esc keeps the staged edits for later retry. Mouse Cancel opens an explicit discard confirmation.\n\n{}",
-                archive_path.display(),
-                err
-            );
-            app.active_overlay = super::app::ActiveOverlay::Confirmation {
-                message,
-                action: super::app::ConfirmAction::ArchiveRepackageFailure {
-                    context,
-                    error: err.clone(),
-                },
-            };
+            if owns_prompt_slot {
+                let message = format!(
+                    "Archive save failed for {}.\n\nY retries the save. D discards your staged edits. N/Esc keeps the staged edits for later retry. Mouse Cancel opens an explicit discard confirmation.\n\n{}",
+                    archive_path.display(),
+                    err
+                );
+                app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                    message,
+                    action: super::app::ConfirmAction::ArchiveRepackageFailure {
+                        context,
+                        error: err.clone(),
+                    },
+                };
+            }
             if quit_after_repackage {
                 app.should_quit = false;
+                if owns_prompt_slot {
+                    app.set_status(format!(
+                        "archive save failed for {}; quit cancelled; staged edits preserved: {err}",
+                        archive_path.display()
+                    ));
+                } else {
+                    app.set_status(format!(
+                        "archive save failed for {}; quit cancelled; staged edits preserved and the current editor or overlay was not replaced: {err}",
+                        archive_path.display()
+                    ));
+                }
+            } else if owns_prompt_slot {
                 app.set_status(format!(
-                    "archive save failed for {}; quit cancelled; staged edits preserved: {err}",
-                    archive_path.display()
+                    "archive save failed; staged edits preserved for retry/discard: {err}"
                 ));
             } else {
                 app.set_status(format!(
-                    "archive save failed; staged edits preserved for retry/discard: {err}"
+                    "archive save failed; staged edits preserved and the current editor or overlay was not replaced: {err}"
                 ));
             }
         }
@@ -2832,16 +2925,31 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         AppMessage::ArchiveRepackageProgress {
             archive_path,
             staging_dir,
+            progress_session_id,
             snapshot,
         } => {
-            handle_archive_repackage_progress(app, archive_path, staging_dir, snapshot);
+            handle_archive_repackage_progress(
+                app,
+                archive_path,
+                staging_dir,
+                progress_session_id,
+                snapshot,
+            );
         }
         AppMessage::ArchiveRepackageResult {
             archive_path,
             staging_dir,
+            progress_session_id,
             result,
         } => {
-            handle_archive_repackage_result(app, archive_path, staging_dir, result, tx);
+            handle_archive_repackage_result(
+                app,
+                archive_path,
+                staging_dir,
+                progress_session_id,
+                result,
+                tx,
+            );
         }
         AppMessage::ArchiveEntryRenameProgress {
             archive_path,
@@ -3344,43 +3452,80 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::PreemphasisComplete { result } => {
+        AppMessage::PreemphasisComplete {
+            operation_id,
+            result,
+        } => {
+            let kind = CompletionOperationKind::Preemphasis;
+            let Some(finished) = complete_counted_completion_operation(
+                app,
+                kind,
+                operation_id,
+            ) else {
+                return;
+            };
             let result = crate::tui::preemphasis::metadata_editor_safe_result(&result);
-            app.preemph_pending = app.preemph_pending.saturating_sub(1);
-            if let ActiveOverlay::MetadataEditor(ref mut state) = app.active_overlay {
-                state.apply_preemphasis_result(&result);
+
+            // Enrich only the exact editor captured when this operation began.
+            // A late completion may never mutate whichever editor later happens
+            // to occupy the active or parked slot.
+            if let Some(guard) =
+                completion_operation_editor_session(app, kind, operation_id)
+            {
+                if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
+                    if metadata_editor_matches_session_guard(state, guard) {
+                        state.apply_preemphasis_result(&result);
+                    }
+                }
+                if let Some(state) = app.pending_metadata_editor.as_mut() {
+                    if metadata_editor_matches_session_guard(state, guard) {
+                        state.apply_preemphasis_result(&result);
+                    }
+                }
             }
-            if let Some(state) = app.pending_metadata_editor.as_mut() {
-                state.apply_preemphasis_result(&result);
-            }
+
             app.preemph_results.push(result);
-            if app.preemph_pending == 0 {
-                // Sort by path for consistent display.
+            if finished {
                 app.preemph_results.sort_by(|a, b| a.path.cmp(&b.path));
                 let detected = app
                     .preemph_results
                     .iter()
-                    .filter(|r| {
-                        r.confidence == crate::tui::preemphasis::PreemphasisConfidence::Detected
+                    .filter(|result| {
+                        result.confidence
+                            == crate::tui::preemphasis::PreemphasisConfidence::Detected
                     })
                     .count();
                 let candidates = app
                     .preemph_results
                     .iter()
-                    .filter(|r| {
-                        r.confidence == crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate
+                    .filter(|result| {
+                        result.confidence
+                            == crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate
                     })
                     .count();
                 let total = app.preemph_results.len();
-                if detected > 0 || candidates > 0 {
-                    app.set_status(format!(
+                let status = if detected > 0 || candidates > 0 {
+                    format!(
                         "Pre-emphasis: {} PRE flag, {} catalog candidate out of {} file(s)",
                         detected, candidates, total,
-                    ));
+                    )
                 } else {
-                    app.set_status(format!("Pre-emphasis: not detected in {} file(s)", total,));
+                    format!("Pre-emphasis: not detected in {} file(s)", total)
+                };
+                let may_publish = !app.preemph_results.is_empty()
+                    && completion_operation_has_overlay_authority(app, kind, operation_id);
+                retire_completion_operation(app, kind, operation_id);
+                if may_publish {
+                    app.active_overlay = ActiveOverlay::Preemphasis { scroll: 0 };
+                    app.set_status(status);
+                } else if app.preemph_results.is_empty() {
+                    app.set_status(status);
+                } else {
+                    app.set_status(format!(
+                        "{}; current editor or overlay preserved",
+                        status
+                    ));
                 }
-                app.active_overlay = super::app::ActiveOverlay::Preemphasis { scroll: 0 };
             }
         }
         AppMessage::CorpusTrainComplete { result } => match result {
@@ -3407,62 +3552,105 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::CompareComplete { result } => {
-            app.compare_pending = app.compare_pending.saturating_sub(1);
+        AppMessage::CompareComplete {
+            operation_id,
+            result,
+        } => {
+            let kind = CompletionOperationKind::Compare;
+            let Some(finished) = complete_counted_completion_operation(
+                app,
+                kind,
+                operation_id,
+            ) else {
+                return;
+            };
             app.compare_results.push(result);
-            if app.compare_pending == 0 {
-                let identical = app.compare_results.iter().filter(|r| r.identical).count();
-                let differ = app.compare_results.len() - identical;
-                if differ == 0 {
-                    app.set_status(format!("Compared {} pair(s): all bit-identical", identical,));
+            if finished {
+                let identical = app.compare_results.iter().filter(|result| result.identical).count();
+                let differ = app.compare_results.len().saturating_sub(identical);
+                let status = if differ == 0 {
+                    format!("Compared {} pair(s): all bit-identical", identical)
                 } else {
-                    app.set_status(format!(
+                    format!(
                         "Compared {} pair(s): {} identical, {} differ",
                         identical + differ,
                         identical,
                         differ,
+                    )
+                };
+                let may_publish = !app.compare_results.is_empty()
+                    && completion_operation_has_overlay_authority(app, kind, operation_id);
+                retire_completion_operation(app, kind, operation_id);
+                if may_publish {
+                    app.active_overlay = ActiveOverlay::BitCompare { scroll: 0 };
+                    app.set_status(status);
+                } else if app.compare_results.is_empty() {
+                    app.set_status(status);
+                } else {
+                    app.set_status(format!(
+                        "{}; current editor or overlay preserved",
+                        status
                     ));
                 }
-                app.active_overlay = super::app::ActiveOverlay::BitCompare { scroll: 0 };
                 if !app.config.ui.compare_keep_reference {
                     app.compare_reference.clear();
                 }
             }
         }
-        AppMessage::VerifyComplete { result } => {
-            app.verify_pending = app.verify_pending.saturating_sub(1);
+        AppMessage::VerifyComplete {
+            operation_id,
+            result,
+        } => {
+            let kind = CompletionOperationKind::Verify;
+            let Some(finished) = complete_counted_completion_operation(
+                app,
+                kind,
+                operation_id,
+            ) else {
+                return;
+            };
             app.verify_results.push(result);
-            if app.verify_pending == 0 {
-                // Sort by disc/track for logical display order.
-                {
-                    let mut result_paths: Vec<std::path::PathBuf> =
-                        app.verify_results.iter().map(|r| r.path.clone()).collect();
-                    crate::tui::probe::sort_paths_by_track(&mut result_paths);
-                    app.verify_results.sort_by(|a, b| {
-                        let ai = result_paths
-                            .iter()
-                            .position(|p| *p == a.path)
-                            .unwrap_or(usize::MAX);
-                        let bi = result_paths
-                            .iter()
-                            .position(|p| *p == b.path)
-                            .unwrap_or(usize::MAX);
-                        ai.cmp(&bi)
-                    });
-                }
-                let passed = app.verify_results.iter().filter(|r| r.passed).count();
-                let failed = app.verify_results.len() - passed;
-                if failed == 0 {
-                    app.set_status(format!("Verified {} file(s): all passed", passed));
+            if finished {
+                let mut result_paths: Vec<std::path::PathBuf> =
+                    app.verify_results.iter().map(|result| result.path.clone()).collect();
+                crate::tui::probe::sort_paths_by_track(&mut result_paths);
+                app.verify_results.sort_by(|a, b| {
+                    let ai = result_paths
+                        .iter()
+                        .position(|path| *path == a.path)
+                        .unwrap_or(usize::MAX);
+                    let bi = result_paths
+                        .iter()
+                        .position(|path| *path == b.path)
+                        .unwrap_or(usize::MAX);
+                    ai.cmp(&bi)
+                });
+                let passed = app.verify_results.iter().filter(|result| result.passed).count();
+                let failed = app.verify_results.len().saturating_sub(passed);
+                let status = if failed == 0 {
+                    format!("Verified {} file(s): all passed", passed)
                 } else {
-                    app.set_status(format!(
+                    format!(
                         "Verified {} file(s): {} passed, {} failed",
                         passed + failed,
                         passed,
                         failed,
+                    )
+                };
+                let may_publish = !app.verify_results.is_empty()
+                    && completion_operation_has_overlay_authority(app, kind, operation_id);
+                retire_completion_operation(app, kind, operation_id);
+                if may_publish {
+                    app.active_overlay = ActiveOverlay::Verify { scroll: 0 };
+                    app.set_status(status);
+                } else if app.verify_results.is_empty() {
+                    app.set_status(status);
+                } else {
+                    app.set_status(format!(
+                        "{}; current editor or overlay preserved",
+                        status
                     ));
                 }
-                app.active_overlay = super::app::ActiveOverlay::Verify { scroll: 0 };
             }
         }
         AppMessage::PathValidationComplete {
@@ -4969,13 +5157,18 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     })
                 });
 
+            if app.pending_ctdb_repair.is_some() && matched_page_idx.is_none() {
+                app.pending_ctdb_repair = None;
+                status.push_str(
+                    "; discarded stale deferred CTDB repair (AR result did not match its first track)",
+                );
+            }
+
             let may_publish =
                 completion_operation_has_overlay_authority(app, kind, operation_id);
             if !may_publish {
                 app.auto_fix_on_complete = false;
-                if matched_page_idx.is_some() {
-                    app.pending_ctdb_repair = None;
-                }
+                app.pending_ctdb_repair = None;
                 retire_completion_operation(app, kind, operation_id);
                 app.set_status(format!(
                     "{}; current editor or overlay preserved",
@@ -6095,9 +6288,50 @@ pub(super) fn begin_completion_operation(
         super::app::ActiveCompletionOperation {
             operation_id,
             editor_session,
+            batch: None,
         },
     );
     Ok(operation_id)
+}
+
+pub(super) fn begin_counted_completion_operation(
+    app: &mut AppState,
+    kind: super::app::CompletionOperationKind,
+    label: &str,
+    total: usize,
+) -> Result<super::message::TagsMbOperationId, String> {
+    if total == 0 {
+        return Err(format!("{label}: no work items were supplied"));
+    }
+    let operation_id = begin_completion_operation(app, kind, label)?;
+    if let Some(active) = app.active_completion_operations.get_mut(&kind) {
+        active.batch = Some(super::app::CompletionBatchProgress {
+            total,
+            remaining: total,
+        });
+    }
+    Ok(operation_id)
+}
+
+/// Accept one terminal worker completion for the matching counted operation.
+/// Returns `Some(true)` exactly once, on the transition to zero remaining;
+/// stale IDs, non-counted operations, and excess duplicate completions return
+/// `None` without mutating state.
+pub(super) fn complete_counted_completion_operation(
+    app: &mut AppState,
+    kind: super::app::CompletionOperationKind,
+    operation_id: super::message::TagsMbOperationId,
+) -> Option<bool> {
+    let active = app.active_completion_operations.get_mut(&kind)?;
+    if active.operation_id != operation_id {
+        return None;
+    }
+    let progress = active.batch.as_mut()?;
+    if progress.remaining == 0 {
+        return None;
+    }
+    progress.remaining -= 1;
+    Some(progress.remaining == 0)
 }
 
 pub(super) fn completion_operation_is_current(
@@ -7609,6 +7843,11 @@ mod archive_listing_overlay_authority_tests {
     use super::*;
     use crate::config::TonepoetConfig;
 
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(4);
+        tx
+    }
+
     #[tokio::test]
     async fn wrong_password_relisting_does_not_clobber_an_occupied_overlay() {
         // Audit HIGH: the wrong-password Enter path can RESTORE a parked
@@ -7671,6 +7910,94 @@ mod archive_listing_overlay_authority_tests {
             ),
             "an empty slot still receives the password prompt"
         );
+    }
+
+    #[test]
+    fn convert_archive_preview_password_prompt_preserves_an_occupied_overlay() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let archive = std::path::PathBuf::from("/library/encrypted.7z");
+        app.probe_generation = 7;
+        app.convert.set_source_mode(super::super::app::SourceMode::Single {
+            path: archive.clone(),
+            info: None,
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: None,
+        });
+        app.convert.install_pending_archive_preview(
+            super::super::app::create_pending_archive_preview(7, archive.clone()),
+        );
+        let baseline = super::super::app::ConvertProbeBaseline::capture(&app.convert);
+        app.active_overlay = ActiveOverlay::Help {
+            screen: AppScreen::Convert,
+            scroll: 3,
+        };
+
+        handle_archive_preview_result(
+            &mut app,
+            7,
+            archive,
+            Err("Wrong password".to_string()),
+            &tx(),
+            baseline,
+        );
+
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Help {
+                screen: AppScreen::Convert,
+                scroll: 3
+            }
+        ));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("current editor or overlay was preserved")
+        }));
+    }
+
+    #[test]
+    fn archive_metadata_password_prompt_preserves_a_parked_editor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("encrypted.7z");
+        let staging = temp.path().join("staging");
+        std::fs::write(&archive, b"archive").expect("archive");
+        std::fs::create_dir_all(&staging).expect("staging");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = super::super::app::MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/parked.flac")],
+            Vec::new(),
+            vec!["parked".to_string()],
+            super::super::app::MetadataTechnicalDetails::default(),
+        );
+        editor.active_surface_mut().dirty = true;
+        let parked_session_id = editor.active_surface().technical_details.session_id;
+        app.pending_metadata_editor = Some(Box::new(editor));
+        // The password re-prompt path only exists for extractions that own
+        // their staging tree; `from_existing` models adopted staging and
+        // would route to the generic failure status instead.
+        let mut pending = super::super::app::PendingBrowseArchiveMetadataEdit::from_existing(
+            archive.clone(),
+            staging.clone(),
+            None,
+        );
+        pending.owns_staging = true;
+        app.pending_browse_archive_metadata = Some(pending);
+
+        handle_archive_metadata_editor_prepared(
+            &mut app,
+            archive,
+            staging,
+            Err("Wrong password".to_string()),
+            &tx(),
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app.pending_metadata_editor.as_deref().is_some_and(|editor| {
+            editor.active_surface().dirty
+                && editor.active_surface().technical_details.session_id == parked_session_id
+        }));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("current editor or overlay was preserved")
+        }));
     }
 }
 
@@ -7906,6 +8233,20 @@ mod browse_archive_quit_lifecycle_tests {
     fn tx() -> mpsc::Sender<AppMessage> {
         let (tx, _rx) = mpsc::channel(8);
         tx
+    }
+
+    fn install_repackage_progress_overlay(app: &mut AppState) -> u64 {
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Archive,
+            "Repackaging archive",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let session = super::super::app::FileTaskProgressSession::new(progress, control_tx);
+        let progress_session_id = session.session_id;
+        app.browse_archive_repackage_progress_session_id = Some(progress_session_id);
+        app.active_overlay = ActiveOverlay::FileTaskProgress(session);
+        progress_session_id
     }
 
     fn clean_browse_archive_editor(
@@ -8252,11 +8593,13 @@ mod browse_archive_quit_lifecycle_tests {
             staging.clone(),
         ));
         app.quit_after_browse_archive_repackage = true;
+        let progress_session_id = install_repackage_progress_overlay(&mut app);
 
         handle_archive_repackage_result(
             &mut app,
             archive,
             staging.clone(),
+            progress_session_id,
             Ok(ArchiveRepackageReport::default()),
             &tx(),
         );
@@ -8285,11 +8628,13 @@ mod browse_archive_quit_lifecycle_tests {
             staging.clone(),
         ));
         app.quit_after_browse_archive_repackage = true;
+        let progress_session_id = install_repackage_progress_overlay(&mut app);
 
         handle_archive_repackage_result(
             &mut app,
             archive,
             staging.clone(),
+            progress_session_id,
             Err("simulated failure".to_string()),
             &tx(),
         );
@@ -8347,11 +8692,15 @@ mod browse_archive_quit_lifecycle_tests {
                     && context.staging_dir == staging),
             "active Browse staging must use a Browse-owned, not editor-owned, repackage context"
         );
+        let progress_session_id = app
+            .browse_archive_repackage_progress_session_id
+            .expect("active repackage progress session");
 
         handle_archive_repackage_result(
             &mut app,
             archive.clone(),
             staging.clone(),
+            progress_session_id,
             Err(crate::convert::pipeline::materializer_archive::ARCHIVE_REPACKAGE_CANCELLED.to_string()),
             &tx(),
         );
@@ -8389,11 +8738,13 @@ mod browse_archive_quit_lifecycle_tests {
         app.current_screen = AppScreen::Browse;
         app.browse_archive_repackage = Some(context);
         app.quit_after_browse_archive_repackage = true;
+        let progress_session_id = install_repackage_progress_overlay(&mut app);
 
         handle_archive_repackage_result(
             &mut app,
             archive.clone(),
             staging.clone(),
+            progress_session_id,
             Err(crate::convert::pipeline::materializer_archive::ARCHIVE_REPACKAGE_CANCELLED.to_string()),
             &tx(),
         );
@@ -8419,7 +8770,112 @@ mod browse_archive_quit_lifecycle_tests {
         );
     }
 
+    #[test]
+    fn failed_repackage_does_not_replace_a_newer_overlay_or_progress_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.tar");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
 
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
+            archive.clone(),
+            staging.clone(),
+        ));
+        let progress_session_id = install_repackage_progress_overlay(&mut app);
+        let stale_progress_session_id = progress_session_id.wrapping_add(1);
+        app.active_overlay = ActiveOverlay::Help {
+            screen: AppScreen::Browse,
+            scroll: 9,
+        };
+        app.set_status("newer overlay status");
+        let status_before_progress = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.clone());
+        let late_snapshot =
+            crate::convert::pipeline::materializer_archive::ArchiveRepackageProgressSnapshot {
+                stage: crate::convert::pipeline::materializer_archive::ArchiveRepackageStage::Compressing,
+                status: "late progress".to_string(),
+                current_item: None,
+                bytes_done: 1,
+                bytes_total: Some(2),
+                items_done: 0,
+                items_total: Some(1),
+                rate_bytes_per_sec: Some(1),
+            };
+
+        handle_archive_repackage_progress(
+            &mut app,
+            archive.clone(),
+            staging.clone(),
+            stale_progress_session_id,
+            late_snapshot.clone(),
+        );
+        handle_archive_repackage_result(
+            &mut app,
+            archive.clone(),
+            staging.clone(),
+            stale_progress_session_id,
+            Err("stale retry failure".to_string()),
+            &tx(),
+        );
+        assert_eq!(
+            app.browse_archive_repackage_progress_session_id,
+            Some(progress_session_id),
+            "same-path stale worker must not retire the newer progress session"
+        );
+        assert!(app.browse_archive_repackage.as_ref().is_some_and(|context| {
+            context.archive_path == archive && context.staging_dir == staging
+        }));
+        assert!(app.preserved_editor_archive_repackage.is_none());
+        assert_eq!(
+            app.status_message
+                .as_ref()
+                .map(|(message, _)| message.clone()),
+            status_before_progress,
+            "same-path stale worker must not mutate status"
+        );
+
+        handle_archive_repackage_progress(
+            &mut app,
+            archive.clone(),
+            staging.clone(),
+            progress_session_id,
+            late_snapshot,
+        );
+        assert_eq!(
+            app.status_message
+                .as_ref()
+                .map(|(message, _)| message.clone()),
+            status_before_progress,
+            "owned late progress must not mutate status after its progress surface lost authority"
+        );
+
+        handle_archive_repackage_result(
+            &mut app,
+            archive.clone(),
+            staging.clone(),
+            progress_session_id,
+            Err("late failure".to_string()),
+            &tx(),
+        );
+
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Help {
+                screen: AppScreen::Browse,
+                scroll: 9
+            }
+        ));
+        assert!(app.preserved_editor_archive_repackage.as_ref().is_some_and(|context| {
+            context.archive_path == archive && context.staging_dir == staging
+        }));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("current editor or overlay was not replaced")
+        }));
+    }
 
     #[tokio::test]
     async fn editor_owned_whole_archive_metadata_save_schedules_immediate_repackage() {
@@ -10412,6 +10868,58 @@ mod musicbrainz_completion_dispatch_tests {
         (app, operation_id, guard)
     }
 
+    fn counted_completion_test_app(
+        kind: CompletionOperationKind,
+        total: usize,
+    ) -> (
+        AppState,
+        crate::tui::message::TagsMbOperationId,
+        crate::tui::message::MetadataEditorSessionGuard,
+    ) {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = single_source_file_editor();
+        editor.active_surface_mut().dirty = true;
+        let guard = session_guard_for(&editor);
+        app.pending_metadata_editor = Some(editor);
+        let operation_id = begin_counted_completion_operation(&mut app, kind, "test", total)
+            .expect("begin counted completion operation");
+        (app, operation_id, guard)
+    }
+
+    fn verify_result(path: &str) -> crate::tui::verify::VerifyResult {
+        crate::tui::verify::VerifyResult {
+            path: std::path::PathBuf::from(path),
+            passed: true,
+            detail: "fixture passed".to_string(),
+        }
+    }
+
+    fn compare_result(path: &str) -> crate::tui::bit_compare::CompareResult {
+        crate::tui::bit_compare::CompareResult {
+            ref_path: std::path::PathBuf::from("/tmp/reference.flac"),
+            target_path: std::path::PathBuf::from(path),
+            identical: true,
+            detail: "fixture identical".to_string(),
+        }
+    }
+
+    fn preemphasis_result(path: &str) -> crate::tui::preemphasis::PreemphasisResult {
+        crate::tui::preemphasis::PreemphasisResult {
+            path: std::path::PathBuf::from(path),
+            confidence: crate::tui::preemphasis::PreemphasisConfidence::NotDetected,
+            cue_confirmed: false,
+            llr_m2_vs_m0: f64::NAN,
+            llr_m2_vs_m1: f64::NAN,
+            fitted_alpha: f64::NAN,
+            frames_scored: 0,
+            deemph_distance_delta: 0.0,
+            gates_fired: Vec::new(),
+            detail: String::new(),
+            spectral_rms_error: 0.0,
+            crest_improvement: 0.0,
+        }
+    }
+
     fn assert_completion_restored_dirty_editor(
         app: &AppState,
         kind: CompletionOperationKind,
@@ -10427,6 +10935,248 @@ mod musicbrainz_completion_dispatch_tests {
         };
         assert!(editor.active_surface().dirty);
         assert_eq!(session_guard_for(editor), guard);
+    }
+
+    #[test]
+    fn replaygain_refresh_replaces_stale_carrier_counts() {
+        let mut editor = single_source_file_editor();
+        let surface = editor.active_surface_mut();
+        surface
+            .entries
+            .retain(|entry| entry.display_key != "REPLAYGAIN_TRACK_GAIN");
+        surface.entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
+            display_key: "REPLAYGAIN_TRACK_GAIN".to_string(),
+            item_key: lofty::tag::ItemKey::ReplayGainTrackGain,
+            value: "-9.00 dB".to_string(),
+            original: "-9.00 dB".to_string(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2],
+            per_file_values: vec!["-9.00 dB".to_string()],
+            per_file_originals: vec!["-9.00 dB".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+
+        metadata_editor_upsert_per_file_entry(
+            surface,
+            "REPLAYGAIN_TRACK_GAIN",
+            lofty::tag::ItemKey::ReplayGainTrackGain,
+            vec!["-7.25 dB".to_string()],
+        );
+
+        let entry = surface
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "REPLAYGAIN_TRACK_GAIN")
+            .expect("ReplayGain row");
+        assert_eq!(entry.value, "-7.25 dB");
+        assert_eq!(entry.per_file_values, vec!["-7.25 dB".to_string()]);
+        assert_eq!(entry.per_file_stored_value_counts, vec![1]);
+        assert!(!entry.has_multiple_stored_values);
+    }
+
+    #[test]
+    fn verify_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::Verify;
+        let (mut app, operation_id, guard) = counted_completion_test_app(kind, 1);
+        handle_message(
+            &mut app,
+            AppMessage::VerifyComplete {
+                operation_id,
+                result: verify_result("/tmp/verify.flac"),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+        assert_eq!(app.verify_results.len(), 1);
+    }
+
+    #[test]
+    fn compare_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::Compare;
+        let (mut app, operation_id, guard) = counted_completion_test_app(kind, 1);
+        handle_message(
+            &mut app,
+            AppMessage::CompareComplete {
+                operation_id,
+                result: compare_result("/tmp/target.flac"),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+        assert_eq!(app.compare_results.len(), 1);
+    }
+
+    #[test]
+    fn preemphasis_completion_preserves_parked_dirty_editor() {
+        let kind = CompletionOperationKind::Preemphasis;
+        let (mut app, operation_id, guard) = counted_completion_test_app(kind, 1);
+        handle_message(
+            &mut app,
+            AppMessage::PreemphasisComplete {
+                operation_id,
+                result: preemphasis_result("/tmp/preemph.flac"),
+            },
+            &tx(),
+        );
+        assert_completion_restored_dirty_editor(&app, kind, guard);
+        assert_eq!(app.preemph_results.len(), 1);
+    }
+
+    #[test]
+    fn counted_completion_families_reject_overlap_and_complete_exactly_once() {
+        for kind in [
+            CompletionOperationKind::Verify,
+            CompletionOperationKind::Compare,
+            CompletionOperationKind::Preemphasis,
+        ] {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            let operation_id = begin_counted_completion_operation(&mut app, kind, "test", 2)
+                .expect("first operation");
+            assert!(begin_counted_completion_operation(&mut app, kind, "overlap", 1).is_err());
+            assert_eq!(
+                app.active_completion_operations
+                    .get(&kind)
+                    .and_then(|active| active.batch)
+                    .map(|batch| (batch.total, batch.remaining)),
+                Some((2, 2))
+            );
+            assert_eq!(
+                complete_counted_completion_operation(&mut app, kind, operation_id),
+                Some(false)
+            );
+            assert_eq!(
+                complete_counted_completion_operation(&mut app, kind, operation_id),
+                Some(true)
+            );
+            assert_eq!(
+                complete_counted_completion_operation(&mut app, kind, operation_id),
+                None,
+                "duplicate terminal completion must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn counted_completion_families_preserve_an_occupied_prompt() {
+        let fixtures = [
+            CompletionOperationKind::Verify,
+            CompletionOperationKind::Compare,
+            CompletionOperationKind::Preemphasis,
+        ];
+        for kind in fixtures {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.active_overlay = ActiveOverlay::TextEdit {
+                input: crate::tui::text_input::TextInputState::new("typed secret".to_string()),
+                target: crate::tui::app::TextEditTarget::ArchivePassword(
+                    std::path::PathBuf::from("/tmp/encrypted.7z"),
+                ),
+                label: "archive password".to_string(),
+            };
+            let operation_id = begin_counted_completion_operation(&mut app, kind, "test", 1)
+                .expect("operation");
+            match kind {
+                CompletionOperationKind::Verify => handle_message(
+                    &mut app,
+                    AppMessage::VerifyComplete {
+                        operation_id,
+                        result: verify_result("/tmp/verify.flac"),
+                    },
+                    &tx(),
+                ),
+                CompletionOperationKind::Compare => handle_message(
+                    &mut app,
+                    AppMessage::CompareComplete {
+                        operation_id,
+                        result: compare_result("/tmp/target.flac"),
+                    },
+                    &tx(),
+                ),
+                CompletionOperationKind::Preemphasis => handle_message(
+                    &mut app,
+                    AppMessage::PreemphasisComplete {
+                        operation_id,
+                        result: preemphasis_result("/tmp/preemph.flac"),
+                    },
+                    &tx(),
+                ),
+                _ => unreachable!(),
+            }
+            let ActiveOverlay::TextEdit { input, .. } = &app.active_overlay else {
+                panic!("{kind:?} completion replaced the occupied prompt");
+            };
+            assert_eq!(input.text, "typed secret");
+            assert!(!app.active_completion_operations.contains_key(&kind));
+        }
+    }
+
+    #[test]
+    fn counted_completion_over_password_prompt_preserves_and_restores_owned_editor() {
+        for kind in [
+            CompletionOperationKind::Verify,
+            CompletionOperationKind::Compare,
+            CompletionOperationKind::Preemphasis,
+        ] {
+            let (mut app, operation_id, guard) = counted_completion_test_app(kind, 1);
+            app.active_overlay = ActiveOverlay::TextEdit {
+                input: crate::tui::text_input::TextInputState::new(
+                    "typed secret".to_string(),
+                ),
+                target: crate::tui::app::TextEditTarget::ArchivePassword(
+                    std::path::PathBuf::from("/tmp/encrypted.7z"),
+                ),
+                label: "archive password".to_string(),
+            };
+
+            match kind {
+                CompletionOperationKind::Verify => handle_message(
+                    &mut app,
+                    AppMessage::VerifyComplete {
+                        operation_id,
+                        result: verify_result("/tmp/verify.flac"),
+                    },
+                    &tx(),
+                ),
+                CompletionOperationKind::Compare => handle_message(
+                    &mut app,
+                    AppMessage::CompareComplete {
+                        operation_id,
+                        result: compare_result("/tmp/target.flac"),
+                    },
+                    &tx(),
+                ),
+                CompletionOperationKind::Preemphasis => handle_message(
+                    &mut app,
+                    AppMessage::PreemphasisComplete {
+                        operation_id,
+                        result: preemphasis_result("/tmp/preemph.flac"),
+                    },
+                    &tx(),
+                ),
+                _ => unreachable!(),
+            }
+
+            let ActiveOverlay::TextEdit { input, .. } = &app.active_overlay else {
+                panic!("{kind:?} completion replaced the password prompt");
+            };
+            assert_eq!(input.text, "typed secret");
+            assert!(app.pending_metadata_editor.as_deref().is_some_and(|editor| {
+                editor.active_surface().dirty && session_guard_for(editor) == guard
+            }));
+
+            crate::tui::keybindings::handle_key(
+                &mut app,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &tx(),
+            );
+            assert_completion_restored_dirty_editor(&app, kind, guard);
+        }
     }
 
     #[test]
@@ -10522,6 +11272,69 @@ mod musicbrainz_completion_dispatch_tests {
             &tx(),
         );
         assert_completion_restored_dirty_editor(&app, kind, guard);
+    }
+
+    #[test]
+    fn mismatched_accuraterip_completion_discards_stale_deferred_ctdb_repair() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let operation_id = begin_completion_operation(
+            &mut app,
+            CompletionOperationKind::AccurateRip,
+            "AccurateRip",
+        )
+        .expect("operation");
+        app.pending_ctdb_repair = Some(crate::tui::app::PendingCtdbRepair {
+            paths: vec![std::path::PathBuf::from("/tmp/stale-first.flac")],
+            parity_url: "https://example.invalid/parity".to_string(),
+            npar: 8,
+            expected_crcs: vec![1],
+            single_image: None,
+        });
+        let page = crate::tui::app::ArVerifyPage {
+            label: String::new(),
+            result: crate::tui::accuraterip::ArVerifyResult {
+                tracks: vec![crate::tui::accuraterip::ArTrackResult {
+                    path: std::path::PathBuf::from("/tmp/unrelated-first.flac"),
+                    track_number: 1,
+                    status: crate::tui::accuraterip::ArTrackStatus::Mismatch,
+                    confidence: None,
+                    offset: None,
+                    crc_v1: 1,
+                    crc_v2: 2,
+                }],
+                was_common_scan: false,
+                disc_id_str: "fixture-disc".to_string(),
+                url: "https://example.invalid/ar".to_string(),
+            },
+        };
+
+        handle_message(
+            &mut app,
+            AppMessage::AccurateRipComplete {
+                operation_id,
+                pages: vec![page],
+            },
+            &tx(),
+        );
+
+        assert!(app.pending_ctdb_repair.is_none());
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::AccurateRipVerify(_)
+        ));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("discarded stale deferred CTDB repair")
+        }));
+    }
+
+    #[test]
+    fn offset_correction_is_classified_as_browse_visible_mutation() {
+        assert!(message_mutates_browse_visible_state(
+            &AppMessage::OffsetCorrectionComplete {
+                operation_id: crate::tui::message::TagsMbOperationId(1),
+                result: Ok("fixture".to_string()),
+            }
+        ));
     }
 
     #[test]

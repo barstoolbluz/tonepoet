@@ -158,7 +158,7 @@ All provided by the nix flake:
 | opusenc, opustags | Opus encoding, metadata |
 | wavpack, wvtag | WavPack encoding, metadata |
 | loudgain | ReplayGain analysis |
-| AtomicParsley | AAC/M4A metadata |
+| AtomicParsley | Required for authoritative non-native/custom tags in M4A/MP4 outputs; conversions fail closed rather than silently dropping those keys |
 | libbluray | Blu-ray disc reading + AACS integration |
 | libaacs | Blu-ray AACS decryption (requires user-provided KEYDB.cfg) |
 | 7z (p7zip) | Archive extraction + repackaging |

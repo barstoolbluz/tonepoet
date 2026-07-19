@@ -6107,31 +6107,7 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
 /// need to merge format-specific aliases before applying the standard ordering.
 /// The returned key is a logical editor key, not necessarily the raw tag name.
 pub fn canonical_metadata_display_key(display_key: &str) -> String {
-    // Alias LOOKUP uses the squashed form, but keys with no known alias
-    // must keep their separators: returning the squashed fallback rewrote
-    // e.g. REPLAYGAIN_ALBUM_GAIN to REPLAYGAINALBUMGAIN — and the AddKey
-    // flow then wrote that separator-less tag name to disk.
-    let normalized: String = display_key
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_uppercase())
-        .collect();
-    match normalized.as_str() {
-        "YEAR" => "DATE".to_string(),
-        "ALBUMARTIST" | "ALBUMARTISTS" | "ALBUMARTISTCREDIT" => "ALBUMARTIST".to_string(),
-        // foobar2000/flac convention is canonical; legacy spellings and
-        // lofty's old DESCRIPTION comment alias merge into it on read.
-        "TOTALTRACKS" => "TRACKTOTAL".to_string(),
-        "TOTALDISCS" => "DISCTOTAL".to_string(),
-        "DESCRIPTION" => "COMMENT".to_string(),
-        "MUSICBRAINZALBUMID" => "MUSICBRAINZ_ALBUMID".to_string(),
-        "MUSICBRAINZALBUMARTISTID" => "MUSICBRAINZ_ALBUMARTISTID".to_string(),
-        "MUSICBRAINZRELEASEGROUPID" => "MUSICBRAINZ_RELEASEGROUPID".to_string(),
-        "MUSICBRAINZTRACKID" | "MUSICBRAINZRECORDINGID" => "MUSICBRAINZ_TRACKID".to_string(),
-        "MUSICBRAINZRELEASETRACKID" => "MUSICBRAINZ_RELEASETRACKID".to_string(),
-        "MUSICBRAINZARTISTID" => "MUSICBRAINZ_ARTISTID".to_string(),
-        _ => display_key.trim().to_ascii_uppercase(),
-    }
+    crate::dsf_tags::canonical_metadata_key(display_key)
 }
 
 
@@ -6228,8 +6204,12 @@ fn canonical_editor_fields_from_dsf(
         .fields
         .iter()
         .map(|(display_key, values)| {
-            let display_key = canonical_metadata_display_key(display_key);
-            let stored_value_count = snapshot.stored_value_count(&display_key);
+            // DsfTagSnapshot is already canonicalized by the DSF backend.
+            // Looking up counts with a second canonicalization can miss the
+            // backend key and can collapse two rows only after one row's
+            // values/counts have already been discarded.
+            let stored_value_count = snapshot.stored_value_count(display_key);
+            let display_key = display_key.clone();
             CanonicalEditorTagField {
                 item_key: canonical_editor_item_key(
                     &display_key,
@@ -8993,6 +8973,26 @@ mod tests {
         assert_eq!(canonical_metadata_display_key("Album Artist"), "ALBUMARTIST");
         assert_eq!(canonical_metadata_display_key("MUSICBRAINZ_ALBUMID"), "MUSICBRAINZ_ALBUMID");
         assert_eq!(canonical_metadata_display_key("MusicBrainz Release Track Id"), "MUSICBRAINZ_RELEASETRACKID");
+    }
+
+    #[test]
+    fn canonical_dsf_editor_row_retains_merged_alias_values_and_counts() {
+        let snapshot = crate::dsf_tags::DsfTagSnapshot {
+            fields: std::collections::BTreeMap::from([(
+                "MUSICBRAINZ_ALBUMID".to_string(),
+                vec!["canonical-id".to_string(), "picard-id".to_string()],
+            )]),
+            stored_value_counts: std::collections::BTreeMap::from([(
+                "MUSICBRAINZ_ALBUMID".to_string(),
+                3,
+            )]),
+        };
+
+        let fields = canonical_editor_fields_from_dsf(&snapshot);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].display_key, "MUSICBRAINZ_ALBUMID");
+        assert_eq!(fields[0].value, "canonical-id; picard-id");
+        assert_eq!(fields[0].stored_value_count, 3);
     }
 
     #[test]

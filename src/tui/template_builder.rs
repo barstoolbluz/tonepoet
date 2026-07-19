@@ -317,21 +317,35 @@ pub fn draw_template_builder(
 
     // ── Template input line ──
     {
+        let focused = state.focus == TemplateBuilderFocus::TemplateInput;
         let label = Span::styled("  Template:  ", theme.muted());
-        let (visible_text, cursor_col) = state.template_input.view(iw.saturating_sub(14));
-        let input_style = if state.focus == TemplateBuilderFocus::TemplateInput {
-            Style::default().fg(theme.text_bright).bg(theme.input_focused_bg)
-        } else {
-            Style::default().fg(theme.text_bright).bg(theme.input_unfocused_bg)
-        };
-        let input_span = Span::styled(
-            format!("{:width$}", visible_text, width = iw.saturating_sub(14)),
+        let input_width = iw.saturating_sub(14);
+        let mut spans = vec![label];
+        let input_style = Style::default()
+            .fg(theme.text_bright)
+            .bg(if focused {
+                theme.input_focused_bg
+            } else {
+                theme.input_unfocused_bg
+            });
+        spans.extend(super::inline_edit::render_text_input_value_with_style(
+            &state.template_input,
+            input_width,
+            focused,
             input_style,
+            theme,
+        ));
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, cy, inner.width, 1),
         );
-        let line = Line::from(vec![label, input_span]);
-        f.render_widget(Paragraph::new(line), Rect::new(inner.x, cy, inner.width, 1));
-        if state.focus == TemplateBuilderFocus::TemplateInput {
-            f.set_cursor(inner.x + 13 + cursor_col as u16, cy);
+        if focused {
+            f.set_cursor(
+                inner.x
+                    + 13
+                    + super::inline_edit::inline_cursor_col(&state.template_input, input_width),
+                cy,
+            );
         }
         cy += 2;
     }
@@ -739,4 +753,45 @@ pub fn draw_template_picker(
         Paragraph::new(Line::from(spans)),
         Rect::new(inner.x, cy, inner.width, 1),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn template_builder_input_paints_partial_selection() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let mut state = TemplateBuilderState::new(
+            TemplateTarget::Filename,
+            "abcdef",
+            TemplateBuilderFocus::TemplateInput,
+        );
+        state.template_input.selection_anchor = Some(1);
+        state.template_input.cursor = 4;
+        let mut button_map = ButtonRenderMap::new();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_template_builder(frame, &state, &mut button_map, theme))
+            .expect("draw template builder");
+
+        let selected_cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| {
+                matches!(cell.symbol(), "b" | "c" | "d")
+                    && cell.fg == theme.bg
+                    && cell.bg == theme.text_bright
+            })
+            .count();
+        assert_eq!(selected_cells, 3);
+    }
 }

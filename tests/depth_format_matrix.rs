@@ -6,11 +6,13 @@
 //! coverage. Unsupported capability cells are pinned at the public planner
 //! boundary in `tonepoet-pipeline/tests/planning.rs`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tonepoet::convert::pipeline::*;
 use tonepoet_pipeline::{AudioFormat, BitDepthTarget, PcmBitDepth, PreferredTool};
@@ -329,6 +331,397 @@ fn base_request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> 
         container_extension: None,
         container_ffmpeg_flags: Vec::new(),
         companion: CompanionCopyPolicy::default(),
+    }
+}
+
+fn run_checked(tool: &str, args: &[String]) -> String {
+    let output = ProcessCommand::new(tool)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {tool}: {err}"));
+    assert!(
+        output.status.success(),
+        "{tool} failed with status {:?}\nstdout:\n{}\nstderr:\n{}\nargs: {:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        args,
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn create_single_flac_with_custom_tags_and_artwork(root: &Path) -> PathBuf {
+    fs::create_dir_all(root).expect("create fixture root");
+    let cover = root.join("cover.jpg");
+    run_checked(
+        "ffmpeg",
+        &[
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-f".to_string(),
+            "lavfi".to_string(),
+            "-i".to_string(),
+            "color=c=blue:s=64x64:d=0.10".to_string(),
+            "-frames:v".to_string(),
+            "1".to_string(),
+            cover.display().to_string(),
+        ],
+    );
+
+    let source = root.join("single-source.flac");
+    run_checked(
+        "ffmpeg",
+        &[
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-f".to_string(),
+            "lavfi".to_string(),
+            "-i".to_string(),
+            "sine=frequency=880:sample_rate=44100:duration=1.5".to_string(),
+            "-i".to_string(),
+            cover.display().to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-map".to_string(),
+            "1:v:0".to_string(),
+            "-c:a".to_string(),
+            "flac".to_string(),
+            "-sample_fmt".to_string(),
+            "s16".to_string(),
+            "-c:v".to_string(),
+            "copy".to_string(),
+            "-disposition:v:0".to_string(),
+            "attached_pic".to_string(),
+            "-metadata".to_string(),
+            "TITLE=Single Track".to_string(),
+            "-metadata".to_string(),
+            "ARTIST=Single Artist".to_string(),
+            "-metadata".to_string(),
+            "ALBUM=Single Album".to_string(),
+            "-metadata".to_string(),
+            "TRACKNUMBER=1".to_string(),
+            "-metadata".to_string(),
+            "PRE_EMPHASIS=1".to_string(),
+            "-metadata".to_string(),
+            "MY_NOTE=keep me".to_string(),
+            source.display().to_string(),
+        ],
+    );
+    source
+}
+
+fn ffprobe_json(path: &Path) -> Value {
+    let stdout = run_checked(
+        "ffprobe",
+        &[
+            "-v".to_string(),
+            "error".to_string(),
+            "-show_streams".to_string(),
+            "-show_format".to_string(),
+            "-of".to_string(),
+            "json".to_string(),
+            path.display().to_string(),
+        ],
+    );
+    serde_json::from_str(&stdout).expect("ffprobe JSON should parse")
+}
+
+fn ffprobe_tag_map(probe: &Value) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    if let Some(values) = probe.pointer("/format/tags").and_then(Value::as_object) {
+        for (key, value) in values {
+            if let Some(value) = value.as_str() {
+                tags.insert(key.to_ascii_uppercase(), value.to_string());
+            }
+        }
+    }
+    if let Some(streams) = probe.get("streams").and_then(Value::as_array) {
+        for stream in streams {
+            if stream.get("codec_type").and_then(Value::as_str) != Some("audio") {
+                continue;
+            }
+            if let Some(values) = stream.get("tags").and_then(Value::as_object) {
+                for (key, value) in values {
+                    if let Some(value) = value.as_str() {
+                        tags.entry(key.to_ascii_uppercase()).or_insert_with(|| value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    tags
+}
+
+fn attached_picture_count(probe: &Value) -> usize {
+    probe
+        .get("streams")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|stream| stream.get("codec_type").and_then(Value::as_str) == Some("video"))
+        .filter(|stream| {
+            stream
+                .pointer("/disposition/attached_pic")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                == 1
+        })
+        .count()
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> usize {
+    u32::from_be_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("four-byte big-endian field"),
+    ) as usize
+}
+
+fn read_be_u64(bytes: &[u8], offset: usize) -> usize {
+    usize::try_from(u64::from_be_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("eight-byte big-endian field"),
+    ))
+    .expect("MP4 box size should fit usize")
+}
+
+fn count_mp4_ilst_atom(
+    bytes: &[u8],
+    mut pos: usize,
+    end: usize,
+    in_ilst: bool,
+    target: &[u8; 4],
+) -> usize {
+    let mut count = 0usize;
+    while pos + 8 <= end {
+        let size32 = read_be_u32(bytes, pos);
+        let code = &bytes[pos + 4..pos + 8];
+        let mut header_size = 8usize;
+        let size = match size32 {
+            0 => end.saturating_sub(pos),
+            1 if pos + 16 <= end => {
+                header_size = 16;
+                read_be_u64(bytes, pos + 8)
+            }
+            _ => size32,
+        };
+        if size < header_size || pos.saturating_add(size) > end {
+            break;
+        }
+
+        let data_start = pos + header_size;
+        let data_end = pos + size;
+        if in_ilst {
+            if code == target {
+                count += 1;
+            }
+        } else if code == b"moov" || code == b"udta" {
+            count += count_mp4_ilst_atom(bytes, data_start, data_end, false, target);
+        } else if code == b"meta" && data_start + 4 <= data_end {
+            count += count_mp4_ilst_atom(bytes, data_start + 4, data_end, false, target);
+        } else if code == b"ilst" {
+            count += count_mp4_ilst_atom(bytes, data_start, data_end, true, target);
+        }
+
+        pos += size;
+    }
+    count
+}
+
+fn mp4_ilst_atom_count(path: &Path, atom: &[u8; 4]) -> usize {
+    let bytes = fs::read(path).expect("read M4A output for ilst inspection");
+    count_mp4_ilst_atom(&bytes, 0, bytes.len(), false, atom)
+}
+
+fn assert_m4a_custom_artwork_state(path: &Path, pass: &str) -> BTreeMap<String, String> {
+    let probe = ffprobe_json(path);
+    let tags = ffprobe_tag_map(&probe);
+    assert_eq!(
+        tags.get("PRE_EMPHASIS").map(String::as_str),
+        Some("1"),
+        "{pass}: PRE_EMPHASIS freeform atom missing; tags were {tags:?}",
+    );
+    assert_eq!(
+        tags.get("MY_NOTE").map(String::as_str),
+        Some("keep me"),
+        "{pass}: MY_NOTE freeform atom missing; tags were {tags:?}",
+    );
+    assert_eq!(
+        attached_picture_count(&probe),
+        1,
+        "{pass}: ALAC/M4A must contain exactly one attached artwork stream",
+    );
+    assert_eq!(
+        mp4_ilst_atom_count(path, b"covr"),
+        1,
+        "{pass}: ALAC/M4A must contain exactly one covr atom",
+    );
+    tags
+}
+
+#[tokio::test]
+async fn strict_gate_exercises_single_file_m4a_freeform_artwork_and_loudgain_invariants() {
+    const TEST: &str =
+        "strict_gate_exercises_single_file_m4a_freeform_artwork_and_loudgain_invariants";
+    if !require_tools_or_skip(TEST, &["ffmpeg", "ffprobe", "AtomicParsley", "loudgain"]) {
+        return;
+    }
+
+    let root = TempRoot::new("single-m4a-freeform-artwork-rg");
+    let source_path = create_single_flac_with_custom_tags_and_artwork(&root.join("source"));
+    assert_eq!(
+        attached_picture_count(&ffprobe_json(&source_path)),
+        1,
+        "strict fixture must begin with exactly one embedded artwork stream",
+    );
+    let case_root = root.join("case");
+    fs::create_dir_all(case_root.join("output")).expect("create output root");
+    fs::create_dir_all(case_root.join("logs")).expect("create log root");
+
+    let mut request = base_request(
+        source_path,
+        case_root.join("output"),
+        case_root.join("logs"),
+    );
+    request.job_id = "single-m4a-freeform-artwork-rg".to_string();
+    request.item_id = request.job_id.clone();
+    request.settings.target_format = AudioFormat::Alac;
+    request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+    request.settings.force_encode = true;
+    // Exercise the exact production split: the planner transfers native tags
+    // and embedded artwork, while the orchestrator must still run Metadata for
+    // non-native M4A keys and apply AtomicParsley after the artwork-bearing
+    // ffmpeg output exists.
+    request.settings.metadata.transfer_tags = true;
+    request.settings.metadata.preserve_artwork = true;
+    request.settings.metadata.store_source_audio_md5 = false;
+    request.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Both);
+    request.settings.replay_gain.existing_tags =
+        tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan;
+    request.stages.metadata = StageRequirement::Enabled;
+    request.stages.replaygain = StageRequirement::Disabled;
+    request.container_extension = Some("m4a".to_string());
+
+    let runner = RealToolRunner::new(HashMap::new());
+    let reporter = RecordingReporter::new();
+    let cancel = CancellationToken::new();
+    let report = run_pipeline_item(request.clone(), &runner, &reporter, &cancel).await;
+    assert!(
+        matches!(&report.outcome, AlbumOutcome::Complete { .. }),
+        "single-file ALAC pipeline did not complete: {:?}",
+        report.outcome,
+    );
+    let stage_records = match &report.outcome {
+        AlbumOutcome::Complete { stages, .. }
+        | AlbumOutcome::Partial { stages, .. }
+        | AlbumOutcome::Blocked { stages, .. } => stages,
+    };
+    assert_eq!(
+        stage_records
+            .iter()
+            .find(|record| record.stage == PipelineStage::Metadata)
+            .map(|record| &record.outcome),
+        Some(&StageOutcome::Ok),
+        "single-file M4A with custom keys must route through the production Metadata stage",
+    );
+
+    let source = report
+        .source
+        .as_ref()
+        .expect("completed pipeline should retain prepared source facts");
+    assert_eq!(source.kind, SourceKind::SingleFile);
+    assert_eq!(source.tracks.len(), 1);
+    assert!(source.tracks[0].metadata.pre_emphasis);
+    assert_eq!(
+        source.tracks[0]
+            .metadata
+            .extra
+            .get("my_note")
+            .map(String::as_str),
+        Some("keep me"),
+    );
+
+    let mut published_artifacts = report
+        .artifacts
+        .clone()
+        .expect("completed pipeline should retain artifact records");
+    let output_path = match &mut published_artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => {
+            assert_eq!(tracks.len(), 1, "single-file ALAC should publish one track");
+            let track = tracks.first_mut().expect("one ALAC artifact");
+            assert!(
+                track.metadata_satisfaction.source_tags_transferred,
+                "planner must report native source-tag transfer before authoritative M4A metadata",
+            );
+            assert!(
+                track.metadata_satisfaction.artwork_transferred,
+                "planner must report artwork transfer before the authoritative metadata rewrite",
+            );
+            assert!(track.final_path.is_file(), "published ALAC output should exist");
+            track.staged_path = track.final_path.clone();
+            track.final_path.clone()
+        }
+        AudioArtifacts::Merged(_) => panic!("single-file ALAC should not produce a merged artifact"),
+    };
+    let published = report
+        .published
+        .as_ref()
+        .expect("completed pipeline should publish output");
+    assert_eq!(
+        published
+            .entries
+            .iter()
+            .filter(|entry| matches!(&entry.role, PublishRole::Audio))
+            .map(|entry| entry.final_path.as_path())
+            .collect::<Vec<_>>(),
+        vec![output_path.as_path()],
+        "artifact and publication records must identify the same ALAC file",
+    );
+
+    let first_tags = assert_m4a_custom_artwork_state(&output_path, "production metadata pass");
+
+    apply_metadata(&published_artifacts, source, &request, &runner, &cancel)
+        .await
+        .expect("second metadata/freeform pass on published output");
+    let second_tags = assert_m4a_custom_artwork_state(&output_path, "second metadata pass");
+    assert_eq!(
+        first_tags, second_tags,
+        "repeated metadata/freeform application must converge semantically",
+    );
+
+    request.stages.replaygain = StageRequirement::Enabled;
+    let replaygain = apply_replaygain_with_source_and_tool_limits(
+        &published_artifacts,
+        Some(source),
+        &request,
+        &runner,
+        &cancel,
+        None,
+    )
+    .await
+    .expect("loudgain scan");
+    assert!(matches!(replaygain.outcome, StageOutcome::Ok));
+
+    let after_replaygain = assert_m4a_custom_artwork_state(&output_path, "after loudgain");
+    for key in [
+        "REPLAYGAIN_TRACK_GAIN",
+        "REPLAYGAIN_TRACK_PEAK",
+        "REPLAYGAIN_ALBUM_GAIN",
+        "REPLAYGAIN_ALBUM_PEAK",
+    ] {
+        assert!(
+            after_replaygain
+                .get(key)
+                .is_some_and(|value| !value.trim().is_empty()),
+            "after loudgain: missing {key}; tags were {after_replaygain:?}",
+        );
     }
 }
 

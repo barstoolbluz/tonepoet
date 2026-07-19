@@ -58,7 +58,10 @@ fn render_editing_spans(
     input: &TextInputState,
     width: usize,
     theme: super::theme::Theme,
+    normal: Style,
+    paint_selection: bool,
     embedded_cursor: bool,
+    pad_to_width: bool,
 ) -> Vec<Span<'static>> {
     let width = width.max(1);
     let (visible, cursor_col) = input.view(width);
@@ -70,9 +73,6 @@ fn render_editing_spans(
         let end = super::display_width::width(&input.text[..range.end]);
         (start.saturating_sub(scroll), end.saturating_sub(scroll))
     });
-    let normal = Style::default()
-        .fg(theme.text_bright)
-        .bg(theme.input_focused_bg);
     let selected = selection_style(theme);
     let cursor_style = selection_style(theme);
 
@@ -88,10 +88,11 @@ fn render_editing_spans(
         if cell_col.saturating_add(ch_width) > width {
             break;
         }
-        let selected_cell = selection_cols.is_some_and(|(start, end)| {
+        let selected_cell = paint_selection && selection_cols.is_some_and(|(start, end)| {
             ch_width > 0 && cell_col < end && cell_col.saturating_add(ch_width) > start
         });
-        let cursor_cell = embedded_cursor
+        let cursor_cell = paint_selection
+            && embedded_cursor
             && ch_width > 0
             && cursor_col >= cell_col
             && cursor_col < cell_col.saturating_add(ch_width);
@@ -107,8 +108,8 @@ fn render_editing_spans(
         cell_col = cell_col.saturating_add(ch_width);
     }
 
-    while cell_col < width {
-        let style = if embedded_cursor && cell_col == cursor_col {
+    while pad_to_width && cell_col < width {
+        let style = if paint_selection && embedded_cursor && cell_col == cursor_col {
             cursor_style
         } else {
             normal
@@ -129,7 +130,10 @@ pub fn render_inline_value(
     theme: super::theme::Theme,
 ) -> Vec<Span<'static>> {
     if editing {
-        return render_editing_spans(input, width, theme, false);
+        let normal = Style::default()
+            .fg(theme.text_bright)
+            .bg(theme.input_focused_bg);
+        return render_editing_spans(input, width, theme, normal, true, false, true);
     }
     let display = if value.is_empty() {
         truncate_to("(empty)", width)
@@ -154,7 +158,55 @@ pub fn render_inline_value_with_embedded_cursor(
     width: usize,
     theme: super::theme::Theme,
 ) -> Vec<Span<'static>> {
-    render_editing_spans(input, width, theme, true)
+    let normal = Style::default()
+        .fg(theme.text_bright)
+        .bg(theme.input_focused_bg);
+    render_editing_spans(input, width, theme, normal, true, true, true)
+}
+
+/// Render a standalone single-line [`TextInputState`] while preserving its
+/// horizontally scrolled view and painting the active selection. This is the
+/// common path for modal prompts, codec-setting inputs, template builders, and
+/// the vi command line. The caller owns terminal cursor placement.
+pub fn render_text_input_value(
+    input: &TextInputState,
+    width: usize,
+    focused: bool,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    let normal = Style::default()
+        .fg(if focused { theme.text_bright } else { theme.text })
+        .bg(if focused {
+            theme.input_focused_bg
+        } else {
+            theme.input_unfocused_bg
+        });
+    render_editing_spans(input, width, theme, normal, focused, false, true)
+}
+
+/// Render a standalone text input using a caller-owned normal style while
+/// retaining the shared inverse-video selection treatment. This keeps the
+/// vi command line, bulk rename, and other specialized surfaces visually
+/// unchanged outside the selected range.
+pub fn render_text_input_value_with_style(
+    input: &TextInputState,
+    width: usize,
+    focused: bool,
+    normal: Style,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    render_editing_spans(input, width, theme, normal, focused, false, true)
+}
+
+/// Compact variant of [`render_text_input_value_with_style`].
+pub fn render_text_input_value_compact_with_style(
+    input: &TextInputState,
+    width: usize,
+    focused: bool,
+    normal: Style,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    render_editing_spans(input, width, theme, normal, focused, false, false)
 }
 
 /// Render a complete labelled inline row with an embedded cursor cell.
@@ -273,6 +325,28 @@ mod tests {
                 contrast(theme.text_bright, theme.input_focused_bg)
             );
         }
+    }
+
+    #[test]
+    fn standalone_text_input_renderer_paints_partial_selection_only_when_focused() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let mut input = TextInputState::new("abcdef".to_string());
+        input.selection_anchor = Some(1);
+        input.cursor = 4;
+
+        let focused = render_text_input_value(&input, 12, true, theme);
+        assert!(focused.iter().any(|span| {
+            span.content.as_ref() == "bcd"
+                && span.style.fg == Some(theme.bg)
+                && span.style.bg == Some(theme.text_bright)
+        }));
+
+        let unfocused = render_text_input_value(&input, 12, false, theme);
+        assert!(!unfocused.iter().any(|span| {
+            span.style.fg == Some(theme.bg) && span.style.bg == Some(theme.text_bright)
+        }));
     }
 
     #[test]

@@ -8845,6 +8845,9 @@ pub struct ActiveCueOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CompletionOperationKind {
     Analysis,
+    Verify,
+    Compare,
+    Preemphasis,
     AccurateRip,
     Ctdb,
     ArBatch,
@@ -8857,9 +8860,19 @@ pub enum CompletionOperationKind {
 /// metadata editor present at dispatch; such operations may enrich that same
 /// editor but never replace it with a result overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionBatchProgress {
+    pub total: usize,
+    pub remaining: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveCompletionOperation {
     pub operation_id: crate::tui::message::TagsMbOperationId,
     pub editor_session: Option<crate::tui::message::MetadataEditorSessionGuard>,
+    /// Present for fan-out completion families whose workers each emit one
+    /// terminal message. The operation identity, not a process-global counter,
+    /// owns this progress state.
+    pub batch: Option<CompletionBatchProgress>,
 }
 
 /// One in-flight Browse inline metadata write. The generation and exact path
@@ -9832,23 +9845,14 @@ pub struct AppState {
     /// Verify results from the last :verify command.
     pub verify_results: Vec<crate::tui::verify::VerifyResult>,
 
-    /// Number of verify tasks currently in flight.
-    pub verify_pending: usize,
-
     /// Pre-emphasis detection results.
     pub preemph_results: Vec<crate::tui::preemphasis::PreemphasisResult>,
-
-    /// Number of pre-emphasis detection tasks in flight.
-    pub preemph_pending: usize,
 
     /// Reference paths for bit-compare (marked by user, persists until cleared).
     pub compare_reference: Vec<std::path::PathBuf>,
 
     /// Bit-compare results from the last comparison.
     pub compare_results: Vec<crate::tui::bit_compare::CompareResult>,
-
-    /// Number of compare tasks currently in flight.
-    pub compare_pending: usize,
 
     // Navigation
     pub current_screen: AppScreen,
@@ -9928,6 +9932,11 @@ pub struct AppState {
     /// saves. Staging is removed only after a successful archive replacement;
     /// failures keep staged edits available for retry/discard.
     pub browse_archive_repackage: Option<ArchiveMetadataEditContext>,
+
+    /// File-task overlay session owned by `browse_archive_repackage`. Terminal
+    /// failure/cancellation prompts may replace only this exact progress
+    /// surface; a newer overlay must never be clobbered by a late completion.
+    pub browse_archive_repackage_progress_session_id: Option<u64>,
 
     /// Editor-owned whole-archive metadata staging preserved after a cancelled
     /// or failed repackage. Unlike in-archive Browse staging, parent-directory
@@ -10760,6 +10769,7 @@ impl AppState {
             pending_browse_archive_rename: None,
             pending_browse_archive_delete: None,
             browse_archive_repackage: None,
+            browse_archive_repackage_progress_session_id: None,
             preserved_editor_archive_repackage: None,
             pending_archive_recovery,
             pending_archive_recovery_resume: None,
@@ -10812,12 +10822,9 @@ impl AppState {
             analysis_pending: 0,
             analysis_temp_dir: None,
             verify_results: Vec::new(),
-            verify_pending: 0,
             preemph_results: Vec::new(),
-            preemph_pending: 0,
             compare_reference: Vec::new(),
             compare_results: Vec::new(),
-            compare_pending: 0,
             tool_check_cache: once_cell::sync::OnceCell::new(),
         }
     }
@@ -11364,29 +11371,50 @@ impl AppState {
             ));
             return;
         }
-        if self.verify_pending > 0 {
-            let pending = self.verify_pending;
-            let done = self.verify_results.len();
+        if let Some(progress) = self
+            .active_completion_operations
+            .get(&CompletionOperationKind::Verify)
+            .and_then(|operation| operation.batch)
+            .filter(|progress| progress.remaining > 0)
+        {
             self.status_message = Some((
-                format!("Verifying... ({}/{})", done, done + pending),
+                format!(
+                    "Verifying... ({}/{})",
+                    progress.total.saturating_sub(progress.remaining),
+                    progress.total
+                ),
                 std::time::Instant::now(),
             ));
             return;
         }
-        if self.compare_pending > 0 {
-            let pending = self.compare_pending;
-            let done = self.compare_results.len();
+        if let Some(progress) = self
+            .active_completion_operations
+            .get(&CompletionOperationKind::Compare)
+            .and_then(|operation| operation.batch)
+            .filter(|progress| progress.remaining > 0)
+        {
             self.status_message = Some((
-                format!("Comparing... ({}/{})", done, done + pending),
+                format!(
+                    "Comparing... ({}/{})",
+                    progress.total.saturating_sub(progress.remaining),
+                    progress.total
+                ),
                 std::time::Instant::now(),
             ));
             return;
         }
-        if self.preemph_pending > 0 {
-            let pending = self.preemph_pending;
-            let done = self.preemph_results.len();
+        if let Some(progress) = self
+            .active_completion_operations
+            .get(&CompletionOperationKind::Preemphasis)
+            .and_then(|operation| operation.batch)
+            .filter(|progress| progress.remaining > 0)
+        {
             self.status_message = Some((
-                format!("Detecting pre-emphasis... ({}/{})", done, done + pending),
+                format!(
+                    "Detecting pre-emphasis... ({}/{})",
+                    progress.total.saturating_sub(progress.remaining),
+                    progress.total
+                ),
                 std::time::Instant::now(),
             ));
             return;

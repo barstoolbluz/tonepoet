@@ -50,6 +50,54 @@ fn truncate_to_chars(s: &str, max: usize) -> String {
     super::display_width::truncate_right(s, max)
 }
 
+/// Render a compact codec-setting text field with the same selection policy as
+/// every other `TextInputState` surface. The caller supplies the label and any
+/// suffix; this helper owns the field-edge cells and placeholder styling.
+fn format_text_input_spans(
+    input: &super::text_input::TextInputState,
+    visible_width: usize,
+    focused: bool,
+    enabled: bool,
+    placeholder: Option<&str>,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    let background = if !enabled {
+        theme.input_disabled_bg
+    } else if focused {
+        theme.input_focused_bg
+    } else {
+        theme.input_unfocused_bg
+    };
+    let normal_fg = if enabled {
+        if focused { theme.text_bright } else { theme.text }
+    } else {
+        theme.text_dim
+    };
+    let normal = Style::default().fg(normal_fg).bg(background);
+    let mut spans = vec![Span::styled(" ", normal)];
+    if input.text.is_empty() {
+        spans.push(Span::styled(
+            placeholder.unwrap_or(" ").to_string(),
+            Style::default()
+                .fg(if placeholder.is_some() { theme.text_dim } else { normal_fg })
+                .bg(background),
+        ));
+    } else if enabled {
+        spans.extend(super::inline_edit::render_text_input_value_compact_with_style(
+            input,
+            visible_width.max(1),
+            focused,
+            Style::default().fg(theme.text_bright).bg(background),
+            theme,
+        ));
+    } else {
+        let (visible, _) = input.view(visible_width.max(1));
+        spans.push(Span::styled(visible, normal));
+    }
+    spans.push(Span::styled(" ", normal));
+    spans
+}
+
 /// Hard-wrap sanitized editor text by terminal display columns while keeping
 /// the cursor expressed as a row plus character index within that row. Wide
 /// glyphs never straddle a row boundary; a glyph that cannot fit even on an
@@ -1142,20 +1190,15 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState, the
 
     // Scrolled view of the input
     let visible_width = chunks[1].width as usize;
-    let (view, cursor_col) = input.view(visible_width);
-    let display_input = if view.is_empty() {
-        " ".to_string()
-    } else {
-        view
-    };
-    let input_widget = Paragraph::new(Line::from(vec![Span::styled(
-        display_input,
-        Style::default().fg(theme.text_bright),
-    )]))
-    .style(Style::default().bg(theme.input_focused_bg));
+    let input_widget = Paragraph::new(Line::from(
+        super::inline_edit::render_text_input_value(input, visible_width, true, theme),
+    ));
     f.render_widget(input_widget, chunks[1]);
 
-    f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
+    f.set_cursor(
+        chunks[1].x + super::inline_edit::inline_cursor_col(input, visible_width),
+        chunks[1].y,
+    );
 
     let help = Paragraph::new(Line::from(vec![
         footer_pill("Enter confirm", theme.green, theme),
@@ -1203,20 +1246,15 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
     f.render_widget(hint, chunks[0]);
 
     let visible_width = chunks[1].width as usize;
-    let (view, cursor_col) = input.view(visible_width);
-    let display_input = if view.is_empty() {
-        " ".to_string()
-    } else {
-        view
-    };
-    let input_widget = Paragraph::new(Line::from(vec![Span::styled(
-        display_input,
-        Style::default().fg(theme.text_bright),
-    )]))
-    .style(Style::default().bg(theme.input_focused_bg));
+    let input_widget = Paragraph::new(Line::from(
+        super::inline_edit::render_text_input_value(input, visible_width, true, theme),
+    ));
     f.render_widget(input_widget, chunks[1]);
 
-    f.set_cursor(chunks[1].x + cursor_col, chunks[1].y);
+    f.set_cursor(
+        chunks[1].x + super::inline_edit::inline_cursor_col(input, visible_width),
+        chunks[1].y,
+    );
 
     let help = Paragraph::new(Line::from(vec![
         footer_pill("Enter save", theme.green, theme),
@@ -1409,23 +1447,23 @@ fn draw_flac_fields(
     let comp_focused = focus == FormatSettingsFocus::Compression;
     let comp_label_style = if comp_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[1].width.saturating_sub(16) as usize;
-    let (view, cursor_col) = compression_input.view(visible_width.max(1));
-    let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let input_bg = if comp_focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let comp_line = Line::from(vec![
-        Span::styled("  compression  ", comp_label_style),
-        Span::styled(
-            format!(" {} ", display_val),
-            Style::default().fg(theme.text_bright).bg(input_bg),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(comp_line), chunks[1]);
+    let mut comp_spans = vec![Span::styled("  compression  ", comp_label_style)];
+    comp_spans.extend(format_text_input_spans(
+        compression_input,
+        visible_width,
+        comp_focused,
+        true,
+        None,
+        theme,
+    ));
+    f.render_widget(Paragraph::new(Line::from(comp_spans)), chunks[1]);
     if comp_focused {
-        f.set_cursor(chunks[1].x + 16 + cursor_col, chunks[1].y);
+        f.set_cursor(
+            chunks[1].x
+                + 16
+                + super::inline_edit::inline_cursor_col(compression_input, visible_width.max(1)),
+            chunks[1].y,
+        );
     }
 
     // Verify toggle pills
@@ -1551,24 +1589,24 @@ fn draw_aac_fields(
     let br_focused = focus == FormatSettingsFocus::AacBitrate;
     let br_label_style = if br_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[3].width.saturating_sub(22) as usize; // label(15) + suffix(~7)
-    let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
-    let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let input_bg = if br_focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let br_line = Line::from(vec![
-        Span::styled("  bitrate      ", br_label_style),
-        Span::styled(
-            format!(" {} ", display_val),
-            Style::default().fg(theme.text_bright).bg(input_bg),
-        ),
-        Span::styled(" kbps", theme.muted()),
-    ]);
-    f.render_widget(Paragraph::new(br_line), chunks[3]);
+    let mut br_spans = vec![Span::styled("  bitrate      ", br_label_style)];
+    br_spans.extend(format_text_input_spans(
+        bitrate_input,
+        visible_width,
+        br_focused,
+        true,
+        None,
+        theme,
+    ));
+    br_spans.push(Span::styled(" kbps", theme.muted()));
+    f.render_widget(Paragraph::new(Line::from(br_spans)), chunks[3]);
     if br_focused {
-        f.set_cursor(chunks[3].x + 16 + cursor_col, chunks[3].y);
+        f.set_cursor(
+            chunks[3].x
+                + 16
+                + super::inline_edit::inline_cursor_col(bitrate_input, visible_width.max(1)),
+            chunks[3].y,
+        );
     }
 }
 
@@ -1661,47 +1699,47 @@ fn draw_opus_fields(
     let br_focused = focus == FormatSettingsFocus::OpusBitrate;
     let br_label_style = if br_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[3].width.saturating_sub(22) as usize;
-    let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
-    let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let input_bg = if br_focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let br_line = Line::from(vec![
-        Span::styled("  bitrate      ", br_label_style),
-        Span::styled(
-            format!(" {} ", display_val),
-            Style::default().fg(theme.text_bright).bg(input_bg),
-        ),
-        Span::styled(" kbps", theme.muted()),
-    ]);
-    f.render_widget(Paragraph::new(br_line), chunks[3]);
+    let mut br_spans = vec![Span::styled("  bitrate      ", br_label_style)];
+    br_spans.extend(format_text_input_spans(
+        bitrate_input,
+        visible_width,
+        br_focused,
+        true,
+        None,
+        theme,
+    ));
+    br_spans.push(Span::styled(" kbps", theme.muted()));
+    f.render_widget(Paragraph::new(Line::from(br_spans)), chunks[3]);
     if br_focused {
-        f.set_cursor(chunks[3].x + 16 + cursor_col, chunks[3].y);
+        f.set_cursor(
+            chunks[3].x
+                + 16
+                + super::inline_edit::inline_cursor_col(bitrate_input, visible_width.max(1)),
+            chunks[3].y,
+        );
     }
 
     // Complexity text entry field
     let comp_focused = focus == FormatSettingsFocus::OpusComplexity;
     let comp_label_style = if comp_focused { theme.bright() } else { theme.muted() };
     let visible_width_c = chunks[4].width.saturating_sub(16) as usize;
-    let (view_c, cursor_col_c) = complexity_input.view(visible_width_c.max(1));
-    let display_val_c = if view_c.is_empty() { " ".to_string() } else { view_c };
-    let comp_bg = if comp_focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let comp_line = Line::from(vec![
-        Span::styled("  complexity   ", comp_label_style),
-        Span::styled(
-            format!(" {} ", display_val_c),
-            Style::default().fg(theme.text_bright).bg(comp_bg),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(comp_line), chunks[4]);
+    let mut comp_spans = vec![Span::styled("  complexity   ", comp_label_style)];
+    comp_spans.extend(format_text_input_spans(
+        complexity_input,
+        visible_width_c,
+        comp_focused,
+        true,
+        None,
+        theme,
+    ));
+    f.render_widget(Paragraph::new(Line::from(comp_spans)), chunks[4]);
     if comp_focused {
-        f.set_cursor(chunks[4].x + 16 + cursor_col_c, chunks[4].y);
+        f.set_cursor(
+            chunks[4].x
+                + 16
+                + super::inline_edit::inline_cursor_col(complexity_input, visible_width_c.max(1)),
+            chunks[4].y,
+        );
     }
 }
 
@@ -1720,7 +1758,6 @@ fn draw_mp3_fields(
 
     let is_vbr = mode == Mp3Mode::Vbr;
     let greyed = Style::default().fg(theme.text_dim);
-    let greyed_bg = theme.input_disabled_bg;
 
     // Row 1: Mode pills (VBR/CBR/ABR) — always active
     let mode_focused = focus == FormatSettingsFocus::Mp3Mode;
@@ -1763,26 +1800,23 @@ fn draw_mp3_fields(
     let vbr_focused = focus == FormatSettingsFocus::Mp3VbrQuality;
     let vbr_label_style = if !is_vbr { greyed } else if vbr_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[2].width.saturating_sub(16) as usize;
-    let (view, cursor_col) = vbr_quality_input.view(visible_width.max(1));
-    let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let input_bg = if !is_vbr {
-        greyed_bg
-    } else if vbr_focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let fg = if !is_vbr { theme.text_dim } else { theme.text_bright };
-    let vbr_line = Line::from(vec![
-        Span::styled("  vbr quality  ", vbr_label_style),
-        Span::styled(
-            format!(" {} ", display_val),
-            Style::default().fg(fg).bg(input_bg),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(vbr_line), chunks[2]);
+    let mut vbr_spans = vec![Span::styled("  vbr quality  ", vbr_label_style)];
+    vbr_spans.extend(format_text_input_spans(
+        vbr_quality_input,
+        visible_width,
+        vbr_focused,
+        is_vbr,
+        None,
+        theme,
+    ));
+    f.render_widget(Paragraph::new(Line::from(vbr_spans)), chunks[2]);
     if vbr_focused && is_vbr {
-        f.set_cursor(chunks[2].x + 16 + cursor_col, chunks[2].y);
+        f.set_cursor(
+            chunks[2].x
+                + 16
+                + super::inline_edit::inline_cursor_col(vbr_quality_input, visible_width.max(1)),
+            chunks[2].y,
+        );
     }
 
     // Row 3: Preset pills — greyed when VBR
@@ -1827,27 +1861,27 @@ fn draw_mp3_fields(
     let br_focused = focus == FormatSettingsFocus::Mp3Bitrate;
     let br_label_style = if is_vbr { greyed } else if br_focused { theme.bright() } else { theme.muted() };
     let visible_width_br = chunks[4].width.saturating_sub(22) as usize;
-    let (view_br, cursor_col_br) = bitrate_input.view(visible_width_br.max(1));
-    let display_val_br = if view_br.is_empty() { " ".to_string() } else { view_br };
-    let br_bg = if is_vbr {
-        greyed_bg
-    } else if br_focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let br_fg = if is_vbr { theme.text_dim } else { theme.text_bright };
-    let br_line = Line::from(vec![
-        Span::styled("  bitrate      ", br_label_style),
-        Span::styled(
-            format!(" {} ", display_val_br),
-            Style::default().fg(br_fg).bg(br_bg),
-        ),
-        Span::styled(" kbps", if is_vbr { greyed } else { theme.muted() }),
-    ]);
-    f.render_widget(Paragraph::new(br_line), chunks[4]);
+    let mut br_spans = vec![Span::styled("  bitrate      ", br_label_style)];
+    br_spans.extend(format_text_input_spans(
+        bitrate_input,
+        visible_width_br,
+        br_focused,
+        !is_vbr,
+        None,
+        theme,
+    ));
+    br_spans.push(Span::styled(
+        " kbps",
+        if is_vbr { greyed } else { theme.muted() },
+    ));
+    f.render_widget(Paragraph::new(Line::from(br_spans)), chunks[4]);
     if br_focused && !is_vbr {
-        f.set_cursor(chunks[4].x + 16 + cursor_col_br, chunks[4].y);
+        f.set_cursor(
+            chunks[4].x
+                + 16
+                + super::inline_edit::inline_cursor_col(bitrate_input, visible_width_br.max(1)),
+            chunks[4].y,
+        );
     }
 }
 
@@ -1865,7 +1899,6 @@ fn draw_wavpack_fields(
     use tonepoet_pipeline::enums::WavPackMode;
 
     let greyed = Style::default().fg(theme.text_dim);
-    let greyed_bg = theme.input_disabled_bg;
 
     // Row 1: Mode pills (fast/normal/high/very high) — always active
     let mode_focused = focus == FormatSettingsFocus::WavPackMode;
@@ -1924,21 +1957,27 @@ fn draw_wavpack_fields(
     let br_focused = focus == FormatSettingsFocus::WavPackBitrate;
     let br_label_style = if !hybrid { greyed } else if br_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[3].width.saturating_sub(24) as usize;
-    let (view, cursor_col) = bitrate_input.view(visible_width.max(1));
-    let display_val = if view.is_empty() { " ".to_string() } else { view };
-    let br_bg = if !hybrid { greyed_bg } else if br_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
-    let br_fg = if !hybrid { theme.text_dim } else { theme.text_bright };
-    let br_line = Line::from(vec![
-        Span::styled("  bitrate      ", br_label_style),
-        Span::styled(
-            format!(" {} ", display_val),
-            Style::default().fg(br_fg).bg(br_bg),
-        ),
-        Span::styled(" kbps/ch", if !hybrid { greyed } else { theme.muted() }),
-    ]);
-    f.render_widget(Paragraph::new(br_line), chunks[3]);
+    let mut br_spans = vec![Span::styled("  bitrate      ", br_label_style)];
+    br_spans.extend(format_text_input_spans(
+        bitrate_input,
+        visible_width,
+        br_focused,
+        hybrid,
+        None,
+        theme,
+    ));
+    br_spans.push(Span::styled(
+        " kbps/ch",
+        if !hybrid { greyed } else { theme.muted() },
+    ));
+    f.render_widget(Paragraph::new(Line::from(br_spans)), chunks[3]);
     if br_focused && hybrid {
-        f.set_cursor(chunks[3].x + 16 + cursor_col, chunks[3].y);
+        f.set_cursor(
+            chunks[3].x
+                + 16
+                + super::inline_edit::inline_cursor_col(bitrate_input, visible_width.max(1)),
+            chunks[3].y,
+        );
     }
 
     // Row 4: Correction toggle (off/on) — greyed when hybrid off
@@ -1983,28 +2022,24 @@ fn draw_ssrc_fields(
     let att_focused = focus == FormatSettingsFocus::SsrcAttenuation;
     let att_ls = if att_focused { theme.bright() } else { theme.muted() };
     let att_vw = chunks[1].width.saturating_sub(22) as usize;
-    let (att_v, att_cc) = attenuation_input.view(att_vw.max(1));
-    let (att_d, att_is_placeholder) = if att_v.is_empty() {
-        ("0".to_string(), true)
-    } else {
-        (att_v, false)
-    };
-    let att_bg = if att_focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let att_fg = if att_is_placeholder { theme.text_dim } else { theme.text_bright };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("  attenuation    ", att_ls),
-            Span::styled(format!(" {} ", att_d), Style::default().fg(att_fg).bg(att_bg)),
-            Span::styled(" dB", theme.muted()),
-        ])),
-        chunks[1],
-    );
+    let mut att_spans = vec![Span::styled("  attenuation    ", att_ls)];
+    att_spans.extend(format_text_input_spans(
+        attenuation_input,
+        att_vw,
+        att_focused,
+        true,
+        Some("0"),
+        theme,
+    ));
+    att_spans.push(Span::styled(" dB", theme.muted()));
+    f.render_widget(Paragraph::new(Line::from(att_spans)), chunks[1]);
     if att_focused {
-        f.set_cursor(chunks[1].x + 18 + att_cc, chunks[1].y);
+        f.set_cursor(
+            chunks[1].x
+                + 18
+                + super::inline_edit::inline_cursor_col(attenuation_input, att_vw.max(1)),
+            chunks[1].y,
+        );
     }
 
     // Row 2: Min phase toggle (off/on)
@@ -2069,29 +2104,25 @@ fn draw_ssrc_numeric_input(
     theme: super::theme::Theme,
 ) {
     let visible_width = rect.width.saturating_sub(31) as usize;
-    let (view, cursor_col) = input.view(visible_width.max(1));
-    let (display, is_placeholder) = if view.is_empty() {
-        (placeholder.to_string(), true)
-    } else {
-        (view, false)
-    };
-    let input_bg = if focused {
-        theme.input_focused_bg
-    } else {
-        theme.input_unfocused_bg
-    };
-    let input_fg = if is_placeholder { theme.text_dim } else { theme.text_bright };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(label, label_style),
-            Span::styled(format!(" {} ", display), Style::default().fg(input_fg).bg(input_bg)),
-            Span::raw("  "),
-            Span::styled(suffix, theme.muted()),
-        ])),
-        rect,
-    );
+    let mut spans = vec![Span::styled(label, label_style)];
+    spans.extend(format_text_input_spans(
+        input,
+        visible_width,
+        focused,
+        true,
+        Some(placeholder),
+        theme,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(suffix, theme.muted()));
+    f.render_widget(Paragraph::new(Line::from(spans)), rect);
     if focused {
-        f.set_cursor(rect.x + 17 + cursor_col, rect.y);
+        f.set_cursor(
+            rect.x
+                + 17
+                + super::inline_edit::inline_cursor_col(input, visible_width.max(1)),
+            rect.y,
+        );
     }
 }
 
@@ -2673,7 +2704,6 @@ fn draw_sox_fields(
     use tonepoet_pipeline::enums::SoxSincPhase;
 
     let greyed = Style::default().fg(theme.text_dim);
-    let greyed_bg = theme.input_disabled_bg;
 
     // ── Rate section (chunks[1..4]) ──
 
@@ -2693,30 +2723,51 @@ fn draw_sox_fields(
     let bw_focused = focus == FormatSettingsFocus::SoxBandwidth;
     let bw_ls = if chebyshev { greyed } else if bw_focused { theme.bright() } else { theme.muted() };
     let bw_vw = chunks[2].width.saturating_sub(22) as usize;
-    let (bw_v, bw_cc) = bandwidth_input.view(bw_vw.max(1));
-    let (bw_d, bw_is_placeholder) = if bw_v.is_empty() { ("95".to_string(), true) } else { (bw_v, false) };
-    let bw_bg = if chebyshev { greyed_bg } else if bw_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
-    let bw_fg = if chebyshev { theme.text_dim } else if bw_is_placeholder { theme.text_dim } else { theme.text_bright };
-    f.render_widget(Paragraph::new(Line::from(vec![
-        Span::styled("  nyquist cutoff  ", bw_ls),
-        Span::styled(format!(" {} ", bw_d), Style::default().fg(bw_fg).bg(bw_bg)),
-        Span::styled(" %", if chebyshev { greyed } else { theme.muted() }),
-    ])), chunks[2]);
-    if bw_focused && !chebyshev { f.set_cursor(chunks[2].x + 19 + bw_cc, chunks[2].y); }
+    let mut bw_spans = vec![Span::styled("  nyquist cutoff  ", bw_ls)];
+    bw_spans.extend(format_text_input_spans(
+        bandwidth_input,
+        bw_vw,
+        bw_focused,
+        !chebyshev,
+        Some("95"),
+        theme,
+    ));
+    bw_spans.push(Span::styled(
+        " %",
+        if chebyshev { greyed } else { theme.muted() },
+    ));
+    f.render_widget(Paragraph::new(Line::from(bw_spans)), chunks[2]);
+    if bw_focused && !chebyshev {
+        f.set_cursor(
+            chunks[2].x
+                + 19
+                + super::inline_edit::inline_cursor_col(bandwidth_input, bw_vw.max(1)),
+            chunks[2].y,
+        );
+    }
 
     // Row 3: Phase
     let ph_focused = focus == FormatSettingsFocus::SoxPhase;
     let ph_ls = if ph_focused { theme.bright() } else { theme.muted() };
     let ph_vw = chunks[3].width.saturating_sub(19) as usize;
-    let (ph_v, ph_cc) = phase_input.view(ph_vw.max(1));
-    let (ph_d, ph_is_placeholder) = if ph_v.is_empty() { ("50".to_string(), true) } else { (ph_v, false) };
-    let ph_bg = if ph_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
-    let ph_fg = if ph_is_placeholder { theme.text_dim } else { theme.text_bright };
-    f.render_widget(Paragraph::new(Line::from(vec![
-        Span::styled("  phase           ", ph_ls),
-        Span::styled(format!(" {} ", ph_d), Style::default().fg(ph_fg).bg(ph_bg)),
-    ])), chunks[3]);
-    if ph_focused { f.set_cursor(chunks[3].x + 19 + ph_cc, chunks[3].y); }
+    let mut ph_spans = vec![Span::styled("  phase           ", ph_ls)];
+    ph_spans.extend(format_text_input_spans(
+        phase_input,
+        ph_vw,
+        ph_focused,
+        true,
+        Some("50"),
+        theme,
+    ));
+    f.render_widget(Paragraph::new(Line::from(ph_spans)), chunks[3]);
+    if ph_focused {
+        f.set_cursor(
+            chunks[3].x
+                + 19
+                + super::inline_edit::inline_cursor_col(phase_input, ph_vw.max(1)),
+            chunks[3].y,
+        );
+    }
 
     // Row 4: Aliasing toggle
     let al_focused = focus == FormatSettingsFocus::SoxAliasing;
@@ -2746,24 +2797,28 @@ fn draw_sox_fields(
         chunk: Rect,
         f: &mut Frame,
         theme: super::theme::Theme,
-    ) -> u16 {
+    ) {
         let ls = if focused { theme.bright() } else { theme.muted() };
         let vw = chunk.width.saturating_sub(22) as usize;
-        let (v, cc) = input.view(vw.max(1));
-        let d = if v.is_empty() { " ".to_string() } else { v };
-        let bg = if focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
-        let mut spans = vec![
-            Span::styled(label, ls),
-            Span::styled(format!(" {} ", d), Style::default().fg(theme.text_bright).bg(bg)),
-        ];
+        let mut spans = vec![Span::styled(label, ls)];
+        spans.extend(format_text_input_spans(
+            input,
+            vw,
+            focused,
+            true,
+            None,
+            theme,
+        ));
         if !suffix.is_empty() {
             spans.push(Span::styled(suffix, theme.muted()));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), chunk);
         if focused {
-            f.set_cursor(chunk.x + 19 + cc, chunk.y);
+            f.set_cursor(
+                chunk.x + 19 + super::inline_edit::inline_cursor_col(input, vw.max(1)),
+                chunk.y,
+            );
         }
-        cc
     }
 
     sinc_text_row("  taps            ", sinc_taps_input, "",
@@ -2846,35 +2901,47 @@ fn draw_soxr_fields(
     let co_focused = focus == FormatSettingsFocus::SoxrCutoff;
     let co_label_style = if co_focused { theme.bright() } else { theme.muted() };
     let visible_width = chunks[2].width.saturating_sub(20) as usize;
-    let (view, cursor_col) = cutoff_input.view(visible_width.max(1));
-    let (display_val, co_is_placeholder) = if view.is_empty() { ("95".to_string(), true) } else { (view, false) };
-    let co_bg = if co_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
-    let co_fg = if co_is_placeholder { theme.text_dim } else { theme.text_bright };
-    let co_line = Line::from(vec![
-        Span::styled("  nyquist cutoff  ", co_label_style),
-        Span::styled(format!(" {} ", display_val), Style::default().fg(co_fg).bg(co_bg)),
-        Span::styled(" %", theme.muted()),
-    ]);
-    f.render_widget(Paragraph::new(co_line), chunks[2]);
+    let mut co_spans = vec![Span::styled("  nyquist cutoff  ", co_label_style)];
+    co_spans.extend(format_text_input_spans(
+        cutoff_input,
+        visible_width,
+        co_focused,
+        true,
+        Some("95"),
+        theme,
+    ));
+    co_spans.push(Span::styled(" %", theme.muted()));
+    f.render_widget(Paragraph::new(Line::from(co_spans)), chunks[2]);
     if co_focused {
-        f.set_cursor(chunks[2].x + 19 + cursor_col, chunks[2].y);
+        f.set_cursor(
+            chunks[2].x
+                + 19
+                + super::inline_edit::inline_cursor_col(cutoff_input, visible_width.max(1)),
+            chunks[2].y,
+        );
     }
 
     // Row 3: Phase text entry
     let ph_focused = focus == FormatSettingsFocus::SoxrPhase;
     let ph_label_style = if ph_focused { theme.bright() } else { theme.muted() };
     let visible_width_ph = chunks[3].width.saturating_sub(16) as usize;
-    let (view_ph, cursor_col_ph) = phase_input.view(visible_width_ph.max(1));
-    let (display_val_ph, ph_is_placeholder) = if view_ph.is_empty() { ("50".to_string(), true) } else { (view_ph, false) };
-    let ph_bg = if ph_focused { theme.input_focused_bg } else { theme.input_unfocused_bg };
-    let ph_fg = if ph_is_placeholder { theme.text_dim } else { theme.text_bright };
-    let ph_line = Line::from(vec![
-        Span::styled("  phase           ", ph_label_style),
-        Span::styled(format!(" {} ", display_val_ph), Style::default().fg(ph_fg).bg(ph_bg)),
-    ]);
-    f.render_widget(Paragraph::new(ph_line), chunks[3]);
+    let mut ph_spans = vec![Span::styled("  phase           ", ph_label_style)];
+    ph_spans.extend(format_text_input_spans(
+        phase_input,
+        visible_width_ph,
+        ph_focused,
+        true,
+        Some("50"),
+        theme,
+    ));
+    f.render_widget(Paragraph::new(Line::from(ph_spans)), chunks[3]);
     if ph_focused {
-        f.set_cursor(chunks[3].x + 19 + cursor_col_ph, chunks[3].y);
+        f.set_cursor(
+            chunks[3].x
+                + 19
+                + super::inline_edit::inline_cursor_col(phase_input, visible_width_ph.max(1)),
+            chunks[3].y,
+        );
     }
 }
 
@@ -2985,17 +3052,18 @@ fn draw_command_input(
     // Clear the command line
     f.render_widget(Clear, cmd_area);
 
-    // Leave 1 col for ":" prefix
+    // Leave 1 col for ":" prefix.
     let visible_width = (cmd_area.width as usize).saturating_sub(1);
-    let (view, cursor_col) = input.view(visible_width);
 
-    // Render ": <input>"
-    let line = Line::from(vec![
-        Span::styled(":", Style::default().fg(theme.blue)), // blue
-        Span::styled(view, Style::default().fg(theme.text_bright)), // bright
-    ]);
-
-    let cmd = Paragraph::new(line).style(Style::default().bg(theme.bg)); // BG color
+    let mut spans = vec![Span::styled(":", Style::default().fg(theme.blue))];
+    spans.extend(super::inline_edit::render_text_input_value_compact_with_style(
+        input,
+        visible_width,
+        true,
+        Style::default().fg(theme.text_bright).bg(theme.bg),
+        theme,
+    ));
+    let cmd = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg));
     f.render_widget(cmd, cmd_area);
 
     // Optional hint row above the command line when cycling matches.
@@ -3032,7 +3100,10 @@ fn draw_command_input(
     }
 
     // Position cursor after the ':'
-    f.set_cursor(cmd_area.x + 1 + cursor_col, cmd_area.y);
+    f.set_cursor(
+        cmd_area.x + 1 + super::inline_edit::inline_cursor_col(input, visible_width),
+        cmd_area.y,
+    );
 }
 
 /// Draw the bulk rename wizard overlay.
@@ -3093,20 +3164,28 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState, theme: super::theme:
         Style::default().fg(theme.text_muted)
     };
     let input_w = chunks[0].width.saturating_sub(11) as usize; // "Template: " = 10 chars + 1
-    let (visible, cursor_col) = state.template_input.view(input_w);
+    let mut template_spans = vec![Span::styled("Template: ", label_style)];
     let input_style = if template_focused {
         Style::default().fg(theme.text_bright)
     } else {
         Style::default().fg(theme.text_muted)
     };
-    let template_line = Line::from(vec![
-        Span::styled("Template: ", label_style),
-        Span::styled(visible, input_style),
-    ]);
-    f.render_widget(Paragraph::new(template_line), chunks[0]);
+    template_spans.extend(super::inline_edit::render_text_input_value_compact_with_style(
+        &state.template_input,
+        input_w,
+        template_focused,
+        input_style,
+        theme,
+    ));
+    f.render_widget(Paragraph::new(Line::from(template_spans)), chunks[0]);
 
     if template_focused {
-        f.set_cursor(chunks[0].x + 10 + cursor_col, chunks[0].y);
+        f.set_cursor(
+            chunks[0].x
+                + 10
+                + super::inline_edit::inline_cursor_col(&state.template_input, input_w),
+            chunks[0].y,
+        );
     }
 
     // ── Placeholder hints ────────────────────────────────────────
@@ -7663,6 +7742,91 @@ mod tests {
     use lofty::tag::ItemKey;
     use std::path::PathBuf;
 
+    fn partially_selected_input() -> super::super::text_input::TextInputState {
+        let mut input = super::super::text_input::TextInputState::new("abcdef".to_string());
+        input.selection_anchor = Some(1);
+        input.cursor = 4;
+        input
+    }
+
+    #[test]
+    fn format_overlay_text_fields_paint_active_selection() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let spans = format_text_input_spans(
+            &partially_selected_input(),
+            12,
+            true,
+            true,
+            None,
+            theme,
+        );
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref() == "bcd"
+                && span.style.fg == Some(theme.bg)
+                && span.style.bg == Some(theme.text_bright)
+        }));
+    }
+
+    #[test]
+    fn generic_text_prompt_and_vi_command_line_paint_active_selection() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let input = partially_selected_input();
+
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_text_edit(frame, "value", &input, theme))
+            .expect("draw generic text prompt");
+        let selected_prompt_cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| {
+                matches!(cell.symbol(), "b" | "c" | "d")
+                    && cell.fg == theme.bg
+                    && cell.bg == theme.text_bright
+            })
+            .count();
+        assert_eq!(selected_prompt_cells, 3);
+
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_file_input(frame, &input, theme))
+            .expect("draw generic file prompt");
+        let selected_file_cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| {
+                matches!(cell.symbol(), "b" | "c" | "d")
+                    && cell.fg == theme.bg
+                    && cell.bg == theme.text_bright
+            })
+            .count();
+        assert_eq!(selected_file_cells, 3);
+
+        let backend = ratatui::backend::TestBackend::new(20, 3);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_command_input(frame, &input, None, theme))
+            .expect("draw vi command line");
+        let buffer = terminal.backend().buffer();
+        for x in 2..=4 {
+            let cell = buffer.get(x, 2);
+            assert_eq!(cell.fg, theme.bg, "selected command cell {x} foreground");
+            assert_eq!(
+                cell.bg, theme.text_bright,
+                "selected command cell {x} background",
+            );
+        }
+    }
 
     fn tag(display_key: &str, value: &str, per_file_values: Vec<&str>) -> TagEntry {
         TagEntry {

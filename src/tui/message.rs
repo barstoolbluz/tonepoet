@@ -206,6 +206,7 @@ pub enum AppMessage {
     ArchiveRepackageProgress {
         archive_path: std::path::PathBuf,
         staging_dir: std::path::PathBuf,
+        progress_session_id: u64,
         snapshot: crate::convert::pipeline::materializer_archive::ArchiveRepackageProgressSnapshot,
     },
     /// Completed Browse-screen archive repackage after staged metadata writes.
@@ -214,6 +215,7 @@ pub enum AppMessage {
     ArchiveRepackageResult {
         archive_path: std::path::PathBuf,
         staging_dir: std::path::PathBuf,
+        progress_session_id: u64,
         result: Result<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport, String>,
     },
 
@@ -320,10 +322,12 @@ pub enum AppMessage {
     },
     /// Result of an async file integrity verification.
     VerifyComplete {
+        operation_id: TagsMbOperationId,
         result: crate::tui::verify::VerifyResult,
     },
     /// Result of an async pre-emphasis detection scan.
     PreemphasisComplete {
+        operation_id: TagsMbOperationId,
         result: crate::tui::preemphasis::PreemphasisResult,
     },
     /// Result of corpus training completion.
@@ -336,6 +340,7 @@ pub enum AppMessage {
     },
     /// Result of an async bit-level comparison between two audio files.
     CompareComplete {
+        operation_id: TagsMbOperationId,
         result: crate::tui::bit_compare::CompareResult,
     },
     /// Result of async path validation (canonicalize + is_dir) for :cd/path bar.
