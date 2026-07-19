@@ -6303,6 +6303,21 @@ pub(super) fn begin_counted_completion_operation(
     if total == 0 {
         return Err(format!("{label}: no work items were supplied"));
     }
+    // Re-invoking a counted command supersedes the in-flight batch instead of
+    // refusing. A worker that dies without sending its terminal message would
+    // otherwise leave `remaining` above zero forever, and the begin-time
+    // refusal would brick the whole command family for the session. This is
+    // safe because every terminal message carries the operation id: late
+    // completions from the superseded batch are rejected as stale. Only a
+    // counted entry may be displaced — an uncounted same-kind operation still
+    // refuses through `begin_completion_operation` below.
+    if app
+        .active_completion_operations
+        .get(&kind)
+        .is_some_and(|active| active.batch.is_some())
+    {
+        app.active_completion_operations.remove(&kind);
+    }
     let operation_id = begin_completion_operation(app, kind, label)?;
     if let Some(active) = app.active_completion_operations.get_mut(&kind) {
         active.batch = Some(super::app::CompletionBatchProgress {
@@ -11027,37 +11042,62 @@ mod musicbrainz_completion_dispatch_tests {
     }
 
     #[test]
-    fn counted_completion_families_reject_overlap_and_complete_exactly_once() {
+    fn counted_completion_families_supersede_stalled_batches_and_complete_exactly_once() {
         for kind in [
             CompletionOperationKind::Verify,
             CompletionOperationKind::Compare,
             CompletionOperationKind::Preemphasis,
         ] {
             let mut app = AppState::new_for_test(TonepoetConfig::default());
-            let operation_id = begin_counted_completion_operation(&mut app, kind, "test", 2)
+            // Audit MEDIUM: a worker that dies before its terminal message
+            // leaves `remaining` above zero forever. Re-invoking the command
+            // must supersede the stalled batch, not refuse for the session.
+            let stalled_id = begin_counted_completion_operation(&mut app, kind, "test", 2)
                 .expect("first operation");
-            assert!(begin_counted_completion_operation(&mut app, kind, "overlap", 1).is_err());
+            let superseding_id =
+                begin_counted_completion_operation(&mut app, kind, "retry", 1)
+                    .expect("re-invocation supersedes the stalled counted batch");
+            assert_ne!(stalled_id, superseding_id);
             assert_eq!(
                 app.active_completion_operations
                     .get(&kind)
                     .and_then(|active| active.batch)
                     .map(|batch| (batch.total, batch.remaining)),
-                Some((2, 2))
+                Some((1, 1))
             );
             assert_eq!(
-                complete_counted_completion_operation(&mut app, kind, operation_id),
-                Some(false)
+                complete_counted_completion_operation(&mut app, kind, stalled_id),
+                None,
+                "late completions from the superseded batch must be rejected"
             );
             assert_eq!(
-                complete_counted_completion_operation(&mut app, kind, operation_id),
+                complete_counted_completion_operation(&mut app, kind, superseding_id),
                 Some(true)
             );
             assert_eq!(
-                complete_counted_completion_operation(&mut app, kind, operation_id),
+                complete_counted_completion_operation(&mut app, kind, superseding_id),
                 None,
                 "duplicate terminal completion must be ignored"
             );
         }
+    }
+
+    #[test]
+    fn counted_begin_still_refuses_an_uncounted_same_kind_operation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let kind = CompletionOperationKind::Verify;
+        let uncounted_id = begin_completion_operation(&mut app, kind, "uncounted")
+            .expect("uncounted operation");
+        assert!(
+            begin_counted_completion_operation(&mut app, kind, "counted", 1).is_err(),
+            "only counted batches may be displaced by a counted re-invocation"
+        );
+        assert_eq!(
+            app.active_completion_operations
+                .get(&kind)
+                .map(|active| active.operation_id),
+            Some(uncounted_id)
+        );
     }
 
     #[test]
