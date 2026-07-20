@@ -12752,6 +12752,21 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         );
         return;
     }
+    let dsd_reference_key = matches!(
+        key,
+        "dsd-path"
+            | "dsd-profile"
+            | "dsd-gain"
+            | "dsd-gain-db"
+            | "dsd-normalize-target"
+    );
+    if dsd_reference_key && !app.convert.format.dsd_reference_controls_available() {
+        app.set_status(
+            "DSD Reference controls are unavailable before policy promotion; default DSD-to-PCM uses the legacy conversion chain",
+        );
+        return;
+    }
+
     if value.is_empty() {
         // Show current value
         match key {

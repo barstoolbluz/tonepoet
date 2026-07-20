@@ -1,3 +1,9 @@
+# ARCHIVAL SNAPSHOT ONLY
+# This file records repository history before the 2026-07-20 runtime-defaults
+# and shared Reference-admission corrections. The delivered archive contains
+# no .git metadata, so this is not current revision authority. Use
+# docs/handoff_dsd_reference_p0_current.md and docs/handoff_manifest.txt.
+#
 # Handoff git history — DSD P0 corrective round
 # HEAD at generation: 4156870
 

@@ -13,9 +13,9 @@ use super::pill::render_pill_spans;
 
 /// Draw the format pane with green border.
 ///
-/// DSD-to-PCM targets expose the complete P0 Reference control surface. The
-/// generic resampler and dither rows remain visible but are rendered as locked
-/// policy facts; their staged values are preserved and inactive.
+/// When native-v2 is the release default, DSD-to-PCM targets expose the P0
+/// Reference control surface and lock its policy-owned resampler/dither rows.
+/// Pre-promotion releases render the ordinary legacy PCM controls instead.
 pub fn draw_format_pane(
     f: &mut Frame,
     area: Rect,
@@ -126,7 +126,7 @@ pub fn draw_format_pane(
                 theme,
             ));
         }
-        if format_state.dsd_to_pcm_gain_available() {
+        if format_state.dsd_reference_controls_available() {
             lines.push(static_row(
                 border_color,
                 w,
@@ -180,7 +180,7 @@ pub fn draw_format_pane(
                 &format_state.replaygain,
                 focused && format_state.field_focus == FormatField::ReplayGain, theme),
             focused && format_state.field_focus == FormatField::ReplayGain, theme));
-        if format_state.dsd_to_pcm_gain_available() {
+        if format_state.dsd_reference_controls_available() {
             lines.push(pill_row(
                 border_color,
                 w,

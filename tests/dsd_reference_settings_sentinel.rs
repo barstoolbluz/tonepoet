@@ -9,10 +9,16 @@ use std::collections::BTreeSet;
 use tonepoet_pipeline::fingerprint::settings_snapshot_fingerprint_v2;
 use tonepoet_pipeline::{
     DbNano, DsdFilterPreset, DsdNoiseShaper, DsdReconstructionSelection,
-    DsdReferencePolicyVersion, DsdSourceGainMode, DsdSourcePathway, GainCompensation,
-    ModulatorOrder, PipelineSettings, TrellisSettings,
+    DsdReferencePolicyVersion, DsdSettings, DsdSourceGainMode, DsdSourcePathway,
+    GainCompensation, ModulatorOrder, PipelineSettings, TrellisSettings,
     SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT, SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS,
 };
+
+fn native_settings() -> PipelineSettings {
+    let mut settings = PipelineSettings::default();
+    settings.dsd = DsdSettings::native_v2();
+    settings
+}
 
 fn round_trip(settings: &PipelineSettings) -> PipelineSettings {
     let json = serde_json::to_vec(settings).expect("serialize native-v2 settings");
@@ -58,6 +64,54 @@ fn serialized_native_dsd_paths(settings: &PipelineSettings) -> BTreeSet<String> 
 }
 
 #[test]
+fn pre_promotion_default_is_exact_legacy_v1_wire() {
+    let settings = PipelineSettings::default();
+    assert!(!settings.dsd.is_native_v2());
+
+    let encoded = serde_json::to_value(&settings).expect("serialize default settings");
+    let dsd = encoded["dsd"].as_object().expect("legacy DSD object");
+    assert!(!dsd.contains_key("schema_version"));
+    assert!(!dsd.contains_key("from_dsd"));
+    assert_eq!(dsd["dsd_to_pcm_lowpass"], "auto");
+    assert_eq!(dsd["dsd_to_pcm_gain_mode"], "disabled");
+
+    let decoded: PipelineSettings =
+        serde_json::from_value(encoded).expect("deserialize default settings");
+    assert_eq!(decoded, settings);
+    assert!(!decoded.dsd.is_native_v2());
+}
+
+#[test]
+fn legacy_pcm_to_dsd_edits_remain_flat_and_survive_native_migration() {
+    let mut settings = PipelineSettings::default();
+    settings.dsd.pcm_to_dsd.noise_shaper = DsdNoiseShaper::Crfb;
+
+    let encoded = serde_json::to_value(&settings)
+        .expect("serialize edited legacy PCM-to-DSD settings");
+    assert_eq!(
+        encoded["dsd"]["noise_shaper"],
+        serde_json::to_value(DsdNoiseShaper::Crfb).unwrap()
+    );
+    assert!(encoded["dsd"].get("schema_version").is_none());
+
+    let migrated = settings.dsd.migrate_to_native_v2();
+    assert!(migrated.is_native_v2());
+    assert_eq!(migrated.pcm_to_dsd.noise_shaper, DsdNoiseShaper::Crfb);
+}
+
+#[test]
+fn native_v2_migration_is_idempotent_and_preserves_existing_controls() {
+    let mut settings = native_settings();
+    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
+    settings.dsd.from_dsd.fixed_gain_db = Some("2.500000000".parse().unwrap());
+
+    let migrated = settings.dsd.migrate_to_native_v2();
+
+    assert_eq!(migrated, settings.dsd);
+}
+
+#[test]
 fn native_v2_dsd_inventory_matches_serialized_wire_and_has_no_duplicates() {
     let expected: BTreeSet<String> = SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS
         .iter()
@@ -68,12 +122,12 @@ fn native_v2_dsd_inventory_matches_serialized_wire_and_has_no_duplicates() {
         SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT,
         "native-v2 DSD inventory contains duplicates"
     );
-    assert_eq!(serialized_native_dsd_paths(&PipelineSettings::default()), expected);
+    assert_eq!(serialized_native_dsd_paths(&native_settings()), expected);
 }
 
 #[test]
 fn native_v2_reference_fields_are_persisted_and_fingerprinted_independently() {
-    let baseline = PipelineSettings::default();
+    let baseline = native_settings();
     assert!(baseline.dsd.is_native_v2());
     let baseline_fingerprint = settings_snapshot_fingerprint_v2(&baseline);
 
@@ -160,12 +214,12 @@ fn native_v2_reference_fields_are_persisted_and_fingerprinted_independently() {
 
 #[test]
 fn native_v2_immutable_identity_fields_are_serialized_and_hashed() {
-    let settings = PipelineSettings::default();
+    let settings = native_settings();
     let encoded = serde_json::to_value(&settings).expect("serialize settings");
     assert_eq!(encoded["dsd"]["schema_version"], 2);
     assert_eq!(
         encoded["dsd"]["from_dsd"]["reference_policy"],
-        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V4).unwrap()
+        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V5).unwrap()
     );
 
     // These fields have one legal P0 value. Pin their exact snapshot tokens so

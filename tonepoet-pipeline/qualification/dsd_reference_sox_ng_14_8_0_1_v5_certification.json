@@ -1,0 +1,7 @@
+{
+  "schema_version": 5,
+  "policy": "sox_ng_14_8_0_1_v5",
+  "status": "not_run",
+  "outcome": "not_run",
+  "note": "Candidate placeholder. Replace atomically with the schema-version-5 machine-readable report produced by the mandatory commissioned real-tool gate before promotion."
+}

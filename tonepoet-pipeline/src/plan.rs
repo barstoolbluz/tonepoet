@@ -50,6 +50,23 @@ pub struct PlanRequest {
     pub planned_riff_non_audio_upper_bound_bytes: Option<u64>,
 }
 
+/// Return whether authoritative source classification and settings select the
+/// native-v2 Reference DSD-to-PCM pathway.
+///
+/// This is the sole admission authority shared by the pure planner and every
+/// orchestrator preflight. Callers with complete source facts pass
+/// `SourceInfo::is_dsd()`. A pre-realization path may pass a known DSD source
+/// classification (for example, an SACD track); a source-agnostic scheduling
+/// guard may conservatively pass `true` only to defer work, and must recheck
+/// exact source facts before any Reference-only probing or execution.
+#[must_use]
+pub fn selects_reference_dsd_to_pcm(
+    settings: &PipelineSettings,
+    source_is_dsd: bool,
+) -> bool {
+    source_is_dsd && settings.dsd.is_native_v2() && !settings.target_format.is_dsd()
+}
+
 impl PlanRequest {
     /// Borrow this request as a plugin planning context.
     #[must_use]
@@ -756,10 +773,7 @@ pub fn plan_conversion_with_registry(
     request: &PlanRequest,
     registry: &ToolRegistry,
 ) -> Result<ConversionPlan> {
-    if request.source.is_dsd()
-        && !request.settings.target_format.is_dsd()
-        && request.settings.dsd.is_native_v2()
-    {
+    if selects_reference_dsd_to_pcm(&request.settings, request.source.is_dsd()) {
         return plan_reference_dsd(request);
     }
     match plan_topology(request)? {
@@ -1714,6 +1728,63 @@ fn resolve_target_dsd_rate(request: &PlanRequest) -> Result<DsdRate> {
             "target_sample_rate",
             "DSD targets cannot use a PCM rate",
         )),
+    }
+}
+
+#[cfg(test)]
+mod reference_admission_tests {
+    use super::*;
+
+    fn dsd_source() -> SourceInfo {
+        SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(DsdRate::Dsd64.hz()),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            dsd_source_kind: None,
+            audio_md5: None,
+        }
+    }
+
+    #[test]
+    fn shared_reference_admission_requires_native_dsd_to_pcm() {
+        let source = dsd_source();
+        let mut settings = PipelineSettings::default();
+        settings.dsd = crate::settings::DsdSettings::native_v2();
+        settings.target_format = AudioFormat::Flac;
+        assert!(selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
+
+        settings.target_format = AudioFormat::Dsf;
+        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
+        settings.target_format = AudioFormat::Dff;
+        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
+
+        settings.target_format = AudioFormat::Flac;
+        settings.dsd = crate::settings::DsdSettings::default();
+        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
+
+        settings.dsd = crate::settings::DsdSettings::native_v2();
+        let mut format_only_dsd = source.clone();
+        format_only_dsd.codec = AudioCodec::Custom("unresolved".to_string());
+        format_only_dsd.sample_kind = None;
+        assert!(format_only_dsd.is_dsd());
+        assert!(selects_reference_dsd_to_pcm(
+            &settings,
+            format_only_dsd.is_dsd(),
+        ));
+
+        let mut pcm_source = source;
+        pcm_source.format = AudioFormat::Wav;
+        pcm_source.codec = AudioCodec::PcmSigned;
+        pcm_source.sample_kind = Some(SampleKind::SignedInteger);
+        pcm_source.sample_rate_hz = Some(44_100);
+        pcm_source.source_representation = SourceRepresentationKind::Pcm;
+        assert!(!selects_reference_dsd_to_pcm(&settings, pcm_source.is_dsd()));
     }
 }
 

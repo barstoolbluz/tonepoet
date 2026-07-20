@@ -34,7 +34,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
     };
 
     let source_h = super::draw_source::source_pane_height(&app.convert.source.mode, area.width);
-    let format_h = if app.convert.format.dsd_to_pcm_gain_available() {
+    let format_h = if app.convert.format.dsd_reference_controls_available() {
         13
     } else {
         10
@@ -302,7 +302,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         register_pill_row(buttons, &state.dither, area.y + 6, label_col, |i| TuiButton::DitherPill(i));
         register_pill_row(buttons, &state.replaygain, area.y + 7, label_col, |i| TuiButton::ReplayGainPill(i));
         last_standard_row = 7;
-        if state.dsd_to_pcm_gain_available() {
+        if state.dsd_reference_controls_available() {
             register_pill_row(buttons, &state.dsd_pathway, area.y + 8, label_col, |i| TuiButton::DsdPathPill(i));
             register_pill_row(buttons, &state.dsd_profile, area.y + 9, label_col, |i| TuiButton::DsdProfilePill(i));
             register_pill_row(buttons, &state.dsd_gain_mode, area.y + 10, label_col, |i| TuiButton::DsdGainPill(i));

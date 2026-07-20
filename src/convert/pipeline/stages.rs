@@ -974,7 +974,7 @@ async fn realize_track_with_tool_limits_and_stats(
             iso,
             track_index,
             area,
-        } if req.settings.dsd.is_native_v2()
+        } if tonepoet_pipeline::selects_reference_dsd_to_pcm(&req.settings, true)
             && req.settings.dsd.from_dsd.pathway
                 == tonepoet_pipeline::DsdSourcePathway::Reference =>
         {
@@ -7483,7 +7483,7 @@ mod replaygain_existing_tag_policy_tests {
         gain_mode: tonepoet_pipeline::DsdToPcmGainMode,
         gain_db: Option<f32>,
     ) -> tonepoet_pipeline::DsdSettings {
-        let native = tonepoet_pipeline::DsdSettings::default();
+        let native = tonepoet_pipeline::DsdSettings::native_v2();
         serde_json::from_value(serde_json::json!({
             "noise_shaper": native.pcm_to_dsd.noise_shaper,
             "modulator_order": native.pcm_to_dsd.modulator_order,
@@ -8415,7 +8415,9 @@ fn inherited_replaygain_tag_policy(
             Some(source) if source_is_dsd(source) => {
                 // Native-v2 Reference always applies an explicit terminal level
                 // policy; legacy applies one only when its frozen controls say so.
-                if settings.dsd.is_native_v2() || legacy_gain_configured {
+                if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, true)
+                    || legacy_gain_configured
+                {
                     reasons.push("DSD-to-PCM gain changes output level".to_string());
                 }
             }
@@ -21049,9 +21051,12 @@ async fn decide_rerun_after_reference_preflight(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> super::rerun::RerunDecision {
-    if !req.settings.dsd.is_native_v2()
-        || req.settings.dsd.from_dsd.pathway
-            != tonepoet_pipeline::DsdSourcePathway::Reference
+    let prepared_source_is_dsd = source_is_dsd(source);
+    if !tonepoet_pipeline::selects_reference_dsd_to_pcm(
+        &req.settings,
+        prepared_source_is_dsd,
+    ) || req.settings.dsd.from_dsd.pathway
+        != tonepoet_pipeline::DsdSourcePathway::Reference
     {
         return super::rerun::decide_rerun(
             &album_plan.album_dir,
@@ -21140,7 +21145,7 @@ async fn prepare_batch_pre_actions_before_materialization(
             ran_pre_actions: false,
         };
     }
-    if req.settings.dsd.is_native_v2()
+    if tonepoet_pipeline::selects_reference_dsd_to_pcm(&req.settings, true)
         && req.settings.dsd.from_dsd.pathway
             == tonepoet_pipeline::DsdSourcePathway::Reference
     {
@@ -38491,7 +38496,7 @@ mod conversion_log_tests {
         gain_mode: DsdToPcmGainMode,
         gain_db: Option<f32>,
     ) -> tonepoet_pipeline::DsdSettings {
-        let native = tonepoet_pipeline::DsdSettings::default();
+        let native = tonepoet_pipeline::DsdSettings::native_v2();
         serde_json::from_value(serde_json::json!({
             "noise_shaper": native.pcm_to_dsd.noise_shaper,
             "modulator_order": native.pcm_to_dsd.modulator_order,

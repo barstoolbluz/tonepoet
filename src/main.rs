@@ -1018,13 +1018,27 @@ fn apply_cli_dsd_reference_settings(
         || gain.is_some()
         || fixed_gain.is_some()
         || normalize_target.is_some();
-    if any_flag && matches!(output_format, AudioFormat::Dsf | AudioFormat::Dff) {
+    // Preserve the pre-existing WavPack CLI canonicalization independently of
+    // whether native DSD Reference was selected. D1 must not change non-DSD
+    // conversion behavior.
+    if matches!(output_format, AudioFormat::WavPack) && !settings.wavpack.hybrid {
+        settings.wavpack.correction_file = false;
+    }
+    if !any_flag {
+        return Ok(());
+    }
+    if matches!(output_format, AudioFormat::Dsf | AudioFormat::Dff) {
         anyhow::bail!(
             "DSD Reference flags apply only to DSD-to-PCM conversions, not PCM-to-DSD targets"
         );
     }
 
-    settings.dsd.from_dsd.pathway = match pathway.unwrap_or("reference").to_ascii_lowercase().as_str() {
+    settings.dsd = settings.dsd.migrate_to_native_v2();
+    settings.dsd.from_dsd.pathway = match pathway
+        .unwrap_or("reference")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "reference" => DsdSourcePathway::Reference,
         "manual" => {
             anyhow::bail!(tonepoet_pipeline::reference_error_text(
@@ -1033,14 +1047,22 @@ fn apply_cli_dsd_reference_settings(
         }
         other => anyhow::bail!("invalid --dsd-path '{other}'; expected reference or manual"),
     };
-    settings.dsd.from_dsd.profile = match profile.unwrap_or("reference").to_ascii_lowercase().as_str() {
+    settings.dsd.from_dsd.profile = match profile
+        .unwrap_or("reference")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "reference" => DsdReconstructionSelection::Reference,
         "wideband" => DsdReconstructionSelection::Wideband,
         other => anyhow::bail!(
             "invalid --dsd-profile '{other}'; expected reference or wideband"
         ),
     };
-    settings.dsd.from_dsd.gain_mode = match gain.unwrap_or("reference").to_ascii_lowercase().as_str() {
+    settings.dsd.from_dsd.gain_mode = match gain
+        .unwrap_or("reference")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "reference" => DsdSourceGainMode::Reference,
         "native" | "native-level" => DsdSourceGainMode::NativeLevel,
         "fixed" => DsdSourceGainMode::Fixed,
@@ -1068,14 +1090,101 @@ fn apply_cli_dsd_reference_settings(
         settings.dsd.from_dsd.normalize_peak_target_dbfs =
             value.parse::<DbNano>().map_err(anyhow::Error::msg)?;
     }
-    if matches!(output_format, AudioFormat::WavPack) && !settings.wavpack.hybrid {
-        settings.wavpack.correction_file = false;
-    }
     // Native-v2 Reference validation is planner-owned so every unsupported
     // cell reaches the stable DSD-REF-P0 error selected by the immutable
     // policy. Generic legacy validation can otherwise preempt those errors
     // with a format/depth message before the Reference planner runs.
     Ok(())
+}
+
+#[cfg(test)]
+mod dsd_reference_cli_settings_tests {
+    use super::*;
+    use tonepoet_pipeline::DsdSourceGainMode;
+
+    #[test]
+    fn absent_reference_flags_preserve_pre_promotion_legacy_default() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply_cli_dsd_reference_settings(
+            &mut settings,
+            AudioFormat::Flac,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("default DSD CLI settings");
+
+        assert!(!settings.dsd.is_native_v2());
+    }
+
+    #[test]
+    fn absent_reference_flags_preserve_existing_wavpack_cli_canonicalization() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        assert!(!settings.wavpack.hybrid);
+        assert!(settings.wavpack.correction_file);
+
+        apply_cli_dsd_reference_settings(
+            &mut settings,
+            AudioFormat::WavPack,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("default WavPack CLI settings");
+
+        assert!(!settings.dsd.is_native_v2());
+        assert!(!settings.wavpack.correction_file);
+    }
+
+    #[test]
+    fn any_reference_flag_is_an_explicit_native_v2_opt_in() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply_cli_dsd_reference_settings(
+            &mut settings,
+            AudioFormat::Flac,
+            Some("reference"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("explicit Reference opt-in");
+
+        assert!(settings.dsd.is_native_v2());
+    }
+
+    #[test]
+    fn explicit_cli_opt_in_applies_canonical_defaults_for_omitted_reference_flags() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.dsd.from_dsd.profile =
+            tonepoet_pipeline::DsdReconstructionSelection::Wideband;
+        settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
+        settings.dsd.from_dsd.fixed_gain_db = Some("2.500000000".parse().unwrap());
+
+        apply_cli_dsd_reference_settings(
+            &mut settings,
+            AudioFormat::Flac,
+            Some("reference"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("apply explicit Reference pathway");
+
+        assert!(settings.dsd.is_native_v2());
+        assert_eq!(
+            settings.dsd.from_dsd.profile,
+            tonepoet_pipeline::DsdReconstructionSelection::Reference
+        );
+        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::Reference);
+        assert_eq!(settings.dsd.from_dsd.fixed_gain_db, None);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

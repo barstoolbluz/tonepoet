@@ -674,6 +674,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                             policy,
                             DsdReferencePolicyVersion::SoxNg14801V3
                                 | DsdReferencePolicyVersion::SoxNg14801V4
+                                | DsdReferencePolicyVersion::SoxNg14801V5
                         ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32])) => {}
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
                         return Err(ManifestError::InvalidAuthority(
@@ -681,6 +682,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 policy,
                                 DsdReferencePolicyVersion::SoxNg14801V3
                                     | DsdReferencePolicyVersion::SoxNg14801V4
+                                    | DsdReferencePolicyVersion::SoxNg14801V5
                             ) {
                                 "Reference v3+ track is missing v1 or v2 executed verification authority"
                             } else {
@@ -984,6 +986,7 @@ mod manifest_merge_gap_tests {
         fs::write(&source, b"reference source").expect("write source");
         let metadata = fs::metadata(&source).expect("source metadata");
         let mut settings = PipelineSettings::default();
+        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
         settings.dsd.from_dsd.reference_policy = policy;
         let track = ConversionManifestTrack::new_reference(
             source,
@@ -1015,6 +1018,27 @@ mod manifest_merge_gap_tests {
     }
 
     #[test]
+    fn pre_promotion_default_manifest_uses_exact_legacy_route_and_flat_dsd_wire() {
+        let manifest = ConversionManifest::new(
+            PathBuf::from("Album"),
+            PipelineSettings::default(),
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            &manifest.route_identity,
+            ManifestRouteIdentityV2::LegacyPipelineV1 { .. }
+        ));
+        let encoded = serde_json::to_value(manifest).expect("serialize default manifest");
+        assert_eq!(encoded["route_identity"]["route"], "legacy_pipeline_v1");
+        let dsd = encoded["settings"]["dsd"]
+            .as_object()
+            .expect("flat legacy DSD settings");
+        assert!(!dsd.contains_key("schema_version"));
+        assert!(!dsd.contains_key("from_dsd"));
+    }
+
+    #[test]
     fn native_identity_missing_v2_digest_deserializes_as_zero_for_historical_compatibility() {
         let identity = native_identity(Sha256Digest([8; 32]), Sha256Digest([9; 32]));
         let mut value = serde_json::to_value(identity).expect("serialize native identity");
@@ -1034,7 +1058,7 @@ mod manifest_merge_gap_tests {
     }
 
     #[test]
-    fn v3_and_v4_manifests_require_v2_source_materialization_evidence_without_changing_v2() {
+    fn v3_v4_and_v5_manifests_require_v2_source_materialization_evidence_without_changing_v2() {
         assert!(reference_manifest_with_evidence(
             DsdReferencePolicyVersion::SoxNg14801V2,
             Sha256Digest([8; 32]),
@@ -1071,6 +1095,23 @@ mod manifest_merge_gap_tests {
 
         assert!(reference_manifest_with_evidence(
             DsdReferencePolicyVersion::SoxNg14801V4,
+            Sha256Digest([8; 32]),
+            Sha256Digest([9; 32]),
+        )
+        .is_ok());
+
+        let error = reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V5,
+            Sha256Digest([8; 32]),
+            Sha256Digest([0; 32]),
+        )
+        .expect_err("v5 must bind source/materialization evidence");
+        assert!(error
+            .to_string()
+            .contains("missing v1 or v2 executed verification authority"));
+
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V5,
             Sha256Digest([8; 32]),
             Sha256Digest([9; 32]),
         )

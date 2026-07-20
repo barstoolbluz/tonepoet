@@ -27,7 +27,7 @@ fn legacy_dsd_settings(
     margin_db: f32,
     gain_db: Option<f32>,
 ) -> DsdSettings {
-    let native = DsdSettings::default();
+    let native = DsdSettings::native_v2();
     serde_json::from_value(serde_json::json!({
         "noise_shaper": native.pcm_to_dsd.noise_shaper,
         "modulator_order": native.pcm_to_dsd.modulator_order,
@@ -58,6 +58,17 @@ fn request(settings: PipelineSettings) -> PlanRequest {
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     }
+}
+
+#[test]
+fn pre_promotion_dsd_default_origin_does_not_change_pcm_planning() {
+    let legacy_plan = plan_conversion(&request(PipelineSettings::default())).unwrap();
+
+    let mut native_settings = PipelineSettings::default();
+    native_settings.dsd = DsdSettings::native_v2();
+    let native_plan = plan_conversion(&request(native_settings)).unwrap();
+
+    assert_eq!(legacy_plan, native_plan);
 }
 
 #[test]
@@ -328,8 +339,9 @@ fn flac_verify_uses_real_decode_test_not_metaflac_streaminfo_listing() {
 }
 
 #[test]
-fn dsd_to_pcm_uses_sox() {
+fn default_dsd_to_pcm_is_exact_frozen_legacy_plan() {
     let mut settings = PipelineSettings::default();
+    assert!(!settings.dsd.is_native_v2());
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     let req = PlanRequest {
@@ -358,8 +370,22 @@ fn dsd_to_pcm_uses_sox() {
         container_ffmpeg_flags: Vec::new(),
     };
     let plan = plan_conversion(&req).unwrap();
+    assert!(plan.reference.is_none());
     assert_eq!(plan.commands()[0].tool, ToolIdentifier::Sox);
     assert!(plan.commands()[0].args.iter().any(|arg| arg == "88200"));
+
+    let mut explicit_legacy = req.clone();
+    explicit_legacy.settings.dsd = legacy_dsd_settings(
+        DsdLowpassMethod::Auto,
+        DsdToPcmGainMode::Disabled,
+        0.15,
+        None,
+    );
+    let explicit_legacy_plan = plan_conversion(&explicit_legacy).unwrap();
+    assert_eq!(
+        plan, explicit_legacy_plan,
+        "pre-promotion defaults must emit the exact frozen legacy argv, cleanup, and finalization"
+    );
 }
 
 #[test]

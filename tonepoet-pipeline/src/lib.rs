@@ -22,7 +22,8 @@ pub use error::{PlanningError, Result};
 pub use mapping::*;
 pub use plan::{
     CommandEnvironmentPolicy, MetadataPlanEffect,
-    plan_conversion, plan_conversion_with_registry, plan_topology, ConversionPlan, Finalization,
+    plan_conversion, plan_conversion_with_registry, plan_topology,
+    selects_reference_dsd_to_pcm, ConversionPlan, Finalization,
     InputSource, OutputSink, PlanAction, PlanContext, PlanOperation, PlanRequest, PlanStep,
     PlannedCommand, PlannedExecutionStep, TopologyPlan,
 };

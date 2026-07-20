@@ -16,6 +16,7 @@ use tonepoet_pipeline::{
     BitDepthTarget, DsdSourceKind, PcmBitDepth, PipelineSettings, PlanRequest, PreferredTool,
     ReferenceProgrammeScope, ResolvedOutputTarget, SacdAreaKind, SacdFrameEncoding,
     SacdTrackSelection, SampleKind, Sha256Digest, SourceInfo, SourceRepresentationKind,
+    selects_reference_dsd_to_pcm,
 };
 
 use super::errors::ConvertError;
@@ -119,7 +120,8 @@ pub fn plan_request_for_track(
     intermediate_dir: PathBuf,
 ) -> Result<PlanRequest, ConvertError> {
     let mut source = source_info_for_realized_track(track, realized_input)?;
-    if request.settings.dsd.is_native_v2() && source.codec.is_dsd() {
+    let selects_reference = selects_reference_dsd_to_pcm(&request.settings, source.is_dsd());
+    if selects_reference {
         source.dsd_source_kind = Some(reference_source_kind(track, realized_input)?);
     }
     source
@@ -231,8 +233,7 @@ pub fn plan_request_for_track(
             }
         }
     }
-    let native_reference = request.settings.dsd.is_native_v2() && source.codec.is_dsd();
-    if !native_reference {
+    if !selects_reference {
         settings
             .validate()
             .map_err(|err| ConvertError::Backend(format!("invalid pipeline settings: {err}")))?;
@@ -242,7 +243,7 @@ pub fn plan_request_for_track(
     // Native-v2 admission resolves through the static enabled product catalog.
     // Raw caller strings are accepted only when they identify exactly one trusted
     // catalog entry; arbitrary flags never become planner authority.
-    let resolved_output_target = if native_reference {
+    let resolved_output_target = if selects_reference {
         Some(resolve_reference_catalog_target(request).ok_or_else(|| {
             ConvertError::Backend(
                 tonepoet_pipeline::reference_error_text(
@@ -363,13 +364,18 @@ fn reference_source_kind(
     track: &PreparedTrack,
     realized_input: &Path,
 ) -> Result<DsdSourceKind, ConvertError> {
-    if let TrackSourceRef::SacdTrack {
-        iso,
-        track_index,
-        area,
-    } = &track.source_ref
-    {
-        return reference_sacd_source_kind(iso, *track_index, *area);
+    if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) {
+        // SACD Reference cells are unavailable in P0. Do not read the ISO TOC
+        // while constructing a plan merely to reject the cell afterward. When
+        // SACD Reference is eventually qualified, TOC selection and its
+        // double-SHA mutation checks belong to executor preflight, where the
+        // source identity is already admitted and revalidated.
+        return Err(ConvertError::Backend(
+            tonepoet_pipeline::reference_error_text(
+                tonepoet_pipeline::ReferenceErrorCode::SacdFrontEndIntegrationUnqualified,
+            )
+            .to_string(),
+        ));
     }
     let metadata = dsd_source_metadata_from_path(realized_input)?.ok_or_else(|| {
         ConvertError::Backend(format!(
@@ -2046,6 +2052,113 @@ mod tests {
         assert_eq!(
             planned.source.audio_md5.as_deref(),
             Some("00112233445566778899aabbccddeeff")
+        );
+    }
+
+    #[test]
+    fn native_sacd_dsd_targets_bypass_reference_admission_without_iso_io() {
+        for (target_format, extension) in [
+            (PlannerFormat::Dsf, "dsf"),
+            (PlannerFormat::Dff, "dff"),
+        ] {
+            let temp = TempDir::new().expect("temp dir");
+            let input = temp.path().join("realized.dsf");
+            write_minimal_dsf(&input);
+            let output = temp.path().join(format!("out.{extension}"));
+            let missing_iso = temp.path().join("missing-album.iso");
+            let mut req = request(temp.path());
+            req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+            req.settings.target_format = target_format;
+            let track = track(TrackSourceRef::SacdTrack {
+                iso: missing_iso,
+                track_index: 1,
+                area: SacdArea::Stereo,
+            });
+
+            let planned = plan_request_for_track(
+                &req,
+                &track,
+                &input,
+                &output,
+                temp.path().join("work"),
+            )
+            .expect("native-v2 SACD to DSD must remain on the ordinary DSD topology");
+
+            assert!(planned.resolved_output_target.is_none());
+            assert!(planned.source.dsd_source_kind.is_none());
+            tonepoet_pipeline::plan_topology(&planned)
+                .expect("ordinary SACD-to-DSD topology must build without ISO access");
+        }
+    }
+
+    #[test]
+    fn native_staged_dsd_to_dsf_does_not_assign_reference_source_kind() {
+        for extension in ["dsf", "dff"] {
+            let temp = TempDir::new().expect("temp dir");
+            let input = temp.path().join(format!("source.{extension}"));
+            match extension {
+                "dsf" => write_minimal_dsf(&input),
+                "dff" => write_minimal_dff_dsd(&input),
+                _ => unreachable!(),
+            }
+            let output = temp.path().join(format!("out-{extension}.dsf"));
+            let mut req = request(temp.path());
+            req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+            req.settings.target_format = PlannerFormat::Dsf;
+            let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+            let planned = plan_request_for_track(
+                &req,
+                &track,
+                &input,
+                &output,
+                temp.path().join("work"),
+            )
+            .expect("native-v2 staged DSD to DSF must use ordinary DSD planning");
+
+            assert!(planned.resolved_output_target.is_none());
+            assert!(
+                planned.source.dsd_source_kind.is_none(),
+                "Reference-only source-kind authority must remain absent for {extension} to DSF"
+            );
+            tonepoet_pipeline::plan_topology(&planned)
+                .expect("ordinary staged DSD-to-DSF topology must build");
+        }
+    }
+
+    #[test]
+    fn explicit_native_sacd_rejects_without_plan_time_iso_io() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("realized.dsf");
+        write_minimal_dsf(&input);
+        let output = temp.path().join("out.flac");
+        let missing_iso = temp.path().join("missing-album.iso");
+        let mut req = request(temp.path());
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        let track = track(TrackSourceRef::SacdTrack {
+            iso: missing_iso,
+            track_index: 1,
+            area: SacdArea::Stereo,
+        });
+
+        let error = plan_request_for_track(
+            &req,
+            &track,
+            &input,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect_err("P0 native SACD must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("DSD-REF-P0-023"), "{message}");
+        assert!(
+            !message.contains("failed to read SACD TOC")
+                && !message.contains("No such file or directory"),
+            "native SACD rejection must not perform plan-time ISO I/O: {message}"
         );
     }
 

@@ -1,7 +1,9 @@
 # DSD Reference P0 Corrective v5 Handoff
 
-**Date:** 2026-07-19  
-**Active candidate policy:** `sox_ng_14_8_0_1_v3`  
+> **Superseded historical snapshot.** This document records an earlier corrective round and does not describe the current policy or handoff state. The current authority is [`docs/handoff_dsd_reference_p0_current.md`](handoff_dsd_reference_p0_current.md), with candidate policy `sox_ng_14_8_0_1_v5`.
+
+**Date:** 2026-07-19
+**Historical candidate policy at this snapshot:** `sox_ng_14_8_0_1_v3`
 **Runtime exposure:** disabled until promotion; the checked-in artifact is `qualification_candidate`
 
 ## Corrective scope

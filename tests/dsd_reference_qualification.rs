@@ -25,11 +25,12 @@ use tonepoet::convert::pipeline::{
 };
 use tonepoet_pipeline::{
     build_reference_render_transcript_fixture, build_reference_silence_scan_command,
-    extract_single_loudnorm_report, parse_reference_true_peak_measurement, plan_reference_dsd,
+    extract_single_loudnorm_report, parse_reference_true_peak_measurement, plan_conversion,
+    plan_reference_dsd,
     resolve_reference_deferred_command, validate_post_final_true_peak,
-    validate_signed_zero_f64le, AudioCodec, AudioFormat, BitDepthTarget, ConversionPlan,
-    DbNano, DsdInputFrontEnd, DsdReconstructionSelection, DsdReferencePolicyVersion,
-    DsdSourceGainMode, DsdSourceKind, MeasurementId, MeasurementParser, PcmBitDepth,
+    validate_signed_zero_f64le, AudioCodec, AudioFormat, BitDepthTarget, ConversionPlan, DbNano,
+    DsdInputFrontEnd, DsdReconstructionSelection, DsdReferencePolicyVersion, DsdSourceGainMode,
+    DsdSourceKind, Finalization, MeasurementId, MeasurementParser, PcmBitDepth, PlanAction,
     PipelineSettings, PlanRequest, PlannedArg, PlannedCommand, PlannedExecutionStep, RateTarget,
     ReferenceErrorCode, ResolvedDsdProfile,
     ReferenceProgrammeScope, ResolvedGainPolicy, ResolvedOutputTarget, SampleKind,
@@ -211,21 +212,17 @@ fn wait_with_deadline(
     }
 }
 
-fn run_with_pre_clear_environment(
-    path: &Path,
-    args: &[String],
-    pre_clear_environment: &[(&str, &str)],
-) -> Output {
+fn run_configured_command<F>(path: &Path, args: &[String], configure_environment: F) -> Output
+where
+    F: FnOnce(&mut Command),
+{
     let mut command = Command::new(path);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, value) in pre_clear_environment {
-        command.env(key, value);
-    }
-    apply_qualified_environment(&mut command);
+    configure_environment(&mut command);
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("failed to run {} {:?}: {error}", path.display(), args));
@@ -266,6 +263,33 @@ fn run_with_pre_clear_environment(
         String::from_utf8_lossy(&output.stderr),
     );
     output
+}
+
+fn run_with_pre_clear_environment(
+    path: &Path,
+    args: &[String],
+    pre_clear_environment: &[(&str, &str)],
+) -> Output {
+    run_configured_command(path, args, |command| {
+        for (key, value) in pre_clear_environment {
+            command.env(key, value);
+        }
+        apply_qualified_environment(command);
+    })
+}
+
+fn run_planned_legacy_command(path: &Path, planned: &PlannedCommand) -> Output {
+    run_configured_command(path, &planned.args, |command| {
+        match planned.environment_policy {
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet => {}
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet => {
+                command.env_clear();
+            }
+        }
+        for (key, value) in &planned.environment {
+            command.env(key, value);
+        }
+    })
 }
 
 fn run(path: &Path, args: &[String]) -> Output {
@@ -546,6 +570,130 @@ fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) 
         .write_interleaved(&payload)
         .expect("write deterministic DSF payload");
     writer.finish().expect("finish DSF qualification fixture");
+}
+
+fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
+    let sox = required_tool(SOX_ENV);
+    let ffmpeg = required_tool(FFMPEG_ENV);
+    let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
+    let temp = TempDir::new().expect("default-settings smoke tempdir");
+    let input = temp.path().join("default-settings-dsd64.dsf");
+    let output = temp.path().join("default-settings.flac");
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).expect("create default-settings smoke workdir");
+    write_dsf_reference_fixture(&input, 2, 2_822_400);
+
+    let settings = PipelineSettings::default();
+    assert!(
+        !settings.dsd.is_native_v2(),
+        "pre-promotion default must retain the frozen legacy DSD route"
+    );
+    let request = PlanRequest {
+        input_path: input.clone(),
+        output_path: output.clone(),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            dsd_source_kind: None,
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(work),
+        container_ffmpeg_flags: Vec::new(),
+        resolved_output_target: None,
+        reference_programme_scope: ReferenceProgrammeScope::Singleton,
+        planned_riff_non_audio_upper_bound_bytes: None,
+    };
+    let plan = plan_conversion(&request).expect("default-settings DSD64 DSF plan");
+    assert!(
+        plan.reference.is_none(),
+        "default-settings smoke must exercise the frozen legacy route"
+    );
+
+    let (commands, finalization) = match &plan.action {
+        PlanAction::Execute {
+            commands,
+            steps,
+            finalization,
+            ..
+        } => {
+            assert!(
+                steps.is_empty(),
+                "legacy plan must not contain native Reference steps"
+            );
+            assert!(
+                !commands.is_empty(),
+                "legacy plan must execute at least one command"
+            );
+            (commands, finalization.as_ref().expect("legacy finalization"))
+        }
+        PlanAction::PassthroughCopy { .. } => {
+            panic!("DSD64 DSF to FLAC must not plan a passthrough copy")
+        }
+    };
+
+    for command in commands {
+        assert_eq!(
+            command.environment_policy,
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            "legacy command environment identity drifted"
+        );
+        let tool = match &command.tool {
+            ToolIdentifier::Sox => &sox,
+            ToolIdentifier::Ffmpeg => &ffmpeg,
+            other => panic!("unexpected default-settings smoke tool {other:?}"),
+        };
+        let executed = run_planned_legacy_command(tool, command);
+        assert!(
+            executed.status.success(),
+            "default-settings smoke command failed: tool={:?} args={:?} status={} stderr={}",
+            command.tool,
+            command.args,
+            executed.status,
+            String::from_utf8_lossy(&executed.stderr),
+        );
+    }
+    match finalization {
+        Finalization::AtomicRename { from, to } => {
+            assert_eq!(to, &output);
+            fs::rename(from, to).expect("publish default-settings smoke output");
+        }
+    }
+
+    assert_exact_package_probe(&ffprobe, &output, "flac_native", "int24", 88_200, 2);
+    let output_bytes = fs::read(&output).expect("read default-settings smoke output");
+    serde_json::json!({
+        "status": "passed",
+        "route": "legacy_flat_v1",
+        "source": "dsd64_dsf",
+        "target": "flac_native",
+        "sample_rate_hz": 88200,
+        "channels": 2,
+        "bit_depth": "int24",
+        "command_count": commands.len(),
+        "commands": commands.iter().map(|command| serde_json::json!({
+            "tool": command.tool.program(),
+            "args": &command.args,
+            "environment_policy": "inherit_and_set",
+        })).collect::<Vec<_>>(),
+        "output_sha256": sha256_hex(&output_bytes),
+    })
+}
+
+#[test]
+fn default_settings_dsd64_dsf_to_flac_live_smoke() {
+    if !selected() {
+        eprintln!("skipping; set {GATE}=1 to run the default-settings DSD smoke");
+        return;
+    }
+    let _ = qualify_default_settings_dsd64_dsf_to_flac();
 }
 
 fn write_dff_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) {
@@ -882,7 +1030,7 @@ fn assert_production_plan_structure(
         let producer = measurement
             .input_stage
             .as_ref()
-            .expect("policy v4 measurement has a typed producer");
+            .expect("policy v5 measurement has a typed producer");
         assert_eq!(producer.tool, ToolIdentifier::Sox);
         assert_eq!(producer.output, tonepoet_pipeline::OutputSink::Stdout);
         assert_eq!(producer.args.get(0).map(String::as_str), Some("-S"));
@@ -987,10 +1135,11 @@ fn planned_reference_source_cell(
     compression_level: Option<u8>,
 ) -> ConversionPlan {
     let mut settings = PipelineSettings::default();
+    settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V4;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V5;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -1265,7 +1414,7 @@ fn run_planned_measurement_pipeline(
     let producer = measurement
         .input_stage
         .as_ref()
-        .expect("policy v4 measurement has a typed input stage");
+        .expect("policy v5 measurement has a typed input stage");
     assert_eq!(producer.tool, ToolIdentifier::Sox);
     assert_eq!(producer.input.as_path(), measurement.carrier_path());
     assert_eq!(producer.output, tonepoet_pipeline::OutputSink::Stdout);
@@ -1679,7 +1828,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
     let producer = measurement
         .input_stage
         .as_ref()
-        .expect("policy v4 producer stage");
+        .expect("policy v5 producer stage");
     let streamed = run(&sox, &producer.args);
     assert!(
         streamed.status.success(),
@@ -1764,7 +1913,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -1886,8 +2035,24 @@ fn execute_planned_terminal_chain(
             PlannedExecutionStep::Measurement(measurement) => {
                 let parsed = execute_measurement(measurement, sox, ffmpeg, root);
                 if measurement.purpose == TruePeakPurpose::PostFinalAcceptance {
-                    validate_post_final_true_peak(parsed.conservative_upper, summary.gain_policy)
-                        .map_err(|error| error.to_string())?;
+                    if let Err(error) =
+                        validate_post_final_true_peak(parsed.conservative_upper, summary.gain_policy)
+                    {
+                        let pre = measurements.get(&MeasurementId(1));
+                        return Err(format!(
+                            "{error}; pre_reported={:?}; pre_conservative_upper={:?}; \
+                             post_reported={:?}; post_conservative_upper={:?}; \
+                             gain_policy={:?}; terminal_args={:?}",
+                            pre.map(|value: &tonepoet_pipeline::TruePeakMeasurement| value.reported),
+                            pre.map(|value: &tonepoet_pipeline::TruePeakMeasurement| {
+                                value.conservative_upper
+                            }),
+                            parsed.reported,
+                            parsed.conservative_upper,
+                            summary.gain_policy,
+                            terminal_args,
+                        ));
+                    }
                 }
                 assert!(measurements.insert(measurement.id, parsed).is_none());
             }
@@ -2218,6 +2383,59 @@ fn gain_arg(args: &[String]) -> Option<&str> {
     args.windows(2)
         .find(|window| window[0] == "gain")
         .map(|window| window[1].as_str())
+}
+
+fn gain_policy_evidence(policy: ResolvedGainPolicy, terminal_args: &[String]) -> Value {
+    let applied_gain_db = gain_arg(terminal_args).map(str::to_owned);
+    match policy {
+        ResolvedGainPolicy::ReferenceCompensated {
+            requested_gain,
+            ceiling,
+            terminal_bound,
+        } => serde_json::json!({
+            "mode": "reference_compensated",
+            "requested_gain_db": requested_gain.render(true),
+            "applied_gain_db": applied_gain_db,
+            "acceptance_ceiling_dbtp": ceiling.render(false),
+            "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
+            "terminal_safe_pre_terminal_ceiling_dbtp": terminal_bound.safe_pre_terminal_ceiling_dbtp.render(false),
+            "terminal_derivation_digest": terminal_bound.derivation_digest.to_hex(),
+            "post_final_acceptance_reserve_db": DbNano::POST_FINAL_ACCEPTANCE_RESERVE.render(false),
+        }),
+        ResolvedGainPolicy::NativeLevelExact {
+            gain,
+            ceiling,
+            terminal_bound,
+        } => serde_json::json!({
+            "mode": "native_level_exact",
+            "requested_gain_db": gain.render(true),
+            "applied_gain_db": applied_gain_db,
+            "acceptance_ceiling_dbtp": ceiling.render(false),
+            "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
+            "terminal_safe_pre_terminal_ceiling_dbtp": terminal_bound.safe_pre_terminal_ceiling_dbtp.render(false),
+            "terminal_derivation_digest": terminal_bound.derivation_digest.to_hex(),
+            "post_final_acceptance_reserve_db": DbNano::POST_FINAL_ACCEPTANCE_RESERVE.render(false),
+        }),
+        ResolvedGainPolicy::FixedExact {
+            gain,
+            ceiling,
+            terminal_bound,
+        } => serde_json::json!({
+            "mode": "fixed_exact",
+            "requested_gain_db": gain.render(true),
+            "applied_gain_db": applied_gain_db,
+            "acceptance_ceiling_dbtp": ceiling.render(false),
+            "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
+            "terminal_safe_pre_terminal_ceiling_dbtp": terminal_bound.safe_pre_terminal_ceiling_dbtp.render(false),
+            "terminal_derivation_digest": terminal_bound.derivation_digest.to_hex(),
+            "post_final_acceptance_reserve_db": DbNano::POST_FINAL_ACCEPTANCE_RESERVE.render(false),
+        }),
+        ResolvedGainPolicy::NormalizePeak { target_dbfs } => serde_json::json!({
+            "mode": "normalize_peak",
+            "target_dbfs": target_dbfs.render(false),
+            "applied_gain_db": applied_gain_db,
+        }),
+    }
 }
 
 fn qualify_true_peak_analyzer_authority() -> Value {
@@ -2701,6 +2919,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
                 "pre_conservative_upper": format!("{:?}", pre.conservative_upper),
                 "post_reported": format!("{:?}", post.reported),
                 "post_conservative_upper": format!("{:?}", post.conservative_upper),
+                "gain_policy": gain_policy_evidence(summary.gain_policy, &chain.terminal_args),
                 "terminal_args": chain.terminal_args,
                 "terminal_realization_count": 1,
             }),
@@ -3682,22 +3901,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v4 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v5 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -3712,7 +3931,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v4 policy status: {other:?}"),
+        other => panic!("unexpected v5 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
     assert_eq!(
@@ -3990,6 +4209,7 @@ fn complete_p0_reference_qualification_report() {
         eprintln!("skipping; set {GATE}=1 to run the mandatory real-tool Reference qualification");
         return;
     }
+    let default_settings_live_smoke = qualify_default_settings_dsd64_dsf_to_flac();
     let environment_probe_results = qualify_subprocess_environment_isolation();
     let (package_case_count, terminal_bound_case_count) = qualify_lossless_package_cells();
     let analyzer_carrier_results = qualify_analyzer_carrier_contract();
@@ -4000,7 +4220,7 @@ fn complete_p0_reference_qualification_report() {
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -4025,11 +4245,12 @@ fn complete_p0_reference_qualification_report() {
         .count();
     let rejected_target_depth_cells = target_depth_cells.len() - supported_target_depth_cells;
     let report = serde_json::json!({
-        "schema_version": 4,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V4_KEY,
+        "schema_version": 5,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V5_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
+        "default_settings_live_smoke": default_settings_live_smoke,
         "in_process_backend": qualification["in_process"].clone(),
         "subprocess_environment": qualification["subprocess_environment"].clone(),
         "qualification_supervision": qualification["qualification_supervision"].clone(),

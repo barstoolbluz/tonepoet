@@ -426,7 +426,7 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                 reference_error_text(ReferenceErrorCode::ManualUnavailable),
             ));
         }
-        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V4 {
+        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V5 {
             return Err(PlanningError::invalid_settings(
                 "dsd.from_dsd.reference_policy",
                 reference_error_text(ReferenceErrorCode::Toolchain),
@@ -774,8 +774,8 @@ pub struct DsdSettings {
     pub pcm_to_dsd: PcmToDsdSettings,
     /// Native-v2 DSD-source Reference controls.
     pub from_dsd: DsdSourceSettings,
-    /// Private wire/behavior origin. Only exact legacy deserialization may create
-    /// `LegacyFlatV1`.
+    /// Private wire/behavior origin. Pre-promotion defaults and exact legacy
+    /// deserialization retain `LegacyFlatV1`; native v2 is explicit opt-in.
     pub(crate) origin: DsdSettingsOrigin,
 }
 
@@ -870,8 +870,9 @@ impl Default for LegacyDsdSettingsWireV1 {
 
 /// Read-only legacy behavior summary used by logging and compatibility policy.
 ///
-/// This type cannot construct legacy settings. Exact legacy wire dispatch is the
-/// only authority that can create `DsdSettingsOrigin::LegacyFlatV1`.
+/// This type cannot construct legacy settings. The pre-promotion default and
+/// exact legacy wire dispatch are the only authorities that create
+/// `DsdSettingsOrigin::LegacyFlatV1`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LegacyDsdBehavior {
     /// Frozen legacy DSD-to-PCM low-pass method.
@@ -899,15 +900,27 @@ fn default_dsd_to_pcm_auto_gain_margin_db() -> f32 {
 
 impl Default for DsdSettings {
     fn default() -> Self {
+        // Reference remains fail-closed until its policy is promoted. Keep the
+        // application default on the exact frozen legacy wire so ordinary
+        // DSD-to-PCM conversions continue to work pre-promotion.
+        Self::from_legacy_wire(LegacyDsdSettingsWireV1::default())
+    }
+}
+
+impl DsdSettings {
+    /// Construct native-v2 DSD settings explicitly.
+    ///
+    /// Reference is deliberately opt-in until the embedded policy is promoted;
+    /// callers that select this constructor accept fail-closed attestation.
+    #[must_use]
+    pub fn native_v2() -> Self {
         Self {
             pcm_to_dsd: PcmToDsdSettings::default(),
             from_dsd: DsdSourceSettings::default(),
             origin: DsdSettingsOrigin::NativeV2,
         }
     }
-}
 
-impl DsdSettings {
     /// Construct the exact frozen legacy settings representation.
     #[must_use]
     pub(crate) fn from_legacy_wire(wire: LegacyDsdSettingsWireV1) -> Self {
@@ -937,13 +950,13 @@ impl DsdSettings {
     /// behaviorally unrelated PCM-to-DSD controls.
     #[must_use]
     pub fn migrate_to_native_v2(self) -> Self {
-        Self {
-            pcm_to_dsd: match self.origin {
-                DsdSettingsOrigin::NativeV2 => self.pcm_to_dsd,
-                DsdSettingsOrigin::LegacyFlatV1(wire) => legacy_pcm_to_dsd(wire),
+        match self.origin {
+            DsdSettingsOrigin::NativeV2 => self,
+            DsdSettingsOrigin::LegacyFlatV1(_) => Self {
+                pcm_to_dsd: self.pcm_to_dsd,
+                from_dsd: DsdSourceSettings::default(),
+                origin: DsdSettingsOrigin::NativeV2,
             },
-            from_dsd: DsdSourceSettings::default(),
-            origin: DsdSettingsOrigin::NativeV2,
         }
     }
 
@@ -951,20 +964,36 @@ impl DsdSettings {
     /// fingerprint and legacy planner.
     #[must_use]
     pub(crate) fn legacy_compat_wire(&self) -> LegacyDsdSettingsWireV1 {
-        match self.origin {
-            DsdSettingsOrigin::LegacyFlatV1(wire) => wire,
-            DsdSettingsOrigin::NativeV2 => LegacyDsdSettingsWireV1 {
-                noise_shaper: self.pcm_to_dsd.noise_shaper,
-                modulator_order: self.pcm_to_dsd.modulator_order,
-                trellis: self.pcm_to_dsd.trellis,
-                pcm_to_dsd_filter: self.pcm_to_dsd.filter,
-                dsd_to_pcm_lowpass: DsdLowpassMethod::Auto,
-                dsd_to_pcm_gain_mode: DsdToPcmGainMode::Disabled,
-                dsd_to_pcm_auto_gain_margin_db: default_dsd_to_pcm_auto_gain_margin_db(),
-                dsd_to_pcm_gain_db: None,
-                sinc: self.pcm_to_dsd.sinc,
-                gain_compensation: self.pcm_to_dsd.gain_compensation,
-            },
+        let (
+            dsd_to_pcm_lowpass,
+            dsd_to_pcm_gain_mode,
+            dsd_to_pcm_auto_gain_margin_db,
+            dsd_to_pcm_gain_db,
+        ) = match self.origin {
+            DsdSettingsOrigin::LegacyFlatV1(wire) => (
+                wire.dsd_to_pcm_lowpass,
+                wire.dsd_to_pcm_gain_mode,
+                wire.dsd_to_pcm_auto_gain_margin_db,
+                wire.dsd_to_pcm_gain_db,
+            ),
+            DsdSettingsOrigin::NativeV2 => (
+                DsdLowpassMethod::Auto,
+                DsdToPcmGainMode::Disabled,
+                default_dsd_to_pcm_auto_gain_margin_db(),
+                None,
+            ),
+        };
+        LegacyDsdSettingsWireV1 {
+            noise_shaper: self.pcm_to_dsd.noise_shaper,
+            modulator_order: self.pcm_to_dsd.modulator_order,
+            trellis: self.pcm_to_dsd.trellis,
+            pcm_to_dsd_filter: self.pcm_to_dsd.filter,
+            dsd_to_pcm_lowpass,
+            dsd_to_pcm_gain_mode,
+            dsd_to_pcm_auto_gain_margin_db,
+            dsd_to_pcm_gain_db,
+            sinc: self.pcm_to_dsd.sinc,
+            gain_compensation: self.pcm_to_dsd.gain_compensation,
         }
     }
 
@@ -1002,7 +1031,6 @@ impl DsdSettings {
     pub(crate) fn legacy_dsd_to_pcm_gain_db(&self) -> Option<f32> {
         self.legacy_compat_wire().dsd_to_pcm_gain_db
     }
-
 }
 
 fn legacy_pcm_to_dsd(wire: LegacyDsdSettingsWireV1) -> PcmToDsdSettings {
@@ -1025,7 +1053,7 @@ fn legacy_from_dsd_mirror(wire: LegacyDsdSettingsWireV1) -> DsdSourceSettings {
     };
     DsdSourceSettings {
         pathway: DsdSourcePathway::Reference,
-        reference_policy: DsdReferencePolicyVersion::SoxNg14801V4,
+        reference_policy: DsdReferencePolicyVersion::SoxNg14801V5,
         profile: DsdReconstructionSelection::Reference,
         gain_mode,
         fixed_gain_db: wire
@@ -1041,8 +1069,7 @@ fn legacy_from_dsd_mirror(wire: LegacyDsdSettingsWireV1) -> DsdSourceSettings {
 }
 
 fn legacy_mirror_matches(settings: &DsdSettings, wire: LegacyDsdSettingsWireV1) -> bool {
-    settings.pcm_to_dsd == legacy_pcm_to_dsd(wire)
-        && settings.from_dsd == legacy_from_dsd_mirror(wire)
+    settings.from_dsd == legacy_from_dsd_mirror(wire)
 }
 
 #[cfg(feature = "serde")]
@@ -1061,10 +1088,10 @@ impl serde::Serialize for DsdSettings {
             DsdSettingsOrigin::LegacyFlatV1(wire) => {
                 if !legacy_mirror_matches(self, wire) {
                     return Err(serde::ser::Error::custom(
-                        "legacy DSD settings were edited; explicitly migrate them to native v2 before serialization",
+                        "native DSD-source settings were edited on a legacy value; explicitly migrate it to native v2 before serialization",
                     ));
                 }
-                wire.serialize(serializer)
+                self.legacy_compat_wire().serialize(serializer)
             }
         }
     }

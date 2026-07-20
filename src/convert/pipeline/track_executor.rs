@@ -321,8 +321,9 @@ pub(crate) async fn preflight_reference_rerun_authority(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<Option<ReferenceRerunPreflightAuthority>, TrackExecutionError> {
-    if !request.settings.dsd.is_native_v2()
-        || request.settings.dsd.from_dsd.pathway != tonepoet_pipeline::DsdSourcePathway::Reference
+    if !tonepoet_pipeline::selects_reference_dsd_to_pcm(&request.settings, true)
+        || request.settings.dsd.from_dsd.pathway
+            != tonepoet_pipeline::DsdSourcePathway::Reference
     {
         return Ok(None);
     }
@@ -811,7 +812,8 @@ struct EmbeddedQualificationReport {
     decimation_report_sha256: String,
     commission_sha256: String,
     amendment_sha256: String,
-    corrective_brief_sha256: String,
+    analyzer_corrective_brief_sha256: String,
+    runtime_defaults_corrective_brief_sha256: String,
     expanded_supported_cell_count: u64,
     expanded_supported_cell_digest: String,
 }
@@ -1018,6 +1020,8 @@ struct EmbeddedPackageRequiredArgs {
 struct EmbeddedTerminalBounds {
     target_rates_hz: Vec<u32>,
     derivation_schema: String,
+    post_final_acceptance_reserve_db: tonepoet_pipeline::DbNano,
+    post_final_acceptance_reserve_basis: String,
     int16_shibata: EmbeddedTerminalBound,
     int24_tpdf: EmbeddedTerminalBound,
     float32: EmbeddedTerminalBound,
@@ -1038,9 +1042,9 @@ fn validate_embedded_release_certification(
     let certification = &manifest.release_certification;
     if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
         || certification.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_certification.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_certification.json"
         || certification.candidate_manifest_path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_candidate.json"
     {
         return Err(reference_toolchain_error(
             "the embedded release-certification descriptor is not canonical",
@@ -1048,7 +1052,7 @@ fn validate_embedded_release_certification(
     }
     let report_sha256 = certification.report_sha256.as_deref().ok_or_else(|| {
         reference_toolchain_error(
-            "the embedded v4 policy has not bound a release-certification report",
+            "the embedded v5 policy has not bound a release-certification report",
         )
     })?;
     let candidate_manifest_sha256 = certification
@@ -1056,20 +1060,20 @@ fn validate_embedded_release_certification(
         .as_deref()
         .ok_or_else(|| {
             reference_toolchain_error(
-                "the embedded v4 policy has not bound its qualified candidate manifest",
+                "the embedded v5 policy has not bound its qualified candidate manifest",
             )
         })?;
     let current_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
     ));
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_certification.json"
     ));
     let candidate_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_candidate.json"
     ));
     let parse_digest = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -1093,13 +1097,13 @@ fn validate_embedded_release_certification(
     let mut normalized_current: serde_json::Value =
         serde_json::from_slice(current_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded current v4 manifest is invalid JSON: {error}"
+                "the embedded current v5 manifest is invalid JSON: {error}"
             ))
         })?;
     let candidate_value: serde_json::Value =
         serde_json::from_slice(candidate_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded preserved v4 candidate is invalid JSON: {error}"
+                "the embedded preserved v5 candidate is invalid JSON: {error}"
             ))
         })?;
     if candidate_value.get("status").and_then(serde_json::Value::as_str)
@@ -1112,7 +1116,7 @@ fn validate_embedded_release_certification(
             .is_none_or(|value| !value.is_null())
     {
         return Err(reference_toolchain_error(
-            "the preserved v4 candidate is not the canonical unpromoted policy snapshot",
+            "the preserved v5 candidate is not the canonical unpromoted policy snapshot",
         ));
     }
     normalized_current["status"] =
@@ -1123,7 +1127,7 @@ fn validate_embedded_release_certification(
         serde_json::Value::Null;
     if normalized_current != candidate_value {
         return Err(reference_toolchain_error(
-            "the promoted v4 manifest differs from its qualified candidate outside the permitted certification fields",
+            "the promoted v5 manifest differs from its qualified candidate outside the permitted certification fields",
         ));
     }
     let report: serde_json::Value = serde_json::from_slice(report_bytes).map_err(|error| {
@@ -1131,9 +1135,9 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report is invalid JSON: {error}"
         ))
     })?;
-    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(4)
+    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(5)
         || report.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V4_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V5_KEY)
         || report.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || report.get("outcome").and_then(serde_json::Value::as_str) != Some("pass")
         || report
@@ -1142,11 +1146,12 @@ fn validate_embedded_release_certification(
             != Some(candidate_manifest_sha256)
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report does not bind the qualified v4 candidate",
+            "the embedded release-certification report does not bind the qualified v5 candidate",
         ));
     }
     for required in [
         "toolchain",
+        "default_settings_live_smoke",
         "subprocess_environment",
         "qualification_supervision",
         "subprocess_environment_probe",
@@ -1163,6 +1168,49 @@ fn validate_embedded_release_certification(
                 "the embedded release-certification report omits {required}"
             )));
         }
+    }
+    let default_smoke = report
+        .get("default_settings_live_smoke")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded default-settings live smoke is not a structured result",
+            )
+        })?;
+    let default_smoke_commands = default_smoke
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded default-settings live smoke omits planned command evidence",
+            )
+        })?;
+    if default_smoke.get("status").and_then(serde_json::Value::as_str) != Some("passed")
+        || default_smoke.get("route").and_then(serde_json::Value::as_str)
+            != Some("legacy_flat_v1")
+        || default_smoke.get("source").and_then(serde_json::Value::as_str)
+            != Some("dsd64_dsf")
+        || default_smoke.get("target").and_then(serde_json::Value::as_str)
+            != Some("flac_native")
+        || default_smoke
+            .get("sample_rate_hz")
+            .and_then(serde_json::Value::as_u64)
+            != Some(88_200)
+        || default_smoke.get("channels").and_then(serde_json::Value::as_u64) != Some(2)
+        || default_smoke.get("bit_depth").and_then(serde_json::Value::as_str) != Some("int24")
+        || default_smoke
+            .get("command_count")
+            .and_then(serde_json::Value::as_u64)
+            != u64::try_from(default_smoke_commands.len()).ok()
+        || default_smoke_commands.is_empty()
+        || default_smoke
+            .get("output_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|digest| Sha256Digest::from_hex(digest).is_err())
+    {
+        return Err(reference_toolchain_error(
+            "the embedded default-settings DSD64 live smoke is not canonical",
+        ));
     }
     let report_environment = report
         .get("subprocess_environment")
@@ -1913,7 +1961,7 @@ fn validate_embedded_release_certification(
             != Some(manifest.cell_contract.expanded_supported_cell_digest.as_str())
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report disagrees with the v4 cell contract",
+            "the embedded release-certification report disagrees with the v5 cell contract",
         ));
     }
     Ok(())
@@ -2040,7 +2088,7 @@ fn validate_embedded_reference_policy_tables(
             != "ffmpeg_7_1_scales_sox_ieee_float64_w64_by_2^31"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v4 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v5 policy",
         ));
     }
     if manifest.analyzer.qualification_schema
@@ -2099,7 +2147,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.analyzer.aligned_multitone_duration_seconds != "0.250000000"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v4 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v5 policy",
         ));
     }
 
@@ -2214,7 +2262,7 @@ fn validate_embedded_reference_policy_tables(
     validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
     if b6.enabled {
         return Err(reference_toolchain_error(
-            "embedded B6 profile must remain typed but disabled under policy v4",
+            "embedded B6 profile must remain typed but disabled under policy v5",
         ));
     }
 
@@ -2246,10 +2294,21 @@ fn validate_embedded_reference_policy_tables(
     ];
     if manifest.terminal_bounds.target_rates_hz != P0_TARGET_RATES_HZ
         || manifest.terminal_bounds.derivation_schema
-            != "tonepoet-reference-terminal-bound/v2"
+            != "tonepoet-reference-terminal-bound/v3"
+        || manifest.terminal_bounds.post_final_acceptance_reserve_db
+            != tonepoet_pipeline::DbNano::POST_FINAL_ACCEPTANCE_RESERVE
+        || manifest.terminal_bounds.post_final_acceptance_reserve_basis
+            != "one_analyzer_reporting_quantum"
     {
         return Err(reference_toolchain_error(
             "embedded terminal-bound cell domain disagrees with the compiled policy",
+        ));
+    }
+    if manifest.terminal_bounds.post_final_acceptance_reserve_db
+        != manifest.analyzer.reporting_uncertainty_db
+    {
+        return Err(reference_toolchain_error(
+            "embedded terminal reserve must equal the analyzer reporting uncertainty",
         ));
     }
     for (name, depth, embedded) in terminal_bounds {
@@ -2295,7 +2354,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2313,9 +2372,13 @@ fn validate_embedded_qualification_report(
         env!("CARGO_MANIFEST_DIR"),
         "/docs/brief_dsd_reference_p0_policy_v3_amendment.md"
     ));
-    let corrective_brief = include_bytes!(concat!(
+    let analyzer_corrective_brief = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/docs/brief_dsd_reference_p0_corrective_analyzer_carrier.md"
+    ));
+    let runtime_defaults_corrective_brief = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/brief_dsd_reference_p0_corrective_runtime_defaults.md"
     ));
     let parse = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -2326,7 +2389,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -2335,8 +2398,14 @@ fn validate_embedded_qualification_report(
             != Sha256Digest::of_bytes(commission)
         || parse("v3 amendment", &report.amendment_sha256)?
             != Sha256Digest::of_bytes(amendment)
-        || parse("v4 corrective brief", &report.corrective_brief_sha256)?
-            != Sha256Digest::of_bytes(corrective_brief)
+        || parse(
+            "analyzer corrective brief",
+            &report.analyzer_corrective_brief_sha256,
+        )? != Sha256Digest::of_bytes(analyzer_corrective_brief)
+        || parse(
+            "runtime-defaults corrective brief",
+            &report.runtime_defaults_corrective_brief_sha256,
+        )? != Sha256Digest::of_bytes(runtime_defaults_corrective_brief)
         || report.expanded_supported_cell_count
             != manifest.cell_contract.expanded_supported_cell_count
         || report.expanded_supported_cell_digest
@@ -2745,17 +2814,17 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
     ));
     let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
         reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
     })?;
-    if manifest.schema_version != 4
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V4_KEY
+    if manifest.schema_version != 5
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V5_KEY
         || manifest.status != "qualified_release"
     {
         return Err(reference_toolchain_error(
-            "the embedded policy artifact is not a qualified v4 release",
+            "the embedded policy artifact is not a qualified v5 release",
         ));
     }
     validate_embedded_release_certification(&manifest)?;
@@ -4656,7 +4725,7 @@ fn validate_reference_measurement_pipe_contract(
     let producer = measurement.input_stage.as_ref().ok_or_else(|| {
         TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v4 measurement requires a typed analyzer input stage".to_string(),
+                "Reference policy v5 measurement requires a typed analyzer input stage".to_string(),
             ),
             Vec::new(),
         )
@@ -4664,7 +4733,7 @@ fn validate_reference_measurement_pipe_contract(
     let carrier = producer.input.as_path().ok_or_else(|| {
         TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v4 measurement producer requires a path-backed W64 carrier".to_string(),
+                "Reference policy v5 measurement producer requires a path-backed W64 carrier".to_string(),
             ),
             Vec::new(),
         )
@@ -4725,7 +4794,7 @@ fn validate_reference_measurement_pipe_contract(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v4 measurement has a noncanonical typed SoX-to-FFmpeg pipe contract"
+                "Reference policy v5 measurement has a noncanonical typed SoX-to-FFmpeg pipe contract"
                     .to_string(),
             ),
             Vec::new(),
@@ -4763,7 +4832,7 @@ async fn execute_reference_measurement(
     // The reference-policy environment is part of the qualified semantic identity.
     // Acquire only the concurrency permits here: the general SoX permit path injects
     // OMP_NUM_THREADS, which would make production execution differ from the frozen
-    // and qualified v4 pipe contract.
+    // and qualified v5 pipe contract.
     let _producer_permit = acquire_reference_pipeline_permit(producer.binary, limits, cancel)
         .await
         .map_err(TrackExecutionError::from)?;
@@ -5666,7 +5735,7 @@ mod tests {
             parser: MeasurementParser::FfmpegLoudnormInputTpV2,
         };
         validate_reference_measurement_pipe_contract(&measurement)
-            .expect("canonical v4 measurement contract is accepted");
+            .expect("canonical v5 measurement contract is accepted");
 
         let mut drifted = measurement.clone();
         drifted.input_stage.as_mut().unwrap().args[8] = "32".to_string();
@@ -5693,7 +5762,7 @@ mod tests {
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -5706,11 +5775,28 @@ mod tests {
         validate_embedded_reference_policy_tables(&manifest)
             .expect("embedded Reference qualification matches compiled policy tables");
 
+        let mut reserve_drift: EmbeddedReferenceQualification =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
+            )))
+            .expect("embedded Reference qualification JSON parses for drift test");
+        reserve_drift.analyzer.reporting_uncertainty_db =
+            tonepoet_pipeline::DbNano(11_000_000);
+        let error = validate_embedded_reference_policy_tables(&reserve_drift)
+            .expect_err("terminal reserve and analyzer uncertainty must be directly bound");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal reserve must equal the analyzer reporting uncertainty"),
+            "unexpected invariant failure: {error}"
+        );
+
         let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_candidate.json"
         )))
-        .expect("preserved v4 candidate JSON parses");
+        .expect("preserved v5 candidate JSON parses");
         assert_eq!(
             candidate
                 .terminal_bounds

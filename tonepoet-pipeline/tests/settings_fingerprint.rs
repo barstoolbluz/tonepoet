@@ -15,7 +15,7 @@ fn legacy_dsd_settings(
     margin_db: f32,
     gain_db: Option<f32>,
 ) -> DsdSettings {
-    let native = DsdSettings::default();
+    let native = DsdSettings::native_v2();
     serde_json::from_value(serde_json::json!({
         "noise_shaper": native.pcm_to_dsd.noise_shaper,
         "modulator_order": native.pcm_to_dsd.modulator_order,
@@ -560,14 +560,13 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
 #[cfg(feature = "serde")]
 #[test]
 fn serde_recursive_field_count_matches_checked_inventory_for_known_shapes() {
-    // Counts re-baselined for directional DSD native-v2 serialization: the
-    // nested schema adds five keys relative to the frozen flat-v1 wire. The
-    // mutation-inventory test above is the authoritative drift guard; this
-    // pins raw serialized shape.
+    // The pre-promotion default serializes through the frozen flat-v1 wire.
+    // Native-v2 remains five keys larger and is covered by the dedicated DSD
+    // settings sentinel. This test pins the default and broad sentinel shapes.
     let default = serde_json::to_value(PipelineSettings::default()).unwrap();
     let sentinel = serde_json::to_value(flac_md5_sentinel()).unwrap();
 
-    assert_eq!(recursive_object_key_count(&default), 85);
+    assert_eq!(recursive_object_key_count(&default), 80);
     assert_eq!(recursive_object_key_count(&sentinel), 92);
 }
 

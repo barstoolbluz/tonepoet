@@ -285,13 +285,12 @@ pub fn try_pills_to_options(
     })
 }
 
-
 /// Build the unified pipeline settings from TUI format state.
 ///
 /// This is the lossless handoff from dynamic TUI rows into command planning.
 /// It validates on every build, including release builds.
 pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<PipelineSettings, String> {
-    if format.dsd_to_pcm_gain_available() && !format.reference_target_confirmed {
+    if format.dsd_reference_controls_available() && !format.reference_target_confirmed {
         return Err(tonepoet_pipeline::reference_error_text(
             tonepoet_pipeline::ReferenceErrorCode::CanonicalTarget,
         )
@@ -379,9 +378,14 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     // codec-specific sub-structs (flac, mp3, aac, etc.) use defaults until the TUI
     // exposes those settings.
     let mut dsd: tonepoet_pipeline::DsdSettings = Default::default();
-    dsd.from_dsd.pathway = *format.dsd_pathway.selected_value();
-    dsd.from_dsd.profile = *format.dsd_profile.selected_value();
-    if format.dsd_to_pcm_gain_available() {
+    // Before Reference policy promotion, the application default is the exact
+    // frozen legacy wire. Do not write native-only TUI fields into that object:
+    // doing so would create a hybrid that plans as legacy but cannot be
+    // serialized into the conversion manifest. When promotion flips the
+    // default to native v2, this same builder begins applying the typed controls.
+    if dsd.is_native_v2() && format.dsd_reference_controls_available() {
+        dsd.from_dsd.pathway = *format.dsd_pathway.selected_value();
+        dsd.from_dsd.profile = *format.dsd_profile.selected_value();
         match *format.dsd_gain_mode.selected_value() {
             DsdGainMode::Reference => {
                 dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Reference;
@@ -394,8 +398,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             DsdGainMode::NormalizePeak => {
                 dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
                 dsd.from_dsd.fixed_gain_db = None;
-                dsd.from_dsd.normalize_peak_target_dbfs =
-                    format.dsd_normalize_target_dbfs;
+                dsd.from_dsd.normalize_peak_target_dbfs = format.dsd_normalize_target_dbfs;
             }
             DsdGainMode::Fixed => {
                 dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Fixed;
@@ -448,7 +451,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             // Reference canonicalizes non-hybrid WavPack to no correction
             // sidecar; an actually hybrid request remains visible to the
             // planner and is rejected fail-closed.
-            correction_file: if format.dsd_to_pcm_gain_available()
+            correction_file: if format.dsd_reference_controls_available()
                 && target_format_is_wavpack
                 && !format.wavpack_hybrid
             {
@@ -503,14 +506,14 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         },
     };
 
-    if !format.dsd_to_pcm_gain_available() {
+    if !format.dsd_reference_controls_available() {
         settings
             .validate()
             .map_err(|err| format!("invalid PipelineSettings from TUI state: {err}"))?;
     }
-    // DSD-source Reference validation remains planner-owned so unsupported
-    // cells surface the stable DSD-REF-P0 error rather than a legacy generic
-    // format/depth error. The TUI fields themselves are typed and bounded.
+    // Once a promotion release exposes native Reference controls, its unsupported
+    // cells remain planner-owned so they surface stable DSD-REF-P0 diagnostics.
+    // Pre-promotion legacy settings take the ordinary validation path above.
     Ok(settings)
 }
 
@@ -792,8 +795,28 @@ mod lifecycle_forwarder_tests {
         }
     }
 
+    fn assert_exact_pre_promotion_legacy_dsd(settings: &PipelineSettings) {
+        assert!(!settings.dsd.is_native_v2());
+        let legacy = settings
+            .dsd
+            .legacy_behavior()
+            .expect("pre-promotion TUI settings retain legacy authority");
+        assert_eq!(legacy.lowpass, tonepoet_pipeline::DsdLowpassMethod::Auto);
+        assert_eq!(
+            legacy.gain_mode,
+            tonepoet_pipeline::DsdToPcmGainMode::Disabled
+        );
+        assert_eq!(legacy.auto_gain_margin_db, 0.15);
+        assert_eq!(legacy.gain_db, None);
+
+        let encoded = serde_json::to_value(settings).expect("serialize exact legacy TUI settings");
+        let dsd = encoded["dsd"].as_object().expect("legacy DSD object");
+        assert!(!dsd.contains_key("schema_version"));
+        assert!(!dsd.contains_key("from_dsd"));
+    }
+
     #[test]
-    fn format_state_to_pipeline_settings_maps_dsd_to_pcm_gain() {
+    fn pre_promotion_tui_normalize_selection_does_not_create_a_hybrid_dsd_object() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
         format.dsd_gain_mode.select_value(&DsdGainMode::NormalizePeak);
@@ -801,19 +824,11 @@ mod lifecycle_forwarder_tests {
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
-        assert_eq!(
-            settings.dsd.from_dsd.gain_mode,
-            tonepoet_pipeline::DsdSourceGainMode::NormalizePeak
-        );
-        assert_eq!(
-            settings.dsd.from_dsd.normalize_peak_target_dbfs,
-            "-0.500000000".parse().expect("fixed point")
-        );
-        assert_eq!(settings.dsd.from_dsd.fixed_gain_db, None);
+        assert_exact_pre_promotion_legacy_dsd(&settings);
     }
 
     #[test]
-    fn format_state_to_pipeline_settings_maps_manual_dsd_to_pcm_gain() {
+    fn pre_promotion_tui_fixed_selection_does_not_create_a_hybrid_dsd_object() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
         format.dsd_gain_mode.select_value(&DsdGainMode::Fixed);
@@ -821,34 +836,22 @@ mod lifecycle_forwarder_tests {
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
-        assert_eq!(
-            settings.dsd.from_dsd.gain_mode,
-            tonepoet_pipeline::DsdSourceGainMode::Fixed
-        );
-        assert_eq!(
-            settings.dsd.from_dsd.fixed_gain_db,
-            Some("2.250000000".parse().expect("fixed point"))
-        );
+        assert_exact_pre_promotion_legacy_dsd(&settings);
     }
 
-
     #[test]
-    fn format_state_to_pipeline_settings_disables_hidden_dsd_gain_for_pcm_source() {
+    fn pre_promotion_tui_hidden_dsd_controls_leave_pcm_source_settings_legacy() {
         let mut format = FormatState::new();
         format.dsd_gain_mode.select_value(&DsdGainMode::Fixed);
         format.dsd_gain_db = "2.250000000".parse().unwrap();
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
-        assert_eq!(
-            settings.dsd.from_dsd.gain_mode,
-            tonepoet_pipeline::DsdSourceGainMode::Reference
-        );
-        assert_eq!(settings.dsd.from_dsd.fixed_gain_db, None);
+        assert_exact_pre_promotion_legacy_dsd(&settings);
     }
 
     #[test]
-    fn format_state_to_pipeline_settings_clamps_manual_dsd_to_pcm_gain() {
+    fn pre_promotion_tui_out_of_range_fixed_gain_cannot_taint_legacy_authority() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
         format.dsd_gain_mode.select_value(&DsdGainMode::Fixed);
@@ -856,10 +859,7 @@ mod lifecycle_forwarder_tests {
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
-        assert_eq!(
-            settings.dsd.from_dsd.fixed_gain_db,
-            Some("24.000000000".parse().expect("fixed point"))
-        );
+        assert_exact_pre_promotion_legacy_dsd(&settings);
     }
 
     #[test]

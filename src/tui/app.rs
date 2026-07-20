@@ -2498,13 +2498,15 @@ mod clamp_pill_tests {
         format.resampler.select_value(&ResamplerChoice::Soxr);
         format.dither_overridden = true;
         format.resampler_overridden = true;
-        // Manual gain is only selectable while DSD-to-PCM gain is available;
-        // enable it the way production does before staging explicit policy.
+        // Stage dormant native-v2 policy directly. Pre-promotion production
+        // constraints keep these controls disabled, but reset/recovery must not
+        // corrupt values already present in a future-version preset.
         format.source_is_dsd = true;
         format.apply_format_constraints();
+        format.dsd_gain_mode.set_all_enabled(true);
         assert!(
             format.dsd_gain_mode.select_value(&DsdGainMode::Fixed),
-            "fixture must be able to stage Manual gain"
+            "fixture must be able to stage dormant native-v2 gain"
         );
         format.dsd_gain_db = "5.500000000".parse().unwrap();
 
@@ -2972,9 +2974,9 @@ pub enum FormatField {
 }
 
 impl FormatField {
-    /// Rows visible in the format pane. DSD-to-PCM gain controls are visible
-    /// only for DSD sources targeting PCM outputs; they are hidden for PCM->PCM
-    /// and PCM->DSD so the UI cannot imply that SoX normalization applies there.
+    /// Rows visible in the format pane. Native DSD-to-PCM Reference controls
+    /// are shown only when the caller has established both the conversion
+    /// direction and release-policy availability.
     pub fn visible_rows(is_dsd_target: bool, show_dsd_to_pcm_gain: bool) -> &'static [Self] {
         if is_dsd_target {
             &[
@@ -3580,10 +3582,22 @@ impl FormatState {
         is_dsd_format(*self.format.selected_value())
     }
 
-    /// True only for the conversion direction where this control has meaning:
-    /// DSD source material rendered to a PCM target format.
+    /// True only for the conversion direction where native DSD-source controls
+    /// could have meaning: DSD source material rendered to a PCM target format.
     pub fn dsd_to_pcm_gain_available(&self) -> bool {
         self.source_is_dsd && !self.is_dsd_selected()
+    }
+
+    /// Whether the native-v2 DSD Reference controls are exposed in this release.
+    ///
+    /// The pre-promotion default is the exact legacy wire, so merely opening a
+    /// DSD source must not opt the TUI into an unqualified native policy, require
+    /// Reference confirmation, or lock the generic legacy resampler/dither rows.
+    /// The promotion release flips `DsdSettings::default()` to native v2 and this
+    /// gate opens automatically.
+    pub fn dsd_reference_controls_available(&self) -> bool {
+        self.dsd_to_pcm_gain_available()
+            && tonepoet_pipeline::DsdSettings::default().is_native_v2()
     }
 
     /// True when the SSRC overlay is overriding any part of the dither pair
@@ -3668,13 +3682,13 @@ impl FormatState {
     pub fn focus_next(&mut self) {
         self.field_focus = self
             .field_focus
-            .next_for(self.is_dsd_selected(), self.dsd_to_pcm_gain_available());
+            .next_for(self.is_dsd_selected(), self.dsd_reference_controls_available());
     }
 
     pub fn focus_prev(&mut self) {
         self.field_focus = self
             .field_focus
-            .prev_for(self.is_dsd_selected(), self.dsd_to_pcm_gain_available());
+            .prev_for(self.is_dsd_selected(), self.dsd_reference_controls_available());
     }
 
     pub fn mark_dither_overridden(&mut self) {
@@ -4250,20 +4264,20 @@ impl FormatState {
         self.conversion_preset.set_all_enabled(true);
         self.dsd_pathway.set_all_enabled(false);
         self.dsd_pathway
-            .set_enabled(&DsdSourcePathway::Reference, self.dsd_to_pcm_gain_available());
+            .set_enabled(&DsdSourcePathway::Reference, self.dsd_reference_controls_available());
         self.dsd_profile.set_all_enabled(false);
         self.dsd_profile.set_enabled(
             &DsdReconstructionSelection::Reference,
-            self.dsd_to_pcm_gain_available(),
+            self.dsd_reference_controls_available(),
         );
         let target_rate_hz = *self.sample_rate.selected_value();
-        let wideband_available = self.dsd_to_pcm_gain_available()
+        let wideband_available = self.dsd_reference_controls_available()
             && self.source_dsd_rate_hz == Some(5_644_800)
             && target_rate_hz >= 176_400
             && target_rate_hz != SOURCE_SAMPLE_RATE_SENTINEL;
         self.dsd_profile
             .set_enabled(&DsdReconstructionSelection::Wideband, wideband_available);
-        self.dsd_gain_mode.set_all_enabled(self.dsd_to_pcm_gain_available());
+        self.dsd_gain_mode.set_all_enabled(self.dsd_reference_controls_available());
 
         // DSD rate threshold: rates at or above this are DSD, below are PCM.
         const DSD_RATE_MIN: u32 = 2_822_400;
@@ -4297,7 +4311,7 @@ impl FormatState {
             self.noise_shaper.set_all_enabled(false);
             self.modulator_order.set_all_enabled(false);
             self.conversion_preset.set_all_enabled(false);
-            if self.dsd_to_pcm_gain_available() {
+            if self.dsd_reference_controls_available() {
                 // Reference owns these effects. Preserve the generic selections
                 // but make them inactive so they cannot be mistaken for policy.
                 self.resampler.set_all_enabled(false);
@@ -4399,8 +4413,11 @@ impl FormatState {
                 self.source_derived_bit_depth = Some(selected);
             }
         }
-        if !FormatField::visible_rows(self.is_dsd_selected(), self.dsd_to_pcm_gain_available())
-            .contains(&self.field_focus)
+        if !FormatField::visible_rows(
+            self.is_dsd_selected(),
+            self.dsd_reference_controls_available(),
+        )
+        .contains(&self.field_focus)
         {
             self.field_focus = FormatField::Format;
         }
@@ -12952,7 +12969,6 @@ mod app_startup_options_tests {
         assert_eq!(other.db.pending_archive_session_count_for_tests().unwrap(), 0);
     }
 
-
     #[test]
     fn explicit_test_database_path_is_file_backed_and_reusable() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -12999,33 +13015,42 @@ mod dsd_gain_format_state_tests {
     }
 
     #[test]
-    fn format_state_hides_dsd_gain_until_source_is_dsd() {
+    fn pre_promotion_reference_controls_remain_hidden_for_dsd_to_pcm() {
         let mut s = FormatState::new();
         assert!(!s.dsd_to_pcm_gain_available());
-        assert!(!FormatField::visible_rows(s.is_dsd_selected(), s.dsd_to_pcm_gain_available())
-            .contains(&FormatField::DsdGain));
+        assert!(!s.dsd_reference_controls_available());
 
         s.set_source_is_dsd(true);
         assert!(s.dsd_to_pcm_gain_available());
-        assert!(FormatField::visible_rows(s.is_dsd_selected(), s.dsd_to_pcm_gain_available())
-            .contains(&FormatField::DsdGain));
+        assert!(!s.dsd_reference_controls_available());
+        assert!(!FormatField::visible_rows(
+            s.is_dsd_selected(),
+            s.dsd_reference_controls_available(),
+        )
+        .contains(&FormatField::DsdGain));
+        assert!(s.resampler.options.iter().any(|option| option.enabled));
+        assert!(s.dither.options.iter().any(|option| option.enabled));
     }
 
     #[test]
-    fn dsd_target_hides_dsd_gain_even_for_dsd_source() {
+    fn dsd_target_hides_reference_controls_even_for_dsd_source() {
         let mut s = FormatState::new();
         s.set_source_is_dsd(true);
         s.format.select_value(&AudioFormat::Dsf);
         s.apply_format_constraints();
 
         assert!(!s.dsd_to_pcm_gain_available());
-        assert!(!FormatField::visible_rows(s.is_dsd_selected(), s.dsd_to_pcm_gain_available())
-            .contains(&FormatField::DsdGain));
+        assert!(!s.dsd_reference_controls_available());
+        assert!(!FormatField::visible_rows(
+            s.is_dsd_selected(),
+            s.dsd_reference_controls_available(),
+        )
+        .contains(&FormatField::DsdGain));
     }
 
 
     #[test]
-    fn focus_navigation_skips_dsd_gain_for_pcm_sources() {
+    fn focus_navigation_skips_reference_rows_before_promotion() {
         let mut s = FormatState::new();
         s.field_focus = FormatField::ReplayGain;
         s.focus_next();
@@ -13034,15 +13059,7 @@ mod dsd_gain_format_state_tests {
         s.set_source_is_dsd(true);
         s.field_focus = FormatField::ReplayGain;
         s.focus_next();
-        assert_eq!(s.field_focus, FormatField::DsdPath);
-        s.focus_next();
-        assert_eq!(s.field_focus, FormatField::DsdProfile);
-        s.focus_next();
-        assert_eq!(s.field_focus, FormatField::DsdGain);
-        s.focus_next();
-        assert_eq!(s.field_focus, FormatField::DsdGainDb);
-        s.focus_next();
-        assert_eq!(s.field_focus, FormatField::DsdNormalizeTarget);
+        assert_eq!(s.field_focus, FormatField::Format);
     }
 
     #[test]
@@ -13057,10 +13074,17 @@ mod dsd_gain_format_state_tests {
         assert!(!s.source_is_dsd);
     }
 
+    fn enable_native_reference_controls_for_unit_test(s: &mut FormatState) {
+        s.set_source_is_dsd(true);
+        s.dsd_pathway.set_all_enabled(true);
+        s.dsd_profile.set_all_enabled(true);
+        s.dsd_gain_mode.set_all_enabled(true);
+    }
+
     #[test]
     fn manual_dsd_gain_row_adjusts_value_and_selects_manual_mode() {
         let mut s = FormatState::new();
-        s.set_source_is_dsd(true);
+        enable_native_reference_controls_for_unit_test(&mut s);
         s.field_focus = FormatField::DsdGainDb;
 
         s.select_focused_next(None, None);
@@ -13074,7 +13098,7 @@ mod dsd_gain_format_state_tests {
     #[test]
     fn manual_dsd_gain_row_clamps_to_valid_settings_range() {
         let mut s = FormatState::new();
-        s.set_source_is_dsd(true);
+        enable_native_reference_controls_for_unit_test(&mut s);
         s.field_focus = FormatField::DsdGainDb;
         s.dsd_gain_db = DbNano(DSD_TO_PCM_GAIN_DB_MAX_NANO);
         s.select_focused_next(None, None);
@@ -13088,7 +13112,7 @@ mod dsd_gain_format_state_tests {
     #[test]
     fn normalize_target_row_preserves_fixed_point_and_selects_normalize() {
         let mut s = FormatState::new();
-        s.set_source_is_dsd(true);
+        enable_native_reference_controls_for_unit_test(&mut s);
         s.field_focus = FormatField::DsdNormalizeTarget;
         s.select_focused_prev(None, None);
         assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::NormalizePeak);
@@ -13099,33 +13123,14 @@ mod dsd_gain_format_state_tests {
     }
 
     #[test]
-    fn wideband_is_enabled_only_for_dsd128_at_176k4_or_higher() {
+    fn pre_promotion_wideband_profile_remains_disabled() {
         let mut s = FormatState::new();
         s.set_source_is_dsd(true);
         s.cascade_dsd_source_to_pcm_defaults(5_644_800);
         s.sample_rate.select_value(&176_400);
         s.apply_format_constraints();
-        assert!(s
-            .dsd_profile
-            .options
-            .iter()
-            .find(|option| option.value == DsdReconstructionSelection::Wideband)
-            .unwrap()
-            .enabled);
 
-        s.sample_rate.select_value(&96_000);
-        s.apply_format_constraints();
-        assert!(!s
-            .dsd_profile
-            .options
-            .iter()
-            .find(|option| option.value == DsdReconstructionSelection::Wideband)
-            .unwrap()
-            .enabled);
-
-        s.cascade_dsd_source_to_pcm_defaults(11_289_600);
-        s.sample_rate.select_value(&352_800);
-        s.apply_format_constraints();
+        assert!(!s.dsd_reference_controls_available());
         assert!(!s
             .dsd_profile
             .options
