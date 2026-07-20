@@ -37563,12 +37563,11 @@ async fn verify_reference_artifacts_after_metadata(
         return Ok(());
     };
     for track in tracks {
-        let Some(evidence) = track.reference_evidence.as_mut() else {
+        if track.reference_evidence.is_none() {
             continue;
-        };
+        }
         verify_reference_output_after_metadata(
-            &track.staged_path,
-            evidence,
+            track,
             runner,
             cancel,
             tool_concurrency_limits,

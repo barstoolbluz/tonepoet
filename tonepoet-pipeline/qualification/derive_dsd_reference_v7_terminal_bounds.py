@@ -125,12 +125,29 @@ def verify_artifact(path: Path, repository_root: Path) -> None:
 
     identity = document.get("sample_identity", {})
     expected_identity = {
-        "schema": "tonepoet-reference-sample-identity/v3",
-        "float64_qpcm_w64_route": "sox_f64le_raw_stream_to_ffmpeg_sha256",
-        "float64_w64_final_route": "sox_f64le_raw_stream_to_ffmpeg_sha256",
-        "float64_riff_rf64_output_route": "ffmpeg_direct_sha256",
-        "other_carrier_route": "ffmpeg_direct_sha256",
-        "hash_format": "interleaved_f64le_sha256",
+        "schema": "tonepoet-reference-sample-identity/v5",
+        "route_authority": "typed_plan_carrier_path_role_target_depth_v2",
+        "routes": {
+            "r64_float64_w64": "sox_f64le_raw_stream",
+            "qpcm_int24_w64": "ffmpeg_direct",
+            "qpcm_float32_w64": "ffmpeg_direct",
+            "qpcm_float64_w64": "sox_f64le_raw_stream",
+            "packaged_int24_w64": "ffmpeg_direct",
+            "packaged_float32_w64": "ffmpeg_direct",
+            "packaged_float64_w64": "sox_f64le_raw_stream",
+            "packaged_non_w64": "ffmpeg_direct",
+            "post_metadata_int24_w64": "ffmpeg_direct",
+            "post_metadata_float32_w64": "ffmpeg_direct",
+            "post_metadata_float64_w64": "sox_f64le_raw_stream",
+            "post_metadata_non_w64": "ffmpeg_direct",
+        },
+        "hash_format": "interleaved_depth_native_le_sha256",
+        "hash_codecs": {
+            "int24": "pcm_s24le",
+            "float32": "pcm_f32le",
+            "float64": "pcm_f64le",
+        },
+        "forbidden_route": "ffmpeg_direct_decode_of_float64_w64",
         "oracle_independence": "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode",
         "environment_policy": "clear_and_set",
         "environment": {"LC_ALL": "C"},
@@ -233,27 +250,169 @@ def verify_compiled_policy(path: Path) -> None:
 def verify_compiled_v7_routes(repository_root: Path) -> None:
     planner = (repository_root / "tonepoet-pipeline/src/dsd_reference.rs").read_text(encoding="utf-8")
     executor = (repository_root / "src/convert/pipeline/track_executor.rs").read_text(encoding="utf-8")
+    qualification = (
+        repository_root / "tests/dsd_reference_qualification.rs"
+    ).read_text(encoding="utf-8")
     manifest = (repository_root / "src/convert/pipeline/manifest.rs").read_text(encoding="utf-8")
     manifest_builder = (repository_root / "src/convert/pipeline/manifest_builder.rs").read_text(encoding="utf-8")
+
+    route_pattern = re.compile(
+        r"ReferenceDecodeRouteRule::new\(\s*"
+        r"ReferenceDecodeRoleClass::(\w+),\s*"
+        r"PcmBitDepth::(\w+),\s*"
+        r"ReferenceDecodeMechanism::(\w+),\s*"
+        r"ReferenceSampleHashEncoding::(\w+),?\s*\)",
+        re.MULTILINE,
+    )
+    actual_routes = set(route_pattern.findall(planner))
+    expected_routes = {
+        ("ReconstructionR64W64", "Float64", "SoxFloat64W64RawStream", "Float64Le"),
+        ("TerminalQpcmW64", "Int24", "DirectFfmpeg", "SignedInt24Le"),
+        ("TerminalQpcmW64", "Float32", "DirectFfmpeg", "Float32Le"),
+        ("TerminalQpcmW64", "Float64", "SoxFloat64W64RawStream", "Float64Le"),
+        ("PackagedW64", "Int24", "DirectFfmpeg", "SignedInt24Le"),
+        ("PackagedW64", "Float32", "DirectFfmpeg", "Float32Le"),
+        ("PackagedW64", "Float64", "SoxFloat64W64RawStream", "Float64Le"),
+        ("PackagedNonW64", "Int24", "DirectFfmpeg", "SignedInt24Le"),
+        ("PackagedNonW64", "Float32", "DirectFfmpeg", "Float32Le"),
+        ("PackagedNonW64", "Float64", "DirectFfmpeg", "Float64Le"),
+        ("PostMetadataW64", "Int24", "DirectFfmpeg", "SignedInt24Le"),
+        ("PostMetadataW64", "Float32", "DirectFfmpeg", "Float32Le"),
+        ("PostMetadataW64", "Float64", "SoxFloat64W64RawStream", "Float64Le"),
+        ("PostMetadataNonW64", "Int24", "DirectFfmpeg", "SignedInt24Le"),
+        ("PostMetadataNonW64", "Float32", "DirectFfmpeg", "Float32Le"),
+        ("PostMetadataNonW64", "Float64", "DirectFfmpeg", "Float64Le"),
+    }
+    if actual_routes != expected_routes:
+        missing = sorted(expected_routes - actual_routes)
+        extra = sorted(actual_routes - expected_routes)
+        raise AssertionError(
+            f"compiled v7 decode route table mismatch: missing={missing}, extra={extra}"
+        )
+    if len(route_pattern.findall(planner)) != len(expected_routes):
+        raise AssertionError("compiled v7 decode route table contains duplicate rules")
+    if "interleaved_depth_native_le_sha256" not in planner:
+        raise AssertionError("compiled v7 hash format is not depth-native")
+    if (
+        "pub struct ReferenceDecodeAuthority" not in planner
+        or "role: ReferenceDecodedSampleRole" not in planner
+        or "pub struct ReferenceDecodedCarrier" not in planner
+        or "path: PathBuf" not in planner
+        or "pub enum ReferenceDecodedCarrierSelector" not in planner
+        or "pub fn bind_decoded_carrier" not in planner
+    ):
+        raise AssertionError(
+            "compiled v7 route authority is not opaque, exact-path, and role-bound"
+        )
+    if "validate_reference_decode_mechanism" not in planner:
+        raise AssertionError("compiled v7 route validator is missing")
+
     required_planner = [
         "build_float64_wav_package_pipeline",
         "PlannedExecutionStep::Pipeline",
         "Float64 RIFF/RF64 packaging must use the qualified typed stream",
         "CommandEnvironmentPolicy::ClearAndSet",
-        '"raw".to_string()',
-        '"f64le".to_string()',
     ]
+    for marker in required_planner:
+        if marker not in planner:
+            raise AssertionError(f"compiled planner is missing v7 package marker: {marker}")
+
+    if "ReferenceSampleHashRoute" in executor:
+        raise AssertionError("executor still exposes caller-selected ReferenceSampleHashRoute")
     required_executor = [
-        "ReferenceSampleHashRoute::StreamFloat64W64ViaSoxRaw",
+        "build_reference_sample_hash_plan",
+        "carrier: &ReferenceDecodedCarrier",
+        "ReferenceDecodedCarrierSelector::PackagedOutput",
+        "ReferenceDecodedCarrierSelector::TerminalQpcm",
+        "ReferenceDecodedCarrierSelector::PostMetadataOutput",
+        "bind_decoded_carrier",
+        "artifact: &mut super::types::TrackArtifact",
         "build_reference_float64_w64_hash_pipeline",
-        "validate_reference_package_pipeline",
-        "build_reference_carrier_probe_command",
-        "build_reference_direct_hash_command",
         "post_metadata_verification_commands",
+        "for rule in tonepoet_pipeline::REFERENCE_DECODE_ROUTE_RULES",
+        "decode_routes.len()",
         "CommandEnvironmentPolicy::ClearAndSet",
-        '"raw".to_string()',
-        '"f64le".to_string()',
     ]
+    for marker in required_executor:
+        if marker not in executor:
+            raise AssertionError(f"compiled executor is missing v7 authority marker: {marker}")
+
+    carrier_only_signatures = {
+        "direct hash builder": (
+            r"fn\s+build_reference_direct_hash_command\(\s*"
+            r"carrier:\s*&ReferenceDecodedCarrier,\s*"
+            r"description:\s*&str,?\s*\)"
+        ),
+        "Float64 W64 hash builder": (
+            r"fn\s+build_reference_float64_w64_hash_pipeline\(\s*"
+            r"carrier:\s*&ReferenceDecodedCarrier,\s*"
+            r"description:\s*&str,?\s*\)"
+        ),
+        "sample hash planner": (
+            r"fn\s+build_reference_sample_hash_plan\(\s*"
+            r"carrier:\s*&ReferenceDecodedCarrier,\s*"
+            r"description:\s*&str,?\s*\)"
+        ),
+    }
+    for label, pattern in carrier_only_signatures.items():
+        if re.search(pattern, executor, re.MULTILINE) is None:
+            raise AssertionError(
+                f"compiled {label} does not accept only an exact-path carrier binding"
+            )
+
+    post_metadata_signature = (
+        r"pub\(crate\)\s+async\s+fn\s+verify_reference_output_after_metadata\(\s*"
+        r"artifact:\s*&mut\s+super::types::TrackArtifact,"
+    )
+    if re.search(post_metadata_signature, executor, re.MULTILINE) is None:
+        raise AssertionError(
+            "post-metadata verification still accepts a free-form path or evidence object"
+        )
+    post_metadata_binding = (
+        r"bind_decoded_carrier\(\s*"
+        r"ReferenceDecodedCarrierSelector::PostMetadataOutput,\s*&path,?\s*\)"
+    )
+    if re.search(post_metadata_binding, executor, re.MULTILINE) is None:
+        raise AssertionError(
+            "post-metadata verification does not bind the track artifact path to the plan"
+        )
+
+    mislabeled_carrier_regression = (
+        r"bind_decoded_carrier\(\s*"
+        r"ReferenceDecodedCarrierSelector::PackagedOutput,\s*"
+        r"&carrier_summary\.qpcm_path,?\s*\)"
+    )
+    if re.search(mislabeled_carrier_regression, qualification, re.MULTILINE) is None:
+        raise AssertionError(
+            "qualification does not reject QPCM W64 presented as a RIFF package carrier"
+        )
+
+    if '"sample_identity_oracle": qualification["sample_identity"].clone()' in qualification:
+        raise AssertionError("qualification report still copies declarative sample-identity policy")
+    required_qualification = [
+        "validate_reference_decode_mechanism",
+        "forbidden_float64_w64_direct_route_regression",
+        "measured_route_case_counts",
+        "measured_hash_encoding_case_counts",
+        "measured_terminal_realization_route_case_counts",
+        '"sample_identity_oracle": sample_identity_oracle',
+        "post_metadata_decode_authority",
+        "r64_decode_authority",
+        "qpcm_decode_authority",
+        "packaged_decode_authority",
+        "decoded_sample_hash(\n    carrier: &ReferenceDecodedCarrier",
+        "ReferenceDecodedCarrierSelector::PostMetadataOutput",
+        "mislabeled_carrier_regression",
+        "rejected_before_command_construction",
+        "for rule in REFERENCE_DECODE_ROUTE_RULES",
+        "rule.hash_encoding().key()",
+    ]
+    for marker in required_qualification:
+        if marker not in qualification:
+            raise AssertionError(
+                f"qualification harness is missing measured route authority: {marker}"
+            )
+
     required_manifest = [
         "executed_evidence_digest_v3",
         'skip_serializing_if = "is_zero_sha256_digest"',
@@ -265,12 +424,6 @@ def verify_compiled_v7_routes(repository_root: Path) -> None:
         "command.environment_policy",
         "command.environment",
     ]
-    for marker in required_planner:
-        if marker not in planner:
-            raise AssertionError(f"compiled planner is missing v7 route marker: {marker}")
-    for marker in required_executor:
-        if marker not in executor:
-            raise AssertionError(f"compiled executor is missing v7 route marker: {marker}")
     for marker in required_manifest:
         if marker not in manifest:
             raise AssertionError(f"compiled manifest is missing v7 authority marker: {marker}")

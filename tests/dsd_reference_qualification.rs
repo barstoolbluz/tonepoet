@@ -26,16 +26,18 @@ use tonepoet::convert::pipeline::{
 use tonepoet_pipeline::{
     build_reference_render_transcript_fixture, build_reference_silence_scan_command,
     extract_single_loudnorm_report, parse_reference_true_peak_measurement, plan_conversion,
-    plan_reference_dsd,
-    resolve_reference_deferred_command, validate_post_final_true_peak,
-    validate_signed_zero_f64le, AudioCodec, AudioFormat, BitDepthTarget, ConversionPlan, DbNano,
-    DsdInputFrontEnd, DsdReconstructionSelection, DsdReferencePolicyVersion, DsdSourceGainMode,
-    DsdSourceKind, Finalization, MeasurementId, MeasurementParser, PcmBitDepth, PlanAction,
-    PipelineSettings, PlanRequest, PlannedArg, PlannedCommand, PlannedExecutionStep, RateTarget,
-    ReferenceErrorCode, ResolvedDsdProfile,
-    ReferenceProgrammeScope, ResolvedGainPolicy, ResolvedOutputTarget, SampleKind,
-    SourceInfo, SourceRepresentationKind, ToolIdentifier, TruePeakMeasurement,
-    TruePeakPurpose, TruePeakValue, WavPackMode,
+    plan_reference_dsd, resolve_reference_deferred_command, validate_post_final_true_peak,
+    validate_reference_decode_mechanism, validate_signed_zero_f64le, AudioCodec, AudioFormat,
+    BitDepthTarget, ConversionPlan, DbNano, DsdInputFrontEnd, DsdReconstructionSelection,
+    DsdReferencePolicyVersion, DsdSourceGainMode, DsdSourceKind, FinalPcmContract, Finalization,
+    MeasurementId, MeasurementParser, PcmBitDepth, PlanAction, PipelineSettings, PlanRequest,
+    PlannedArg, PlannedCommand, PlannedExecutionStep, RateTarget, ReferenceDecodeAuthority,
+    ReferenceDecodeMechanism, ReferenceDecodedCarrier, ReferenceDecodedCarrierSelector,
+    ReferenceDecodedSampleRole, ReferenceDither, ReferenceErrorCode,
+    ReferenceProgrammeScope, ReferenceSampleHashEncoding, ResolvedDsdProfile,
+    ResolvedGainPolicy, ResolvedOutputTarget, SampleKind, SourceInfo, SourceRepresentationKind,
+    ToolIdentifier, TruePeakMeasurement, TruePeakPurpose, TruePeakValue, WavPackMode,
+    REFERENCE_DECODE_ROUTE_RULES, REFERENCE_SAMPLE_HASH_FORMAT,
 };
 
 const GATE: &str = "TONEPOET_REQUIRE_TOOLS";
@@ -484,6 +486,218 @@ fn assert_exact_package_probe(
     );
 }
 
+fn r64_decode_authority(final_pcm: FinalPcmContract) -> ReferenceDecodeAuthority {
+    tonepoet_pipeline::reference_decode_authority(
+        ReferenceDecodedSampleRole::ReconstructionR64W64,
+        FinalPcmContract {
+            sample_rate_hz: final_pcm.sample_rate_hz,
+            channels: final_pcm.channels,
+            sample_kind: SampleKind::Float,
+            bit_depth: PcmBitDepth::Float64,
+            dither: ReferenceDither::None,
+        },
+    )
+    .expect("qualified R64 decode authority")
+}
+
+fn qpcm_decode_authority(contract: FinalPcmContract) -> ReferenceDecodeAuthority {
+    tonepoet_pipeline::reference_decode_authority(
+        ReferenceDecodedSampleRole::TerminalQpcmW64,
+        contract,
+    )
+    .expect("qualified QPCM decode authority")
+}
+
+fn packaged_decode_authority(
+    target: ResolvedOutputTarget,
+    contract: FinalPcmContract,
+) -> ReferenceDecodeAuthority {
+    tonepoet_pipeline::reference_decode_authority(
+        ReferenceDecodedSampleRole::PackagedOutput { target },
+        contract,
+    )
+    .expect("qualified packaged-output decode authority")
+}
+
+fn post_metadata_decode_authority(
+    target: ResolvedOutputTarget,
+    contract: FinalPcmContract,
+) -> ReferenceDecodeAuthority {
+    tonepoet_pipeline::reference_decode_authority(
+        ReferenceDecodedSampleRole::PostMetadataOutput { target },
+        contract,
+    )
+    .expect("qualified post-metadata decode authority")
+}
+
+fn assert_qualification_decode_route_table() -> Value {
+    assert_eq!(REFERENCE_DECODE_ROUTE_RULES.len(), 16);
+    let int24 = FinalPcmContract {
+        sample_rate_hz: 176_400,
+        channels: 2,
+        sample_kind: SampleKind::SignedInteger,
+        bit_depth: PcmBitDepth::Int24,
+        dither: ReferenceDither::Tpdf,
+    };
+    let float32 = FinalPcmContract {
+        sample_kind: SampleKind::Float,
+        bit_depth: PcmBitDepth::Float32,
+        dither: ReferenceDither::None,
+        ..int24
+    };
+    let float64 = FinalPcmContract {
+        sample_kind: SampleKind::Float,
+        bit_depth: PcmBitDepth::Float64,
+        dither: ReferenceDither::None,
+        ..int24
+    };
+
+    assert_eq!(
+        qpcm_decode_authority(int24).mechanism(),
+        ReferenceDecodeMechanism::DirectFfmpeg
+    );
+    assert_eq!(
+        qpcm_decode_authority(float32).mechanism(),
+        ReferenceDecodeMechanism::DirectFfmpeg
+    );
+    assert_eq!(
+        qpcm_decode_authority(float64).mechanism(),
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream
+    );
+    assert_eq!(
+        packaged_decode_authority(ResolvedOutputTarget::WavW64, float64).mechanism(),
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream
+    );
+    assert_eq!(
+        packaged_decode_authority(ResolvedOutputTarget::WavRiff, float64).mechanism(),
+        ReferenceDecodeMechanism::DirectFfmpeg
+    );
+    assert_eq!(
+        packaged_decode_authority(ResolvedOutputTarget::WavRf64, float64).mechanism(),
+        ReferenceDecodeMechanism::DirectFfmpeg
+    );
+    assert_eq!(
+        qpcm_decode_authority(int24).hash_encoding(),
+        ReferenceSampleHashEncoding::SignedInt24Le
+    );
+    assert_eq!(
+        qpcm_decode_authority(float32).hash_encoding(),
+        ReferenceSampleHashEncoding::Float32Le
+    );
+    assert_eq!(
+        qpcm_decode_authority(float64).hash_encoding(),
+        ReferenceSampleHashEncoding::Float64Le
+    );
+    assert_eq!(
+        qpcm_decode_authority(float64).hash_format(),
+        REFERENCE_SAMPLE_HASH_FORMAT
+    );
+
+    let mut rejected_roles = Vec::new();
+    for (role, role_key) in [
+        (
+            ReferenceDecodedSampleRole::ReconstructionR64W64,
+            "r64_float64_w64",
+        ),
+        (
+            ReferenceDecodedSampleRole::TerminalQpcmW64,
+            "qpcm_float64_w64",
+        ),
+        (
+            ReferenceDecodedSampleRole::PackagedOutput {
+                target: ResolvedOutputTarget::WavW64,
+            },
+            "packaged_float64_w64",
+        ),
+        (
+            ReferenceDecodedSampleRole::PostMetadataOutput {
+                target: ResolvedOutputTarget::WavW64,
+            },
+            "post_metadata_float64_w64",
+        ),
+    ] {
+        let contract = if role == ReferenceDecodedSampleRole::ReconstructionR64W64 {
+            FinalPcmContract {
+                sample_rate_hz: float64.sample_rate_hz,
+                channels: float64.channels,
+                sample_kind: SampleKind::Float,
+                bit_depth: PcmBitDepth::Float64,
+                dither: ReferenceDither::None,
+            }
+        } else {
+            float64
+        };
+        let error = validate_reference_decode_mechanism(
+            role,
+            contract,
+            ReferenceDecodeMechanism::DirectFfmpeg,
+        )
+        .expect_err("direct FFmpeg must be rejected for every Float64 W64 role");
+        assert!(error.to_string().contains("required route is sox_f64le_raw_stream"));
+        rejected_roles.push(role_key);
+    }
+
+    let carrier_temp = TempDir::new().expect("carrier-binding regression tempdir");
+    let carrier_source = carrier_temp.path().join("source-placeholder.dsf");
+    let carrier_plan = planned_reference_cell(
+        carrier_temp.path(),
+        &carrier_source,
+        2_822_400,
+        88_200,
+        2,
+        PcmBitDepth::Float64,
+        ResolvedOutputTarget::WavRiff,
+        DsdReconstructionSelection::Reference,
+        DsdSourceGainMode::Reference,
+        None,
+        DbNano::DEFAULT_NORMALIZE_TARGET,
+        None,
+    );
+    let carrier_summary = carrier_plan.reference.as_ref().expect("Reference summary");
+    let mislabeled_error = carrier_summary
+        .bind_decoded_carrier(
+            ReferenceDecodedCarrierSelector::PackagedOutput,
+            &carrier_summary.qpcm_path,
+        )
+        .expect_err("Float64 QPCM W64 must not impersonate Float64 RIFF package");
+    assert!(mislabeled_error.to_string().contains("carrier path mismatch"));
+
+    serde_json::json!({
+        "status": "passed",
+        "attempted_mechanism": ReferenceDecodeMechanism::DirectFfmpeg.key(),
+        "required_mechanism": ReferenceDecodeMechanism::SoxFloat64W64RawStream.key(),
+        "rejected_role_count": rejected_roles.len(),
+        "rejected_roles": rejected_roles,
+        "mislabeled_carrier_regression": {
+            "status": "passed",
+            "attempted_path_role": "qpcm_w64_as_packaged_riff",
+            "rejected_before_command_construction": true,
+        },
+    })
+}
+
+fn qualification_decode_route_table_evidence() -> Value {
+    let mut routes = serde_json::Map::new();
+    for rule in REFERENCE_DECODE_ROUTE_RULES {
+        let key = format!(
+            "{}:{}",
+            rule.role_class().key(),
+            rule.hash_encoding().key(),
+        );
+        let previous = routes.insert(
+            key.clone(),
+            serde_json::json!({
+                "bit_depth": rule.bit_depth().bits(),
+                "mechanism": rule.mechanism().key(),
+                "hash_encoding": rule.hash_encoding().key(),
+            }),
+        );
+        assert!(previous.is_none(), "duplicate route-evidence key {key}");
+    }
+    assert_eq!(routes.len(), REFERENCE_DECODE_ROUTE_RULES.len());
+    Value::Object(routes)
+}
+
 fn ffmpeg_sample_hash(ffmpeg: &Path, input: &Path, pcm_codec: &str) -> String {
     let output = run(
         ffmpeg,
@@ -517,6 +731,35 @@ fn ffmpeg_sample_hash(ffmpeg: &Path, input: &Path, pcm_codec: &str) -> String {
         .unwrap_or_else(|| panic!("FFmpeg hash output was missing SHA256=: {}", combined(&output)))
 }
 
+fn decoded_sample_hash(
+    carrier: &ReferenceDecodedCarrier,
+    sox: &Path,
+    ffmpeg: &Path,
+) -> String {
+    let authority = carrier.authority();
+    let contract = authority.contract();
+    match authority.mechanism() {
+        ReferenceDecodeMechanism::DirectFfmpeg => ffmpeg_sample_hash(
+            ffmpeg,
+            carrier.path(),
+            authority.hash_encoding().ffmpeg_codec(),
+        ),
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream => {
+            assert_eq!(
+                authority.hash_encoding(),
+                ReferenceSampleHashEncoding::Float64Le,
+                "the streamed W64 route is reserved for Float64"
+            );
+            sox_streamed_float64_w64_sample_hash(
+                sox,
+                ffmpeg,
+                carrier.path(),
+                contract.sample_rate_hz,
+                contract.channels,
+            )
+        }
+    }
+}
 
 fn sox_streamed_float64_w64_sample_hash(
     sox: &Path,
@@ -1253,11 +1496,65 @@ fn assert_production_plan_structure(
             _ => None,
         })
         .collect();
+    let package_pipelines: Vec<_> = steps
+        .iter()
+        .skip(1)
+        .filter_map(|step| match step {
+            PlannedExecutionStep::Pipeline(pipeline) => Some(pipeline),
+            _ => None,
+        })
+        .collect();
+    let float64_wav_pipeline_target = summary.final_pcm.bit_depth == PcmBitDepth::Float64
+        && matches!(
+            summary.target,
+            ResolvedOutputTarget::WavRiff | ResolvedOutputTarget::WavRf64
+        );
     if summary.target == ResolvedOutputTarget::WavW64 {
         assert!(packages.is_empty());
+        assert!(package_pipelines.is_empty());
         assert_eq!(summary.qpcm_path, summary.packaged_path);
+    } else if float64_wav_pipeline_target {
+        // Float64 RIFF/RF64 packaging is a typed two-process pipeline: the
+        // defective direct FFmpeg f64-W64 decode route is forbidden, so the
+        // producer streams raw f64le and FFmpeg consumes stdin.
+        assert!(packages.is_empty());
+        assert_eq!(package_pipelines.len(), 1);
+        let pipeline = package_pipelines[0];
+        assert!(matches!(&pipeline.producer.tool, ToolIdentifier::Sox));
+        assert!(matches!(&pipeline.consumer.tool, ToolIdentifier::Ffmpeg));
+        // Raw f64le stdin has no header, so `-ar`/`-ac` are mandatory
+        // INPUT-side declarations and must precede `-i`; they are not
+        // resampling requests. Filter/resample flags remain forbidden.
+        assert!(!pipeline.consumer.args.iter().any(|arg| matches!(
+            arg.as_str(),
+            "-af" | "-filter:a" | "-sample_fmt"
+        )));
+        let input_index = pipeline
+            .consumer
+            .args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("pipeline consumer declares -i");
+        let ar_index = pipeline
+            .consumer
+            .args
+            .iter()
+            .position(|arg| arg == "-ar")
+            .expect("raw f64le consumer declares -ar");
+        assert!(
+            ar_index < input_index,
+            "-ar must be an input-side declaration, not an output resample"
+        );
+        assert!(
+            !pipeline.consumer.args[input_index..]
+                .iter()
+                .any(|arg| arg == "-ar"),
+            "no output-side -ar (resample) is permitted"
+        );
+        assert!(expected_compression_level.is_none());
     } else {
         assert_eq!(packages.len(), 1);
+        assert!(package_pipelines.is_empty());
         let package = packages[0];
         assert!(matches!(&package.tool, ToolIdentifier::Ffmpeg));
         assert!(!package.args.iter().any(|arg| matches!(
@@ -2090,11 +2387,14 @@ fn qualify_analyzer_carrier_contract() -> Value {
     assert_eq!(&streamed.stdout[8..12], b"WAVE");
     let streamed_wav = root.join("captured-f64-analyzer-carrier.wav");
     fs::write(&streamed_wav, &streamed.stdout).expect("write captured analyzer stream");
-    let f64_source_sample_bits = sox_f64_samples(&sox, &f64_summary.r64_path)
+    let f64_source_sample_bits = streamed_float64_w64_f64_samples(
+        &sox,
+        &f64_summary.r64_path,
+    )
         .into_iter()
         .map(f64::to_bits)
         .collect::<Vec<_>>();
-    let f64_streamed_sample_bits = sox_f64_samples(&sox, &streamed_wav)
+    let f64_streamed_sample_bits = direct_ffmpeg_f64_samples(&ffmpeg, &streamed_wav)
         .into_iter()
         .map(f64::to_bits)
         .collect::<Vec<_>>();
@@ -2611,33 +2911,85 @@ fn execute_planned_terminal_chain(
     })
 }
 
-fn sox_f64_samples(sox: &Path, input: &Path) -> Vec<f64> {
-    let output = run(
-        sox,
-        &[
-            "-D".to_string(),
-            input.display().to_string(),
-            "-t".to_string(),
-            "f64".to_string(),
-            "-L".to_string(),
-            "-e".to_string(),
-            "floating-point".to_string(),
-            "-b".to_string(),
-            "64".to_string(),
-            "-".to_string(),
-        ],
+fn decode_f64le_samples(output: &Output, route: ReferenceDecodeMechanism) -> Vec<f64> {
+    assert!(
+        !output.stdout.is_empty(),
+        "{route:?} produced no decoded samples"
     );
-    assert!(!output.stdout.is_empty(), "SoX produced no decoded samples");
     assert_eq!(
         output.stdout.len() % 8,
         0,
-        "SoX produced a truncated f64 stream"
+        "{route:?} produced a truncated f64le stream"
     );
     output
         .stdout
         .chunks_exact(8)
         .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("f64 sample width")))
         .collect()
+}
+
+fn direct_ffmpeg_f64_samples(ffmpeg: &Path, input: &Path) -> Vec<f64> {
+    let route = ReferenceDecodeMechanism::DirectFfmpeg;
+    let output = run(
+        ffmpeg,
+        &[
+            "-nostdin".to_string(),
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            input.display().to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-map_metadata".to_string(),
+            "-1".to_string(),
+            "-vn".to_string(),
+            "-sn".to_string(),
+            "-dn".to_string(),
+            "-c:a".to_string(),
+            "pcm_f64le".to_string(),
+            "-f".to_string(),
+            "f64le".to_string(),
+            "-".to_string(),
+        ],
+    );
+    decode_f64le_samples(&output, route)
+}
+
+fn streamed_float64_w64_f64_samples(sox: &Path, input: &Path) -> Vec<f64> {
+    let route = ReferenceDecodeMechanism::SoxFloat64W64RawStream;
+    let output = run(
+        sox,
+        &[
+            "-S".to_string(),
+            "-D".to_string(),
+            input.display().to_string(),
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-L".to_string(),
+            "-".to_string(),
+        ],
+    );
+    decode_f64le_samples(&output, route)
+}
+
+fn decoded_f64_samples(
+    carrier: &ReferenceDecodedCarrier,
+    sox: &Path,
+    ffmpeg: &Path,
+) -> Vec<f64> {
+    match carrier.authority().mechanism() {
+        ReferenceDecodeMechanism::DirectFfmpeg => {
+            direct_ffmpeg_f64_samples(ffmpeg, carrier.path())
+        }
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream => {
+            streamed_float64_w64_f64_samples(sox, carrier.path())
+        }
+    }
 }
 
 fn terminal_bound_q63(policy: ResolvedGainPolicy) -> u64 {
@@ -2655,6 +3007,7 @@ fn terminal_bound_q63(policy: ResolvedGainPolicy) -> u64 {
 
 fn assert_terminal_realization_bound(
     sox: &Path,
+    ffmpeg: &Path,
     summary: &tonepoet_pipeline::DsdReferencePlanSummary,
     terminal_args: &[String],
 ) -> f64 {
@@ -2663,8 +3016,14 @@ fn assert_terminal_realization_bound(
         .parse::<f64>()
         .expect("Reference gain token parses as f64");
     let gain = 10_f64.powf(gain_db / 20.0);
-    let input = sox_f64_samples(sox, &summary.r64_path);
-    let output = sox_f64_samples(sox, &summary.qpcm_path);
+    let input_carrier = summary
+        .decoded_carrier(ReferenceDecodedCarrierSelector::ReconstructionR64)
+        .expect("qualified R64 carrier binding");
+    let output_carrier = summary
+        .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+        .expect("qualified QPCM carrier binding");
+    let input = decoded_f64_samples(&input_carrier, sox, ffmpeg);
+    let output = decoded_f64_samples(&output_carrier, sox, ffmpeg);
     assert_eq!(input.len(), output.len(), "terminal realization changed duration/channels");
     let observed = input
         .iter()
@@ -2714,27 +3073,56 @@ fn package_stream_copy_metadata_args(input: &Path, output: &Path, target: &str) 
     args
 }
 
-fn qualify_lossless_package_cells() -> (usize, usize) {
+struct PackageQualificationEvidence {
+    case_count: usize,
+    terminal_bound_case_count: usize,
+    sample_identity_oracle: Value,
+}
+
+fn record_decode_authority(
+    route_counts: &mut BTreeMap<String, usize>,
+    encoding_counts: &mut BTreeMap<String, usize>,
+    phase: &str,
+    authority: ReferenceDecodeAuthority,
+) {
+    assert_eq!(authority.hash_format(), REFERENCE_SAMPLE_HASH_FORMAT);
+    *route_counts
+        .entry(format!("{phase}:{}", authority.mechanism().key()))
+        .or_default() += 1;
+    *encoding_counts
+        .entry(format!("{phase}:{}", authority.hash_encoding().key()))
+        .or_default() += 1;
+}
+
+fn qualify_lossless_package_cells(
+    forbidden_route_regression: Value,
+) -> PackageQualificationEvidence {
     let sox = required_tool(SOX_ENV);
     let ffmpeg = required_tool(FFMPEG_ENV);
     let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
     let temp = TempDir::new().expect("package qualification tempdir");
     let mut case_count = 0_usize;
     let mut terminal_bound_cells = BTreeSet::new();
+    let mut route_counts = BTreeMap::<String, usize>::new();
+    let mut encoding_counts = BTreeMap::<String, usize>::new();
+    let mut terminal_route_counts = BTreeMap::<String, usize>::new();
+    let mut independent_float64_riff_rf64_case_count = 0_usize;
+    let mut package_identity_comparison_count = 0_usize;
+    let mut post_metadata_identity_comparison_count = 0_usize;
 
     let rates = [
         44_100_u32, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
         705_600, 768_000,
     ];
     let depths = [
-        (PcmBitDepth::Int24, "int24", "pcm_s24le"),
-        (PcmBitDepth::Float32, "float32", "pcm_f32le"),
-        (PcmBitDepth::Float64, "float64", "pcm_f64le"),
+        (PcmBitDepth::Int24, "int24"),
+        (PcmBitDepth::Float32, "float32"),
+        (PcmBitDepth::Float64, "float64"),
     ];
 
     for sample_rate_hz in rates {
         for channels in [1_u16, 2_u16] {
-            for (depth, depth_key, pcm_codec) in depths {
+            for (depth, depth_key) in depths {
                 let targets: Vec<(ResolvedOutputTarget, Vec<Option<u8>>)> =
                     if matches!(depth, PcmBitDepth::Float32 | PcmBitDepth::Float64) {
                         vec![
@@ -2800,8 +3188,24 @@ fn qualify_lossless_package_cells() -> (usize, usize) {
                         )
                         .unwrap_or_else(|error| panic!("production chain failed: {error}"));
                         if terminal_bound_cells.insert((sample_rate_hz, channels, depth)) {
+                            let r64_authority = r64_decode_authority(summary.final_pcm);
+                            let terminal_qpcm_authority =
+                                qpcm_decode_authority(summary.final_pcm);
+                            *terminal_route_counts
+                                .entry(format!(
+                                    "r64:{}",
+                                    r64_authority.mechanism().key(),
+                                ))
+                                .or_default() += 1;
+                            *terminal_route_counts
+                                .entry(format!(
+                                    "qpcm:{}",
+                                    terminal_qpcm_authority.mechanism().key(),
+                                ))
+                                .or_default() += 1;
                             let observed = assert_terminal_realization_bound(
                                 &sox,
+                                &ffmpeg,
                                 summary,
                                 &chain.terminal_args,
                             );
@@ -2816,36 +3220,55 @@ fn qualify_lossless_package_cells() -> (usize, usize) {
                             sample_rate_hz,
                             channels,
                         );
-                        let qpcm_hash = if depth == PcmBitDepth::Float64 {
-                            sox_streamed_float64_w64_sample_hash(
-                                &sox,
-                                &ffmpeg,
-                                &summary.qpcm_path,
-                                sample_rate_hz,
-                                channels,
+                        let qpcm_authority = qpcm_decode_authority(summary.final_pcm);
+                        let packaged_authority =
+                            packaged_decode_authority(target, summary.final_pcm);
+                        record_decode_authority(
+                            &mut route_counts,
+                            &mut encoding_counts,
+                            "qpcm",
+                            qpcm_authority,
+                        );
+                        record_decode_authority(
+                            &mut route_counts,
+                            &mut encoding_counts,
+                            "packaged",
+                            packaged_authority,
+                        );
+                        if depth == PcmBitDepth::Float64
+                            && matches!(
+                                target,
+                                ResolvedOutputTarget::WavRiff | ResolvedOutputTarget::WavRf64
                             )
-                        } else {
-                            ffmpeg_sample_hash(&ffmpeg, &summary.qpcm_path, pcm_codec)
-                        };
-                        let packaged_hash = if target == ResolvedOutputTarget::WavW64
-                            && depth == PcmBitDepth::Float64
                         {
-                            sox_streamed_float64_w64_sample_hash(
-                                &sox,
-                                &ffmpeg,
-                                packaged,
-                                sample_rate_hz,
-                                channels,
-                            )
-                        } else {
-                            ffmpeg_sample_hash(&ffmpeg, packaged, pcm_codec)
-                        };
+                            assert_eq!(
+                                qpcm_authority.mechanism(),
+                                ReferenceDecodeMechanism::SoxFloat64W64RawStream
+                            );
+                            assert_eq!(
+                                packaged_authority.mechanism(),
+                                ReferenceDecodeMechanism::DirectFfmpeg
+                            );
+                            independent_float64_riff_rf64_case_count += 1;
+                        }
+                        let qpcm_carrier = summary
+                            .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+                            .expect("qualified QPCM carrier binding");
+                        let packaged_carrier = summary
+                            .decoded_carrier(ReferenceDecodedCarrierSelector::PackagedOutput)
+                            .expect("qualified packaged carrier binding");
+                        assert_eq!(qpcm_carrier.authority(), qpcm_authority);
+                        assert_eq!(packaged_carrier.authority(), packaged_authority);
+                        let qpcm_hash = decoded_sample_hash(&qpcm_carrier, &sox, &ffmpeg);
+                        let packaged_hash =
+                            decoded_sample_hash(&packaged_carrier, &sox, &ffmpeg);
                         assert_eq!(
                             packaged_hash,
                             qpcm_hash,
                             "decoded samples changed for {}",
                             case_root.display()
                         );
+                        package_identity_comparison_count += 1;
                         let dither_tail: &[&str] = match depth {
                             PcmBitDepth::Int24 => &["dither"],
                             PcmBitDepth::Float32 | PcmBitDepth::Float64 => &[],
@@ -2939,24 +3362,31 @@ fn qualify_lossless_package_cells() -> (usize, usize) {
                             &ffmpeg,
                             &package_stream_copy_metadata_args(packaged, &tagged, target_key(target)),
                         );
-                        let tagged_hash = if target == ResolvedOutputTarget::WavW64
-                            && depth == PcmBitDepth::Float64
-                        {
-                            sox_streamed_float64_w64_sample_hash(
-                                &sox,
-                                &ffmpeg,
+                        let post_metadata_authority =
+                            post_metadata_decode_authority(target, summary.final_pcm);
+                        record_decode_authority(
+                            &mut route_counts,
+                            &mut encoding_counts,
+                            "post_metadata",
+                            post_metadata_authority,
+                        );
+                        let mut post_metadata_summary = summary.clone();
+                        post_metadata_summary.delivered_path = tagged.clone();
+                        let tagged_carrier = post_metadata_summary
+                            .bind_decoded_carrier(
+                                ReferenceDecodedCarrierSelector::PostMetadataOutput,
                                 &tagged,
-                                sample_rate_hz,
-                                channels,
                             )
-                        } else {
-                            ffmpeg_sample_hash(&ffmpeg, &tagged, pcm_codec)
-                        };
+                            .expect("qualified post-metadata carrier binding");
+                        assert_eq!(tagged_carrier.authority(), post_metadata_authority);
+                        let tagged_hash =
+                            decoded_sample_hash(&tagged_carrier, &sox, &ffmpeg);
                         assert_eq!(
                             tagged_hash,
                             qpcm_hash,
                             "test-only package stream-copy metadata rewrite changed decoded samples"
                         );
+                        post_metadata_identity_comparison_count += 1;
                         let generated = BTreeSet::from([
                             summary.r64_path.clone(),
                             summary.qpcm_path.clone(),
@@ -2978,7 +3408,67 @@ fn qualify_lossless_package_cells() -> (usize, usize) {
     }
     assert_eq!(case_count, 480);
     assert_eq!(terminal_bound_cells.len(), 60);
-    (case_count, terminal_bound_cells.len())
+    assert_eq!(package_identity_comparison_count, 480);
+    assert_eq!(post_metadata_identity_comparison_count, 480);
+    assert_eq!(independent_float64_riff_rf64_case_count, 40);
+    assert_eq!(
+        terminal_route_counts,
+        BTreeMap::from([
+            ("qpcm:ffmpeg_direct".to_string(), 40),
+            ("qpcm:sox_f64le_raw_stream".to_string(), 20),
+            ("r64:sox_f64le_raw_stream".to_string(), 60),
+        ])
+    );
+    assert_eq!(
+        route_counts,
+        BTreeMap::from([
+            ("packaged:ffmpeg_direct".to_string(), 460),
+            ("packaged:sox_f64le_raw_stream".to_string(), 20),
+            ("post_metadata:ffmpeg_direct".to_string(), 460),
+            ("post_metadata:sox_f64le_raw_stream".to_string(), 20),
+            ("qpcm:ffmpeg_direct".to_string(), 420),
+            ("qpcm:sox_f64le_raw_stream".to_string(), 60),
+        ])
+    );
+    assert_eq!(
+        encoding_counts,
+        BTreeMap::from([
+            ("packaged:float32_le".to_string(), 60),
+            ("packaged:float64_le".to_string(), 60),
+            ("packaged:int24_le".to_string(), 360),
+            ("post_metadata:float32_le".to_string(), 60),
+            ("post_metadata:float64_le".to_string(), 60),
+            ("post_metadata:int24_le".to_string(), 360),
+            ("qpcm:float32_le".to_string(), 60),
+            ("qpcm:float64_le".to_string(), 60),
+            ("qpcm:int24_le".to_string(), 360),
+        ])
+    );
+
+    PackageQualificationEvidence {
+        case_count,
+        terminal_bound_case_count: terminal_bound_cells.len(),
+        sample_identity_oracle: serde_json::json!({
+            "schema": "tonepoet-reference-sample-identity-oracle/v2",
+            "status": "passed",
+            "route_authority": "typed_plan_carrier_path_role_target_depth_v2",
+            "hash_format": REFERENCE_SAMPLE_HASH_FORMAT,
+            "hash_codecs": {
+                "int24": ReferenceSampleHashEncoding::SignedInt24Le.ffmpeg_codec(),
+                "float32": ReferenceSampleHashEncoding::Float32Le.ffmpeg_codec(),
+                "float64": ReferenceSampleHashEncoding::Float64Le.ffmpeg_codec(),
+            },
+            "measured_route_case_counts": route_counts,
+            "measured_hash_encoding_case_counts": encoding_counts,
+            "measured_terminal_realization_route_case_counts": terminal_route_counts,
+            "package_identity_comparison_count": package_identity_comparison_count,
+            "post_metadata_identity_comparison_count": post_metadata_identity_comparison_count,
+            "independent_float64_riff_rf64_case_count": independent_float64_riff_rf64_case_count,
+            "forbidden_float64_w64_direct_route_regression": forbidden_route_regression,
+            "oracle_independence":
+                "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode",
+        }),
+    }
 }
 
 fn gain_arg(args: &[String]) -> Option<&str> {
@@ -3385,9 +3875,15 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
     assert!(end_to_end_summary.qpcm_path.is_file());
     assert!(end_to_end_summary.packaged_path.is_file());
     assert!(end_to_end.package_args.is_some());
+    let end_to_end_packaged = end_to_end_summary
+        .decoded_carrier(ReferenceDecodedCarrierSelector::PackagedOutput)
+        .expect("end-to-end packaged carrier binding");
+    let end_to_end_qpcm = end_to_end_summary
+        .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+        .expect("end-to-end QPCM carrier binding");
     assert_eq!(
-        ffmpeg_sample_hash(&ffmpeg, &end_to_end_summary.packaged_path, "pcm_s24le"),
-        ffmpeg_sample_hash(&ffmpeg, &end_to_end_summary.qpcm_path, "pcm_s24le"),
+        decoded_sample_hash(&end_to_end_packaged, &sox, &ffmpeg),
+        decoded_sample_hash(&end_to_end_qpcm, &sox, &ffmpeg),
         "planner render end-to-end package changed terminal samples",
     );
     results.insert(
@@ -3549,7 +4045,10 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
     synth_r64_fixture(&sox, &summary.r64_path, 44_100, 1, "0.000", true);
     let chain = execute_planned_terminal_chain(&plan, &sox, &ffmpeg, &root, false)
         .unwrap_or_else(|error| panic!("Int24 TPDF production chain failed: {error}"));
-    let samples = sox_f64_samples(&sox, &summary.qpcm_path);
+    let qpcm_carrier = summary
+        .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+        .expect("Int24 TPDF QPCM carrier binding");
+    let samples = decoded_f64_samples(&qpcm_carrier, &sox, &ffmpeg);
     let max_abs = samples.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
     let bound = terminal_bound_q63(summary.gain_policy) as f64
         / 9_223_372_036_854_775_808.0_f64;
@@ -4811,9 +5310,15 @@ fn complete_p0_reference_qualification_report() {
         eprintln!("skipping; set {GATE}=1 to run the mandatory real-tool Reference qualification");
         return;
     }
+    let forbidden_route_regression = assert_qualification_decode_route_table();
+    let decode_route_table = qualification_decode_route_table_evidence();
     let default_settings_live_smoke = qualify_default_settings_dsd64_dsf_to_flac();
     let environment_probe_results = qualify_subprocess_environment_isolation();
-    let (package_case_count, terminal_bound_case_count) = qualify_lossless_package_cells();
+    let PackageQualificationEvidence {
+        case_count: package_case_count,
+        terminal_bound_case_count,
+        sample_identity_oracle,
+    } = qualify_lossless_package_cells(forbidden_route_regression);
     let analyzer_carrier_results = qualify_analyzer_carrier_contract();
     let analyzer_results = qualify_true_peak_analyzer_authority();
     let gain_terminal_results = qualify_production_measurement_gain_terminal_chain();
@@ -4886,7 +5391,7 @@ fn complete_p0_reference_qualification_report() {
         "terminal_bounds": qualification["terminal_bounds"].clone(),
         "riff_capacity": qualification["riff_capacity"].clone(),
         "float64_package_pipeline": qualification["packaging"].clone(),
-        "sample_identity_oracle": qualification["sample_identity"].clone(),
+        "sample_identity_oracle": sample_identity_oracle,
         "evidence_command_environment": {
             "status": "passed",
             "policy": qualification["subprocess_environment"].clone(),
@@ -4894,6 +5399,7 @@ fn complete_p0_reference_qualification_report() {
         },
         "package_decode_back": {
             "status": "passed",
+            "decode_route_table": decode_route_table,
             "case_count": package_case_count,
             "empirical_terminal_bound_case_count": terminal_bound_case_count,
             "rates_hz": [44100,48000,88200,96000,176400,192000,352800,384000,705600,768000],

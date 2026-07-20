@@ -896,6 +896,533 @@ pub struct FinalPcmContract {
     pub dither: ReferenceDither,
 }
 
+/// Canonical byte contract for decoded-sample SHA-256 evidence.
+///
+/// Samples are interleaved, little-endian, and encoded at the terminal depth:
+/// Int24 as `pcm_s24le`, Float32 as `pcm_f32le`, and Float64 as `pcm_f64le`.
+pub const REFERENCE_SAMPLE_HASH_FORMAT: &str = "interleaved_depth_native_le_sha256";
+
+/// Semantic role of a carrier whose decoded samples are inspected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReferenceDecodedSampleRole {
+    /// Planner-owned Float64 W64 reconstruction carrier before terminal realization.
+    ReconstructionR64W64,
+    /// Planner-owned W64 terminal PCM carrier.
+    TerminalQpcmW64,
+    /// Planner-owned lossless package before metadata mutation.
+    PackagedOutput {
+        /// Exact output target and therefore exact carrier/container identity.
+        target: ResolvedOutputTarget,
+    },
+    /// Delivered output after metadata, artwork, and ReplayGain mutation.
+    PostMetadataOutput {
+        /// Exact output target and therefore exact carrier/container identity.
+        target: ResolvedOutputTarget,
+    },
+}
+
+/// Closed selector for planner-owned carriers whose decoded samples are inspected.
+///
+/// The selector does not contain a path. `DsdReferencePlanSummary` resolves the
+/// selector to both the exact planner-owned path and its semantic role, so callers
+/// cannot pair an arbitrary path with a more permissive decode authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReferenceDecodedCarrierSelector {
+    /// Planner-owned Float64 W64 reconstruction carrier.
+    ReconstructionR64,
+    /// Planner-owned terminal QPCM W64 carrier.
+    TerminalQpcm,
+    /// Planner-owned lossless package before finalization and metadata mutation.
+    PackagedOutput,
+    /// Planner-owned delivered output after finalization and metadata mutation.
+    PostMetadataOutput,
+}
+
+impl ReferenceDecodedCarrierSelector {
+    /// Stable diagnostic key.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::ReconstructionR64 => "reconstruction_r64",
+            Self::TerminalQpcm => "terminal_qpcm",
+            Self::PackagedOutput => "packaged_output",
+            Self::PostMetadataOutput => "post_metadata_output",
+        }
+    }
+}
+
+/// Normalized role/carrier class used by the immutable decode rule table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReferenceDecodeRoleClass {
+    /// Float64 reconstruction W64.
+    ReconstructionR64W64,
+    /// Terminal QPCM W64.
+    TerminalQpcmW64,
+    /// Packaged W64 before metadata mutation.
+    PackagedW64,
+    /// Packaged non-W64 output before metadata mutation.
+    PackagedNonW64,
+    /// Delivered W64 after metadata mutation.
+    PostMetadataW64,
+    /// Delivered non-W64 output after metadata mutation.
+    PostMetadataNonW64,
+}
+
+impl ReferenceDecodeRoleClass {
+    /// Stable evidence key.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::ReconstructionR64W64 => "r64_float64_w64",
+            Self::TerminalQpcmW64 => "qpcm_w64",
+            Self::PackagedW64 => "packaged_w64",
+            Self::PackagedNonW64 => "packaged_non_w64",
+            Self::PostMetadataW64 => "post_metadata_w64",
+            Self::PostMetadataNonW64 => "post_metadata_non_w64",
+        }
+    }
+}
+
+/// Authorized decoder mechanism for one carrier role and terminal depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReferenceDecodeMechanism {
+    /// Decode the carrier directly with FFmpeg.
+    DirectFfmpeg,
+    /// Decode Float64 W64 with SoX-ng to headerless little-endian raw f64.
+    SoxFloat64W64RawStream,
+}
+
+impl ReferenceDecodeMechanism {
+    /// Stable evidence key.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::DirectFfmpeg => "ffmpeg_direct",
+            Self::SoxFloat64W64RawStream => "sox_f64le_raw_stream",
+        }
+    }
+}
+
+/// Exact depth-native encoding hashed by FFmpeg's SHA-256 sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReferenceSampleHashEncoding {
+    /// Signed 24-bit little-endian PCM.
+    SignedInt24Le,
+    /// IEEE-754 binary32 little-endian PCM.
+    Float32Le,
+    /// IEEE-754 binary64 little-endian PCM.
+    Float64Le,
+}
+
+impl ReferenceSampleHashEncoding {
+    /// FFmpeg codec name that materializes the canonical hash bytes.
+    #[must_use]
+    pub const fn ffmpeg_codec(self) -> &'static str {
+        match self {
+            Self::SignedInt24Le => "pcm_s24le",
+            Self::Float32Le => "pcm_f32le",
+            Self::Float64Le => "pcm_f64le",
+        }
+    }
+
+    /// Stable evidence key.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::SignedInt24Le => "int24_le",
+            Self::Float32Le => "float32_le",
+            Self::Float64Le => "float64_le",
+        }
+    }
+}
+
+/// One immutable carrier-role/depth decoder rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReferenceDecodeRouteRule {
+    role_class: ReferenceDecodeRoleClass,
+    bit_depth: PcmBitDepth,
+    mechanism: ReferenceDecodeMechanism,
+    hash_encoding: ReferenceSampleHashEncoding,
+}
+
+impl ReferenceDecodeRouteRule {
+    const fn new(
+        role_class: ReferenceDecodeRoleClass,
+        bit_depth: PcmBitDepth,
+        mechanism: ReferenceDecodeMechanism,
+        hash_encoding: ReferenceSampleHashEncoding,
+    ) -> Self {
+        Self {
+            role_class,
+            bit_depth,
+            mechanism,
+            hash_encoding,
+        }
+    }
+
+    /// Normalized carrier role.
+    #[must_use]
+    pub const fn role_class(self) -> ReferenceDecodeRoleClass {
+        self.role_class
+    }
+
+    /// Terminal depth whose decoded bytes are inspected.
+    #[must_use]
+    pub const fn bit_depth(self) -> PcmBitDepth {
+        self.bit_depth
+    }
+
+    /// Authorized decoder mechanism.
+    #[must_use]
+    pub const fn mechanism(self) -> ReferenceDecodeMechanism {
+        self.mechanism
+    }
+
+    /// Exact depth-native bytes hashed after decoding.
+    #[must_use]
+    pub const fn hash_encoding(self) -> ReferenceSampleHashEncoding {
+        self.hash_encoding
+    }
+}
+
+/// Complete immutable v7 decoder authority.
+///
+/// The rule table is deliberately exhaustive for every admitted terminal depth
+/// and every production or qualification carrier role. Float64 W64 never has a
+/// direct-FFmpeg rule.
+pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 16] = [
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::ReconstructionR64W64,
+        PcmBitDepth::Float64,
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+        ReferenceSampleHashEncoding::Float64Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::TerminalQpcmW64,
+        PcmBitDepth::Int24,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::TerminalQpcmW64,
+        PcmBitDepth::Float32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::Float32Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::TerminalQpcmW64,
+        PcmBitDepth::Float64,
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+        ReferenceSampleHashEncoding::Float64Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedW64,
+        PcmBitDepth::Int24,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedW64,
+        PcmBitDepth::Float32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::Float32Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedW64,
+        PcmBitDepth::Float64,
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+        ReferenceSampleHashEncoding::Float64Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedNonW64,
+        PcmBitDepth::Int24,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedNonW64,
+        PcmBitDepth::Float32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::Float32Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedNonW64,
+        PcmBitDepth::Float64,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::Float64Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataW64,
+        PcmBitDepth::Int24,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataW64,
+        PcmBitDepth::Float32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::Float32Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataW64,
+        PcmBitDepth::Float64,
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+        ReferenceSampleHashEncoding::Float64Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataNonW64,
+        PcmBitDepth::Int24,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataNonW64,
+        PcmBitDepth::Float32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::Float32Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataNonW64,
+        PcmBitDepth::Float64,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::Float64Le,
+    ),
+];
+
+/// Failure to authorize a decoded-sample route under the immutable v7 table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceDecodeAuthorityError {
+    message: String,
+}
+
+impl ReferenceDecodeAuthorityError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ReferenceDecodeAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReferenceDecodeAuthorityError {}
+
+/// Opaque proof that one carrier role, target, and depth has an admitted route.
+///
+/// Callers cannot construct this value directly. Executable command builders do
+/// not accept this mechanism proof on its own; they accept a
+/// `ReferenceDecodedCarrier`, which additionally binds the exact planner-owned
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReferenceDecodeAuthority {
+    role: ReferenceDecodedSampleRole,
+    role_class: ReferenceDecodeRoleClass,
+    contract: FinalPcmContract,
+    mechanism: ReferenceDecodeMechanism,
+    hash_encoding: ReferenceSampleHashEncoding,
+}
+
+impl ReferenceDecodeAuthority {
+    /// Original semantic carrier role.
+    #[must_use]
+    pub const fn role(self) -> ReferenceDecodedSampleRole {
+        self.role
+    }
+
+    /// Normalized role/carrier class selected by the rule table.
+    #[must_use]
+    pub const fn role_class(self) -> ReferenceDecodeRoleClass {
+        self.role_class
+    }
+
+    /// Exact PCM contract bound into the authority.
+    #[must_use]
+    pub const fn contract(self) -> FinalPcmContract {
+        self.contract
+    }
+
+    /// Authorized decoder mechanism.
+    #[must_use]
+    pub const fn mechanism(self) -> ReferenceDecodeMechanism {
+        self.mechanism
+    }
+
+    /// Exact depth-native bytes hashed after decoding.
+    #[must_use]
+    pub const fn hash_encoding(self) -> ReferenceSampleHashEncoding {
+        self.hash_encoding
+    }
+
+    /// Canonical hash-format identifier.
+    #[must_use]
+    pub const fn hash_format(self) -> &'static str {
+        REFERENCE_SAMPLE_HASH_FORMAT
+    }
+}
+
+/// Opaque binding between one exact planner-owned carrier path and its route authority.
+///
+/// Fields are private and construction is available only through
+/// `DsdReferencePlanSummary`, which selects the path, semantic role, and PCM
+/// contract as one operation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReferenceDecodedCarrier {
+    path: PathBuf,
+    authority: ReferenceDecodeAuthority,
+}
+
+impl ReferenceDecodedCarrier {
+    /// Exact path selected by the trusted plan summary.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Opaque route authority bound to this exact path.
+    #[must_use]
+    pub const fn authority(&self) -> ReferenceDecodeAuthority {
+        self.authority
+    }
+}
+
+fn reference_decode_role_class(
+    role: ReferenceDecodedSampleRole,
+    contract: FinalPcmContract,
+) -> std::result::Result<ReferenceDecodeRoleClass, ReferenceDecodeAuthorityError> {
+    match role {
+        ReferenceDecodedSampleRole::ReconstructionR64W64 => {
+            if contract.bit_depth != PcmBitDepth::Float64
+                || contract.sample_kind != SampleKind::Float
+                || contract.dither != ReferenceDither::None
+            {
+                return Err(ReferenceDecodeAuthorityError::new(
+                    "Reference R64 decode authority requires undithered Float64 PCM",
+                ));
+            }
+            Ok(ReferenceDecodeRoleClass::ReconstructionR64W64)
+        }
+        ReferenceDecodedSampleRole::TerminalQpcmW64 => {
+            Ok(ReferenceDecodeRoleClass::TerminalQpcmW64)
+        }
+        ReferenceDecodedSampleRole::PackagedOutput { target } => {
+            validate_reference_target_depth(target, contract.bit_depth).map_err(|error| {
+                ReferenceDecodeAuthorityError::new(format!(
+                    "Reference packaged-output decode authority rejected {}/{}: {error}",
+                    target.key(),
+                    contract.bit_depth.bits(),
+                ))
+            })?;
+            Ok(if target == ResolvedOutputTarget::WavW64 {
+                ReferenceDecodeRoleClass::PackagedW64
+            } else {
+                ReferenceDecodeRoleClass::PackagedNonW64
+            })
+        }
+        ReferenceDecodedSampleRole::PostMetadataOutput { target } => {
+            validate_reference_target_depth(target, contract.bit_depth).map_err(|error| {
+                ReferenceDecodeAuthorityError::new(format!(
+                    "Reference post-metadata decode authority rejected {}/{}: {error}",
+                    target.key(),
+                    contract.bit_depth.bits(),
+                ))
+            })?;
+            Ok(if target == ResolvedOutputTarget::WavW64 {
+                ReferenceDecodeRoleClass::PostMetadataW64
+            } else {
+                ReferenceDecodeRoleClass::PostMetadataNonW64
+            })
+        }
+    }
+}
+
+/// Authorize the only decoder route admitted for a carrier role and PCM contract.
+pub fn reference_decode_authority(
+    role: ReferenceDecodedSampleRole,
+    contract: FinalPcmContract,
+) -> std::result::Result<ReferenceDecodeAuthority, ReferenceDecodeAuthorityError> {
+    if contract.sample_rate_hz == 0 || contract.channels == 0 {
+        return Err(ReferenceDecodeAuthorityError::new(
+            "Reference decode contract requires a nonzero sample rate and channel count",
+        ));
+    }
+    if contract.sample_kind != contract.bit_depth.sample_kind() {
+        return Err(ReferenceDecodeAuthorityError::new(format!(
+            "Reference decode contract sample kind {:?} disagrees with {:?}",
+            contract.sample_kind, contract.bit_depth,
+        )));
+    }
+    let expected_dither = match contract.bit_depth {
+        PcmBitDepth::Int24 => ReferenceDither::Tpdf,
+        PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
+        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int32 => {
+            return Err(ReferenceDecodeAuthorityError::new(format!(
+                "Reference v7 has no decoded-sample route for {:?}",
+                contract.bit_depth,
+            )));
+        }
+    };
+    if contract.dither != expected_dither {
+        return Err(ReferenceDecodeAuthorityError::new(format!(
+            "Reference decode contract dither {:?} disagrees with {:?} for {:?}",
+            contract.dither, expected_dither, contract.bit_depth,
+        )));
+    }
+
+    let role_class = reference_decode_role_class(role, contract)?;
+    let mut rules = REFERENCE_DECODE_ROUTE_RULES
+        .iter()
+        .copied()
+        .filter(|rule| rule.role_class == role_class && rule.bit_depth == contract.bit_depth);
+    let rule = rules.next().ok_or_else(|| {
+        ReferenceDecodeAuthorityError::new(format!(
+            "Reference v7 has no decoded-sample rule for {}/{}",
+            role_class.key(),
+            contract.bit_depth.bits(),
+        ))
+    })?;
+    if rules.next().is_some() {
+        return Err(ReferenceDecodeAuthorityError::new(format!(
+            "Reference v7 has ambiguous decoded-sample rules for {}/{}",
+            role_class.key(),
+            contract.bit_depth.bits(),
+        )));
+    }
+    Ok(ReferenceDecodeAuthority {
+        role,
+        role_class,
+        contract,
+        mechanism: rule.mechanism,
+        hash_encoding: rule.hash_encoding,
+    })
+}
+
+/// Validate an externally proposed decoder mechanism against the immutable table.
+///
+/// This entry point exists for manifest/report validation and the mandatory
+/// negative regression. It returns an opaque authority only when the proposed
+/// mechanism exactly matches the carrier-role-aware rule.
+pub fn validate_reference_decode_mechanism(
+    role: ReferenceDecodedSampleRole,
+    contract: FinalPcmContract,
+    proposed: ReferenceDecodeMechanism,
+) -> std::result::Result<ReferenceDecodeAuthority, ReferenceDecodeAuthorityError> {
+    let authority = reference_decode_authority(role, contract)?;
+    if authority.mechanism != proposed {
+        return Err(ReferenceDecodeAuthorityError::new(format!(
+            "Reference v7 rejects {} for {}/{}; required route is {}",
+            proposed.key(),
+            authority.role_class.key(),
+            contract.bit_depth.bits(),
+            authority.mechanism.key(),
+        )));
+    }
+    Ok(authority)
+}
+
 /// Conservative additive terminal realization error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
@@ -1163,12 +1690,88 @@ pub struct DsdReferencePlanSummary {
     pub r64_path: PathBuf,
     /// Planner-owned one-and-only terminal PCM carrier.
     pub qpcm_path: PathBuf,
-    /// Planner-owned staged lossless package; equal to `qpcm_path` for W64.
+    /// Planner-owned staged lossless package before atomic finalization; equal to
+    /// `qpcm_path` for W64.
     pub packaged_path: PathBuf,
+    /// Planner-owned delivered carrier after atomic finalization. Metadata, artwork,
+    /// and ReplayGain mutation operate on this exact path.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delivered_path: PathBuf,
     /// Semantic plan hash with path roles normalized.
     pub semantic_plan_hash_v1: Sha256Digest,
     /// Ordered operation summaries.
     pub operations: Vec<DsdReferenceOperation>,
+}
+
+impl DsdReferencePlanSummary {
+    fn decoded_carrier_spec(
+        &self,
+        selector: ReferenceDecodedCarrierSelector,
+    ) -> (&Path, ReferenceDecodedSampleRole, FinalPcmContract) {
+        match selector {
+            ReferenceDecodedCarrierSelector::ReconstructionR64 => (
+                self.r64_path.as_path(),
+                ReferenceDecodedSampleRole::ReconstructionR64W64,
+                FinalPcmContract {
+                    sample_rate_hz: self.final_pcm.sample_rate_hz,
+                    channels: self.final_pcm.channels,
+                    sample_kind: SampleKind::Float,
+                    bit_depth: PcmBitDepth::Float64,
+                    dither: ReferenceDither::None,
+                },
+            ),
+            ReferenceDecodedCarrierSelector::TerminalQpcm => (
+                self.qpcm_path.as_path(),
+                ReferenceDecodedSampleRole::TerminalQpcmW64,
+                self.final_pcm,
+            ),
+            ReferenceDecodedCarrierSelector::PackagedOutput => (
+                self.packaged_path.as_path(),
+                ReferenceDecodedSampleRole::PackagedOutput { target: self.target },
+                self.final_pcm,
+            ),
+            ReferenceDecodedCarrierSelector::PostMetadataOutput => (
+                self.delivered_path.as_path(),
+                ReferenceDecodedSampleRole::PostMetadataOutput { target: self.target },
+                self.final_pcm,
+            ),
+        }
+    }
+
+    /// Resolve one closed carrier selector to an opaque exact-path binding.
+    pub fn decoded_carrier(
+        &self,
+        selector: ReferenceDecodedCarrierSelector,
+    ) -> std::result::Result<ReferenceDecodedCarrier, ReferenceDecodeAuthorityError> {
+        let (path, role, contract) = self.decoded_carrier_spec(selector);
+        let authority = reference_decode_authority(role, contract)?;
+        Ok(ReferenceDecodedCarrier {
+            path: path.to_path_buf(),
+            authority,
+        })
+    }
+
+    /// Bind an externally held artifact path to a closed plan carrier selector.
+    ///
+    /// This is the fail-closed boundary used by post-metadata verification. The
+    /// candidate must equal the exact planner-owned path before any decode command
+    /// can be constructed.
+    pub fn bind_decoded_carrier(
+        &self,
+        selector: ReferenceDecodedCarrierSelector,
+        candidate_path: &Path,
+    ) -> std::result::Result<ReferenceDecodedCarrier, ReferenceDecodeAuthorityError> {
+        let carrier = self.decoded_carrier(selector)?;
+        if carrier.path() != candidate_path {
+            return Err(ReferenceDecodeAuthorityError::new(format!(
+                "Reference {} carrier path mismatch: expected {}, got {}",
+                selector.key(),
+                carrier.path().display(),
+                candidate_path.display(),
+            )));
+        }
+        Ok(carrier)
+    }
 }
 
 /// Stable P0 error codes.
@@ -2291,6 +2894,7 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
         r64_path: r64,
         qpcm_path: qpcm,
         packaged_path: final_work,
+        delivered_path: request.output_path.clone(),
         semantic_plan_hash_v1,
         operations,
     };
@@ -3008,6 +3612,289 @@ fn normalize_path_token(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_contract(bit_depth: PcmBitDepth) -> FinalPcmContract {
+        FinalPcmContract {
+            sample_rate_hz: 176_400,
+            channels: 2,
+            sample_kind: bit_depth.sample_kind(),
+            bit_depth,
+            dither: if bit_depth == PcmBitDepth::Int24 {
+                ReferenceDither::Tpdf
+            } else {
+                ReferenceDither::None
+            },
+        }
+    }
+
+    #[test]
+    fn v7_decode_route_table_is_complete_unique_and_depth_native() {
+        use std::collections::BTreeSet;
+
+        let actual = REFERENCE_DECODE_ROUTE_RULES
+            .iter()
+            .copied()
+            .map(|rule| {
+                (
+                    rule.role_class(),
+                    rule.bit_depth(),
+                    rule.mechanism(),
+                    rule.hash_encoding(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            (
+                ReferenceDecodeRoleClass::ReconstructionR64W64,
+                PcmBitDepth::Float64,
+                ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+                ReferenceSampleHashEncoding::Float64Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::TerminalQpcmW64,
+                PcmBitDepth::Int24,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt24Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::TerminalQpcmW64,
+                PcmBitDepth::Float32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::Float32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::TerminalQpcmW64,
+                PcmBitDepth::Float64,
+                ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+                ReferenceSampleHashEncoding::Float64Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedW64,
+                PcmBitDepth::Int24,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt24Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedW64,
+                PcmBitDepth::Float32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::Float32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedW64,
+                PcmBitDepth::Float64,
+                ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+                ReferenceSampleHashEncoding::Float64Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedNonW64,
+                PcmBitDepth::Int24,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt24Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedNonW64,
+                PcmBitDepth::Float32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::Float32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedNonW64,
+                PcmBitDepth::Float64,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::Float64Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataW64,
+                PcmBitDepth::Int24,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt24Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataW64,
+                PcmBitDepth::Float32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::Float32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataW64,
+                PcmBitDepth::Float64,
+                ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+                ReferenceSampleHashEncoding::Float64Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataNonW64,
+                PcmBitDepth::Int24,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt24Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataNonW64,
+                PcmBitDepth::Float32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::Float32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataNonW64,
+                PcmBitDepth::Float64,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::Float64Le,
+            ),
+        ]);
+        assert_eq!(actual.len(), REFERENCE_DECODE_ROUTE_RULES.len());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            ReferenceSampleHashEncoding::SignedInt24Le.ffmpeg_codec(),
+            "pcm_s24le"
+        );
+        assert_eq!(
+            ReferenceSampleHashEncoding::Float32Le.ffmpeg_codec(),
+            "pcm_f32le"
+        );
+        assert_eq!(
+            ReferenceSampleHashEncoding::Float64Le.ffmpeg_codec(),
+            "pcm_f64le"
+        );
+        assert_eq!(
+            REFERENCE_SAMPLE_HASH_FORMAT,
+            "interleaved_depth_native_le_sha256"
+        );
+    }
+
+    #[test]
+    fn v7_decode_authority_rejects_invalid_pcm_contracts() {
+        let mut contract = decode_contract(PcmBitDepth::Int24);
+        contract.dither = ReferenceDither::None;
+        assert!(reference_decode_authority(
+            ReferenceDecodedSampleRole::TerminalQpcmW64,
+            contract,
+        )
+        .is_err());
+
+        let mut contract = decode_contract(PcmBitDepth::Float32);
+        contract.channels = 0;
+        assert!(reference_decode_authority(
+            ReferenceDecodedSampleRole::TerminalQpcmW64,
+            contract,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v7_float64_w64_direct_ffmpeg_route_is_rejected() {
+        let contract = decode_contract(PcmBitDepth::Float64);
+        for role in [
+            ReferenceDecodedSampleRole::ReconstructionR64W64,
+            ReferenceDecodedSampleRole::TerminalQpcmW64,
+            ReferenceDecodedSampleRole::PackagedOutput {
+                target: ResolvedOutputTarget::WavW64,
+            },
+            ReferenceDecodedSampleRole::PostMetadataOutput {
+                target: ResolvedOutputTarget::WavW64,
+            },
+        ] {
+            let authority = reference_decode_authority(role, contract)
+                .expect("Float64 W64 has an authorized route");
+            assert_eq!(
+                authority.mechanism(),
+                ReferenceDecodeMechanism::SoxFloat64W64RawStream
+            );
+            let error = validate_reference_decode_mechanism(
+                role,
+                contract,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+            )
+            .expect_err("direct FFmpeg must not authorize Float64 W64");
+            assert!(error.to_string().contains("required route is sox_f64le_raw_stream"));
+        }
+    }
+
+    #[test]
+    fn v7_carrier_binding_rejects_qpcm_path_with_riff_package_identity() {
+        let request = reference_request(
+            DsdRate::Dsd64,
+            88_200,
+            ResolvedOutputTarget::WavRiff,
+            PcmBitDepth::Float64,
+            DsdReconstructionSelection::Reference,
+        );
+        let plan = plan_reference_dsd(&request).expect("Float64 RIFF plan");
+        let summary = plan.reference.as_ref().expect("Reference summary");
+
+        let error = summary
+            .bind_decoded_carrier(
+                ReferenceDecodedCarrierSelector::PackagedOutput,
+                &summary.qpcm_path,
+            )
+            .expect_err("QPCM W64 path must not impersonate the RIFF package");
+        assert!(error.to_string().contains("carrier path mismatch"));
+
+        let packaged = summary
+            .decoded_carrier(ReferenceDecodedCarrierSelector::PackagedOutput)
+            .expect("planner-owned RIFF package carrier");
+        assert_eq!(packaged.path(), summary.packaged_path.as_path());
+        assert_eq!(
+            packaged.authority().mechanism(),
+            ReferenceDecodeMechanism::DirectFfmpeg
+        );
+
+        let qpcm = summary
+            .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+            .expect("planner-owned QPCM carrier");
+        assert_eq!(qpcm.path(), summary.qpcm_path.as_path());
+        assert_eq!(
+            qpcm.authority().mechanism(),
+            ReferenceDecodeMechanism::SoxFloat64W64RawStream
+        );
+
+        let post_metadata_error = summary
+            .bind_decoded_carrier(
+                ReferenceDecodedCarrierSelector::PostMetadataOutput,
+                &summary.packaged_path,
+            )
+            .expect_err("pre-finalization package path must not impersonate delivered output");
+        assert!(post_metadata_error
+            .to_string()
+            .contains("carrier path mismatch"));
+
+        let delivered = summary
+            .decoded_carrier(ReferenceDecodedCarrierSelector::PostMetadataOutput)
+            .expect("planner-owned delivered RIFF carrier");
+        assert_eq!(delivered.path(), request.output_path.as_path());
+        assert_eq!(summary.delivered_path, request.output_path);
+    }
+
+    #[test]
+    fn v7_role_authority_selects_independent_float64_package_routes() {
+        let contract = decode_contract(PcmBitDepth::Float64);
+        let source = reference_decode_authority(
+            ReferenceDecodedSampleRole::TerminalQpcmW64,
+            contract,
+        )
+        .expect("Float64 QPCM route");
+        let riff = reference_decode_authority(
+            ReferenceDecodedSampleRole::PackagedOutput {
+                target: ResolvedOutputTarget::WavRiff,
+            },
+            contract,
+        )
+        .expect("Float64 RIFF route");
+        let rf64 = reference_decode_authority(
+            ReferenceDecodedSampleRole::PackagedOutput {
+                target: ResolvedOutputTarget::WavRf64,
+            },
+            contract,
+        )
+        .expect("Float64 RF64 route");
+        assert_eq!(
+            source.mechanism(),
+            ReferenceDecodeMechanism::SoxFloat64W64RawStream
+        );
+        assert_eq!(riff.mechanism(), ReferenceDecodeMechanism::DirectFfmpeg);
+        assert_eq!(rf64.mechanism(), ReferenceDecodeMechanism::DirectFfmpeg);
+        assert_eq!(source.hash_encoding(), ReferenceSampleHashEncoding::Float64Le);
+        assert_eq!(riff.hash_encoding(), ReferenceSampleHashEncoding::Float64Le);
+    }
 
     #[test]
     fn db_nano_is_canonical_and_strict() {

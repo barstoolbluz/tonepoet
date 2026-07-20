@@ -36,7 +36,40 @@ V7 removes the v6 common-mode verification oracle for Float64 RIFF/RF64:
 - Equality therefore compares independently routed source and destination decoders. FFmpeg's defective direct Float64-W64 decoder cannot validate output produced from its own defective decode.
 - Float64 W64 final-output verification uses the same SoX raw-stream route; non-Float64 carriers retain their qualified direct routes.
 
-All hash and carrier-probe subprocesses use `ClearAndSet` with exactly `LC_ALL=C`. The frozen v1 and v2 executed-evidence digests remain byte-contract compatible. V7 adds `executed_evidence_digest_v3`, which binds every ordered post-metadata producer and consumer command, its typed role, sanitized argv, environment policy, explicit environment, and exit outcome without incorporating nondeterministic elapsed time or output tails.
+All decoded-sample hashes use the truthful
+`interleaved_depth_native_le_sha256` byte contract: Int24 hashes
+`pcm_s24le`, Float32 hashes `pcm_f32le`, and Float64 hashes `pcm_f64le`.
+Hash and carrier-probe subprocesses use `ClearAndSet` with exactly `LC_ALL=C`.
+
+A single opaque, exact-path carrier binding now selects every production and
+qualification decode. The trusted plan summary resolves a closed carrier
+selector to the carrier path, semantic role, target, PCM contract, and route
+authority as one operation. Command builders accept only that binding; they do
+not accept a free-form path, role, target, contract, or decoder. The
+direct-FFmpeg builder therefore cannot accept Float64 W64 authority, and a
+QPCM W64 path cannot impersonate a RIFF/RF64 packaged-output identity.
+
+The mandatory negative regressions propose direct FFmpeg for R64, QPCM,
+packaged W64, and post-metadata W64 and require all four proposals to fail. A
+separate mislabeled-carrier regression presents the planner-owned Float64 QPCM
+W64 path as the Float64 RIFF packaged output and requires rejection before
+command construction. Post-metadata verification additionally consumes the
+trusted track artifact and rejects any staged path that differs from the
+planner-owned delivered carrier path.
+
+The tool-gated report records the complete 16-rule compiled route table,
+measured route and hash-encoding case counts for all 480 package cells, the 60
+terminal-realization cells, 480 package comparisons, 480 post-metadata
+comparisons, and the 40 independently routed Float64 RIFF/RF64 cells.
+Release-certification validation compares every
+route-table entry and measured count against compiled authority. It also checks
+the negative regression rather than accepting a declarative policy copy.
+
+The frozen v1 and v2 executed-evidence digests remain byte-contract
+compatible. V7 adds `executed_evidence_digest_v3`, which binds every ordered
+post-metadata producer and consumer command, its typed role, sanitized argv,
+environment policy, explicit environment, and exit outcome without incorporating
+nondeterministic elapsed time or output tails.
 
 ## Inherited policy surface
 
@@ -51,7 +84,11 @@ Qualification must prove:
 - Float64 RIFF and RF64 plans contain the exact typed SoX-to-FFmpeg package pipeline and no direct `ffmpeg -i QPCM.w64` package command.
 - Float32 and integer package routes remain the previously qualified direct paths.
 - Float64 source hashes use the SoX-stream authority while RIFF/RF64 output hashes use direct FFmpeg decode.
-- A deliberately substituted direct-FFmpeg Float64-W64 source hash cannot satisfy the v7 route validator.
+- A deliberately substituted direct-FFmpeg Float64-W64 source hash cannot
+  produce an authorized hash plan and is rejected by the v7 route validator.
+- A Float64 QPCM W64 path presented with a RIFF/RF64 packaged-output identity
+  is rejected before command construction, and post-metadata verification
+  rejects any artifact path other than the planner-owned delivered path.
 - carrier probes, direct hashes, streamed hashes, analyzer commands, package commands, and package pipelines all clear the environment and set only `LC_ALL=C`.
 - RF64 and W64 retain W64 QPCM and no disk-backed RIFF intermediate, including the high-rate capacity cases.
 - semantic-plan and v7 executed-evidence digests change if either pipeline command, endpoint, argv, environment policy, or environment changes, while historical v1/v2 digest contracts remain unchanged.

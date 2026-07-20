@@ -1053,7 +1053,7 @@
   "qualification_report": {
     "schema": "tonepoet-dsd-reference-policy-qualification-report/v1",
     "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_report.md",
-    "sha256": "c353c70b526d9c0e4f049964c04a094057804f38a1c91910c715709fd8610d1d",
+    "sha256": "1ab6bd9a559159f5cbafc2f5d694d21d1c6168f02a8281a9f6b532206a5ed1db",
     "guidance_sha256": "a5a5556c70b93c56d216c0d142ab5213920fa9f696caa48ea4110f382bf2e36f",
     "decimation_report_sha256": "af6e6880003f2b3673d804b992a093700cd8141465ee0277f8689d48209055c7",
     "commission_sha256": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",
@@ -1140,12 +1140,29 @@
     "endianness": "little"
   },
   "sample_identity": {
-    "schema": "tonepoet-reference-sample-identity/v3",
-    "float64_qpcm_w64_route": "sox_f64le_raw_stream_to_ffmpeg_sha256",
-    "float64_w64_final_route": "sox_f64le_raw_stream_to_ffmpeg_sha256",
-    "float64_riff_rf64_output_route": "ffmpeg_direct_sha256",
-    "other_carrier_route": "ffmpeg_direct_sha256",
-    "hash_format": "interleaved_f64le_sha256",
+    "schema": "tonepoet-reference-sample-identity/v5",
+    "route_authority": "typed_plan_carrier_path_role_target_depth_v2",
+    "routes": {
+      "r64_float64_w64": "sox_f64le_raw_stream",
+      "qpcm_int24_w64": "ffmpeg_direct",
+      "qpcm_float32_w64": "ffmpeg_direct",
+      "qpcm_float64_w64": "sox_f64le_raw_stream",
+      "packaged_int24_w64": "ffmpeg_direct",
+      "packaged_float32_w64": "ffmpeg_direct",
+      "packaged_float64_w64": "sox_f64le_raw_stream",
+      "packaged_non_w64": "ffmpeg_direct",
+      "post_metadata_int24_w64": "ffmpeg_direct",
+      "post_metadata_float32_w64": "ffmpeg_direct",
+      "post_metadata_float64_w64": "sox_f64le_raw_stream",
+      "post_metadata_non_w64": "ffmpeg_direct"
+    },
+    "hash_format": "interleaved_depth_native_le_sha256",
+    "hash_codecs": {
+      "int24": "pcm_s24le",
+      "float32": "pcm_f32le",
+      "float64": "pcm_f64le"
+    },
+    "forbidden_route": "ffmpeg_direct_decode_of_float64_w64",
     "oracle_independence": "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode",
     "environment_policy": "clear_and_set",
     "environment": {

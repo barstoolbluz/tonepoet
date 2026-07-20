@@ -174,3 +174,46 @@ kept on our side: legacy-wire casing corrections in your new tests
 — byte compatibility pins it), and one real production fix your
 exact-legacy test caught: the DbNano→f32 legacy gain conversion now
 rounds through f64 so representable values (2.25) survive exactly.
+
+
+## F4 (F3-corrective round) — Float64 terminal bound assumes f64 arithmetic; SoX's 32-bit effects boundary makes it unattainable
+
+Your F3 corrective is applied and lands: the workspace suite is fully
+green (4,587/0), the live smoke passes, warnings are zero, and the
+typed sample-identity verify routes work — the qualification gate now
+runs 53s of real tool work and progresses past every prior blocker.
+Apply-side corrections kept on our side (review in the commit): the new
+`reference_evidence_subprocesses_clear_and_set_exact_environment`
+fixture passes `Some(0)` for the mandatory RIFF size bound like its
+siblings; the harness package-collection now recognizes the Float64
+RIFF/RF64 `Pipeline` step (producer SoX / consumer FFmpeg, filter flags
+forbidden, `-ar`/`-ac` asserted as input-side raw-stream declarations
+that must precede `-i`, output-side `-ar` still forbidden).
+
+The one remaining failure is a policy-derivation finding, not a route
+bug:
+
+```text
+tests/dsd_reference_qualification.rs:3034 (Float64 cell)
+terminal realization error 2.328118253736022325e-10
+exceeded policy bound     4.440892098500626162e-16
+```
+
+The observed maximum error is ≈ 2^-32 (2.3283e-10) — exactly one step
+of SoX-ng's signed 32-bit internal effects representation. Your own v5
+evidence records that boundary ("substantially more than 24 bits of
+effective resolution inside the signed 32-bit effects representation").
+The terminal `gain` for Float64 runs through that 32-bit chain, so its
+realization error floor is 2^-32-class regardless of the f64 carrier;
+the policy's Float64 bound was derived as if the arithmetic were f64
+(≈ 2 × 2^-52). No decode route is wrong — the bound is unattainable by
+the qualified toolchain.
+
+Resolve in your domain under the append-only rules: re-derive the
+Float64 terminal realization bound (and its safe pre-terminal ceiling)
+from the 32-bit effects boundary, or restructure the Float64 terminal
+operation to avoid the 32-bit quantization if a qualified route exists
+— your choice with rationale. Float32 (bound 2^-23 ≫ 2^-32) and Int24
+appear unaffected, but re-check all three cells' derivations against
+the same boundary while you are in there. Do not widen any bound
+without a derivation; do not soften the check.

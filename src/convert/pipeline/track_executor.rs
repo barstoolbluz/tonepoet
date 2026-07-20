@@ -22,12 +22,14 @@ use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::{
     build_reference_silence_scan_command, extract_single_loudnorm_report,
     parse_reference_true_peak_measurement, plan_conversion, resolve_reference_deferred_command,
-    validate_post_final_true_peak, validate_signed_zero_f64le, ConversionPlan,
-    DsdReferencePlanSummary, DsdSourceKind, Finalization, MeasurementId, MeasurementParser,
-    PlanAction, PlanRequest, PlannedCommand, PlannedCommandPipeline, SacdAreaKind,
-    SacdFrameEncoding, PlannedDeferredCommand, PlannedExecutionStep, PlannedMeasurement,
-    Sha256Digest,
-    ToolIdentifier, TruePeakMeasurement, TruePeakPurpose,
+    validate_post_final_true_peak, validate_reference_decode_mechanism,
+    validate_signed_zero_f64le, ConversionPlan, DsdReferencePlanSummary, DsdSourceKind,
+    Finalization, MeasurementId, MeasurementParser, PlanAction, PlanRequest, PlannedCommand,
+    PlannedCommandPipeline, PlannedDeferredCommand, PlannedExecutionStep, PlannedMeasurement,
+    ReferenceDecodeAuthority, ReferenceDecodeMechanism, ReferenceDecodedCarrier,
+    ReferenceDecodedCarrierSelector, ReferenceSampleHashEncoding,
+    SacdAreaKind, SacdFrameEncoding, Sha256Digest, ToolIdentifier,
+    TruePeakMeasurement, TruePeakPurpose,
 };
 use tonepoet_pipeline::fingerprint::{
     conversion_behavior_fingerprint_v1, execution_fingerprint_v1,
@@ -813,14 +815,39 @@ struct EmbeddedReferencePackaging {
 #[serde(deny_unknown_fields)]
 struct EmbeddedReferenceSampleIdentity {
     schema: String,
-    float64_qpcm_w64_route: String,
-    float64_w64_final_route: String,
-    float64_riff_rf64_output_route: String,
-    other_carrier_route: String,
+    route_authority: String,
+    routes: EmbeddedReferenceSampleIdentityRoutes,
     hash_format: String,
+    hash_codecs: EmbeddedReferenceSampleHashCodecs,
+    forbidden_route: String,
     oracle_independence: String,
     environment_policy: String,
     environment: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReferenceSampleIdentityRoutes {
+    r64_float64_w64: String,
+    qpcm_int24_w64: String,
+    qpcm_float32_w64: String,
+    qpcm_float64_w64: String,
+    packaged_int24_w64: String,
+    packaged_float32_w64: String,
+    packaged_float64_w64: String,
+    packaged_non_w64: String,
+    post_metadata_int24_w64: String,
+    post_metadata_float32_w64: String,
+    post_metadata_float64_w64: String,
+    post_metadata_non_w64: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReferenceSampleHashCodecs {
+    int24: String,
+    float32: String,
+    float64: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1079,6 +1106,15 @@ struct EmbeddedTerminalBound {
     realization: String,
     max_added_peak_fs_q63_ceil: u64,
     safe_pre_terminal_ceiling_dbtp: tonepoet_pipeline::DbNano,
+}
+
+fn json_object_u64(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<u64> {
+    object
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_u64)
 }
 
 fn validate_embedded_release_certification(
@@ -2143,6 +2179,192 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report has incomplete package/terminal evidence",
         ));
     }
+    let sample_identity = report
+        .get("sample_identity_oracle")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report has no measured sample-identity oracle",
+            )
+        })?;
+    let route_counts = sample_identity
+        .get("measured_route_case_counts")
+        .and_then(serde_json::Value::as_object);
+    let encoding_counts = sample_identity
+        .get("measured_hash_encoding_case_counts")
+        .and_then(serde_json::Value::as_object);
+    let terminal_route_counts = sample_identity
+        .get("measured_terminal_realization_route_case_counts")
+        .and_then(serde_json::Value::as_object);
+    let hash_codecs = sample_identity
+        .get("hash_codecs")
+        .and_then(serde_json::Value::as_object);
+    let forbidden = sample_identity
+        .get("forbidden_float64_w64_direct_route_regression")
+        .and_then(serde_json::Value::as_object);
+    if sample_identity.len() != 13
+        || route_counts.is_none_or(|value| value.len() != 6)
+        || encoding_counts.is_none_or(|value| value.len() != 9)
+        || terminal_route_counts.is_none_or(|value| value.len() != 3)
+        || hash_codecs.is_none_or(|value| value.len() != 3)
+        || forbidden.is_none_or(|value| value.len() != 6)
+        || sample_identity.get("schema").and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-sample-identity-oracle/v2")
+        || sample_identity.get("status").and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || sample_identity
+            .get("route_authority")
+            .and_then(serde_json::Value::as_str)
+            != Some("typed_plan_carrier_path_role_target_depth_v2")
+        || sample_identity
+            .get("hash_format")
+            .and_then(serde_json::Value::as_str)
+            != Some(tonepoet_pipeline::REFERENCE_SAMPLE_HASH_FORMAT)
+        || hash_codecs
+            .and_then(|value| value.get("int24"))
+            .and_then(serde_json::Value::as_str)
+            != Some(ReferenceSampleHashEncoding::SignedInt24Le.ffmpeg_codec())
+        || hash_codecs
+            .and_then(|value| value.get("float32"))
+            .and_then(serde_json::Value::as_str)
+            != Some(ReferenceSampleHashEncoding::Float32Le.ffmpeg_codec())
+        || hash_codecs
+            .and_then(|value| value.get("float64"))
+            .and_then(serde_json::Value::as_str)
+            != Some(ReferenceSampleHashEncoding::Float64Le.ffmpeg_codec())
+        || json_object_u64(route_counts, "qpcm:ffmpeg_direct") != Some(420)
+        || json_object_u64(route_counts, "qpcm:sox_f64le_raw_stream") != Some(60)
+        || json_object_u64(route_counts, "packaged:ffmpeg_direct") != Some(460)
+        || json_object_u64(route_counts, "packaged:sox_f64le_raw_stream") != Some(20)
+        || json_object_u64(route_counts, "post_metadata:ffmpeg_direct") != Some(460)
+        || json_object_u64(route_counts, "post_metadata:sox_f64le_raw_stream") != Some(20)
+        || json_object_u64(encoding_counts, "qpcm:int24_le") != Some(360)
+        || json_object_u64(encoding_counts, "qpcm:float32_le") != Some(60)
+        || json_object_u64(encoding_counts, "qpcm:float64_le") != Some(60)
+        || json_object_u64(encoding_counts, "packaged:int24_le") != Some(360)
+        || json_object_u64(encoding_counts, "packaged:float32_le") != Some(60)
+        || json_object_u64(encoding_counts, "packaged:float64_le") != Some(60)
+        || json_object_u64(encoding_counts, "post_metadata:int24_le") != Some(360)
+        || json_object_u64(encoding_counts, "post_metadata:float32_le") != Some(60)
+        || json_object_u64(encoding_counts, "post_metadata:float64_le") != Some(60)
+        || json_object_u64(terminal_route_counts, "r64:sox_f64le_raw_stream") != Some(60)
+        || json_object_u64(terminal_route_counts, "qpcm:ffmpeg_direct") != Some(40)
+        || json_object_u64(terminal_route_counts, "qpcm:sox_f64le_raw_stream") != Some(20)
+        || sample_identity
+            .get("package_identity_comparison_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(480)
+        || sample_identity
+            .get("post_metadata_identity_comparison_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(480)
+        || sample_identity
+            .get("independent_float64_riff_rf64_case_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(40)
+        || sample_identity
+            .get("oracle_independence")
+            .and_then(serde_json::Value::as_str)
+            != Some("float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode")
+        || forbidden
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || forbidden
+            .and_then(|value| value.get("attempted_mechanism"))
+            .and_then(serde_json::Value::as_str)
+            != Some(ReferenceDecodeMechanism::DirectFfmpeg.key())
+        || forbidden
+            .and_then(|value| value.get("required_mechanism"))
+            .and_then(serde_json::Value::as_str)
+            != Some(ReferenceDecodeMechanism::SoxFloat64W64RawStream.key())
+        || forbidden
+            .and_then(|value| value.get("rejected_role_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(4)
+        || forbidden
+            .and_then(|value| value.get("rejected_roles"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|roles| {
+                roles.iter().map(serde_json::Value::as_str).ne([
+                    Some("r64_float64_w64"),
+                    Some("qpcm_float64_w64"),
+                    Some("packaged_float64_w64"),
+                    Some("post_metadata_float64_w64"),
+                ])
+            })
+        || forbidden
+            .and_then(|value| value.get("mislabeled_carrier_regression"))
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|regression| {
+                regression.len() != 3
+                    || regression.get("status").and_then(serde_json::Value::as_str)
+                        != Some("passed")
+                    || regression
+                        .get("attempted_path_role")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("qpcm_w64_as_packaged_riff")
+                    || regression
+                        .get("rejected_before_command_construction")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+            })
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has incomplete or false \
+             decoded-sample route evidence",
+        ));
+    }
+
+    let decode_routes = packages
+        .and_then(|value| value.get("decode_route_table"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report omits the compiled decode-route table",
+            )
+        })?;
+    if decode_routes.len() != tonepoet_pipeline::REFERENCE_DECODE_ROUTE_RULES.len() {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report decode-route table has the wrong \
+             cardinality",
+        ));
+    }
+    for rule in tonepoet_pipeline::REFERENCE_DECODE_ROUTE_RULES {
+        let key = format!(
+            "{}:{}",
+            rule.role_class().key(),
+            rule.hash_encoding().key(),
+        );
+        let entry = decode_routes
+            .get(&key)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "the embedded release-certification report omits decode route {key}",
+                ))
+            })?;
+        if entry.len() != 3
+            || entry
+            .get("bit_depth")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(rule.bit_depth().bits()))
+            || entry
+                .get("mechanism")
+                .and_then(serde_json::Value::as_str)
+                != Some(rule.mechanism().key())
+            || entry
+                .get("hash_encoding")
+                .and_then(serde_json::Value::as_str)
+                != Some(rule.hash_encoding().key())
+        {
+            return Err(reference_toolchain_error(format!(
+                "the embedded release-certification report decode route {key} disagrees \
+                 with the compiled v7 authority",
+            )));
+        }
+    }
+
     let cells = report
         .get("qualified_cell_contract")
         .and_then(serde_json::Value::as_object)
@@ -2275,14 +2497,32 @@ fn validate_embedded_reference_policy_tables(
             "embedded Float64 package contract disagrees with the compiled v7 policy",
         ));
     }
-    if manifest.sample_identity.schema != "tonepoet-reference-sample-identity/v3"
-        || manifest.sample_identity.float64_qpcm_w64_route
-            != "sox_f64le_raw_stream_to_ffmpeg_sha256"
-        || manifest.sample_identity.float64_w64_final_route
-            != "sox_f64le_raw_stream_to_ffmpeg_sha256"
-        || manifest.sample_identity.float64_riff_rf64_output_route != "ffmpeg_direct_sha256"
-        || manifest.sample_identity.other_carrier_route != "ffmpeg_direct_sha256"
-        || manifest.sample_identity.hash_format != "interleaved_f64le_sha256"
+    let direct_route = ReferenceDecodeMechanism::DirectFfmpeg.key();
+    let streamed_route = ReferenceDecodeMechanism::SoxFloat64W64RawStream.key();
+    let routes = &manifest.sample_identity.routes;
+    let codecs = &manifest.sample_identity.hash_codecs;
+    if manifest.sample_identity.schema != "tonepoet-reference-sample-identity/v5"
+        || manifest.sample_identity.route_authority
+            != "typed_plan_carrier_path_role_target_depth_v2"
+        || routes.r64_float64_w64 != streamed_route
+        || routes.qpcm_int24_w64 != direct_route
+        || routes.qpcm_float32_w64 != direct_route
+        || routes.qpcm_float64_w64 != streamed_route
+        || routes.packaged_int24_w64 != direct_route
+        || routes.packaged_float32_w64 != direct_route
+        || routes.packaged_float64_w64 != streamed_route
+        || routes.packaged_non_w64 != direct_route
+        || routes.post_metadata_int24_w64 != direct_route
+        || routes.post_metadata_float32_w64 != direct_route
+        || routes.post_metadata_float64_w64 != streamed_route
+        || routes.post_metadata_non_w64 != direct_route
+        || manifest.sample_identity.hash_format
+            != tonepoet_pipeline::REFERENCE_SAMPLE_HASH_FORMAT
+        || codecs.int24 != ReferenceSampleHashEncoding::SignedInt24Le.ffmpeg_codec()
+        || codecs.float32 != ReferenceSampleHashEncoding::Float32Le.ffmpeg_codec()
+        || codecs.float64 != ReferenceSampleHashEncoding::Float64Le.ffmpeg_codec()
+        || manifest.sample_identity.forbidden_route
+            != "ffmpeg_direct_decode_of_float64_w64"
         || manifest.sample_identity.oracle_independence
             != "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode"
         || manifest.sample_identity.environment_policy != "clear_and_set"
@@ -4347,27 +4587,27 @@ async fn execute_reference_steps(
                             records.clone(),
                         )
                     })?;
-                    let (mut verification_records, digest) = reference_decoded_sample_hash_with_paths(
-                        &summary.packaged_path,
-                        summary.final_pcm,
-                        ReferenceSampleHashRoute::DirectFfmpeg,
-                        "Verify packaged output decoded samples",
-                        runner,
-                        cancel,
-                        tool_paths,
-                        tool_concurrency_limits.as_ref(),
-                        progress,
-                        window_start,
-                        window_end,
-                        &track_label,
-                    )
-                    .await
-                    .map_err(|mut err| {
-                        let mut all = records.clone();
-                        all.append(&mut err.commands);
-                        err.commands = all;
-                        err
-                    })?;
+                    let (mut verification_records, digest) =
+                        reference_decoded_sample_hash_with_plan_carrier(
+                            summary,
+                            ReferenceDecodedCarrierSelector::PackagedOutput,
+                            "Verify packaged output decoded samples",
+                            runner,
+                            cancel,
+                            tool_paths,
+                            tool_concurrency_limits.as_ref(),
+                            progress,
+                            window_start,
+                            window_end,
+                            &track_label,
+                        )
+                        .await
+                        .map_err(|mut err| {
+                            let mut all = records.clone();
+                            all.append(&mut err.commands);
+                            err.commands = all;
+                            err
+                        })?;
                     records.append(&mut verification_records);
                     if digest != expected {
                         return Err(TrackExecutionError::new(
@@ -4413,10 +4653,9 @@ async fn execute_reference_steps(
                     )
                 })?;
                 let (mut verification_records, digest) =
-                    reference_decoded_sample_hash_with_paths(
-                        &summary.packaged_path,
-                        summary.final_pcm,
-                        ReferenceSampleHashRoute::DirectFfmpeg,
+                    reference_decoded_sample_hash_with_plan_carrier(
+                        summary,
+                        ReferenceDecodedCarrierSelector::PackagedOutput,
                         "Verify packaged output decoded samples",
                         runner,
                         cancel,
@@ -4625,21 +4864,6 @@ struct ReferenceCarrierProbe {
     floating_point: bool,
 }
 
-fn reference_pcm_codec(
-    contract: tonepoet_pipeline::FinalPcmContract,
-) -> Result<&'static str, String> {
-    match contract.bit_depth {
-        tonepoet_pipeline::PcmBitDepth::Int16 => Ok("pcm_s16le"),
-        tonepoet_pipeline::PcmBitDepth::Int24 => Ok("pcm_s24le"),
-        tonepoet_pipeline::PcmBitDepth::Float32 => Ok("pcm_f32le"),
-        tonepoet_pipeline::PcmBitDepth::Float64 => Ok("pcm_f64le"),
-        tonepoet_pipeline::PcmBitDepth::Int8 | tonepoet_pipeline::PcmBitDepth::Int32 => Err(
-            "Reference verification received an unsupported terminal depth".to_string(),
-        ),
-    }
-}
-
-
 fn canonical_reference_environment() -> BTreeMap<String, String> {
     BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
 }
@@ -4663,20 +4887,43 @@ fn build_reference_carrier_probe_command(
     command
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReferenceSampleHashRoute {
-    DirectFfmpeg,
-    StreamFloat64W64ViaSoxRaw,
+#[derive(Debug, Clone)]
+enum PlannedReferenceSampleHash {
+    Direct {
+        authority: ReferenceDecodeAuthority,
+        command: PlannedCommand,
+    },
+    StreamedFloat64W64 {
+        authority: ReferenceDecodeAuthority,
+        pipeline: PlannedCommandPipeline,
+    },
+}
+
+impl PlannedReferenceSampleHash {
+    fn authority(&self) -> ReferenceDecodeAuthority {
+        match self {
+            Self::Direct { authority, .. } | Self::StreamedFloat64W64 { authority, .. } => {
+                *authority
+            }
+        }
+    }
 }
 
 fn build_reference_direct_hash_command(
-    path: &Path,
-    contract: tonepoet_pipeline::FinalPcmContract,
+    carrier: &ReferenceDecodedCarrier,
     description: &str,
 ) -> Result<PlannedCommand, String> {
+    let path = carrier.path();
+    let authority = carrier.authority();
+    validate_reference_decode_mechanism(
+        authority.role(),
+        authority.contract(),
+        ReferenceDecodeMechanism::DirectFfmpeg,
+    )
+    .map_err(|error| error.to_string())?;
     let mut command = PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
-        reference_hash_args(path, contract)?,
+        reference_hash_args(carrier),
         tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
         tonepoet_pipeline::OutputSink::Stdout,
         None,
@@ -4688,10 +4935,18 @@ fn build_reference_direct_hash_command(
 }
 
 fn build_reference_float64_w64_hash_pipeline(
-    path: &Path,
-    contract: tonepoet_pipeline::FinalPcmContract,
+    carrier: &ReferenceDecodedCarrier,
     description: &str,
 ) -> Result<PlannedCommandPipeline, String> {
+    let path = carrier.path();
+    let authority = carrier.authority();
+    validate_reference_decode_mechanism(
+        authority.role(),
+        authority.contract(),
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+    )
+    .map_err(|error| error.to_string())?;
+    let contract = authority.contract();
     if contract.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64 {
         return Err("streamed W64 sample hashing is reserved for Float64".to_string());
     }
@@ -4718,7 +4973,6 @@ fn build_reference_float64_w64_hash_pipeline(
     producer.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
     producer.environment = canonical_reference_environment();
 
-    let codec = reference_pcm_codec(contract)?;
     let mut consumer = PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
         vec![
@@ -4742,7 +4996,7 @@ fn build_reference_float64_w64_hash_pipeline(
             "-sn".to_string(),
             "-dn".to_string(),
             "-c:a".to_string(),
-            codec.to_string(),
+            authority.hash_encoding().ffmpeg_codec().to_string(),
             "-f".to_string(),
             "hash".to_string(),
             "-hash".to_string(),
@@ -4762,6 +5016,25 @@ fn build_reference_float64_w64_hash_pipeline(
         consumer,
         description: description.to_string(),
     })
+}
+
+fn build_reference_sample_hash_plan(
+    carrier: &ReferenceDecodedCarrier,
+    description: &str,
+) -> Result<PlannedReferenceSampleHash, String> {
+    let authority = carrier.authority();
+    match authority.mechanism() {
+        ReferenceDecodeMechanism::DirectFfmpeg => Ok(PlannedReferenceSampleHash::Direct {
+            command: build_reference_direct_hash_command(carrier, description)?,
+            authority,
+        }),
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream => {
+            Ok(PlannedReferenceSampleHash::StreamedFloat64W64 {
+                pipeline: build_reference_float64_w64_hash_pipeline(carrier, description)?,
+                authority,
+            })
+        }
+    }
 }
 
 async fn run_reference_capture_command(
@@ -4796,7 +5069,6 @@ async fn run_reference_capture_command(
     output.command.description = non_empty_planned_description(planned);
     Ok(output)
 }
-
 
 async fn run_reference_capture_pipeline(
     pipeline: &PlannedCommandPipeline,
@@ -4987,12 +5259,10 @@ fn reference_carrier_probe_digest(
     Sha256Digest(hasher.finalize().into())
 }
 
-fn reference_hash_args(
-    path: &Path,
-    contract: tonepoet_pipeline::FinalPcmContract,
-) -> Result<Vec<String>, String> {
-    let codec = reference_pcm_codec(contract)?;
-    Ok(vec![
+fn reference_hash_args(carrier: &ReferenceDecodedCarrier) -> Vec<String> {
+    let path = carrier.path();
+    let authority = carrier.authority();
+    vec![
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
         "-loglevel".to_string(),
@@ -5007,13 +5277,13 @@ fn reference_hash_args(
         "-sn".to_string(),
         "-dn".to_string(),
         "-c:a".to_string(),
-        codec.to_string(),
+        authority.hash_encoding().ffmpeg_codec().to_string(),
         "-f".to_string(),
         "hash".to_string(),
         "-hash".to_string(),
         "sha256".to_string(),
         "-".to_string(),
-    ])
+    ]
 }
 
 fn parse_reference_hash_output(text: &str) -> Result<Sha256Digest, String> {
@@ -5031,10 +5301,9 @@ fn parse_reference_hash_output(text: &str) -> Result<Sha256Digest, String> {
     Sha256Digest::from_hex(value)
 }
 
-async fn reference_decoded_sample_hash_with_paths(
-    path: &Path,
-    contract: tonepoet_pipeline::FinalPcmContract,
-    route: ReferenceSampleHashRoute,
+async fn reference_decoded_sample_hash_with_plan_carrier(
+    summary: &DsdReferencePlanSummary,
+    selector: ReferenceDecodedCarrierSelector,
     description: &str,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -5045,14 +5314,16 @@ async fn reference_decoded_sample_hash_with_paths(
     window_end: f32,
     track_label: &str,
 ) -> Result<(Vec<CommandRecord>, Sha256Digest), TrackExecutionError> {
-    let (records, text) = match route {
-        ReferenceSampleHashRoute::DirectFfmpeg => {
-            let planned = build_reference_direct_hash_command(path, contract, description)
-                .map_err(|message| {
-                    TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
-                })?;
+    let carrier = summary.decoded_carrier(selector).map_err(|error| {
+        TrackExecutionError::new(ConvertError::Backend(error.to_string()), Vec::new())
+    })?;
+    let plan = build_reference_sample_hash_plan(&carrier, description).map_err(|message| {
+        TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
+    })?;
+    let (records, text) = match plan {
+        PlannedReferenceSampleHash::Direct { command, .. } => {
             let output = run_reference_capture_command(
-                &planned,
+                &command,
                 runner,
                 cancel,
                 tool_paths,
@@ -5066,11 +5337,7 @@ async fn reference_decoded_sample_hash_with_paths(
             let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
             (vec![output.command], text)
         }
-        ReferenceSampleHashRoute::StreamFloat64W64ViaSoxRaw => {
-            let pipeline = build_reference_float64_w64_hash_pipeline(path, contract, description)
-                .map_err(|message| {
-                    TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
-                })?;
+        PlannedReferenceSampleHash::StreamedFloat64W64 { pipeline, .. } => {
             run_reference_capture_pipeline(
                 &pipeline,
                 runner,
@@ -5184,15 +5451,9 @@ async fn verify_reference_qpcm_contract(
             records,
         ));
     }
-    let hash_route = if summary.final_pcm.bit_depth == tonepoet_pipeline::PcmBitDepth::Float64 {
-        ReferenceSampleHashRoute::StreamFloat64W64ViaSoxRaw
-    } else {
-        ReferenceSampleHashRoute::DirectFfmpeg
-    };
-    let (mut hash_records, digest) = reference_decoded_sample_hash_with_paths(
-        &summary.qpcm_path,
-        summary.final_pcm,
-        hash_route,
+    let (mut hash_records, digest) = reference_decoded_sample_hash_with_plan_carrier(
+        summary,
+        ReferenceDecodedCarrierSelector::TerminalQpcm,
         "Hash QPCM decoded samples",
         runner,
         cancel,
@@ -5209,12 +5470,22 @@ async fn verify_reference_qpcm_contract(
 }
 
 pub(crate) async fn verify_reference_output_after_metadata(
-    path: &Path,
-    evidence: &mut ReferenceExecutionEvidence,
+    artifact: &mut super::types::TrackArtifact,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), ConvertError> {
+    let path = artifact.staged_path.clone();
+    let evidence = artifact.reference_evidence.as_mut().ok_or_else(|| {
+        ConvertError::TrackValidation(
+            "Reference post-metadata verification requires execution evidence".to_string(),
+        )
+    })?;
+    let carrier = evidence
+        .plan
+        .bind_decoded_carrier(ReferenceDecodedCarrierSelector::PostMetadataOutput, &path)
+        .map_err(|error| ConvertError::TrackValidation(error.to_string()))?;
+
     let resolved_ffmpeg = runner.resolved_tool_path(ToolBinary::Ffmpeg).ok_or_else(|| {
         ConvertError::TrackValidation(
             "Reference post-metadata verification cannot resolve the attested FFmpeg path"
@@ -5229,10 +5500,14 @@ pub(crate) async fn verify_reference_output_after_metadata(
         )));
     }
 
-    let stream_float64_w64 = evidence.plan.final_pcm.bit_depth
-        == tonepoet_pipeline::PcmBitDepth::Float64
-        && evidence.plan.target == tonepoet_pipeline::ResolvedOutputTarget::WavW64;
-    let (records, text) = if stream_float64_w64 {
+    let hash_plan = build_reference_sample_hash_plan(
+        &carrier,
+        "Verify post-metadata Reference decoded samples",
+    )
+    .map_err(ConvertError::TrackValidation)?;
+    if hash_plan.authority().mechanism()
+        == ReferenceDecodeMechanism::SoxFloat64W64RawStream
+    {
         let resolved_sox = runner.resolved_tool_path(ToolBinary::Sox).ok_or_else(|| {
             ConvertError::TrackValidation(
                 "Reference post-metadata verification cannot resolve the attested SoX path"
@@ -5246,62 +5521,61 @@ pub(crate) async fn verify_reference_output_after_metadata(
                 resolved_sox.display(),
             )));
         }
-        let pipeline = build_reference_float64_w64_hash_pipeline(
-            path,
-            evidence.plan.final_pcm,
-            "Verify post-metadata Reference decoded samples",
-        )
-        .map_err(ConvertError::TrackValidation)?;
-        let producer = planned_command_to_tool_command(
-            &pipeline.producer,
-            DEFAULT_PLANNED_COMMAND_TIMEOUT,
-        )
-        .map_err(ConvertError::from)?;
-        let consumer = planned_command_to_tool_command(
-            &pipeline.consumer,
-            DEFAULT_PLANNED_COMMAND_TIMEOUT,
-        )
-        .map_err(ConvertError::from)?;
-        let _producer_permit =
-            acquire_reference_pipeline_permit(producer.binary, limits, cancel).await?;
-        let _consumer_permit =
-            acquire_reference_pipeline_permit(consumer.binary, limits, cancel).await?;
-        let output = runner
-            .run_pipeline(producer, consumer, cancel)
-            .await
-            .map_err(|pipeline_error| ConvertError::Tool(pipeline_error.error))?;
-        let text = format!(
-            "{}\n{}",
-            output.consumer.stdout_tail, output.consumer.stderr_tail
-        );
-        let mut producer_record = output.producer.command;
-        producer_record.description = Some(pipeline.producer.description);
-        let mut consumer_record = output.consumer.command;
-        consumer_record.description = Some(pipeline.consumer.description);
-        (vec![producer_record, consumer_record], text)
-    } else {
-        let planned = build_reference_direct_hash_command(
-            path,
-            evidence.plan.final_pcm,
-            "Verify post-metadata Reference decoded samples",
-        )
-        .map_err(ConvertError::TrackValidation)?;
-        let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
+    }
+
+    let (records, text) = match hash_plan {
+        PlannedReferenceSampleHash::StreamedFloat64W64 { pipeline, .. } => {
+            let producer = planned_command_to_tool_command(
+                &pipeline.producer,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            )
             .map_err(ConvertError::from)?;
-        let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
-            .await
-            .map_err(ConvertError::Tool)?;
-        let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
-        let mut record = output.command;
-        record.description = Some(planned.description);
-        (vec![record], text)
+            let consumer = planned_command_to_tool_command(
+                &pipeline.consumer,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            )
+            .map_err(ConvertError::from)?;
+            let _producer_permit =
+                acquire_reference_pipeline_permit(producer.binary, limits, cancel).await?;
+            let _consumer_permit =
+                acquire_reference_pipeline_permit(consumer.binary, limits, cancel).await?;
+            let output = runner
+                .run_pipeline(producer, consumer, cancel)
+                .await
+                .map_err(|pipeline_error| ConvertError::Tool(pipeline_error.error))?;
+            let text = format!(
+                "{}\n{}",
+                output.consumer.stdout_tail, output.consumer.stderr_tail
+            );
+            let mut producer_record = output.producer.command;
+            producer_record.description = Some(pipeline.producer.description);
+            let mut consumer_record = output.consumer.command;
+            consumer_record.description = Some(pipeline.consumer.description);
+            (vec![producer_record, consumer_record], text)
+        }
+        PlannedReferenceSampleHash::Direct { command: planned, .. } => {
+            let command = planned_command_to_tool_command(
+                &planned,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            )
+            .map_err(ConvertError::from)?;
+            let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
+                .await
+                .map_err(ConvertError::Tool)?;
+            let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
+            let mut record = output.command;
+            record.description = Some(planned.description);
+            (vec![record], text)
+        }
     };
 
     let digest = parse_reference_hash_output(&text).map_err(ConvertError::TrackValidation)?;
     if digest != evidence.pcm_verification.qpcm_sample_sha256 {
         return Err(ConvertError::TrackValidation(format!(
             "Reference metadata/artwork processing changed decoded samples for {}: expected {}, got {}",
-            path.display(), evidence.pcm_verification.qpcm_sample_sha256.to_hex(), digest.to_hex()
+            carrier.path().display(),
+            evidence.pcm_verification.qpcm_sample_sha256.to_hex(),
+            digest.to_hex(),
         )));
     }
     evidence.pcm_verification.post_metadata_sample_sha256 = Some(digest);
@@ -6518,7 +6792,9 @@ mod tests {
             container_ffmpeg_flags: Vec::new(),
             resolved_output_target: Some(target),
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
-            planned_riff_non_audio_upper_bound_bytes: None,
+            // RIFF-family targets require the planner size-bound preflight;
+            // sibling fixtures pin the same zero upper bound.
+            planned_riff_non_audio_upper_bound_bytes: Some(0),
         })
         .expect("Reference WAV-family plan")
     }
@@ -6794,14 +7070,15 @@ mod tests {
         );
         assert_eq!(probe.environment, expected);
 
-        let contract = tonepoet_pipeline::FinalPcmContract {
-            sample_rate_hz: 88_200,
-            channels: 2,
-            sample_kind: tonepoet_pipeline::SampleKind::Float,
-            bit_depth: tonepoet_pipeline::PcmBitDepth::Float64,
-            dither: tonepoet_pipeline::ReferenceDither::None,
-        };
-        let direct = build_reference_direct_hash_command(&path, contract, "direct hash")
+        let direct_plan = reference_wav_plan(
+            tonepoet_pipeline::PcmBitDepth::Float64,
+            tonepoet_pipeline::ResolvedOutputTarget::WavRiff,
+        );
+        let direct_summary = direct_plan.reference.as_ref().expect("Reference summary");
+        let direct_carrier = direct_summary
+            .decoded_carrier(ReferenceDecodedCarrierSelector::PackagedOutput)
+            .expect("Float64 RIFF packaged carrier");
+        let direct = build_reference_direct_hash_command(&direct_carrier, "direct hash")
             .expect("direct hash command");
         assert_eq!(
             direct.environment_policy,
@@ -6809,8 +7086,16 @@ mod tests {
         );
         assert_eq!(direct.environment, expected);
 
-        let pipeline = build_reference_float64_w64_hash_pipeline(&path, contract, "stream hash")
-            .expect("Float64 W64 hash pipeline");
+        let stream_plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
+        let stream_summary = stream_plan.reference.as_ref().expect("Reference summary");
+        let stream_carrier = stream_summary
+            .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+            .expect("Float64 W64 QPCM carrier");
+        let pipeline = build_reference_float64_w64_hash_pipeline(
+            &stream_carrier,
+            "stream hash",
+        )
+        .expect("Float64 W64 hash pipeline");
         for command in [&pipeline.producer, &pipeline.consumer] {
             assert_eq!(
                 command.environment_policy,
@@ -6818,6 +7103,21 @@ mod tests {
             );
             assert_eq!(command.environment, expected);
         }
+
+        let rejected = build_reference_direct_hash_command(
+            &stream_carrier,
+            "forbidden direct Float64 W64 hash",
+        )
+        .expect_err("typed builder must reject direct FFmpeg for Float64 W64");
+        assert!(rejected.contains("required route is sox_f64le_raw_stream"));
+
+        let mislabeled = direct_summary
+            .bind_decoded_carrier(
+                ReferenceDecodedCarrierSelector::PackagedOutput,
+                &direct_summary.qpcm_path,
+            )
+            .expect_err("QPCM path cannot impersonate the RIFF packaged carrier");
+        assert!(mislabeled.to_string().contains("carrier path mismatch"));
     }
 
     #[test]
@@ -6852,6 +7152,42 @@ mod tests {
                 .to_string()
                 .contains("terminal reserve must equal the analyzer reporting uncertainty"),
             "unexpected invariant failure: {error}"
+        );
+
+        let mut hash_contract_drift: EmbeddedReferenceQualification =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+            )))
+            .expect("embedded Reference qualification JSON parses for hash-contract drift test");
+        hash_contract_drift.sample_identity.hash_format =
+            "interleaved_f64le_sha256".to_string();
+        let error = validate_embedded_reference_policy_tables(&hash_contract_drift)
+            .expect_err("the immutable sample-hash byte contract must be truthful");
+        assert!(
+            error
+                .to_string()
+                .contains("decoded-sample identity contract disagrees"),
+            "unexpected hash-contract invariant failure: {error}"
+        );
+
+        let mut route_contract_drift: EmbeddedReferenceQualification =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+            )))
+            .expect("embedded Reference qualification JSON parses for route-contract drift test");
+        route_contract_drift
+            .sample_identity
+            .routes
+            .qpcm_float64_w64 = ReferenceDecodeMechanism::DirectFfmpeg.key().to_string();
+        let error = validate_embedded_reference_policy_tables(&route_contract_drift)
+            .expect_err("the immutable Float64-W64 route must reject direct FFmpeg");
+        assert!(
+            error
+                .to_string()
+                .contains("decoded-sample identity contract disagrees"),
+            "unexpected route-contract invariant failure: {error}"
         );
 
         let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
