@@ -567,7 +567,11 @@ fn serde_recursive_field_count_matches_checked_inventory_for_known_shapes() {
     let sentinel = serde_json::to_value(flac_md5_sentinel()).unwrap();
 
     assert_eq!(recursive_object_key_count(&default), 80);
-    assert_eq!(recursive_object_key_count(&sentinel), 92);
+    // The sentinel helper deliberately deserializes the frozen flat-v1 DSD
+    // wire (see `sentinel_dsd_settings`), so it re-serializes the legacy
+    // shape: 80 default keys + 7 sentinel-specific non-default nested keys,
+    // NOT the native-v2 shape that would be five keys larger.
+    assert_eq!(recursive_object_key_count(&sentinel), 87);
 }
 
 #[cfg(feature = "serde")]

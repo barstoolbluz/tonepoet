@@ -4127,13 +4127,16 @@ mod tests {
     #[test]
     fn wavpack_int24_package_argv_freezes_authoritative_raw_depth() {
         fn package_args(depth: PcmBitDepth) -> Vec<String> {
-            let request = reference_request(
+            let mut request = reference_request(
                 DsdRate::Dsd64,
                 88_200,
                 ResolvedOutputTarget::WavPackNative,
                 depth,
                 DsdReconstructionSelection::Reference,
             );
+            // Reference WavPack is non-hybrid: clear the generic UI default
+            // exactly as the canonical-target validation test above does.
+            request.settings.wavpack.correction_file = false;
             let plan = plan_reference_dsd(&request).unwrap();
             let crate::plan::PlanAction::Execute { steps, .. } = plan.action else {
                 panic!("Reference plan was not executable");

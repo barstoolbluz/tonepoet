@@ -264,6 +264,10 @@ pub fn plan_request_for_track(
         resolved_output_target,
     )?;
 
+    // settings-sentinel-allow: `settings` is `request.settings.clone()` (bound
+    // at the top of this function) plus the documented BluRay tool-preference
+    // and legacy-DSD adjustments; no defaults are synthesized outside the
+    // typed request.
     Ok(PlanRequest {
         resolved_output_target,
         reference_programme_scope,
