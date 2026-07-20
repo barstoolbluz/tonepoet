@@ -1053,45 +1053,111 @@ A target rate above the listed source profile never widens the profile automatic
 
 ## 3.4 True-peak measurement
 
-Exact analysis-only argv:
+The analyzer input route is part of the immutable policy. It is selected from
+the measured carrier's sample contract; it is not a generic decoder path.
+Policy v6 freezes these two shell-free forms.
+
+Float64 R64, Int24 QPCM, and Float64 QPCM use a typed two-process stream:
 
 ```text
+sox -S -D INPUT.w64 -t wav -e floating-point -b 64 -
 ffmpeg -nostdin -hide_banner -nostats -loglevel info
-       -i R64
+       -f wav -i pipe:0
        -filter:a loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json
        -f null -
 ```
 
-Single-line tokens:
+Exact producer tokens after the executable:
+
+```text
+["-S", "-D", INPUT_W64,
+ "-t", "wav", "-e", "floating-point", "-b", "64", "-"]
+```
+
+Exact consumer tokens after the executable:
 
 ```text
 ["-nostdin", "-hide_banner", "-nostats", "-loglevel", "info",
- "-i", R64,
+ "-f", "wav", "-i", "pipe:0",
  "-filter:a", "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
  "-f", "null", "-"]
 ```
 
-The output audio is discarded; only `input_tp` from the analyzer's JSON report is authoritative. Explicit I/LRA/TP values stabilize the invocation but do not authorize applying the filter's output gain.
+Float32 QPCM uses direct path-backed W64 input:
 
-Parser contract:
+```text
+ffmpeg -nostdin -hide_banner -nostats -loglevel info
+       -i QPCM.w64
+       -filter:a loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json
+       -f null -
+```
+
+Exact tokens after the executable:
+
+```text
+["-nostdin", "-hide_banner", "-nostats", "-loglevel", "info",
+ "-i", QPCM_W64,
+ "-filter:a", "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+ "-f", "null", "-"]
+```
+
+The route distinction is load-bearing. FFmpeg 7.1 mis-scales SoX-ng
+64-bit-float W64 by exactly `2^31`, so Float64 carriers require the streamed
+SoX re-container. Conversely, SoX-ng mis-scales its own Float32 W64 on
+readback while FFmpeg reads that carrier correctly, so Float32 QPCM must be
+measured directly. Applying either route to the other carrier is a policy
+binding failure, not an interchangeable implementation detail.
+
+The output audio is discarded; only `input_tp` from the analyzer's JSON report
+is authoritative. Explicit I/LRA/TP values stabilize the invocation but do not
+authorize applying the filter's output gain. The typed stream is stdout to
+stdin without a shell and is consumed to EOF; it does not materialize a
+size-limited RIFF file. QPCM itself remains W64 for every terminal depth.
+
+Every planned measurement binds exactly one measurement operation to its
+measurement ID, purpose, programme scope, stage path, producer presence,
+decoder route, environment, complete argv, and parser identity. Runtime must
+revalidate that binding against the immutable plan summary before launch. R64
+is always the GainAuthority carrier; QPCM is always the PostFinalAcceptance
+carrier; only Float32 PostFinalAcceptance may use the direct route.
+
+Parser contract (`ffmpeg_loudnorm_input_tp_v3`):
 
 - parse exactly one final JSON object emitted by the identified `loudnorm` instance;
 - require exactly one `input_tp` string in dBTP and reject use of `output_tp`;
 - require the policy-pinned decimal grammar/resolution or the literal `-inf`;
-- accept `-inf` only after a deterministic scan of the R64 W64 carrier proves every finite sample is signed zero; reject NaN/Inf samples during that scan;
-- reject NaN, positive infinity, absent/duplicate reports, locale commas, unknown numeric syntax, and values outside −1000 to +100 dBTP;
-- record toolchain identity, raw JSON, reported value, rounding model, and conservative upper-bound value;
+- accept `-inf` only after a deterministic scan of the bound carrier proves every finite sample is signed zero; reject NaN/Inf samples during that scan;
+- reject duplicate `input_tp` keys, NaN, positive infinity, absent/duplicate reports, locale commas, unknown numeric syntax, and values outside -1000 to +100 dBTP;
+- record toolchain identity, route identity, raw JSON, reported value, rounding model, and conservative upper-bound value;
 - parse finite values directly into `DbNano`; no binary floating-point value enters policy arithmetic or serialized identity.
 
-The policy stores a certified **one-sided reporting uncertainty** `Q` for the exact analyzer build/grammar. It then derives `E` as the maximum residual positive shortfall of `(TP_reported + Q)` against the qualification reference, so reporting quantization is not double-counted:
+The policy stores a certified **one-sided reporting uncertainty** `Q` for the
+exact analyzer build, route, and grammar. It then derives `E` as the maximum
+residual positive shortfall of `(TP_reported + Q)` against the qualification
+reference, so reporting quantization is not double-counted:
 
 ```text
 TP_upper = TP_reported + Q + E
 ```
 
-`Q = 0.005000000 dB` is permitted only when qualification proves round-to-nearest at 0.01 dB. If the tool truncates, rounds directionally, or the rule is uncertain, `Q` is the full one-sided worst case (at least 0.010000000 dB for a 0.01 dB report step) or the cell remains unavailable. The parser never infers `Q` from the number of printed decimals.
+`Q = 0.005000000 dB` is permitted only when qualification proves
+round-to-nearest at 0.01 dB. If the tool truncates, rounds directionally, or
+the rule is uncertain, `Q` is the full one-sided worst case (at least
+0.010000000 dB for a 0.01 dB report step) or the cell remains unavailable.
+The parser never infers `Q` from the number of printed decimals.
 
-A finite fixture corpus cannot by itself prove a universal analyzer error bound. `E` must be justified by a standards-conformance tolerance, implementation/filter analysis, or another defensible one-sided contract, with the tool-gated corpus validating that contract. Without such a basis, the cell cannot claim the strict −1 dBTP policy. The suite must also show that the pinned analyzer catches a known inter-sample peak above sample peak, is monotone over controlled sweeps, and stays within the recorded contract for every policy cell. It must also prove that any internal resampling retains the complete qualified reconstruction band. B6 retains content to about 140 kHz and cannot be authorized by a 192 kHz analysis path; it requires a separately qualified full-band analyzer and a new policy/analyzer identity. A failed analyzer cell cannot substitute sample peak while retaining a dBTP label.
+A finite fixture corpus cannot by itself prove a universal analyzer error
+bound. `E` must be justified by a standards-conformance tolerance,
+implementation/filter analysis, or another defensible one-sided contract, with
+the tool-gated corpus validating that contract. Without such a basis, the cell
+cannot claim the strict -1 dBTP policy. The suite must also show that the
+pinned analyzer catches a known inter-sample peak above sample peak, is
+monotone over controlled sweeps, and stays within the recorded contract for
+every policy cell. It must also prove that any internal resampling retains the
+complete qualified reconstruction band. B6 retains content to about 140 kHz
+and cannot be authorized by a 192 kHz analysis path; it requires a separately
+qualified full-band analyzer and a new policy/analyzer identity. A failed
+analyzer cell cannot substitute sample peak while retaining a dBTP label.
 
 ## 3.5 Gain resolution
 

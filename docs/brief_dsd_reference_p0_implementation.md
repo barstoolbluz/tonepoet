@@ -509,39 +509,80 @@ The generic token form for B3–B6 is:
 
 ### 4.4 True-peak measurement
 
-Exact argv against `R64`, then repeated against `QPCM`:
+Measurement routing is carrier-sensitive and frozen by policy v6.
+
+Float64 `R64`, Int24 `QPCM`, and Float64 `QPCM` use a typed shell-free
+producer/consumer pair:
 
 ```text
+sox -S -D INPUT.w64 -t wav -e floating-point -b 64 -
 ffmpeg -nostdin -hide_banner -nostats -loglevel info
-       -i INPUT
+       -f wav -i pipe:0
        -filter:a loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json
        -f null -
 ```
 
-Exact tokens after executable:
+Exact producer tokens after the executable:
+
+```text
+["-S", "-D", INPUT_W64,
+ "-t", "wav", "-e", "floating-point", "-b", "64", "-"]
+```
+
+Exact consumer tokens after the executable:
 
 ```text
 ["-nostdin", "-hide_banner", "-nostats", "-loglevel", "info",
- "-i", INPUT,
+ "-f", "wav", "-i", "pipe:0",
  "-filter:a", "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
  "-f", "null", "-"]
 ```
 
+Float32 `QPCM` uses direct FFmpeg W64 input:
+
+```text
+ffmpeg -nostdin -hide_banner -nostats -loglevel info
+       -i QPCM.w64
+       -filter:a loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json
+       -f null -
+```
+
+Exact direct tokens after the executable:
+
+```text
+["-nostdin", "-hide_banner", "-nostats", "-loglevel", "info",
+ "-i", QPCM_W64,
+ "-filter:a", "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+ "-f", "null", "-"]
+```
+
+The planner records the route, producer and consumer commands, explicit
+`ClearAndSet` environment (`LC_ALL=C` only), input/output modes, carrier path,
+measurement ID, purpose, programme scope, and
+`FfmpegLoudnormInputTpV3` parser. The semantic hash binds all of them. Before
+launch, the executor requires exactly one matching measurement operation in
+the immutable plan summary and rejects any ID, purpose, scope, path, route,
+producer-presence, argv, environment, or parser mismatch. A syntactically
+canonical command against the wrong stage therefore fails closed.
+
 The strict parser:
 
 - accepts exactly one final JSON object from the identified filter;
-- reads exactly `input_tp`, never `output_tp`;
+- reads exactly one `input_tp`, never `output_tp`;
 - accepts the frozen decimal grammar or exact `-inf` silence literal;
 - parses directly to `DbNano`, never through binary floating point;
-- rejects missing/duplicate reports, locale commas, NaN, positive infinity, unknown syntax, and values outside −1000 to +100 dBTP;
-- accepts `-inf` only after an independent scan proves all finite samples are signed zero;
-- records raw JSON, reported value, one-sided reporting uncertainty, analyzer residual bound, and conservative upper bound.
+- rejects duplicate `input_tp` keys, missing/duplicate reports, locale commas, NaN, positive infinity, unknown syntax, and values outside -1000 to +100 dBTP;
+- accepts `-inf` only after an independent scan proves all finite samples in the bound carrier are signed zero;
+- records raw JSON, route identity, reported value, one-sided reporting uncertainty, analyzer residual bound, and conservative upper bound.
 
 ```text
 TP_upper = TP_reported + Q + E
 ```
 
-`Q` and `E` are immutable policy data for the exact analyzer closure. A cell without a defensible one-sided contract remains unavailable.
+`Q` and `E` are immutable policy data for the exact analyzer closure. A cell
+without a defensible one-sided contract remains unavailable. The streamed WAV
+is transport only and is never materialized on disk; QPCM remains W64, so
+W64/RF64 cells do not inherit RIFF's 4 GiB limit.
 
 ### 4.5 Terminal safety arithmetic
 

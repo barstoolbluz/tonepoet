@@ -12748,22 +12748,20 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
 fn execute_set(app: &mut AppState, key: &str, value: &str) {
     if key.is_empty() {
         app.set_status(
-            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-normalize-target)",
+            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-auto-margin, dsd-normalize-target)",
         );
         return;
     }
-    let dsd_reference_key = matches!(
-        key,
-        "dsd-path"
-            | "dsd-profile"
-            | "dsd-gain"
-            | "dsd-gain-db"
-            | "dsd-normalize-target"
-    );
+    let dsd_reference_key = matches!(key, "dsd-path" | "dsd-profile" | "dsd-normalize-target");
     if dsd_reference_key && !app.convert.format.dsd_reference_controls_available() {
         app.set_status(
-            "DSD Reference controls are unavailable before policy promotion; default DSD-to-PCM uses the legacy conversion chain",
+            "That DSD Reference control is unavailable before policy promotion; use legacy dsd-gain, dsd-gain-db, or dsd-auto-margin",
         );
+        return;
+    }
+    let dsd_gain_key = matches!(key, "dsd-gain" | "dsd-gain-db" | "dsd-auto-margin");
+    if dsd_gain_key && !app.convert.format.dsd_to_pcm_gain_available() {
+        app.set_status("DSD gain controls require a DSD source and a PCM output target");
         return;
     }
 
@@ -12828,6 +12826,12 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status(format!(
                     "dsd-gain-db = {}",
                     app.convert.format.dsd_gain_db.render(false)
+                ));
+            }
+            "dsd-auto-margin" => {
+                app.set_status(format!(
+                    "dsd-auto-margin = {}",
+                    app.convert.format.dsd_auto_gain_margin_db.render(false)
                 ));
             }
             "dsd-normalize-target" => {
@@ -13067,23 +13071,28 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         }
         "dsd-gain" => {
             let mode = match value.to_ascii_lowercase().as_str() {
+                "disabled" | "off" => Some(DsdGainMode::Disabled),
+                "auto" => Some(DsdGainMode::Auto),
                 "reference" => Some(DsdGainMode::Reference),
                 "native" | "native-level" | "native_level" => Some(DsdGainMode::NativeLevel),
-                "fixed" => Some(DsdGainMode::Fixed),
+                "manual" | "fixed" => Some(DsdGainMode::Fixed),
                 "normalize" | "normalize-peak" | "normalize_peak" => {
                     Some(DsdGainMode::NormalizePeak)
                 }
                 _ => None,
             };
             if let Some(mode) = mode {
-                app.convert.format.dsd_gain_mode.select_value(&mode);
-                app.preset.mark_modified();
-                app.set_status(format!(
-                    "dsd-gain = {}",
-                    app.convert.format.dsd_gain_mode.selected_label()
-                ));
+                if app.convert.format.dsd_gain_mode.select_value(&mode) {
+                    app.preset.mark_modified();
+                    app.set_status(format!(
+                        "dsd-gain = {}",
+                        app.convert.format.dsd_gain_mode.selected_label()
+                    ));
+                } else {
+                    app.set_status("That DSD gain mode is unavailable for the current settings origin");
+                }
             } else {
-                app.set_status("Unknown dsd-gain. Try: reference, native, fixed, normalize");
+                app.set_status("Unknown dsd-gain. Try: disabled, auto, manual, reference, native, fixed, normalize");
             }
         }
         "dsd-gain-db" => match value.parse::<tonepoet_pipeline::DbNano>() {
@@ -13104,6 +13113,27 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 }
             }
             Err(error) => app.set_status(format!("Invalid dsd-gain-db: {error}")),
+        },
+        "dsd-auto-margin" => match value.parse::<tonepoet_pipeline::DbNano>() {
+            Ok(parsed) => {
+                if !(tonepoet_pipeline::DbNano::ZERO..=tonepoet_pipeline::DbNano(6_000_000_000))
+                    .contains(&parsed)
+                {
+                    app.set_status("dsd-auto-margin must be between 0 and 6 dB");
+                } else if app
+                    .convert
+                    .format
+                    .dsd_gain_mode
+                    .select_value(&DsdGainMode::Auto)
+                {
+                    app.convert.format.dsd_auto_gain_margin_db = parsed;
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-auto-margin = {}", parsed.render(false)));
+                } else {
+                    app.set_status("Legacy Auto gain is unavailable for the current settings origin");
+                }
+            }
+            Err(error) => app.set_status(format!("Invalid dsd-auto-margin: {error}")),
         },
         "dsd-normalize-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
             Ok(parsed) => {
@@ -13129,7 +13159,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         },
         _ => {
             app.set_status(format!(
-                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-normalize-target",
+                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-auto-margin, dsd-normalize-target",
                 key
             ));
         }

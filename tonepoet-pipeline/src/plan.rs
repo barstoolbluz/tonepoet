@@ -339,13 +339,29 @@ impl PlannedCommand {
     }
 }
 
+/// Typed two-process pipeline whose producer stdout is connected directly to
+/// the consumer stdin. No shell participates in the transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct PlannedCommandPipeline {
+    /// Path-backed producer that writes the canonical stream to stdout.
+    pub producer: PlannedCommand,
+    /// Stdin-backed consumer that writes the planned output.
+    pub consumer: PlannedCommand,
+    /// User-facing description for the pipeline as one semantic operation.
+    pub description: String,
+}
+
 /// One executable P0 step. Existing plans use `Command`; Reference plans may
-/// additionally measure and bind a later command without replanning.
+/// additionally use a typed pipeline, measure, and bind a later command without
+/// replanning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PlannedExecutionStep {
     /// Ordinary fully resolved command.
     Command(PlannedCommand),
+    /// Shell-free producer-to-consumer pipeline.
+    Pipeline(PlannedCommandPipeline),
     /// Typed measurement whose result is recorded under a stable ID.
     Measurement(PlannedMeasurement),
     /// Command with one or more typed arguments resolved from measurements.
@@ -358,6 +374,7 @@ impl PlannedExecutionStep {
     pub fn output_path(&self) -> Option<&std::path::Path> {
         match self {
             Self::Command(command) => command.output.as_path(),
+            Self::Pipeline(pipeline) => pipeline.consumer.output.as_path(),
             Self::Measurement(measurement) => measurement.command.output.as_path(),
             Self::DeferredCommand(command) => command.output.as_path(),
         }

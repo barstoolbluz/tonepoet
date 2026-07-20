@@ -35,7 +35,9 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
 
     let source_h = super::draw_source::source_pane_height(&app.convert.source.mode, area.width);
     let format_h = if app.convert.format.dsd_reference_controls_available() {
-        13
+        14
+    } else if app.convert.format.dsd_to_pcm_gain_available() {
+        12
     } else {
         10
     };
@@ -319,6 +321,21 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 );
             }
             last_standard_row = 12;
+        } else if state.dsd_to_pcm_gain_available() {
+            register_pill_row(buttons, &state.dsd_gain_mode, area.y + 8, label_col, |i| TuiButton::DsdGainPill(i));
+            if area.y + 9 < area.y + area.height {
+                buttons.record_button(
+                    TuiButton::DsdGainDbField,
+                    ratatui::layout::Rect::new(area.x, area.y + 9, area.width, 1),
+                );
+            }
+            if area.y + 10 < area.y + area.height {
+                buttons.record_button(
+                    TuiButton::DsdNormalizeTargetField,
+                    ratatui::layout::Rect::new(area.x, area.y + 10, area.width, 1),
+                );
+            }
+            last_standard_row = 10;
         }
     }
 

@@ -25,7 +25,7 @@ pub use plan::{
     plan_conversion, plan_conversion_with_registry, plan_topology,
     selects_reference_dsd_to_pcm, ConversionPlan, Finalization,
     InputSource, OutputSink, PlanAction, PlanContext, PlanOperation, PlanRequest, PlanStep,
-    PlannedCommand, PlannedExecutionStep, TopologyPlan,
+    PlannedCommand, PlannedCommandPipeline, PlannedExecutionStep, TopologyPlan,
 };
 pub use plugins::{
     FfmpegPlugin, FlacPlugin, LoudgainPlugin, MetaflacPlugin, SoxPlugin, SsrcPlugin,

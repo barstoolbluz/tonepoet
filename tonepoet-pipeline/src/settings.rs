@@ -426,7 +426,7 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                 reference_error_text(ReferenceErrorCode::ManualUnavailable),
             ));
         }
-        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V5 {
+        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V7 {
             return Err(PlanningError::invalid_settings(
                 "dsd.from_dsd.reference_policy",
                 reference_error_text(ReferenceErrorCode::Toolchain),
@@ -997,6 +997,65 @@ impl DsdSettings {
         }
     }
 
+    /// Update the exact frozen legacy DSD-to-PCM gain wire without migrating
+    /// the settings object to native-v2 or creating a mixed-origin value.
+    ///
+    /// `auto_gain_margin_db` is authoritative only for [`DsdToPcmGainMode::Auto`],
+    /// and `gain_db` is authoritative only for [`DsdToPcmGainMode::Manual`].
+    /// Irrelevant fields are canonicalized so serialization and behavior remain
+    /// byte-for-byte compatible with the legacy planner contract.
+    pub fn set_legacy_dsd_to_pcm_gain(
+        &mut self,
+        mode: DsdToPcmGainMode,
+        auto_gain_margin_db: f32,
+        gain_db: Option<f32>,
+    ) -> Result<()> {
+        if self.is_native_v2() {
+            return Err(PlanningError::invalid_settings(
+                "dsd.dsd_to_pcm_gain_mode",
+                "legacy DSD-to-PCM gain cannot be applied to native-v2 settings",
+            ));
+        }
+        if mode == DsdToPcmGainMode::Auto
+            && (!auto_gain_margin_db.is_finite()
+                || !(0.0..=6.0).contains(&auto_gain_margin_db))
+        {
+            return Err(PlanningError::invalid_settings(
+                "dsd.dsd_to_pcm_auto_gain_margin_db",
+                "auto gain safety margin must be between 0 and 6 dB",
+            ));
+        }
+        if mode == DsdToPcmGainMode::Manual {
+            let value = gain_db.ok_or_else(|| {
+                PlanningError::invalid_settings(
+                    "dsd.dsd_to_pcm_gain_db",
+                    "manual DSD-to-PCM gain requires a dB value",
+                )
+            })?;
+            if !value.is_finite() || !(-24.0..=24.0).contains(&value) {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.dsd_to_pcm_gain_db",
+                    "gain must be between -24 and +24 dB",
+                ));
+            }
+        }
+
+        let mut wire = self.legacy_compat_wire();
+        wire.dsd_to_pcm_gain_mode = mode;
+        wire.dsd_to_pcm_auto_gain_margin_db = if mode == DsdToPcmGainMode::Auto {
+            auto_gain_margin_db
+        } else {
+            default_dsd_to_pcm_auto_gain_margin_db()
+        };
+        wire.dsd_to_pcm_gain_db = if mode == DsdToPcmGainMode::Manual {
+            gain_db
+        } else {
+            None
+        };
+        *self = Self::from_legacy_wire(wire);
+        Ok(())
+    }
+
     /// Read-only compatibility behavior for legacy logging and inherited-tag policy.
     #[must_use]
     pub fn legacy_behavior(&self) -> Option<LegacyDsdBehavior> {
@@ -1053,7 +1112,7 @@ fn legacy_from_dsd_mirror(wire: LegacyDsdSettingsWireV1) -> DsdSourceSettings {
     };
     DsdSourceSettings {
         pathway: DsdSourcePathway::Reference,
-        reference_policy: DsdReferencePolicyVersion::SoxNg14801V5,
+        reference_policy: DsdReferencePolicyVersion::SoxNg14801V7,
         profile: DsdReconstructionSelection::Reference,
         gain_mode,
         fixed_gain_db: wire
@@ -1527,5 +1586,65 @@ mod ssrc_rate_dependent_dither_validation_tests {
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         settings.dither_type = DitherType::HighShibata;
         assert!(settings.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod legacy_dsd_gain_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn exact_legacy_gain_mutation_canonicalizes_non_authoritative_fields() {
+        let mut settings = DsdSettings::default();
+        settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.50, Some(9.0))
+            .expect("legacy Auto should be accepted");
+        let behavior = settings.legacy_behavior().expect("legacy authority");
+        assert_eq!(behavior.gain_mode, DsdToPcmGainMode::Auto);
+        assert_eq!(behavior.auto_gain_margin_db, 0.50);
+        assert_eq!(behavior.gain_db, None);
+
+        settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 5.0, Some(2.25))
+            .expect("legacy Manual should be accepted");
+        let behavior = settings.legacy_behavior().expect("legacy authority");
+        assert_eq!(behavior.gain_mode, DsdToPcmGainMode::Manual);
+        assert_eq!(behavior.auto_gain_margin_db, default_dsd_to_pcm_auto_gain_margin_db());
+        assert_eq!(behavior.gain_db, Some(2.25));
+
+        settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Disabled, 6.0, Some(-3.0))
+            .expect("legacy Disabled should be accepted");
+        let behavior = settings.legacy_behavior().expect("legacy authority");
+        assert_eq!(behavior.gain_mode, DsdToPcmGainMode::Disabled);
+        assert_eq!(behavior.auto_gain_margin_db, default_dsd_to_pcm_auto_gain_margin_db());
+        assert_eq!(behavior.gain_db, None);
+    }
+
+    #[test]
+    fn exact_legacy_gain_mutation_rejects_invalid_authority_without_mutation() {
+        let mut settings = DsdSettings::default();
+        let before = settings;
+        assert!(settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 6.01, None)
+            .is_err());
+        assert_eq!(settings, before);
+        assert!(settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, None)
+            .is_err());
+        assert_eq!(settings, before);
+        assert!(settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, Some(24.01))
+            .is_err());
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn exact_legacy_gain_mutation_never_creates_a_mixed_native_origin() {
+        let mut settings = DsdSettings::native_v2();
+        assert!(settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, Some(1.0))
+            .is_err());
+        assert!(settings.is_native_v2());
     }
 }

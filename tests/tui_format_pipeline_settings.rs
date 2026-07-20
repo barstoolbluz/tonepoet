@@ -108,12 +108,12 @@ fn auto_dither_selects_defaults_and_preserves_manual_choice() {
 
 #[test]
 fn format_navigation_skips_hidden_rows() {
-    let pcm_rows = FormatField::visible_rows(false, false);
+    let pcm_rows = FormatField::visible_rows(false, false, false);
     assert!(pcm_rows.contains(&FormatField::Resampler));
     assert!(pcm_rows.contains(&FormatField::Dither));
     assert!(!pcm_rows.contains(&FormatField::NoiseShaper));
 
-    let dsd_rows = FormatField::visible_rows(true, false);
+    let dsd_rows = FormatField::visible_rows(true, false, false);
     assert!(dsd_rows.contains(&FormatField::DsdRate));
     assert!(dsd_rows.contains(&FormatField::NoiseShaper));
     assert!(!dsd_rows.contains(&FormatField::Resampler));
@@ -240,7 +240,7 @@ fn all_format_families_have_expected_visible_rows_and_valid_pipeline_mapping() {
         state.format.select_value(&format);
         state.apply_format_constraints();
 
-        let rows = FormatField::visible_rows(is_dsd, false);
+        let rows = FormatField::visible_rows(is_dsd, false, false);
         assert_eq!(state.is_dsd_selected(), is_dsd, "{:?}", format);
         assert_eq!(rows.contains(&FormatField::Resampler), !is_dsd, "{:?}", format);
         assert_eq!(rows.contains(&FormatField::Dither), !is_dsd, "{:?}", format);

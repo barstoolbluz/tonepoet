@@ -330,10 +330,29 @@ pub type DsdConversionPreset = DsdFilterPreset;
 /// Native-v2 DSD-source gain policy exposed in the format pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsdGainMode {
+    /// Exact legacy no-gain behavior.
+    Disabled,
+    /// Exact legacy peak-normalize behavior.
+    Auto,
     Reference,
     NativeLevel,
+    /// Native fixed gain or legacy manual gain, depending on settings origin.
     Fixed,
     NormalizePeak,
+}
+
+impl DsdGainMode {
+    /// Stable preset key independent of presentation labels.
+    pub const fn preset_key(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Auto => "auto",
+            Self::Reference => "reference",
+            Self::NativeLevel => "native",
+            Self::Fixed => "fixed",
+            Self::NormalizePeak => "normalize",
+        }
+    }
 }
 
 /// User-editable manual gain range for DSD-to-PCM conversions.
@@ -346,6 +365,9 @@ pub const DSD_TO_PCM_GAIN_DB_STEP: f32 = 0.25;
 const DSD_TO_PCM_GAIN_DB_MIN_NANO: i64 = -24_000_000_000;
 const DSD_TO_PCM_GAIN_DB_MAX_NANO: i64 = 24_000_000_000;
 const DSD_TO_PCM_GAIN_DB_STEP_NANO: i64 = 250_000_000;
+const DSD_AUTO_GAIN_MARGIN_DB_MIN_NANO: i64 = 0;
+const DSD_AUTO_GAIN_MARGIN_DB_MAX_NANO: i64 = 6_000_000_000;
+const DSD_AUTO_GAIN_MARGIN_DB_STEP_NANO: i64 = 50_000_000;
 
 impl ResamplerChoice {
     pub const fn label(self) -> &'static str {
@@ -2543,7 +2565,7 @@ mod clamp_pill_tests {
 
         assert_eq!(*format.dither.selected_value(), DitherType::None);
         assert_eq!(*format.resampler.selected_value(), ResamplerChoice::None);
-        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::Reference);
+        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::Disabled);
         assert_eq!(format.dsd_gain_db, tonepoet_pipeline::DbNano::ZERO);
         assert!(!format.dither_overridden);
         assert!(!format.resampler_overridden);
@@ -2969,15 +2991,19 @@ pub enum FormatField {
     DsdGain,
     /// Fixed DSD-to-PCM gain value, edited with left/right controls.
     DsdGainDb,
-    /// NormalizePeak target in dBFS, edited with left/right controls.
+    /// Native NormalizePeak target or exact legacy Auto safety margin.
     DsdNormalizeTarget,
 }
 
 impl FormatField {
-    /// Rows visible in the format pane. Native DSD-to-PCM Reference controls
-    /// are shown only when the caller has established both the conversion
-    /// direction and release-policy availability.
-    pub fn visible_rows(is_dsd_target: bool, show_dsd_to_pcm_gain: bool) -> &'static [Self] {
+    /// Rows visible in the format pane. Legacy gain remains visible for every
+    /// DSD-to-PCM conversion; native Reference-only rows are independently
+    /// promotion-gated.
+    pub fn visible_rows(
+        is_dsd_target: bool,
+        show_dsd_to_pcm_gain: bool,
+        show_reference_controls: bool,
+    ) -> &'static [Self] {
         if is_dsd_target {
             &[
                 Self::Format,
@@ -2987,40 +3013,48 @@ impl FormatField {
                 Self::ModulatorOrder,
                 Self::ConversionPreset,
             ]
+        } else if show_reference_controls {
+            &[
+                Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
+                Self::Dither, Self::ReplayGain, Self::DsdPath, Self::DsdProfile,
+                Self::DsdGain, Self::DsdGainDb, Self::DsdNormalizeTarget,
+            ]
         } else if show_dsd_to_pcm_gain {
             &[
-                Self::Format,
-                Self::SampleRate,
-                Self::BitDepth,
-                Self::Resampler,
-                Self::Dither,
-                Self::ReplayGain,
-                Self::DsdPath,
-                Self::DsdProfile,
-                Self::DsdGain,
-                Self::DsdGainDb,
+                Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
+                Self::Dither, Self::ReplayGain, Self::DsdGain, Self::DsdGainDb,
                 Self::DsdNormalizeTarget,
             ]
         } else {
             &[
-                Self::Format,
-                Self::SampleRate,
-                Self::BitDepth,
-                Self::Resampler,
-                Self::Dither,
-                Self::ReplayGain,
+                Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
+                Self::Dither, Self::ReplayGain,
             ]
         }
     }
 
-    pub fn next_for(self, is_dsd_target: bool, show_dsd_to_pcm_gain: bool) -> Self {
-        let rows = Self::visible_rows(is_dsd_target, show_dsd_to_pcm_gain);
+    pub fn next_for(
+        self,
+        is_dsd_target: bool,
+        show_dsd_to_pcm_gain: bool,
+        show_reference_controls: bool,
+    ) -> Self {
+        let rows = Self::visible_rows(
+            is_dsd_target, show_dsd_to_pcm_gain, show_reference_controls,
+        );
         let idx = rows.iter().position(|row| *row == self).unwrap_or(0);
         rows[(idx + 1) % rows.len()]
     }
 
-    pub fn prev_for(self, is_dsd_target: bool, show_dsd_to_pcm_gain: bool) -> Self {
-        let rows = Self::visible_rows(is_dsd_target, show_dsd_to_pcm_gain);
+    pub fn prev_for(
+        self,
+        is_dsd_target: bool,
+        show_dsd_to_pcm_gain: bool,
+        show_reference_controls: bool,
+    ) -> Self {
+        let rows = Self::visible_rows(
+            is_dsd_target, show_dsd_to_pcm_gain, show_reference_controls,
+        );
         let idx = rows.iter().position(|row| *row == self).unwrap_or(0);
         rows[(idx + rows.len() - 1) % rows.len()]
     }
@@ -3227,6 +3261,8 @@ pub struct FormatState {
     pub dsd_gain_db: DbNano,
     /// NormalizePeak target in dBFS. Stored as fixed-point text authority.
     pub dsd_normalize_target_dbfs: DbNano,
+    /// Exact legacy Auto-mode safety margin in dB.
+    pub dsd_auto_gain_margin_db: DbNano,
     /// Whether the currently previewed source is DSD. Drives visibility and
     /// activation of DSD-to-PCM gain controls so they never appear for PCM sources.
     pub source_is_dsd: bool,
@@ -3474,9 +3510,11 @@ impl FormatState {
         ]);
 
         let dsd_gain_mode = PillState::new(vec![
+            (DsdGainMode::Disabled, "disabled"),
+            (DsdGainMode::Auto, "auto"),
             (DsdGainMode::Reference, "reference"),
             (DsdGainMode::NativeLevel, "native"),
-            (DsdGainMode::Fixed, "fixed"),
+            (DsdGainMode::Fixed, "manual"),
             (DsdGainMode::NormalizePeak, "normalize"),
         ]);
         let mut dsd_pathway = PillState::new(vec![
@@ -3505,6 +3543,7 @@ impl FormatState {
             dsd_gain_mode,
             dsd_gain_db: DbNano(0),
             dsd_normalize_target_dbfs: DbNano::DEFAULT_NORMALIZE_TARGET,
+            dsd_auto_gain_margin_db: DbNano(150_000_000),
             source_is_dsd: false,
             source_dsd_rate_hz: None,
             source_rate_identity: SourceRateIdentity::Unstaged,
@@ -3682,13 +3721,21 @@ impl FormatState {
     pub fn focus_next(&mut self) {
         self.field_focus = self
             .field_focus
-            .next_for(self.is_dsd_selected(), self.dsd_reference_controls_available());
+            .next_for(
+                self.is_dsd_selected(),
+                self.dsd_to_pcm_gain_available(),
+                self.dsd_reference_controls_available(),
+            );
     }
 
     pub fn focus_prev(&mut self) {
         self.field_focus = self
             .field_focus
-            .prev_for(self.is_dsd_selected(), self.dsd_reference_controls_available());
+            .prev_for(
+                self.is_dsd_selected(),
+                self.dsd_to_pcm_gain_available(),
+                self.dsd_reference_controls_available(),
+            );
     }
 
     pub fn mark_dither_overridden(&mut self) {
@@ -3932,9 +3979,19 @@ impl FormatState {
                 true
             }
             FormatField::DsdNormalizeTarget => {
-                self.dsd_gain_mode.select_value(&DsdGainMode::NormalizePeak);
-                self.dsd_normalize_target_dbfs =
-                    clamp_dsd_normalize_target_dbfs(self.dsd_normalize_target_dbfs);
+                if self.dsd_reference_controls_available() {
+                    if !self.dsd_gain_mode.select_value(&DsdGainMode::NormalizePeak) {
+                        return false;
+                    }
+                    self.dsd_normalize_target_dbfs =
+                        clamp_dsd_normalize_target_dbfs(self.dsd_normalize_target_dbfs);
+                } else {
+                    if !self.dsd_gain_mode.select_value(&DsdGainMode::Auto) {
+                        return false;
+                    }
+                    self.dsd_auto_gain_margin_db =
+                        clamp_dsd_auto_gain_margin_db(self.dsd_auto_gain_margin_db);
+                }
                 true
             }
         };
@@ -4122,7 +4179,12 @@ impl FormatState {
             self.resampler.select_value(&ResamplerChoice::None);
         }
         if *self.dsd_gain_mode.selected_value() != DsdGainMode::Fixed {
-            self.dsd_gain_mode.select_value(&DsdGainMode::Reference);
+            let default_mode = if self.dsd_reference_controls_available() {
+                DsdGainMode::Reference
+            } else {
+                DsdGainMode::Disabled
+            };
+            self.dsd_gain_mode.select_value(&default_mode);
             self.dsd_gain_db = DbNano(0);
         }
 
@@ -4277,7 +4339,36 @@ impl FormatState {
             && target_rate_hz != SOURCE_SAMPLE_RATE_SENTINEL;
         self.dsd_profile
             .set_enabled(&DsdReconstructionSelection::Wideband, wideband_available);
-        self.dsd_gain_mode.set_all_enabled(self.dsd_reference_controls_available());
+        // Pre-promotion exposes the exact legacy Disabled/Auto/Manual family.
+        // Promotion switches this same row to the native Reference family; the
+        // two settings origins are never mixed.
+        let gain_available = self.dsd_to_pcm_gain_available();
+        let reference_available = self.dsd_reference_controls_available();
+        self.dsd_gain_mode.set_all_enabled(false);
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::Disabled, gain_available && !reference_available);
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::Auto, gain_available && !reference_available);
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::Reference, reference_available);
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::NativeLevel, reference_available);
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::Fixed, gain_available);
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::NormalizePeak, reference_available);
+        for option in &mut self.dsd_gain_mode.options {
+            option.label = match option.value {
+                DsdGainMode::Disabled => "disabled",
+                DsdGainMode::Auto => "auto",
+                DsdGainMode::Reference => "reference",
+                DsdGainMode::NativeLevel => "native",
+                DsdGainMode::Fixed if reference_available => "fixed",
+                DsdGainMode::Fixed => "manual",
+                DsdGainMode::NormalizePeak => "normalize",
+            }
+            .to_string();
+        }
 
         // DSD rate threshold: rates at or above this are DSD, below are PCM.
         const DSD_RATE_MIN: u32 = 2_822_400;
@@ -4391,10 +4482,9 @@ impl FormatState {
             }
         }
 
-        // DSD sources always use sox for decode — resampler pill is irrelevant.
-        if self.source_is_dsd {
-            self.resampler.set_all_enabled(false);
-        }
+        // Native-v2 Reference owns resampling and dither, but the pre-promotion
+        // legacy DSD-to-PCM route still exposes the generic controls.  Do not
+        // disable them merely because the source is DSD.
 
         self.clamp_disabled_selections();
         // Constraint clamping does not change provenance. When a source-derived
@@ -4415,6 +4505,7 @@ impl FormatState {
         }
         if !FormatField::visible_rows(
             self.is_dsd_selected(),
+            self.dsd_to_pcm_gain_available(),
             self.dsd_reference_controls_available(),
         )
         .contains(&self.field_focus)
@@ -4445,9 +4536,12 @@ impl FormatState {
         self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
         self.dsd_normalize_target_dbfs =
             clamp_dsd_normalize_target_dbfs(self.dsd_normalize_target_dbfs);
+        self.dsd_auto_gain_margin_db =
+            clamp_dsd_auto_gain_margin_db(self.dsd_auto_gain_margin_db);
     }
 
     pub fn focused_pill_mut(&mut self) -> FocusedPill<'_> {
+        let reference_available = self.dsd_reference_controls_available();
         match self.field_focus {
             FormatField::Format => FocusedPill::Format(&mut self.format),
             FormatField::SampleRate | FormatField::DsdRate => FocusedPill::SampleRate(&mut self.sample_rate),
@@ -4465,8 +4559,14 @@ impl FormatState {
                 gain_db: &mut self.dsd_gain_db,
                 gain_mode: &mut self.dsd_gain_mode,
             },
-            FormatField::DsdNormalizeTarget => FocusedPill::DsdNormalizeTarget {
-                target_dbfs: &mut self.dsd_normalize_target_dbfs,
+            FormatField::DsdNormalizeTarget if reference_available => {
+                FocusedPill::DsdNormalizeTarget {
+                    target_dbfs: &mut self.dsd_normalize_target_dbfs,
+                    gain_mode: &mut self.dsd_gain_mode,
+                }
+            }
+            FormatField::DsdNormalizeTarget => FocusedPill::DsdAutoGainMargin {
+                margin_db: &mut self.dsd_auto_gain_margin_db,
                 gain_mode: &mut self.dsd_gain_mode,
             },
         }
@@ -4488,6 +4588,13 @@ fn clamp_dsd_normalize_target_dbfs(value: DbNano) -> DbNano {
     DbNano(value.0.clamp(
         DbNano::MIN_NORMALIZE_TARGET.0,
         DbNano::MAX_NORMALIZE_TARGET.0,
+    ))
+}
+
+fn clamp_dsd_auto_gain_margin_db(value: DbNano) -> DbNano {
+    DbNano(value.0.clamp(
+        DSD_AUTO_GAIN_MARGIN_DB_MIN_NANO,
+        DSD_AUTO_GAIN_MARGIN_DB_MAX_NANO,
     ))
 }
 
@@ -4624,6 +4731,10 @@ pub enum FocusedPill<'a> {
         target_dbfs: &'a mut DbNano,
         gain_mode: &'a mut PillState<DsdGainMode>,
     },
+    DsdAutoGainMargin {
+        margin_db: &'a mut DbNano,
+        gain_mode: &'a mut PillState<DsdGainMode>,
+    },
 }
 
 impl FocusedPill<'_> {
@@ -4648,6 +4759,10 @@ impl FocusedPill<'_> {
             Self::DsdNormalizeTarget { target_dbfs, gain_mode } => {
                 (*gain_mode).select_value(&DsdGainMode::NormalizePeak);
                 step_dsd_normalize_target_dbfs(*target_dbfs, DSD_TO_PCM_GAIN_DB_STEP_NANO);
+            }
+            Self::DsdAutoGainMargin { margin_db, gain_mode } => {
+                (*gain_mode).select_value(&DsdGainMode::Auto);
+                step_dsd_auto_gain_margin_db(*margin_db, DSD_AUTO_GAIN_MARGIN_DB_STEP_NANO);
             }
         }
     }
@@ -4674,12 +4789,20 @@ impl FocusedPill<'_> {
                 (*gain_mode).select_value(&DsdGainMode::NormalizePeak);
                 step_dsd_normalize_target_dbfs(*target_dbfs, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
+            Self::DsdAutoGainMargin { margin_db, gain_mode } => {
+                (*gain_mode).select_value(&DsdGainMode::Auto);
+                step_dsd_auto_gain_margin_db(*margin_db, -DSD_AUTO_GAIN_MARGIN_DB_STEP_NANO);
+            }
         }
     }
 }
 
 fn step_dsd_normalize_target_dbfs(value: &mut DbNano, delta_nano: i64) {
     *value = clamp_dsd_normalize_target_dbfs(DbNano(value.0.saturating_add(delta_nano)));
+}
+
+fn step_dsd_auto_gain_margin_db(value: &mut DbNano, delta_nano: i64) {
+    *value = clamp_dsd_auto_gain_margin_db(DbNano(value.0.saturating_add(delta_nano)));
 }
 
 /// Which single-file metadata field in the Convert metadata pane is focused
@@ -13002,16 +13125,16 @@ mod dsd_gain_format_state_tests {
 
     #[test]
     fn dsd_gain_rows_are_visible_only_for_dsd_sources_targeting_pcm() {
-        assert!(!FormatField::visible_rows(false, false).contains(&FormatField::DsdGain));
-        assert!(!FormatField::visible_rows(false, false).contains(&FormatField::DsdGainDb));
-        assert!(FormatField::visible_rows(false, true).contains(&FormatField::DsdGain));
-        assert!(FormatField::visible_rows(false, true).contains(&FormatField::DsdGainDb));
-        assert!(FormatField::visible_rows(false, true).contains(&FormatField::DsdPath));
-        assert!(FormatField::visible_rows(false, true).contains(&FormatField::DsdProfile));
-        assert!(FormatField::visible_rows(false, true)
+        assert!(!FormatField::visible_rows(false, false, false).contains(&FormatField::DsdGain));
+        assert!(!FormatField::visible_rows(false, false, false).contains(&FormatField::DsdGainDb));
+        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdGain));
+        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdGainDb));
+        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdPath));
+        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdProfile));
+        assert!(FormatField::visible_rows(false, true, true)
             .contains(&FormatField::DsdNormalizeTarget));
-        assert!(!FormatField::visible_rows(true, false).contains(&FormatField::DsdGain));
-        assert!(!FormatField::visible_rows(true, true).contains(&FormatField::DsdGain));
+        assert!(!FormatField::visible_rows(true, false, false).contains(&FormatField::DsdGain));
+        assert!(!FormatField::visible_rows(true, true, true).contains(&FormatField::DsdGain));
     }
 
     #[test]
@@ -13023,11 +13146,20 @@ mod dsd_gain_format_state_tests {
         s.set_source_is_dsd(true);
         assert!(s.dsd_to_pcm_gain_available());
         assert!(!s.dsd_reference_controls_available());
-        assert!(!FormatField::visible_rows(
+        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Disabled && option.enabled));
+        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Auto && option.enabled));
+        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Fixed && option.enabled));
+        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Reference && !option.enabled));
+        let rows = FormatField::visible_rows(
             s.is_dsd_selected(),
+            s.dsd_to_pcm_gain_available(),
             s.dsd_reference_controls_available(),
-        )
-        .contains(&FormatField::DsdGain));
+        );
+        assert!(rows.contains(&FormatField::DsdGain));
+        assert!(rows.contains(&FormatField::DsdGainDb));
+        assert!(rows.contains(&FormatField::DsdNormalizeTarget));
+        assert!(!rows.contains(&FormatField::DsdPath));
+        assert!(!rows.contains(&FormatField::DsdProfile));
         assert!(s.resampler.options.iter().any(|option| option.enabled));
         assert!(s.dither.options.iter().any(|option| option.enabled));
     }
@@ -13043,6 +13175,7 @@ mod dsd_gain_format_state_tests {
         assert!(!s.dsd_reference_controls_available());
         assert!(!FormatField::visible_rows(
             s.is_dsd_selected(),
+            s.dsd_to_pcm_gain_available(),
             s.dsd_reference_controls_available(),
         )
         .contains(&FormatField::DsdGain));
@@ -13059,17 +13192,18 @@ mod dsd_gain_format_state_tests {
         s.set_source_is_dsd(true);
         s.field_focus = FormatField::ReplayGain;
         s.focus_next();
-        assert_eq!(s.field_focus, FormatField::Format);
+        assert_eq!(s.field_focus, FormatField::DsdGain);
     }
 
     #[test]
-    fn dsd_reference_controls_default_to_reference_and_minus_015_dbfs() {
+    fn pre_promotion_dsd_gain_defaults_are_exact_legacy_disabled_and_point_15_margin() {
         let s = FormatState::new();
-        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Reference);
+        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Disabled);
         assert_eq!(
             s.dsd_normalize_target_dbfs,
             "-0.150000000".parse().unwrap()
         );
+        assert_eq!(s.dsd_auto_gain_margin_db, "0.150000000".parse().unwrap());
         assert_eq!(s.dsd_gain_db, DbNano::ZERO);
         assert!(!s.source_is_dsd);
     }
@@ -13110,16 +13244,29 @@ mod dsd_gain_format_state_tests {
     }
 
     #[test]
-    fn normalize_target_row_preserves_fixed_point_and_selects_normalize() {
+    fn native_normalize_target_value_preserves_fixed_point() {
+        let mut mode = PillState::new(vec![
+            (DsdGainMode::NormalizePeak, "normalize"),
+            (DsdGainMode::Fixed, "fixed"),
+        ]);
+        let mut target = DbNano::DEFAULT_NORMALIZE_TARGET;
+        let mut focused = FocusedPill::DsdNormalizeTarget {
+            target_dbfs: &mut target,
+            gain_mode: &mut mode,
+        };
+        focused.select_prev();
+        assert_eq!(*mode.selected_value(), DsdGainMode::NormalizePeak);
+        assert_eq!(target, "-0.400000000".parse().unwrap());
+    }
+
+    #[test]
+    fn pre_promotion_auto_margin_row_selects_auto_and_steps_exact_margin() {
         let mut s = FormatState::new();
-        enable_native_reference_controls_for_unit_test(&mut s);
+        s.set_source_is_dsd(true);
         s.field_focus = FormatField::DsdNormalizeTarget;
-        s.select_focused_prev(None, None);
-        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::NormalizePeak);
-        assert_eq!(
-            s.dsd_normalize_target_dbfs,
-            "-0.400000000".parse().unwrap()
-        );
+        s.select_focused_next(None, None);
+        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Auto);
+        assert_eq!(s.dsd_auto_gain_margin_db, "0.200000000".parse().unwrap());
     }
 
     #[test]

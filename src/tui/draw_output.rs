@@ -180,33 +180,36 @@ pub fn draw_format_pane(
                 &format_state.replaygain,
                 focused && format_state.field_focus == FormatField::ReplayGain, theme),
             focused && format_state.field_focus == FormatField::ReplayGain, theme));
-        if format_state.dsd_reference_controls_available() {
-            lines.push(pill_row(
-                border_color,
-                w,
-                "DSD path   ",
-                "",
-                &render_pill_spans(
-                    &format_state.dsd_pathway,
+        if format_state.dsd_to_pcm_gain_available() {
+            let reference_available = format_state.dsd_reference_controls_available();
+            if reference_available {
+                lines.push(pill_row(
+                    border_color,
+                    w,
+                    "DSD path   ",
+                    "",
+                    &render_pill_spans(
+                        &format_state.dsd_pathway,
+                        focused && format_state.field_focus == FormatField::DsdPath,
+                        theme,
+                    ),
                     focused && format_state.field_focus == FormatField::DsdPath,
                     theme,
-                ),
-                focused && format_state.field_focus == FormatField::DsdPath,
-                theme,
-            ));
-            lines.push(pill_row(
-                border_color,
-                w,
-                "DSD profile",
-                "",
-                &render_pill_spans(
-                    &format_state.dsd_profile,
+                ));
+                lines.push(pill_row(
+                    border_color,
+                    w,
+                    "DSD profile",
+                    "",
+                    &render_pill_spans(
+                        &format_state.dsd_profile,
+                        focused && format_state.field_focus == FormatField::DsdProfile,
+                        theme,
+                    ),
                     focused && format_state.field_focus == FormatField::DsdProfile,
                     theme,
-                ),
-                focused && format_state.field_focus == FormatField::DsdProfile,
-                theme,
-            ));
+                ));
+            }
             lines.push(pill_row(
                 border_color,
                 w,
@@ -214,8 +217,12 @@ pub fn draw_format_pane(
                 "",
                 &render_pill_spans(
                     &format_state.dsd_gain_mode,
-                    focused && format_state.field_focus == FormatField::DsdGain, theme),
-                focused && format_state.field_focus == FormatField::DsdGain, theme));
+                    focused && format_state.field_focus == FormatField::DsdGain,
+                    theme,
+                ),
+                focused && format_state.field_focus == FormatField::DsdGain,
+                theme,
+            ));
             lines.push(dsd_db_value_row(
                 border_color,
                 w,
@@ -223,17 +230,38 @@ pub fn draw_format_pane(
                 format_state.dsd_gain_db,
                 *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Fixed,
                 focused && format_state.field_focus == FormatField::DsdGainDb,
-                "select fixed to apply",
+                if reference_available {
+                    "select fixed to apply"
+                } else {
+                    "select manual to apply"
+                },
                 theme,
             ));
+            let (target_label, target_value, target_active, target_hint) =
+                if reference_available {
+                    (
+                        "normalize  ",
+                        format_state.dsd_normalize_target_dbfs,
+                        *format_state.dsd_gain_mode.selected_value()
+                            == DsdGainMode::NormalizePeak,
+                        "select normalize to apply",
+                    )
+                } else {
+                    (
+                        "auto margin",
+                        format_state.dsd_auto_gain_margin_db,
+                        *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Auto,
+                        "select auto to apply",
+                    )
+                };
             lines.push(dsd_db_value_row(
                 border_color,
                 w,
-                "normalize  ",
-                format_state.dsd_normalize_target_dbfs,
-                *format_state.dsd_gain_mode.selected_value() == DsdGainMode::NormalizePeak,
+                target_label,
+                target_value,
+                target_active,
                 focused && format_state.field_focus == FormatField::DsdNormalizeTarget,
-                "select normalize to apply",
+                target_hint,
                 theme,
             ));
         }

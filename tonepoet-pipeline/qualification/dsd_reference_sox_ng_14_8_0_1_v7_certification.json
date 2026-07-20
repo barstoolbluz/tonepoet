@@ -1,0 +1,7 @@
+{
+  "schema_version": 7,
+  "policy": "sox_ng_14_8_0_1_v7",
+  "status": "not_run",
+  "outcome": "not_run",
+  "note": "Policy v7 is a source-controlled qualification candidate. Run the mandatory pinned real-tool gate and bind its exact report before promotion."
+}

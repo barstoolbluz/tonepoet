@@ -24,8 +24,9 @@ use tonepoet_pipeline::{
     parse_reference_true_peak_measurement, plan_conversion, resolve_reference_deferred_command,
     validate_post_final_true_peak, validate_signed_zero_f64le, ConversionPlan,
     DsdReferencePlanSummary, DsdSourceKind, Finalization, MeasurementId, MeasurementParser,
-    PlanAction, PlanRequest, PlannedCommand, SacdAreaKind, SacdFrameEncoding,
-    PlannedDeferredCommand, PlannedExecutionStep, PlannedMeasurement, Sha256Digest,
+    PlanAction, PlanRequest, PlannedCommand, PlannedCommandPipeline, SacdAreaKind,
+    SacdFrameEncoding, PlannedDeferredCommand, PlannedExecutionStep, PlannedMeasurement,
+    Sha256Digest,
     ToolIdentifier, TruePeakMeasurement, TruePeakPurpose,
 };
 use tonepoet_pipeline::fingerprint::{
@@ -126,9 +127,13 @@ pub struct ReferencePcmVerificationEvidence {
     /// Hash repeated after metadata/artwork/replaygain mutation. Required before manifest authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_metadata_sample_sha256: Option<Sha256Digest>,
-    /// Exact post-metadata verification invocation, retained as durable evidence.
+    /// Historical single-command post-metadata transcript retained for backward decoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_metadata_verification_command: Option<CommandRecord>,
+    /// Exact ordered post-metadata verification transcript. Policy v7 records both
+    /// stages when Float64 W64 requires the qualified SoX-to-FFmpeg stream.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_metadata_verification_commands: Vec<CommandRecord>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -770,6 +775,8 @@ struct EmbeddedReferenceQualification {
     ffmpeg: EmbeddedQualifiedFfmpeg,
     in_process: EmbeddedInProcessIdentity,
     analyzer: EmbeddedAnalyzerAuthority,
+    packaging: EmbeddedReferencePackaging,
+    sample_identity: EmbeddedReferenceSampleIdentity,
     subprocess_environment: EmbeddedSubprocessEnvironment,
     qualification_supervision: EmbeddedQualificationSupervision,
     profiles: EmbeddedReferenceProfiles,
@@ -780,6 +787,40 @@ struct EmbeddedReferenceQualification {
     release_certification: EmbeddedReleaseCertification,
     qualification_basis: String,
     runtime_activation: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReferencePackaging {
+    schema: String,
+    float64_wav_targets: Vec<String>,
+    producer_tool: String,
+    producer_args_template: Vec<String>,
+    consumer_tool: String,
+    consumer_args_template: Vec<String>,
+    rf64_args: Vec<String>,
+    transport: String,
+    stream_encoding: String,
+    stream_framing: String,
+    endianness: String,
+    disk_intermediate: bool,
+    environment_policy: String,
+    environment: std::collections::BTreeMap<String, String>,
+    forbidden_route: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReferenceSampleIdentity {
+    schema: String,
+    float64_qpcm_w64_route: String,
+    float64_w64_final_route: String,
+    float64_riff_rf64_output_route: String,
+    other_carrier_route: String,
+    hash_format: String,
+    oracle_independence: String,
+    environment_policy: String,
+    environment: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -903,6 +944,10 @@ struct EmbeddedAnalyzerCarrier {
     exact_recontainer: bool,
     greater_than_4_gib_fixture_required: bool,
     known_ffmpeg_w64_defect: String,
+    routing_rule: String,
+    direct_float32_input: String,
+    direct_float32_consumer_args_template: Vec<String>,
+    known_sox_float32_w64_defect: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1042,9 +1087,9 @@ fn validate_embedded_release_certification(
     let certification = &manifest.release_certification;
     if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
         || certification.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_certification.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_certification.json"
         || certification.candidate_manifest_path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_candidate.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
     {
         return Err(reference_toolchain_error(
             "the embedded release-certification descriptor is not canonical",
@@ -1052,7 +1097,7 @@ fn validate_embedded_release_certification(
     }
     let report_sha256 = certification.report_sha256.as_deref().ok_or_else(|| {
         reference_toolchain_error(
-            "the embedded v5 policy has not bound a release-certification report",
+            "the embedded v7 policy has not bound a release-certification report",
         )
     })?;
     let candidate_manifest_sha256 = certification
@@ -1060,20 +1105,20 @@ fn validate_embedded_release_certification(
         .as_deref()
         .ok_or_else(|| {
             reference_toolchain_error(
-                "the embedded v5 policy has not bound its qualified candidate manifest",
+                "the embedded v7 policy has not bound its qualified candidate manifest",
             )
         })?;
     let current_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
     ));
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_certification.json"
     ));
     let candidate_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
     ));
     let parse_digest = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -1097,13 +1142,13 @@ fn validate_embedded_release_certification(
     let mut normalized_current: serde_json::Value =
         serde_json::from_slice(current_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded current v5 manifest is invalid JSON: {error}"
+                "the embedded current v7 manifest is invalid JSON: {error}"
             ))
         })?;
     let candidate_value: serde_json::Value =
         serde_json::from_slice(candidate_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded preserved v5 candidate is invalid JSON: {error}"
+                "the embedded preserved v7 candidate is invalid JSON: {error}"
             ))
         })?;
     if candidate_value.get("status").and_then(serde_json::Value::as_str)
@@ -1116,7 +1161,7 @@ fn validate_embedded_release_certification(
             .is_none_or(|value| !value.is_null())
     {
         return Err(reference_toolchain_error(
-            "the preserved v5 candidate is not the canonical unpromoted policy snapshot",
+            "the preserved v7 candidate is not the canonical unpromoted policy snapshot",
         ));
     }
     normalized_current["status"] =
@@ -1127,7 +1172,7 @@ fn validate_embedded_release_certification(
         serde_json::Value::Null;
     if normalized_current != candidate_value {
         return Err(reference_toolchain_error(
-            "the promoted v5 manifest differs from its qualified candidate outside the permitted certification fields",
+            "the promoted v7 manifest differs from its qualified candidate outside the permitted certification fields",
         ));
     }
     let report: serde_json::Value = serde_json::from_slice(report_bytes).map_err(|error| {
@@ -1135,9 +1180,9 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report is invalid JSON: {error}"
         ))
     })?;
-    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(5)
+    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(7)
         || report.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V5_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V7_KEY)
         || report.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || report.get("outcome").and_then(serde_json::Value::as_str) != Some("pass")
         || report
@@ -1146,7 +1191,7 @@ fn validate_embedded_release_certification(
             != Some(candidate_manifest_sha256)
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report does not bind the qualified v5 candidate",
+            "the embedded release-certification report does not bind the qualified v7 candidate",
         ));
     }
     for required in [
@@ -1161,6 +1206,9 @@ fn validate_embedded_release_certification(
         "production_source_front_end_integration",
         "dst_independent_oracle",
         "package_decode_back",
+        "float64_package_pipeline",
+        "sample_identity_oracle",
+        "evidence_command_environment",
         "qualified_cell_contract",
     ] {
         if report.get(required).is_none() {
@@ -1323,6 +1371,15 @@ fn validate_embedded_release_certification(
     let corrected_path = carrier
         .get("corrected_path")
         .and_then(serde_json::Value::as_object);
+    let float32_direct_path = carrier
+        .get("float32_direct_path")
+        .and_then(serde_json::Value::as_object);
+    let float32_sox_defect = carrier
+        .get("float32_sox_recontainer_defect")
+        .and_then(serde_json::Value::as_object);
+    let f1_reference_gain = carrier
+        .get("f1_reference_gain_regression")
+        .and_then(serde_json::Value::as_object);
     let large_stream = carrier
         .get("greater_than_4_gib_stream")
         .and_then(serde_json::Value::as_object);
@@ -1376,6 +1433,25 @@ fn validate_embedded_release_certification(
             "-",
         ],
     );
+    let float32_consumer_argv_valid = float32_direct_path
+        .and_then(|value| value.get("consumer_argv"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|args| {
+            args.len() == 12
+                && args[0].as_str() == Some("-nostdin")
+                && args[1].as_str() == Some("-hide_banner")
+                && args[2].as_str() == Some("-nostats")
+                && args[3].as_str() == Some("-loglevel")
+                && args[4].as_str() == Some("info")
+                && args[5].as_str() == Some("-i")
+                && args[6].as_str().is_some_and(|path| !path.is_empty())
+                && args[7].as_str() == Some("-filter:a")
+                && args[8].as_str()
+                    == Some("loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json")
+                && args[9].as_str() == Some("-f")
+                && args[10].as_str() == Some("null")
+                && args[11].as_str() == Some("-")
+        });
     let analytic_peak = known_defect
         .and_then(|value| value.get("analytic_peak_dbfs"))
         .and_then(serde_json::Value::as_f64);
@@ -1388,9 +1464,39 @@ fn validate_embedded_release_certification(
     let corrected_input_tp = corrected_path
         .and_then(|value| value.get("reported_input_tp_dbtp"))
         .and_then(serde_json::Value::as_f64);
+    let float32_analytic_peak = float32_direct_path
+        .and_then(|value| value.get("analytic_peak_dbfs"))
+        .and_then(serde_json::Value::as_f64);
+    let float32_direct_input_tp = float32_direct_path
+        .and_then(|value| value.get("reported_input_tp_dbtp"))
+        .and_then(serde_json::Value::as_f64);
+    let float32_sox_input_tp = float32_sox_defect
+        .and_then(|value| value.get("recontainer_reported_input_tp_dbtp"))
+        .and_then(serde_json::Value::as_f64);
+    let float32_sox_delta = float32_sox_defect
+        .and_then(|value| value.get("scaling_delta_db"))
+        .and_then(serde_json::Value::as_f64);
+    let f1_pre_reported = f1_reference_gain
+        .and_then(|value| value.get("pre_reported_input_tp_dbtp"))
+        .and_then(serde_json::Value::as_f64);
+    let f1_applied_gain = f1_reference_gain
+        .and_then(|value| value.get("applied_gain_db"))
+        .and_then(serde_json::Value::as_f64);
+    let f1_expected_post = f1_reference_gain
+        .and_then(|value| value.get("expected_post_from_pre_and_gain_dbtp"))
+        .and_then(serde_json::Value::as_f64);
+    let f1_post_reported = f1_reference_gain
+        .and_then(|value| value.get("post_reported_input_tp_dbtp"))
+        .and_then(serde_json::Value::as_f64);
+    let f1_post_upper = f1_reference_gain
+        .and_then(|value| value.get("post_conservative_upper_dbtp"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<tonepoet_pipeline::DbNano>().ok());
     if carrier.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || carrier.get("contract").and_then(serde_json::Value::as_str)
-            != Some("tonepoet-reference-analyzer-carrier/v1")
+            != Some("tonepoet-reference-analyzer-carrier/v2")
+        || carrier.get("routing_rule").and_then(serde_json::Value::as_str)
+            != Some("float32_w64_direct_ffmpeg_else_sox_f64_wav_stream")
         || known_defect
             .and_then(|value| value.get("status"))
             .and_then(serde_json::Value::as_str)
@@ -1428,7 +1534,7 @@ fn validate_embedded_release_certification(
         || corrected_path
             .and_then(|value| value.get("parser"))
             .and_then(serde_json::Value::as_str)
-            != Some("ffmpeg_loudnorm_input_tp_v2")
+            != Some("ffmpeg_loudnorm_input_tp_v3")
         || corrected_path
             .and_then(|value| value.get("environment_policy"))
             .and_then(serde_json::Value::as_str)
@@ -1458,6 +1564,100 @@ fn validate_embedded_release_certification(
         || !producer_argv_valid
         || !consumer_input_valid
         || !consumer_argv_valid
+        || float32_direct_path
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || float32_direct_path
+            .and_then(|value| value.get("carrier_depth"))
+            .and_then(serde_json::Value::as_str)
+            != Some("float32")
+        || float32_direct_path
+            .and_then(|value| value.get("carrier_container"))
+            .and_then(serde_json::Value::as_str)
+            != Some("w64")
+        || float32_direct_path
+            .and_then(|value| value.get("disk_intermediate"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || float32_direct_path
+            .and_then(|value| value.get("package_step"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || float32_direct_path
+            .and_then(|value| value.get("parser"))
+            .and_then(serde_json::Value::as_str)
+            != Some("ffmpeg_loudnorm_input_tp_v3")
+        || float32_direct_path
+            .and_then(|value| value.get("environment_policy"))
+            .and_then(serde_json::Value::as_str)
+            != Some("clear_and_set")
+        || float32_direct_path
+            .and_then(|value| value.get("environment"))
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|variables| {
+                variables.len() != 1
+                    || variables.get("LC_ALL").and_then(serde_json::Value::as_str) != Some("C")
+            })
+        || float32_direct_path
+            .and_then(|value| value.get("input_stage"))
+            .is_none_or(|value| !value.is_null())
+        || float32_analytic_peak
+            .zip(float32_direct_input_tp)
+            .is_none_or(|(analytic, direct)| (direct - analytic).abs() > 0.02)
+        || !float32_consumer_argv_valid
+        || float32_sox_defect
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("reproduced")
+        || float32_sox_input_tp.is_none_or(|value| value < -0.10)
+        || float32_direct_input_tp
+            .zip(float32_sox_input_tp)
+            .zip(float32_sox_delta)
+            .is_none_or(|((direct, recontainer), delta)| {
+                delta <= 10.0 || ((recontainer - direct) - delta).abs() > 1e-9
+            })
+        || f1_reference_gain
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || f1_reference_gain
+            .and_then(|value| value.get("target_rate_hz"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(44_100)
+        || f1_reference_gain
+            .and_then(|value| value.get("channels"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || f1_reference_gain
+            .and_then(|value| value.get("depth"))
+            .and_then(serde_json::Value::as_str)
+            != Some("float32")
+        || f1_reference_gain
+            .and_then(|value| value.get("final_target"))
+            .and_then(serde_json::Value::as_str)
+            != Some("wav_riff")
+        || f1_reference_gain
+            .and_then(|value| value.get("qpcm_container"))
+            .and_then(serde_json::Value::as_str)
+            != Some("w64")
+        || f1_pre_reported.is_none_or(|value| !(-20.20..=-19.80).contains(&value))
+        || f1_pre_reported
+            .zip(f1_applied_gain)
+            .zip(f1_expected_post)
+            .is_none_or(|((pre, gain), expected)| ((pre + gain) - expected).abs() > 1e-9)
+        || f1_expected_post
+            .zip(f1_post_reported)
+            .is_none_or(|(expected, reported)| (reported - expected).abs() > 0.03)
+        || f1_post_upper.is_none_or(|value| value > tonepoet_pipeline::DbNano::REFERENCE_CEILING)
+        || f1_reference_gain
+            .and_then(|value| value.get("terminal_argv"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+        || f1_reference_gain
+            .and_then(|value| value.get("package_argv"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
         || large_stream
             .and_then(|value| value.get("status"))
             .and_then(serde_json::Value::as_str)
@@ -1961,7 +2161,7 @@ fn validate_embedded_release_certification(
             != Some(manifest.cell_contract.expanded_supported_cell_digest.as_str())
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report disagrees with the v5 cell contract",
+            "the embedded release-certification report disagrees with the v7 cell contract",
         ));
     }
     Ok(())
@@ -2026,6 +2226,72 @@ fn validate_embedded_reference_policy_tables(
         "LC_ALL".to_string(),
         "C".to_string(),
     )]);
+    const PACKAGE_PRODUCER_ARGS: [&str; 11] = [
+        "-S", "-D", "{qpcm_w64}", "-t", "raw", "-e", "floating-point", "-b", "64", "-L", "-",
+    ];
+    const PACKAGE_CONSUMER_ARGS: [&str; 24] = [
+        "-y", "-hide_banner", "-nostdin", "-f", "f64le", "-ar", "{sample_rate_hz}",
+        "-ac", "{channels}", "-i", "pipe:0", "-map", "0:a:0", "-map_metadata", "-1",
+        "-vn", "-sn", "-dn", "-c:a", "pcm_f64le", "-f", "wav", "{rf64_args}", "{output}",
+    ];
+    if manifest.packaging.schema != "tonepoet-reference-lossless-packaging/v3"
+        || !manifest
+            .packaging
+            .float64_wav_targets
+            .iter()
+            .map(String::as_str)
+            .eq(["wav_riff", "wav_rf64"])
+        || manifest.packaging.producer_tool != "sox_ng"
+        || !manifest
+            .packaging
+            .producer_args_template
+            .iter()
+            .map(String::as_str)
+            .eq(PACKAGE_PRODUCER_ARGS)
+        || manifest.packaging.consumer_tool != "ffmpeg"
+        || !manifest
+            .packaging
+            .consumer_args_template
+            .iter()
+            .map(String::as_str)
+            .eq(PACKAGE_CONSUMER_ARGS)
+        || !manifest
+            .packaging
+            .rf64_args
+            .iter()
+            .map(String::as_str)
+            .eq(["-rf64", "always"])
+        || manifest.packaging.transport != "direct_stdout_to_stdin_no_shell"
+        || manifest.packaging.stream_encoding != "pcm_f64le"
+        || manifest.packaging.stream_framing != "headerless_raw_pcm"
+        || manifest.packaging.endianness != "little"
+        || manifest.packaging.disk_intermediate
+        || manifest.packaging.environment_policy != "clear_and_set"
+        || manifest.packaging.environment != expected_environment
+        || manifest.packaging.forbidden_route
+            != "ffmpeg_direct_decode_of_float64_qpcm_w64"
+    {
+        return Err(reference_toolchain_error(
+            "embedded Float64 package contract disagrees with the compiled v7 policy",
+        ));
+    }
+    if manifest.sample_identity.schema != "tonepoet-reference-sample-identity/v3"
+        || manifest.sample_identity.float64_qpcm_w64_route
+            != "sox_f64le_raw_stream_to_ffmpeg_sha256"
+        || manifest.sample_identity.float64_w64_final_route
+            != "sox_f64le_raw_stream_to_ffmpeg_sha256"
+        || manifest.sample_identity.float64_riff_rf64_output_route != "ffmpeg_direct_sha256"
+        || manifest.sample_identity.other_carrier_route != "ffmpeg_direct_sha256"
+        || manifest.sample_identity.hash_format != "interleaved_f64le_sha256"
+        || manifest.sample_identity.oracle_independence
+            != "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode"
+        || manifest.sample_identity.environment_policy != "clear_and_set"
+        || manifest.sample_identity.environment != expected_environment
+    {
+        return Err(reference_toolchain_error(
+            "embedded decoded-sample identity contract disagrees with the compiled v7 policy",
+        ));
+    }
     if manifest.subprocess_environment.schema
         != "tonepoet-reference-subprocess-environment/v1"
         || manifest.subprocess_environment.policy != "clear_and_set"
@@ -2055,8 +2321,22 @@ fn validate_embedded_reference_policy_tables(
         ));
     }
     let carrier = &manifest.analyzer.carrier;
-    if carrier.schema != "tonepoet-reference-analyzer-carrier/v1"
-        || carrier.source_container != "sox_f64_w64"
+    const ANALYZER_DIRECT_FLOAT32_ARGS: [&str; 12] = [
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "info",
+        "-i",
+        "{carrier_w64}",
+        "-filter:a",
+        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ];
+    if carrier.schema != "tonepoet-reference-analyzer-carrier/v2"
+        || carrier.source_container != "carrier_sensitive_w64"
         || carrier.producer_tool != "sox_ng"
         || !carrier
             .producer_args_template
@@ -2077,7 +2357,7 @@ fn validate_embedded_reference_policy_tables(
             .iter()
             .map(String::as_str)
             .eq(ANALYZER_CONSUMER_ARGS)
-        || carrier.parser != "ffmpeg_loudnorm_input_tp_v2"
+        || carrier.parser != "ffmpeg_loudnorm_input_tp_v3"
         || carrier.stream_encoding != "pcm_f64le"
         || carrier.stream_header != "riff_wave_stream_read_to_eof"
         || carrier.streaming_size_sentinel_floor != 0x7fff_0000
@@ -2086,9 +2366,18 @@ fn validate_embedded_reference_policy_tables(
         || !carrier.greater_than_4_gib_fixture_required
         || carrier.known_ffmpeg_w64_defect
             != "ffmpeg_7_1_scales_sox_ieee_float64_w64_by_2^31"
+        || carrier.routing_rule != "float32_w64_direct_ffmpeg_else_sox_f64_wav_stream"
+        || carrier.direct_float32_input != "path_backed_w64"
+        || !carrier
+            .direct_float32_consumer_args_template
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_DIRECT_FLOAT32_ARGS)
+        || carrier.known_sox_float32_w64_defect
+            != "sox_ng_14_8_0_1_misscales_its_float32_w64_on_decode"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v5 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v7 policy",
         ));
     }
     if manifest.analyzer.qualification_schema
@@ -2147,7 +2436,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.analyzer.aligned_multitone_duration_seconds != "0.250000000"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v5 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v7 policy",
         ));
     }
 
@@ -2262,7 +2551,7 @@ fn validate_embedded_reference_policy_tables(
     validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
     if b6.enabled {
         return Err(reference_toolchain_error(
-            "embedded B6 profile must remain typed but disabled under policy v5",
+            "embedded B6 profile must remain typed but disabled under policy v7",
         ));
     }
 
@@ -2354,7 +2643,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2389,7 +2678,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -2814,17 +3103,17 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
     ));
     let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
         reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
     })?;
-    if manifest.schema_version != 5
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V5_KEY
+    if manifest.schema_version != 7
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V7_KEY
         || manifest.status != "qualified_release"
     {
         return Err(reference_toolchain_error(
-            "the embedded policy artifact is not a qualified v5 release",
+            "the embedded policy artifact is not a qualified v7 release",
         ));
     }
     validate_embedded_release_certification(&manifest)?;
@@ -4058,9 +4347,10 @@ async fn execute_reference_steps(
                             records.clone(),
                         )
                     })?;
-                    let (record, digest) = reference_decoded_sample_hash_with_paths(
+                    let (mut verification_records, digest) = reference_decoded_sample_hash_with_paths(
                         &summary.packaged_path,
                         summary.final_pcm,
+                        ReferenceSampleHashRoute::DirectFfmpeg,
                         "Verify packaged output decoded samples",
                         runner,
                         cancel,
@@ -4078,7 +4368,7 @@ async fn execute_reference_steps(
                         err.commands = all;
                         err
                     })?;
-                    records.push(record);
+                    records.append(&mut verification_records);
                     if digest != expected {
                         return Err(TrackExecutionError::new(
                             ConvertError::Backend(format!(
@@ -4092,6 +4382,71 @@ async fn execute_reference_steps(
                     packaged_hash = Some(digest);
                 }
             }
+            PlannedExecutionStep::Pipeline(pipeline) => {
+                validate_reference_package_pipeline(summary, pipeline).map_err(|mut err| {
+                    err.commands = records.clone();
+                    err
+                })?;
+                let (mut step_records, _) = run_reference_capture_pipeline(
+                    pipeline,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits.as_ref(),
+                    progress,
+                    &format!("{track_label} - {}", pipeline.description),
+                )
+                .await
+                .map_err(|mut err| {
+                    let mut all = records.clone();
+                    all.append(&mut err.commands);
+                    err.commands = all;
+                    err
+                })?;
+                records.append(&mut step_records);
+
+                let expected = qpcm_hash.ok_or_else(|| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference package pipeline ran before QPCM verification".to_string(),
+                        ),
+                        records.clone(),
+                    )
+                })?;
+                let (mut verification_records, digest) =
+                    reference_decoded_sample_hash_with_paths(
+                        &summary.packaged_path,
+                        summary.final_pcm,
+                        ReferenceSampleHashRoute::DirectFfmpeg,
+                        "Verify packaged output decoded samples",
+                        runner,
+                        cancel,
+                        tool_paths,
+                        tool_concurrency_limits.as_ref(),
+                        progress,
+                        window_start,
+                        window_end,
+                        &track_label,
+                    )
+                    .await
+                    .map_err(|mut err| {
+                        let mut all = records.clone();
+                        all.append(&mut err.commands);
+                        err.commands = all;
+                        err
+                    })?;
+                records.append(&mut verification_records);
+                if digest != expected {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(format!(
+                            "Reference Float64 package changed decoded samples: QPCM={}, packaged={}",
+                            expected.to_hex(),
+                            digest.to_hex()
+                        )),
+                        records,
+                    ));
+                }
+                packaged_hash = Some(digest);
+            }
             PlannedExecutionStep::Measurement(measurement) => {
                 if measurements.contains_key(&measurement.id) {
                     return Err(TrackExecutionError::new(
@@ -4102,6 +4457,10 @@ async fn execute_reference_steps(
                         records,
                     ));
                 }
+                validate_reference_measurement_binding(summary, measurement).map_err(|mut err| {
+                    err.commands = records.clone();
+                    err
+                })?;
                 match measurement.purpose {
                     TruePeakPurpose::GainAuthority if r64_probe.is_none() => {
                         return Err(TrackExecutionError::new(
@@ -4246,6 +4605,7 @@ async fn execute_reference_steps(
         packaged_sample_sha256: packaged_hash,
         post_metadata_sample_sha256: None,
         post_metadata_verification_command: None,
+        post_metadata_verification_commands: Vec::new(),
     };
     let resolved_command_hash = command_records_hash(&records);
     Ok(ReferenceRuntimeResult {
@@ -4277,6 +4637,131 @@ fn reference_pcm_codec(
             "Reference verification received an unsupported terminal depth".to_string(),
         ),
     }
+}
+
+
+fn canonical_reference_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+}
+
+fn build_reference_carrier_probe_command(
+    path: &Path,
+    description: &str,
+    flag: &'static str,
+    field: &'static str,
+) -> PlannedCommand {
+    let mut command = PlannedCommand::new(
+        ToolIdentifier::Sox,
+        vec!["--i".to_string(), flag.to_string(), path.display().to_string()],
+        tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Stdout,
+        None,
+        format!("Verify {description} {field}"),
+    );
+    command.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+    command.environment = canonical_reference_environment();
+    command
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceSampleHashRoute {
+    DirectFfmpeg,
+    StreamFloat64W64ViaSoxRaw,
+}
+
+fn build_reference_direct_hash_command(
+    path: &Path,
+    contract: tonepoet_pipeline::FinalPcmContract,
+    description: &str,
+) -> Result<PlannedCommand, String> {
+    let mut command = PlannedCommand::new(
+        ToolIdentifier::Ffmpeg,
+        reference_hash_args(path, contract)?,
+        tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Stdout,
+        None,
+        description.to_string(),
+    );
+    command.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+    command.environment = canonical_reference_environment();
+    Ok(command)
+}
+
+fn build_reference_float64_w64_hash_pipeline(
+    path: &Path,
+    contract: tonepoet_pipeline::FinalPcmContract,
+    description: &str,
+) -> Result<PlannedCommandPipeline, String> {
+    if contract.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64 {
+        return Err("streamed W64 sample hashing is reserved for Float64".to_string());
+    }
+    let mut producer = PlannedCommand::new(
+        ToolIdentifier::Sox,
+        vec![
+            "-S".to_string(),
+            "-D".to_string(),
+            path.display().to_string(),
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-L".to_string(),
+            "-".to_string(),
+        ],
+        tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Stdout,
+        None,
+        format!("{description}: stream exact Float64 W64"),
+    );
+    producer.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+    producer.environment = canonical_reference_environment();
+
+    let codec = reference_pcm_codec(contract)?;
+    let mut consumer = PlannedCommand::new(
+        ToolIdentifier::Ffmpeg,
+        vec![
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-f".to_string(),
+            "f64le".to_string(),
+            "-ar".to_string(),
+            contract.sample_rate_hz.to_string(),
+            "-ac".to_string(),
+            contract.channels.to_string(),
+            "-i".to_string(),
+            "pipe:0".to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-map_metadata".to_string(),
+            "-1".to_string(),
+            "-vn".to_string(),
+            "-sn".to_string(),
+            "-dn".to_string(),
+            "-c:a".to_string(),
+            codec.to_string(),
+            "-f".to_string(),
+            "hash".to_string(),
+            "-hash".to_string(),
+            "sha256".to_string(),
+            "-".to_string(),
+        ],
+        tonepoet_pipeline::InputSource::Stdin,
+        tonepoet_pipeline::OutputSink::Stdout,
+        None,
+        description.to_string(),
+    );
+    consumer.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+    consumer.environment = canonical_reference_environment();
+
+    Ok(PlannedCommandPipeline {
+        producer,
+        consumer,
+        description: description.to_string(),
+    })
 }
 
 async fn run_reference_capture_command(
@@ -4312,6 +4797,58 @@ async fn run_reference_capture_command(
     Ok(output)
 }
 
+
+async fn run_reference_capture_pipeline(
+    pipeline: &PlannedCommandPipeline,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    label: &str,
+) -> Result<(Vec<CommandRecord>, String), TrackExecutionError> {
+    let producer = planned_command_to_tool_command(
+        &pipeline.producer,
+        DEFAULT_PLANNED_COMMAND_TIMEOUT,
+    )
+    .map_err(TrackExecutionError::from)?;
+    let consumer = planned_command_to_tool_command(
+        &pipeline.consumer,
+        DEFAULT_PLANNED_COMMAND_TIMEOUT,
+    )
+    .map_err(TrackExecutionError::from)?;
+    let _producer_permit = acquire_reference_pipeline_permit(producer.binary, limits, cancel)
+        .await
+        .map_err(TrackExecutionError::from)?;
+    let _consumer_permit = acquire_reference_pipeline_permit(consumer.binary, limits, cancel)
+        .await
+        .map_err(TrackExecutionError::from)?;
+    progress
+        .unknown_alive_with_key(
+            format!("reference-pipeline:{label}"),
+            label.to_string(),
+        )
+        .await;
+    let output = runner
+        .run_pipeline(producer, consumer, cancel)
+        .await
+        .map_err(|pipeline_error| {
+            let mut commands = pipeline_error.other_commands;
+            if let Some(command) = command_record_from_tool_error(&pipeline_error.error) {
+                commands.push(command);
+            }
+            TrackExecutionError::new(ConvertError::Tool(pipeline_error.error), commands)
+        })?;
+    let text = format!(
+        "{}\n{}",
+        output.consumer.stdout_tail, output.consumer.stderr_tail
+    );
+    let mut producer_record = output.producer.command;
+    producer_record.description = Some(pipeline.producer.description.clone());
+    let mut consumer_record = output.consumer.command;
+    consumer_record.description = Some(pipeline.consumer.description.clone());
+    Ok((vec![producer_record, consumer_record], text))
+}
+
 async fn probe_reference_carrier(
     path: &Path,
     description: &str,
@@ -4326,16 +4863,7 @@ async fn probe_reference_carrier(
 ) -> Result<(Vec<CommandRecord>, ReferenceCarrierProbe), TrackExecutionError> {
     let mut records = Vec::new();
     let query = |flag: &'static str, field: &'static str| {
-        let mut command = PlannedCommand::new(
-            ToolIdentifier::Sox,
-            vec!["--i".to_string(), flag.to_string(), path.display().to_string()],
-            tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
-            tonepoet_pipeline::OutputSink::Stdout,
-            None,
-            format!("Verify {description} {field}"),
-        );
-        command.environment.insert("LC_ALL".to_string(), "C".to_string());
-        command
+        build_reference_carrier_probe_command(path, description, flag, field)
     };
 
     async fn capture(
@@ -4506,6 +5034,7 @@ fn parse_reference_hash_output(text: &str) -> Result<Sha256Digest, String> {
 async fn reference_decoded_sample_hash_with_paths(
     path: &Path,
     contract: tonepoet_pipeline::FinalPcmContract,
+    route: ReferenceSampleHashRoute,
     description: &str,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -4515,27 +5044,48 @@ async fn reference_decoded_sample_hash_with_paths(
     window_start: f32,
     window_end: f32,
     track_label: &str,
-) -> Result<(CommandRecord, Sha256Digest), TrackExecutionError> {
-    let mut planned = PlannedCommand::new(
-        ToolIdentifier::Ffmpeg,
-        reference_hash_args(path, contract).map_err(|message| {
-            TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
-        })?,
-        tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
-        tonepoet_pipeline::OutputSink::Stdout,
-        None,
-        description.to_string(),
-    );
-    planned.environment.insert("LC_ALL".to_string(), "C".to_string());
-    let output = run_reference_capture_command(
-        &planned, runner, cancel, tool_paths, limits, progress, window_start, window_end,
-        &format!("{track_label} - {description}"),
-    ).await?;
-    let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
+) -> Result<(Vec<CommandRecord>, Sha256Digest), TrackExecutionError> {
+    let (records, text) = match route {
+        ReferenceSampleHashRoute::DirectFfmpeg => {
+            let planned = build_reference_direct_hash_command(path, contract, description)
+                .map_err(|message| {
+                    TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
+                })?;
+            let output = run_reference_capture_command(
+                &planned,
+                runner,
+                cancel,
+                tool_paths,
+                limits,
+                progress,
+                window_start,
+                window_end,
+                &format!("{track_label} - {description}"),
+            )
+            .await?;
+            let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
+            (vec![output.command], text)
+        }
+        ReferenceSampleHashRoute::StreamFloat64W64ViaSoxRaw => {
+            let pipeline = build_reference_float64_w64_hash_pipeline(path, contract, description)
+                .map_err(|message| {
+                    TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
+                })?;
+            run_reference_capture_pipeline(
+                &pipeline,
+                runner,
+                cancel,
+                limits,
+                progress,
+                &format!("{track_label} - {description}"),
+            )
+            .await?
+        }
+    };
     let digest = parse_reference_hash_output(&text).map_err(|message| {
-        TrackExecutionError::new(ConvertError::Backend(message), vec![output.command.clone()])
+        TrackExecutionError::new(ConvertError::Backend(message), records.clone())
     })?;
-    Ok((output.command, digest))
+    Ok((records, digest))
 }
 
 async fn verify_reference_r64_contract(
@@ -4634,9 +5184,15 @@ async fn verify_reference_qpcm_contract(
             records,
         ));
     }
-    let (record, digest) = reference_decoded_sample_hash_with_paths(
+    let hash_route = if summary.final_pcm.bit_depth == tonepoet_pipeline::PcmBitDepth::Float64 {
+        ReferenceSampleHashRoute::StreamFloat64W64ViaSoxRaw
+    } else {
+        ReferenceSampleHashRoute::DirectFfmpeg
+    };
+    let (mut hash_records, digest) = reference_decoded_sample_hash_with_paths(
         &summary.qpcm_path,
         summary.final_pcm,
+        hash_route,
         "Hash QPCM decoded samples",
         runner,
         cancel,
@@ -4648,7 +5204,7 @@ async fn verify_reference_qpcm_contract(
         track_label,
     )
     .await?;
-    records.push(record);
+    records.append(&mut hash_records);
     Ok((records, qpcm_probe, digest))
 }
 
@@ -4672,24 +5228,75 @@ pub(crate) async fn verify_reference_output_after_metadata(
             resolved_ffmpeg.display(),
         )));
     }
-    let command = ToolCommand {
-        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
-        binary: ToolBinary::Ffmpeg,
-        args: reference_hash_args(path, evidence.plan.final_pcm)
-            .map_err(ConvertError::TrackValidation)?,
-        secret_args: Vec::new(),
-        cwd: None,
-        env: vec![EnvVar {
-            key: "LC_ALL".to_string(),
-            value: super::types::SecretString::new("C".to_string()),
-            secret: false,
-        }],
-        timeout: DEFAULT_PLANNED_COMMAND_TIMEOUT,
+
+    let stream_float64_w64 = evidence.plan.final_pcm.bit_depth
+        == tonepoet_pipeline::PcmBitDepth::Float64
+        && evidence.plan.target == tonepoet_pipeline::ResolvedOutputTarget::WavW64;
+    let (records, text) = if stream_float64_w64 {
+        let resolved_sox = runner.resolved_tool_path(ToolBinary::Sox).ok_or_else(|| {
+            ConvertError::TrackValidation(
+                "Reference post-metadata verification cannot resolve the attested SoX path"
+                    .to_string(),
+            )
+        })?;
+        if resolved_sox != evidence.toolchain.sox_ng.canonical_path {
+            return Err(ConvertError::TrackValidation(format!(
+                "Reference post-metadata verification SoX changed after attestation: expected {}, got {}",
+                evidence.toolchain.sox_ng.canonical_path.display(),
+                resolved_sox.display(),
+            )));
+        }
+        let pipeline = build_reference_float64_w64_hash_pipeline(
+            path,
+            evidence.plan.final_pcm,
+            "Verify post-metadata Reference decoded samples",
+        )
+        .map_err(ConvertError::TrackValidation)?;
+        let producer = planned_command_to_tool_command(
+            &pipeline.producer,
+            DEFAULT_PLANNED_COMMAND_TIMEOUT,
+        )
+        .map_err(ConvertError::from)?;
+        let consumer = planned_command_to_tool_command(
+            &pipeline.consumer,
+            DEFAULT_PLANNED_COMMAND_TIMEOUT,
+        )
+        .map_err(ConvertError::from)?;
+        let _producer_permit =
+            acquire_reference_pipeline_permit(producer.binary, limits, cancel).await?;
+        let _consumer_permit =
+            acquire_reference_pipeline_permit(consumer.binary, limits, cancel).await?;
+        let output = runner
+            .run_pipeline(producer, consumer, cancel)
+            .await
+            .map_err(|pipeline_error| ConvertError::Tool(pipeline_error.error))?;
+        let text = format!(
+            "{}\n{}",
+            output.consumer.stdout_tail, output.consumer.stderr_tail
+        );
+        let mut producer_record = output.producer.command;
+        producer_record.description = Some(pipeline.producer.description);
+        let mut consumer_record = output.consumer.command;
+        consumer_record.description = Some(pipeline.consumer.description);
+        (vec![producer_record, consumer_record], text)
+    } else {
+        let planned = build_reference_direct_hash_command(
+            path,
+            evidence.plan.final_pcm,
+            "Verify post-metadata Reference decoded samples",
+        )
+        .map_err(ConvertError::TrackValidation)?;
+        let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
+            .map_err(ConvertError::from)?;
+        let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
+            .await
+            .map_err(ConvertError::Tool)?;
+        let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
+        let mut record = output.command;
+        record.description = Some(planned.description);
+        (vec![record], text)
     };
-    let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
-        .await
-        .map_err(ConvertError::Tool)?;
-    let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
+
     let digest = parse_reference_hash_output(&text).map_err(ConvertError::TrackValidation)?;
     if digest != evidence.pcm_verification.qpcm_sample_sha256 {
         return Err(ConvertError::TrackValidation(format!(
@@ -4697,10 +5304,9 @@ pub(crate) async fn verify_reference_output_after_metadata(
             path.display(), evidence.pcm_verification.qpcm_sample_sha256.to_hex(), digest.to_hex()
         )));
     }
-    let mut record = output.command;
-    record.description = Some("Verify post-metadata Reference decoded samples".to_string());
     evidence.pcm_verification.post_metadata_sample_sha256 = Some(digest);
-    evidence.pcm_verification.post_metadata_verification_command = Some(record);
+    evidence.pcm_verification.post_metadata_verification_command = records.last().cloned();
+    evidence.pcm_verification.post_metadata_verification_commands = records;
     Ok(())
 }
 
@@ -4713,94 +5319,282 @@ fn resolve_deferred_command(
     })
 }
 
-fn validate_reference_measurement_pipe_contract(
-    measurement: &PlannedMeasurement,
-) -> Result<&PlannedCommand, TrackExecutionError> {
-    if measurement.parser != MeasurementParser::FfmpegLoudnormInputTpV2 {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend("unknown or historical Reference measurement parser".to_string()),
-            Vec::new(),
-        ));
-    }
-    let producer = measurement.input_stage.as_ref().ok_or_else(|| {
-        TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference policy v5 measurement requires a typed analyzer input stage".to_string(),
-            ),
-            Vec::new(),
+enum ReferenceMeasurementContract<'a> {
+    StreamedF64(&'a PlannedCommand),
+    DirectFloat32W64,
+}
+
+fn reference_measurement_environment_is_canonical(command: &PlannedCommand) -> bool {
+    command.environment_policy
+        == tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+        && command.environment.len() == 1
+        && command.environment.get("LC_ALL").map(String::as_str) == Some("C")
+}
+
+fn validate_reference_package_pipeline(
+    summary: &DsdReferencePlanSummary,
+    pipeline: &PlannedCommandPipeline,
+) -> Result<(), TrackExecutionError> {
+    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7
+        || summary.final_pcm.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64
+        || !matches!(
+            summary.target,
+            tonepoet_pipeline::ResolvedOutputTarget::WavRiff
+                | tonepoet_pipeline::ResolvedOutputTarget::WavRf64
         )
-    })?;
-    let carrier = producer.input.as_path().ok_or_else(|| {
-        TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference policy v5 measurement producer requires a path-backed W64 carrier".to_string(),
-            ),
-            Vec::new(),
-        )
-    })?;
-    let carrier_arg = carrier.display().to_string();
-    let producer_args = [
-        "-S",
-        "-D",
-        carrier_arg.as_str(),
-        "-t",
-        "wav",
-        "-e",
-        "floating-point",
-        "-b",
-        "64",
-        "-",
-    ];
-    let consumer_args = [
-        "-nostdin",
-        "-hide_banner",
-        "-nostats",
-        "-loglevel",
-        "info",
-        "-f",
-        "wav",
-        "-i",
-        "pipe:0",
-        "-filter:a",
-        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
-        "-f",
-        "null",
-        "-",
-    ];
-    let canonical_environment = |command: &PlannedCommand| {
-        command.environment_policy
-            == tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
-            && command.environment.len() == 1
-            && command.environment.get("LC_ALL").map(String::as_str) == Some("C")
-    };
-    if producer.tool != ToolIdentifier::Sox
-        || producer.output != tonepoet_pipeline::OutputSink::Stdout
-        || !producer
-            .args
-            .iter()
-            .map(String::as_str)
-            .eq(producer_args)
-        || !canonical_environment(producer)
-        || measurement.command.tool != ToolIdentifier::Ffmpeg
-        || measurement.command.input != tonepoet_pipeline::InputSource::Stdin
-        || measurement.command.output != tonepoet_pipeline::OutputSink::Stdout
-        || !measurement
-            .command
-            .args
-            .iter()
-            .map(String::as_str)
-            .eq(consumer_args)
-        || !canonical_environment(&measurement.command)
+        || summary.packaged_path == summary.qpcm_path
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v5 measurement has a noncanonical typed SoX-to-FFmpeg pipe contract"
+                "Reference policy v7 package pipeline is bound to an invalid plan cell"
                     .to_string(),
             ),
             Vec::new(),
         ));
     }
-    Ok(producer)
+
+    let qpcm = summary.qpcm_path.display().to_string();
+    let expected_producer = [
+        "-S",
+        "-D",
+        qpcm.as_str(),
+        "-t",
+        "raw",
+        "-e",
+        "floating-point",
+        "-b",
+        "64",
+        "-L",
+        "-",
+    ];
+    if pipeline.producer.tool != ToolIdentifier::Sox
+        || pipeline.producer.input.as_path() != Some(summary.qpcm_path.as_path())
+        || pipeline.producer.output != tonepoet_pipeline::OutputSink::Stdout
+        || !pipeline
+            .producer
+            .args
+            .iter()
+            .map(String::as_str)
+            .eq(expected_producer)
+        || !reference_measurement_environment_is_canonical(&pipeline.producer)
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v7 package pipeline has a noncanonical SoX producer"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+
+    let packaged = summary.packaged_path.display().to_string();
+    let sample_rate = summary.final_pcm.sample_rate_hz.to_string();
+    let channels = summary.final_pcm.channels.to_string();
+    let mut expected_consumer = vec![
+        "-y",
+        "-hide_banner",
+        "-nostdin",
+        "-f",
+        "f64le",
+        "-ar",
+        sample_rate.as_str(),
+        "-ac",
+        channels.as_str(),
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:a:0",
+        "-map_metadata",
+        "-1",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-c:a",
+        "pcm_f64le",
+        "-f",
+        "wav",
+    ];
+    if summary.target == tonepoet_pipeline::ResolvedOutputTarget::WavRf64 {
+        expected_consumer.extend(["-rf64", "always"]);
+    }
+    expected_consumer.push(packaged.as_str());
+    if pipeline.consumer.tool != ToolIdentifier::Ffmpeg
+        || pipeline.consumer.input != tonepoet_pipeline::InputSource::Stdin
+        || pipeline.consumer.output.as_path() != Some(summary.packaged_path.as_path())
+        || !pipeline
+            .consumer
+            .args
+            .iter()
+            .map(String::as_str)
+            .eq(expected_consumer)
+        || !reference_measurement_environment_is_canonical(&pipeline.consumer)
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v7 package pipeline has a noncanonical FFmpeg consumer"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reference_measurement_binding(
+    summary: &DsdReferencePlanSummary,
+    measurement: &PlannedMeasurement,
+) -> Result<(), TrackExecutionError> {
+    let authority_count = summary
+        .operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation,
+                tonepoet_pipeline::DsdReferenceOperation::MeasureTruePeak {
+                    measurement_id,
+                    scope,
+                    purpose,
+                } if *measurement_id == measurement.id
+                    && *scope == measurement.scope
+                    && *purpose == measurement.purpose
+            )
+        })
+        .count();
+    if authority_count != 1 {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference measurement {} is not bound exactly once in the plan summary",
+                measurement.id.0
+            )),
+            Vec::new(),
+        ));
+    }
+
+    let expected_carrier = match measurement.purpose {
+        TruePeakPurpose::GainAuthority => summary.r64_path.as_path(),
+        TruePeakPurpose::PostFinalAcceptance => summary.qpcm_path.as_path(),
+    };
+    if measurement.carrier_path() != Some(expected_carrier) {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference measurement {} is bound to the wrong carrier path",
+                measurement.id.0
+            )),
+            Vec::new(),
+        ));
+    }
+
+    let direct_float32 = measurement.purpose == TruePeakPurpose::PostFinalAcceptance
+        && summary.final_pcm.bit_depth == tonepoet_pipeline::PcmBitDepth::Float32;
+    if measurement.input_stage.is_none() != direct_float32 {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference measurement {} uses the wrong analyzer carrier route for {:?} {:?}",
+                measurement.id.0, measurement.purpose, summary.final_pcm.bit_depth
+            )),
+            Vec::new(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_reference_measurement_contract(
+    measurement: &PlannedMeasurement,
+) -> Result<ReferenceMeasurementContract<'_>, TrackExecutionError> {
+    if measurement.parser != MeasurementParser::FfmpegLoudnormInputTpV3 {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend("unknown or historical Reference measurement parser".to_string()),
+            Vec::new(),
+        ));
+    }
+    if measurement.command.tool != ToolIdentifier::Ffmpeg
+        || measurement.command.output != tonepoet_pipeline::OutputSink::Stdout
+        || !reference_measurement_environment_is_canonical(&measurement.command)
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v7 measurement has a noncanonical FFmpeg analyzer command"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+
+    if let Some(producer) = measurement.input_stage.as_ref() {
+        let carrier = producer.input.as_path().ok_or_else(|| {
+            TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference policy v7 streamed measurement requires a path-backed W64 carrier"
+                        .to_string(),
+                ),
+                Vec::new(),
+            )
+        })?;
+        let carrier_arg = carrier.display().to_string();
+        let producer_args = [
+            "-S", "-D", carrier_arg.as_str(), "-t", "wav", "-e",
+            "floating-point", "-b", "64", "-",
+        ];
+        let consumer_args = [
+            "-nostdin", "-hide_banner", "-nostats", "-loglevel", "info", "-f",
+            "wav", "-i", "pipe:0", "-filter:a",
+            "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json", "-f", "null", "-",
+        ];
+        if producer.tool != ToolIdentifier::Sox
+            || producer.output != tonepoet_pipeline::OutputSink::Stdout
+            || !producer.args.iter().map(String::as_str).eq(producer_args)
+            || !reference_measurement_environment_is_canonical(producer)
+            || measurement.command.input != tonepoet_pipeline::InputSource::Stdin
+            || !measurement
+                .command
+                .args
+                .iter()
+                .map(String::as_str)
+                .eq(consumer_args)
+        {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference policy v7 measurement has a noncanonical typed SoX-to-FFmpeg f64 pipe contract"
+                        .to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+        return Ok(ReferenceMeasurementContract::StreamedF64(producer));
+    }
+
+    let carrier = measurement.command.input.as_path().ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v7 direct measurement requires a path-backed Float32 W64 carrier"
+                    .to_string(),
+            ),
+            Vec::new(),
+        )
+    })?;
+    let carrier_arg = carrier.display().to_string();
+    let direct_args = [
+        "-nostdin", "-hide_banner", "-nostats", "-loglevel", "info", "-i",
+        carrier_arg.as_str(), "-filter:a",
+        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json", "-f", "null", "-",
+    ];
+    if !measurement
+        .command
+        .args
+        .iter()
+        .map(String::as_str)
+        .eq(direct_args)
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v7 measurement has a noncanonical direct Float32-W64 FFmpeg contract"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+    Ok(ReferenceMeasurementContract::DirectFloat32W64)
 }
 
 async fn execute_reference_measurement(
@@ -4817,59 +5611,89 @@ async fn execute_reference_measurement(
     reporting_uncertainty: tonepoet_pipeline::DbNano,
     analyzer_residual: tonepoet_pipeline::DbNano,
 ) -> Result<(Vec<CommandRecord>, TruePeakMeasurement), TrackExecutionError> {
-    let input_stage = validate_reference_measurement_pipe_contract(measurement)?;
-
-    let producer = planned_command_to_tool_command(
-        input_stage,
-        DEFAULT_PLANNED_COMMAND_TIMEOUT,
-    )
-    .map_err(TrackExecutionError::from)?;
-    let consumer = planned_command_to_tool_command(
-        &measurement.command,
-        DEFAULT_PLANNED_COMMAND_TIMEOUT,
-    )
-    .map_err(TrackExecutionError::from)?;
-    // The reference-policy environment is part of the qualified semantic identity.
-    // Acquire only the concurrency permits here: the general SoX permit path injects
-    // OMP_NUM_THREADS, which would make production execution differ from the frozen
-    // and qualified v5 pipe contract.
-    let _producer_permit = acquire_reference_pipeline_permit(producer.binary, limits, cancel)
-        .await
-        .map_err(TrackExecutionError::from)?;
-    let _consumer_permit = acquire_reference_pipeline_permit(consumer.binary, limits, cancel)
-        .await
-        .map_err(TrackExecutionError::from)?;
-
+    let contract = validate_reference_measurement_contract(measurement)?;
     let label = format!("{track_label} - {}", measurement.command.description);
-    progress
-        .unknown_alive_with_key(
-            format!("reference-measurement-pipe:{label}"),
-            format!("{label} - streaming exact analyzer carrier"),
-        )
-        .await;
-    let output = runner
-        .run_pipeline(producer, consumer, cancel)
-        .await
-        .map_err(|pipeline_error| {
-            let mut commands = pipeline_error.other_commands;
-            if let Some(command) = command_record_from_tool_error(&pipeline_error.error) {
-                commands.push(command);
-            }
-            TrackExecutionError::new(ConvertError::Tool(pipeline_error.error), commands)
-        })?;
+
+    let (stderr_tail, mut records) = match contract {
+        ReferenceMeasurementContract::StreamedF64(input_stage) => {
+            let producer = planned_command_to_tool_command(
+                input_stage,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            )
+            .map_err(TrackExecutionError::from)?;
+            let consumer = planned_command_to_tool_command(
+                &measurement.command,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            )
+            .map_err(TrackExecutionError::from)?;
+            // The v7 environment is semantic policy. Acquire permits without
+            // the generic SoX path's OMP_NUM_THREADS injection.
+            let _producer_permit =
+                acquire_reference_pipeline_permit(producer.binary, limits, cancel)
+                    .await
+                    .map_err(TrackExecutionError::from)?;
+            let _consumer_permit =
+                acquire_reference_pipeline_permit(consumer.binary, limits, cancel)
+                    .await
+                    .map_err(TrackExecutionError::from)?;
+            progress
+                .unknown_alive_with_key(
+                    format!("reference-measurement-pipe:{label}"),
+                    format!("{label} - streaming exact f64 analyzer carrier"),
+                )
+                .await;
+            let output = runner
+                .run_pipeline(producer, consumer, cancel)
+                .await
+                .map_err(|pipeline_error| {
+                    let mut commands = pipeline_error.other_commands;
+                    if let Some(command) = command_record_from_tool_error(&pipeline_error.error) {
+                        commands.push(command);
+                    }
+                    TrackExecutionError::new(ConvertError::Tool(pipeline_error.error), commands)
+                })?;
+            let stderr_tail = output.consumer.stderr_tail.clone();
+            let mut producer_record = output.producer.command;
+            producer_record.description = Some(input_stage.description.clone());
+            let mut consumer_record = output.consumer.command;
+            consumer_record.description = Some(measurement.command.description.clone());
+            (stderr_tail, vec![producer_record, consumer_record])
+        }
+        ReferenceMeasurementContract::DirectFloat32W64 => {
+            let command = planned_command_to_tool_command(
+                &measurement.command,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            )
+            .map_err(TrackExecutionError::from)?;
+            progress
+                .unknown_alive_with_key(
+                    format!("reference-measurement-direct:{}", measurement.id.0),
+                    format!("{label} - decoding Float32 W64 directly"),
+                )
+                .await;
+            let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
+                .await
+                .map_err(|error| {
+                    let commands = command_record_from_tool_error(&error).into_iter().collect();
+                    TrackExecutionError::new(ConvertError::Tool(error), commands)
+                })?;
+            let stderr_tail = output.stderr_tail.clone();
+            let mut record = output.command;
+            record.description = Some(measurement.command.description.clone());
+            (stderr_tail, vec![record])
+        }
+    };
+
     progress
         .estimated_with_key(
             window_end,
-            format!("reference-measurement-pipe-finish:{}", measurement.id.0),
+            format!("reference-measurement-finish:{}", measurement.id.0),
             format!("Finished {label}"),
         )
         .await;
 
-    let raw_report = extract_single_loudnorm_report(&output.consumer.stderr_tail).map_err(|message| {
-        TrackExecutionError::new(
-            ConvertError::Backend(message),
-            vec![output.producer.command.clone(), output.consumer.command.clone()],
-        )
+    let raw_report = extract_single_loudnorm_report(&stderr_tail).map_err(|message| {
+        TrackExecutionError::new(ConvertError::Backend(message), records.clone())
     })?;
     let needs_silence_proof = serde_json::from_str::<serde_json::Value>(&raw_report)
         .ok()
@@ -4881,27 +5705,23 @@ async fn execute_reference_measurement(
         })
         .as_deref()
         == Some("-inf");
-    let mut auxiliary_records = Vec::new();
     if needs_silence_proof {
         let input = measurement.carrier_path().ok_or_else(|| {
             TrackExecutionError::new(
                 ConvertError::Backend(
                     "Reference silence verification requires a path-backed carrier".to_string(),
                 ),
-                vec![output.producer.command.clone(), output.consumer.command.clone()],
+                records.clone(),
             )
         })?;
         let silence_record = verify_signed_zero_audio(input, runner, cancel, limits, work_dir)
             .await
             .map_err(|err| {
-                let mut commands = vec![
-                    output.producer.command.clone(),
-                    output.consumer.command.clone(),
-                ];
+                let mut commands = records.clone();
                 commands.extend(err.commands);
                 TrackExecutionError::new(err.error, commands)
             })?;
-        auxiliary_records.push(silence_record);
+        records.push(silence_record);
     }
     let parsed = parse_reference_true_peak_measurement(
         measurement.id,
@@ -4913,17 +5733,8 @@ async fn execute_reference_measurement(
         needs_silence_proof,
     )
     .map_err(|message| {
-        TrackExecutionError::new(
-            ConvertError::Backend(message),
-            vec![output.producer.command.clone(), output.consumer.command.clone()],
-        )
+        TrackExecutionError::new(ConvertError::Backend(message), records.clone())
     })?;
-    let mut producer_record = output.producer.command;
-    producer_record.description = Some(input_stage.description.clone());
-    let mut consumer_record = output.consumer.command;
-    consumer_record.description = Some(measurement.command.description.clone());
-    let mut records = vec![producer_record, consumer_record];
-    records.append(&mut auxiliary_records);
     Ok((records, parsed))
 }
 
@@ -5671,8 +6482,119 @@ mod tests {
         .is_err());
     }
 
+    fn reference_wav_plan(
+        depth: tonepoet_pipeline::PcmBitDepth,
+        target: tonepoet_pipeline::ResolvedOutputTarget,
+    ) -> tonepoet_pipeline::ConversionPlan {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(depth);
+        let output = match target {
+            tonepoet_pipeline::ResolvedOutputTarget::WavW64 => "output.w64",
+            tonepoet_pipeline::ResolvedOutputTarget::WavRiff
+            | tonepoet_pipeline::ResolvedOutputTarget::WavRf64 => "output.wav",
+            _ => panic!("test helper accepts WAV-family targets only"),
+        };
+        tonepoet_pipeline::plan_reference_dsd(&tonepoet_pipeline::PlanRequest {
+            input_path: PathBuf::from("source.dff"),
+            output_path: PathBuf::from(output),
+            source: tonepoet_pipeline::SourceInfo {
+                format: tonepoet_pipeline::AudioFormat::Dff,
+                codec: tonepoet_pipeline::AudioCodec::Dsd,
+                sample_rate_hz: Some(2_822_400),
+                bit_depth: None,
+                true_source_depth: None,
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Dsd,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
+                channels: Some(2),
+                duration: Some(Duration::from_secs(60)),
+                dsd_source_kind: Some(tonepoet_pipeline::DsdSourceKind::DsdiffUncompressed),
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: Some(PathBuf::from("work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: Some(target),
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: None,
+        })
+        .expect("Reference WAV-family plan")
+    }
+
+    fn reference_w64_plan(depth: tonepoet_pipeline::PcmBitDepth) -> tonepoet_pipeline::ConversionPlan {
+        reference_wav_plan(depth, tonepoet_pipeline::ResolvedOutputTarget::WavW64)
+    }
+
     #[test]
-    fn reference_measurement_pipe_contract_rejects_transport_or_argv_drift() {
+    fn reference_measurements_are_bound_to_their_summary_carrier_and_route() {
+        let f32 = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float32);
+        let f32_summary = f32.reference.as_ref().expect("Reference summary");
+        let f32_measurements = f32
+            .steps()
+            .iter()
+            .filter_map(|step| match step {
+                tonepoet_pipeline::PlannedExecutionStep::Measurement(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(f32_measurements.len(), 2);
+        for measurement in &f32_measurements {
+            validate_reference_measurement_binding(f32_summary, measurement)
+                .expect("planner measurement binding is canonical");
+            validate_reference_measurement_contract(measurement)
+                .expect("planner measurement transport is canonical");
+        }
+
+        let mut crossed_path = (*f32_measurements
+            .iter()
+            .find(|measurement| {
+                measurement.purpose == TruePeakPurpose::PostFinalAcceptance
+            })
+            .expect("Float32 post measurement"))
+        .clone();
+        let wrong_path = f32_summary.r64_path.display().to_string();
+        crossed_path.command.input = InputSource::Path(f32_summary.r64_path.clone());
+        crossed_path.command.args[6] = wrong_path;
+        validate_reference_measurement_contract(&crossed_path)
+            .expect("crossed path still has canonical direct argv shape");
+        assert!(validate_reference_measurement_binding(f32_summary, &crossed_path).is_err());
+
+        let f64 = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
+        let f64_summary = f64.reference.as_ref().expect("Reference summary");
+        let f64_post = f64
+            .steps()
+            .iter()
+            .find_map(|step| match step {
+                tonepoet_pipeline::PlannedExecutionStep::Measurement(value)
+                    if value.purpose == TruePeakPurpose::PostFinalAcceptance =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("Float64 post measurement");
+        validate_reference_measurement_binding(f64_summary, f64_post)
+            .expect("Float64 post measurement uses streamed route");
+
+        let mut crossed_route = (*f32_measurements
+            .iter()
+            .find(|measurement| {
+                measurement.purpose == TruePeakPurpose::PostFinalAcceptance
+            })
+            .expect("Float32 post measurement"))
+        .clone();
+        let f64_qpcm = f64_summary.qpcm_path.display().to_string();
+        crossed_route.command.input = InputSource::Path(f64_summary.qpcm_path.clone());
+        crossed_route.command.args[6] = f64_qpcm;
+        validate_reference_measurement_contract(&crossed_route)
+            .expect("direct route remains structurally canonical");
+        assert!(validate_reference_measurement_binding(f64_summary, &crossed_route).is_err());
+    }
+
+    #[test]
+    fn reference_measurement_contract_rejects_transport_or_argv_drift() {
         let carrier = PathBuf::from("reference-r64.w64");
         let mut producer = PlannedCommand::new(
             ToolIdentifier::Sox,
@@ -5726,43 +6648,183 @@ mod tests {
         consumer
             .environment
             .insert("LC_ALL".to_string(), "C".to_string());
-        let measurement = PlannedMeasurement {
+        let streamed = PlannedMeasurement {
             id: MeasurementId(1),
             scope: tonepoet_pipeline::MeasurementScope::Plan,
             purpose: TruePeakPurpose::GainAuthority,
             input_stage: Some(producer),
             command: consumer,
-            parser: MeasurementParser::FfmpegLoudnormInputTpV2,
+            parser: MeasurementParser::FfmpegLoudnormInputTpV3,
         };
-        validate_reference_measurement_pipe_contract(&measurement)
-            .expect("canonical v5 measurement contract is accepted");
+        assert!(matches!(
+            validate_reference_measurement_contract(&streamed)
+                .expect("canonical v7 f64 measurement contract is accepted"),
+            ReferenceMeasurementContract::StreamedF64(_)
+        ));
 
-        let mut drifted = measurement.clone();
+        let mut drifted = streamed.clone();
         drifted.input_stage.as_mut().unwrap().args[8] = "32".to_string();
-        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+        assert!(validate_reference_measurement_contract(&drifted).is_err());
 
-        let mut drifted = measurement.clone();
+        let mut drifted = streamed.clone();
         drifted.command.input = InputSource::Path(PathBuf::from("carrier.wav"));
-        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+        assert!(validate_reference_measurement_contract(&drifted).is_err());
 
-        let mut drifted = measurement.clone();
+        let mut drifted = streamed.clone();
         drifted.command.environment_policy =
             tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet;
-        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+        assert!(validate_reference_measurement_contract(&drifted).is_err());
 
-        let mut drifted = measurement;
+        let mut drifted = streamed;
         drifted
             .command
             .environment
             .insert("EXTRA".to_string(), "1".to_string());
-        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+        assert!(validate_reference_measurement_contract(&drifted).is_err());
+
+        let carrier = PathBuf::from("reference-f32.w64");
+        let carrier_arg = carrier.display().to_string();
+        let mut direct_command = PlannedCommand::new(
+            ToolIdentifier::Ffmpeg,
+            vec![
+                "-nostdin".to_string(),
+                "-hide_banner".to_string(),
+                "-nostats".to_string(),
+                "-loglevel".to_string(),
+                "info".to_string(),
+                "-i".to_string(),
+                carrier_arg,
+                "-filter:a".to_string(),
+                "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json".to_string(),
+                "-f".to_string(),
+                "null".to_string(),
+                "-".to_string(),
+            ],
+            InputSource::Path(carrier),
+            OutputSink::Stdout,
+            None,
+            "measure Float32 W64 true peak directly",
+        );
+        direct_command.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        direct_command
+            .environment
+            .insert("LC_ALL".to_string(), "C".to_string());
+        let direct = PlannedMeasurement {
+            id: MeasurementId(2),
+            scope: tonepoet_pipeline::MeasurementScope::Plan,
+            purpose: TruePeakPurpose::PostFinalAcceptance,
+            input_stage: None,
+            command: direct_command,
+            parser: MeasurementParser::FfmpegLoudnormInputTpV3,
+        };
+        assert!(matches!(
+            validate_reference_measurement_contract(&direct)
+                .expect("canonical v7 direct Float32-W64 contract is accepted"),
+            ReferenceMeasurementContract::DirectFloat32W64
+        ));
+
+        let mut drifted = direct.clone();
+        drifted.command.args.insert(5, "-f".to_string());
+        drifted.command.args.insert(6, "wav".to_string());
+        assert!(validate_reference_measurement_contract(&drifted).is_err());
+
+        let mut drifted = direct;
+        drifted.input_stage = Some(PlannedCommand::new(
+            ToolIdentifier::Sox,
+            vec![],
+            InputSource::Path(PathBuf::from("reference-f32.w64")),
+            OutputSink::Stdout,
+            None,
+            "invalid Float32 re-container",
+        ));
+        assert!(validate_reference_measurement_contract(&drifted).is_err());
+    }
+
+    #[test]
+    fn v7_float64_package_pipeline_binding_rejects_route_and_environment_drift() {
+        let plan = reference_wav_plan(
+            tonepoet_pipeline::PcmBitDepth::Float64,
+            tonepoet_pipeline::ResolvedOutputTarget::WavRf64,
+        );
+        let summary = plan.reference.as_ref().expect("Reference summary");
+        let pipeline = plan
+            .steps()
+            .iter()
+            .find_map(|step| match step {
+                tonepoet_pipeline::PlannedExecutionStep::Pipeline(value) => Some(value),
+                _ => None,
+            })
+            .expect("Float64 RF64 package pipeline");
+        validate_reference_package_pipeline(summary, pipeline)
+            .expect("planner-owned package pipeline is canonical");
+
+        let mut direct_decode = pipeline.clone();
+        direct_decode.consumer.input = InputSource::Path(summary.qpcm_path.clone());
+        direct_decode.consumer.args = vec![
+            "-i".to_string(),
+            summary.qpcm_path.display().to_string(),
+        ];
+        assert!(validate_reference_package_pipeline(summary, &direct_decode).is_err());
+
+        let mut inherited = pipeline.clone();
+        inherited.producer.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet;
+        assert!(validate_reference_package_pipeline(summary, &inherited).is_err());
+
+        let mut wrong_rate = pipeline.clone();
+        let rate_index = wrong_rate
+            .consumer
+            .args
+            .iter()
+            .position(|arg| arg == "-ar")
+            .expect("raw input rate option");
+        wrong_rate.consumer.args[rate_index + 1] = "96000".to_string();
+        assert!(validate_reference_package_pipeline(summary, &wrong_rate).is_err());
+    }
+
+    #[test]
+    fn reference_evidence_subprocesses_clear_and_set_exact_environment() {
+        let expected = BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]);
+        let path = PathBuf::from("carrier.w64");
+        let probe = build_reference_carrier_probe_command(&path, "carrier", "-r", "sample rate");
+        assert_eq!(
+            probe.environment_policy,
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+        );
+        assert_eq!(probe.environment, expected);
+
+        let contract = tonepoet_pipeline::FinalPcmContract {
+            sample_rate_hz: 88_200,
+            channels: 2,
+            sample_kind: tonepoet_pipeline::SampleKind::Float,
+            bit_depth: tonepoet_pipeline::PcmBitDepth::Float64,
+            dither: tonepoet_pipeline::ReferenceDither::None,
+        };
+        let direct = build_reference_direct_hash_command(&path, contract, "direct hash")
+            .expect("direct hash command");
+        assert_eq!(
+            direct.environment_policy,
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+        );
+        assert_eq!(direct.environment, expected);
+
+        let pipeline = build_reference_float64_w64_hash_pipeline(&path, contract, "stream hash")
+            .expect("Float64 W64 hash pipeline");
+        for command in [&pipeline.producer, &pipeline.consumer] {
+            assert_eq!(
+                command.environment_policy,
+                tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+            );
+            assert_eq!(command.environment, expected);
+        }
     }
 
     #[test]
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -5778,7 +6840,7 @@ mod tests {
         let mut reserve_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
             )))
             .expect("embedded Reference qualification JSON parses for drift test");
         reserve_drift.analyzer.reporting_uncertainty_db =
@@ -5794,9 +6856,9 @@ mod tests {
 
         let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v5_candidate.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
         )))
-        .expect("preserved v5 candidate JSON parses");
+        .expect("preserved v7 candidate JSON parses");
         assert_eq!(
             candidate
                 .terminal_bounds

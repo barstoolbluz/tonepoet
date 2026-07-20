@@ -210,12 +210,19 @@ fn build_reference_manifest_track(
     );
     let executed_evidence_digest_v1 = reference_executed_evidence_digest_v1(&evidence)?;
     let executed_evidence_digest_v2 = reference_executed_evidence_digest_v2(&evidence)?;
+    let executed_evidence_digest_v3 =
+        if evidence.plan.policy == tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7 {
+            reference_executed_evidence_digest_v3(&evidence)?
+        } else {
+            Sha256Digest([0; 32])
+        };
     let execution_identity = ManifestTrackExecutionIdentityV2::NativeDsdV2 {
         behavior_fingerprint_v1: behavior,
         execution_fingerprint_v1: execution,
         semantic_plan_hash_v1: semantic_plan,
         executed_evidence_digest_v1,
         executed_evidence_digest_v2,
+        executed_evidence_digest_v3,
     };
     let canonical_materialization_sha256 = match evidence.plan.front_end {
         DsdInputFrontEnd::NativeUncompressed => None,
@@ -256,12 +263,16 @@ fn reference_executed_evidence_digest_v1(
             "Reference decoded-sample verification identities do not match".to_string(),
         ));
     }
+    // Preserve the frozen v1 authority exactly. For v7 streamed verification,
+    // this historical slot contains the terminal consumer; v3 below binds the
+    // complete ordered producer/consumer transcript.
     let command = verification
         .post_metadata_verification_command
         .as_ref()
         .ok_or_else(|| {
             ManifestError::InvalidAuthority(
-                "Reference manifest requires the post-metadata verification transcript".to_string(),
+                "Reference manifest requires the post-metadata verification transcript"
+                    .to_string(),
             )
         })?;
 
@@ -321,6 +332,57 @@ fn reference_executed_evidence_digest_v2(
     Ok(Sha256Digest(hasher.finalize().into()))
 }
 
+fn reference_executed_evidence_digest_v3(
+    evidence: &ReferenceExecutionEvidence,
+) -> Result<Sha256Digest, ManifestError> {
+    let v2 = reference_executed_evidence_digest_v2(evidence)?;
+    reference_executed_evidence_digest_v3_from_commands(
+        v2,
+        &evidence
+            .pcm_verification
+            .post_metadata_verification_commands,
+    )
+}
+
+fn reference_executed_evidence_digest_v3_from_commands(
+    v2: Sha256Digest,
+    commands: &[super::tool::CommandRecord],
+) -> Result<Sha256Digest, ManifestError> {
+    if commands.is_empty() {
+        return Err(ManifestError::InvalidAuthority(
+            "Reference v7 manifest requires the complete ordered post-metadata verification transcript"
+                .to_string(),
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-reference-executed-evidence/v3\0");
+    hasher.update(v2.0);
+    hasher.update((commands.len() as u64).to_be_bytes());
+    for command in commands {
+        // Bind only deterministic command identity and outcome. Bounded output
+        // tails and elapsed duration are diagnostics, not semantic authority.
+        let command_identity = serde_json::to_vec(&(
+            &command.description,
+            command.binary,
+            &command.sanitized_args,
+            &command.cwd,
+            command.environment_policy,
+            &command.environment,
+            &command.env_keys,
+            &command.exit,
+        ))
+        .map_err(|error| {
+            ManifestError::InvalidAuthority(format!(
+                "cannot serialize Reference v7 verification command identity: {error}"
+            ))
+        })?;
+        hasher.update((command_identity.len() as u64).to_be_bytes());
+        hasher.update(command_identity);
+    }
+    Ok(Sha256Digest(hasher.finalize().into()))
+}
+
 fn digest_file(path: &std::path::Path) -> Result<Sha256Digest, ManifestError> {
     let hex = file_sha256(path)?;
     Sha256Digest::from_hex(&hex).map_err(ManifestError::InvalidAuthority)
@@ -337,6 +399,96 @@ mod manifest_merge_gap_tests {
             std::fs::create_dir_all(parent).expect("parent dir");
         }
         std::fs::write(path, bytes).expect("write file");
+    }
+
+    fn v7_verification_record(
+        binary: crate::convert::pipeline::tool::ToolBinary,
+        description: &str,
+        args: &[&str],
+    ) -> crate::convert::pipeline::tool::CommandRecord {
+        crate::convert::pipeline::tool::CommandRecord {
+            description: Some(description.to_string()),
+            binary,
+            sanitized_args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            cwd: None,
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+            environment: std::collections::BTreeMap::from([(
+                "LC_ALL".to_string(),
+                "C".to_string(),
+            )]),
+            env_keys: vec!["LC_ALL".to_string()],
+            exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
+            stdout_tail: "diagnostic stdout".to_string(),
+            stderr_tail: "diagnostic stderr".to_string(),
+            elapsed: std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn v7_evidence_digest_binds_order_route_and_exact_environment() {
+        let v2 = Sha256Digest([11; 32]);
+        let producer = v7_verification_record(
+            crate::convert::pipeline::tool::ToolBinary::Sox,
+            "stream Float64 W64",
+            &["-t", "raw", "-b", "64", "-L", "-"],
+        );
+        let consumer = v7_verification_record(
+            crate::convert::pipeline::tool::ToolBinary::Ffmpeg,
+            "hash streamed Float64 samples",
+            &["-f", "f64le", "-i", "pipe:0", "-f", "hash", "-"],
+        );
+        let baseline = reference_executed_evidence_digest_v3_from_commands(
+            v2,
+            &[producer.clone(), consumer.clone()],
+        )
+        .expect("canonical v7 transcript digest");
+
+        let reordered = reference_executed_evidence_digest_v3_from_commands(
+            v2,
+            &[consumer.clone(), producer.clone()],
+        )
+        .expect("reordered transcript digest");
+        assert_ne!(baseline, reordered);
+
+        let mut inherited = producer.clone();
+        inherited.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet;
+        assert_ne!(
+            baseline,
+            reference_executed_evidence_digest_v3_from_commands(
+                v2,
+                &[inherited, consumer.clone()],
+            )
+            .expect("environment-policy drift digest")
+        );
+
+        let mut environment_drift = producer.clone();
+        environment_drift
+            .environment
+            .insert("HOME".to_string(), "/ambient".to_string());
+        environment_drift.env_keys.push("HOME".to_string());
+        assert_ne!(
+            baseline,
+            reference_executed_evidence_digest_v3_from_commands(
+                v2,
+                &[environment_drift, consumer.clone()],
+            )
+            .expect("environment drift digest")
+        );
+
+        let mut diagnostics_only = producer;
+        diagnostics_only.stdout_tail = "different stdout".to_string();
+        diagnostics_only.stderr_tail = "different stderr".to_string();
+        diagnostics_only.elapsed = std::time::Duration::from_secs(99);
+        assert_eq!(
+            baseline,
+            reference_executed_evidence_digest_v3_from_commands(
+                v2,
+                &[diagnostics_only, consumer],
+            )
+            .expect("diagnostic-only drift digest")
+        );
+        assert!(reference_executed_evidence_digest_v3_from_commands(v2, &[]).is_err());
     }
 
     #[test]

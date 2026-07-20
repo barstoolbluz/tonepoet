@@ -24,6 +24,10 @@ fn zero_sha256_digest() -> Sha256Digest {
     Sha256Digest([0; 32])
 }
 
+fn is_zero_sha256_digest(value: &Sha256Digest) -> bool {
+    *value == Sha256Digest([0; 32])
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConversionManifest {
     pub manifest_version: u32,
@@ -78,6 +82,15 @@ pub enum ManifestTrackExecutionIdentityV2 {
         /// content, and canonical materialization identity.
         #[serde(default = "zero_sha256_digest")]
         executed_evidence_digest_v2: Sha256Digest,
+        /// V7-and-later executed authority. This preserves the frozen v1/v2
+        /// digests while additionally binding the ordered post-metadata
+        /// verification pipeline, including each command's explicit
+        /// environment policy and sanitized environment.
+        #[serde(
+            default = "zero_sha256_digest",
+            skip_serializing_if = "is_zero_sha256_digest"
+        )]
+        executed_evidence_digest_v3: Sha256Digest,
     },
 }
 
@@ -668,6 +681,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 {
                         executed_evidence_digest_v1,
                         executed_evidence_digest_v2,
+                        executed_evidence_digest_v3,
                         ..
                     } if *executed_evidence_digest_v1 != Sha256Digest([0; 32])
                         && (!matches!(
@@ -675,7 +689,11 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                             DsdReferencePolicyVersion::SoxNg14801V3
                                 | DsdReferencePolicyVersion::SoxNg14801V4
                                 | DsdReferencePolicyVersion::SoxNg14801V5
-                        ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32])) => {}
+                                | DsdReferencePolicyVersion::SoxNg14801V6
+                                | DsdReferencePolicyVersion::SoxNg14801V7
+                        ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32]))
+                        && (!matches!(policy, DsdReferencePolicyVersion::SoxNg14801V7)
+                            || *executed_evidence_digest_v3 != Sha256Digest([0; 32])) => {}
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
                         return Err(ManifestError::InvalidAuthority(
                             if matches!(
@@ -683,8 +701,14 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 DsdReferencePolicyVersion::SoxNg14801V3
                                     | DsdReferencePolicyVersion::SoxNg14801V4
                                     | DsdReferencePolicyVersion::SoxNg14801V5
+                                    | DsdReferencePolicyVersion::SoxNg14801V6
+                                    | DsdReferencePolicyVersion::SoxNg14801V7
                             ) {
-                                "Reference v3+ track is missing v1 or v2 executed verification authority"
+                                if matches!(policy, DsdReferencePolicyVersion::SoxNg14801V7) {
+                                    "Reference v7 track is missing v1, v2, or v3 executed verification authority"
+                                } else {
+                                    "Reference v3+ track is missing v1 or v2 executed verification authority"
+                                }
                             } else {
                                 "Reference track is missing executed verification authority"
                             }
@@ -965,13 +989,18 @@ mod manifest_merge_gap_tests {
         ExecutionFingerprintV1, SemanticPlanHashV1,
     };
 
-    fn native_identity(v1: Sha256Digest, v2: Sha256Digest) -> ManifestTrackExecutionIdentityV2 {
+    fn native_identity(
+        v1: Sha256Digest,
+        v2: Sha256Digest,
+        v3: Sha256Digest,
+    ) -> ManifestTrackExecutionIdentityV2 {
         ManifestTrackExecutionIdentityV2::NativeDsdV2 {
             behavior_fingerprint_v1: BehaviorFingerprintV1(Sha256Digest([1; 32])),
             execution_fingerprint_v1: ExecutionFingerprintV1(Sha256Digest([2; 32])),
             semantic_plan_hash_v1: SemanticPlanHashV1(Sha256Digest([3; 32])),
             executed_evidence_digest_v1: v1,
             executed_evidence_digest_v2: v2,
+            executed_evidence_digest_v3: v3,
         }
     }
 
@@ -979,6 +1008,7 @@ mod manifest_merge_gap_tests {
         policy: DsdReferencePolicyVersion,
         v1: Sha256Digest,
         v2: Sha256Digest,
+        v3: Sha256Digest,
     ) -> Result<ConversionManifest, ManifestError> {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_dir = temp.path().join("Album");
@@ -1002,7 +1032,7 @@ mod manifest_merge_gap_tests {
                 disc_number: None,
                 track_number: Some(1),
             },
-            native_identity(v1, v2),
+            native_identity(v1, v2, v3),
             PathBuf::from("01.w64"),
             16,
             Sha256Digest([6; 32]),
@@ -1040,7 +1070,11 @@ mod manifest_merge_gap_tests {
 
     #[test]
     fn native_identity_missing_v2_digest_deserializes_as_zero_for_historical_compatibility() {
-        let identity = native_identity(Sha256Digest([8; 32]), Sha256Digest([9; 32]));
+        let identity = native_identity(
+            Sha256Digest([8; 32]),
+            Sha256Digest([9; 32]),
+            Sha256Digest([10; 32]),
+        );
         let mut value = serde_json::to_value(identity).expect("serialize native identity");
         value
             .as_object_mut()
@@ -1058,64 +1092,86 @@ mod manifest_merge_gap_tests {
     }
 
     #[test]
-    fn v3_v4_and_v5_manifests_require_v2_source_materialization_evidence_without_changing_v2() {
+    fn historical_policies_preserve_v1_v2_authority_and_v7_requires_v3() {
+        let zero = Sha256Digest([0; 32]);
+        let v1 = Sha256Digest([8; 32]);
+        let v2 = Sha256Digest([9; 32]);
+        let v3 = Sha256Digest([10; 32]);
+
         assert!(reference_manifest_with_evidence(
             DsdReferencePolicyVersion::SoxNg14801V2,
-            Sha256Digest([8; 32]),
-            Sha256Digest([0; 32]),
+            v1,
+            zero,
+            zero,
         )
         .is_ok());
 
-        let error = reference_manifest_with_evidence(
+        for policy in [
             DsdReferencePolicyVersion::SoxNg14801V3,
-            Sha256Digest([8; 32]),
-            Sha256Digest([0; 32]),
-        )
-        .expect_err("v3 must bind source/materialization evidence");
-        assert!(error
-            .to_string()
-            .contains("missing v1 or v2 executed verification authority"));
-
-        assert!(reference_manifest_with_evidence(
-            DsdReferencePolicyVersion::SoxNg14801V3,
-            Sha256Digest([8; 32]),
-            Sha256Digest([9; 32]),
-        )
-        .is_ok());
+            DsdReferencePolicyVersion::SoxNg14801V4,
+            DsdReferencePolicyVersion::SoxNg14801V5,
+            DsdReferencePolicyVersion::SoxNg14801V6,
+        ] {
+            let error = reference_manifest_with_evidence(policy, v1, zero, zero)
+                .expect_err("v3-v6 must bind source/materialization evidence");
+            assert!(error
+                .to_string()
+                .contains("missing v1 or v2 executed verification authority"));
+            assert!(reference_manifest_with_evidence(policy, v1, v2, zero).is_ok());
+        }
 
         let error = reference_manifest_with_evidence(
-            DsdReferencePolicyVersion::SoxNg14801V4,
-            Sha256Digest([8; 32]),
-            Sha256Digest([0; 32]),
+            DsdReferencePolicyVersion::SoxNg14801V7,
+            v1,
+            zero,
+            zero,
         )
-        .expect_err("v4 must bind source/materialization evidence");
+        .expect_err("v7 must retain v2 source/materialization authority");
         assert!(error
             .to_string()
-            .contains("missing v1 or v2 executed verification authority"));
-
-        assert!(reference_manifest_with_evidence(
-            DsdReferencePolicyVersion::SoxNg14801V4,
-            Sha256Digest([8; 32]),
-            Sha256Digest([9; 32]),
-        )
-        .is_ok());
+            .contains("missing v1, v2, or v3 executed verification authority"));
 
         let error = reference_manifest_with_evidence(
-            DsdReferencePolicyVersion::SoxNg14801V5,
-            Sha256Digest([8; 32]),
-            Sha256Digest([0; 32]),
+            DsdReferencePolicyVersion::SoxNg14801V7,
+            v1,
+            v2,
+            zero,
         )
-        .expect_err("v5 must bind source/materialization evidence");
+        .expect_err("v7 must bind the ordered verification command pipeline");
         assert!(error
             .to_string()
-            .contains("missing v1 or v2 executed verification authority"));
+            .contains("missing v1, v2, or v3 executed verification authority"));
 
         assert!(reference_manifest_with_evidence(
-            DsdReferencePolicyVersion::SoxNg14801V5,
-            Sha256Digest([8; 32]),
-            Sha256Digest([9; 32]),
+            DsdReferencePolicyVersion::SoxNg14801V7,
+            v1,
+            v2,
+            v3,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn native_identity_missing_v3_digest_deserializes_as_zero_for_historical_compatibility() {
+        let identity = native_identity(
+            Sha256Digest([8; 32]),
+            Sha256Digest([9; 32]),
+            Sha256Digest([10; 32]),
+        );
+        let mut value = serde_json::to_value(identity).expect("serialize native identity");
+        value
+            .as_object_mut()
+            .expect("identity object")
+            .remove("executed_evidence_digest_v3");
+        let parsed: ManifestTrackExecutionIdentityV2 =
+            serde_json::from_value(value).expect("deserialize historical native identity");
+        assert!(matches!(
+            parsed,
+            ManifestTrackExecutionIdentityV2::NativeDsdV2 {
+                executed_evidence_digest_v3,
+                ..
+            } if executed_evidence_digest_v3 == Sha256Digest([0; 32])
+        ));
     }
 
     #[test]
@@ -1123,17 +1179,33 @@ mod manifest_merge_gap_tests {
         let route = ManifestRouteIdentityV2::DsdReferenceV2 {
             settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2(Sha256Digest([1; 32])),
             resolved_output_target: ResolvedOutputTarget::WavW64,
-            policy: DsdReferencePolicyVersion::SoxNg14801V4,
+            policy: DsdReferencePolicyVersion::SoxNg14801V6,
             qualification_manifest_digest: Sha256Digest([2; 32]),
         };
         let route_json = serde_json::to_value(route).expect("serialize route identity");
         assert_eq!(route_json["route"], "dsd_reference_v2");
-        assert_eq!(route_json["policy"], "sox_ng_14_8_0_1_v4");
+        assert_eq!(route_json["policy"], "sox_ng_14_8_0_1_v6");
         assert_eq!(route_json["resolved_output_target"], "wav_w64");
 
-        let execution = native_identity(Sha256Digest([3; 32]), Sha256Digest([4; 32]));
+        let execution = native_identity(
+            Sha256Digest([3; 32]),
+            Sha256Digest([4; 32]),
+            Sha256Digest([0; 32]),
+        );
         let execution_json = serde_json::to_value(execution).expect("serialize execution identity");
         assert_eq!(execution_json["kind"], "native_dsd_v2");
+        assert!(execution_json.get("executed_evidence_digest_v3").is_none());
+
+        let v7_execution = native_identity(
+            Sha256Digest([3; 32]),
+            Sha256Digest([4; 32]),
+            Sha256Digest([5; 32]),
+        );
+        let v7_json = serde_json::to_value(v7_execution).expect("serialize v7 execution identity");
+        assert_eq!(
+            v7_json["executed_evidence_digest_v3"],
+            serde_json::to_value(Sha256Digest([5; 32])).expect("serialize digest")
+        );
     }
 
     #[test]

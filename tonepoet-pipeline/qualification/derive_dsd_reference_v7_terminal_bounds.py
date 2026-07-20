@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Derive and verify the policy-v7 terminal true-peak bounds.
+
+The calculation is intentionally standard-library-only and uses Decimal at
+120-digit precision. For each qualified terminal realization it computes:
+
+    A = 10 ** ((C - R) / 20)
+    S = 20 * log10(A - epsilon)
+
+where C is the public post-final ceiling, R is exactly one analyzer reporting
+quantum, and epsilon is the upward-rounded Q1.63 additive peak bound. S is
+rounded toward negative infinity to one nanodecibel.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from decimal import Decimal, ROUND_FLOOR, localcontext
+from pathlib import Path
+from typing import Final
+
+NANO: Final[Decimal] = Decimal(1_000_000_000)
+Q63_DENOMINATOR: Final[Decimal] = Decimal(2) ** 63
+PUBLIC_CEILING_DB: Final[Decimal] = Decimal("-1.000000000")
+REPORTING_QUANTUM_DB: Final[Decimal] = Decimal("0.010000000")
+
+CELLS: Final[dict[str, int]] = {
+    "int24_tpdf": 2_199_023_255_552,
+    "float32": 1_099_511_627_776,
+    "float64": 4_096,
+}
+
+
+def derive_safe_dbnano(q63_ceil: int) -> int:
+    """Return the conservative pre-terminal ceiling in signed nanodecibels."""
+    with localcontext() as context:
+        context.prec = 120
+        ln_10 = Decimal(10).ln()
+        admitted_peak = (
+            ((PUBLIC_CEILING_DB - REPORTING_QUANTUM_DB) / 20) * ln_10
+        ).exp()
+        epsilon = Decimal(q63_ceil) / Q63_DENOMINATOR
+        if epsilon <= 0 or epsilon >= admitted_peak:
+            raise ValueError("terminal epsilon is outside the derivable amplitude domain")
+        safe_db = Decimal(20) * (admitted_peak - epsilon).ln() / ln_10
+        return int((safe_db * NANO).to_integral_value(rounding=ROUND_FLOOR))
+
+
+def render_dbnano(value: int) -> str:
+    sign = "-" if value < 0 else ""
+    magnitude = abs(value)
+    return f"{sign}{magnitude // 1_000_000_000}.{magnitude % 1_000_000_000:09d}"
+
+
+def derived_cells() -> dict[str, dict[str, int | str]]:
+    return {
+        name: {
+            "max_added_peak_fs_q63_ceil": q63,
+            "safe_pre_terminal_ceiling_dbtp": render_dbnano(derive_safe_dbnano(q63)),
+        }
+        for name, q63 in CELLS.items()
+    }
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify_artifact(path: Path, repository_root: Path) -> None:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("schema_version") != 7:
+        raise AssertionError(f"{path}: expected schema_version 7")
+    if document.get("policy") != "sox_ng_14_8_0_1_v7":
+        raise AssertionError(f"{path}: unexpected policy identity")
+    if document.get("status") != "qualification_candidate":
+        raise AssertionError(f"{path}: v7 must remain an unpromoted candidate")
+
+    carrier = document["analyzer"]["carrier"]
+    if carrier.get("schema") != "tonepoet-reference-analyzer-carrier/v2":
+        raise AssertionError(f"{path}: unexpected analyzer carrier schema")
+    if carrier.get("parser") != "ffmpeg_loudnorm_input_tp_v3":
+        raise AssertionError(f"{path}: unexpected analyzer parser")
+    if (
+        carrier.get("routing_rule")
+        != "float32_w64_direct_ffmpeg_else_sox_f64_wav_stream"
+    ):
+        raise AssertionError(f"{path}: unexpected analyzer routing rule")
+    if carrier.get("disk_intermediate") is not False:
+        raise AssertionError(f"{path}: analyzer contract introduced a disk intermediate")
+
+    packaging = document.get("packaging", {})
+    if packaging.get("schema") != "tonepoet-reference-lossless-packaging/v3":
+        raise AssertionError(f"{path}: unexpected packaging schema")
+    if packaging.get("float64_wav_targets") != ["wav_riff", "wav_rf64"]:
+        raise AssertionError(f"{path}: unexpected Float64 package targets")
+    if packaging.get("producer_tool") != "sox_ng" or packaging.get("consumer_tool") != "ffmpeg":
+        raise AssertionError(f"{path}: unexpected Float64 package tools")
+    if packaging.get("producer_args_template") != [
+        "-S", "-D", "{qpcm_w64}", "-t", "raw", "-e", "floating-point", "-b", "64", "-L", "-"
+    ]:
+        raise AssertionError(f"{path}: unexpected Float64 package producer argv")
+    if packaging.get("consumer_args_template") != [
+        "-y", "-hide_banner", "-nostdin", "-f", "f64le", "-ar", "{sample_rate_hz}",
+        "-ac", "{channels}", "-i", "pipe:0", "-map", "0:a:0", "-map_metadata", "-1",
+        "-vn", "-sn", "-dn", "-c:a", "pcm_f64le", "-f", "wav", "{rf64_args}", "{output}"
+    ]:
+        raise AssertionError(f"{path}: unexpected Float64 package consumer argv")
+    if packaging.get("rf64_args") != ["-rf64", "always"]:
+        raise AssertionError(f"{path}: unexpected RF64 package args")
+    if (
+        packaging.get("transport") != "direct_stdout_to_stdin_no_shell"
+        or packaging.get("stream_encoding") != "pcm_f64le"
+        or packaging.get("stream_framing") != "headerless_raw_pcm"
+        or packaging.get("endianness") != "little"
+        or packaging.get("disk_intermediate") is not False
+    ):
+        raise AssertionError(f"{path}: Float64 package transport is not canonical")
+    if packaging.get("environment_policy") != "clear_and_set" or packaging.get("environment") != {"LC_ALL": "C"}:
+        raise AssertionError(f"{path}: Float64 package environment is not canonical")
+    if packaging.get("forbidden_route") != "ffmpeg_direct_decode_of_float64_qpcm_w64":
+        raise AssertionError(f"{path}: Float64 forbidden route is not bound")
+
+    identity = document.get("sample_identity", {})
+    expected_identity = {
+        "schema": "tonepoet-reference-sample-identity/v3",
+        "float64_qpcm_w64_route": "sox_f64le_raw_stream_to_ffmpeg_sha256",
+        "float64_w64_final_route": "sox_f64le_raw_stream_to_ffmpeg_sha256",
+        "float64_riff_rf64_output_route": "ffmpeg_direct_sha256",
+        "other_carrier_route": "ffmpeg_direct_sha256",
+        "hash_format": "interleaved_f64le_sha256",
+        "oracle_independence": "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode",
+        "environment_policy": "clear_and_set",
+        "environment": {"LC_ALL": "C"},
+    }
+    if identity != expected_identity:
+        raise AssertionError(f"{path}: decoded-sample identity contract is not canonical")
+
+    report = document["qualification_report"]
+    bound_paths = {
+        "sha256": report["path"],
+        "guidance_sha256": "docs/tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md",
+        "decimation_report_sha256": "docs/sox_ng_dsd_decimation_test_report_v5.md",
+        "commission_sha256": "docs/brief_dsd_reference_p0_scope_and_commission.md",
+        "amendment_sha256": "docs/brief_dsd_reference_p0_policy_v3_amendment.md",
+        "analyzer_corrective_brief_sha256": (
+            "docs/brief_dsd_reference_p0_corrective_analyzer_carrier.md"
+        ),
+        "runtime_defaults_corrective_brief_sha256": (
+            "docs/brief_dsd_reference_p0_corrective_runtime_defaults.md"
+        ),
+    }
+    for field, relative in bound_paths.items():
+        bound_path = repository_root / relative
+        actual = sha256_file(bound_path)
+        if report.get(field) != actual:
+            raise AssertionError(
+                f"{path}: {field}={report.get(field)!r}, expected {actual!r} "
+                f"for {relative}"
+            )
+    analyzer_uncertainty = document["analyzer"]["reporting_uncertainty_db"]
+    terminal = document["terminal_bounds"]
+    reserve = terminal["post_final_acceptance_reserve_db"]
+    if analyzer_uncertainty != "0.010000000":
+        raise AssertionError(
+            f"{path}: unexpected analyzer reporting uncertainty "
+            f"{analyzer_uncertainty}"
+        )
+    if reserve != analyzer_uncertainty:
+        raise AssertionError(
+            f"{path}: terminal reserve {reserve} != analyzer uncertainty "
+            f"{analyzer_uncertainty}"
+        )
+    expected_cells = derived_cells()
+    for name, expected in expected_cells.items():
+        actual = terminal[name]
+        for field, value in expected.items():
+            if actual[field] != value:
+                raise AssertionError(
+                    f"{path}: {name}.{field}={actual[field]!r}, expected {value!r}"
+                )
+
+
+def verify_compiled_policy(path: Path) -> None:
+    source = path.read_text(encoding="utf-8")
+    constant_patterns = {
+        "REFERENCE_CEILING": -1_000_000_000,
+        "POST_FINAL_ACCEPTANCE_RESERVE": 10_000_000,
+    }
+    for name, expected in constant_patterns.items():
+        match = re.search(
+            rf"pub const {name}: Self = Self\((-?[0-9_]+)\);",
+            source,
+        )
+        if match is None:
+            raise AssertionError(f"{path}: cannot locate DbNano::{name}")
+        actual = int(match.group(1).replace("_", ""))
+        if actual != expected:
+            raise AssertionError(f"{path}: DbNano::{name}={actual}, expected {expected}")
+
+    variants = {
+        "int24_tpdf": "Int24",
+        "float32": "Float32",
+        "float64": "Float64",
+    }
+    expected_cells = derived_cells()
+    for name, variant in variants.items():
+        match = re.search(
+            rf"PcmBitDepth::{variant}\s*=>\s*\(\s*([0-9_]+)\s*,\s*(-?[0-9_]+)",
+            source,
+        )
+        if match is None:
+            raise AssertionError(f"{path}: cannot locate compiled {variant} terminal cell")
+        actual_q63 = int(match.group(1).replace("_", ""))
+        actual_safe = int(match.group(2).replace("_", ""))
+        expected = expected_cells[name]
+        if actual_q63 != expected["max_added_peak_fs_q63_ceil"]:
+            raise AssertionError(
+                f"{path}: compiled {variant} q63={actual_q63}, "
+                f"expected {expected['max_added_peak_fs_q63_ceil']}"
+            )
+        expected_safe = int(
+            str(expected["safe_pre_terminal_ceiling_dbtp"]).replace(".", "")
+        )
+        if actual_safe != expected_safe:
+            raise AssertionError(
+                f"{path}: compiled {variant} safe={actual_safe}, expected {expected_safe}"
+            )
+
+
+def verify_compiled_v7_routes(repository_root: Path) -> None:
+    planner = (repository_root / "tonepoet-pipeline/src/dsd_reference.rs").read_text(encoding="utf-8")
+    executor = (repository_root / "src/convert/pipeline/track_executor.rs").read_text(encoding="utf-8")
+    manifest = (repository_root / "src/convert/pipeline/manifest.rs").read_text(encoding="utf-8")
+    manifest_builder = (repository_root / "src/convert/pipeline/manifest_builder.rs").read_text(encoding="utf-8")
+    required_planner = [
+        "build_float64_wav_package_pipeline",
+        "PlannedExecutionStep::Pipeline",
+        "Float64 RIFF/RF64 packaging must use the qualified typed stream",
+        "CommandEnvironmentPolicy::ClearAndSet",
+        '"raw".to_string()',
+        '"f64le".to_string()',
+    ]
+    required_executor = [
+        "ReferenceSampleHashRoute::StreamFloat64W64ViaSoxRaw",
+        "build_reference_float64_w64_hash_pipeline",
+        "validate_reference_package_pipeline",
+        "build_reference_carrier_probe_command",
+        "build_reference_direct_hash_command",
+        "post_metadata_verification_commands",
+        "CommandEnvironmentPolicy::ClearAndSet",
+        '"raw".to_string()',
+        '"f64le".to_string()',
+    ]
+    required_manifest = [
+        "executed_evidence_digest_v3",
+        'skip_serializing_if = "is_zero_sha256_digest"',
+        "Reference v7 track is missing v1, v2, or v3 executed verification authority",
+    ]
+    required_manifest_builder = [
+        r"tonepoet-reference-executed-evidence/v3\0",
+        "post_metadata_verification_commands",
+        "command.environment_policy",
+        "command.environment",
+    ]
+    for marker in required_planner:
+        if marker not in planner:
+            raise AssertionError(f"compiled planner is missing v7 route marker: {marker}")
+    for marker in required_executor:
+        if marker not in executor:
+            raise AssertionError(f"compiled executor is missing v7 route marker: {marker}")
+    for marker in required_manifest:
+        if marker not in manifest:
+            raise AssertionError(f"compiled manifest is missing v7 authority marker: {marker}")
+    for marker in required_manifest_builder:
+        if marker not in manifest_builder:
+            raise AssertionError(
+                f"compiled manifest builder is missing v7 evidence marker: {marker}"
+            )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify both checked-in v7 qualification artifacts",
+    )
+    args = parser.parse_args()
+
+    if args.check:
+        qualification_dir = Path(__file__).resolve().parent
+        repository_root = qualification_dir.parent.parent
+        current = qualification_dir / "dsd_reference_sox_ng_14_8_0_1_v7.json"
+        candidate = qualification_dir / "dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
+        verify_artifact(current, repository_root)
+        verify_artifact(candidate, repository_root)
+        if current.read_bytes() != candidate.read_bytes():
+            raise AssertionError(
+                "v7 current and candidate manifests differ before promotion"
+            )
+        verify_compiled_policy(qualification_dir.parent / "src" / "dsd_reference.rs")
+        verify_compiled_v7_routes(repository_root)
+        print("v7 terminal-bound derivation and route contracts verified")
+    else:
+        print(json.dumps(derived_cells(), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

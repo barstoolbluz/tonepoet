@@ -336,6 +336,13 @@ impl TuiPreset {
         output_opts: &OutputOptionsState,
         metadata: &MetadataState,
     ) -> Self {
+        let dsd_gain_parameter = if !format.dsd_reference_controls_available()
+            && *format.dsd_gain_mode.selected_value() == DsdGainMode::Auto
+        {
+            format.dsd_auto_gain_margin_db.render(false)
+        } else {
+            format.dsd_normalize_target_dbfs.render(false)
+        };
         Self {
             name: name.to_string(),
             description: None,
@@ -368,11 +375,13 @@ impl TuiPreset {
                 tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband",
             }
             .to_string()),
-            dsd_gain: Some(format.dsd_gain_mode.selected_label().to_string()),
+            dsd_gain: Some(format.dsd_gain_mode.selected_value().preset_key().to_string()),
             dsd_gain_db: Some(format.dsd_gain_db.render(false)),
-            dsd_normalize_target_dbfs: Some(
-                format.dsd_normalize_target_dbfs.render(false),
-            ),
+            // v4 has one auxiliary DSD-gain scalar. Pre-promotion Auto
+            // stores its positive legacy margin directly. The `dsd_gain` key
+            // distinguishes Auto from native NormalizePeak; apply still accepts
+            // a negative historical token by magnitude for compatibility.
+            dsd_normalize_target_dbfs: Some(dsd_gain_parameter),
             album_artist_for_conversion: normalize_optional_text_override(
                 metadata.album_artist_for_conversion.as_deref(),
             ),
@@ -450,76 +459,112 @@ impl TuiPreset {
             });
             report.record("output_target", target_applied);
 
-            match self.dsd_path.as_deref().unwrap_or("reference") {
-                "reference" => {
-                    report.record(
-                        "dsd_path",
-                        format_state
-                            .dsd_pathway
-                            .select_value(&tonepoet_pipeline::DsdSourcePathway::Reference),
-                    );
-                }
-                "manual" => report.record("dsd_path", false),
-                _ => report.record("dsd_path", false),
-            }
-            match self.dsd_profile.as_deref().unwrap_or("reference") {
-                "reference" => {
-                    report.record(
-                        "dsd_profile",
-                        format_state.dsd_profile.select_value(
-                            &tonepoet_pipeline::DsdReconstructionSelection::Reference,
+            // DSD-source fields are meaningful only for an actual DSD-to-PCM
+            // conversion. Irrelevant fields are ignored rather than reported as
+            // refusals, so preset application is independent of disabled stale pills.
+            if format_state.dsd_to_pcm_gain_available() {
+                let native = format_state.dsd_reference_controls_available();
+                if native {
+                    match self.dsd_path.as_deref().unwrap_or("reference") {
+                        "reference" => report.record(
+                            "dsd_path",
+                            format_state.dsd_pathway.select_value(
+                                &tonepoet_pipeline::DsdSourcePathway::Reference,
+                            ),
                         ),
-                    );
-                }
-                "wideband" => {
-                    report.record(
-                        "dsd_profile",
-                        format_state.dsd_profile.select_value(
-                            &tonepoet_pipeline::DsdReconstructionSelection::Wideband,
+                        _ => report.record("dsd_path", false),
+                    }
+                    match self.dsd_profile.as_deref().unwrap_or("reference") {
+                        "reference" => report.record(
+                            "dsd_profile",
+                            format_state.dsd_profile.select_value(
+                                &tonepoet_pipeline::DsdReconstructionSelection::Reference,
+                            ),
                         ),
-                    );
-                }
-                _ => report.record("dsd_profile", false),
-            }
-            let gain_mode = match self.dsd_gain.as_deref().unwrap_or("reference") {
-                "reference" => Some(DsdGainMode::Reference),
-                "native" => Some(DsdGainMode::NativeLevel),
-                "fixed" => Some(DsdGainMode::Fixed),
-                "normalize" => Some(DsdGainMode::NormalizePeak),
-                _ => None,
-            };
-            if let Some(mode) = gain_mode {
-                report.record(
-                    "dsd_gain",
-                    format_state.dsd_gain_mode.select_value(&mode),
-                );
-            } else {
-                report.record("dsd_gain", false);
-            }
-            if let Some(raw) = self.dsd_gain_db.as_deref() {
-                match raw.parse::<tonepoet_pipeline::DbNano>() {
-                    Ok(value)
-                        if (tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
-                            ..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN)
-                            .contains(&value) =>
-                    {
-                        format_state.dsd_gain_db = value;
-                        report.record("dsd_gain_db", true);
+                        "wideband" => report.record(
+                            "dsd_profile",
+                            format_state.dsd_profile.select_value(
+                                &tonepoet_pipeline::DsdReconstructionSelection::Wideband,
+                            ),
+                        ),
+                        _ => report.record("dsd_profile", false),
                     }
-                    _ => report.record("dsd_gain_db", false),
-                }
-            }
-            if let Some(raw) = self.dsd_normalize_target_dbfs.as_deref() {
-                match raw.parse::<tonepoet_pipeline::DbNano>() {
-                    Ok(value)
-                        if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
-                            ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
-                            .contains(&value) =>
-                    {
-                        format_state.dsd_normalize_target_dbfs = value;
-                        report.record("dsd_normalize_target_dbfs", true);
+                } else {
+                    // The v4 defaults `reference/reference` carry no legacy
+                    // behavior and are accepted as no-ops. Native-only requests
+                    // remain explicit refusals before promotion.
+                    if !matches!(self.dsd_path.as_deref(), None | Some("reference")) {
+                        report.record("dsd_path", false);
                     }
-                    _ => report.record("dsd_normalize_target_dbfs", false),
+                    if !matches!(self.dsd_profile.as_deref(), None | Some("reference")) {
+                        report.record("dsd_profile", false);
+                    }
+                }
+
+                let raw_gain = self.dsd_gain.as_deref().unwrap_or("reference");
+                let gain_mode = if native {
+                    match raw_gain {
+                        "reference" => Some(DsdGainMode::Reference),
+                        "native" => Some(DsdGainMode::NativeLevel),
+                        "fixed" | "manual" => Some(DsdGainMode::Fixed),
+                        "normalize" => Some(DsdGainMode::NormalizePeak),
+                        _ => None,
+                    }
+                } else {
+                    match raw_gain {
+                        // Old v4 presets captured `reference` even while the
+                        // exact legacy default was Disabled. Preserve that
+                        // behavior during pre-promotion application.
+                        "reference" | "disabled" => Some(DsdGainMode::Disabled),
+                        "auto" | "normalize" => Some(DsdGainMode::Auto),
+                        "fixed" | "manual" => Some(DsdGainMode::Fixed),
+                        _ => None,
+                    }
+                };
+                if let Some(mode) = gain_mode {
+                    report.record("dsd_gain", format_state.dsd_gain_mode.select_value(&mode));
+                    if mode == DsdGainMode::Fixed {
+                        if let Some(raw) = self.dsd_gain_db.as_deref() {
+                            match raw.parse::<tonepoet_pipeline::DbNano>() {
+                                Ok(value)
+                                    if (tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
+                                        ..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN)
+                                        .contains(&value) =>
+                                {
+                                    format_state.dsd_gain_db = value;
+                                    report.record("dsd_gain_db", true);
+                                }
+                                _ => report.record("dsd_gain_db", false),
+                            }
+                        }
+                    }
+                    if matches!(mode, DsdGainMode::Auto | DsdGainMode::NormalizePeak) {
+                        if let Some(raw) = self.dsd_normalize_target_dbfs.as_deref() {
+                            match raw.parse::<tonepoet_pipeline::DbNano>() {
+                                Ok(value) if mode == DsdGainMode::Auto => {
+                                    let magnitude = value.0.unsigned_abs();
+                                    if magnitude <= 6_000_000_000 {
+                                        format_state.dsd_auto_gain_margin_db =
+                                            tonepoet_pipeline::DbNano(magnitude as i64);
+                                        report.record("dsd_normalize_target_dbfs", true);
+                                    } else {
+                                        report.record("dsd_normalize_target_dbfs", false);
+                                    }
+                                }
+                                Ok(value)
+                                    if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
+                                        ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
+                                        .contains(&value) =>
+                                {
+                                    format_state.dsd_normalize_target_dbfs = value;
+                                    report.record("dsd_normalize_target_dbfs", true);
+                                }
+                                _ => report.record("dsd_normalize_target_dbfs", false),
+                            }
+                        }
+                    }
+                } else {
+                    report.record("dsd_gain", false);
                 }
             }
         }
@@ -1601,10 +1646,16 @@ merge = "multi-file"
 
         assert_eq!(
             report.refused_fields,
-            vec!["bit_depth".to_string(), "merge".to_string()]
+            vec![
+                "output_target".to_string(),
+                "bit_depth".to_string(),
+                "merge".to_string(),
+            ]
         );
         assert!(!report.is_complete());
-        assert!(report.status_suffix().contains("bit_depth, merge"));
+        assert!(report
+            .status_suffix()
+            .contains("output_target, bit_depth, merge"));
         assert_eq!(*restored_format.format.selected_value(), AudioFormat::Alac);
         assert_ne!(
             *restored_format.bit_depth.selected_value(),
@@ -1650,9 +1701,118 @@ merge = "multi-file"
         );
 
         assert_eq!(first, second);
-        assert!(first.is_complete(), "unexpected refusals: {:?}", first.refused_fields);
+        assert_eq!(first.refused_fields, vec!["output_target".to_string()]);
         assert_eq!(*first_format.format.selected_value(), AudioFormat::Dsf);
         assert_eq!(*second_format.format.selected_value(), AudioFormat::Dsf);
+    }
+
+    #[test]
+    fn pre_promotion_v4_preset_applies_legacy_manual_gain_without_native_refusals() {
+        let mut source = FormatState::new();
+        source.set_source_is_dsd(true);
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let mut preset = TuiPreset::from_pill_state("legacy-manual", &source, &output, &metadata);
+        preset.dsd_path = Some("reference".to_string());
+        preset.dsd_profile = Some("reference".to_string());
+        preset.dsd_gain = Some("manual".to_string());
+        preset.dsd_gain_db = Some("2.250000000".to_string());
+
+        let mut restored = FormatState::new();
+        restored.set_source_is_dsd(true);
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(*restored.dsd_gain_mode.selected_value(), DsdGainMode::Fixed);
+        assert_eq!(restored.dsd_gain_db, "2.250000000".parse().unwrap());
+    }
+
+    #[test]
+    fn pre_promotion_v4_preset_maps_normalize_to_exact_legacy_auto() {
+        let mut source = FormatState::new();
+        source.set_source_is_dsd(true);
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let mut preset = TuiPreset::from_pill_state("legacy-auto", &source, &output, &metadata);
+        preset.dsd_gain = Some("normalize".to_string());
+        preset.dsd_normalize_target_dbfs = Some("-0.500000000".to_string());
+
+        let mut restored = FormatState::new();
+        restored.set_source_is_dsd(true);
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(*restored.dsd_gain_mode.selected_value(), DsdGainMode::Auto);
+        assert_eq!(restored.dsd_auto_gain_margin_db, "0.500000000".parse().unwrap());
+    }
+
+    #[test]
+    fn pre_promotion_v4_auto_preset_round_trips_the_exact_legacy_margin() {
+        let mut source = FormatState::new();
+        source.set_source_is_dsd(true);
+        assert!(source.dsd_gain_mode.select_value(&DsdGainMode::Auto));
+        source.dsd_auto_gain_margin_db = "0.350000000".parse().unwrap();
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let preset = TuiPreset::from_pill_state("legacy-auto-roundtrip", &source, &output, &metadata);
+        assert_eq!(preset.dsd_gain.as_deref(), Some("auto"));
+        assert_eq!(preset.dsd_normalize_target_dbfs.as_deref(), Some("0.350000000"));
+
+        let mut restored = FormatState::new();
+        restored.set_source_is_dsd(true);
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(*restored.dsd_gain_mode.selected_value(), DsdGainMode::Auto);
+        assert_eq!(restored.dsd_auto_gain_margin_db, "0.350000000".parse().unwrap());
+    }
+
+    #[test]
+    fn pre_promotion_v4_preset_refuses_native_only_dsd_requests() {
+        let mut source = FormatState::new();
+        source.set_source_is_dsd(true);
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let mut preset = TuiPreset::from_pill_state("native-only", &source, &output, &metadata);
+        preset.dsd_path = Some("manual".to_string());
+        preset.dsd_profile = Some("wideband".to_string());
+        preset.dsd_gain = Some("native".to_string());
+
+        let mut restored = FormatState::new();
+        restored.set_source_is_dsd(true);
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert_eq!(
+            report.refused_fields,
+            vec![
+                "dsd_path".to_string(),
+                "dsd_profile".to_string(),
+                "dsd_gain".to_string(),
+            ]
+        );
     }
 
     #[test]

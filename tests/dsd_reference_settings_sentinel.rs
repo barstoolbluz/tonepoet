@@ -72,8 +72,8 @@ fn pre_promotion_default_is_exact_legacy_v1_wire() {
     let dsd = encoded["dsd"].as_object().expect("legacy DSD object");
     assert!(!dsd.contains_key("schema_version"));
     assert!(!dsd.contains_key("from_dsd"));
-    assert_eq!(dsd["dsd_to_pcm_lowpass"], "auto");
-    assert_eq!(dsd["dsd_to_pcm_gain_mode"], "disabled");
+    assert_eq!(dsd["dsd_to_pcm_lowpass"], "Auto");
+    assert_eq!(dsd["dsd_to_pcm_gain_mode"], "Disabled");
 
     let decoded: PipelineSettings =
         serde_json::from_value(encoded).expect("deserialize default settings");
@@ -219,7 +219,7 @@ fn native_v2_immutable_identity_fields_are_serialized_and_hashed() {
     assert_eq!(encoded["dsd"]["schema_version"], 2);
     assert_eq!(
         encoded["dsd"]["from_dsd"]["reference_policy"],
-        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V5).unwrap()
+        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V7).unwrap()
     );
 
     // These fields have one legal P0 value. Pin their exact snapshot tokens so
