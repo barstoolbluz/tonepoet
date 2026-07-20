@@ -87,6 +87,13 @@ pub enum ToolRunnerError {
     },
     #[error("tool cancelled")]
     Cancelled { command: CommandRecord },
+    #[error("tool runner does not support typed pipelines")]
+    UnsupportedPipeline,
+    #[error("tool termination/reaping failed: {message}")]
+    Termination {
+        message: String,
+        command: CommandRecord,
+    },
     #[error("tool exited non-zero")]
     NonZeroExit {
         exit: ProcessExit,

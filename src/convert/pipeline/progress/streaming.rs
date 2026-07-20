@@ -19,7 +19,9 @@ use super::heartbeat::DEFAULT_HEARTBEAT_INTERVAL;
 use super::operation::OperationProgressTracker;
 use crate::convert::pipeline::errors::ToolRunnerError;
 use crate::convert::pipeline::tool::{
+    apply_command_environment, resolve_command_launch_path, terminate_and_reap_child,
     CommandRecord, ProcessExit, ToolBinary, ToolCommand, ToolOutput, TOOL_OUTPUT_TAIL_BYTES,
+    TOOL_TERMINATION_TIMEOUT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +145,10 @@ pub async fn run_streaming_tool_with_probe_with_tool_paths<F>(
 where
     F: FnMut(StreamSource, &str) -> Option<ProbeUpdate>,
 {
-    let binary_path = resolve_binary_with_tool_paths(cmd.binary, tool_paths);
+    let binary_path = resolve_command_launch_path(
+        resolve_binary_with_tool_paths(cmd.binary, tool_paths),
+        cmd.environment_policy,
+    );
     run_streaming_tool_with_probe_at_path(binary_path, cmd, cancel, tracker, heartbeat, parse_line)
         .await
 }
@@ -164,15 +169,14 @@ where
     proc.args(&cmd.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     if let Some(ref cwd) = cmd.cwd {
         proc.current_dir(cwd);
     }
 
-    for env_var in &cmd.env {
-        proc.env(&env_var.key, env_var.value.expose());
-    }
+    apply_command_environment(&mut proc, &cmd);
 
     let mut child = proc.spawn().map_err(|_io| {
         let elapsed = start.elapsed();
@@ -202,17 +206,26 @@ where
     let mut heartbeat_ticks =
         time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
 
+    let mut wait_failure_termination = None;
     let wait_result = loop {
         tokio::select! {
             status = child.wait() => {
                 break match status {
                     Ok(status) => Ok(status),
-                    Err(err) => Err(err),
+                    Err(error) => {
+                        wait_failure_termination = Some(
+                            terminate_and_reap_child(
+                                &mut child,
+                                "streaming tool child after wait failure",
+                            )
+                            .await,
+                        );
+                        Err(error)
+                    }
                 };
             }
             _ = &mut timeout_sleep => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                let termination = terminate_and_reap_child(&mut child, "streaming tool child").await;
                 let elapsed = start.elapsed();
                 let (stdout_tail, stderr_tail) = collect_tails_while_draining(
                     stdout_task,
@@ -222,17 +235,34 @@ where
                     &mut parse_line,
                 )
                 .await;
-                return Err(ToolRunnerError::Timeout {
-                    elapsed,
-                    command: build_record(&cmd, None, &stdout_tail, &stderr_tail, elapsed),
-                });
+                return match termination {
+                    Ok(status) => Err(ToolRunnerError::Timeout {
+                        elapsed,
+                        command: build_record(
+                            &cmd,
+                            Some(map_exit_status(status)),
+                            &stdout_tail,
+                            &stderr_tail,
+                            elapsed,
+                        ),
+                    }),
+                    Err(message) => Err(ToolRunnerError::Termination {
+                        message,
+                        command: build_record(
+                            &cmd,
+                            None,
+                            &stdout_tail,
+                            &stderr_tail,
+                            elapsed,
+                        ),
+                    }),
+                };
             }
             _ = cancel.cancelled() => {
                 if let Some(tracker) = tracker.as_deref_mut() {
                     tracker.cancel_requested_for_tool(cmd.binary.default_name()).await;
                 }
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                let termination = terminate_and_reap_child(&mut child, "streaming tool child").await;
                 let elapsed = start.elapsed();
                 let (stdout_tail, stderr_tail) = collect_tails_while_draining(
                     stdout_task,
@@ -245,9 +275,27 @@ where
                 if let Some(tracker) = tracker.as_deref_mut() {
                     tracker.cancelled_at_last_progress().await;
                 }
-                return Err(ToolRunnerError::Cancelled {
-                    command: build_record(&cmd, None, &stdout_tail, &stderr_tail, elapsed),
-                });
+                return match termination {
+                    Ok(status) => Err(ToolRunnerError::Cancelled {
+                        command: build_record(
+                            &cmd,
+                            Some(map_exit_status(status)),
+                            &stdout_tail,
+                            &stderr_tail,
+                            elapsed,
+                        ),
+                    }),
+                    Err(message) => Err(ToolRunnerError::Termination {
+                        message,
+                        command: build_record(
+                            &cmd,
+                            None,
+                            &stdout_tail,
+                            &stderr_tail,
+                            elapsed,
+                        ),
+                    }),
+                };
             }
             Some(line) = line_rx.recv() => {
                 apply_line(&mut tracker, &mut parse_line, line).await;
@@ -296,7 +344,15 @@ where
                 })
             }
         }
-        Err(io_err) => Err(ToolRunnerError::Io(io_err)),
+        Err(io_err) => match wait_failure_termination
+            .expect("wait failure records terminalization outcome")
+        {
+            Ok(_status) => Err(ToolRunnerError::Io(io_err)),
+            Err(message) => Err(ToolRunnerError::Termination {
+                message: format!("wait failed: {io_err}; {message}"),
+                command: build_record(&cmd, None, &stdout_tail, &stderr_tail, elapsed),
+            }),
+        },
     }
 }
 
@@ -312,8 +368,12 @@ where
 {
     let mut stdout_tail: Option<String> = None;
     let mut stderr_tail: Option<String> = None;
+    let deadline = Instant::now() + TOOL_TERMINATION_TIMEOUT;
 
     loop {
+        if Instant::now() >= deadline {
+            break;
+        }
         match (stdout_task.is_some(), stderr_task.is_some()) {
             (false, false) => {
                 while let Some(line) = line_rx.recv().await {
@@ -337,6 +397,7 @@ where
                         stderr_tail = Some(result.unwrap_or_default());
                         stderr_task = None;
                     }
+                    _ = time::sleep_until(deadline) => break,
                 }
             }
             (true, false) => {
@@ -348,6 +409,7 @@ where
                         stdout_tail = Some(result.unwrap_or_default());
                         stdout_task = None;
                     }
+                    _ = time::sleep_until(deadline) => break,
                 }
             }
             (false, true) => {
@@ -359,10 +421,27 @@ where
                         stderr_tail = Some(result.unwrap_or_default());
                         stderr_task = None;
                     }
+                    _ = time::sleep_until(deadline) => break,
                 }
             }
         }
     }
+
+    if let Some(task) = stdout_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    while let Ok(line) = line_rx.try_recv() {
+        apply_line(tracker, parse_line, line).await;
+    }
+    (
+        stdout_tail.unwrap_or_default(),
+        stderr_tail.unwrap_or_default(),
+    )
 }
 
 async fn apply_line<F>(
@@ -519,6 +598,8 @@ fn build_record(
     elapsed: Duration,
 ) -> CommandRecord {
     CommandRecord {
+        environment_policy: cmd.environment_policy,
+        environment: cmd.sanitized_environment(),
         binary: cmd.binary,
         sanitized_args: cmd.sanitized_args(),
         cwd: cmd.cwd.clone(),
@@ -556,6 +637,7 @@ mod tests {
 
     fn sh_command(script: &str, timeout_secs: u64) -> ToolCommand {
         ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
             binary: ToolBinary::Ffmpeg,
             args: vec!["-c".into(), script.into()],
             secret_args: vec![],
@@ -704,7 +786,10 @@ mod tests {
         .await
         .expect_err("should timeout");
 
-        assert!(matches!(err, ToolRunnerError::Timeout { .. }));
+        match err {
+            ToolRunnerError::Timeout { command, .. } => assert!(command.exit.is_some()),
+            other => panic!("expected timeout, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -728,7 +813,51 @@ mod tests {
         .await
         .expect_err("should cancel");
 
-        assert!(matches!(err, ToolRunnerError::Cancelled { .. }));
+        match err {
+            ToolRunnerError::Cancelled { command } => assert!(command.exit.is_some()),
+            other => panic!("expected cancellation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_clear_and_set_environment_excludes_ambient_values() {
+        let mut cmd = sh_command(
+            r#"printf 'home=%s path=%s lc=%s\n' "${HOME-unset}" "${PATH-unset}" "${LC_ALL-unset}""#,
+            5,
+        );
+        cmd.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        cmd.env.push(crate::convert::pipeline::tool::EnvVar {
+            key: "LC_ALL".to_string(),
+            value: crate::convert::pipeline::types::SecretString::new("C"),
+            secret: false,
+        });
+        let output = run_streaming_tool_with_probe_at_path(
+            PathBuf::from("/bin/sh"),
+            cmd,
+            &CancellationToken::new(),
+            None,
+            None,
+            |_source, _line| None,
+        )
+        .await
+        .expect("closed streaming command succeeds");
+        // A cleared shell self-assigns the libc default PATH; assert
+        // clearing via HOME/ambient-PATH absence and the LC_ALL allowlist.
+        let tail = output.stdout_tail.trim().to_string();
+        assert!(tail.starts_with("home=unset path="), "{tail}");
+        assert!(tail.ends_with("lc=C"), "{tail}");
+        assert!(
+            !tail.contains(&std::env::var("PATH").unwrap_or_default()),
+            "ambient PATH leaked into the cleared streaming child: {tail}"
+        );
+        assert_eq!(
+            output.command.environment_policy,
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+        );
+        assert_eq!(
+            output.command.environment,
+            std::collections::BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+        );
     }
 
     #[tokio::test]

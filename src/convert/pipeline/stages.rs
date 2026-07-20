@@ -1248,6 +1248,7 @@ async fn cut_segment_with_ffmpeg(
     let filter =
         format!("atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS");
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args: cut_segment_ffmpeg_args(input, &filter, out_path),
         secret_args: vec![],
@@ -1358,6 +1359,7 @@ async fn decode_wavpack_image(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), ConvertError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Wvunpack,
         args: vec![
             "-q".into(),
@@ -1455,6 +1457,7 @@ async fn probe_realized_segment_with_tool_limits(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<RealizedProbe, ConvertError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),
@@ -1832,6 +1835,7 @@ async fn probe_wavpack_depth_with_tool_limits(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<Option<tonepoet_pipeline::PcmBitDepth>, ConvertError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Wvunpack,
         args: vec![
             "-q".into(),
@@ -3718,6 +3722,7 @@ pub async fn merge_tracks_with_tool_limits(
     fs::write(&concat_list, &list_content)?;
 
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args: vec![
             "-y".into(),
@@ -3749,6 +3754,7 @@ pub async fn merge_tracks_with_tool_limits(
 
     // Validate merged output via ffprobe.
     let probe_cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),
@@ -4058,6 +4064,9 @@ pub async fn apply_metadata_with_tool_limits(
                 if cancel.is_cancelled() {
                     return Err(MetadataError::Tool(ToolRunnerError::Cancelled {
                         command: CommandRecord {
+                            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                            environment: std::collections::BTreeMap::new(),
+
                             description: None,
                             binary: ToolBinary::Metaflac,
                             sanitized_args: vec![],
@@ -4585,6 +4594,7 @@ fn native_existing_tag_list_command(path: &Path, ext: &str) -> Option<ToolComman
     };
 
     Some(ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary,
         args,
         secret_args: vec![],
@@ -4811,6 +4821,7 @@ async fn apply_m4a_freeform_tags(
     }
     args.push("--overWrite".into());
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::AtomicParsley,
         args,
         secret_args: vec![],
@@ -4849,6 +4860,7 @@ fn metadata_tag_command(
 
     Ok((
         ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
             binary,
             args,
             secret_args: vec![],
@@ -4955,6 +4967,7 @@ fn cue_artwork_embed_command(
 
     Ok(Some((
         ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
             binary,
             args,
             secret_args: vec![],
@@ -7596,6 +7609,9 @@ mod replaygain_existing_tag_policy_tests {
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(1),
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary: ToolBinary::Loudgain,
                 sanitized_args: Vec::new(),
@@ -8779,6 +8795,7 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     );
 
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Loudgain,
         args,
         secret_args: vec![],
@@ -35133,8 +35150,10 @@ fn command_from_tool_error(err: &super::errors::ToolRunnerError) -> Option<Comma
         super::errors::ToolRunnerError::Spawn { command }
         | super::errors::ToolRunnerError::Timeout { command, .. }
         | super::errors::ToolRunnerError::Cancelled { command }
+        | super::errors::ToolRunnerError::Termination { command, .. }
         | super::errors::ToolRunnerError::NonZeroExit { command, .. } => Some(command.clone()),
-        super::errors::ToolRunnerError::Io(_) => None,
+        super::errors::ToolRunnerError::UnsupportedPipeline
+        | super::errors::ToolRunnerError::Io(_) => None,
     }
 }
 
@@ -37848,6 +37867,9 @@ mod pipeline_test_helpers {
 
     pub(super) fn command_record_for(binary: ToolBinary) -> CommandRecord {
         CommandRecord {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            environment: std::collections::BTreeMap::new(),
+
             description: None,
             binary,
             sanitized_args: vec![
@@ -37975,6 +37997,9 @@ mod m4a_freeform_invocation_tests {
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(1),
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary,
                 sanitized_args: Vec::new(),
@@ -41632,6 +41657,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
     fn fragment_command_record_for(binary: ToolBinary) -> CommandRecord {
         CommandRecord {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            environment: std::collections::BTreeMap::new(),
+
             description: None,
             binary,
             sanitized_args: vec!["-i".to_string(), "input.wav".to_string(), "output.flac".to_string()],
@@ -42291,6 +42319,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(1),
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary: ToolBinary::Ffprobe,
                 sanitized_args: Vec::new(),
@@ -42602,6 +42633,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(10),
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary: ToolBinary::Ffprobe,
                 sanitized_args: vec!["input.flac".to_string()],
@@ -47327,6 +47361,9 @@ Source-aware setting: yes
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(10),
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary: ToolBinary::Ffprobe,
                 sanitized_args: vec!["input.flac".to_string()],
@@ -48215,6 +48252,9 @@ mod validate_encoded_output_tests {
             stderr_tail: stderr_tail.to_string(),
             elapsed: Duration::from_millis(1),
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary,
                 sanitized_args: vec![],

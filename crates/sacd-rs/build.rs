@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,66 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
     hex
 }
 
+fn verify_fixture_manifest(fixture_dir: &Path, manifest: &Path) {
+    let raw = fs::read_to_string(manifest)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", manifest.display()));
+    let mut listed = BTreeSet::new();
+    for (line_index, line) in raw.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let (expected, name) = line.split_once("  ").unwrap_or_else(|| {
+            panic!(
+                "malformed fixture checksum at {}:{}",
+                manifest.display(),
+                line_index + 1
+            )
+        });
+        if expected.len() != 64
+            || !expected.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || name.is_empty()
+            || Path::new(name).components().count() != 1
+        {
+            panic!(
+                "non-canonical fixture checksum at {}:{}",
+                manifest.display(),
+                line_index + 1
+            );
+        }
+        if !listed.insert(name.to_string()) {
+            panic!("duplicate fixture checksum entry: {name}");
+        }
+        let path = fixture_dir.join(name);
+        if !path.is_file() {
+            panic!("checksummed P0 fixture is absent: {}", path.display());
+        }
+        let actual = hash_file(&path);
+        if actual != expected {
+            panic!(
+                "P0 fixture checksum mismatch for {}: expected {expected}, got {actual}",
+                path.display()
+            );
+        }
+    }
+
+    let mut payloads = Vec::new();
+    collect_files_with_extension(fixture_dir, "bin", &mut payloads);
+    let actual = payloads
+        .iter()
+        .map(|path| {
+            path.strip_prefix(fixture_dir)
+                .expect("fixture path is below fixture directory")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<BTreeSet<_>>();
+    if actual != listed {
+        panic!(
+            "P0 fixture checksum manifest does not exactly cover the binary corpus: listed={listed:?}, actual={actual:?}"
+        );
+    }
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let src = manifest_dir.join("src");
@@ -71,6 +132,7 @@ fn main() {
 
     let fixture_manifest = fixture_dir.join("P0_SHA256SUMS");
     let fixture_provenance = fixture_dir.join("P0_PROVENANCE.json");
+    verify_fixture_manifest(&fixture_dir, &fixture_manifest);
     let fixture_payloads = [
         "frame_001.dst.bin",
         "frame_001.dsd.bin",

@@ -426,7 +426,7 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                 reference_error_text(ReferenceErrorCode::ManualUnavailable),
             ));
         }
-        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V3 {
+        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V4 {
             return Err(PlanningError::invalid_settings(
                 "dsd.from_dsd.reference_policy",
                 reference_error_text(ReferenceErrorCode::Toolchain),
@@ -1025,7 +1025,7 @@ fn legacy_from_dsd_mirror(wire: LegacyDsdSettingsWireV1) -> DsdSourceSettings {
     };
     DsdSourceSettings {
         pathway: DsdSourcePathway::Reference,
-        reference_policy: DsdReferencePolicyVersion::SoxNg14801V3,
+        reference_policy: DsdReferencePolicyVersion::SoxNg14801V4,
         profile: DsdReconstructionSelection::Reference,
         gain_mode,
         fixed_gain_db: wire

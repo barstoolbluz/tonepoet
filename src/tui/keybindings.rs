@@ -7550,6 +7550,7 @@ fn metadata_replaygain_tool_command(
     paths: &[std::path::PathBuf],
 ) -> crate::convert::pipeline::tool::ToolCommand {
     crate::convert::pipeline::tool::ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: crate::convert::pipeline::tool::ToolBinary::Loudgain,
         args: metadata_replaygain_tool_args(mode, prevent_clipping, paths),
         secret_args: Vec::new(),

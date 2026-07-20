@@ -1196,6 +1196,7 @@ async fn decode_wavpack_image_for_cue(
     }
     remove_path_if_exists(&temporary)?;
     let command = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Wvunpack,
         args: vec![
             "-q".into(),
@@ -1280,6 +1281,7 @@ async fn probe_audio_image(
     cancel: &CancellationToken,
 ) -> Result<AudioProbe, MaterializeError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),
@@ -1390,6 +1392,7 @@ async fn probe_image_artwork(
     cancel: &CancellationToken,
 ) -> Result<Option<ImageArtworkProbe>, MaterializeError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),
@@ -1480,6 +1483,7 @@ fn cue_artwork_extract_command(
     destination: &Path,
 ) -> ToolCommand {
     ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args: vec![
             "-v".into(),
@@ -2244,6 +2248,7 @@ async fn probe_staged_cue_segment(
     cancel: &CancellationToken,
 ) -> Result<AudioProbe, MaterializeError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),
@@ -2586,6 +2591,7 @@ fn cue_segment_ffmpeg_command_for_carrier(
 ) -> Result<ToolCommand, MaterializeError> {
     let filter = cue_segment_atrim_filter(start_sample, samples)?;
     Ok(ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args: vec![
             "-v".into(),
@@ -3456,10 +3462,12 @@ mod materializer_cue_tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::from_millis(10),
                 command: crate::convert::pipeline::tool::CommandRecord {
+                    environment_policy: cmd.environment_policy,
+                    environment: cmd.sanitized_environment(),
                     binary: command_binary,
                     sanitized_args: cmd.args.clone(),
-                    cwd: None,
-                    env_keys: vec![],
+                    cwd: cmd.cwd.clone(),
+                    env_keys: cmd.env_keys(),
                     exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
                     stdout_tail: String::new(),
                     stderr_tail: String::new(),
@@ -3713,10 +3721,12 @@ TRACK XX AUDIO
                 stderr_tail: String::new(),
                 elapsed: Duration::from_millis(10),
                 command: crate::convert::pipeline::tool::CommandRecord {
+                    environment_policy: cmd.environment_policy,
+                    environment: cmd.sanitized_environment(),
                     binary: command_binary,
                     sanitized_args: cmd.args.clone(),
-                    cwd: None,
-                    env_keys: vec![],
+                    cwd: cmd.cwd.clone(),
+                    env_keys: cmd.env_keys(),
                     exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(0)),
                     stdout_tail: String::new(),
                     stderr_tail: String::new(),
@@ -5278,10 +5288,19 @@ FILE "side-b.flac" WAVE
                 _ => panic!("real CUE staging fixture only supports ffmpeg/ffprobe"),
             };
 
-            let mut process = std::process::Command::new(binary_name);
+            let binary_path = crate::convert::pipeline::tool::resolve_command_launch_path(
+                PathBuf::from(binary_name),
+                cmd.environment_policy,
+            );
+            let mut process = std::process::Command::new(&binary_path);
             process.args(&cmd.args);
             if let Some(cwd) = &cmd.cwd {
                 process.current_dir(cwd);
+            }
+            if cmd.environment_policy
+                == tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+            {
+                process.env_clear();
             }
             for env_var in &cmd.env {
                 process.env(&env_var.key, env_var.value.expose());
@@ -5305,16 +5324,21 @@ FILE "side-b.flac" WAVE
             );
 
             let exit_code = output.status.code().unwrap_or(0);
+            let environment_policy = cmd.environment_policy;
+            let environment = cmd.sanitized_environment();
+            let env_keys = cmd.env_keys();
             Ok(ToolOutput {
                 exit: crate::convert::pipeline::tool::ProcessExit::Code(exit_code),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
                 elapsed: Duration::from_millis(0),
                 command: crate::convert::pipeline::tool::CommandRecord {
+                    environment_policy,
+                    environment,
                     binary: cmd.binary,
                     sanitized_args: cmd.args,
                     cwd: cmd.cwd,
-                    env_keys: cmd.env.into_iter().map(|ev| ev.key).collect(),
+                    env_keys,
                     exit: Some(crate::convert::pipeline::tool::ProcessExit::Code(exit_code)),
                     stdout_tail,
                     stderr_tail,

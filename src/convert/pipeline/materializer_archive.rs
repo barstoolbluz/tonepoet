@@ -1415,6 +1415,7 @@ async fn run_archive_extract_command(
     args.push("-y".to_string());
 
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::SevenZip,
         args,
         secret_args,
@@ -1672,6 +1673,7 @@ async fn probe_audio_file(
     cancel: &CancellationToken,
 ) -> Result<ProbeResult, MaterializeError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),
@@ -2204,6 +2206,9 @@ mod tests {
             stderr_tail: String::new(),
             elapsed: Duration::from_millis(10),
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary,
                 sanitized_args: args,
@@ -2510,13 +2515,18 @@ mod tests {
             cancel: &CancellationToken,
         ) -> Result<ToolOutput, ToolRunnerError> {
             if cancel.is_cancelled() {
+                let environment_policy = cmd.environment_policy;
+                let environment = cmd.sanitized_environment();
+                let env_keys = cmd.env_keys();
                 return Err(ToolRunnerError::Cancelled {
                     command: CommandRecord {
+                        environment_policy,
+                        environment,
                         description: None,
                         binary: cmd.binary,
                         sanitized_args: cmd.args,
                         cwd: cmd.cwd,
-                        env_keys: cmd.env.into_iter().map(|env| env.key).collect(),
+                        env_keys,
                         exit: None,
                         stdout_tail: String::new(),
                         stderr_tail: String::new(),
@@ -2545,6 +2555,11 @@ mod tests {
             if let Some(cwd) = &cmd.cwd {
                 command.current_dir(cwd);
             }
+            if cmd.environment_policy
+                == tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+            {
+                command.env_clear();
+            }
             for env in &cmd.env {
                 command.env(&env.key, env.value.expose());
             }
@@ -2556,12 +2571,17 @@ mod tests {
             let record_exit = ProcessExit::Code(code);
             let stdout_tail = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr_tail = String::from_utf8_lossy(&output.stderr).into_owned();
+            let environment_policy = cmd.environment_policy;
+            let environment = cmd.sanitized_environment();
+            let env_keys = cmd.env_keys();
             let record = CommandRecord {
+                environment_policy,
+                environment,
                 description: None,
                 binary: binary.clone(),
                 sanitized_args: args.clone(),
                 cwd: cmd.cwd,
-                env_keys: cmd.env.into_iter().map(|env| env.key).collect(),
+                env_keys,
                 exit: Some(record_exit),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),

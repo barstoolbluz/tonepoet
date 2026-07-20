@@ -21,7 +21,7 @@ pub use enums::*;
 pub use error::{PlanningError, Result};
 pub use mapping::*;
 pub use plan::{
-    MetadataPlanEffect,
+    CommandEnvironmentPolicy, MetadataPlanEffect,
     plan_conversion, plan_conversion_with_registry, plan_topology, ConversionPlan, Finalization,
     InputSource, OutputSink, PlanAction, PlanContext, PlanOperation, PlanRequest, PlanStep,
     PlannedCommand, PlannedExecutionStep, TopologyPlan,

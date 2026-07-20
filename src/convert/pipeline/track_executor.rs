@@ -769,6 +769,8 @@ struct EmbeddedReferenceQualification {
     ffmpeg: EmbeddedQualifiedFfmpeg,
     in_process: EmbeddedInProcessIdentity,
     analyzer: EmbeddedAnalyzerAuthority,
+    subprocess_environment: EmbeddedSubprocessEnvironment,
+    qualification_supervision: EmbeddedQualificationSupervision,
     profiles: EmbeddedReferenceProfiles,
     terminal_bounds: EmbeddedTerminalBounds,
     riff_capacity: EmbeddedRiffCapacity,
@@ -781,6 +783,26 @@ struct EmbeddedReferenceQualification {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EmbeddedSubprocessEnvironment {
+    schema: String,
+    policy: String,
+    variables: std::collections::BTreeMap<String, String>,
+    scope: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedQualificationSupervision {
+    schema: String,
+    command_deadline_seconds: u64,
+    pipeline_deadline_seconds: u64,
+    termination_reap_deadline_seconds: u64,
+    poll_interval_milliseconds: u64,
+    failure_contract: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmbeddedQualificationReport {
     schema: String,
     path: String,
@@ -789,6 +811,7 @@ struct EmbeddedQualificationReport {
     decimation_report_sha256: String,
     commission_sha256: String,
     amendment_sha256: String,
+    corrective_brief_sha256: String,
     expanded_supported_cell_count: u64,
     expanded_supported_cell_digest: String,
 }
@@ -842,6 +865,7 @@ struct EmbeddedAnalyzerAuthority {
     reporting_uncertainty_db: tonepoet_pipeline::DbNano,
     analyzer_residual_db: tonepoet_pipeline::DbNano,
     qualification_schema: String,
+    carrier: EmbeddedAnalyzerCarrier,
     required_case_count: u64,
     target_rates_hz: Vec<u32>,
     channels: Vec<u16>,
@@ -854,6 +878,29 @@ struct EmbeddedAnalyzerAuthority {
     aligned_multitone_normalized_frequencies_cycles_per_sample: Vec<String>,
     aligned_multitone_peak_offsets_samples: Vec<String>,
     aligned_multitone_duration_seconds: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedAnalyzerCarrier {
+    schema: String,
+    source_container: String,
+    producer_tool: String,
+    producer_args_template: Vec<String>,
+    environment_policy: String,
+    environment: std::collections::BTreeMap<String, String>,
+    transport: String,
+    consumer_tool: String,
+    consumer_input_args: Vec<String>,
+    consumer_args_template: Vec<String>,
+    parser: String,
+    stream_encoding: String,
+    stream_header: String,
+    streaming_size_sentinel_floor: u32,
+    disk_intermediate: bool,
+    exact_recontainer: bool,
+    greater_than_4_gib_fixture_required: bool,
+    known_ffmpeg_w64_defect: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -991,9 +1038,9 @@ fn validate_embedded_release_certification(
     let certification = &manifest.release_certification;
     if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
         || certification.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_certification.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_certification.json"
         || certification.candidate_manifest_path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_candidate.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
     {
         return Err(reference_toolchain_error(
             "the embedded release-certification descriptor is not canonical",
@@ -1001,7 +1048,7 @@ fn validate_embedded_release_certification(
     }
     let report_sha256 = certification.report_sha256.as_deref().ok_or_else(|| {
         reference_toolchain_error(
-            "the embedded v3 policy has not bound a release-certification report",
+            "the embedded v4 policy has not bound a release-certification report",
         )
     })?;
     let candidate_manifest_sha256 = certification
@@ -1009,20 +1056,20 @@ fn validate_embedded_release_certification(
         .as_deref()
         .ok_or_else(|| {
             reference_toolchain_error(
-                "the embedded v3 policy has not bound its qualified candidate manifest",
+                "the embedded v4 policy has not bound its qualified candidate manifest",
             )
         })?;
     let current_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
     ));
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_certification.json"
     ));
     let candidate_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
     ));
     let parse_digest = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -1046,13 +1093,13 @@ fn validate_embedded_release_certification(
     let mut normalized_current: serde_json::Value =
         serde_json::from_slice(current_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded current v3 manifest is invalid JSON: {error}"
+                "the embedded current v4 manifest is invalid JSON: {error}"
             ))
         })?;
     let candidate_value: serde_json::Value =
         serde_json::from_slice(candidate_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded preserved v3 candidate is invalid JSON: {error}"
+                "the embedded preserved v4 candidate is invalid JSON: {error}"
             ))
         })?;
     if candidate_value.get("status").and_then(serde_json::Value::as_str)
@@ -1065,7 +1112,7 @@ fn validate_embedded_release_certification(
             .is_none_or(|value| !value.is_null())
     {
         return Err(reference_toolchain_error(
-            "the preserved v3 candidate is not the canonical unpromoted policy snapshot",
+            "the preserved v4 candidate is not the canonical unpromoted policy snapshot",
         ));
     }
     normalized_current["status"] =
@@ -1076,7 +1123,7 @@ fn validate_embedded_release_certification(
         serde_json::Value::Null;
     if normalized_current != candidate_value {
         return Err(reference_toolchain_error(
-            "the promoted v3 manifest differs from its qualified candidate outside the permitted certification fields",
+            "the promoted v4 manifest differs from its qualified candidate outside the permitted certification fields",
         ));
     }
     let report: serde_json::Value = serde_json::from_slice(report_bytes).map_err(|error| {
@@ -1084,9 +1131,9 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report is invalid JSON: {error}"
         ))
     })?;
-    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(3)
+    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(4)
         || report.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V3_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V4_KEY)
         || report.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || report.get("outcome").and_then(serde_json::Value::as_str) != Some("pass")
         || report
@@ -1095,11 +1142,15 @@ fn validate_embedded_release_certification(
             != Some(candidate_manifest_sha256)
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report does not bind the qualified v3 candidate",
+            "the embedded release-certification report does not bind the qualified v4 candidate",
         ));
     }
     for required in [
         "toolchain",
+        "subprocess_environment",
+        "qualification_supervision",
+        "subprocess_environment_probe",
+        "analyzer_carrier",
         "production_true_peak_analyzer",
         "production_measurement_gain_terminal_chain",
         "production_source_front_end_integration",
@@ -1113,6 +1164,87 @@ fn validate_embedded_release_certification(
             )));
         }
     }
+    let report_environment = report
+        .get("subprocess_environment")
+        .and_then(serde_json::Value::as_object);
+    let report_environment_variables = report_environment
+        .and_then(|value| value.get("variables"))
+        .and_then(serde_json::Value::as_object);
+    let report_supervision = report
+        .get("qualification_supervision")
+        .and_then(serde_json::Value::as_object);
+    let environment_probe = report
+        .get("subprocess_environment_probe")
+        .and_then(serde_json::Value::as_object);
+    if report_environment
+        .and_then(|value| value.get("schema"))
+        .and_then(serde_json::Value::as_str)
+        != Some("tonepoet-reference-subprocess-environment/v1")
+        || report_environment
+            .and_then(|value| value.get("policy"))
+            .and_then(serde_json::Value::as_str)
+            != Some("clear_and_set")
+        || report_environment
+            .and_then(|value| value.get("scope"))
+            .and_then(serde_json::Value::as_str)
+            != Some("all_reference_external_commands")
+        || report_environment_variables.is_none_or(|variables| {
+            variables.len() != 1
+                || variables.get("LC_ALL").and_then(serde_json::Value::as_str) != Some("C")
+        })
+        || report_supervision
+            .and_then(|value| value.get("schema"))
+            .and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-qualification-supervision/v1")
+        || report_supervision
+            .and_then(|value| value.get("command_deadline_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(1_200)
+        || report_supervision
+            .and_then(|value| value.get("pipeline_deadline_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(3_600)
+        || report_supervision
+            .and_then(|value| value.get("termination_reap_deadline_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(10)
+        || report_supervision
+            .and_then(|value| value.get("poll_interval_milliseconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(10)
+        || report_supervision
+            .and_then(|value| value.get("failure_contract"))
+            .and_then(serde_json::Value::as_str)
+            != Some("terminate_and_reap_or_fail")
+        || environment_probe
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || environment_probe
+            .and_then(|value| value.get("schema"))
+            .and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-subprocess-environment-probe/v1")
+        || environment_probe
+            .and_then(|value| value.get("policy"))
+            .and_then(serde_json::Value::as_str)
+            != Some("clear_and_set")
+        || environment_probe
+            .and_then(|value| value.get("ambient_poison_observed"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || environment_probe
+            .and_then(|value| value.get("qualified_environment"))
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|variables| {
+                variables.len() != 1
+                    || variables.get("LC_ALL").and_then(serde_json::Value::as_str) != Some("C")
+            })
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report does not prove the frozen subprocess environment and bounded supervision contract",
+        ));
+    }
+
     let toolchain = report.get("toolchain").and_then(serde_json::Value::as_object);
     if toolchain
         .and_then(|value| value.get("integrated_rate_profiles"))
@@ -1129,6 +1261,228 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report has incomplete D1 profile evidence",
         ));
     }
+    let carrier = report
+        .get("analyzer_carrier")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report has no analyzer carrier evidence",
+            )
+        })?;
+    let known_defect = carrier
+        .get("known_defect")
+        .and_then(serde_json::Value::as_object);
+    let corrected_path = carrier
+        .get("corrected_path")
+        .and_then(serde_json::Value::as_object);
+    let large_stream = carrier
+        .get("greater_than_4_gib_stream")
+        .and_then(serde_json::Value::as_object);
+    let exact_string_array = |value: Option<&serde_json::Value>, expected: &[&str]| {
+        value
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|actual| {
+                actual.len() == expected.len()
+                    && actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| actual.as_str() == Some(*expected))
+            })
+    };
+    let producer_argv_valid = corrected_path
+        .and_then(|value| value.get("producer_argv"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|args| {
+            args.len() == 10
+                && args[0].as_str() == Some("-S")
+                && args[1].as_str() == Some("-D")
+                && args[2].as_str().is_some_and(|path| !path.is_empty())
+                && args[3].as_str() == Some("-t")
+                && args[4].as_str() == Some("wav")
+                && args[5].as_str() == Some("-e")
+                && args[6].as_str() == Some("floating-point")
+                && args[7].as_str() == Some("-b")
+                && args[8].as_str() == Some("64")
+                && args[9].as_str() == Some("-")
+        });
+    let consumer_input_valid = exact_string_array(
+        corrected_path.and_then(|value| value.get("consumer_input_argv")),
+        &["-f", "wav", "-i", "pipe:0"],
+    );
+    let consumer_argv_valid = exact_string_array(
+        corrected_path.and_then(|value| value.get("consumer_argv")),
+        &[
+            "-nostdin",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "info",
+            "-f",
+            "wav",
+            "-i",
+            "pipe:0",
+            "-filter:a",
+            "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ],
+    );
+    let analytic_peak = known_defect
+        .and_then(|value| value.get("analytic_peak_dbfs"))
+        .and_then(serde_json::Value::as_f64);
+    let direct_input_tp = known_defect
+        .and_then(|value| value.get("reported_input_tp_dbtp"))
+        .and_then(serde_json::Value::as_f64);
+    let scaling_delta = known_defect
+        .and_then(|value| value.get("scaling_delta_db"))
+        .and_then(serde_json::Value::as_f64);
+    let corrected_input_tp = corrected_path
+        .and_then(|value| value.get("reported_input_tp_dbtp"))
+        .and_then(serde_json::Value::as_f64);
+    if carrier.get("status").and_then(serde_json::Value::as_str) != Some("passed")
+        || carrier.get("contract").and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-analyzer-carrier/v1")
+        || known_defect
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("reproduced")
+        || known_defect
+            .and_then(|value| value.get("expected_scaling"))
+            .and_then(serde_json::Value::as_str)
+            != Some("2^31")
+        || direct_input_tp.is_none_or(|value| value <= 100.0)
+        || scaling_delta.is_none_or(|value| {
+            (value - 20.0 * (2_f64.powi(31)).log10()).abs() > 0.02
+        })
+        || analytic_peak
+            .zip(direct_input_tp)
+            .zip(scaling_delta)
+            .is_none_or(|((analytic, direct), delta)| {
+                ((direct - analytic) - delta).abs() > 1e-9
+            })
+        || corrected_path
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || corrected_path
+            .and_then(|value| value.get("transport"))
+            .and_then(serde_json::Value::as_str)
+            != Some("direct_stdout_to_stdin_no_shell")
+        || corrected_path
+            .and_then(|value| value.get("stream_encoding"))
+            .and_then(serde_json::Value::as_str)
+            != Some("pcm_f64le")
+        || corrected_path
+            .and_then(|value| value.get("sample_exact_recontainer"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || corrected_path
+            .and_then(|value| value.get("parser"))
+            .and_then(serde_json::Value::as_str)
+            != Some("ffmpeg_loudnorm_input_tp_v2")
+        || corrected_path
+            .and_then(|value| value.get("environment_policy"))
+            .and_then(serde_json::Value::as_str)
+            != Some("clear_and_set")
+        || corrected_path
+            .and_then(|value| value.get("environment"))
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|variables| {
+                variables.len() != 1
+                    || variables.get("LC_ALL").and_then(serde_json::Value::as_str) != Some("C")
+            })
+        || corrected_path
+            .and_then(|value| value.get("pipeline_deadline_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(3_600)
+        || corrected_path
+            .and_then(|value| value.get("termination_reap_deadline_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(10)
+        || corrected_path
+            .and_then(|value| value.get("failure_contract"))
+            .and_then(serde_json::Value::as_str)
+            != Some("terminate_and_reap_or_fail")
+        || analytic_peak
+            .zip(corrected_input_tp)
+            .is_none_or(|(analytic, corrected)| (corrected - analytic).abs() > 0.02)
+        || !producer_argv_valid
+        || !consumer_input_valid
+        || !consumer_argv_valid
+        || large_stream
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || large_stream
+            .and_then(|value| value.get("sparse_source_container"))
+            .and_then(serde_json::Value::as_str)
+            != Some("w64")
+        || large_stream
+            .and_then(|value| value.get("environment_policy"))
+            .and_then(serde_json::Value::as_str)
+            != Some("clear_and_set")
+        || large_stream
+            .and_then(|value| value.get("environment"))
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|variables| {
+                variables.len() != 1
+                    || variables.get("LC_ALL").and_then(serde_json::Value::as_str) != Some("C")
+            })
+        || large_stream
+            .and_then(|value| value.get("pipeline_deadline_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(3_600)
+        || large_stream
+            .and_then(|value| value.get("termination_reap_deadline_seconds"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(10)
+        || large_stream
+            .and_then(|value| value.get("failure_contract"))
+            .and_then(serde_json::Value::as_str)
+            != Some("terminate_and_reap_or_fail")
+        || large_stream
+            .and_then(|value| value.get("audio_payload_bytes"))
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|value| value <= u64::from(u32::MAX))
+        || large_stream
+            .and_then(|value| value.get("riff_u32_max_bytes"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(u32::MAX))
+        || large_stream
+            .and_then(|value| value.get("streaming_sentinel_floor"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(0x7fff_0000_u32))
+        || large_stream
+            .and_then(|value| value.get("riff_size_field"))
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|value| value < u64::from(0x7fff_0000_u32))
+        || large_stream
+            .and_then(|value| value.get("data_size_field"))
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|value| value < u64::from(0x7fff_0000_u32))
+        || large_stream
+            .and_then(|value| value.get("read_to_eof"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || large_stream
+            .and_then(|value| value.get("consumer_mode"))
+            .and_then(serde_json::Value::as_str)
+            != Some("stream_copy_to_null")
+        || large_stream
+            .and_then(|value| value.get("producer_exit"))
+            .and_then(serde_json::Value::as_i64)
+            != Some(0)
+        || large_stream
+            .and_then(|value| value.get("consumer_exit"))
+            .and_then(serde_json::Value::as_i64)
+            != Some(0)
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has incomplete analyzer carrier evidence",
+        ));
+    }
+
     let analyzer = report
         .get("production_true_peak_analyzer")
         .and_then(serde_json::Value::as_object);
@@ -1559,7 +1913,7 @@ fn validate_embedded_release_certification(
             != Some(manifest.cell_contract.expanded_supported_cell_digest.as_str())
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report disagrees with the v3 cell contract",
+            "the embedded release-certification report disagrees with the v4 cell contract",
         ));
     }
     Ok(())
@@ -1591,8 +1945,106 @@ fn validate_embedded_reference_policy_tables(
         "0.445312500",
     ];
     const ANALYZER_MULTITONE_OFFSETS: [&str; 2] = ["0.250000000", "0.750000000"];
+    const ANALYZER_PRODUCER_ARGS: [&str; 10] = [
+        "-S",
+        "-D",
+        "{carrier_w64}",
+        "-t",
+        "wav",
+        "-e",
+        "floating-point",
+        "-b",
+        "64",
+        "-",
+    ];
+    const ANALYZER_CONSUMER_INPUT_ARGS: [&str; 4] = ["-f", "wav", "-i", "pipe:0"];
+    const ANALYZER_CONSUMER_ARGS: [&str; 14] = [
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "info",
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0",
+        "-filter:a",
+        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ];
+    let expected_environment = std::collections::BTreeMap::from([(
+        "LC_ALL".to_string(),
+        "C".to_string(),
+    )]);
+    if manifest.subprocess_environment.schema
+        != "tonepoet-reference-subprocess-environment/v1"
+        || manifest.subprocess_environment.policy != "clear_and_set"
+        || manifest.subprocess_environment.variables != expected_environment
+        || manifest.subprocess_environment.scope != "all_reference_external_commands"
+    {
+        return Err(reference_toolchain_error(
+            "embedded Reference subprocess environment policy is not canonical",
+        ));
+    }
+    if manifest.qualification_supervision.schema
+        != "tonepoet-reference-qualification-supervision/v1"
+        || manifest.qualification_supervision.command_deadline_seconds != 1_200
+        || manifest.qualification_supervision.pipeline_deadline_seconds != 3_600
+        || manifest
+            .qualification_supervision
+            .termination_reap_deadline_seconds
+            != 10
+        || manifest
+            .qualification_supervision
+            .poll_interval_milliseconds
+            != 10
+        || manifest.qualification_supervision.failure_contract != "terminate_and_reap_or_fail"
+    {
+        return Err(reference_toolchain_error(
+            "embedded Reference qualification supervision policy is not canonical",
+        ));
+    }
+    let carrier = &manifest.analyzer.carrier;
+    if carrier.schema != "tonepoet-reference-analyzer-carrier/v1"
+        || carrier.source_container != "sox_f64_w64"
+        || carrier.producer_tool != "sox_ng"
+        || !carrier
+            .producer_args_template
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_PRODUCER_ARGS)
+        || carrier.environment_policy != "clear_and_set"
+        || carrier.environment != expected_environment
+        || carrier.transport != "direct_stdout_to_stdin_no_shell"
+        || carrier.consumer_tool != "ffmpeg"
+        || !carrier
+            .consumer_input_args
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_CONSUMER_INPUT_ARGS)
+        || !carrier
+            .consumer_args_template
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_CONSUMER_ARGS)
+        || carrier.parser != "ffmpeg_loudnorm_input_tp_v2"
+        || carrier.stream_encoding != "pcm_f64le"
+        || carrier.stream_header != "riff_wave_stream_read_to_eof"
+        || carrier.streaming_size_sentinel_floor != 0x7fff_0000
+        || carrier.disk_intermediate
+        || !carrier.exact_recontainer
+        || !carrier.greater_than_4_gib_fixture_required
+        || carrier.known_ffmpeg_w64_defect
+            != "ffmpeg_7_1_scales_sox_ieee_float64_w64_by_2^31"
+    {
+        return Err(reference_toolchain_error(
+            "embedded analyzer carrier contract disagrees with the compiled v4 policy",
+        ));
+    }
     if manifest.analyzer.qualification_schema
-        != "tonepoet-reference-analyzer-qualification/v3"
+        != "tonepoet-reference-analyzer-qualification/v4"
         || manifest.analyzer.required_case_count != 1_200
         || manifest.analyzer.target_rates_hz.as_slice() != ANALYZER_RATES.as_slice()
         || manifest.analyzer.channels.as_slice() != ANALYZER_CHANNELS.as_slice()
@@ -1647,7 +2099,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.analyzer.aligned_multitone_duration_seconds != "0.250000000"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v3 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v4 policy",
         ));
     }
 
@@ -1762,7 +2214,7 @@ fn validate_embedded_reference_policy_tables(
     validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
     if b6.enabled {
         return Err(reference_toolchain_error(
-            "embedded B6 profile must remain typed but disabled under policy v3",
+            "embedded B6 profile must remain typed but disabled under policy v4",
         ));
     }
 
@@ -1843,7 +2295,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1861,6 +2313,10 @@ fn validate_embedded_qualification_report(
         env!("CARGO_MANIFEST_DIR"),
         "/docs/brief_dsd_reference_p0_policy_v3_amendment.md"
     ));
+    let corrective_brief = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/brief_dsd_reference_p0_corrective_analyzer_carrier.md"
+    ));
     let parse = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
             reference_toolchain_error(format!(
@@ -1870,7 +2326,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -1879,6 +2335,8 @@ fn validate_embedded_qualification_report(
             != Sha256Digest::of_bytes(commission)
         || parse("v3 amendment", &report.amendment_sha256)?
             != Sha256Digest::of_bytes(amendment)
+        || parse("v4 corrective brief", &report.corrective_brief_sha256)?
+            != Sha256Digest::of_bytes(corrective_brief)
         || report.expanded_supported_cell_count
             != manifest.cell_contract.expanded_supported_cell_count
         || report.expanded_supported_cell_digest
@@ -2287,17 +2745,17 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
     ));
     let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
         reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
     })?;
-    if manifest.schema_version != 3
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V3_KEY
+    if manifest.schema_version != 4
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V4_KEY
         || manifest.status != "qualified_release"
     {
         return Err(reference_toolchain_error(
-            "the embedded policy artifact is not a qualified v3 release",
+            "the embedded policy artifact is not a qualified v4 release",
         ));
     }
     validate_embedded_release_certification(&manifest)?;
@@ -2625,6 +3083,7 @@ fn reference_version_probe_command(
         }
     };
     Ok(ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
         binary,
         args,
         secret_args: Vec::new(),
@@ -2656,6 +3115,7 @@ fn reference_behavior_probe_command(
         }
     };
     Ok(ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
         binary,
         args,
         secret_args: Vec::new(),
@@ -3019,6 +3479,15 @@ fn materialize_reference_source_blocking(
                     Vec::new(),
                 ));
             }
+            // Threat boundary: the pre/post SHA-256 checks detect ordinary
+            // same-user mutation while TOC selection and extraction run. They
+            // are deliberately not described as a pathname-race proof against
+            // a privileged adversary or a filesystem that violates stable-open
+            // semantics: the ISO is reopened by path for each check and by the
+            // extractor. Promotion of SACD Reference cells therefore still
+            // requires commissioned end-to-end fixtures and an explicit review
+            // of this reopen boundary; these hashes are fail-closed mutation
+            // detection, not a capability-style identity guarantee.
             let post_toc_source_sha256 = stable_file_sha256_cancel(iso, cancel)
                 .map_err(|err| {
                     reference_materialization_error(
@@ -4135,6 +4604,7 @@ pub(crate) async fn verify_reference_output_after_metadata(
         )));
     }
     let command = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
         binary: ToolBinary::Ffmpeg,
         args: reference_hash_args(path, evidence.plan.final_pcm)
             .map_err(ConvertError::TrackValidation)?,
@@ -4174,52 +4644,163 @@ fn resolve_deferred_command(
     })
 }
 
+fn validate_reference_measurement_pipe_contract(
+    measurement: &PlannedMeasurement,
+) -> Result<&PlannedCommand, TrackExecutionError> {
+    if measurement.parser != MeasurementParser::FfmpegLoudnormInputTpV2 {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend("unknown or historical Reference measurement parser".to_string()),
+            Vec::new(),
+        ));
+    }
+    let producer = measurement.input_stage.as_ref().ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v4 measurement requires a typed analyzer input stage".to_string(),
+            ),
+            Vec::new(),
+        )
+    })?;
+    let carrier = producer.input.as_path().ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v4 measurement producer requires a path-backed W64 carrier".to_string(),
+            ),
+            Vec::new(),
+        )
+    })?;
+    let carrier_arg = carrier.display().to_string();
+    let producer_args = [
+        "-S",
+        "-D",
+        carrier_arg.as_str(),
+        "-t",
+        "wav",
+        "-e",
+        "floating-point",
+        "-b",
+        "64",
+        "-",
+    ];
+    let consumer_args = [
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "info",
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0",
+        "-filter:a",
+        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ];
+    let canonical_environment = |command: &PlannedCommand| {
+        command.environment_policy
+            == tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+            && command.environment.len() == 1
+            && command.environment.get("LC_ALL").map(String::as_str) == Some("C")
+    };
+    if producer.tool != ToolIdentifier::Sox
+        || producer.output != tonepoet_pipeline::OutputSink::Stdout
+        || !producer
+            .args
+            .iter()
+            .map(String::as_str)
+            .eq(producer_args)
+        || !canonical_environment(producer)
+        || measurement.command.tool != ToolIdentifier::Ffmpeg
+        || measurement.command.input != tonepoet_pipeline::InputSource::Stdin
+        || measurement.command.output != tonepoet_pipeline::OutputSink::Stdout
+        || !measurement
+            .command
+            .args
+            .iter()
+            .map(String::as_str)
+            .eq(consumer_args)
+        || !canonical_environment(&measurement.command)
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference policy v4 measurement has a noncanonical typed SoX-to-FFmpeg pipe contract"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+    Ok(producer)
+}
+
 async fn execute_reference_measurement(
     measurement: &PlannedMeasurement,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
-    tool_paths: &HashMap<String, PathBuf>,
+    _tool_paths: &HashMap<String, PathBuf>,
     limits: Option<&Arc<ToolConcurrencyLimits>>,
     progress: &mut OperationProgressTracker<'_>,
-    window_start: f32,
+    _window_start: f32,
     window_end: f32,
     track_label: &str,
     work_dir: &Path,
     reporting_uncertainty: tonepoet_pipeline::DbNano,
     analyzer_residual: tonepoet_pipeline::DbNano,
 ) -> Result<(Vec<CommandRecord>, TruePeakMeasurement), TrackExecutionError> {
-    if measurement.parser != MeasurementParser::FfmpegLoudnormInputTpV1 {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend("unknown Reference measurement parser".to_string()),
-            Vec::new(),
-        ));
-    }
-    let mut command = planned_command_to_tool_command(
+    let input_stage = validate_reference_measurement_pipe_contract(measurement)?;
+
+    let producer = planned_command_to_tool_command(
+        input_stage,
+        DEFAULT_PLANNED_COMMAND_TIMEOUT,
+    )
+    .map_err(TrackExecutionError::from)?;
+    let consumer = planned_command_to_tool_command(
         &measurement.command,
         DEFAULT_PLANNED_COMMAND_TIMEOUT,
     )
     .map_err(TrackExecutionError::from)?;
-    let _permit = acquire_tool_permit(&mut command, limits, cancel)
+    // The reference-policy environment is part of the qualified semantic identity.
+    // Acquire only the concurrency permits here: the general SoX permit path injects
+    // OMP_NUM_THREADS, which would make production execution differ from the frozen
+    // and qualified v4 pipe contract.
+    let _producer_permit = acquire_reference_pipeline_permit(producer.binary, limits, cancel)
         .await
         .map_err(TrackExecutionError::from)?;
+    let _consumer_permit = acquire_reference_pipeline_permit(consumer.binary, limits, cancel)
+        .await
+        .map_err(TrackExecutionError::from)?;
+
     let label = format!("{track_label} - {}", measurement.command.description);
-    let output = run_planned_command(
-        command,
-        &measurement.command,
-        runner,
-        cancel,
-        tool_paths,
-        progress,
-        window_start,
-        window_end,
-        &label,
-    )
-    .await
-    .map_err(|err| {
-        track_execution_error_from_tool_error(0, &measurement.command, err, Vec::new())
-    })?;
-    let raw_report = extract_single_loudnorm_report(&output.stderr_tail).map_err(|message| {
-        TrackExecutionError::new(ConvertError::Backend(message), vec![output.command.clone()])
+    progress
+        .unknown_alive_with_key(
+            format!("reference-measurement-pipe:{label}"),
+            format!("{label} - streaming exact analyzer carrier"),
+        )
+        .await;
+    let output = runner
+        .run_pipeline(producer, consumer, cancel)
+        .await
+        .map_err(|pipeline_error| {
+            let mut commands = pipeline_error.other_commands;
+            if let Some(command) = command_record_from_tool_error(&pipeline_error.error) {
+                commands.push(command);
+            }
+            TrackExecutionError::new(ConvertError::Tool(pipeline_error.error), commands)
+        })?;
+    progress
+        .estimated_with_key(
+            window_end,
+            format!("reference-measurement-pipe-finish:{}", measurement.id.0),
+            format!("Finished {label}"),
+        )
+        .await;
+
+    let raw_report = extract_single_loudnorm_report(&output.consumer.stderr_tail).map_err(|message| {
+        TrackExecutionError::new(
+            ConvertError::Backend(message),
+            vec![output.producer.command.clone(), output.consumer.command.clone()],
+        )
     })?;
     let needs_silence_proof = serde_json::from_str::<serde_json::Value>(&raw_report)
         .ok()
@@ -4233,18 +4814,21 @@ async fn execute_reference_measurement(
         == Some("-inf");
     let mut auxiliary_records = Vec::new();
     if needs_silence_proof {
-        let input = measurement.command.input.as_path().ok_or_else(|| {
+        let input = measurement.carrier_path().ok_or_else(|| {
             TrackExecutionError::new(
                 ConvertError::Backend(
                     "Reference silence verification requires a path-backed carrier".to_string(),
                 ),
-                vec![output.command.clone()],
+                vec![output.producer.command.clone(), output.consumer.command.clone()],
             )
         })?;
         let silence_record = verify_signed_zero_audio(input, runner, cancel, limits, work_dir)
             .await
             .map_err(|err| {
-                let mut commands = vec![output.command.clone()];
+                let mut commands = vec![
+                    output.producer.command.clone(),
+                    output.consumer.command.clone(),
+                ];
                 commands.extend(err.commands);
                 TrackExecutionError::new(err.error, commands)
             })?;
@@ -4260,18 +4844,19 @@ async fn execute_reference_measurement(
         needs_silence_proof,
     )
     .map_err(|message| {
-        TrackExecutionError::new(ConvertError::Backend(message), vec![output.command.clone()])
+        TrackExecutionError::new(
+            ConvertError::Backend(message),
+            vec![output.producer.command.clone(), output.consumer.command.clone()],
+        )
     })?;
-    let mut record = output.command;
-    record.description = Some(measurement.command.description.clone());
-    let mut records = vec![record];
+    let mut producer_record = output.producer.command;
+    producer_record.description = Some(input_stage.description.clone());
+    let mut consumer_record = output.consumer.command;
+    consumer_record.description = Some(measurement.command.description.clone());
+    let mut records = vec![producer_record, consumer_record];
     records.append(&mut auxiliary_records);
-    Ok((
-        records,
-        parsed,
-    ))
+    Ok((records, parsed))
 }
-
 
 async fn verify_signed_zero_audio(
     input: &Path,
@@ -4347,14 +4932,29 @@ async fn verify_signed_zero_audio(
 }
 
 fn command_records_hash(records: &[CommandRecord]) -> String {
+    fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(b"tonepoet-reference-resolved-command-transcript/v1\0");
+    hasher.update(b"tonepoet-reference-resolved-command-transcript/v2\0");
+    hasher.update((records.len() as u64).to_be_bytes());
     for record in records {
-        hasher.update(format!("{:?}", record.binary).as_bytes());
-        hasher.update([0]);
+        let binary = format!("{:?}", record.binary);
+        hash_bytes(&mut hasher, binary.as_bytes());
+        hasher.update((record.sanitized_args.len() as u64).to_be_bytes());
         for arg in &record.sanitized_args {
-            hasher.update((arg.len() as u64).to_be_bytes());
-            hasher.update(arg.as_bytes());
+            hash_bytes(&mut hasher, arg.as_bytes());
+        }
+        hasher.update([match record.environment_policy {
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet => 0_u8,
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet => 1_u8,
+        }]);
+        hasher.update((record.environment.len() as u64).to_be_bytes());
+        for (key, value) in &record.environment {
+            hash_bytes(&mut hasher, key.as_bytes());
+            hash_bytes(&mut hasher, value.as_bytes());
         }
     }
     let digest = hasher.finalize();
@@ -4445,6 +5045,28 @@ async fn execute_commands(
     Ok(records)
 }
 
+async fn acquire_reference_pipeline_permit(
+    binary: ToolBinary,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    cancel: &CancellationToken,
+) -> Result<Option<OwnedSemaphorePermit>, ConvertError> {
+    let Some(limits) = limits else {
+        return Ok(None);
+    };
+
+    let semaphore = match binary {
+        ToolBinary::Sox => Some(limits.sox.clone()),
+        ToolBinary::Ffmpeg | ToolBinary::Ffprobe => Some(limits.ffmpeg.clone()),
+        ToolBinary::Ssrc => Some(limits.ssrc.clone()),
+        _ => None,
+    };
+
+    match semaphore {
+        Some(semaphore) => acquire_owned_permit(semaphore, cancel).await.map(Some),
+        None => Ok(None),
+    }
+}
+
 async fn acquire_tool_permit(
     cmd: &mut ToolCommand,
     limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -4456,7 +5078,11 @@ async fn acquire_tool_permit(
 
     match cmd.binary {
         ToolBinary::Sox => {
-            set_sox_omp_threads(cmd, limits.sox_omp_threads());
+            if cmd.environment_policy
+                == tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet
+            {
+                set_sox_omp_threads(cmd, limits.sox_omp_threads());
+            }
             acquire_owned_permit(limits.sox.clone(), cancel)
                 .await
                 .map(Some)
@@ -4512,11 +5138,13 @@ fn tool_permit_error_to_runner_error(err: ConvertError, cmd: &ToolCommand) -> To
 
 fn command_record_for_unstarted_command(cmd: &ToolCommand) -> CommandRecord {
     CommandRecord {
+        environment_policy: cmd.environment_policy,
+        environment: cmd.sanitized_environment(),
         description: None,
         binary: cmd.binary,
-        sanitized_args: cmd.args.clone(),
+        sanitized_args: cmd.sanitized_args(),
         cwd: cmd.cwd.clone(),
-        env_keys: cmd.env.iter().map(|var| var.key.clone()).collect(),
+        env_keys: cmd.env_keys(),
         exit: None,
         stdout_tail: String::new(),
         stderr_tail: String::new(),
@@ -4552,7 +5180,6 @@ fn is_omp_num_threads_key(key: &str) -> bool {
     key == "OMP_NUM_THREADS"
 }
 
-
 #[cfg(test)]
 const CAPTURE_PLANNED_COMMAND_FOR_TEST_ARG: &str = "__tonepoet_capture_planned_command_for_test__";
 
@@ -4566,6 +5193,9 @@ fn should_capture_planned_command_for_test(cmd: &ToolCommand) -> bool {
 #[cfg(test)]
 fn successful_captured_tool_output_for_test(cmd: ToolCommand) -> ToolOutput {
     let elapsed = Duration::from_millis(1);
+    let sanitized_args = cmd.sanitized_args();
+    let environment = cmd.sanitized_environment();
+    let env_keys = cmd.env_keys();
     let stdout_tail = cmd
         .env
         .iter()
@@ -4578,11 +5208,13 @@ fn successful_captured_tool_output_for_test(cmd: ToolCommand) -> ToolOutput {
         stderr_tail: String::new(),
         elapsed,
         command: CommandRecord {
+            environment_policy: cmd.environment_policy,
+            environment,
             description: None,
             binary: cmd.binary,
-            sanitized_args: cmd.args.clone(),
+            sanitized_args,
             cwd: cmd.cwd.clone(),
-            env_keys: cmd.env.iter().map(|var| var.key.clone()).collect(),
+            env_keys,
             exit: Some(ProcessExit::Code(0)),
             stdout_tail,
             stderr_tail: String::new(),
@@ -4748,10 +5380,11 @@ fn annotate_tool_error(mut err: ToolRunnerError, planned: &PlannedCommand) -> To
         ToolRunnerError::Spawn { command }
         | ToolRunnerError::Timeout { command, .. }
         | ToolRunnerError::Cancelled { command }
+        | ToolRunnerError::Termination { command, .. }
         | ToolRunnerError::NonZeroExit { command, .. } => {
             command.description = description;
         }
-        ToolRunnerError::Io(_) => {}
+        ToolRunnerError::UnsupportedPipeline | ToolRunnerError::Io(_) => {}
     }
     err
 }
@@ -4793,6 +5426,17 @@ fn planned_tool_error_message(
             index + 1,
             planned.description
         ),
+        ToolRunnerError::UnsupportedPipeline => format!(
+            "planned command {} requires a runner with typed pipeline support ({})",
+            index + 1,
+            planned.description
+        ),
+        ToolRunnerError::Termination { message, .. } => format!(
+            "planned command {} could not prove process termination/reaping ({}): {}",
+            index + 1,
+            planned.description,
+            message
+        ),
         ToolRunnerError::Io(err) => format!(
             "planned command {} failed before execution ({}): {}",
             index + 1,
@@ -4818,8 +5462,9 @@ fn command_record_from_tool_error(err: &ToolRunnerError) -> Option<CommandRecord
         ToolRunnerError::Spawn { command }
         | ToolRunnerError::Timeout { command, .. }
         | ToolRunnerError::Cancelled { command }
+        | ToolRunnerError::Termination { command, .. }
         | ToolRunnerError::NonZeroExit { command, .. } => Some(command.clone()),
-        ToolRunnerError::Io(_) => None,
+        ToolRunnerError::UnsupportedPipeline | ToolRunnerError::Io(_) => None,
     }
 }
 
@@ -4891,7 +5536,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             finite.reported,
-            TruePeakValue::Finite("-3.125000000".parse().unwrap())
+            tonepoet_pipeline::TruePeakValue::Finite("-3.125000000".parse().unwrap())
         );
         let silence = parse_reference_true_peak_measurement(
             MeasurementId(2),
@@ -4903,7 +5548,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(silence.reported, TruePeakValue::VerifiedSilence);
+        assert_eq!(silence.reported, tonepoet_pipeline::TruePeakValue::VerifiedSilence);
     }
 
     #[test]
@@ -4958,10 +5603,97 @@ mod tests {
     }
 
     #[test]
+    fn reference_measurement_pipe_contract_rejects_transport_or_argv_drift() {
+        let carrier = PathBuf::from("reference-r64.w64");
+        let mut producer = PlannedCommand::new(
+            ToolIdentifier::Sox,
+            vec![
+                "-S".to_string(),
+                "-D".to_string(),
+                carrier.display().to_string(),
+                "-t".to_string(),
+                "wav".to_string(),
+                "-e".to_string(),
+                "floating-point".to_string(),
+                "-b".to_string(),
+                "64".to_string(),
+                "-".to_string(),
+            ],
+            InputSource::Path(carrier),
+            OutputSink::Stdout,
+            None,
+            "stream analyzer carrier",
+        );
+        producer.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        producer
+            .environment
+            .insert("LC_ALL".to_string(), "C".to_string());
+        let mut consumer = PlannedCommand::new(
+            ToolIdentifier::Ffmpeg,
+            vec![
+                "-nostdin".to_string(),
+                "-hide_banner".to_string(),
+                "-nostats".to_string(),
+                "-loglevel".to_string(),
+                "info".to_string(),
+                "-f".to_string(),
+                "wav".to_string(),
+                "-i".to_string(),
+                "pipe:0".to_string(),
+                "-filter:a".to_string(),
+                "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json".to_string(),
+                "-f".to_string(),
+                "null".to_string(),
+                "-".to_string(),
+            ],
+            InputSource::Stdin,
+            OutputSink::Stdout,
+            None,
+            "measure true peak",
+        );
+        consumer.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        consumer
+            .environment
+            .insert("LC_ALL".to_string(), "C".to_string());
+        let measurement = PlannedMeasurement {
+            id: MeasurementId(1),
+            scope: tonepoet_pipeline::MeasurementScope::Plan,
+            purpose: TruePeakPurpose::GainAuthority,
+            input_stage: Some(producer),
+            command: consumer,
+            parser: MeasurementParser::FfmpegLoudnormInputTpV2,
+        };
+        validate_reference_measurement_pipe_contract(&measurement)
+            .expect("canonical v4 measurement contract is accepted");
+
+        let mut drifted = measurement.clone();
+        drifted.input_stage.as_mut().unwrap().args[8] = "32".to_string();
+        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+
+        let mut drifted = measurement.clone();
+        drifted.command.input = InputSource::Path(PathBuf::from("carrier.wav"));
+        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+
+        let mut drifted = measurement.clone();
+        drifted.command.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet;
+        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+
+        let mut drifted = measurement;
+        drifted
+            .command
+            .environment
+            .insert("EXTRA".to_string(), "1".to_string());
+        assert!(validate_reference_measurement_pipe_contract(&drifted).is_err());
+    }
+
+    #[test]
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -4976,9 +5708,9 @@ mod tests {
 
         let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_candidate.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
         )))
-        .expect("preserved v3 candidate JSON parses");
+        .expect("preserved v4 candidate JSON parses");
         assert_eq!(
             candidate
                 .terminal_bounds
@@ -4992,6 +5724,7 @@ mod tests {
 
     fn test_tool_command(binary: ToolBinary) -> ToolCommand {
         ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
             binary,
             args: vec!["--test".to_string()],
             secret_args: Vec::new(),
@@ -5143,6 +5876,8 @@ mod tests {
         elapsed: Duration,
     ) -> CommandRecord {
         CommandRecord {
+            environment_policy: cmd.environment_policy,
+            environment: cmd.sanitized_environment(),
             description: None,
             binary: cmd.binary,
             sanitized_args: cmd.sanitized_args(),
@@ -5209,6 +5944,9 @@ mod tests {
             stderr_tail: String::new(),
             elapsed: Duration::ZERO,
             command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: std::collections::BTreeMap::new(),
+
                 description: None,
                 binary: ToolBinary::Ssrc,
                 sanitized_args: Vec::new(),
@@ -5564,6 +6302,35 @@ mod tests {
         .expect("SoX has a permit");
         assert_eq!(env_value(&second, "OMP_NUM_THREADS"), Some("6"));
         drop(second_permit);
+    }
+
+    #[tokio::test]
+    async fn reference_pipeline_permit_preserves_frozen_sox_environment() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 6));
+        let cancel = CancellationToken::new();
+        let mut producer = test_tool_command(ToolBinary::Sox);
+        producer.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        producer.env.push(EnvVar {
+            key: "LC_ALL".to_string(),
+            value: crate::convert::pipeline::types::SecretString::new("C".to_string()),
+            secret: false,
+        });
+        let permit = acquire_reference_pipeline_permit(producer.binary, Some(&limits), &cancel)
+            .await
+            .expect("reference SoX permit acquired")
+            .expect("reference SoX has a permit");
+
+        assert_eq!(producer.env.len(), 1);
+        assert_eq!(env_value(&producer, "LC_ALL"), Some("C"));
+        assert_eq!(
+            env_value(&producer, "OMP_NUM_THREADS"),
+            None,
+            "reference execution must not inject OMP_NUM_THREADS into the qualified environment"
+        );
+        assert_eq!(limits.sox.available_permits(), 0);
+        drop(permit);
+        assert_eq!(limits.sox.available_permits(), 1);
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ description = "Pure command-planning crate for tonepoet audio conversion pipelin
 repository = "https://github.com/barstoolbluz/tonepoet"
 
 [features]
-default = []
+default = ["serde"]
 serde = []
 
 [dependencies]

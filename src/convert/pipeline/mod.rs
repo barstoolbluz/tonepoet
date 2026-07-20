@@ -215,6 +215,7 @@ mod tests {
     async fn stub_runner_transcript_redacts_secret_args() {
         let runner = StubToolRunner::new();
         let cmd = ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
             binary: ToolBinary::SevenZip,
             args: vec!["x".into(), "-phunter2".into(), "archive.7z".into()],
             secret_args: vec![1],

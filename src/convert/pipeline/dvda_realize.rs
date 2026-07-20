@@ -2736,6 +2736,7 @@ async fn run_dvda_ffmpeg_args(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), ConvertError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args,
         secret_args: vec![],
@@ -3260,6 +3261,7 @@ async fn mux_s32le_to_wav(
     ]);
 
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args,
         secret_args: vec![],
@@ -4802,6 +4804,7 @@ async fn probe_dvda_wav(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<DvdaWavProbe, ConvertError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),

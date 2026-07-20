@@ -670,12 +670,19 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                         executed_evidence_digest_v2,
                         ..
                     } if *executed_evidence_digest_v1 != Sha256Digest([0; 32])
-                        && (*policy != DsdReferencePolicyVersion::SoxNg14801V3
-                            || *executed_evidence_digest_v2 != Sha256Digest([0; 32])) => {}
+                        && (!matches!(
+                            policy,
+                            DsdReferencePolicyVersion::SoxNg14801V3
+                                | DsdReferencePolicyVersion::SoxNg14801V4
+                        ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32])) => {}
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
                         return Err(ManifestError::InvalidAuthority(
-                            if *policy == DsdReferencePolicyVersion::SoxNg14801V3 {
-                                "Reference v3 track is missing v1 or v2 executed verification authority"
+                            if matches!(
+                                policy,
+                                DsdReferencePolicyVersion::SoxNg14801V3
+                                    | DsdReferencePolicyVersion::SoxNg14801V4
+                            ) {
+                                "Reference v3+ track is missing v1 or v2 executed verification authority"
                             } else {
                                 "Reference track is missing executed verification authority"
                             }
@@ -1027,7 +1034,7 @@ mod manifest_merge_gap_tests {
     }
 
     #[test]
-    fn v3_manifest_requires_v2_source_materialization_evidence_without_retroactively_changing_v2() {
+    fn v3_and_v4_manifests_require_v2_source_materialization_evidence_without_changing_v2() {
         assert!(reference_manifest_with_evidence(
             DsdReferencePolicyVersion::SoxNg14801V2,
             Sha256Digest([8; 32]),
@@ -1051,6 +1058,41 @@ mod manifest_merge_gap_tests {
             Sha256Digest([9; 32]),
         )
         .is_ok());
+
+        let error = reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V4,
+            Sha256Digest([8; 32]),
+            Sha256Digest([0; 32]),
+        )
+        .expect_err("v4 must bind source/materialization evidence");
+        assert!(error
+            .to_string()
+            .contains("missing v1 or v2 executed verification authority"));
+
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V4,
+            Sha256Digest([8; 32]),
+            Sha256Digest([9; 32]),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn manifest_wire_tags_are_frozen() {
+        let route = ManifestRouteIdentityV2::DsdReferenceV2 {
+            settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2(Sha256Digest([1; 32])),
+            resolved_output_target: ResolvedOutputTarget::WavW64,
+            policy: DsdReferencePolicyVersion::SoxNg14801V4,
+            qualification_manifest_digest: Sha256Digest([2; 32]),
+        };
+        let route_json = serde_json::to_value(route).expect("serialize route identity");
+        assert_eq!(route_json["route"], "dsd_reference_v2");
+        assert_eq!(route_json["policy"], "sox_ng_14_8_0_1_v4");
+        assert_eq!(route_json["resolved_output_target"], "wav_w64");
+
+        let execution = native_identity(Sha256Digest([3; 32]), Sha256Digest([4; 32]));
+        let execution_json = serde_json::to_value(execution).expect("serialize execution identity");
+        assert_eq!(execution_json["kind"], "native_dsd_v2");
     }
 
     #[test]

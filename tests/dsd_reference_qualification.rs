@@ -7,11 +7,14 @@
 //! the gate while using the flake-owned SoX-ng and FFmpeg paths.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use sacd_rs::dsd_file::DsdFrameReader;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -37,6 +40,10 @@ use tonepoet_pipeline::{
 const GATE: &str = "TONEPOET_REQUIRE_TOOLS";
 const SOX_ENV: &str = "TONEPOET_REFERENCE_SOX_PATH";
 const FFMPEG_ENV: &str = "TONEPOET_REFERENCE_FFMPEG_PATH";
+const QUALIFICATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const QUALIFICATION_PIPELINE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const QUALIFICATION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+const QUALIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn selected() -> bool {
     std::env::var(GATE).as_deref() == Ok("1")
@@ -63,12 +70,193 @@ fn required_sibling_tool(tool: &Path, executable: &str) -> PathBuf {
     })
 }
 
-fn run(path: &Path, args: &[String]) -> Output {
-    let output = Command::new(path)
+fn apply_qualified_environment(command: &mut Command) {
+    command.env_clear();
+    command.env("LC_ALL", "C");
+}
+
+const QUALIFICATION_RETAINED_TAIL_BYTES: usize = 64 * 1024;
+
+struct OutputDrain {
+    label: &'static str,
+    tail: Arc<Mutex<Vec<u8>>>,
+    completion: mpsc::Receiver<Result<(), String>>,
+    task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OutputDrain {
+    fn finish(mut self) -> (Vec<u8>, Option<String>) {
+        let result = self
+            .completion
+            .recv_timeout(QUALIFICATION_TERMINATION_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "{} drain did not finish within {:?}: {error}",
+                    self.label, QUALIFICATION_TERMINATION_TIMEOUT
+                )
+            })
+            .and_then(|result| result);
+        if result.is_ok() {
+            if let Some(task) = self.task.take() {
+                if task.join().is_err() {
+                    return (
+                        self.tail.lock().expect("output tail lock").clone(),
+                        Some(format!("{} drain thread panicked", self.label)),
+                    );
+                }
+            }
+        }
+        let tail = self.tail.lock().expect("output tail lock").clone();
+        (tail, result.err())
+    }
+}
+
+fn drain_child_output(
+    mut stream: impl Read + Send + 'static,
+    label: &'static str,
+) -> OutputDrain {
+    let tail = Arc::new(Mutex::new(Vec::with_capacity(
+        QUALIFICATION_RETAINED_TAIL_BYTES,
+    )));
+    let writer_tail = tail.clone();
+    let (sender, completion) = mpsc::sync_channel(1);
+    let task = std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        let result = loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break Ok(()),
+                Ok(read) => {
+                    let mut retained = writer_tail.lock().expect("output tail lock");
+                    retained.extend_from_slice(&buffer[..read]);
+                    if retained.len() > QUALIFICATION_RETAINED_TAIL_BYTES {
+                        let excess = retained.len() - QUALIFICATION_RETAINED_TAIL_BYTES;
+                        retained.drain(..excess);
+                    }
+                }
+                Err(error) => break Err(format!("cannot drain {label}: {error}")),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    OutputDrain {
+        label,
+        tail,
+        completion,
+        task: Some(task),
+    }
+}
+
+fn terminate_and_reap_result(child: &mut Child, label: &str) -> Result<ExitStatus, String> {
+    let inspection_error = match child.try_wait() {
+        Ok(Some(status)) => return Ok(status),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    let kill_error = child.kill().err();
+    let deadline = Instant::now() + QUALIFICATION_TERMINATION_TIMEOUT;
+    let mut last_wait_error = inspection_error;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => last_wait_error = Some(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{label} did not terminate and reap within {:?}; kill_error={:?}; wait_error={:?}",
+                QUALIFICATION_TERMINATION_TIMEOUT, kill_error, last_wait_error
+            ));
+        }
+        std::thread::sleep(QUALIFICATION_POLL_INTERVAL);
+    }
+}
+
+fn terminate_and_reap(child: &mut Child, label: &str) -> ExitStatus {
+    terminate_and_reap_result(child, label).unwrap_or_else(|message| panic!("{message}"))
+}
+
+fn wait_with_deadline(
+    child: &mut Child,
+    label: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(QUALIFICATION_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                return match terminate_and_reap_result(child, label) {
+                    Ok(status) => Err(format!(
+                        "{label} exceeded qualification deadline {timeout:?} and was terminated/reaped with status {status}"
+                    )),
+                    Err(termination) => Err(format!(
+                        "{label} exceeded qualification deadline {timeout:?}; {termination}"
+                    )),
+                };
+            }
+            Err(error) => {
+                return match terminate_and_reap_result(child, label) {
+                    Ok(status) => Err(format!(
+                        "cannot inspect {label}: {error}; terminated/reaped with status {status}"
+                    )),
+                    Err(termination) => Err(format!(
+                        "cannot inspect {label}: {error}; {termination}"
+                    )),
+                };
+            }
+        }
+    }
+}
+
+fn run_with_pre_clear_environment(
+    path: &Path,
+    args: &[String],
+    pre_clear_environment: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new(path);
+    command
         .args(args)
-        .env("LC_ALL", "C")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in pre_clear_environment {
+        command.env(key, value);
+    }
+    apply_qualified_environment(&mut command);
+    let mut child = command
+        .spawn()
         .unwrap_or_else(|error| panic!("failed to run {} {:?}: {error}", path.display(), args));
+    let stdout_task = drain_child_output(
+        child.stdout.take().expect("qualified command stdout is piped"),
+        "qualified command stdout",
+    );
+    let stderr_task = drain_child_output(
+        child.stderr.take().expect("qualified command stderr is piped"),
+        "qualified command stderr",
+    );
+    let status = wait_with_deadline(&mut child, "qualified command", QUALIFICATION_COMMAND_TIMEOUT);
+    let (stdout, stdout_drain_error) = stdout_task.finish();
+    let (stderr, stderr_drain_error) = stderr_task.finish();
+    let status = status.unwrap_or_else(|failure| {
+        panic!(
+            "{failure}; stdout_drain_error={stdout_drain_error:?}; \
+             stderr_drain_error={stderr_drain_error:?}; stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        )
+    });
+    assert!(
+        stdout_drain_error.is_none() && stderr_drain_error.is_none(),
+        "qualified command output drain failed: stdout={stdout_drain_error:?} stderr={stderr_drain_error:?}"
+    );
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
     assert!(
         output.status.success(),
         "{} {:?} failed: stdout={} stderr={}",
@@ -80,12 +268,52 @@ fn run(path: &Path, args: &[String]) -> Output {
     output
 }
 
+fn run(path: &Path, args: &[String]) -> Output {
+    run_with_pre_clear_environment(path, args, &[])
+}
+
 fn combined(output: &Output) -> String {
     format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[test]
+fn qualified_environment_probe_child() {
+    println!(
+        "ambient={} lc_all={}",
+        std::env::var("TONEPOET_QUALIFICATION_AMBIENT_POISON")
+            .unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("LC_ALL").unwrap_or_else(|_| "unset".to_string()),
+    );
+}
+
+fn qualify_subprocess_environment_isolation() -> Value {
+    let executable = std::env::current_exe().expect("resolve qualification test executable");
+    let output = run_with_pre_clear_environment(
+        &executable,
+        &[
+            "--exact".to_string(),
+            "qualified_environment_probe_child".to_string(),
+            "--nocapture".to_string(),
+        ],
+        &[("TONEPOET_QUALIFICATION_AMBIENT_POISON", "present")],
+    );
+    let text = combined(&output);
+    assert!(
+        text.contains("ambient=unset lc_all=C"),
+        "clear-and-set environment probe observed unexpected child environment: {text}"
+    );
+    serde_json::json!({
+        "status": "passed",
+        "schema": "tonepoet-reference-subprocess-environment-probe/v1",
+        "policy": "clear_and_set",
+        "qualified_environment": {"LC_ALL": "C"},
+        "ambient_poison_key": "TONEPOET_QUALIFICATION_AMBIENT_POISON",
+        "ambient_poison_observed": false,
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -649,7 +877,45 @@ fn assert_production_plan_structure(
     assert_eq!(measurements[1].purpose, TruePeakPurpose::PostFinalAcceptance);
     assert!(measurements
         .iter()
-        .all(|measurement| measurement.parser == MeasurementParser::FfmpegLoudnormInputTpV1));
+        .all(|measurement| measurement.parser == MeasurementParser::FfmpegLoudnormInputTpV2));
+    for measurement in &measurements {
+        let producer = measurement
+            .input_stage
+            .as_ref()
+            .expect("policy v4 measurement has a typed producer");
+        assert_eq!(producer.tool, ToolIdentifier::Sox);
+        assert_eq!(producer.output, tonepoet_pipeline::OutputSink::Stdout);
+        assert_eq!(producer.args.get(0).map(String::as_str), Some("-S"));
+        assert_eq!(producer.args.get(1).map(String::as_str), Some("-D"));
+        assert!(producer
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-t" && window[1] == "wav"));
+        assert!(producer
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-e" && window[1] == "floating-point"));
+        assert!(producer.args.windows(2).any(|window| window[0] == "-b" && window[1] == "64"));
+        assert_eq!(producer.args.last().map(String::as_str), Some("-"));
+        assert_eq!(measurement.command.tool, ToolIdentifier::Ffmpeg);
+        assert_eq!(measurement.command.input, tonepoet_pipeline::InputSource::Stdin);
+        assert!(measurement
+            .command
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-f" && window[1] == "wav"));
+        assert!(measurement
+            .command
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-i" && window[1] == "pipe:0"));
+        let carrier = measurement
+            .carrier_path()
+            .expect("measurement carrier is path-backed")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!measurement.command.args.iter().any(|arg| arg == &carrier));
+    }
 
     let deferred: Vec<_> = steps
         .iter()
@@ -724,7 +990,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V3;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V4;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -811,6 +1077,11 @@ fn run_planned_command(
     sox: &Path,
     ffmpeg: &Path,
 ) -> Output {
+    assert_eq!(
+        command.environment_policy,
+        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+    );
+    assert_eq!(command.environment.len(), 1);
     assert_eq!(command.environment.get("LC_ALL").map(String::as_str), Some("C"));
     let tool = match &command.tool {
         ToolIdentifier::Sox => sox,
@@ -820,10 +1091,680 @@ fn run_planned_command(
     run(tool, &command.args)
 }
 
+struct PlannedPipelineOutput {
+    producer: Output,
+    consumer: Output,
+}
+
+fn drain_child_stderr(child: &mut Child, label: &'static str) -> OutputDrain {
+    drain_child_output(
+        child
+            .stderr
+            .take()
+            .unwrap_or_else(|| panic!("{label} stderr is piped")),
+        label,
+    )
+}
+
+fn supervise_qualified_pipeline(
+    mut producer_child: Child,
+    producer_stderr_task: OutputDrain,
+    mut consumer_child: Child,
+    label: &str,
+) -> PlannedPipelineOutput {
+    let consumer_stdout_task = drain_child_output(
+        consumer_child
+            .stdout
+            .take()
+            .expect("qualified pipeline consumer stdout is piped"),
+        "qualified pipeline consumer stdout",
+    );
+    let consumer_stderr_task = drain_child_output(
+        consumer_child
+            .stderr
+            .take()
+            .expect("qualified pipeline consumer stderr is piped"),
+        "qualified pipeline consumer stderr",
+    );
+    let deadline = Instant::now() + QUALIFICATION_PIPELINE_TIMEOUT;
+    let mut producer_status = None;
+    let mut consumer_status = None;
+    let mut supervisor_failure: Option<String> = None;
+
+    loop {
+        if producer_status.is_none() {
+            match producer_child.try_wait() {
+                Ok(status) => producer_status = status,
+                Err(error) => {
+                    supervisor_failure = Some(format!("cannot inspect {label} producer: {error}"));
+                }
+            }
+        }
+        if consumer_status.is_none() {
+            match consumer_child.try_wait() {
+                Ok(status) => consumer_status = status,
+                Err(error) => {
+                    supervisor_failure = Some(format!("cannot inspect {label} consumer: {error}"));
+                }
+            }
+        }
+        if producer_status
+            .as_ref()
+            .is_some_and(|status| !status.success())
+            && consumer_status.is_none()
+        {
+            match terminate_and_reap_result(
+                &mut consumer_child,
+                "qualified pipeline consumer after producer failure",
+            ) {
+                Ok(status) => consumer_status = Some(status),
+                Err(error) => supervisor_failure = Some(error),
+            }
+        }
+        if consumer_status
+            .as_ref()
+            .is_some_and(|status| !status.success())
+            && producer_status.is_none()
+        {
+            match terminate_and_reap_result(
+                &mut producer_child,
+                "qualified pipeline producer after consumer failure",
+            ) {
+                Ok(status) => producer_status = Some(status),
+                Err(error) => supervisor_failure = Some(error),
+            }
+        }
+        if supervisor_failure.is_some()
+            || (producer_status.is_some() && consumer_status.is_some())
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            supervisor_failure = Some(format!(
+                "{label} exceeded qualification deadline {:?}",
+                QUALIFICATION_PIPELINE_TIMEOUT
+            ));
+            break;
+        }
+        std::thread::sleep(QUALIFICATION_POLL_INTERVAL);
+    }
+
+    if supervisor_failure.is_some() {
+        if producer_status.is_none() {
+            match terminate_and_reap_result(
+                &mut producer_child,
+                "failed qualified pipeline producer",
+            ) {
+                Ok(status) => producer_status = Some(status),
+                Err(error) => supervisor_failure
+                    .as_mut()
+                    .expect("supervisor failure exists")
+                    .push_str(&format!("; producer termination failure: {error}")),
+            }
+        }
+        if consumer_status.is_none() {
+            match terminate_and_reap_result(
+                &mut consumer_child,
+                "failed qualified pipeline consumer",
+            ) {
+                Ok(status) => consumer_status = Some(status),
+                Err(error) => supervisor_failure
+                    .as_mut()
+                    .expect("supervisor failure exists")
+                    .push_str(&format!("; consumer termination failure: {error}")),
+            }
+        }
+    }
+
+    let (producer_stderr, producer_drain_error) = producer_stderr_task.finish();
+    let (consumer_stdout, consumer_stdout_drain_error) = consumer_stdout_task.finish();
+    let (consumer_stderr, consumer_stderr_drain_error) = consumer_stderr_task.finish();
+    for drain_error in [
+        producer_drain_error,
+        consumer_stdout_drain_error,
+        consumer_stderr_drain_error,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match supervisor_failure.as_mut() {
+            Some(failure) => failure.push_str(&format!("; {drain_error}")),
+            None => supervisor_failure = Some(drain_error),
+        }
+    }
+
+    if let Some(failure) = supervisor_failure {
+        panic!(
+            "{failure}; producer_status={producer_status:?} consumer_status={consumer_status:?} \
+             producer_stderr={} consumer_stdout={} consumer_stderr={}",
+            String::from_utf8_lossy(&producer_stderr),
+            String::from_utf8_lossy(&consumer_stdout),
+            String::from_utf8_lossy(&consumer_stderr),
+        );
+    }
+
+    PlannedPipelineOutput {
+        producer: Output {
+            status: producer_status.expect("qualified producer has terminal status"),
+            stdout: Vec::new(),
+            stderr: producer_stderr,
+        },
+        consumer: Output {
+            status: consumer_status.expect("qualified consumer has terminal status"),
+            stdout: consumer_stdout,
+            stderr: consumer_stderr,
+        },
+    }
+}
+
+fn run_planned_measurement_pipeline(
+    measurement: &tonepoet_pipeline::PlannedMeasurement,
+    sox: &Path,
+    ffmpeg: &Path,
+) -> PlannedPipelineOutput {
+    let producer = measurement
+        .input_stage
+        .as_ref()
+        .expect("policy v4 measurement has a typed input stage");
+    assert_eq!(producer.tool, ToolIdentifier::Sox);
+    assert_eq!(producer.input.as_path(), measurement.carrier_path());
+    assert_eq!(producer.output, tonepoet_pipeline::OutputSink::Stdout);
+    assert_eq!(
+        producer.environment_policy,
+        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+    );
+    assert_eq!(producer.environment, BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]));
+    assert_eq!(measurement.command.tool, ToolIdentifier::Ffmpeg);
+    assert_eq!(measurement.command.input, tonepoet_pipeline::InputSource::Stdin);
+    assert_eq!(
+        measurement.command.environment_policy,
+        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+    );
+    assert_eq!(
+        measurement.command.environment,
+        BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+    );
+
+    let mut producer_command = Command::new(sox);
+    producer_command
+        .args(&producer.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_qualified_environment(&mut producer_command);
+    let mut producer_child = producer_command.spawn().unwrap_or_else(|error| {
+        panic!("failed to spawn {} {:?}: {error}", sox.display(), producer.args)
+    });
+    let producer_stderr_task = drain_child_stderr(&mut producer_child, "measurement producer");
+    let producer_stdout = producer_child
+        .stdout
+        .take()
+        .expect("measurement producer stdout is piped");
+
+    let mut consumer_command = Command::new(ffmpeg);
+    consumer_command
+        .args(&measurement.command.args)
+        .stdin(Stdio::from(producer_stdout))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_qualified_environment(&mut consumer_command);
+    let consumer_child = match consumer_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let status = terminate_and_reap(
+                &mut producer_child,
+                "measurement producer after consumer spawn failure",
+            );
+            let (producer_stderr, producer_drain_error) = producer_stderr_task.finish();
+            panic!(
+                "failed to spawn {} {:?}: {error}; producer_status={status}; producer_drain_error={producer_drain_error:?}; producer_stderr={}",
+                ffmpeg.display(),
+                measurement.command.args,
+                String::from_utf8_lossy(&producer_stderr),
+            )
+        }
+    };
+    let output = supervise_qualified_pipeline(
+        producer_child,
+        producer_stderr_task,
+        consumer_child,
+        "measurement pipeline",
+    );
+    assert!(
+        output.producer.status.success(),
+        "{} {:?} failed: stderr={}",
+        sox.display(),
+        producer.args,
+        String::from_utf8_lossy(&output.producer.stderr),
+    );
+    assert!(
+        output.consumer.status.success(),
+        "{} {:?} failed: stdout={} stderr={}",
+        ffmpeg.display(),
+        measurement.command.args,
+        String::from_utf8_lossy(&output.consumer.stdout),
+        String::from_utf8_lossy(&output.consumer.stderr),
+    );
+    output
+}
+
+fn loudnorm_input_tp(stderr: &[u8]) -> f64 {
+    let stderr = String::from_utf8_lossy(stderr);
+    let raw = extract_single_loudnorm_report(&stderr)
+        .unwrap_or_else(|error| panic!("loudnorm report extraction failed: {error}"));
+    let report: Value = serde_json::from_str(&raw).expect("loudnorm report parses");
+    report["input_tp"]
+        .as_str()
+        .expect("loudnorm input_tp is a string")
+        .parse::<f64>()
+        .expect("loudnorm input_tp is finite decimal evidence")
+}
+
+#[cfg(unix)]
+fn require_sparse_file_support(directory: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = directory.join(".tonepoet-sparse-capacity-probe");
+    let file = File::create(&probe).expect("create sparse-file capability probe");
+    file.set_len(16 * 1024 * 1024)
+        .expect("size sparse-file capability probe");
+    let metadata = file
+        .metadata()
+        .expect("inspect sparse-file capability probe");
+    drop(file);
+    fs::remove_file(&probe).expect("remove sparse-file capability probe");
+    let allocated = metadata.blocks().saturating_mul(512);
+    assert!(
+        allocated < metadata.len() / 8,
+        "the mandatory >4 GiB analyzer-carrier fixture requires a sparse-file-capable qualification filesystem (logical={} allocated={allocated})",
+        metadata.len(),
+    );
+}
+
+#[cfg(not(unix))]
+fn require_sparse_file_support(_directory: &Path) {
+    panic!("the mandatory >4 GiB analyzer-carrier qualification fixture requires Unix sparse-file accounting");
+}
+
+fn create_sparse_w64_capacity_fixture(seed: &Path, output: &Path) -> u64 {
+    const RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00\x00";
+    const FACT_GUID: &[u8; 16] = b"fact\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
+    const DATA_GUID: &[u8; 16] = b"data\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
+    const AUDIO_PAYLOAD_BYTES: u64 = (1_u64 << 32) + 8;
+
+    let seed_bytes = fs::read(seed).expect("read seed W64");
+    assert_eq!(&seed_bytes[..16], RIFF_GUID, "seed is W64");
+    let fact = seed_bytes
+        .windows(16)
+        .position(|window| window == FACT_GUID)
+        .expect("W64 fact chunk");
+    let data = seed_bytes
+        .windows(16)
+        .position(|window| window == DATA_GUID)
+        .expect("W64 data chunk");
+    let payload_offset = data + 24;
+    assert!(payload_offset <= seed_bytes.len(), "valid W64 data header");
+    let frame_count = AUDIO_PAYLOAD_BYTES / 8;
+    let file_size = u64::try_from(payload_offset).expect("W64 header size") + AUDIO_PAYLOAD_BYTES;
+
+    let mut header = seed_bytes[..payload_offset].to_vec();
+    header[16..24].copy_from_slice(&file_size.to_le_bytes());
+    header[fact + 24..fact + 32].copy_from_slice(&frame_count.to_le_bytes());
+    header[data + 16..data + 24]
+        .copy_from_slice(&(AUDIO_PAYLOAD_BYTES + 24).to_le_bytes());
+
+    let mut file = File::create(output).expect("create sparse W64 capacity fixture");
+    file.write_all(&header).expect("write sparse W64 header");
+    file.set_len(file_size).expect("size sparse W64 fixture");
+    file.sync_all().expect("sync sparse W64 fixture");
+    assert!(AUDIO_PAYLOAD_BYTES > u64::from(u32::MAX));
+    AUDIO_PAYLOAD_BYTES
+}
+
+fn inspect_streaming_wav_header(producer: &PlannedCommand, sox: &Path) -> (u32, u32) {
+    const HEADER_CAPTURE_BYTES: usize = 4096;
+    const STREAMING_SENTINEL_FLOOR: u32 = 0x7fff_0000;
+
+    assert_eq!(
+        producer.environment_policy,
+        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+    );
+    assert_eq!(producer.environment, BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]));
+    let mut command = Command::new(sox);
+    command
+        .args(&producer.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_qualified_environment(&mut command);
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!(
+            "failed to spawn streaming-header producer {} {:?}: {error}",
+            sox.display(),
+            producer.args
+        )
+    });
+    let stderr_task = drain_child_stderr(&mut child, "streaming-header producer");
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("streaming-header producer stdout is piped");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let header_task = std::thread::spawn(move || {
+        let mut header = vec![0_u8; HEADER_CAPTURE_BYTES];
+        let result = stdout
+            .read_exact(&mut header)
+            .map(|()| header)
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+    let header = match receiver.recv_timeout(QUALIFICATION_COMMAND_TIMEOUT) {
+        Ok(Ok(header)) => header,
+        Ok(Err(error)) => {
+            let status = terminate_and_reap(&mut child, "streaming-header producer after read failure");
+            let (stderr, stderr_drain_error) = stderr_task.finish();
+            panic!(
+                "cannot read streaming WAV header: {error}; status={status}; stderr_drain_error={stderr_drain_error:?}; stderr={}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        Err(error) => {
+            let status = terminate_and_reap(&mut child, "streaming-header producer after deadline");
+            let (stderr, stderr_drain_error) = stderr_task.finish();
+            panic!(
+                "streaming WAV header read exceeded {:?}: {error}; status={status}; stderr_drain_error={stderr_drain_error:?}; stderr={}",
+                QUALIFICATION_COMMAND_TIMEOUT,
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    };
+    let status = terminate_and_reap(&mut child, "streaming-header producer after capture");
+    header_task.join().expect("streaming-header reader joins");
+    let (stderr, stderr_drain_error) = stderr_task.finish();
+    assert!(
+        stderr_drain_error.is_none(),
+        "streaming-header stderr drain failed: {stderr_drain_error:?}; stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let _ = status;
+
+    assert_eq!(&header[..4], b"RIFF", "streaming carrier is RIFF/WAVE");
+    assert_eq!(&header[8..12], b"WAVE", "streaming carrier is RIFF/WAVE");
+    let riff_size_field = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let mut offset = 12_usize;
+    let mut data_size_field = None;
+    while offset.checked_add(8).is_some_and(|end| end <= header.len()) {
+        let chunk_id = &header[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes(header[offset + 4..offset + 8].try_into().unwrap());
+        if chunk_id == b"data" {
+            data_size_field = Some(chunk_size);
+            break;
+        }
+        let padded = usize::try_from(chunk_size)
+            .expect("WAV chunk size fits usize")
+            .checked_add(1)
+            .expect("WAV chunk size does not overflow")
+            & !1;
+        offset = offset
+            .checked_add(8)
+            .and_then(|value| value.checked_add(padded))
+            .expect("WAV chunk traversal does not overflow");
+    }
+    let data_size_field = data_size_field.unwrap_or_else(|| {
+        panic!(
+            "streaming WAV data chunk was not present in the first {HEADER_CAPTURE_BYTES} bytes; stderr={}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    assert!(
+        riff_size_field >= STREAMING_SENTINEL_FLOOR
+            && data_size_field >= STREAMING_SENTINEL_FLOOR,
+        "SoX-ng did not emit the frozen large streaming-WAV size sentinels: \
+         riff={riff_size_field:#010x}, data={data_size_field:#010x}, stderr={}",
+        String::from_utf8_lossy(&stderr),
+    );
+    (riff_size_field, data_size_field)
+}
+
+fn run_capacity_carrier_pipeline(
+    producer: &PlannedCommand,
+    sox: &Path,
+    ffmpeg: &Path,
+) -> PlannedPipelineOutput {
+    assert_eq!(
+        producer.environment_policy,
+        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+    );
+    assert_eq!(producer.environment, BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]));
+    let mut producer_command = Command::new(sox);
+    producer_command
+        .args(&producer.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_qualified_environment(&mut producer_command);
+    let mut producer_child = producer_command.spawn().unwrap_or_else(|error| {
+        panic!(
+            "failed to spawn capacity producer {} {:?}: {error}",
+            sox.display(),
+            producer.args
+        )
+    });
+    let producer_stderr_task = drain_child_stderr(&mut producer_child, "capacity producer");
+    let producer_stdout = producer_child
+        .stdout
+        .take()
+        .expect("capacity producer stdout is piped");
+    let consumer_args = [
+        "-nostdin", "-hide_banner", "-nostats", "-loglevel", "info", "-f", "wav", "-i",
+        "pipe:0", "-map", "0:a:0", "-c:a", "copy", "-f", "null", "-",
+    ];
+    let mut consumer_command = Command::new(ffmpeg);
+    consumer_command
+        .args(consumer_args)
+        .stdin(Stdio::from(producer_stdout))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_qualified_environment(&mut consumer_command);
+    let consumer_child = match consumer_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let status = terminate_and_reap(
+                &mut producer_child,
+                "capacity producer after consumer spawn failure",
+            );
+            let (producer_stderr, producer_drain_error) = producer_stderr_task.finish();
+            panic!(
+                "failed to spawn capacity consumer {}: {error}; producer_status={status}; \
+                 producer_drain_error={producer_drain_error:?}; producer_stderr={}",
+                ffmpeg.display(),
+                String::from_utf8_lossy(&producer_stderr),
+            )
+        }
+    };
+    let output = supervise_qualified_pipeline(
+        producer_child,
+        producer_stderr_task,
+        consumer_child,
+        "greater-than-4-GiB capacity pipeline",
+    );
+    assert!(
+        output.producer.status.success(),
+        "capacity producer failed: {}",
+        String::from_utf8_lossy(&output.producer.stderr)
+    );
+    assert!(
+        output.consumer.status.success(),
+        "capacity consumer failed: {}",
+        String::from_utf8_lossy(&output.consumer.stderr)
+    );
+    output
+}
+
+fn qualify_analyzer_carrier_contract() -> Value {
+    let sox = required_tool(SOX_ENV);
+    let ffmpeg = required_tool(FFMPEG_ENV);
+    let temp = TempDir::new().expect("analyzer carrier tempdir");
+    let root = temp.path().join("carrier");
+    fs::create_dir_all(&root).expect("create analyzer carrier root");
+    let source = root.join("source-placeholder.dsf");
+    let plan = planned_reference_cell(
+        &root,
+        &source,
+        2_822_400,
+        48_000,
+        1,
+        PcmBitDepth::Float64,
+        ResolvedOutputTarget::WavW64,
+        DsdReconstructionSelection::Reference,
+        DsdSourceGainMode::Reference,
+        None,
+        DbNano::DEFAULT_NORMALIZE_TARGET,
+        None,
+    );
+    let summary = plan.reference.as_ref().expect("Reference summary");
+    let analytic_peak = write_analytic_analyzer_fixture(
+        &sox,
+        &summary.r64_path,
+        48_000,
+        1,
+        -20.0,
+        0.25,
+        0.0,
+        0.125,
+        AnalyzerPeakPosition::Early,
+    );
+    let measurement = plan
+        .steps()
+        .iter()
+        .find_map(|step| match step {
+            PlannedExecutionStep::Measurement(measurement)
+                if measurement.purpose == TruePeakPurpose::GainAuthority => Some(measurement),
+            _ => None,
+        })
+        .expect("planner emits gain measurement");
+
+    let direct_args = [
+        "-nostdin".to_string(),
+        "-hide_banner".to_string(),
+        "-nostats".to_string(),
+        "-loglevel".to_string(),
+        "info".to_string(),
+        "-i".to_string(),
+        summary.r64_path.display().to_string(),
+        "-filter:a".to_string(),
+        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json".to_string(),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ];
+    let direct = run(&ffmpeg, &direct_args);
+    let direct_input_tp = loudnorm_input_tp(&direct.stderr);
+    let defect_delta_db = direct_input_tp - analytic_peak;
+    assert!(
+        direct_input_tp > 100.0 && (defect_delta_db - 20.0 * (2_f64.powi(31)).log10()).abs() < 0.02,
+        "pinned direct-W64 defect changed: analytic={analytic_peak}, direct={direct_input_tp}, delta={defect_delta_db}"
+    );
+
+    let corrected = execute_measurement(measurement, &sox, &ffmpeg, &root);
+    let corrected_input_tp = match corrected.reported {
+        TruePeakValue::Finite(value) => value.0 as f64 / 1_000_000_000.0,
+        TruePeakValue::VerifiedSilence => panic!("-20 dB carrier measured as silence"),
+    };
+    assert!(
+        (corrected_input_tp - analytic_peak).abs() <= 0.02,
+        "streamed carrier changed true peak: analytic={analytic_peak}, corrected={corrected_input_tp}"
+    );
+
+    let producer = measurement
+        .input_stage
+        .as_ref()
+        .expect("policy v4 producer stage");
+    let streamed = run(&sox, &producer.args);
+    assert!(
+        streamed.status.success(),
+        "producer stream capture failed: {}",
+        String::from_utf8_lossy(&streamed.stderr)
+    );
+    assert_eq!(&streamed.stdout[..4], b"RIFF");
+    assert_eq!(&streamed.stdout[8..12], b"WAVE");
+    let streamed_wav = root.join("captured-analyzer-carrier.wav");
+    fs::write(&streamed_wav, &streamed.stdout).expect("write captured analyzer stream");
+    let source_sample_bits = sox_f64_samples(&sox, &summary.r64_path)
+        .into_iter()
+        .map(f64::to_bits)
+        .collect::<Vec<_>>();
+    let streamed_sample_bits = sox_f64_samples(&sox, &streamed_wav)
+        .into_iter()
+        .map(f64::to_bits)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_sample_bits, streamed_sample_bits,
+        "f64 W64 to streamed f64 WAV re-container changed decoded sample bits"
+    );
+
+    require_sparse_file_support(&root);
+    let sparse = root.join("over-4-gib.w64");
+    let capacity_payload_bytes = create_sparse_w64_capacity_fixture(&summary.r64_path, &sparse);
+    let mut capacity_producer = producer.clone();
+    capacity_producer.input = tonepoet_pipeline::InputSource::Path(sparse.clone());
+    capacity_producer.args[2] = sparse.display().to_string();
+    let (riff_size_field, data_size_field) =
+        inspect_streaming_wav_header(&capacity_producer, &sox);
+    let capacity = run_capacity_carrier_pipeline(&capacity_producer, &sox, &ffmpeg);
+
+    serde_json::json!({
+        "status": "passed",
+        "contract": "tonepoet-reference-analyzer-carrier/v1",
+        "known_defect": {
+            "status": "reproduced",
+            "carrier": "sox_f64_w64_direct_to_ffmpeg_7_1",
+            "analytic_peak_dbfs": analytic_peak,
+            "reported_input_tp_dbtp": direct_input_tp,
+            "scaling_delta_db": defect_delta_db,
+            "expected_scaling": "2^31",
+        },
+        "corrected_path": {
+            "status": "passed",
+            "transport": "direct_stdout_to_stdin_no_shell",
+            "stream_encoding": "pcm_f64le",
+            "reported_input_tp_dbtp": corrected_input_tp,
+            "sample_exact_recontainer": true,
+            "parser": "ffmpeg_loudnorm_input_tp_v2",
+            "environment_policy": "clear_and_set",
+            "environment": {"LC_ALL": "C"},
+            "pipeline_deadline_seconds": QUALIFICATION_PIPELINE_TIMEOUT.as_secs(),
+            "termination_reap_deadline_seconds": QUALIFICATION_TERMINATION_TIMEOUT.as_secs(),
+            "failure_contract": "terminate_and_reap_or_fail",
+            "producer_argv": producer.args.clone(),
+            "consumer_input_argv": ["-f", "wav", "-i", "pipe:0"],
+            "consumer_argv": measurement.command.args.clone(),
+        },
+        "greater_than_4_gib_stream": {
+            "status": "passed",
+            "sparse_source_container": "w64",
+            "environment_policy": "clear_and_set",
+            "environment": {"LC_ALL": "C"},
+            "pipeline_deadline_seconds": QUALIFICATION_PIPELINE_TIMEOUT.as_secs(),
+            "termination_reap_deadline_seconds": QUALIFICATION_TERMINATION_TIMEOUT.as_secs(),
+            "failure_contract": "terminate_and_reap_or_fail",
+            "audio_payload_bytes": capacity_payload_bytes,
+            "riff_u32_max_bytes": u32::MAX,
+            "streaming_sentinel_floor": 0x7fff_0000_u32,
+            "riff_size_field": riff_size_field,
+            "data_size_field": data_size_field,
+            "read_to_eof": true,
+            "consumer_mode": "stream_copy_to_null",
+            "producer_exit": capacity.producer.status.code(),
+            "consumer_exit": capacity.consumer.status.code(),
+        },
+    })
+}
+
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -845,18 +1786,17 @@ fn execute_measurement(
     ffmpeg: &Path,
     root: &Path,
 ) -> TruePeakMeasurement {
-    let output = run_planned_command(&measurement.command, sox, ffmpeg);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = run_planned_measurement_pipeline(measurement, sox, ffmpeg);
+    assert!(output.producer.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.consumer.stderr);
     let raw = extract_single_loudnorm_report(&stderr)
         .unwrap_or_else(|error| panic!("production loudnorm extraction failed: {error}"));
     let report: Value = serde_json::from_str(&raw).expect("loudnorm report parses as JSON");
     let silence = report["input_tp"] == "-inf";
     if silence {
         let input = measurement
-            .command
-            .input
-            .as_path()
-            .expect("measurement input is path-backed");
+            .carrier_path()
+            .expect("measurement carrier is path-backed");
         let raw_path = root.join(format!("silence-{}.f64le", measurement.id.0));
         let scan = build_reference_silence_scan_command(input, &raw_path);
         run_planned_command(&scan, sox, ffmpeg);
@@ -1320,7 +2260,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
     let mut near_silence_finite_count = 0_usize;
     let mut cell_summary: BTreeMap<String, (usize, f64, f64)> = BTreeMap::new();
     let mut evidence_hasher = Sha256::new();
-    evidence_hasher.update(b"tonepoet-reference-analyzer-qualification/v3\0");
+    evidence_hasher.update(b"tonepoet-reference-analyzer-qualification/v4\0");
 
     for sample_rate_hz in RATES {
         for channels in CHANNELS {
@@ -2742,22 +3682,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v3 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v4 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -2772,7 +3712,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v3 policy status: {other:?}"),
+        other => panic!("unexpected v4 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
     assert_eq!(
@@ -2996,17 +3936,52 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 fn write_report_atomically(path: &Path, value: &Value) {
     let parent = path.parent().expect("qualification report has a parent");
     fs::create_dir_all(parent).expect("create qualification report directory");
-    let temporary = path.with_extension("json.tmp");
+
+    // A report is release authority. Serialize writers before creating a unique
+    // same-directory temporary so two commissioned gates cannot overwrite or
+    // rename each other's partial output.
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("qualification report filename is valid UTF-8");
+    let lock_path = parent.join(format!(".{file_name}.lock"));
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open qualification report writer lock");
+    lock.try_lock_exclusive().unwrap_or_else(|error| {
+        panic!(
+            "another qualification writer owns {}: {error}",
+            lock_path.display()
+        )
+    });
+
     let bytes = serde_json::to_vec_pretty(value).expect("serialize qualification report");
-    let mut file = File::create(&temporary).expect("create qualification report temporary");
-    file.write_all(&bytes).expect("write qualification report");
-    file.write_all(b"\n").expect("terminate qualification report");
-    file.sync_all().expect("sync qualification report temporary");
-    fs::rename(&temporary, path).expect("atomically install qualification report");
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .expect("create unique qualification report temporary");
+    temporary
+        .write_all(&bytes)
+        .expect("write qualification report");
+    temporary
+        .write_all(b"\n")
+        .expect("terminate qualification report");
+    temporary
+        .as_file()
+        .sync_all()
+        .expect("sync qualification report temporary");
+    temporary
+        .persist(path)
+        .unwrap_or_else(|error| panic!("atomically install qualification report: {error}"));
     File::open(parent)
         .expect("open qualification report parent")
         .sync_all()
         .expect("sync qualification report parent");
+    FileExt::unlock(&lock).expect("release qualification report writer lock");
 }
 
 #[test]
@@ -3015,7 +3990,9 @@ fn complete_p0_reference_qualification_report() {
         eprintln!("skipping; set {GATE}=1 to run the mandatory real-tool Reference qualification");
         return;
     }
+    let environment_probe_results = qualify_subprocess_environment_isolation();
     let (package_case_count, terminal_bound_case_count) = qualify_lossless_package_cells();
+    let analyzer_carrier_results = qualify_analyzer_carrier_contract();
     let analyzer_results = qualify_true_peak_analyzer_authority();
     let gain_terminal_results = qualify_production_measurement_gain_terminal_chain();
     let dst_counts = qualify_dst_oracle_fixture_authority();
@@ -3023,7 +4000,7 @@ fn complete_p0_reference_qualification_report() {
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v4.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -3048,12 +4025,15 @@ fn complete_p0_reference_qualification_report() {
         .count();
     let rejected_target_depth_cells = target_depth_cells.len() - supported_target_depth_cells;
     let report = serde_json::json!({
-        "schema_version": 3,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V3_KEY,
+        "schema_version": 4,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V4_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
         "in_process_backend": qualification["in_process"].clone(),
+        "subprocess_environment": qualification["subprocess_environment"].clone(),
+        "qualification_supervision": qualification["qualification_supervision"].clone(),
+        "subprocess_environment_probe": environment_probe_results,
         "dst_independent_oracle": {
             "status": "passed",
             "total_case_count": dst_counts.total,
@@ -3075,6 +4055,7 @@ fn complete_p0_reference_qualification_report() {
             "fixture_manifest_id": sacd_rs::DST_REFERENCE_FIXTURE_MANIFEST_ID,
             "fixture_provenance_id": sacd_rs::DST_REFERENCE_FIXTURE_PROVENANCE_ID,
         },
+        "analyzer_carrier": analyzer_carrier_results,
         "production_true_peak_analyzer": analyzer_results,
         "production_source_front_end_integration": source_front_end_results,
         "production_measurement_gain_terminal_chain": gain_terminal_results,

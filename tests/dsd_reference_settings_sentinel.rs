@@ -165,7 +165,7 @@ fn native_v2_immutable_identity_fields_are_serialized_and_hashed() {
     assert_eq!(encoded["dsd"]["schema_version"], 2);
     assert_eq!(
         encoded["dsd"]["from_dsd"]["reference_policy"],
-        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V3).unwrap()
+        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V4).unwrap()
     );
 
     // These fields have one legal P0 value. Pin their exact snapshot tokens so

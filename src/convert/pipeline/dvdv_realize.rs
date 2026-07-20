@@ -519,6 +519,7 @@ async fn decode_elementary_stream(
     ]);
 
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args,
         secret_args: vec![],

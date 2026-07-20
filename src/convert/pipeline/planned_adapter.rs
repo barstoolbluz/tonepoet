@@ -19,6 +19,7 @@ pub fn planned_command_to_tool_command(
         args: planned.args.clone(),
         secret_args: Vec::new(),
         cwd: None,
+        environment_policy: planned.environment_policy,
         env: planned
             .environment
             .iter()
@@ -67,11 +68,16 @@ mod tests {
         );
         let mut env = BTreeMap::new();
         env.insert("LC_ALL".to_string(), "C".to_string());
+        planned.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
         planned.environment = env;
 
         let cmd = planned_command_to_tool_command(&planned, Duration::from_secs(60)).unwrap();
         assert_eq!(cmd.binary, ToolBinary::Ssrc);
         assert_eq!(cmd.timeout, Duration::from_secs(9));
+        assert_eq!(
+            cmd.environment_policy,
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+        );
         assert_eq!(cmd.env_keys(), vec!["LC_ALL".to_string()]);
         assert_eq!(cmd.env[0].value.expose(), "C");
     }

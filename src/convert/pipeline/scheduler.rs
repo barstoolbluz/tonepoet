@@ -2255,6 +2255,7 @@ mod chunk_2_1_3_worker_recovery_tests {
 
     fn cmd(index: usize) -> ToolCommand {
         ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
             binary: ToolBinary::Ssrc,
             args: vec![format!("track-{index}")],
             secret_args: Vec::new(),

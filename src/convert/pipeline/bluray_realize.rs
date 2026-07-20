@@ -347,6 +347,7 @@ async fn realize_compressed_bluray_via_ffmpeg(
     ]);
 
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
         args,
         secret_args: vec![],
@@ -1209,6 +1210,8 @@ mod tests {
 
     fn command_record(cmd: &ToolCommand, exit: Option<ProcessExit>) -> CommandRecord {
         CommandRecord {
+            environment_policy: cmd.environment_policy,
+            environment: cmd.sanitized_environment(),
             description: None,
             binary: cmd.binary,
             sanitized_args: cmd.sanitized_args(),

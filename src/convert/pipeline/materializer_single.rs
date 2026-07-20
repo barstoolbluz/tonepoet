@@ -119,6 +119,7 @@ async fn probe_audio_file(
     cancel: &CancellationToken,
 ) -> Result<ProbeResult, MaterializeError> {
     let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
             "-v".into(),

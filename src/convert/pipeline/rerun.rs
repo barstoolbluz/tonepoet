@@ -660,6 +660,21 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
             .and_then(|route| route.get_mut("settings_fingerprint_v1"))
             .expect("legacy route settings fingerprint field");
         assert!(alter_value(fingerprint), "fingerprint JSON must contain a mutable component");
+        // The v2 parser cross-validates the route-level v1 fingerprint against
+        // every track's execution identity; mutate the tracks with the same
+        // deterministic transformation so the altered manifest stays
+        // well-formed and the decision reflects a fingerprint MISMATCH, not
+        // manifest corruption.
+        if let Some(tracks) = value.get_mut("tracks").and_then(|t| t.as_array_mut()) {
+            for track in tracks {
+                if let Some(track_fingerprint) = track
+                    .get_mut("execution_identity")
+                    .and_then(|identity| identity.get_mut("settings_fingerprint_v1"))
+                {
+                    assert!(alter_value(track_fingerprint));
+                }
+            }
+        }
     }
 
     #[test]

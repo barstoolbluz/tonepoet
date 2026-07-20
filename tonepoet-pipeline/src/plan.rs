@@ -243,6 +243,27 @@ impl MetadataPlanEffect {
     }
 }
 
+/// Environment inheritance semantics for one external command.
+///
+/// `InheritAndSet` preserves the ambient process environment and overlays the
+/// command's explicit variables. `ClearAndSet` starts from an empty environment
+/// and installs only the explicitly planned variables. Qualified Reference
+/// subprocesses use the latter so execution cannot depend on unrecorded ambient
+/// state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum CommandEnvironmentPolicy {
+    /// Preserve the parent environment, then overlay explicit variables.
+    #[default]
+    InheritAndSet,
+    /// Clear the parent environment, then install only explicit variables.
+    ClearAndSet,
+}
+
 /// One command ready for an executor to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -255,6 +276,9 @@ pub struct PlannedCommand {
     pub input: InputSource,
     /// Logical command output.
     pub output: OutputSink,
+    /// Environment inheritance policy.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub environment_policy: CommandEnvironmentPolicy,
     /// Stable environment variables requested by this command.
     pub environment: BTreeMap<String, String>,
     /// Optional progress estimate.
@@ -282,6 +306,7 @@ impl PlannedCommand {
             args,
             input,
             output,
+            environment_policy: CommandEnvironmentPolicy::InheritAndSet,
             environment: BTreeMap::new(),
             expected_duration,
             description: description.into(),
