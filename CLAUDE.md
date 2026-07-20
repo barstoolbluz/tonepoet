@@ -194,7 +194,7 @@ cargo test -p tonepoet-backend     # ffmpeg builders, integration, channels
 cargo test -p tonepoet-features    # log writer, CUE generator
 ```
 
-Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The main crate has 2500+ tests across all binaries. Run `cargo test` for the full suite.
+Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~4,600 tests across all targets (verify with `cargo test --workspace`). When checking results, NEVER truncate failure output — assert every `test result:` line shows 0 failed.
 
 ## External Tool Dependencies
 
@@ -233,7 +233,7 @@ The flake provides:
 
 ## Important Notes
 
-- **stages.rs is the largest file** (~1MB / ~27K LOC) — it contains the full pipeline stage functions, publish logic, template rendering, and conversion log assembly. processor.rs (~4K LOC) orchestrates the shared scheduler and queue processing.
+- **stages.rs is the largest file** (~2MB / ~52K lines) — it contains the full pipeline stage functions, publish logic, template rendering, and conversion log assembly. keybindings.rs (~41K lines) and app.rs (~16K lines) are the TUI giants; processor.rs (~6K lines) orchestrates the shared scheduler and queue processing.
 - The wizard crate has its own `main.rs` for standalone use but tonepoet's `main.rs` embeds the wizard directly
 - The new TUI (`src/tui/`) is the primary interface; the wizard crate is kept as-is for legacy/preset access
 - Archive passwords are configurable via `--archive-password` flag or `config.toml` — no hardcoded defaults
