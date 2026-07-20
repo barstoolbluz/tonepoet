@@ -4,31 +4,154 @@
 //! passthrough copy or a sequential command chain; this module executes that
 //! result through `ToolRunner` and applies deterministic finalization.
 
-use std::collections::HashMap;
-use std::{fs, io};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File};
+use std::io;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sacd_rs::{
+    inspect_dsd_container, open_dsd_as_decoded_reader,
+    write_decoded_dsd_to_dff_with_cancel, DsdCompression, DsdContainerFormat,
+};
+use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::{
-    plan_conversion, ConversionPlan, Finalization, PlanAction, PlanRequest, PlannedCommand,
+    build_reference_silence_scan_command, extract_single_loudnorm_report,
+    parse_reference_true_peak_measurement, plan_conversion, resolve_reference_deferred_command,
+    validate_post_final_true_peak, validate_signed_zero_f64le, ConversionPlan,
+    DsdReferencePlanSummary, DsdSourceKind, Finalization, MeasurementId, MeasurementParser,
+    PlanAction, PlanRequest, PlannedCommand, SacdAreaKind, SacdFrameEncoding,
+    PlannedDeferredCommand, PlannedExecutionStep, PlannedMeasurement, Sha256Digest,
+    ToolIdentifier, TruePeakMeasurement, TruePeakPurpose,
+};
+use tonepoet_pipeline::fingerprint::{
+    conversion_behavior_fingerprint_v1, execution_fingerprint_v1,
+    reference_source_probe_digest_v1, settings_snapshot_fingerprint_v2,
+    BehaviorFingerprintV1, ExecutionFingerprintV1, ReferenceExecutionIdentityInput,
+    SemanticPlanHashV1, SettingsSnapshotFingerprintV2,
 };
 
 use super::errors::{ConvertError, ToolRunnerError};
 use super::plan_bridge::{
-    plan_request_for_track, planner_metadata_obligations_for_track, settings_request_metadata,
+    plan_request_for_track, planner_metadata_obligations_for_track, reference_sacd_source_kind,
+    settings_request_metadata, source_info_for_realized_track,
 };
 use super::planned_adapter::{planned_command_to_tool_command, DEFAULT_PLANNED_COMMAND_TIMEOUT};
 use super::progress::{
     probes, run_streaming_tool_with_probe_with_tool_paths, OperationProgressTracker,
     StreamSource, StreamingHeartbeat,
 };
-use super::tool::{CommandRecord, EnvVar, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
-#[cfg(test)]
-use super::tool::ProcessExit;
+use super::tool::{
+    parse_tool_version_output, CommandRecord, EnvVar, ProcessExit, ToolBinary, ToolCommand,
+    ToolOutput, ToolRunner,
+};
 use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceToolIdentity {
+    pub canonical_path: PathBuf,
+    pub executable_sha256: Sha256Digest,
+    pub reported_version: String,
+    pub version_probe_command: CommandRecord,
+    pub closure_digest: Sha256Digest,
+    pub behavior_probe_digest: Sha256Digest,
+    pub behavior_probe_command: CommandRecord,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceToolchainEvidence {
+    pub qualification_manifest_digest: Sha256Digest,
+    pub sox_ng: ReferenceToolIdentity,
+    pub ffmpeg: ReferenceToolIdentity,
+    pub sacd_rs_build_identity: String,
+    pub dst_fixture_digest: Sha256Digest,
+    pub platform_abi_digest: Sha256Digest,
+    pub runtime_dispatch_digest: Sha256Digest,
+    pub reporting_uncertainty: tonepoet_pipeline::DbNano,
+    pub analyzer_residual: tonepoet_pipeline::DbNano,
+}
+
+pub(crate) fn reference_execution_identity_input(
+    toolchain: &ReferenceToolchainEvidence,
+) -> ReferenceExecutionIdentityInput {
+    ReferenceExecutionIdentityInput {
+        planner_build_identity: super::manifest::tonepoet_pipeline_version().to_string(),
+        platform_abi_digest: toolchain.platform_abi_digest,
+        runtime_dispatch_digest: toolchain.runtime_dispatch_digest,
+        sox_ng_sha256: toolchain.sox_ng.executable_sha256,
+        sox_ng_version: toolchain.sox_ng.reported_version.clone(),
+        sox_ng_closure_digest: toolchain.sox_ng.closure_digest,
+        sox_ng_behavior_probe_digest: toolchain.sox_ng.behavior_probe_digest,
+        ffmpeg_sha256: toolchain.ffmpeg.executable_sha256,
+        ffmpeg_version: toolchain.ffmpeg.reported_version.clone(),
+        ffmpeg_closure_digest: toolchain.ffmpeg.closure_digest,
+        ffmpeg_behavior_probe_digest: toolchain.ffmpeg.behavior_probe_digest,
+        sacd_rs_build_identity: toolchain.sacd_rs_build_identity.clone(),
+        dst_fixture_digest: toolchain.dst_fixture_digest,
+        reporting_uncertainty: toolchain.reporting_uncertainty,
+        analyzer_residual: toolchain.analyzer_residual,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReferenceRerunPreflightAuthority {
+    pub track_identity: super::manifest::TrackIdentity,
+    pub settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2,
+    pub resolved_output_target: tonepoet_pipeline::ResolvedOutputTarget,
+    pub policy: tonepoet_pipeline::DsdReferencePolicyVersion,
+    pub qualification_manifest_digest: Sha256Digest,
+    pub source_content_sha256: Sha256Digest,
+    pub source_probe_digest: Sha256Digest,
+    pub original_source_kind: DsdSourceKind,
+    pub front_end: tonepoet_pipeline::DsdInputFrontEnd,
+    pub behavior_fingerprint_v1: BehaviorFingerprintV1,
+    pub execution_fingerprint_v1: ExecutionFingerprintV1,
+    pub semantic_plan_hash_v1: SemanticPlanHashV1,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReferencePcmVerificationEvidence {
+    /// Canonical probe digest for the 64-bit floating render carrier.
+    pub r64_contract_digest: Sha256Digest,
+    /// Canonical probe digest for the one terminal PCM carrier.
+    pub qpcm_contract_digest: Sha256Digest,
+    /// Hash of QPCM decoded to its exact terminal PCM representation.
+    pub qpcm_sample_sha256: Sha256Digest,
+    /// Hash of the lossless packaged output decoded to the same representation.
+    pub packaged_sample_sha256: Sha256Digest,
+    /// Hash repeated after metadata/artwork/replaygain mutation. Required before manifest authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_metadata_sample_sha256: Option<Sha256Digest>,
+    /// Exact post-metadata verification invocation, retained as durable evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_metadata_verification_command: Option<CommandRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceExecutionEvidence {
+    /// Qualified original DSD source/container identity.
+    pub original_source_kind: DsdSourceKind,
+    /// SHA-256 of the original admitted source authority (the ISO for SACD).
+    pub source_content_sha256: Sha256Digest,
+    /// Canonical probe identity for source facts that select the policy cell.
+    pub source_probe_digest: Sha256Digest,
+    /// SHA-256 of the private canonical source materialization consumed by tools.
+    pub canonical_materialization_sha256: Sha256Digest,
+    /// Immutable pure-plan facts.
+    pub plan: DsdReferencePlanSummary,
+    /// Typed measurements keyed by their plan-local IDs.
+    pub measurements: BTreeMap<MeasurementId, TruePeakMeasurement>,
+    /// Exact attested toolchain and analyzer policy.
+    pub toolchain: ReferenceToolchainEvidence,
+    /// Exact fully resolved command transcript hash, including carrier and pre-metadata package verification.
+    pub resolved_command_hash: String,
+    /// Executed carrier/package sample-identity authority.
+    pub pcm_verification: ReferencePcmVerificationEvidence,
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecutedTrackPlan {
@@ -43,8 +166,10 @@ pub struct ExecutedTrackPlan {
     /// compares planner satisfaction against this per-track requirement instead
     /// of inferring source-MD5 support from file names.
     pub metadata_required: PlannedMetadataSatisfaction,
-    /// SHA-256 of the planned command sequence, for manifest rerun identity.
+    /// SHA-256 of the planned command sequence, for legacy manifest rerun identity.
     pub command_hash: Option<String>,
+    /// Native-v2 Reference execution authority, absent for all existing routes.
+    pub reference: Option<ReferenceExecutionEvidence>,
 }
 
 #[derive(Debug)]
@@ -189,6 +314,135 @@ impl Default for ToolConcurrencyLimits {
     }
 }
 
+pub(crate) async fn preflight_reference_rerun_authority(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    planned_output: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Option<ReferenceRerunPreflightAuthority>, TrackExecutionError> {
+    if !request.settings.dsd.is_native_v2()
+        || request.settings.dsd.from_dsd.pathway != tonepoet_pipeline::DsdSourcePathway::Reference
+    {
+        return Ok(None);
+    }
+
+    let presented_input = match &track.source_ref {
+        super::types::TrackSourceRef::StagedFile(path) => path.clone(),
+        super::types::TrackSourceRef::SacdTrack {
+            iso,
+            track_index,
+            ..
+        } => iso.with_file_name(format!(
+            ".tonepoet-reference-preflight-{track_index}.dsf"
+        )),
+        _ => {
+            return Ok(None);
+        }
+    };
+    let intermediate_dir = planned_output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".tonepoet-reference-preflight");
+    let plan_request = plan_request_for_track(
+        request,
+        track,
+        &presented_input,
+        planned_output,
+        intermediate_dir,
+    )?;
+    let plan = plan_conversion(&plan_request)
+        .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+    let Some(summary) = plan.reference else {
+        return Ok(None);
+    };
+    let toolchain = attest_reference_toolchain(runner, cancel, summary.front_end).await?;
+    let original_authority = match &track.source_ref {
+        super::types::TrackSourceRef::SacdTrack { iso, .. } => iso.as_path(),
+        _ => presented_input.as_path(),
+    };
+    let source_content_sha256 = stable_file_sha256_cancel(original_authority, cancel)
+        .map_err(|err| {
+            reference_materialization_error(
+                format!(
+                    "failed to admit Reference source {} for rerun preflight",
+                    original_authority.display()
+                ),
+                err,
+            )
+        })?;
+    let original_source_kind = plan_request.source.dsd_source_kind.clone().ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference rerun preflight is missing DSD source identity".to_string(),
+            ),
+            Vec::new(),
+        )
+    })?;
+    if let super::types::TrackSourceRef::SacdTrack {
+        iso,
+        track_index,
+        area,
+    } = &track.source_ref
+    {
+        let current_source_kind = reference_sacd_source_kind(iso, *track_index, *area)?;
+        if current_source_kind != original_source_kind {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference SACD TOC selection changed during rerun admission".to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+        let post_toc_sha256 = stable_file_sha256_cancel(iso, cancel).map_err(|err| {
+            reference_materialization_error(
+                format!(
+                    "failed to re-verify Reference SACD source {} after TOC admission",
+                    iso.display()
+                ),
+                err,
+            )
+        })?;
+        if post_toc_sha256 != source_content_sha256 {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference SACD source changed during rerun admission".to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+    }
+    let source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
+    let behavior_fingerprint_v1 =
+        conversion_behavior_fingerprint_v1(&summary, &original_source_kind);
+    let semantic_plan_hash_v1 = SemanticPlanHashV1(summary.semantic_plan_hash_v1);
+    let execution_fingerprint_v1 = execution_fingerprint_v1(
+        behavior_fingerprint_v1,
+        semantic_plan_hash_v1,
+        summary.qualification_manifest_digest,
+        &reference_execution_identity_input(&toolchain),
+    );
+
+    Ok(Some(ReferenceRerunPreflightAuthority {
+        track_identity: super::manifest::TrackIdentity {
+            source_ordinal: track.id.source_ordinal as usize,
+            disc_number: track.id.disc_number,
+            track_number: Some(track.id.track_number),
+        },
+        settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&request.settings),
+        resolved_output_target: summary.target,
+        policy: summary.policy,
+        qualification_manifest_digest: summary.qualification_manifest_digest,
+        source_content_sha256,
+        source_probe_digest,
+        original_source_kind,
+        front_end: summary.front_end,
+        behavior_fingerprint_v1,
+        execution_fingerprint_v1,
+        semantic_plan_hash_v1,
+    }))
+}
+
 pub async fn execute_planned_track_conversion(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -206,15 +460,115 @@ pub async fn execute_planned_track_conversion(
     let work_dir = convert_root.join(format!(".track-{:04}.work", track.id.source_ordinal));
     reset_track_work_dir(&work_dir)?;
 
-    let plan_request = plan_request_for_track(
+    let mut plan_request = plan_request_for_track(
         request,
         track,
         realized_input,
         staged_output,
         work_dir.clone(),
     )?;
-    let plan = plan_conversion(&plan_request)
+    // Run the pure planner first so unsupported cells fail deterministically
+    // before any source copy, DST decode, executable probe, or process launch.
+    let admitted_source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
+    let admitted_plan = plan_conversion(&plan_request)
         .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+    let reference_toolchain = if let Some(summary) = admitted_plan.reference.as_ref() {
+        Some(attest_reference_toolchain(runner, cancel, summary.front_end).await?)
+    } else {
+        None
+    };
+    let reference_materialization = if admitted_plan.reference.is_some() {
+        let materialization = materialize_reference_source(
+            &plan_request,
+            track,
+            realized_input,
+            &work_dir,
+            cancel,
+        )
+        .await?;
+        let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
+        let admitted_target = plan_request.resolved_output_target;
+        let admitted_scope = plan_request.reference_programme_scope.clone();
+        let admitted_summary = admitted_plan.reference.as_ref().ok_or_else(|| {
+            TrackExecutionError::new(
+                ConvertError::Backend("Reference plan authority is missing".to_string()),
+                Vec::new(),
+            )
+        })?;
+        let materialized_source = source_info_for_realized_track(track, &materialization.path)?;
+        if !materialized_source.codec.is_dsd()
+            || materialized_source.sample_rate_hz != plan_request.source.sample_rate_hz
+            || materialized_source.channels != plan_request.source.channels
+            || materialized_source.sample_kind != Some(tonepoet_pipeline::SampleKind::Dsd)
+        {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference private materialization changed the admitted DSD rate, channel count, or representation"
+                        .to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+
+        // Rebind only the immutable private input path and carrier facts. Keep
+        // the original container/front-end identity: DSDIFF/DST and SACD/DST
+        // must remain qualified decode operations even though their private
+        // carrier is now uncompressed DSDIFF/DSD or DSF.
+        let mut rematerialized = plan_request.clone();
+        rematerialized.input_path = materialization.path.clone();
+        rematerialized.source.format = materialized_source.format;
+        rematerialized.source.codec = materialized_source.codec;
+        rematerialized.source.sample_rate_hz = materialized_source.sample_rate_hz;
+        rematerialized.source.bit_depth = materialized_source.bit_depth;
+        rematerialized.source.true_source_depth = materialized_source.true_source_depth;
+        rematerialized.source.source_representation = materialized_source.source_representation;
+        rematerialized.source.sample_kind = materialized_source.sample_kind;
+        rematerialized.source.channels = materialized_source.channels;
+        rematerialized.source.duration = materialized_source.duration;
+        rematerialized.source.audio_md5 = materialized_source.audio_md5;
+        rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
+        if rematerialized.resolved_output_target != admitted_target
+            || rematerialized.reference_programme_scope != admitted_scope
+        {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference target or programme authority changed during materialization"
+                        .to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+        let rematerialized_plan = plan_conversion(&rematerialized)
+            .map_err(|err| ConvertError::Backend(format!("planner failed after materialization: {err}")))?;
+        let rematerialized_summary = rematerialized_plan.reference.as_ref().ok_or_else(|| {
+            TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference authority disappeared after source materialization".to_string(),
+                ),
+                Vec::new(),
+            )
+        })?;
+        if admitted_summary.semantic_plan_hash_v1 != rematerialized_summary.semantic_plan_hash_v1
+            || admitted_summary.policy != rematerialized_summary.policy
+            || admitted_summary.qualification_manifest_digest
+                != rematerialized_summary.qualification_manifest_digest
+        {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference semantic plan changed during source materialization".to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+        plan_request = rematerialized;
+        Some((materialization, rematerialized_plan))
+    } else {
+        None
+    };
+    let plan = reference_materialization
+        .as_ref()
+        .map(|(_, plan)| plan.clone())
+        .unwrap_or(admitted_plan);
     let command_hash = super::manifest::planned_command_hash(&plan).ok();
     let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
     let metadata_required = planner_metadata_obligations_for_track(request, &plan_request);
@@ -251,25 +605,61 @@ pub async fn execute_planned_track_conversion(
                 metadata_satisfaction,
                 metadata_required,
                 command_hash: command_hash.clone(),
+                reference: None,
             })
         }
         PlanAction::Execute {
             commands,
+            steps,
             finalization,
             ..
         } => {
-            let commands = execute_commands(
-                commands,
-                runner,
-                cancel,
-                tool_paths,
-                tool_concurrency_limits,
-                progress,
-                start_fraction,
-                end_fraction,
-                track_label(track),
-            )
-            .await?;
+            let (commands, reference_runtime) = if steps.is_empty() {
+                (
+                    execute_commands(
+                        commands,
+                        runner,
+                        cancel,
+                        tool_paths,
+                        tool_concurrency_limits,
+                        progress,
+                        start_fraction,
+                        end_fraction,
+                        track_label(track),
+                    )
+                    .await?,
+                    None,
+                )
+            } else {
+                let runtime = execute_reference_steps(
+                    steps,
+                    plan.reference.as_ref().ok_or_else(|| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "measurement-aware plan is missing Reference authority".to_string(),
+                            ),
+                            Vec::new(),
+                        )
+                    })?,
+                    runner,
+                    cancel,
+                    tool_paths,
+                    tool_concurrency_limits,
+                    progress,
+                    start_fraction,
+                    end_fraction,
+                    track_label(track),
+                    &work_dir,
+                    reference_toolchain.as_ref().ok_or_else(|| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend("Reference toolchain evidence is missing".to_string()),
+                            Vec::new(),
+                        )
+                    })?,
+                )
+                .await?;
+                (runtime.commands.clone(), Some(runtime))
+            };
             if let Some(finalization) = finalization {
                 if let Err(err) = apply_finalization(finalization) {
                     return Err(TrackExecutionError::new(err, commands));
@@ -282,12 +672,40 @@ pub async fn execute_planned_track_conversion(
                     format!("Finished track {}", track.id.source_ordinal),
                 )
                 .await;
+            let reference = match (reference_materialization.as_ref(), reference_toolchain, reference_runtime, plan.reference.clone()) {
+                (Some((materialization, _)), Some(toolchain), Some(runtime), Some(summary)) => Some(ReferenceExecutionEvidence {
+                    original_source_kind: plan_request.source.dsd_source_kind.clone().ok_or_else(|| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend("Reference source identity is missing after materialization".to_string()),
+                            commands.clone(),
+                        )
+                    })?,
+                    source_content_sha256: materialization.source_content_sha256,
+                    source_probe_digest: admitted_source_probe_digest,
+                    canonical_materialization_sha256: materialization.canonical_materialization_sha256,
+                    plan: summary,
+                    measurements: runtime.measurements,
+                    toolchain,
+                    resolved_command_hash: runtime.resolved_command_hash,
+                    pcm_verification: runtime.pcm_verification,
+                }),
+                (None, None, None, None) => None,
+                _ => {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference plan/materialization/runtime authority is incomplete".to_string(),
+                        ),
+                        commands,
+                    ));
+                }
+            };
             Ok(ExecutedTrackPlan {
                 commands,
                 elapsed: started.elapsed(),
                 metadata_satisfaction,
                 metadata_required,
                 command_hash,
+                reference,
             })
         }
     };
@@ -337,6 +755,3610 @@ fn effective_metadata_satisfaction(
                 })
             }),
     }
+}
+
+
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReferenceQualification {
+    schema_version: u32,
+    policy: String,
+    status: String,
+    sox_ng: EmbeddedQualifiedSox,
+    ffmpeg: EmbeddedQualifiedFfmpeg,
+    in_process: EmbeddedInProcessIdentity,
+    analyzer: EmbeddedAnalyzerAuthority,
+    profiles: EmbeddedReferenceProfiles,
+    terminal_bounds: EmbeddedTerminalBounds,
+    riff_capacity: EmbeddedRiffCapacity,
+    cell_contract: EmbeddedQualifiedCellContract,
+    qualification_report: EmbeddedQualificationReport,
+    release_certification: EmbeddedReleaseCertification,
+    qualification_basis: String,
+    runtime_activation: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedQualificationReport {
+    schema: String,
+    path: String,
+    sha256: String,
+    guidance_sha256: String,
+    decimation_report_sha256: String,
+    commission_sha256: String,
+    amendment_sha256: String,
+    expanded_supported_cell_count: u64,
+    expanded_supported_cell_digest: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReleaseCertification {
+    schema: String,
+    path: String,
+    candidate_manifest_path: String,
+    report_sha256: Option<String>,
+    candidate_manifest_sha256: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedQualifiedSox {
+    version: String,
+    revision: String,
+    nar_hash: String,
+    required_probe_markers: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedQualifiedFfmpeg {
+    major_version: u32,
+    package_attribute: String,
+    nixpkgs_revision: String,
+    nixpkgs_nar_hash: String,
+    required_probe_markers: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedInProcessIdentity {
+    sacd_rs_build_identity: String,
+    dst_fixture_digest: String,
+    dst_fixture_manifest_digest: String,
+    dst_fixture_provenance_digest: String,
+    commission_attestation_digest: String,
+    qualification_method: String,
+    dst_case_count: u32,
+    six_channel_decoder_only_cases: u32,
+    standards_literal_oracle_sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedAnalyzerAuthority {
+    reporting_uncertainty_db: tonepoet_pipeline::DbNano,
+    analyzer_residual_db: tonepoet_pipeline::DbNano,
+    qualification_schema: String,
+    required_case_count: u64,
+    target_rates_hz: Vec<u32>,
+    channels: Vec<u16>,
+    normalized_frequencies_cycles_per_sample: Vec<String>,
+    phases_radians: Vec<String>,
+    analytic_true_peak_levels_dbfs: Vec<String>,
+    durations_seconds: Vec<String>,
+    peak_positions: Vec<String>,
+    waveform_families: Vec<String>,
+    aligned_multitone_normalized_frequencies_cycles_per_sample: Vec<String>,
+    aligned_multitone_peak_offsets_samples: Vec<String>,
+    aligned_multitone_duration_seconds: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedRiffCapacity {
+    max_file_bytes: u64,
+    muxer_structure_upper_bound_bytes: u64,
+    metadata_expansion_factor: u64,
+    source_derived_tag_artwork_upper_bound: String,
+    admission_rule: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReferenceProfiles {
+    b1: EmbeddedIntegratedProfile,
+    b2: EmbeddedIntegratedProfile,
+    b3: EmbeddedSincProfile,
+    b4: EmbeddedSincProfile,
+    b4w: EmbeddedSincProfile,
+    b5: EmbeddedSincProfile,
+    b6: EmbeddedDisabledSincProfile,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedIntegratedProfile {
+    kind: String,
+    target_rate_hz: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedSincProfile {
+    passband_hz: u32,
+    transition_hz: u32,
+    center_hz: u32,
+    stopband_hz: u32,
+    attenuation_db: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedDisabledSincProfile {
+    passband_hz: u32,
+    transition_hz: u32,
+    center_hz: u32,
+    stopband_hz: u32,
+    attenuation_db: u32,
+    enabled: bool,
+}
+
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedQualifiedCellContract {
+    schema: String,
+    source_kinds: Vec<String>,
+    source_rates_hz: Vec<u32>,
+    source_rate_channel_cells: Vec<EmbeddedSourceRateChannelCell>,
+    channels: Vec<u16>,
+    gain_modes: Vec<String>,
+    profile_cells: Vec<EmbeddedProfileCell>,
+    target_depth_cells: Vec<EmbeddedTargetDepthCell>,
+    package_compression_levels: Vec<EmbeddedPackageCompressionLevels>,
+    package_required_args: Vec<EmbeddedPackageRequiredArgs>,
+    expanded_supported_cell_count: u64,
+    expanded_supported_cell_digest: String,
+    qualification_dimensions: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedSourceRateChannelCell {
+    source_kind: String,
+    source_rate_hz: u32,
+    channels: u16,
+    result: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedProfileCell {
+    source_rate_hz: u32,
+    selection: String,
+    target_rate_hz: u32,
+    result: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedTargetDepthCell {
+    target: String,
+    depth: String,
+    result: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedPackageCompressionLevels {
+    target: String,
+    levels: Vec<Option<u8>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedPackageRequiredArgs {
+    target: String,
+    depth: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedTerminalBounds {
+    target_rates_hz: Vec<u32>,
+    derivation_schema: String,
+    int16_shibata: EmbeddedTerminalBound,
+    int24_tpdf: EmbeddedTerminalBound,
+    float32: EmbeddedTerminalBound,
+    float64: EmbeddedTerminalBound,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedTerminalBound {
+    realization: String,
+    max_added_peak_fs_q63_ceil: u64,
+    safe_pre_terminal_ceiling_dbtp: tonepoet_pipeline::DbNano,
+}
+
+fn validate_embedded_release_certification(
+    manifest: &EmbeddedReferenceQualification,
+) -> Result<(), TrackExecutionError> {
+    let certification = &manifest.release_certification;
+    if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
+        || certification.path
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_certification.json"
+        || certification.candidate_manifest_path
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_candidate.json"
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification descriptor is not canonical",
+        ));
+    }
+    let report_sha256 = certification.report_sha256.as_deref().ok_or_else(|| {
+        reference_toolchain_error(
+            "the embedded v3 policy has not bound a release-certification report",
+        )
+    })?;
+    let candidate_manifest_sha256 = certification
+        .candidate_manifest_sha256
+        .as_deref()
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded v3 policy has not bound its qualified candidate manifest",
+            )
+        })?;
+    let current_manifest_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+    ));
+    let report_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_certification.json"
+    ));
+    let candidate_manifest_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_candidate.json"
+    ));
+    let parse_digest = |label: &str, value: &str| {
+        Sha256Digest::from_hex(value).map_err(|error| {
+            reference_toolchain_error(format!(
+                "invalid {label} SHA-256 in release certification: {error}"
+            ))
+        })
+    };
+    if parse_digest("report", report_sha256)? != Sha256Digest::of_bytes(report_bytes) {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report hash does not match its bytes",
+        ));
+    }
+    if parse_digest("candidate manifest", candidate_manifest_sha256)?
+        != Sha256Digest::of_bytes(candidate_manifest_bytes)
+    {
+        return Err(reference_toolchain_error(
+            "the embedded qualified-candidate manifest hash does not match its preserved bytes",
+        ));
+    }
+    let mut normalized_current: serde_json::Value =
+        serde_json::from_slice(current_manifest_bytes).map_err(|error| {
+            reference_toolchain_error(format!(
+                "the embedded current v3 manifest is invalid JSON: {error}"
+            ))
+        })?;
+    let candidate_value: serde_json::Value =
+        serde_json::from_slice(candidate_manifest_bytes).map_err(|error| {
+            reference_toolchain_error(format!(
+                "the embedded preserved v3 candidate is invalid JSON: {error}"
+            ))
+        })?;
+    if candidate_value.get("status").and_then(serde_json::Value::as_str)
+        != Some("qualification_candidate")
+        || candidate_value
+            .pointer("/release_certification/report_sha256")
+            .is_none_or(|value| !value.is_null())
+        || candidate_value
+            .pointer("/release_certification/candidate_manifest_sha256")
+            .is_none_or(|value| !value.is_null())
+    {
+        return Err(reference_toolchain_error(
+            "the preserved v3 candidate is not the canonical unpromoted policy snapshot",
+        ));
+    }
+    normalized_current["status"] =
+        serde_json::Value::String("qualification_candidate".to_string());
+    normalized_current["release_certification"]["report_sha256"] =
+        serde_json::Value::Null;
+    normalized_current["release_certification"]["candidate_manifest_sha256"] =
+        serde_json::Value::Null;
+    if normalized_current != candidate_value {
+        return Err(reference_toolchain_error(
+            "the promoted v3 manifest differs from its qualified candidate outside the permitted certification fields",
+        ));
+    }
+    let report: serde_json::Value = serde_json::from_slice(report_bytes).map_err(|error| {
+        reference_toolchain_error(format!(
+            "the embedded release-certification report is invalid JSON: {error}"
+        ))
+    })?;
+    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(3)
+        || report.get("policy").and_then(serde_json::Value::as_str)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V3_KEY)
+        || report.get("status").and_then(serde_json::Value::as_str) != Some("passed")
+        || report.get("outcome").and_then(serde_json::Value::as_str) != Some("pass")
+        || report
+            .get("qualification_manifest_digest")
+            .and_then(serde_json::Value::as_str)
+            != Some(candidate_manifest_sha256)
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report does not bind the qualified v3 candidate",
+        ));
+    }
+    for required in [
+        "toolchain",
+        "production_true_peak_analyzer",
+        "production_measurement_gain_terminal_chain",
+        "production_source_front_end_integration",
+        "dst_independent_oracle",
+        "package_decode_back",
+        "qualified_cell_contract",
+    ] {
+        if report.get(required).is_none() {
+            return Err(reference_toolchain_error(format!(
+                "the embedded release-certification report omits {required}"
+            )));
+        }
+    }
+    let toolchain = report.get("toolchain").and_then(serde_json::Value::as_object);
+    if toolchain
+        .and_then(|value| value.get("integrated_rate_profiles"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        != Some(2)
+        || toolchain
+            .and_then(|value| value.get("explicit_composite_profiles"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            != Some(5)
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has incomplete D1 profile evidence",
+        ));
+    }
+    let analyzer = report
+        .get("production_true_peak_analyzer")
+        .and_then(serde_json::Value::as_object);
+    let analyzer_rates = [
+        44_100_u64, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        705_600, 768_000,
+    ];
+    let analyzer_channels = [1_u64, 2];
+    let analyzer_case_count = analyzer
+        .and_then(|value| value.get("case_count"))
+        .and_then(serde_json::Value::as_u64);
+    let analyzer_under = analyzer
+        .and_then(|value| value.get("worst_under_report_db"))
+        .and_then(serde_json::Value::as_f64);
+    let analyzer_authority = analyzer
+        .and_then(|value| value.get("one_sided_authority_db"))
+        .and_then(serde_json::Value::as_f64);
+    let analyzer_digest_valid = analyzer
+        .and_then(|value| value.get("evidence_digest"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    let analyzer_cells_valid = analyzer
+        .and_then(|value| value.get("per_rate_channel"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|cells| {
+            let expected = analyzer_rates
+                .into_iter()
+                .flat_map(|rate| analyzer_channels.into_iter().map(move |channels| format!("{rate}/{channels}")))
+                .collect::<BTreeSet<_>>();
+            let actual = cells
+                .iter()
+                .filter_map(|cell| {
+                    let key = cell.get("cell")?.as_str()?;
+                    let count = cell.get("case_count")?.as_u64()?;
+                    let under = cell.get("worst_under_report_db")?.as_f64()?;
+                    let over = cell.get("worst_over_report_db")?.as_f64()?;
+                    if count != 60 || under > 0.110_000_001 || !over.is_finite() {
+                        return None;
+                    }
+                    Some(key.to_string())
+                })
+                .collect::<BTreeSet<_>>();
+            cells.len() == expected.len() && actual == expected
+        });
+    if !analyzer_cells_valid
+        || analyzer.and_then(|value| value.get("status")).and_then(serde_json::Value::as_str)
+        != Some("passed")
+        || analyzer_case_count != Some(manifest.analyzer.required_case_count)
+        || analyzer
+            .and_then(|value| value.get("required_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(manifest.analyzer.required_case_count)
+        || analyzer
+            .and_then(|value| value.get("single_tone_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(960)
+        || analyzer
+            .and_then(|value| value.get("phase_aligned_multitone_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(240)
+        || analyzer
+            .and_then(|value| value.get("waveform_families"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                !values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .eq(["single_tone", "phase_aligned_multitone"])
+            })
+        || analyzer
+            .and_then(|value| value.get("rates_hz"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                !values
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .eq(analyzer_rates)
+            })
+        || analyzer
+            .and_then(|value| value.get("channels"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                !values
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .eq(analyzer_channels)
+            })
+        || analyzer
+            .and_then(|value| value.get("normalized_frequencies_cycles_per_sample"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                let expected = [0.25_f64, 0.45];
+                values.len() != expected.len()
+                    || values
+                        .iter()
+                        .zip(expected)
+                        .any(|(value, expected)| {
+                            value
+                                .as_f64()
+                                .is_none_or(|actual| (actual - expected).abs() > 1e-12)
+                        })
+            })
+        || analyzer
+            .and_then(|value| value.get("phases_radians"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                let expected = [0.0_f64, std::f64::consts::FRAC_PI_4];
+                values.len() != expected.len()
+                    || values
+                        .iter()
+                        .zip(expected)
+                        .any(|(value, expected)| {
+                            value
+                                .as_f64()
+                                .is_none_or(|actual| (actual - expected).abs() > 1e-12)
+                        })
+            })
+        || analyzer
+            .and_then(|value| value.get("analytic_true_peak_levels_dbfs"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                let expected = [-120.003_f64, -12.003, -0.5];
+                values.len() != expected.len()
+                    || values
+                        .iter()
+                        .zip(expected)
+                        .any(|(value, expected)| {
+                            value
+                                .as_f64()
+                                .is_none_or(|actual| (actual - expected).abs() > 1e-12)
+                        })
+            })
+        || analyzer
+            .and_then(|value| value.get("durations_seconds"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                let expected = [0.125_f64, 0.5];
+                values.len() != expected.len()
+                    || values
+                        .iter()
+                        .zip(expected)
+                        .any(|(value, expected)| {
+                            value
+                                .as_f64()
+                                .is_none_or(|actual| (actual - expected).abs() > 1e-12)
+                        })
+            })
+        || analyzer
+            .and_then(|value| value.get("peak_positions"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                !values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .eq(["early", "late"])
+            })
+        || analyzer
+            .and_then(|value| value.get("aligned_multitone_normalized_frequencies_cycles_per_sample"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                let expected = [0.03125_f64, 0.1171875, 0.2734375, 0.4453125];
+                values.len() != expected.len()
+                    || values.iter().zip(expected).any(|(value, expected)| {
+                        value
+                            .as_f64()
+                            .is_none_or(|actual| (actual - expected).abs() > 1e-12)
+                    })
+            })
+        || analyzer
+            .and_then(|value| value.get("aligned_multitone_peak_offsets_samples"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|values| {
+                let expected = [0.25_f64, 0.75];
+                values.len() != expected.len()
+                    || values.iter().zip(expected).any(|(value, expected)| {
+                        value
+                            .as_f64()
+                            .is_none_or(|actual| (actual - expected).abs() > 1e-12)
+                    })
+            })
+        || analyzer
+            .and_then(|value| value.get("aligned_multitone_duration_seconds"))
+            .and_then(serde_json::Value::as_f64)
+            .is_none_or(|value| (value - 0.25).abs() > 1e-12)
+        || analyzer_under.is_none_or(|under| under > 0.110_000_001)
+        || analyzer_authority.is_none_or(|authority| (authority - 0.11).abs() > 1e-12)
+        || analyzer
+            .and_then(|value| value.get("maximum_intersample_delta_db"))
+            .and_then(serde_json::Value::as_f64)
+            .is_none_or(|delta| delta <= 2.8)
+        || analyzer
+            .and_then(|value| value.get("monotonic_per_cell"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || analyzer
+            .and_then(|value| value.get("nonzero_near_silence_remained_finite"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || !analyzer_digest_valid
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has incomplete analyzer evidence",
+        ));
+    }
+    let chain = report
+        .get("production_measurement_gain_terminal_chain")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report has no production gain chain",
+            )
+        })?;
+    for required in [
+        "planner_render_end_to_end",
+        "reference_constrained",
+        "native_exact",
+        "fixed_exact",
+        "normalize",
+        "verified_silence",
+        "dither_semantics",
+        "native_unsafe_refusal",
+        "fixed_unsafe_refusal",
+        "strict_parser_input_tp_and_q_plus_e",
+    ] {
+        if !chain.contains_key(required) {
+            return Err(reference_toolchain_error(format!(
+                "the embedded release-certification report omits production chain case {required}"
+            )));
+        }
+    }
+    let source_integration = report
+        .get("production_source_front_end_integration")
+        .and_then(serde_json::Value::as_object);
+    let native_source_matrix_valid = source_integration
+        .and_then(|value| value.get("native_cases"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|rows| {
+            let expected = ["dsf_uncompressed", "dsdiff_uncompressed"]
+                .into_iter()
+                .flat_map(|kind| {
+                    [2_822_400_u64, 5_644_800, 11_289_600]
+                        .into_iter()
+                        .flat_map(move |rate| [1_u64, 2].into_iter().map(move |channels| (kind, rate, channels)))
+                })
+                .collect::<BTreeSet<_>>();
+            let actual = rows
+                .iter()
+                .filter_map(|row| {
+                    let kind = row.get("source_kind")?.as_str()?;
+                    let rate = row.get("source_rate_hz")?.as_u64()?;
+                    let channels = row.get("channels")?.as_u64()?;
+                    let source_sha256 = row.get("source_sha256")?.as_str()?;
+                    let materialized_sha256 = row.get("materialized_sha256")?.as_str()?;
+                    let identity = row.get("materialization_identity_digest")?.as_str()?;
+                    if row.get("hard_link")?.as_bool()?
+                        || row.get("planner_render")?.as_str()? != "passed"
+                        || source_sha256 != materialized_sha256
+                        || ![source_sha256, materialized_sha256, identity]
+                            .into_iter()
+                            .all(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                        || row
+                            .get("render_args_sha256")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|digest| digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    {
+                        return None;
+                    }
+                    Some((kind, rate, channels))
+                })
+                .collect::<BTreeSet<_>>();
+            rows.len() == expected.len() && actual == expected
+        });
+    if !native_source_matrix_valid
+        || source_integration
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        != Some("passed")
+        || source_integration
+            .and_then(|value| value.get("native_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(12)
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("source_rate_hz"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(2_822_400)
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("channels"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(2)
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("cmpr_classification"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("dstc_verification"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("canonical_dff_readback"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("planner_render"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("render_args_sha256"))
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|digest| {
+                digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("executed_evidence_binding_schema"))
+            .and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-executed-evidence/v2")
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("materialization_identity_tamper_rejected"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || source_integration
+            .and_then(|value| value.get("dsdiff_dst")).and_then(|value| value.get("materialization_identity_digest"))
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|digest| {
+                digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        || source_integration
+            .and_then(|value| value.get("sacd_dsd"))
+            .and_then(serde_json::Value::as_str)
+            != Some("unavailable:DSD-REF-P0-023")
+        || source_integration
+            .and_then(|value| value.get("sacd_dst"))
+            .and_then(serde_json::Value::as_str)
+            != Some("unavailable:DSD-REF-P0-023")
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has incomplete production source-front-end evidence",
+        ));
+    }
+    let dst = report
+        .get("dst_independent_oracle")
+        .and_then(serde_json::Value::as_object);
+    if dst.and_then(|value| value.get("status")).and_then(serde_json::Value::as_str)
+        != Some("passed")
+        || dst
+            .and_then(|value| value.get("total_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(12)
+        || dst
+            .and_then(|value| value.get("predictive_independent_oracle_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(6)
+        || dst
+            .and_then(|value| value.get("predictive_stereo_reference_oracle_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(3)
+        || dst
+            .and_then(|value| value.get("predictive_six_channel_decoder_only_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(3)
+        || dst
+            .and_then(|value| value.get("standards_literal_geometry_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(6)
+        || dst
+            .and_then(|value| value.get("predictive_reference_cells"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|cells| {
+                cells.len() != 1
+                    || cells[0].get("source_rate_hz").and_then(serde_json::Value::as_u64)
+                        != Some(2_822_400)
+                    || cells[0].get("channels").and_then(serde_json::Value::as_u64)
+                        != Some(2)
+            })
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has incomplete or overstated DST evidence",
+        ));
+    }
+    let packages = report
+        .get("package_decode_back")
+        .and_then(serde_json::Value::as_object);
+    if packages
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        != Some("passed")
+        || packages
+            .and_then(|value| value.get("case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(480)
+        || packages
+            .and_then(|value| value.get("empirical_terminal_bound_case_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(60)
+        || packages
+            .and_then(|value| value.get("package_stream_copy_metadata_sample_identity"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || packages
+            .and_then(|value| value.get("production_metadata_mutator_qualification"))
+            .and_then(serde_json::Value::as_str)
+            != Some("not claimed; production retains mandatory post-mutation decoded-sample verification")
+        || packages
+            .and_then(|value| value.get("command_authority"))
+            .and_then(serde_json::Value::as_str)
+            != Some("exact PlannedExecutionStep vectors from plan_reference_dsd")
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has incomplete package/terminal evidence",
+        ));
+    }
+    let cells = report
+        .get("qualified_cell_contract")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report has no cell contract",
+            )
+        })?;
+    if cells
+        .get("expanded_supported_cell_count")
+        .and_then(serde_json::Value::as_u64)
+        != Some(manifest.cell_contract.expanded_supported_cell_count)
+        || cells
+            .get("expanded_supported_cell_digest")
+            .and_then(serde_json::Value::as_str)
+            != Some(manifest.cell_contract.expanded_supported_cell_digest.as_str())
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report disagrees with the v3 cell contract",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_embedded_reference_policy_tables(
+    manifest: &EmbeddedReferenceQualification,
+) -> Result<(), TrackExecutionError> {
+    use tonepoet_pipeline::{
+        resolve_reference_profile, terminal_realization_bound, typed_b6_profile,
+        DsdRate, DsdReconstructionSelection, PcmBitDepth, ResolvedDsdProfile,
+    };
+
+    const ANALYZER_RATES: [u32; 10] = [
+        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        705_600, 768_000,
+    ];
+    const ANALYZER_CHANNELS: [u16; 2] = [1, 2];
+    const ANALYZER_FREQUENCIES: [&str; 2] = ["0.250000000", "0.450000000"];
+    const ANALYZER_PHASES: [&str; 2] = ["0.0000000000000000", "0.7853981633974483"];
+    const ANALYZER_LEVELS: [&str; 3] = ["-120.003000000", "-12.003000000", "-0.500000000"];
+    const ANALYZER_DURATIONS: [&str; 2] = ["0.125000000", "0.500000000"];
+    const ANALYZER_POSITIONS: [&str; 2] = ["early", "late"];
+    const ANALYZER_WAVEFORMS: [&str; 2] = ["single_tone", "phase_aligned_multitone"];
+    const ANALYZER_MULTITONE_FREQUENCIES: [&str; 4] = [
+        "0.031250000",
+        "0.117187500",
+        "0.273437500",
+        "0.445312500",
+    ];
+    const ANALYZER_MULTITONE_OFFSETS: [&str; 2] = ["0.250000000", "0.750000000"];
+    if manifest.analyzer.qualification_schema
+        != "tonepoet-reference-analyzer-qualification/v3"
+        || manifest.analyzer.required_case_count != 1_200
+        || manifest.analyzer.target_rates_hz.as_slice() != ANALYZER_RATES.as_slice()
+        || manifest.analyzer.channels.as_slice() != ANALYZER_CHANNELS.as_slice()
+        || !manifest
+            .analyzer
+            .normalized_frequencies_cycles_per_sample
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_FREQUENCIES)
+        || !manifest
+            .analyzer
+            .phases_radians
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_PHASES)
+        || !manifest
+            .analyzer
+            .analytic_true_peak_levels_dbfs
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_LEVELS)
+        || !manifest
+            .analyzer
+            .durations_seconds
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_DURATIONS)
+        || !manifest
+            .analyzer
+            .peak_positions
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_POSITIONS)
+        || !manifest
+            .analyzer
+            .waveform_families
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_WAVEFORMS)
+        || !manifest
+            .analyzer
+            .aligned_multitone_normalized_frequencies_cycles_per_sample
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_MULTITONE_FREQUENCIES)
+        || !manifest
+            .analyzer
+            .aligned_multitone_peak_offsets_samples
+            .iter()
+            .map(String::as_str)
+            .eq(ANALYZER_MULTITONE_OFFSETS)
+        || manifest.analyzer.aligned_multitone_duration_seconds != "0.250000000"
+    {
+        return Err(reference_toolchain_error(
+            "embedded analyzer qualification matrix disagrees with the compiled v3 policy",
+        ));
+    }
+
+    if manifest.riff_capacity.max_file_bytes
+        != tonepoet_pipeline::REFERENCE_RIFF_MAX_FILE_BYTES
+        || manifest.riff_capacity.muxer_structure_upper_bound_bytes
+            != tonepoet_pipeline::REFERENCE_RIFF_MUXER_STRUCTURE_UPPER_BOUND_BYTES
+        || manifest.riff_capacity.metadata_expansion_factor
+            != tonepoet_pipeline::REFERENCE_RIFF_METADATA_EXPANSION_FACTOR
+        || manifest
+            .riff_capacity
+            .source_derived_tag_artwork_upper_bound
+            .trim()
+            .is_empty()
+        || manifest.riff_capacity.admission_rule.trim().is_empty()
+    {
+        return Err(reference_toolchain_error(
+            "embedded RIFF capacity authority disagrees with the compiled policy",
+        ));
+    }
+
+    if manifest.profiles.b1.kind != "integrated_rate_u"
+        || manifest.profiles.b1.target_rate_hz != 44_100
+        || resolve_reference_profile(
+            DsdRate::Dsd64,
+            44_100,
+            DsdReconstructionSelection::Reference,
+        )
+        .map_err(|err| reference_toolchain_error(format!(
+            "compiled B1 policy cannot be resolved: {err}"
+        )))?
+            != ResolvedDsdProfile::B1RateOnly
+        || manifest.profiles.b2.kind != "integrated_rate_u"
+        || manifest.profiles.b2.target_rate_hz != 48_000
+        || resolve_reference_profile(
+            DsdRate::Dsd64,
+            48_000,
+            DsdReconstructionSelection::Reference,
+        )
+        .map_err(|err| reference_toolchain_error(format!(
+            "compiled B2 policy cannot be resolved: {err}"
+        )))?
+            != ResolvedDsdProfile::B2RateOnly
+    {
+        return Err(reference_toolchain_error(
+            "embedded integrated-rate profiles disagree with the compiled policy",
+        ));
+    }
+
+    let compiled_profiles = [
+        (
+            "b3",
+            resolve_reference_profile(
+                DsdRate::Dsd64,
+                176_400,
+                DsdReconstructionSelection::Reference,
+            )
+            .map_err(|err| reference_toolchain_error(format!(
+                "compiled B3 policy cannot be resolved: {err}"
+            )))?,
+            &manifest.profiles.b3,
+        ),
+        (
+            "b4",
+            resolve_reference_profile(
+                DsdRate::Dsd128,
+                176_400,
+                DsdReconstructionSelection::Reference,
+            )
+            .map_err(|err| reference_toolchain_error(format!(
+                "compiled B4 policy cannot be resolved: {err}"
+            )))?,
+            &manifest.profiles.b4,
+        ),
+        (
+            "b4w",
+            resolve_reference_profile(
+                DsdRate::Dsd128,
+                176_400,
+                DsdReconstructionSelection::Wideband,
+            )
+            .map_err(|err| reference_toolchain_error(format!(
+                "compiled B4W policy cannot be resolved: {err}"
+            )))?,
+            &manifest.profiles.b4w,
+        ),
+        (
+            "b5",
+            resolve_reference_profile(
+                DsdRate::Dsd256,
+                176_400,
+                DsdReconstructionSelection::Reference,
+            )
+            .map_err(|err| reference_toolchain_error(format!(
+                "compiled B5 policy cannot be resolved: {err}"
+            )))?,
+            &manifest.profiles.b5,
+        ),
+    ];
+    for (name, compiled, embedded) in compiled_profiles {
+        validate_embedded_sinc_profile(name, compiled, embedded)?;
+    }
+
+    let b6 = &manifest.profiles.b6;
+    let b6_common = EmbeddedSincProfile {
+        passband_hz: b6.passband_hz,
+        transition_hz: b6.transition_hz,
+        center_hz: b6.center_hz,
+        stopband_hz: b6.stopband_hz,
+        attenuation_db: b6.attenuation_db,
+    };
+    validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
+    if b6.enabled {
+        return Err(reference_toolchain_error(
+            "embedded B6 profile must remain typed but disabled under policy v3",
+        ));
+    }
+
+    let terminal_bounds = [
+        (
+            "int16_shibata",
+            PcmBitDepth::Int16,
+            &manifest.terminal_bounds.int16_shibata,
+        ),
+        (
+            "int24_tpdf",
+            PcmBitDepth::Int24,
+            &manifest.terminal_bounds.int24_tpdf,
+        ),
+        (
+            "float32",
+            PcmBitDepth::Float32,
+            &manifest.terminal_bounds.float32,
+        ),
+        (
+            "float64",
+            PcmBitDepth::Float64,
+            &manifest.terminal_bounds.float64,
+        ),
+    ];
+    const P0_TARGET_RATES_HZ: [u32; 10] = [
+        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        705_600, 768_000,
+    ];
+    if manifest.terminal_bounds.target_rates_hz != P0_TARGET_RATES_HZ
+        || manifest.terminal_bounds.derivation_schema
+            != "tonepoet-reference-terminal-bound/v2"
+    {
+        return Err(reference_toolchain_error(
+            "embedded terminal-bound cell domain disagrees with the compiled policy",
+        ));
+    }
+    for (name, depth, embedded) in terminal_bounds {
+        let expected_realization = match depth {
+            PcmBitDepth::Int16 => "int16-shibata-unqualified-no-conservative-bound",
+            PcmBitDepth::Int24 => "int24-tpdf-2lsb",
+            PcmBitDepth::Float32 => "float32-2^-23",
+            PcmBitDepth::Float64 => "float64-2^-51",
+            PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
+                return Err(reference_toolchain_error(
+                    "compiled terminal-bound table contains an unsupported depth",
+                ));
+            }
+        };
+        if embedded.realization != expected_realization {
+            return Err(reference_toolchain_error(format!(
+                "embedded terminal realization {name} disagrees with the compiled policy"
+            )));
+        }
+        for target_rate_hz in P0_TARGET_RATES_HZ {
+            let compiled = terminal_realization_bound(target_rate_hz, depth);
+            if embedded.max_added_peak_fs_q63_ceil != compiled.max_added_peak_fs_q63_ceil
+                || embedded.safe_pre_terminal_ceiling_dbtp
+                    != compiled.safe_pre_terminal_ceiling_dbtp
+            {
+                return Err(reference_toolchain_error(format!(
+                    "embedded terminal bound {name} at {target_rate_hz} Hz disagrees with the compiled policy"
+                )));
+            }
+        }
+    }
+
+    validate_embedded_reference_cell_contract(&manifest.cell_contract)?;
+    validate_embedded_qualification_report(manifest)?;
+
+    Ok(())
+}
+
+
+fn validate_embedded_qualification_report(
+    manifest: &EmbeddedReferenceQualification,
+) -> Result<(), TrackExecutionError> {
+    let report = &manifest.qualification_report;
+    let report_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_report.md"
+    ));
+    let guidance = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md"
+    ));
+    let decimation = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/sox_ng_dsd_decimation_test_report_v5.md"
+    ));
+    let commission = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/brief_dsd_reference_p0_scope_and_commission.md"
+    ));
+    let amendment = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/brief_dsd_reference_p0_policy_v3_amendment.md"
+    ));
+    let parse = |label: &str, value: &str| {
+        Sha256Digest::from_hex(value).map_err(|error| {
+            reference_toolchain_error(format!(
+                "invalid embedded {label} qualification digest: {error}"
+            ))
+        })
+    };
+    if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
+        || report.path
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_report.md"
+        || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
+        || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
+        || parse("decimation report", &report.decimation_report_sha256)?
+            != Sha256Digest::of_bytes(decimation)
+        || parse("commission", &report.commission_sha256)?
+            != Sha256Digest::of_bytes(commission)
+        || parse("v3 amendment", &report.amendment_sha256)?
+            != Sha256Digest::of_bytes(amendment)
+        || report.expanded_supported_cell_count
+            != manifest.cell_contract.expanded_supported_cell_count
+        || report.expanded_supported_cell_digest
+            != manifest.cell_contract.expanded_supported_cell_digest
+    {
+        return Err(reference_toolchain_error(
+            "embedded policy qualification report/evidence does not match the manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn embedded_error_code(error: &impl std::fmt::Display) -> String {
+    let rendered = error.to_string();
+    rendered
+        .split(|character: char| character.is_whitespace() || character == ':' || character == ',')
+        .find(|token| token.starts_with("DSD-REF-P0-"))
+        .map_or_else(|| format!("error:unclassified:{rendered}"), |code| format!("error:{code}"))
+}
+
+fn embedded_target_from_key(key: &str) -> Option<tonepoet_pipeline::ResolvedOutputTarget> {
+    use tonepoet_pipeline::ResolvedOutputTarget as Target;
+    Some(match key {
+        "flac_native" => Target::FlacNative,
+        "wav_riff" => Target::WavRiff,
+        "wav_rf64" => Target::WavRf64,
+        "wav_w64" => Target::WavW64,
+        "aiff_native" => Target::AiffNative,
+        "wavpack_native" => Target::WavPackNative,
+        "alac_m4a" => Target::AlacM4a,
+        _ => return None,
+    })
+}
+
+fn embedded_depth_from_key(key: &str) -> Option<tonepoet_pipeline::PcmBitDepth> {
+    use tonepoet_pipeline::PcmBitDepth as Depth;
+    Some(match key {
+        "int16" => Depth::Int16,
+        "int24" => Depth::Int24,
+        "float32" => Depth::Float32,
+        "float64" => Depth::Float64,
+        _ => return None,
+    })
+}
+
+fn validate_embedded_reference_cell_contract(
+    contract: &EmbeddedQualifiedCellContract,
+) -> Result<(), TrackExecutionError> {
+    use tonepoet_pipeline::{
+        resolve_reference_profile, validate_reference_target_depth, DsdRate,
+        DsdReconstructionSelection,
+    };
+
+    const SOURCE_KINDS: [&str; 5] = [
+        "dsf_uncompressed",
+        "dsdiff_uncompressed",
+        "dsdiff_dst",
+        "sacd_dsd",
+        "sacd_dst",
+    ];
+    const SOURCE_RATES: [u32; 3] = [2_822_400, 5_644_800, 11_289_600];
+    const CHANNELS: [u16; 2] = [1, 2];
+    const GAIN_MODES: [&str; 4] = ["reference", "native_level", "fixed", "normalize_peak"];
+    const TARGET_RATES: [u32; 10] = [
+        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        705_600, 768_000,
+    ];
+    const TARGETS: [&str; 7] = [
+        "flac_native",
+        "wav_riff",
+        "wav_rf64",
+        "wav_w64",
+        "aiff_native",
+        "wavpack_native",
+        "alac_m4a",
+    ];
+    const DEPTHS: [&str; 4] = ["int16", "int24", "float32", "float64"];
+    const DIMENSIONS: [&str; 10] = [
+        "source_kind",
+        "source_rate_hz",
+        "channels",
+        "profile_selection",
+        "target_rate_hz",
+        "resolved_profile",
+        "target",
+        "depth",
+        "package_compression_level",
+        "gain_mode",
+    ];
+
+    if contract.schema != "tonepoet-dsd-reference-qualified-cells/v3"
+        || !contract
+            .source_kinds
+            .iter()
+            .map(String::as_str)
+            .eq(SOURCE_KINDS)
+        || contract.source_rates_hz.as_slice() != SOURCE_RATES.as_slice()
+        || contract.channels.as_slice() != CHANNELS.as_slice()
+        || !contract
+            .gain_modes
+            .iter()
+            .map(String::as_str)
+            .eq(GAIN_MODES)
+        || !contract
+            .qualification_dimensions
+            .iter()
+            .map(String::as_str)
+            .eq(DIMENSIONS)
+    {
+        return Err(reference_toolchain_error(
+            "embedded qualified-cell dimensions disagree with the compiled P0 contract",
+        ));
+    }
+
+    let mut source_cell_index = 0_usize;
+    let mut supported_source_cells = BTreeSet::new();
+    for source_kind in SOURCE_KINDS {
+        for source_rate_hz in SOURCE_RATES {
+            for channels in CHANNELS {
+                let embedded = contract
+                    .source_rate_channel_cells
+                    .get(source_cell_index)
+                    .ok_or_else(|| {
+                        reference_toolchain_error(
+                            "embedded source-kind/rate/channel matrix is truncated",
+                        )
+                    })?;
+                source_cell_index += 1;
+                if embedded.source_kind != source_kind
+                    || embedded.source_rate_hz != source_rate_hz
+                    || embedded.channels != channels
+                {
+                    return Err(reference_toolchain_error(
+                        "embedded source-kind/rate/channel ordering disagrees with policy",
+                    ));
+                }
+                let expected = match source_kind {
+                    "dsf_uncompressed" | "dsdiff_uncompressed" => "supported",
+                    "dsdiff_dst" if source_rate_hz == 2_822_400 && channels == 2 => {
+                        "supported"
+                    }
+                    "dsdiff_dst" => "error:DSD-REF-P0-021",
+                    "sacd_dsd" | "sacd_dst" => "error:DSD-REF-P0-023",
+                    _ => unreachable!("source-kind table is fixed above"),
+                };
+                if embedded.result != expected {
+                    return Err(reference_toolchain_error(format!(
+                        "embedded source-kind/rate/channel cell {source_kind}/{source_rate_hz}/{channels} disagrees with compiled result: embedded={}, compiled={expected}",
+                        embedded.result,
+                    )));
+                }
+                if expected == "supported" {
+                    supported_source_cells.insert((source_kind, source_rate_hz, channels));
+                }
+            }
+        }
+    }
+    if source_cell_index != contract.source_rate_channel_cells.len() {
+        return Err(reference_toolchain_error(
+            "embedded source-kind/rate/channel matrix contains extra rows",
+        ));
+    }
+
+    let mut profile_index = 0_usize;
+    let mut supported_profiles = Vec::new();
+    let mut seen_profiles = BTreeSet::new();
+    for (source_rate_hz, source_rate) in [
+        (2_822_400, DsdRate::Dsd64),
+        (5_644_800, DsdRate::Dsd128),
+        (11_289_600, DsdRate::Dsd256),
+    ] {
+        for (selection_key, selection) in [
+            ("reference", DsdReconstructionSelection::Reference),
+            ("wideband", DsdReconstructionSelection::Wideband),
+        ] {
+            for target_rate_hz in TARGET_RATES {
+                let embedded = contract.profile_cells.get(profile_index).ok_or_else(|| {
+                    reference_toolchain_error("embedded profile-cell matrix is truncated")
+                })?;
+                profile_index += 1;
+                if embedded.source_rate_hz != source_rate_hz
+                    || embedded.selection != selection_key
+                    || embedded.target_rate_hz != target_rate_hz
+                    || !seen_profiles.insert((source_rate_hz, selection_key, target_rate_hz))
+                {
+                    return Err(reference_toolchain_error(
+                        "embedded profile-cell ordering or uniqueness disagrees with policy",
+                    ));
+                }
+                let compiled = match resolve_reference_profile(source_rate, target_rate_hz, selection) {
+                    Ok(profile) => profile.key().to_string(),
+                    Err(error) => embedded_error_code(&error),
+                };
+                if embedded.result != compiled {
+                    return Err(reference_toolchain_error(format!(
+                        "embedded profile cell {source_rate_hz}/{selection_key}/{target_rate_hz} disagrees with compiled result: embedded={}, compiled={compiled}",
+                        embedded.result,
+                    )));
+                }
+                if !compiled.starts_with("error:") {
+                    supported_profiles.push((
+                        source_rate_hz,
+                        selection_key,
+                        target_rate_hz,
+                        compiled,
+                    ));
+                }
+            }
+        }
+    }
+    if profile_index != contract.profile_cells.len() {
+        return Err(reference_toolchain_error(
+            "embedded profile-cell matrix contains extra rows",
+        ));
+    }
+
+    let mut target_depth_index = 0_usize;
+    let mut supported_target_depths = Vec::new();
+    let mut seen_target_depths = BTreeSet::new();
+    for target_key in TARGETS {
+        let target = embedded_target_from_key(target_key).ok_or_else(|| {
+            reference_toolchain_error(format!(
+                "compiled target key table omitted {target_key}"
+            ))
+        })?;
+        for depth_key in DEPTHS {
+            let depth = embedded_depth_from_key(depth_key).ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "compiled depth key table omitted {depth_key}"
+                ))
+            })?;
+            let embedded = contract
+                .target_depth_cells
+                .get(target_depth_index)
+                .ok_or_else(|| {
+                    reference_toolchain_error("embedded target/depth matrix is truncated")
+                })?;
+            target_depth_index += 1;
+            if embedded.target != target_key
+                || embedded.depth != depth_key
+                || !seen_target_depths.insert((target_key, depth_key))
+            {
+                return Err(reference_toolchain_error(
+                    "embedded target/depth ordering or uniqueness disagrees with policy",
+                ));
+            }
+            let compiled = match validate_reference_target_depth(target, depth) {
+                Ok(()) => "supported".to_string(),
+                Err(error) => embedded_error_code(&error),
+            };
+            if embedded.result != compiled {
+                return Err(reference_toolchain_error(format!(
+                    "embedded target/depth cell {target_key}/{depth_key} disagrees with compiled result: embedded={}, compiled={compiled}",
+                    embedded.result,
+                )));
+            }
+            if compiled == "supported" {
+                supported_target_depths.push((target_key, depth_key));
+            }
+        }
+    }
+    if target_depth_index != contract.target_depth_cells.len() {
+        return Err(reference_toolchain_error(
+            "embedded target/depth matrix contains extra rows",
+        ));
+    }
+
+    let expected_compression_levels: [(&str, &[Option<u8>]); 7] = [
+        (
+            "flac_native",
+            &[Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8)],
+        ),
+        ("wav_riff", &[None]),
+        ("wav_rf64", &[None]),
+        ("wav_w64", &[None]),
+        ("aiff_native", &[None]),
+        ("wavpack_native", &[Some(0), Some(1), Some(2), Some(3)]),
+        ("alac_m4a", &[None]),
+    ];
+    if contract.package_compression_levels.len() != expected_compression_levels.len() {
+        return Err(reference_toolchain_error(
+            "embedded package-compression matrix has the wrong size",
+        ));
+    }
+    for (embedded, (target, levels)) in contract
+        .package_compression_levels
+        .iter()
+        .zip(expected_compression_levels)
+    {
+        if embedded.target != target || embedded.levels.as_slice() != levels {
+            return Err(reference_toolchain_error(format!(
+                "embedded package-compression levels for {target} disagree with policy"
+            )));
+        }
+    }
+
+    let expected_required_args = [(
+        "wavpack_native",
+        "int24",
+        ["-bits_per_raw_sample", "24"],
+    )];
+    if contract.package_required_args.len() != expected_required_args.len() {
+        return Err(reference_toolchain_error(
+            "embedded package-required-argv table has the wrong size",
+        ));
+    }
+    for (embedded, (target, depth, args)) in contract
+        .package_required_args
+        .iter()
+        .zip(expected_required_args)
+    {
+        if embedded.target != target
+            || embedded.depth != depth
+            || !embedded.args.iter().map(String::as_str).eq(args)
+        {
+            return Err(reference_toolchain_error(format!(
+                "embedded required package argv for {target}/{depth} disagrees with policy"
+            )));
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-dsd-reference-expanded-cells/v3\0");
+    let mut count = 0_u64;
+    for source_kind in SOURCE_KINDS {
+        for channels in CHANNELS {
+            for (source_rate_hz, selection, target_rate_hz, profile) in &supported_profiles {
+                if !supported_source_cells.contains(&(source_kind, *source_rate_hz, channels)) {
+                    continue;
+                }
+                for (target, depth) in &supported_target_depths {
+                    let levels = expected_compression_levels
+                        .iter()
+                        .find_map(|(candidate, levels)| (*candidate == *target).then_some(*levels))
+                        .ok_or_else(|| {
+                            reference_toolchain_error(format!(
+                                "compiled compression-level table omitted {target}"
+                            ))
+                        })?;
+                    for level in levels {
+                        let level = (*level)
+                            .map_or_else(|| "none".to_string(), |value| value.to_string());
+                        for gain_mode in GAIN_MODES {
+                            hasher.update(format!(
+                                "{source_kind}|{source_rate_hz}|{channels}|{selection}|{target_rate_hz}|{profile}|{target}|{depth}|{level}|{gain_mode}\n"
+                            ));
+                            count = count.checked_add(1).ok_or_else(|| {
+                                reference_toolchain_error("qualified-cell count overflow")
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    if count != contract.expanded_supported_cell_count
+        || digest != contract.expanded_supported_cell_digest
+    {
+        return Err(reference_toolchain_error(format!(
+            "expanded qualified-cell authority disagrees with compiled policy: embedded={}/{}, compiled={count}/{digest}",
+            contract.expanded_supported_cell_count,
+            contract.expanded_supported_cell_digest,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_embedded_sinc_profile(
+    name: &str,
+    compiled: tonepoet_pipeline::ResolvedDsdProfile,
+    embedded: &EmbeddedSincProfile,
+) -> Result<(), TrackExecutionError> {
+    let Some((transition_hz, center_hz)) = compiled.sinc() else {
+        return Err(reference_toolchain_error(format!(
+            "compiled profile {name} is not an explicit-sinc profile"
+        )));
+    };
+    let Some(passband_hz) = compiled.passband_hz() else {
+        return Err(reference_toolchain_error(format!(
+            "compiled profile {name} has no passband edge"
+        )));
+    };
+    let Some(stopband_hz) = compiled.stopband_hz() else {
+        return Err(reference_toolchain_error(format!(
+            "compiled profile {name} has no stopband edge"
+        )));
+    };
+    if embedded.passband_hz != passband_hz
+        || embedded.transition_hz != transition_hz
+        || embedded.center_hz != center_hz
+        || embedded.stopband_hz != stopband_hz
+        || embedded.attenuation_db != 180
+    {
+        return Err(reference_toolchain_error(format!(
+            "embedded profile {name} disagrees with the compiled PB/TW/center/stopband/attenuation contract"
+        )));
+    }
+    Ok(())
+}
+
+async fn attest_reference_toolchain(
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    front_end: tonepoet_pipeline::DsdInputFrontEnd,
+) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
+    let raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+    ));
+    let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
+        reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
+    })?;
+    if manifest.schema_version != 3
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V3_KEY
+        || manifest.status != "qualified_release"
+    {
+        return Err(reference_toolchain_error(
+            "the embedded policy artifact is not a qualified v3 release",
+        ));
+    }
+    validate_embedded_release_certification(&manifest)?;
+    if manifest.qualification_basis.trim().is_empty()
+        || manifest.runtime_activation.trim().is_empty()
+    {
+        return Err(reference_toolchain_error(
+            "the embedded qualification basis/runtime activation contract is empty",
+        ));
+    }
+    validate_embedded_reference_policy_tables(&manifest)?;
+
+    let (locked_sox_revision, locked_sox_nar_hash) = embedded_flake_lock_input("sox_ng")?;
+    if manifest.sox_ng.version != tonepoet_pipeline::DSD_REFERENCE_SOX_NG_VERSION
+        || manifest.sox_ng.revision != tonepoet_pipeline::DSD_REFERENCE_SOX_NG_REVISION
+        || manifest.sox_ng.revision != locked_sox_revision
+        || manifest.sox_ng.nar_hash != locked_sox_nar_hash
+    {
+        return Err(reference_toolchain_error(
+            "the embedded SoX-ng source lock does not match the immutable policy",
+        ));
+    }
+
+    let (locked_nixpkgs_revision, locked_nixpkgs_nar_hash) = embedded_flake_lock_input("nixpkgs")?;
+    if manifest.ffmpeg.major_version != 7
+        || manifest.ffmpeg.package_attribute != "ffmpeg_7-full"
+        || manifest.ffmpeg.nixpkgs_revision != locked_nixpkgs_revision
+        || manifest.ffmpeg.nixpkgs_nar_hash != locked_nixpkgs_nar_hash
+    {
+        return Err(reference_toolchain_error(
+            "the embedded FFmpeg package lock does not match the immutable policy",
+        ));
+    }
+
+    let front_end_requires_attestation = !matches!(
+        front_end,
+        tonepoet_pipeline::DsdInputFrontEnd::NativeUncompressed
+    );
+    if front_end_requires_attestation {
+        if manifest.in_process.sacd_rs_build_identity != sacd_rs::REFERENCE_BUILD_ID {
+            return Err(reference_front_end_error(
+                "the in-process SACD/DST implementation does not match the qualified source identity",
+            ));
+        }
+        let expected_fixture_identity =
+            format!("sha256:{}", manifest.in_process.dst_fixture_digest);
+        let expected_fixture_manifest_identity =
+            format!("sha256:{}", manifest.in_process.dst_fixture_manifest_digest);
+        let expected_fixture_provenance_identity =
+            format!("sha256:{}", manifest.in_process.dst_fixture_provenance_digest);
+        let commission_attestation_digest = Sha256Digest::of_bytes(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/docs/brief_dsd_reference_p0_scope_and_commission.md"
+            ))
+            .as_bytes(),
+        );
+        let expected_commission_attestation_digest = Sha256Digest::from_hex(
+            &manifest.in_process.commission_attestation_digest,
+        )
+        .map_err(|err| {
+            reference_front_end_error(format!(
+                "invalid commission attestation digest: {err}"
+            ))
+        })?;
+        if expected_fixture_identity != sacd_rs::DST_REFERENCE_FIXTURE_CORPUS_ID
+            || expected_fixture_manifest_identity != sacd_rs::DST_REFERENCE_FIXTURE_MANIFEST_ID
+            || expected_fixture_provenance_identity
+                != sacd_rs::DST_REFERENCE_FIXTURE_PROVENANCE_ID
+            || commission_attestation_digest != expected_commission_attestation_digest
+            || manifest.in_process.qualification_method
+                != "compressed_dsd64_independent_oracle_plus_standards_literal_geometry_corpus"
+            || manifest.in_process.dst_case_count != 12
+            || manifest.in_process.six_channel_decoder_only_cases != 4
+            || manifest.in_process.standards_literal_oracle_sha256
+                != Sha256Digest::of_bytes(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/crates/sacd-rs/src/dst/fixtures/verify_p0_raw_oracle.py"
+                )))
+                .to_hex()
+        {
+            return Err(reference_front_end_error(
+                "the in-process DST fixture/provenance authority does not match the qualified release",
+            ));
+        }
+    }
+
+    if manifest.analyzer.reporting_uncertainty_db < tonepoet_pipeline::DbNano::ZERO
+        || manifest.analyzer.analyzer_residual_db < tonepoet_pipeline::DbNano::ZERO
+    {
+        return Err(reference_toolchain_error(
+            "qualified analyzer bounds must be non-negative",
+        ));
+    }
+
+    let sox_ng = attest_external_reference_tool(
+        ToolBinary::Sox,
+        &manifest.sox_ng.version,
+        None,
+        &manifest.sox_ng.required_probe_markers,
+        runner,
+        cancel,
+    )
+    .await?;
+    let ffmpeg = attest_external_reference_tool(
+        ToolBinary::Ffmpeg,
+        "",
+        Some(manifest.ffmpeg.major_version),
+        &manifest.ffmpeg.required_probe_markers,
+        runner,
+        cancel,
+    )
+    .await?;
+
+    let platform_abi_digest = reference_platform_abi_digest();
+    let runtime_dispatch_digest = reference_runtime_dispatch_digest();
+    let actual_fixture_digest = sacd_rs::DST_REFERENCE_FIXTURE_CORPUS_ID
+        .strip_prefix("sha256:")
+        .ok_or_else(|| reference_toolchain_error(
+            "the in-process DST fixture identity is not a SHA-256 authority",
+        ))?;
+    let dst_fixture_digest = Sha256Digest::from_hex(actual_fixture_digest)
+        .map_err(|err| reference_toolchain_error(format!("invalid DST fixture digest: {err}")))?;
+    let qualification_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
+    if qualification_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
+        return Err(reference_toolchain_error(
+            "compiled and packaged qualification digests disagree",
+        ));
+    }
+
+    Ok(ReferenceToolchainEvidence {
+        qualification_manifest_digest,
+        sox_ng,
+        ffmpeg,
+        sacd_rs_build_identity: sacd_rs::REFERENCE_BUILD_ID.to_string(),
+        dst_fixture_digest,
+        platform_abi_digest,
+        runtime_dispatch_digest,
+        reporting_uncertainty: manifest.analyzer.reporting_uncertainty_db,
+        analyzer_residual: manifest.analyzer.analyzer_residual_db,
+    })
+}
+
+fn embedded_flake_lock_input(input: &str) -> Result<(String, String), TrackExecutionError> {
+    let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/flake.lock"));
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| reference_toolchain_error(format!("flake.lock is invalid: {err}")))?;
+    let root_key = value
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| reference_toolchain_error("flake.lock has no root node"))?;
+    let input_node = value
+        .pointer(&format!("/nodes/{root_key}/inputs/{input}"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| reference_toolchain_error(format!("flake.lock has no {input} input")))?;
+    let locked = value
+        .pointer(&format!("/nodes/{input_node}/locked"))
+        .ok_or_else(|| reference_toolchain_error(format!("flake.lock {input} input is unlocked")))?;
+    let revision = locked
+        .get("rev")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| reference_toolchain_error(format!("flake.lock {input} revision is absent")))?;
+    let nar_hash = locked
+        .get("narHash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| reference_toolchain_error(format!("flake.lock {input} narHash is absent")))?;
+    Ok((revision.to_string(), nar_hash.to_string()))
+}
+
+async fn attest_external_reference_tool(
+    binary: ToolBinary,
+    exact_version: &str,
+    required_major_version: Option<u32>,
+    required_probe_markers: &[String],
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<ReferenceToolIdentity, TrackExecutionError> {
+    if !runner.tool_available(binary) {
+        return Err(reference_toolchain_error(format!(
+            "{} is not available",
+            binary.canonical_name()
+        )));
+    }
+    let path = runner.resolved_tool_path(binary).ok_or_else(|| {
+        reference_toolchain_error(format!(
+            "{} runner cannot prove the executable path it will spawn",
+            binary.canonical_name()
+        ))
+    })?;
+    let policy_path = resolve_policy_owned_reference_tool_path(binary).map_err(|err| {
+        reference_toolchain_error(format!(
+            "could not resolve policy-owned {}: {err}",
+            binary.canonical_name()
+        ))
+    })?;
+    let compiled_path = compiled_reference_executable_path(binary).map_err(|err| {
+        reference_toolchain_error(format!(
+            "could not resolve the compiled {} closure: {err}",
+            binary.canonical_name()
+        ))
+    })?;
+    if path != policy_path || path != compiled_path {
+        return Err(reference_toolchain_error(format!(
+            "{} runner path {}, activation path {}, and compiled closure path {} do not match",
+            binary.canonical_name(),
+            path.display(),
+            policy_path.display(),
+            compiled_path.display()
+        )));
+    }
+    let executable_sha256 = stable_file_sha256(&path).map_err(|err| {
+        reference_toolchain_error(format!("could not hash {}: {err}", path.display()))
+    })?;
+    let version_probe = reference_version_probe_command(binary)?;
+    let version_output = runner
+        .run(version_probe, cancel)
+        .await
+        .map_err(|err| reference_toolchain_error(format!(
+            "{} version probe failed: {err}",
+            binary.canonical_name()
+        )))?;
+    if version_output.exit != ProcessExit::Code(0) {
+        return Err(reference_toolchain_error(format!(
+            "{} version probe did not exit successfully",
+            binary.canonical_name()
+        )));
+    }
+    let reported_version = parse_tool_version_output(
+        binary,
+        &version_output.stdout_tail,
+        &version_output.stderr_tail,
+    )
+    .ok_or_else(|| {
+        reference_toolchain_error(format!(
+            "{} did not report a parseable version",
+            binary.canonical_name()
+        ))
+    })?;
+    if !exact_version.is_empty() && reported_version != exact_version {
+        return Err(reference_toolchain_error(format!(
+            "{} reported version {reported_version}, expected {exact_version}",
+            binary.canonical_name()
+        )));
+    }
+    if let Some(required_major) = required_major_version {
+        let actual_major = reported_version
+            .split('.')
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "{} reported an unparseable version {reported_version}",
+                    binary.canonical_name()
+                ))
+            })?;
+        let required_for_binary = match binary {
+            ToolBinary::Ffmpeg => required_major,
+            _ => actual_major,
+        };
+        if actual_major != required_for_binary {
+            return Err(reference_toolchain_error(format!(
+                "{} reported major version {actual_major}, expected {required_for_binary}",
+                binary.canonical_name()
+            )));
+        }
+    }
+
+    let probe = reference_behavior_probe_command(binary)?;
+    let output = runner
+        .run(probe, cancel)
+        .await
+        .map_err(|err| reference_toolchain_error(format!(
+            "{} behavior probe failed: {err}",
+            binary.canonical_name()
+        )))?;
+    if output.exit != ProcessExit::Code(0) {
+        return Err(reference_toolchain_error(format!(
+            "{} behavior probe did not exit successfully",
+            binary.canonical_name()
+        )));
+    }
+    let probe_text = format!("{}\n{}", output.stdout_tail, output.stderr_tail).to_lowercase();
+    for marker in required_probe_markers {
+        if !probe_text.contains(&marker.to_lowercase()) {
+            return Err(reference_toolchain_error(format!(
+                "{} behavior probe omitted required marker {marker:?}",
+                binary.canonical_name()
+            )));
+        }
+    }
+    let behavior_probe_digest = Sha256Digest::of_bytes(
+        format!(
+            "tonepoet-reference-tool-probe/v1\0{}\0{}\0{}",
+            binary.canonical_name(),
+            output.command.sanitized_args.join("\0"),
+            probe_text.trim()
+        )
+        .as_bytes(),
+    );
+    let closure_digest =
+        reference_installation_identity(binary, &path, executable_sha256, &reported_version)?;
+
+    Ok(ReferenceToolIdentity {
+        canonical_path: path,
+        executable_sha256,
+        reported_version,
+        version_probe_command: version_output.command,
+        closure_digest,
+        behavior_probe_digest,
+        behavior_probe_command: output.command,
+    })
+}
+
+fn reference_version_probe_command(
+    binary: ToolBinary,
+) -> Result<ToolCommand, TrackExecutionError> {
+    let args = match binary {
+        ToolBinary::Sox => vec!["--version".to_string()],
+        ToolBinary::Ffmpeg => vec!["-version".to_string()],
+        _ => {
+            return Err(reference_toolchain_error(format!(
+                "{} has no Reference version probe",
+                binary.canonical_name()
+            )))
+        }
+    };
+    Ok(ToolCommand {
+        binary,
+        args,
+        secret_args: Vec::new(),
+        cwd: None,
+        env: vec![EnvVar {
+            key: "LC_ALL".to_string(),
+            value: super::types::SecretString::new("C"),
+            secret: false,
+        }],
+        timeout: Duration::from_secs(10),
+    })
+}
+
+fn reference_behavior_probe_command(
+    binary: ToolBinary,
+) -> Result<ToolCommand, TrackExecutionError> {
+    let args = match binary {
+        ToolBinary::Sox => vec!["--help-effect".to_string(), "sinc".to_string()],
+        ToolBinary::Ffmpeg => vec![
+            "-hide_banner".to_string(),
+            "-h".to_string(),
+            "filter=loudnorm".to_string(),
+        ],
+        _ => {
+            return Err(reference_toolchain_error(format!(
+                "{} has no Reference behavior probe",
+                binary.canonical_name()
+            )))
+        }
+    };
+    Ok(ToolCommand {
+        binary,
+        args,
+        secret_args: Vec::new(),
+        cwd: None,
+        env: vec![EnvVar {
+            key: "LC_ALL".to_string(),
+            value: super::types::SecretString::new("C"),
+            secret: false,
+        }],
+        timeout: Duration::from_secs(10),
+    })
+}
+
+fn compiled_reference_store_path(binary: ToolBinary) -> Option<&'static str> {
+    match binary {
+        ToolBinary::Sox => option_env!("TONEPOET_REFERENCE_SOX_STORE_PATH"),
+        ToolBinary::Ffmpeg => option_env!("TONEPOET_REFERENCE_FFMPEG_STORE_PATH"),
+        _ => None,
+    }
+}
+
+fn compiled_reference_executable_path(binary: ToolBinary) -> io::Result<PathBuf> {
+    let store = compiled_reference_store_path(binary).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "the binary was not built with an immutable {} Reference store binding",
+                binary.canonical_name()
+            ),
+        )
+    })?;
+    let executable = match binary {
+        ToolBinary::Sox => "sox",
+        ToolBinary::Ffmpeg => "ffmpeg",
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} has no Reference executable binding", binary.canonical_name()),
+            ));
+        }
+    };
+    fs::canonicalize(Path::new(store).join("bin").join(executable))
+}
+
+fn reference_installation_identity(
+    binary: ToolBinary,
+    path: &Path,
+    executable_sha256: Sha256Digest,
+    reported_version: &str,
+) -> Result<Sha256Digest, TrackExecutionError> {
+    let store = compiled_reference_store_path(binary).ok_or_else(|| {
+        reference_toolchain_error(format!(
+            "the binary lacks an immutable {} Reference store binding",
+            binary.canonical_name()
+        ))
+    })?;
+    let installation = format!(
+        "nix-store-closure/v2\0{}\0{}\0{}\0{}",
+        store,
+        path.display(),
+        executable_sha256.to_hex(),
+        reported_version
+    );
+    Ok(Sha256Digest::of_bytes(installation.as_bytes()))
+}
+
+fn resolve_policy_owned_reference_tool_path(binary: ToolBinary) -> io::Result<PathBuf> {
+    let packaged_env = match binary {
+        ToolBinary::Sox => Some("TONEPOET_REFERENCE_SOX_PATH"),
+        ToolBinary::Ffmpeg => Some("TONEPOET_REFERENCE_FFMPEG_PATH"),
+        _ => None,
+    };
+    let variable = packaged_env.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no Reference package binding", binary.canonical_name()),
+        )
+    })?;
+    let path = std::env::var_os(variable).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{variable} is not set; run the packaged binary or qualified dev shell"),
+        )
+    })?;
+    fs::canonicalize(path)
+}
+
+fn reference_platform_abi_digest() -> Sha256Digest {
+    let identity = format!(
+        "tonepoet-reference-platform-abi/v1\0{}\0{}\0{}\0{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::consts::FAMILY,
+        std::mem::size_of::<usize>() * 8,
+    );
+    Sha256Digest::of_bytes(identity.as_bytes())
+}
+
+fn reference_runtime_dispatch_digest() -> Sha256Digest {
+    let mut features = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        for (name, enabled) in [
+            ("sse2", std::is_x86_feature_detected!("sse2")),
+            ("sse3", std::is_x86_feature_detected!("sse3")),
+            ("ssse3", std::is_x86_feature_detected!("ssse3")),
+            ("sse4.1", std::is_x86_feature_detected!("sse4.1")),
+            ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
+            ("avx", std::is_x86_feature_detected!("avx")),
+            ("avx2", std::is_x86_feature_detected!("avx2")),
+            ("fma", std::is_x86_feature_detected!("fma")),
+        ] {
+            if enabled {
+                features.push(name);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for (name, enabled) in [
+            ("neon", std::arch::is_aarch64_feature_detected!("neon")),
+        ] {
+            if enabled {
+                features.push(name);
+            }
+        }
+    }
+    let identity = format!(
+        "tonepoet-reference-runtime-dispatch/v1\0{}\0{}",
+        std::env::consts::ARCH,
+        features.join(",")
+    );
+    Sha256Digest::of_bytes(identity.as_bytes())
+}
+
+
+fn reference_front_end_error(detail: impl AsRef<str>) -> TrackExecutionError {
+    TrackExecutionError::new(
+        ConvertError::Backend(format!(
+            "{} ({})",
+            tonepoet_pipeline::reference_error_text(
+                tonepoet_pipeline::ReferenceErrorCode::FrontEndUnattested,
+            ),
+            detail.as_ref()
+        )),
+        Vec::new(),
+    )
+}
+
+fn reference_toolchain_error(detail: impl AsRef<str>) -> TrackExecutionError {
+    TrackExecutionError::new(
+        ConvertError::Backend(format!(
+            "{} ({})",
+            tonepoet_pipeline::reference_error_text(
+                tonepoet_pipeline::ReferenceErrorCode::Toolchain,
+            ),
+            detail.as_ref()
+        )),
+        Vec::new(),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceMaterialization {
+    path: PathBuf,
+    source_content_sha256: Sha256Digest,
+    canonical_materialization_sha256: Sha256Digest,
+}
+
+/// Release-qualification view of the exact production standalone source
+/// materialization seam. This is intentionally narrow: it exposes no alternate
+/// decoder or writer and calls the same private-copy/container-validation/DST
+/// decode path used by production execution.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceSourceMaterializationQualification {
+    pub materialized_path: PathBuf,
+    pub source_content_sha256: Sha256Digest,
+    pub canonical_materialization_sha256: Sha256Digest,
+    pub materialization_identity_digest: Sha256Digest,
+}
+
+/// Exercise the exact production materialization seam for a standalone DSF,
+/// DSDIFF/DSD, or qualified DSDIFF/DST source. SACD remains unavailable until
+/// an end-to-end ISO extraction corpus is commissioned.
+#[doc(hidden)]
+pub fn qualify_reference_source_materialization(
+    source_kind: &DsdSourceKind,
+    source: &Path,
+    work_dir: &Path,
+) -> io::Result<ReferenceSourceMaterializationQualification> {
+    let cancel = CancellationToken::new();
+    let materialization = materialize_reference_presented_source(
+        source_kind,
+        source,
+        work_dir,
+        &cancel,
+    )?;
+    Ok(ReferenceSourceMaterializationQualification {
+        materialized_path: materialization.path,
+        source_content_sha256: materialization.source_content_sha256,
+        canonical_materialization_sha256: materialization.canonical_materialization_sha256,
+        materialization_identity_digest: reference_materialization_identity_digest(
+            source_kind,
+            materialization.source_content_sha256,
+            materialization.canonical_materialization_sha256,
+        ),
+    })
+}
+
+#[doc(hidden)]
+pub fn qualify_reference_materialization_identity_digest(
+    source_kind: &DsdSourceKind,
+    source_content_sha256: Sha256Digest,
+    canonical_materialization_sha256: Sha256Digest,
+) -> Sha256Digest {
+    reference_materialization_identity_digest(
+        source_kind,
+        source_content_sha256,
+        canonical_materialization_sha256,
+    )
+}
+
+pub(crate) fn reference_materialization_identity_digest(
+    source_kind: &DsdSourceKind,
+    source_content_sha256: Sha256Digest,
+    canonical_materialization_sha256: Sha256Digest,
+) -> Sha256Digest {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-reference-materialization-identity/v1\0");
+    match source_kind {
+        DsdSourceKind::DsfUncompressed => field(&mut hasher, b"dsf_uncompressed"),
+        DsdSourceKind::DsdiffUncompressed => field(&mut hasher, b"dsdiff_uncompressed"),
+        DsdSourceKind::DsdiffDst => field(&mut hasher, b"dsdiff_dst"),
+        DsdSourceKind::SacdTrack {
+            frame_format,
+            selection,
+        } => {
+            field(&mut hasher, b"sacd_track");
+            field(
+                &mut hasher,
+                match frame_format {
+                    SacdFrameEncoding::Dsd => b"dsd",
+                    SacdFrameEncoding::Dst => b"dst",
+                },
+            );
+            field(
+                &mut hasher,
+                match selection.area {
+                    SacdAreaKind::Stereo => b"stereo",
+                    SacdAreaKind::Multichannel => b"multichannel",
+                },
+            );
+            field(
+                &mut hasher,
+                &selection.track_index_zero_based.to_be_bytes(),
+            );
+            field(&mut hasher, &selection.start_frame.to_be_bytes());
+            field(&mut hasher, &selection.frame_count.to_be_bytes());
+            field(&mut hasher, &selection.toc_digest.0);
+        }
+        DsdSourceKind::UnknownDsdContainer => {
+            field(&mut hasher, b"unknown_dsd_container")
+        }
+    }
+    field(&mut hasher, &source_content_sha256.0);
+    field(&mut hasher, &canonical_materialization_sha256.0);
+    Sha256Digest(hasher.finalize().into())
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceRuntimeResult {
+    commands: Vec<CommandRecord>,
+    measurements: BTreeMap<MeasurementId, TruePeakMeasurement>,
+    resolved_command_hash: String,
+    pcm_verification: ReferencePcmVerificationEvidence,
+}
+
+async fn materialize_reference_source(
+    plan_request: &PlanRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    work_dir: &Path,
+    cancel: &CancellationToken,
+) -> Result<ReferenceMaterialization, TrackExecutionError> {
+    let plan_request = plan_request.clone();
+    let track = track.clone();
+    let realized_input = realized_input.to_path_buf();
+    let work_dir = work_dir.to_path_buf();
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        materialize_reference_source_blocking(
+            &plan_request,
+            &track,
+            &realized_input,
+            &work_dir,
+            &cancel,
+        )
+    })
+    .await
+    .map_err(|err| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference source materialization task failed: {err}"
+            )),
+            Vec::new(),
+        )
+    })?
+}
+
+fn materialize_reference_source_blocking(
+    plan_request: &PlanRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    work_dir: &Path,
+    cancel: &CancellationToken,
+) -> Result<ReferenceMaterialization, TrackExecutionError> {
+    if cancel.is_cancelled() {
+        return Err(reference_cancelled_error());
+    }
+    let source_kind = plan_request
+        .source
+        .dsd_source_kind
+        .as_ref()
+        .ok_or_else(|| {
+            TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference source materialization is missing DSD source identity".to_string(),
+                ),
+                Vec::new(),
+            )
+        })?;
+    let original_authority = match &track.source_ref {
+        super::types::TrackSourceRef::SacdTrack { iso, .. } => iso.as_path(),
+        _ => realized_input,
+    };
+    let source_content_sha256 = stable_file_sha256_cancel(original_authority, cancel)
+        .map_err(|err| reference_materialization_error(
+            format!("failed to admit Reference source {}", original_authority.display()),
+            err,
+        ))?;
+
+    let presented_source = match &track.source_ref {
+        super::types::TrackSourceRef::SacdTrack {
+            iso,
+            track_index,
+            area,
+        } => {
+            let current_source_kind = reference_sacd_source_kind(iso, *track_index, *area)
+                .map_err(|err| TrackExecutionError::new(err, Vec::new()))?;
+            if &current_source_kind != source_kind {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference SACD TOC selection changed after planning".to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+            let post_toc_source_sha256 = stable_file_sha256_cancel(iso, cancel)
+                .map_err(|err| {
+                    reference_materialization_error(
+                        format!(
+                            "failed to re-verify Reference SACD source {} after TOC admission",
+                            iso.display()
+                        ),
+                        err,
+                    )
+                })?;
+            if post_toc_source_sha256 != source_content_sha256 {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference SACD source changed during TOC admission".to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+            let extracted = super::stages::realize_reference_sacd_track_blocking(
+                iso,
+                *track_index,
+                *area,
+                work_dir,
+                cancel,
+            )
+            .map_err(|err| {
+                if cancel.is_cancelled() {
+                    reference_cancelled_error()
+                } else {
+                    TrackExecutionError::new(err, Vec::new())
+                }
+            })?;
+            let post_extract_source_sha256 = stable_file_sha256_cancel(iso, cancel)
+                .map_err(|err| {
+                    reference_materialization_error(
+                        format!(
+                            "failed to re-verify Reference SACD source {} after extraction",
+                            iso.display()
+                        ),
+                        err,
+                    )
+                })?;
+            if post_extract_source_sha256 != source_content_sha256 {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference SACD source changed during qualified track extraction"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+            extracted
+        }
+        _ => realized_input.to_path_buf(),
+    };
+
+    let materialized = materialize_reference_presented_source(
+        source_kind,
+        &presented_source,
+        work_dir,
+        cancel,
+    )
+    .map_err(|err| {
+        if err.kind() == io::ErrorKind::Interrupted {
+            reference_cancelled_error()
+        } else {
+            reference_materialization_error(
+                format!(
+                    "failed to materialize verified Reference source {}",
+                    presented_source.display()
+                ),
+                err,
+            )
+        }
+    })?;
+    let copied_sha256 = materialized.source_content_sha256;
+    let path = materialized.path;
+    let canonical_materialization_sha256 = materialized.canonical_materialization_sha256;
+
+    // A standalone source's original authority is the same byte object that was
+    // copied. SACD binds the ISO hash separately while the canonical hash binds
+    // the decoded per-track carrier.
+    if !matches!(source_kind, DsdSourceKind::SacdTrack { .. })
+        && source_content_sha256 != copied_sha256
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference source changed between admission and private materialization"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+
+    Ok(ReferenceMaterialization {
+        path,
+        source_content_sha256,
+        canonical_materialization_sha256,
+    })
+}
+
+fn materialize_reference_presented_source(
+    source_kind: &DsdSourceKind,
+    presented_source: &Path,
+    work_dir: &Path,
+    cancel: &CancellationToken,
+) -> io::Result<ReferenceMaterialization> {
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    let mut source_file = File::open(presented_source)?;
+    let source_info = inspect_dsd_container(&mut source_file)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let expected = match source_kind {
+        DsdSourceKind::DsfUncompressed => {
+            (DsdContainerFormat::Dsf, DsdCompression::Dsd)
+        }
+        DsdSourceKind::DsdiffUncompressed => {
+            (DsdContainerFormat::Dsdiff, DsdCompression::Dsd)
+        }
+        DsdSourceKind::DsdiffDst => {
+            (DsdContainerFormat::Dsdiff, DsdCompression::Dst)
+        }
+        DsdSourceKind::SacdTrack { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                tonepoet_pipeline::reference_error_text(
+                    tonepoet_pipeline::ReferenceErrorCode::SacdFrontEndIntegrationUnqualified,
+                ),
+            ));
+        }
+        DsdSourceKind::UnknownDsdContainer => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                tonepoet_pipeline::reference_error_text(
+                    tonepoet_pipeline::ReferenceErrorCode::UnknownEncoding,
+                ),
+            ));
+        }
+    };
+    if (source_info.format, source_info.compression) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Reference source classification mismatch: declared {source_kind:?}, inspected {:?}/{:?}",
+                source_info.format, source_info.compression
+            ),
+        ));
+    }
+
+    fs::create_dir_all(work_dir)?;
+    let extension = presented_source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("dsd");
+    let admitted = work_dir.join(format!("reference-admitted-source.{extension}"));
+    let copied_sha256 = verified_private_copy(presented_source, &admitted, cancel)?;
+    let (path, canonical_materialization_sha256) = if matches!(source_kind, DsdSourceKind::DsdiffDst) {
+        let canonical = work_dir.join("reference-canonical-dsd.dff");
+        decode_dsdiff_dst_to_canonical_dff(&admitted, &canonical, cancel)?;
+        let digest = stable_file_sha256_cancel(&canonical, cancel)?;
+        (canonical, digest)
+    } else {
+        (admitted, copied_sha256)
+    };
+    Ok(ReferenceMaterialization {
+        path,
+        source_content_sha256: copied_sha256,
+        canonical_materialization_sha256,
+    })
+}
+
+fn verified_private_copy(
+    source: &Path,
+    destination: &Path,
+    cancel: &CancellationToken,
+) -> io::Result<Sha256Digest> {
+    let resolved = fs::canonicalize(source)?;
+    let mut input = File::open(&resolved)?;
+    if !input.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Reference source is not a regular file",
+        ));
+    }
+    let admitted = sha256_reader_cancel(&mut input, cancel)?;
+    input.seek(SeekFrom::Start(0))?;
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = destination.with_extension(format!(
+        "{}.tmp-{}",
+        destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("reference"),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&tmp);
+    let result = (|| {
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        copy_reader_cancel(&mut input, &mut output, cancel)?;
+        output.sync_all()?;
+        drop(output);
+
+        input.seek(SeekFrom::Start(0))?;
+        let after_copy = sha256_reader_cancel(&mut input, cancel)?;
+        if admitted != after_copy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source bytes changed while materializing",
+            ));
+        }
+        let copied = stable_file_sha256_cancel(&tmp, cancel)?;
+        if admitted != copied {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private materialization hash does not match admitted source",
+            ));
+        }
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let _ = fs::remove_file(destination);
+        fs::rename(&tmp, destination)?;
+        Ok(admitted)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn decode_dsdiff_dst_to_canonical_dff(
+    source: &Path,
+    destination: &Path,
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    let input = File::open(source)?;
+    let mut reader = open_dsd_as_decoded_reader(input)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let tmp = destination.with_extension(format!("dff.tmp-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let mut output = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let result = (|| {
+        let stats = write_decoded_dsd_to_dff_with_cancel(&mut reader, &mut output, || {
+            cancel.is_cancelled()
+        })
+        .map_err(|err| match err {
+            sacd_rs::DsdReadError::Io(inner)
+                if inner.kind() == io::ErrorKind::Interrupted => inner,
+            other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+        })?;
+        if stats.frames_read == 0 || stats.bytes_written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DST decoder produced no DSD audio",
+            ));
+        }
+        output.sync_all()?;
+        output.seek(SeekFrom::Start(0))?;
+        let info = inspect_dsd_container(&mut output)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        if info.format != DsdContainerFormat::Dsdiff || info.compression != DsdCompression::Dsd {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DST decoder did not produce canonical uncompressed DSDIFF/DSD",
+            ));
+        }
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        drop(output);
+        let _ = fs::remove_file(destination);
+        fs::rename(&tmp, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn stable_file_sha256(path: &Path) -> io::Result<Sha256Digest> {
+    let resolved = fs::canonicalize(path)?;
+    let mut file = File::open(&resolved)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    let first = sha256_reader(&mut file)?;
+    file.seek(SeekFrom::Start(0))?;
+    let second = sha256_reader(&mut file)?;
+    if first != second {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file changed while hashing",
+        ));
+    }
+    Ok(first)
+}
+
+fn stable_file_sha256_cancel(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> io::Result<Sha256Digest> {
+    let resolved = fs::canonicalize(path)?;
+    let mut file = File::open(&resolved)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    let first = sha256_reader_cancel(&mut file, cancel)?;
+    file.seek(SeekFrom::Start(0))?;
+    let second = sha256_reader_cancel(&mut file, cancel)?;
+    if first != second {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file changed while hashing",
+        ));
+    }
+    Ok(first)
+}
+
+fn sha256_reader(reader: &mut File) -> io::Result<Sha256Digest> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(Sha256Digest(bytes))
+}
+
+fn sha256_reader_cancel(
+    reader: &mut File,
+    cancel: &CancellationToken,
+) -> io::Result<Sha256Digest> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(Sha256Digest(bytes))
+}
+
+fn copy_reader_cancel(
+    input: &mut File,
+    output: &mut File,
+    cancel: &CancellationToken,
+) -> io::Result<u64> {
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        output.write_all(&buffer[..count])?;
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "copy size overflow"))?;
+    }
+    Ok(copied)
+}
+
+fn reference_materialization_error(
+    context: impl AsRef<str>,
+    error: io::Error,
+) -> TrackExecutionError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        reference_cancelled_error()
+    } else {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("{}: {error}", context.as_ref())),
+            Vec::new(),
+        )
+    }
+}
+
+fn reference_cancelled_error() -> TrackExecutionError {
+    TrackExecutionError::new(ConvertError::Realize("cancelled".to_string()), Vec::new())
+}
+
+async fn execute_reference_steps(
+    steps: &[PlannedExecutionStep],
+    summary: &DsdReferencePlanSummary,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    start_fraction: f32,
+    end_fraction: f32,
+    track_label: String,
+    work_dir: &Path,
+    toolchain: &ReferenceToolchainEvidence,
+) -> Result<ReferenceRuntimeResult, TrackExecutionError> {
+    let mut records = Vec::new();
+    let mut measurements = BTreeMap::new();
+    let mut r64_probe = None;
+    let mut qpcm_probe = None;
+    let mut qpcm_hash = None;
+    let mut packaged_hash = None;
+    let step_count = steps.len().max(1) as f32;
+    let total_width = (end_fraction - start_fraction).max(0.0);
+
+    for (index, step) in steps.iter().enumerate() {
+        if cancel.is_cancelled() {
+            progress.cancel_requested().await;
+            return Err(TrackExecutionError::new(
+                ConvertError::Realize("cancelled".to_string()),
+                records,
+            ));
+        }
+        let window_start = start_fraction + total_width * (index as f32 / step_count);
+        let window_end = start_fraction + total_width * ((index + 1) as f32 / step_count);
+        match step {
+            PlannedExecutionStep::Command(command) => {
+                let mut step_records = execute_commands(
+                    std::slice::from_ref(command),
+                    runner,
+                    cancel,
+                    tool_paths,
+                    tool_concurrency_limits.clone(),
+                    progress,
+                    window_start,
+                    window_end,
+                    track_label.clone(),
+                )
+                .await?;
+                records.append(&mut step_records);
+
+                if command.output.as_path() == Some(summary.r64_path.as_path()) {
+                    let (mut verification_records, probe) = verify_reference_r64_contract(
+                        summary,
+                        runner,
+                        cancel,
+                        tool_paths,
+                        tool_concurrency_limits.as_ref(),
+                        progress,
+                        window_start,
+                        window_end,
+                        &track_label,
+                    )
+                    .await
+                    .map_err(|mut err| {
+                        let mut all = records.clone();
+                        all.append(&mut err.commands);
+                        err.commands = all;
+                        err
+                    })?;
+                    records.append(&mut verification_records);
+                    r64_probe = Some(probe);
+                } else if command.output.as_path() == Some(summary.packaged_path.as_path())
+                    && summary.packaged_path != summary.qpcm_path
+                {
+                    let expected = qpcm_hash.ok_or_else(|| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference package was produced before QPCM verification"
+                                    .to_string(),
+                            ),
+                            records.clone(),
+                        )
+                    })?;
+                    let (record, digest) = reference_decoded_sample_hash_with_paths(
+                        &summary.packaged_path,
+                        summary.final_pcm,
+                        "Verify packaged output decoded samples",
+                        runner,
+                        cancel,
+                        tool_paths,
+                        tool_concurrency_limits.as_ref(),
+                        progress,
+                        window_start,
+                        window_end,
+                        &track_label,
+                    )
+                    .await
+                    .map_err(|mut err| {
+                        let mut all = records.clone();
+                        all.append(&mut err.commands);
+                        err.commands = all;
+                        err
+                    })?;
+                    records.push(record);
+                    if digest != expected {
+                        return Err(TrackExecutionError::new(
+                            ConvertError::Backend(format!(
+                                "Reference lossless package changed decoded samples: QPCM={}, packaged={}",
+                                expected.to_hex(),
+                                digest.to_hex()
+                            )),
+                            records,
+                        ));
+                    }
+                    packaged_hash = Some(digest);
+                }
+            }
+            PlannedExecutionStep::Measurement(measurement) => {
+                if measurements.contains_key(&measurement.id) {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(format!(
+                            "duplicate Reference measurement id {}",
+                            measurement.id.0
+                        )),
+                        records,
+                    ));
+                }
+                match measurement.purpose {
+                    TruePeakPurpose::GainAuthority if r64_probe.is_none() => {
+                        return Err(TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference gain measurement was scheduled before R64 verification"
+                                    .to_string(),
+                            ),
+                            records,
+                        ));
+                    }
+                    TruePeakPurpose::PostFinalAcceptance if qpcm_probe.is_none() => {
+                        return Err(TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference post-final measurement was scheduled before QPCM verification"
+                                    .to_string(),
+                            ),
+                            records,
+                        ));
+                    }
+                    _ => {}
+                }
+                let (mut measurement_records, parsed) = execute_reference_measurement(
+                    measurement,
+                    runner,
+                    cancel,
+                    tool_paths,
+                    tool_concurrency_limits.as_ref(),
+                    progress,
+                    window_start,
+                    window_end,
+                    &track_label,
+                    work_dir,
+                    toolchain.reporting_uncertainty,
+                    toolchain.analyzer_residual,
+                )
+                .await
+                .map_err(|mut err| {
+                    let mut all = records.clone();
+                    all.append(&mut err.commands);
+                    err.commands = all;
+                    err
+                })?;
+                records.append(&mut measurement_records);
+                if measurement.purpose == TruePeakPurpose::PostFinalAcceptance {
+                    validate_post_final_true_peak(parsed.conservative_upper, summary.gain_policy)
+                        .map_err(|err| {
+                            TrackExecutionError::new(
+                                ConvertError::Backend(format!(
+                                    "Reference post-final acceptance failed: {err}"
+                                )),
+                                records.clone(),
+                            )
+                        })?;
+                }
+                measurements.insert(measurement.id, parsed);
+            }
+            PlannedExecutionStep::DeferredCommand(command) => {
+                let resolved = resolve_deferred_command(command, &measurements)?;
+                let mut step_records = execute_commands(
+                    std::slice::from_ref(&resolved),
+                    runner,
+                    cancel,
+                    tool_paths,
+                    tool_concurrency_limits.clone(),
+                    progress,
+                    window_start,
+                    window_end,
+                    track_label.clone(),
+                )
+                .await?;
+                records.append(&mut step_records);
+
+                if command.output.as_path() == Some(summary.qpcm_path.as_path()) {
+                    let r64 = r64_probe.ok_or_else(|| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference terminal realization ran without verified R64 authority"
+                                    .to_string(),
+                            ),
+                            records.clone(),
+                        )
+                    })?;
+                    let (mut verification_records, probe, digest) =
+                        verify_reference_qpcm_contract(
+                            summary,
+                            r64,
+                            runner,
+                            cancel,
+                            tool_paths,
+                            tool_concurrency_limits.as_ref(),
+                            progress,
+                            window_start,
+                            window_end,
+                            &track_label,
+                        )
+                        .await
+                        .map_err(|mut err| {
+                            let mut all = records.clone();
+                            all.append(&mut err.commands);
+                            err.commands = all;
+                            err
+                        })?;
+                    records.append(&mut verification_records);
+                    qpcm_probe = Some(probe);
+                    qpcm_hash = Some(digest);
+                    if summary.packaged_path == summary.qpcm_path {
+                        packaged_hash = Some(digest);
+                    }
+                }
+            }
+        }
+    }
+
+    let r64_probe = r64_probe.ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend("Reference execution omitted R64 verification".to_string()),
+            records.clone(),
+        )
+    })?;
+    let qpcm_probe = qpcm_probe.ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend("Reference execution omitted QPCM verification".to_string()),
+            records.clone(),
+        )
+    })?;
+    let qpcm_hash = qpcm_hash.ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend("Reference execution omitted QPCM sample identity".to_string()),
+            records.clone(),
+        )
+    })?;
+    let packaged_hash = packaged_hash.ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend("Reference execution omitted package sample identity".to_string()),
+            records.clone(),
+        )
+    })?;
+    let pcm_verification = ReferencePcmVerificationEvidence {
+        r64_contract_digest: reference_carrier_probe_digest("r64", r64_probe),
+        qpcm_contract_digest: reference_carrier_probe_digest("qpcm", qpcm_probe),
+        qpcm_sample_sha256: qpcm_hash,
+        packaged_sample_sha256: packaged_hash,
+        post_metadata_sample_sha256: None,
+        post_metadata_verification_command: None,
+    };
+    let resolved_command_hash = command_records_hash(&records);
+    Ok(ReferenceRuntimeResult {
+        commands: records,
+        measurements,
+        resolved_command_hash,
+        pcm_verification,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceCarrierProbe {
+    sample_rate_hz: u32,
+    channels: u16,
+    bits_per_sample: u16,
+    samples_per_channel: u64,
+    floating_point: bool,
+}
+
+fn reference_pcm_codec(
+    contract: tonepoet_pipeline::FinalPcmContract,
+) -> Result<&'static str, String> {
+    match contract.bit_depth {
+        tonepoet_pipeline::PcmBitDepth::Int16 => Ok("pcm_s16le"),
+        tonepoet_pipeline::PcmBitDepth::Int24 => Ok("pcm_s24le"),
+        tonepoet_pipeline::PcmBitDepth::Float32 => Ok("pcm_f32le"),
+        tonepoet_pipeline::PcmBitDepth::Float64 => Ok("pcm_f64le"),
+        tonepoet_pipeline::PcmBitDepth::Int8 | tonepoet_pipeline::PcmBitDepth::Int32 => Err(
+            "Reference verification received an unsupported terminal depth".to_string(),
+        ),
+    }
+}
+
+async fn run_reference_capture_command(
+    planned: &PlannedCommand,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    window_start: f32,
+    window_end: f32,
+    label: &str,
+) -> Result<ToolOutput, TrackExecutionError> {
+    let mut command = planned_command_to_tool_command(planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
+        .map_err(TrackExecutionError::from)?;
+    let _permit = acquire_tool_permit(&mut command, limits, cancel)
+        .await
+        .map_err(TrackExecutionError::from)?;
+    let mut output = run_planned_command(
+        command,
+        planned,
+        runner,
+        cancel,
+        tool_paths,
+        progress,
+        window_start,
+        window_end,
+        label,
+    )
+    .await
+    .map_err(|error| track_execution_error_from_tool_error(0, planned, error, Vec::new()))?;
+    output.command.description = non_empty_planned_description(planned);
+    Ok(output)
+}
+
+async fn probe_reference_carrier(
+    path: &Path,
+    description: &str,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    window_start: f32,
+    window_end: f32,
+    track_label: &str,
+) -> Result<(Vec<CommandRecord>, ReferenceCarrierProbe), TrackExecutionError> {
+    let mut records = Vec::new();
+    let query = |flag: &'static str, field: &'static str| {
+        let mut command = PlannedCommand::new(
+            ToolIdentifier::Sox,
+            vec!["--i".to_string(), flag.to_string(), path.display().to_string()],
+            tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
+            tonepoet_pipeline::OutputSink::Stdout,
+            None,
+            format!("Verify {description} {field}"),
+        );
+        command.environment.insert("LC_ALL".to_string(), "C".to_string());
+        command
+    };
+
+    async fn capture(
+        planned: PlannedCommand,
+        runner: &dyn ToolRunner,
+        cancel: &CancellationToken,
+        tool_paths: &HashMap<String, PathBuf>,
+        limits: Option<&Arc<ToolConcurrencyLimits>>,
+        progress: &mut OperationProgressTracker<'_>,
+        window_start: f32,
+        window_end: f32,
+        label: &str,
+    ) -> Result<(CommandRecord, String), TrackExecutionError> {
+        let output = run_reference_capture_command(
+            &planned,
+            runner,
+            cancel,
+            tool_paths,
+            limits,
+            progress,
+            window_start,
+            window_end,
+            label,
+        )
+        .await?;
+        let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail)
+            .trim()
+            .to_string();
+        Ok((output.command, text))
+    }
+
+    let label = format!("{track_label} - verify {description}");
+    let (record, sample_rate) = capture(
+        query("-r", "sample rate"), runner, cancel, tool_paths, limits, progress,
+        window_start, window_end, &label,
+    ).await?;
+    records.push(record);
+    let (record, channels) = capture(
+        query("-c", "channel count"), runner, cancel, tool_paths, limits, progress,
+        window_start, window_end, &label,
+    ).await?;
+    records.push(record);
+    let (record, bits) = capture(
+        query("-b", "bit depth"), runner, cancel, tool_paths, limits, progress,
+        window_start, window_end, &label,
+    ).await?;
+    records.push(record);
+    let (record, samples) = capture(
+        query("-s", "sample count"), runner, cancel, tool_paths, limits, progress,
+        window_start, window_end, &label,
+    ).await?;
+    records.push(record);
+    let (record, encoding) = capture(
+        query("-e", "sample encoding"), runner, cancel, tool_paths, limits, progress,
+        window_start, window_end, &label,
+    ).await?;
+    records.push(record);
+
+    let parse = |value: &str, field: &str| -> Result<u64, TrackExecutionError> {
+        value.trim().parse::<u64>().map_err(|_| {
+            TrackExecutionError::new(
+                ConvertError::Backend(format!(
+                    "Reference {description} probe returned invalid {field}: {value:?}"
+                )),
+                records.clone(),
+            )
+        })
+    };
+    let sample_rate_hz = u32::try_from(parse(&sample_rate, "sample rate")?).map_err(|_| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference {description} sample rate overflows u32")),
+            records.clone(),
+        )
+    })?;
+    let channels = u16::try_from(parse(&channels, "channel count")?).map_err(|_| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference {description} channel count overflows u16")),
+            records.clone(),
+        )
+    })?;
+    let bits_per_sample = u16::try_from(parse(&bits, "bit depth")?).map_err(|_| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference {description} bit depth overflows u16")),
+            records.clone(),
+        )
+    })?;
+    let samples_per_channel = parse(&samples, "sample count")?;
+    let encoding_lower = encoding.to_ascii_lowercase();
+    let floating_point = encoding_lower.contains("floating") || encoding_lower.contains("float");
+    let signed_integer = encoding_lower.contains("signed") && encoding_lower.contains("integer");
+    if !floating_point && !signed_integer {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference {description} probe returned unsupported encoding: {encoding:?}"
+            )),
+            records,
+        ));
+    }
+    Ok((records, ReferenceCarrierProbe {
+        sample_rate_hz,
+        channels,
+        bits_per_sample,
+        samples_per_channel,
+        floating_point,
+    }))
+}
+
+fn reference_carrier_probe_digest(
+    role: &str,
+    probe: ReferenceCarrierProbe,
+) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-reference-carrier-probe/v1\0");
+    hasher.update(role.as_bytes());
+    hasher.update([0]);
+    hasher.update(probe.sample_rate_hz.to_be_bytes());
+    hasher.update(probe.channels.to_be_bytes());
+    hasher.update(probe.bits_per_sample.to_be_bytes());
+    hasher.update(probe.samples_per_channel.to_be_bytes());
+    hasher.update([u8::from(probe.floating_point)]);
+    Sha256Digest(hasher.finalize().into())
+}
+
+fn reference_hash_args(
+    path: &Path,
+    contract: tonepoet_pipeline::FinalPcmContract,
+) -> Result<Vec<String>, String> {
+    let codec = reference_pcm_codec(contract)?;
+    Ok(vec![
+        "-hide_banner".to_string(),
+        "-nostdin".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        path.display().to_string(),
+        "-map".to_string(),
+        "0:a:0".to_string(),
+        "-map_metadata".to_string(),
+        "-1".to_string(),
+        "-vn".to_string(),
+        "-sn".to_string(),
+        "-dn".to_string(),
+        "-c:a".to_string(),
+        codec.to_string(),
+        "-f".to_string(),
+        "hash".to_string(),
+        "-hash".to_string(),
+        "sha256".to_string(),
+        "-".to_string(),
+    ])
+}
+
+fn parse_reference_hash_output(text: &str) -> Result<Sha256Digest, String> {
+    let mut values = text.lines().filter_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("SHA256=")
+            .or_else(|| line.strip_prefix("sha256="))
+    });
+    let value = values
+        .next()
+        .ok_or_else(|| "FFmpeg hash output omitted SHA256".to_string())?;
+    if values.next().is_some() {
+        return Err("FFmpeg hash output contained multiple SHA256 values".to_string());
+    }
+    Sha256Digest::from_hex(value)
+}
+
+async fn reference_decoded_sample_hash_with_paths(
+    path: &Path,
+    contract: tonepoet_pipeline::FinalPcmContract,
+    description: &str,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    window_start: f32,
+    window_end: f32,
+    track_label: &str,
+) -> Result<(CommandRecord, Sha256Digest), TrackExecutionError> {
+    let mut planned = PlannedCommand::new(
+        ToolIdentifier::Ffmpeg,
+        reference_hash_args(path, contract).map_err(|message| {
+            TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
+        })?,
+        tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Stdout,
+        None,
+        description.to_string(),
+    );
+    planned.environment.insert("LC_ALL".to_string(), "C".to_string());
+    let output = run_reference_capture_command(
+        &planned, runner, cancel, tool_paths, limits, progress, window_start, window_end,
+        &format!("{track_label} - {description}"),
+    ).await?;
+    let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
+    let digest = parse_reference_hash_output(&text).map_err(|message| {
+        TrackExecutionError::new(ConvertError::Backend(message), vec![output.command.clone()])
+    })?;
+    Ok((output.command, digest))
+}
+
+async fn verify_reference_r64_contract(
+    summary: &DsdReferencePlanSummary,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    window_start: f32,
+    window_end: f32,
+    track_label: &str,
+) -> Result<(Vec<CommandRecord>, ReferenceCarrierProbe), TrackExecutionError> {
+    let (records, probe) = probe_reference_carrier(
+        &summary.r64_path,
+        "R64",
+        runner,
+        cancel,
+        tool_paths,
+        limits,
+        progress,
+        window_start,
+        window_end,
+        track_label,
+    )
+    .await?;
+    if probe.sample_rate_hz != summary.final_pcm.sample_rate_hz
+        || probe.channels != summary.final_pcm.channels
+        || probe.bits_per_sample != 64
+        || !probe.floating_point
+        || probe.samples_per_channel == 0
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference R64 carrier contract mismatch: {probe:?}"
+            )),
+            records,
+        ));
+    }
+    Ok((records, probe))
+}
+
+async fn verify_reference_qpcm_contract(
+    summary: &DsdReferencePlanSummary,
+    r64_probe: ReferenceCarrierProbe,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    window_start: f32,
+    window_end: f32,
+    track_label: &str,
+) -> Result<(Vec<CommandRecord>, ReferenceCarrierProbe, Sha256Digest), TrackExecutionError> {
+    let (mut records, qpcm_probe) = probe_reference_carrier(
+        &summary.qpcm_path,
+        "QPCM",
+        runner,
+        cancel,
+        tool_paths,
+        limits,
+        progress,
+        window_start,
+        window_end,
+        track_label,
+    )
+    .await?;
+    let expected_bits = match summary.final_pcm.bit_depth {
+        tonepoet_pipeline::PcmBitDepth::Int16 => 16,
+        tonepoet_pipeline::PcmBitDepth::Int24 => 24,
+        tonepoet_pipeline::PcmBitDepth::Float32 => 32,
+        tonepoet_pipeline::PcmBitDepth::Float64 => 64,
+        tonepoet_pipeline::PcmBitDepth::Int8 | tonepoet_pipeline::PcmBitDepth::Int32 => {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference verification received an unsupported terminal depth".to_string(),
+                ),
+                records,
+            ));
+        }
+    };
+    let expected_float = matches!(
+        summary.final_pcm.bit_depth,
+        tonepoet_pipeline::PcmBitDepth::Float32 | tonepoet_pipeline::PcmBitDepth::Float64
+    );
+    if qpcm_probe.sample_rate_hz != summary.final_pcm.sample_rate_hz
+        || qpcm_probe.channels != summary.final_pcm.channels
+        || qpcm_probe.bits_per_sample != expected_bits
+        || qpcm_probe.floating_point != expected_float
+        || qpcm_probe.samples_per_channel != r64_probe.samples_per_channel
+    {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference QPCM carrier contract mismatch: r64={r64_probe:?}, qpcm={qpcm_probe:?}"
+            )),
+            records,
+        ));
+    }
+    let (record, digest) = reference_decoded_sample_hash_with_paths(
+        &summary.qpcm_path,
+        summary.final_pcm,
+        "Hash QPCM decoded samples",
+        runner,
+        cancel,
+        tool_paths,
+        limits,
+        progress,
+        window_start,
+        window_end,
+        track_label,
+    )
+    .await?;
+    records.push(record);
+    Ok((records, qpcm_probe, digest))
+}
+
+pub(crate) async fn verify_reference_output_after_metadata(
+    path: &Path,
+    evidence: &mut ReferenceExecutionEvidence,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), ConvertError> {
+    let resolved_ffmpeg = runner.resolved_tool_path(ToolBinary::Ffmpeg).ok_or_else(|| {
+        ConvertError::TrackValidation(
+            "Reference post-metadata verification cannot resolve the attested FFmpeg path"
+                .to_string(),
+        )
+    })?;
+    if resolved_ffmpeg != evidence.toolchain.ffmpeg.canonical_path {
+        return Err(ConvertError::TrackValidation(format!(
+            "Reference post-metadata verification FFmpeg changed after attestation: expected {}, got {}",
+            evidence.toolchain.ffmpeg.canonical_path.display(),
+            resolved_ffmpeg.display(),
+        )));
+    }
+    let command = ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args: reference_hash_args(path, evidence.plan.final_pcm)
+            .map_err(ConvertError::TrackValidation)?,
+        secret_args: Vec::new(),
+        cwd: None,
+        env: vec![EnvVar {
+            key: "LC_ALL".to_string(),
+            value: super::types::SecretString::new("C".to_string()),
+            secret: false,
+        }],
+        timeout: DEFAULT_PLANNED_COMMAND_TIMEOUT,
+    };
+    let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
+        .await
+        .map_err(ConvertError::Tool)?;
+    let text = format!("{}\n{}", output.stdout_tail, output.stderr_tail);
+    let digest = parse_reference_hash_output(&text).map_err(ConvertError::TrackValidation)?;
+    if digest != evidence.pcm_verification.qpcm_sample_sha256 {
+        return Err(ConvertError::TrackValidation(format!(
+            "Reference metadata/artwork processing changed decoded samples for {}: expected {}, got {}",
+            path.display(), evidence.pcm_verification.qpcm_sample_sha256.to_hex(), digest.to_hex()
+        )));
+    }
+    let mut record = output.command;
+    record.description = Some("Verify post-metadata Reference decoded samples".to_string());
+    evidence.pcm_verification.post_metadata_sample_sha256 = Some(digest);
+    evidence.pcm_verification.post_metadata_verification_command = Some(record);
+    Ok(())
+}
+
+fn resolve_deferred_command(
+    deferred: &PlannedDeferredCommand,
+    measurements: &BTreeMap<MeasurementId, TruePeakMeasurement>,
+) -> Result<PlannedCommand, TrackExecutionError> {
+    resolve_reference_deferred_command(deferred, measurements).map_err(|message| {
+        TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
+    })
+}
+
+async fn execute_reference_measurement(
+    measurement: &PlannedMeasurement,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    window_start: f32,
+    window_end: f32,
+    track_label: &str,
+    work_dir: &Path,
+    reporting_uncertainty: tonepoet_pipeline::DbNano,
+    analyzer_residual: tonepoet_pipeline::DbNano,
+) -> Result<(Vec<CommandRecord>, TruePeakMeasurement), TrackExecutionError> {
+    if measurement.parser != MeasurementParser::FfmpegLoudnormInputTpV1 {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend("unknown Reference measurement parser".to_string()),
+            Vec::new(),
+        ));
+    }
+    let mut command = planned_command_to_tool_command(
+        &measurement.command,
+        DEFAULT_PLANNED_COMMAND_TIMEOUT,
+    )
+    .map_err(TrackExecutionError::from)?;
+    let _permit = acquire_tool_permit(&mut command, limits, cancel)
+        .await
+        .map_err(TrackExecutionError::from)?;
+    let label = format!("{track_label} - {}", measurement.command.description);
+    let output = run_planned_command(
+        command,
+        &measurement.command,
+        runner,
+        cancel,
+        tool_paths,
+        progress,
+        window_start,
+        window_end,
+        &label,
+    )
+    .await
+    .map_err(|err| {
+        track_execution_error_from_tool_error(0, &measurement.command, err, Vec::new())
+    })?;
+    let raw_report = extract_single_loudnorm_report(&output.stderr_tail).map_err(|message| {
+        TrackExecutionError::new(ConvertError::Backend(message), vec![output.command.clone()])
+    })?;
+    let needs_silence_proof = serde_json::from_str::<serde_json::Value>(&raw_report)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("input_tp")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("-inf");
+    let mut auxiliary_records = Vec::new();
+    if needs_silence_proof {
+        let input = measurement.command.input.as_path().ok_or_else(|| {
+            TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference silence verification requires a path-backed carrier".to_string(),
+                ),
+                vec![output.command.clone()],
+            )
+        })?;
+        let silence_record = verify_signed_zero_audio(input, runner, cancel, limits, work_dir)
+            .await
+            .map_err(|err| {
+                let mut commands = vec![output.command.clone()];
+                commands.extend(err.commands);
+                TrackExecutionError::new(err.error, commands)
+            })?;
+        auxiliary_records.push(silence_record);
+    }
+    let parsed = parse_reference_true_peak_measurement(
+        measurement.id,
+        measurement.scope,
+        measurement.purpose,
+        raw_report,
+        reporting_uncertainty,
+        analyzer_residual,
+        needs_silence_proof,
+    )
+    .map_err(|message| {
+        TrackExecutionError::new(ConvertError::Backend(message), vec![output.command.clone()])
+    })?;
+    let mut record = output.command;
+    record.description = Some(measurement.command.description.clone());
+    let mut records = vec![record];
+    records.append(&mut auxiliary_records);
+    Ok((
+        records,
+        parsed,
+    ))
+}
+
+
+async fn verify_signed_zero_audio(
+    input: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    work_dir: &Path,
+) -> Result<CommandRecord, TrackExecutionError> {
+    let raw = work_dir.join("reference-silence-scan.f64le");
+    let _ = fs::remove_file(&raw);
+    let planned = build_reference_silence_scan_command(input, &raw);
+    let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
+        .map_err(TrackExecutionError::from)?;
+    let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
+        .await
+        .map_err(|err| {
+            let record = command_record_from_tool_error(&err).into_iter().collect();
+            TrackExecutionError::new(ConvertError::Tool(err), record)
+        })?;
+    let scan_result = (|| -> Result<(), TrackExecutionError> {
+        let mut file = File::open(&raw).map_err(|err| {
+            TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
+        })?;
+        let len = file
+            .metadata()
+            .map_err(|err| {
+                TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
+            })?
+            .len();
+        if len == 0 || len % 8 != 0 {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference silence scan produced an empty or truncated f64 stream".to_string(),
+                ),
+                vec![output.command.clone()],
+            ));
+        }
+        let mut buffer = [0_u8; 8 * 4096];
+        let mut remaining = len;
+        while remaining > 0 {
+            let count = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference silence scan length does not fit this platform".to_string(),
+                    ),
+                    vec![output.command.clone()],
+                )
+            })?;
+            file.read_exact(&mut buffer[..count]).map_err(|err| {
+                TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
+            })?;
+            validate_signed_zero_f64le(&buffer[..count]).map_err(|message| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(message),
+                    vec![output.command.clone()],
+                )
+            })?;
+            remaining -= count as u64;
+        }
+        Ok(())
+    })();
+    let cleanup_result = fs::remove_file(&raw);
+    scan_result?;
+    if let Err(err) = cleanup_result {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(TrackExecutionError::new(
+                ConvertError::Io(err),
+                vec![output.command.clone()],
+            ));
+        }
+    }
+    Ok(output.command)
+}
+
+fn command_records_hash(records: &[CommandRecord]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-reference-resolved-command-transcript/v1\0");
+    for record in records {
+        hasher.update(format!("{:?}", record.binary).as_bytes());
+        hasher.update([0]);
+        for arg in &record.sanitized_args {
+            hasher.update((arg.len() as u64).to_be_bytes());
+            hasher.update(arg.as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn execute_commands(
@@ -812,7 +4834,7 @@ fn track_label(track: &PreparedTrack) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -832,6 +4854,141 @@ mod tests {
     use tonepoet_pipeline::{AudioFormat, InputSource, OutputSink, PipelineSettings, ToolIdentifier};
 
     use super::*;
+
+    fn valid_loudnorm_json(input_tp: &str) -> String {
+        format!(
+            r#"{{
+                "input_i": "-23.00",
+                "input_tp": "{input_tp}",
+                "input_lra": "0.10",
+                "input_thresh": "-33.00",
+                "output_i": "-23.00",
+                "output_tp": "-1.00",
+                "output_lra": "0.10",
+                "output_thresh": "-33.00",
+                "normalization_type": "linear",
+                "target_offset": "0.00"
+            }}"#
+        )
+    }
+
+    #[test]
+    fn loudnorm_parser_accepts_only_one_complete_strict_report() {
+        let json = valid_loudnorm_json("-3.125000000");
+        assert_eq!(
+            extract_single_loudnorm_report(&format!("prefix\n{json}\nsuffix")).unwrap(),
+            json
+        );
+        let finite = parse_reference_true_peak_measurement(
+            MeasurementId(1),
+            tonepoet_pipeline::MeasurementScope::Plan,
+            TruePeakPurpose::GainAuthority,
+            json.clone(),
+            tonepoet_pipeline::DbNano::ZERO,
+            tonepoet_pipeline::DbNano::ZERO,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            finite.reported,
+            TruePeakValue::Finite("-3.125000000".parse().unwrap())
+        );
+        let silence = parse_reference_true_peak_measurement(
+            MeasurementId(2),
+            tonepoet_pipeline::MeasurementScope::Plan,
+            TruePeakPurpose::GainAuthority,
+            valid_loudnorm_json("-inf"),
+            tonepoet_pipeline::DbNano::ZERO,
+            tonepoet_pipeline::DbNano::ZERO,
+            true,
+        )
+        .unwrap();
+        assert_eq!(silence.reported, TruePeakValue::VerifiedSilence);
+    }
+
+    #[test]
+    fn loudnorm_parser_rejects_ambiguous_or_malformed_reports() {
+        let json = valid_loudnorm_json("-3.00");
+        assert!(extract_single_loudnorm_report("no report").is_err());
+        assert!(extract_single_loudnorm_report(&format!("{json}\n{json}")).is_err());
+        assert!(extract_single_loudnorm_report(&json[..json.len() - 1]).is_err());
+
+        for invalid in ["1e2", "1E2", "+1.0", "1,0", "inf", "+inf", "NaN", "-1000.000000001", "100.000000001"] {
+            assert!(
+                parse_reference_true_peak_measurement(
+                    MeasurementId(1),
+                    tonepoet_pipeline::MeasurementScope::Plan,
+                    TruePeakPurpose::GainAuthority,
+                    valid_loudnorm_json(invalid),
+                    tonepoet_pipeline::DbNano::ZERO,
+                    tonepoet_pipeline::DbNano::ZERO,
+                    false,
+                )
+                .is_err(),
+                "unsupported input_tp syntax was accepted: {invalid}"
+            );
+        }
+
+        let missing = json.replace("\n                \"target_offset\": \"0.00\"", "");
+        assert!(parse_reference_true_peak_measurement(
+            MeasurementId(1),
+            tonepoet_pipeline::MeasurementScope::Plan,
+            TruePeakPurpose::GainAuthority,
+            missing,
+            tonepoet_pipeline::DbNano::ZERO,
+            tonepoet_pipeline::DbNano::ZERO,
+            false,
+        )
+        .is_err());
+        let unknown = json.replacen(
+            "\n            }",
+            ",\n                \"unexpected\": \"value\"\n            }",
+            1,
+        );
+        assert!(parse_reference_true_peak_measurement(
+            MeasurementId(1),
+            tonepoet_pipeline::MeasurementScope::Plan,
+            TruePeakPurpose::GainAuthority,
+            unknown,
+            tonepoet_pipeline::DbNano::ZERO,
+            tonepoet_pipeline::DbNano::ZERO,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn embedded_reference_qualification_matches_compiled_policy_tables() {
+        let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3.json"
+        )))
+        .expect("embedded Reference qualification JSON parses");
+        assert_eq!(
+            manifest
+                .terminal_bounds
+                .int16_shibata
+                .safe_pre_terminal_ceiling_dbtp,
+            tonepoet_pipeline::DbNano(i64::MIN)
+        );
+        validate_embedded_reference_policy_tables(&manifest)
+            .expect("embedded Reference qualification matches compiled policy tables");
+
+        let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v3_candidate.json"
+        )))
+        .expect("preserved v3 candidate JSON parses");
+        assert_eq!(
+            candidate
+                .terminal_bounds
+                .int16_shibata
+                .safe_pre_terminal_ceiling_dbtp,
+            tonepoet_pipeline::DbNano(i64::MIN)
+        );
+        assert_eq!(candidate.status, "qualification_candidate");
+        assert!(validate_embedded_release_certification(&candidate).is_err());
+    }
 
     fn test_tool_command(binary: ToolBinary) -> ToolCommand {
         ToolCommand {
@@ -1843,7 +6000,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
         PipelineStage, SourceAudioDescriptor, TrackId, TrackMetadata, TrackOutcome, TrackRecord,
         TrackSourceRef,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;

@@ -7,12 +7,16 @@
 use sha2::{Digest, Sha256};
 
 use crate::enums::{
-    AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
+    AacProfile, AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
     NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcProfile, WavPackMode,
 };
+use crate::dsd_reference::{
+    DbNano, DsdInputFrontEnd, DsdReferencePlanSummary, DsdSourceKind, Sha256Digest,
+};
+use crate::source::{SourceInfo, SourceRepresentationKind};
 use crate::settings::{
     AacSettings, DsdSettings, FlacSettings, MetadataSettings, Mp3Settings, OpusSettings,
     PipelineSettings, ReplayGainSettings, SincFilterSettings, SoxResamplerSettings,
@@ -134,6 +138,37 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
 /// Number of conversion-affecting field paths in [`SETTINGS_FINGERPRINT_FIELD_PATHS`].
 pub const SETTINGS_FINGERPRINT_FIELD_COUNT: usize = SETTINGS_FINGERPRINT_FIELD_PATHS.len();
 
+/// Native-v2 DSD settings paths written by [`settings_snapshot_fingerprint_v2`].
+///
+/// This inventory is deliberately separate from [`SETTINGS_FINGERPRINT_FIELD_PATHS`],
+/// which is frozen as legacy manifest-v1 authority. Additive directional DSD
+/// settings must never be inferred into an old fingerprint domain.
+pub const SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS: &[&str] = &[
+    "dsd.schema",
+    "dsd.pcm_to_dsd.noise_shaper",
+    "dsd.pcm_to_dsd.modulator_order",
+    "dsd.pcm_to_dsd.trellis",
+    "dsd.pcm_to_dsd.filter",
+    "dsd.pcm_to_dsd.sinc.oversample_factor",
+    "dsd.pcm_to_dsd.sinc.taps",
+    "dsd.pcm_to_dsd.sinc.passband_hz",
+    "dsd.pcm_to_dsd.sinc.transition_hz",
+    "dsd.pcm_to_dsd.sinc.kaiser_beta",
+    "dsd.pcm_to_dsd.sinc.linear_phase",
+    "dsd.pcm_to_dsd.sinc.allow_aliasing",
+    "dsd.pcm_to_dsd.gain_compensation",
+    "dsd.from_dsd.pathway",
+    "dsd.from_dsd.reference_policy",
+    "dsd.from_dsd.profile",
+    "dsd.from_dsd.gain_mode",
+    "dsd.from_dsd.fixed_gain_db",
+    "dsd.from_dsd.normalize_peak_target_dbfs",
+];
+
+/// Number of native-v2 directional DSD fields in the settings snapshot.
+pub const SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT: usize =
+    SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS.len();
+
 /// Returns a deterministic content fingerprint for all conversion-affecting
 /// fields in [`PipelineSettings`].
 #[must_use]
@@ -142,6 +177,203 @@ pub fn settings_fingerprint(settings: &PipelineSettings) -> SettingsFingerprint 
     writer.field_static("schema", "tonepoet-pipeline-settings-fingerprint/v1");
     push_pipeline_settings(&mut writer, settings);
     SettingsFingerprint(writer.finish())
+}
+
+/// Frozen name for the byte-for-byte legacy settings identity.
+pub type LegacySettingsFingerprintV1 = SettingsFingerprint;
+
+/// Return the exact pre-directional settings fingerprint used by manifest v1.
+#[must_use]
+pub fn legacy_settings_fingerprint_v1(
+    settings: &PipelineSettings,
+) -> LegacySettingsFingerprintV1 {
+    settings_fingerprint(settings)
+}
+
+/// Canonical native-v2 settings snapshot digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SettingsSnapshotFingerprintV2(pub Sha256Digest);
+
+/// Source-aware Reference behavior digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BehaviorFingerprintV1(pub Sha256Digest);
+
+/// Runtime/tool closure digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ExecutionFingerprintV1(pub Sha256Digest);
+
+/// Path-normalized immutable plan digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SemanticPlanHashV1(pub Sha256Digest);
+
+/// Exact tool/runtime closure inputs for native-v2 execution identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct ReferenceExecutionIdentityInput {
+    /// Stable planner/build identity.
+    pub planner_build_identity: String,
+    /// Platform ABI identity.
+    pub platform_abi_digest: Sha256Digest,
+    /// Runtime CPU/dispatch identity.
+    pub runtime_dispatch_digest: Sha256Digest,
+    /// Exact SoX-ng executable content digest.
+    pub sox_ng_sha256: Sha256Digest,
+    /// Reported SoX-ng version text.
+    pub sox_ng_version: String,
+    /// Package/store closure identity for SoX-ng.
+    pub sox_ng_closure_digest: Sha256Digest,
+    /// Qualified SoX-ng behavior-probe identity.
+    pub sox_ng_behavior_probe_digest: Sha256Digest,
+    /// Exact FFmpeg executable content digest.
+    pub ffmpeg_sha256: Sha256Digest,
+    /// Reported FFmpeg version text.
+    pub ffmpeg_version: String,
+    /// Package/store closure identity for FFmpeg.
+    pub ffmpeg_closure_digest: Sha256Digest,
+    /// Qualified FFmpeg behavior-probe identity.
+    pub ffmpeg_behavior_probe_digest: Sha256Digest,
+    /// In-process DST/SACD build identity.
+    pub sacd_rs_build_identity: String,
+    /// Pinned byte-exact DST fixture corpus.
+    pub dst_fixture_digest: Sha256Digest,
+    /// Frozen analyzer reporting uncertainty.
+    pub reporting_uncertainty: DbNano,
+    /// Frozen analyzer residual bound.
+    pub analyzer_residual: DbNano,
+}
+
+/// Hash the canonical native-v2 settings snapshot. This is audit identity, not
+/// sufficient rerun authority by itself.
+#[must_use]
+pub fn settings_snapshot_fingerprint_v2(
+    settings: &PipelineSettings,
+) -> SettingsSnapshotFingerprintV2 {
+    let mut writer = FingerprintWriter::new();
+    writer.field_static("schema", "tonepoet-settings-snapshot/v2");
+    push_pipeline_settings_v2(&mut writer, settings);
+    SettingsSnapshotFingerprintV2(Sha256Digest(writer.finish()))
+}
+
+/// Hash the source-aware, pathway-scoped Reference behavior.
+#[must_use]
+pub fn conversion_behavior_fingerprint_v1(
+    summary: &DsdReferencePlanSummary,
+    source_kind: &DsdSourceKind,
+) -> BehaviorFingerprintV1 {
+    let mut writer = FingerprintWriter::new();
+    writer.field_static("schema", "tonepoet-dsd-reference-behavior/v1");
+    writer.field_static("policy", summary.policy.key());
+    writer.field_static("target", summary.target.key());
+    writer.field_static("profile", summary.profile.key());
+    writer.field_string("front_end", canonical_front_end(summary.front_end));
+    writer.field_string("source_kind", canonical_source_kind(source_kind));
+    writer.field_string("final.sample_rate_hz", summary.final_pcm.sample_rate_hz.to_string());
+    writer.field_string("final.channels", summary.final_pcm.channels.to_string());
+    writer.field_static("final.sample_kind", sample_kind(summary.final_pcm.sample_kind));
+    writer.field_static("final.bit_depth", pcm_bit_depth(summary.final_pcm.bit_depth));
+    writer.field_string("gain_policy", canonical_gain_policy(summary.gain_policy));
+    writer.field_string(
+        "package_compression_level",
+        summary
+            .package_compression_level
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+    );
+    BehaviorFingerprintV1(Sha256Digest(writer.finish()))
+}
+
+/// Bind behavior and semantic plan to the exact runtime/tool closure.
+#[must_use]
+pub fn execution_fingerprint_v1(
+    behavior: BehaviorFingerprintV1,
+    semantic_plan: SemanticPlanHashV1,
+    qualification_manifest_digest: Sha256Digest,
+    identity: &ReferenceExecutionIdentityInput,
+) -> ExecutionFingerprintV1 {
+    let mut writer = FingerprintWriter::new();
+    writer.field_static("schema", "tonepoet-dsd-reference-execution/v1");
+    writer.field_static("behavior", &behavior.0.to_hex());
+    writer.field_static("semantic_plan", &semantic_plan.0.to_hex());
+    writer.field_static("qualification", &qualification_manifest_digest.to_hex());
+    writer.field_static("planner_build", &identity.planner_build_identity);
+    writer.field_static("platform_abi", &identity.platform_abi_digest.to_hex());
+    writer.field_static("runtime_dispatch", &identity.runtime_dispatch_digest.to_hex());
+    writer.field_static("sox_ng_sha256", &identity.sox_ng_sha256.to_hex());
+    writer.field_static("sox_ng_version", &identity.sox_ng_version);
+    writer.field_static("sox_ng_closure", &identity.sox_ng_closure_digest.to_hex());
+    writer.field_static(
+        "sox_ng_behavior_probe",
+        &identity.sox_ng_behavior_probe_digest.to_hex(),
+    );
+    writer.field_static("ffmpeg_sha256", &identity.ffmpeg_sha256.to_hex());
+    writer.field_static("ffmpeg_version", &identity.ffmpeg_version);
+    writer.field_static("ffmpeg_closure", &identity.ffmpeg_closure_digest.to_hex());
+    writer.field_static(
+        "ffmpeg_behavior_probe",
+        &identity.ffmpeg_behavior_probe_digest.to_hex(),
+    );
+    writer.field_static("sacd_rs_build", &identity.sacd_rs_build_identity);
+    writer.field_static("dst_fixture", &identity.dst_fixture_digest.to_hex());
+    writer.field_static(
+        "analyzer_reporting_uncertainty_db",
+        &identity.reporting_uncertainty.render(false),
+    );
+    writer.field_static(
+        "analyzer_residual_db",
+        &identity.analyzer_residual.render(false),
+    );
+    ExecutionFingerprintV1(Sha256Digest(writer.finish()))
+}
+
+/// Hash the exact source probe facts that can affect Reference planning.
+/// Paths, timestamps, duration estimates, and mutable tag metadata are excluded.
+#[must_use]
+pub fn reference_source_probe_digest_v1(source: &SourceInfo) -> Sha256Digest {
+    let mut writer = FingerprintWriter::new();
+    writer.field_static("schema", "tonepoet-dsd-reference-source-probe/v1");
+    writer.field_string("format", audio_format(&source.format));
+    writer.field_string("codec", audio_codec(&source.codec));
+    writer.field_string(
+        "sample_rate_hz",
+        source.sample_rate_hz.map_or_else(|| "none".to_string(), |value| value.to_string()),
+    );
+    writer.field_string(
+        "bit_depth",
+        source.bit_depth.map_or_else(|| "none".to_string(), |value| pcm_bit_depth(value).to_string()),
+    );
+    writer.field_string(
+        "true_source_depth",
+        source.true_source_depth.map_or_else(|| "none".to_string(), |value| pcm_bit_depth(value).to_string()),
+    );
+    writer.field_static(
+        "source_representation",
+        match source.source_representation {
+            SourceRepresentationKind::Pcm => "pcm",
+            SourceRepresentationKind::Dsd => "dsd",
+            SourceRepresentationKind::Lossy => "lossy",
+            SourceRepresentationKind::Unknown => "unknown",
+            SourceRepresentationKind::Unspecified => "unspecified",
+        },
+    );
+    writer.field_string(
+        "sample_kind",
+        source.sample_kind.map_or_else(|| "none".to_string(), |value| sample_kind(value).to_string()),
+    );
+    writer.field_string(
+        "channels",
+        source.channels.map_or_else(|| "none".to_string(), |value| value.to_string()),
+    );
+    writer.field_string(
+        "dsd_source_kind",
+        source.dsd_source_kind.as_ref().map_or_else(
+            || "none".to_string(),
+            canonical_source_kind,
+        ),
+    );
+    Sha256Digest(writer.finish())
 }
 
 struct FingerprintWriter {
@@ -203,6 +435,141 @@ fn push_pipeline_settings(writer: &mut FingerprintWriter, settings: &PipelineSet
     push_metadata(writer, &settings.metadata);
     push_verification(writer, &settings.verification);
     push_replay_gain(writer, &settings.replay_gain);
+}
+
+fn push_pipeline_settings_v2(writer: &mut FingerprintWriter, settings: &PipelineSettings) {
+    writer.field_string("target_format", audio_format(&settings.target_format));
+    writer.field_string("target_sample_rate", rate_target(settings.target_sample_rate));
+    writer.field_string("target_bit_depth", bit_depth_target(settings.target_bit_depth));
+    writer.field_static("resample_quality", resample_quality(settings.resample_quality));
+    writer.field_static("nyquist_transition", nyquist_transition(settings.nyquist_transition));
+    writer.field_static("dither_type", dither_type(settings.dither_type));
+    writer.field_string("preferred_tool", preferred_tool(&settings.preferred_tool));
+    writer.field_static("force_encode", bool_value(settings.force_encode));
+    push_flac(writer, &settings.flac);
+    push_mp3(writer, &settings.mp3);
+    push_aac(writer, &settings.aac);
+    push_opus(writer, &settings.opus);
+    push_wavpack(writer, &settings.wavpack);
+    push_ssrc(writer, &settings.ssrc);
+    push_sox_resampler(writer, &settings.sox_resampler);
+    push_soxr_resampler(writer, &settings.soxr_resampler);
+    push_native_dsd_v2(writer, &settings.dsd);
+    push_metadata(writer, &settings.metadata);
+    push_verification(writer, &settings.verification);
+    push_replay_gain(writer, &settings.replay_gain);
+}
+
+fn push_native_dsd_v2(writer: &mut FingerprintWriter, settings: &DsdSettings) {
+    let pcm = settings.pcm_to_dsd;
+    writer.field_static("dsd.schema", if settings.is_native_v2() { "native_v2" } else { "legacy_v1" });
+    writer.field_static("dsd.pcm_to_dsd.noise_shaper", dsd_noise_shaper(pcm.noise_shaper));
+    writer.field_static("dsd.pcm_to_dsd.modulator_order", modulator_order(pcm.modulator_order));
+    writer.field_string("dsd.pcm_to_dsd.trellis", option_trellis(pcm.trellis));
+    writer.field_static("dsd.pcm_to_dsd.filter", dsd_filter_preset(pcm.filter));
+    push_sinc_v2(writer, &pcm.sinc);
+    writer.field_string("dsd.pcm_to_dsd.gain_compensation", gain_compensation(pcm.gain_compensation));
+    let from = settings.from_dsd;
+    writer.field_static("dsd.from_dsd.pathway", match from.pathway {
+        crate::DsdSourcePathway::Reference => "reference",
+        crate::DsdSourcePathway::Manual => "manual",
+    });
+    writer.field_static("dsd.from_dsd.reference_policy", from.reference_policy.key());
+    writer.field_static("dsd.from_dsd.profile", match from.profile {
+        crate::DsdReconstructionSelection::Reference => "reference",
+        crate::DsdReconstructionSelection::Wideband => "wideband",
+    });
+    writer.field_static("dsd.from_dsd.gain_mode", match from.gain_mode {
+        crate::DsdSourceGainMode::Reference => "reference",
+        crate::DsdSourceGainMode::NativeLevel => "native_level",
+        crate::DsdSourceGainMode::Fixed => "fixed",
+        crate::DsdSourceGainMode::NormalizePeak => "normalize_peak",
+    });
+    writer.field_string("dsd.from_dsd.fixed_gain_db", option_db_nano(from.fixed_gain_db));
+    writer.field_string(
+        "dsd.from_dsd.normalize_peak_target_dbfs",
+        from.normalize_peak_target_dbfs.render(false),
+    );
+}
+
+fn push_sinc_v2(writer: &mut FingerprintWriter, settings: &SincFilterSettings) {
+    writer.field_string("dsd.pcm_to_dsd.sinc.oversample_factor", settings.oversample_factor.to_string());
+    writer.field_string("dsd.pcm_to_dsd.sinc.taps", settings.taps.to_string());
+    writer.field_string("dsd.pcm_to_dsd.sinc.passband_hz", f32_value(settings.passband_hz));
+    writer.field_string("dsd.pcm_to_dsd.sinc.transition_hz", f32_value(settings.transition_hz));
+    writer.field_string("dsd.pcm_to_dsd.sinc.kaiser_beta", f32_value(settings.kaiser_beta));
+    writer.field_static("dsd.pcm_to_dsd.sinc.linear_phase", bool_value(settings.linear_phase));
+    writer.field_static("dsd.pcm_to_dsd.sinc.allow_aliasing", bool_value(settings.allow_aliasing));
+}
+
+fn option_db_nano(value: Option<DbNano>) -> String {
+    value.map_or_else(|| "None".to_string(), |value| format!("Some({})", value.render(false)))
+}
+
+fn sample_kind(value: crate::SampleKind) -> &'static str {
+    match value {
+        crate::SampleKind::SignedInteger => "signed_integer",
+        crate::SampleKind::UnsignedInteger => "unsigned_integer",
+        crate::SampleKind::Float => "float",
+        crate::SampleKind::Dsd => "dsd",
+    }
+}
+
+fn canonical_front_end(front_end: DsdInputFrontEnd) -> String {
+    match front_end {
+        DsdInputFrontEnd::NativeUncompressed => "native_uncompressed".to_string(),
+        DsdInputFrontEnd::DsdiffDst { decoder } => format!("dsdiff_dst:{decoder:?}"),
+        DsdInputFrontEnd::SacdDsd { extractor } => format!("sacd_dsd:{extractor:?}"),
+        DsdInputFrontEnd::SacdDst { extractor, decoder } => {
+            format!("sacd_dst:{extractor:?}:{decoder:?}")
+        }
+    }
+}
+
+fn canonical_source_kind(source: &DsdSourceKind) -> String {
+    match source {
+        DsdSourceKind::DsfUncompressed => "dsf_uncompressed".to_string(),
+        DsdSourceKind::DsdiffUncompressed => "dsdiff_uncompressed".to_string(),
+        DsdSourceKind::DsdiffDst => "dsdiff_dst".to_string(),
+        DsdSourceKind::SacdTrack { frame_format, selection } => format!(
+            "sacd:{frame_format:?}:{:?}:{}:{}:{}:{}",
+            selection.area,
+            selection.track_index_zero_based,
+            selection.start_frame,
+            selection.frame_count,
+            selection.toc_digest.to_hex(),
+        ),
+        DsdSourceKind::UnknownDsdContainer => "unknown_dsd_container".to_string(),
+    }
+}
+
+fn canonical_gain_policy(policy: crate::ResolvedGainPolicy) -> String {
+    match policy {
+        crate::ResolvedGainPolicy::ReferenceCompensated { requested_gain, ceiling, terminal_bound } => format!(
+            "reference:{}:{}:{}:{}",
+            requested_gain.render(false),
+            ceiling.render(false),
+            terminal_bound.max_added_peak_fs_q63_ceil,
+            terminal_bound.derivation_digest.to_hex(),
+        ),
+        crate::ResolvedGainPolicy::NativeLevelExact { gain, ceiling, terminal_bound } => format!(
+            "native:{}:{}:{}:{}",
+            gain.render(false),
+            ceiling.render(false),
+            terminal_bound.max_added_peak_fs_q63_ceil,
+            terminal_bound.derivation_digest.to_hex(),
+        ),
+        crate::ResolvedGainPolicy::FixedExact { gain, ceiling, terminal_bound } => format!(
+            "fixed:{}:{}:{}:{}",
+            gain.render(false),
+            ceiling.render(false),
+            terminal_bound.max_added_peak_fs_q63_ceil,
+            terminal_bound.derivation_digest.to_hex(),
+        ),
+        crate::ResolvedGainPolicy::NormalizePeak { target_dbfs } => {
+            format!("normalize:{}", target_dbfs.render(false))
+        }
+    }
 }
 
 fn push_flac(writer: &mut FingerprintWriter, settings: &FlacSettings) {
@@ -305,10 +672,12 @@ fn option_u8(value: Option<u8>) -> String {
 }
 
 fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
-    writer.field_static("dsd.noise_shaper", dsd_noise_shaper(settings.noise_shaper));
-    writer.field_static("dsd.modulator_order", modulator_order(settings.modulator_order));
-    writer.field_string("dsd.trellis", option_trellis(settings.trellis));
-    if let Some(trellis) = settings.trellis {
+    let pcm = settings.pcm_to_dsd;
+    let legacy = settings.legacy_compat_wire();
+    writer.field_static("dsd.noise_shaper", dsd_noise_shaper(pcm.noise_shaper));
+    writer.field_static("dsd.modulator_order", modulator_order(pcm.modulator_order));
+    writer.field_string("dsd.trellis", option_trellis(pcm.trellis));
+    if let Some(trellis) = pcm.trellis {
         writer.field_string("dsd.trellis.lookahead", trellis.lookahead.to_string());
         writer.field_string("dsd.trellis.nodes", trellis.nodes.to_string());
         writer.field_string("dsd.trellis.latency", option_u16(trellis.latency));
@@ -317,20 +686,23 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         writer.field_static("dsd.trellis.nodes", "None");
         writer.field_static("dsd.trellis.latency", "None");
     }
-    writer.field_static("dsd.pcm_to_dsd_filter", dsd_filter_preset(settings.pcm_to_dsd_filter));
+    writer.field_static("dsd.pcm_to_dsd_filter", dsd_filter_preset(pcm.filter));
     writer.field_static(
         "dsd.dsd_to_pcm_lowpass",
-        dsd_lowpass_method(settings.dsd_to_pcm_lowpass),
+        dsd_lowpass_method(legacy.dsd_to_pcm_lowpass),
     );
-    push_dsd_to_pcm_gain(writer, settings);
-    push_sinc(writer, &settings.sinc);
+    push_legacy_dsd_to_pcm_gain(writer, legacy);
+    push_sinc(writer, &pcm.sinc);
     writer.field_string(
         "dsd.gain_compensation",
-        gain_compensation(settings.gain_compensation),
+        gain_compensation(pcm.gain_compensation),
     );
 }
 
-fn push_dsd_to_pcm_gain(writer: &mut FingerprintWriter, settings: &DsdSettings) {
+fn push_legacy_dsd_to_pcm_gain(
+    writer: &mut FingerprintWriter,
+    settings: crate::settings::LegacyDsdSettingsWireV1,
+) {
     writer.field_static(
         "dsd.dsd_to_pcm_gain_mode",
         dsd_to_pcm_gain_mode(settings.dsd_to_pcm_gain_mode),
@@ -338,13 +710,8 @@ fn push_dsd_to_pcm_gain(writer: &mut FingerprintWriter, settings: &DsdSettings) 
 
     match settings.dsd_to_pcm_gain_mode {
         DsdToPcmGainMode::Disabled => {
-            // Compatibility: a legacy caller that sets only `dsd_to_pcm_gain_db`
-            // still changes DSD-to-PCM output, so include it only when present.
             if let Some(gain_db) = settings.dsd_to_pcm_gain_db {
-                writer.field_string(
-                    "dsd.dsd_to_pcm_gain_db",
-                    option_f32(Some(gain_db)),
-                );
+                writer.field_string("dsd.dsd_to_pcm_gain_db", option_f32(Some(gain_db)));
             }
         }
         DsdToPcmGainMode::Auto => {
@@ -443,6 +810,22 @@ fn audio_format(value: &AudioFormat) -> String {
             string_value(extension),
             string_value(display_name)
         ),
+    }
+}
+
+fn audio_codec(value: &AudioCodec) -> String {
+    match value {
+        AudioCodec::Flac => "flac".to_string(),
+        AudioCodec::PcmSigned => "pcm_signed".to_string(),
+        AudioCodec::PcmUnsigned => "pcm_unsigned".to_string(),
+        AudioCodec::PcmFloat => "pcm_float".to_string(),
+        AudioCodec::WavPack => "wavpack".to_string(),
+        AudioCodec::Mp3 => "mp3".to_string(),
+        AudioCodec::Aac => "aac".to_string(),
+        AudioCodec::Opus => "opus".to_string(),
+        AudioCodec::Alac => "alac".to_string(),
+        AudioCodec::Dsd => "dsd".to_string(),
+        AudioCodec::Custom(name) => format!("custom({})", string_value(name)),
     }
 }
 
@@ -672,6 +1055,18 @@ fn pcm_bit_depth(value: PcmBitDepth) -> &'static str {
 mod tests {
     use super::*;
 
+    fn legacy_dsd(
+        gain_mode: DsdToPcmGainMode,
+        margin_db: f32,
+        gain_db: Option<f32>,
+    ) -> crate::settings::DsdSettings {
+        let mut wire = crate::settings::LegacyDsdSettingsWireV1::default();
+        wire.dsd_to_pcm_gain_mode = gain_mode;
+        wire.dsd_to_pcm_auto_gain_margin_db = margin_db;
+        wire.dsd_to_pcm_gain_db = gain_db;
+        crate::settings::DsdSettings::from_legacy_wire(wire)
+    }
+
     fn fingerprint_with(mut update: impl FnMut(&mut PipelineSettings)) -> SettingsFingerprint {
         let mut settings = PipelineSettings::default();
         update(&mut settings);
@@ -681,14 +1076,10 @@ mod tests {
     #[test]
     fn disabled_dsd_to_pcm_fingerprint_ignores_auto_margin_without_legacy_gain() {
         let base = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
-            settings.dsd.dsd_to_pcm_gain_db = None;
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 0.15, None);
         });
         let changed_stale_margin = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
-            settings.dsd.dsd_to_pcm_gain_db = None;
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 1.0, None);
         });
 
         assert_eq!(base, changed_stale_margin);
@@ -697,21 +1088,16 @@ mod tests {
     #[test]
     fn disabled_dsd_to_pcm_fingerprint_honors_legacy_gain_only_when_present() {
         let no_legacy_gain = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-            settings.dsd.dsd_to_pcm_gain_db = None;
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 0.15, None);
         });
         let legacy_gain = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 0.15, Some(2.0));
         });
         let same_legacy_gain_stale_margin = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
-            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 1.0, Some(2.0));
         });
         let different_legacy_gain = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-            settings.dsd.dsd_to_pcm_gain_db = Some(3.0);
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 0.15, Some(3.0));
         });
 
         assert_ne!(no_legacy_gain, legacy_gain);
@@ -722,19 +1108,13 @@ mod tests {
     #[test]
     fn auto_dsd_to_pcm_fingerprint_includes_margin_and_ignores_manual_gain() {
         let base = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
-            settings.dsd.dsd_to_pcm_gain_db = None;
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Auto, 0.15, None);
         });
         let stale_manual_gain = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
-            settings.dsd.dsd_to_pcm_gain_db = Some(6.0);
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Auto, 0.15, Some(6.0));
         });
         let changed_margin = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.50;
-            settings.dsd.dsd_to_pcm_gain_db = None;
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Auto, 0.50, None);
         });
 
         assert_eq!(base, stale_manual_gain);
@@ -744,19 +1124,13 @@ mod tests {
     #[test]
     fn manual_dsd_to_pcm_fingerprint_includes_manual_gain_and_ignores_auto_margin() {
         let base = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
-            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Manual, 0.15, Some(2.0));
         });
         let stale_auto_margin = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
-            settings.dsd.dsd_to_pcm_gain_db = Some(2.0);
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Manual, 1.0, Some(2.0));
         });
         let changed_manual_gain = fingerprint_with(|settings| {
-            settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
-            settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
-            settings.dsd.dsd_to_pcm_gain_db = Some(2.25);
+            settings.dsd = legacy_dsd(DsdToPcmGainMode::Manual, 0.15, Some(2.25));
         });
 
         assert_eq!(base, stale_auto_margin);

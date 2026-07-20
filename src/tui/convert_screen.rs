@@ -34,6 +34,11 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
     };
 
     let source_h = super::draw_source::source_pane_height(&app.convert.source.mode, area.width);
+    let format_h = if app.convert.format.dsd_to_pcm_gain_available() {
+        13
+    } else {
+        10
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -43,7 +48,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
             Constraint::Length(1),
             pane_constraint(ConvertFocus::Source, source_h),
             pane_constraint(ConvertFocus::Metadata, 6),
-            pane_constraint(ConvertFocus::Format, 10),
+            pane_constraint(ConvertFocus::Format, format_h),
             pane_constraint(ConvertFocus::OutputOptions, 7),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -298,8 +303,22 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         register_pill_row(buttons, &state.replaygain, area.y + 7, label_col, |i| TuiButton::ReplayGainPill(i));
         last_standard_row = 7;
         if state.dsd_to_pcm_gain_available() {
-            register_pill_row(buttons, &state.dsd_gain_mode, area.y + 8, label_col, |i| TuiButton::DsdGainPill(i));
-            last_standard_row = 9;
+            register_pill_row(buttons, &state.dsd_pathway, area.y + 8, label_col, |i| TuiButton::DsdPathPill(i));
+            register_pill_row(buttons, &state.dsd_profile, area.y + 9, label_col, |i| TuiButton::DsdProfilePill(i));
+            register_pill_row(buttons, &state.dsd_gain_mode, area.y + 10, label_col, |i| TuiButton::DsdGainPill(i));
+            if area.y + 11 < area.y + area.height {
+                buttons.record_button(
+                    TuiButton::DsdGainDbField,
+                    ratatui::layout::Rect::new(area.x, area.y + 11, area.width, 1),
+                );
+            }
+            if area.y + 12 < area.y + area.height {
+                buttons.record_button(
+                    TuiButton::DsdNormalizeTargetField,
+                    ratatui::layout::Rect::new(area.x, area.y + 12, area.width, 1),
+                );
+            }
+            last_standard_row = 12;
         }
     }
 

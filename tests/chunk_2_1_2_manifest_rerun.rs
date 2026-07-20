@@ -124,7 +124,10 @@ fn refresh_manifest_for_publish_honors_hashing_policy() {
     assert_eq!(manifest.tracks[0].output_size, b"published audio".len() as u64);
 
     refresh_manifest_output_facts_for_publish(&mut manifest, &temp_album_dir, &final_album_dir, true).unwrap();
-    assert_eq!(manifest.tracks[0].output_hash, Some(file_sha256(&temp_album_dir.join("01.flac")).unwrap()));
+    assert_eq!(
+        manifest.tracks[0].output_hash.map(tonepoet_pipeline::Sha256Digest::to_hex),
+        Some(file_sha256(&temp_album_dir.join("01.flac")).unwrap())
+    );
 }
 
 #[test]

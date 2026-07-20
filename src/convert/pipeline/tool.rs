@@ -173,6 +173,14 @@ pub trait ToolRunner: Send + Sync {
     fn tool_available(&self, _binary: ToolBinary) -> bool {
         true
     }
+
+    /// Return the exact executable path this runner will spawn for `binary`.
+    /// Reference-policy attestation uses this to bind the probed executable to
+    /// the executable that later commands actually run. Test/in-process
+    /// runners may leave it unavailable when they cannot make that guarantee.
+    fn resolved_tool_path(&self, _binary: ToolBinary) -> Option<PathBuf> {
+        None
+    }
 }
 
 // ===========================================================================
@@ -502,7 +510,7 @@ fn first_version_after_marker(line: &str, marker: &str) -> Option<String> {
     first_version_like_token(&line[start..])
 }
 
-fn parse_tool_version_output(binary: ToolBinary, stdout: &str, stderr: &str) -> Option<String> {
+pub(crate) fn parse_tool_version_output(binary: ToolBinary, stdout: &str, stderr: &str) -> Option<String> {
     let combined = [stdout, stderr].join("\n");
     for line in combined.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let parsed = match binary {
@@ -709,6 +717,10 @@ impl ToolRunner for RealToolRunner {
 
     fn tool_available(&self, binary: ToolBinary) -> bool {
         executable_path_is_available(&self.resolve_binary(binary))
+    }
+
+    fn resolved_tool_path(&self, binary: ToolBinary) -> Option<PathBuf> {
+        std::fs::canonicalize(self.resolve_binary(binary)).ok()
     }
 
     async fn run(

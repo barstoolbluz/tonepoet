@@ -18,6 +18,7 @@ use crate::dsd_file::reader::{
     DstCrcStatus, DstFrameReader,
 };
 use std::fmt;
+use std::io;
 use std::io::{Read, Seek, Write};
 
 /// How much audio work [`validate_dsd_stream`] should do after container open.
@@ -251,6 +252,23 @@ where
     R: Read + Seek,
     W: Write + Seek,
 {
+    write_decoded_dsd_to_dff_with_cancel(reader, writer, || false)
+}
+
+/// Write decoded DSD frames to DSDIFF/DSD while allowing the caller to abort
+/// between frames. Cancellation is surfaced as an interrupted I/O error so
+/// callers can map it to their own lifecycle state without weakening the
+/// existing typed read/decode errors.
+pub fn write_decoded_dsd_to_dff_with_cancel<R, W, F>(
+    reader: &mut DsdDecodedFileReader<R>,
+    writer: W,
+    mut is_cancelled: F,
+) -> Result<DsdStreamCopyStats, DsdReadError>
+where
+    R: Read + Seek,
+    W: Write + Seek,
+    F: FnMut() -> bool,
+{
     let info = reader.info().clone();
     let channel_count = u8_channel_count(&info)?;
     let mut out = DffWriter::new(writer, channel_count, info.sample_rate)?;
@@ -259,6 +277,12 @@ where
         bytes_written: 0,
     };
     while let Some(frame) = reader.next_dsd_frame()? {
+        if is_cancelled() {
+            return Err(DsdReadError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "DSD decode cancelled",
+            )));
+        }
         out.write_frame(&frame.data)?;
         stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
             DsdReadError::Malformed { offset: 0, reason: "DFF copy frame counter overflow".to_string() }
@@ -266,6 +290,12 @@ where
         stats.bytes_written = stats.bytes_written.checked_add(frame.data.len() as u64).ok_or_else(|| {
             DsdReadError::Malformed { offset: 0, reason: "DFF copy byte counter overflow".to_string() }
         })?;
+    }
+    if is_cancelled() {
+        return Err(DsdReadError::Io(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "DSD decode cancelled",
+        )));
     }
     out.finish()?;
     Ok(stats)

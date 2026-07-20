@@ -12747,7 +12747,9 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
 /// Execute a :set command
 fn execute_set(app: &mut AppState, key: &str, value: &str) {
     if key.is_empty() {
-        app.set_status("Usage: :set <key> <value>  (format, rate, depth, dither, rg)");
+        app.set_status(
+            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-normalize-target)",
+        );
         return;
     }
     if value.is_empty() {
@@ -12781,6 +12783,42 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status(format!(
                     "replaygain = {}",
                     app.convert.format.replaygain.selected_label()
+                ));
+            }
+            "dsd-path" => {
+                app.set_status(format!(
+                    "dsd-path = {}",
+                    match *app.convert.format.dsd_pathway.selected_value() {
+                        tonepoet_pipeline::DsdSourcePathway::Reference => "reference",
+                        tonepoet_pipeline::DsdSourcePathway::Manual => "manual (not yet available)",
+                    }
+                ));
+            }
+            "dsd-profile" => {
+                app.set_status(format!(
+                    "dsd-profile = {}",
+                    match *app.convert.format.dsd_profile.selected_value() {
+                        tonepoet_pipeline::DsdReconstructionSelection::Reference => "reference",
+                        tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband",
+                    }
+                ));
+            }
+            "dsd-gain" => {
+                app.set_status(format!(
+                    "dsd-gain = {}",
+                    app.convert.format.dsd_gain_mode.selected_label()
+                ));
+            }
+            "dsd-gain-db" => {
+                app.set_status(format!(
+                    "dsd-gain-db = {}",
+                    app.convert.format.dsd_gain_db.render(false)
+                ));
+            }
+            "dsd-normalize-target" => {
+                app.set_status(format!(
+                    "dsd-normalize-target = {}",
+                    app.convert.format.dsd_normalize_target_dbfs.render(false)
                 ));
             }
             _ => {
@@ -12974,9 +13012,109 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 ));
             }
         }
+        "dsd-path" => match value.to_ascii_lowercase().as_str() {
+            "reference" => {
+                if app
+                    .convert
+                    .format
+                    .dsd_pathway
+                    .select_value(&tonepoet_pipeline::DsdSourcePathway::Reference)
+                {
+                    app.preset.mark_modified();
+                    app.set_status("dsd-path = reference");
+                } else {
+                    app.set_status("dsd-path is available only for a DSD source targeting PCM");
+                }
+            }
+            "manual" => {
+                app.set_status(tonepoet_pipeline::reference_error_text(
+                    tonepoet_pipeline::ReferenceErrorCode::ManualUnavailable,
+                ));
+            }
+            _ => app.set_status("Unknown dsd-path. Try: reference, manual"),
+        },
+        "dsd-profile" => {
+            let profile = match value.to_ascii_lowercase().as_str() {
+                "reference" => Some(tonepoet_pipeline::DsdReconstructionSelection::Reference),
+                "wideband" => Some(tonepoet_pipeline::DsdReconstructionSelection::Wideband),
+                _ => None,
+            };
+            if let Some(profile) = profile {
+                if app.convert.format.dsd_profile.select_value(&profile) {
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-profile = {}", value.to_ascii_lowercase()));
+                } else {
+                    app.set_status("That DSD profile is unavailable for the current source/target cell");
+                }
+            } else {
+                app.set_status("Unknown dsd-profile. Try: reference, wideband");
+            }
+        }
+        "dsd-gain" => {
+            let mode = match value.to_ascii_lowercase().as_str() {
+                "reference" => Some(DsdGainMode::Reference),
+                "native" | "native-level" | "native_level" => Some(DsdGainMode::NativeLevel),
+                "fixed" => Some(DsdGainMode::Fixed),
+                "normalize" | "normalize-peak" | "normalize_peak" => {
+                    Some(DsdGainMode::NormalizePeak)
+                }
+                _ => None,
+            };
+            if let Some(mode) = mode {
+                app.convert.format.dsd_gain_mode.select_value(&mode);
+                app.preset.mark_modified();
+                app.set_status(format!(
+                    "dsd-gain = {}",
+                    app.convert.format.dsd_gain_mode.selected_label()
+                ));
+            } else {
+                app.set_status("Unknown dsd-gain. Try: reference, native, fixed, normalize");
+            }
+        }
+        "dsd-gain-db" => match value.parse::<tonepoet_pipeline::DbNano>() {
+            Ok(parsed) => {
+                if !(tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
+                    ..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN)
+                    .contains(&parsed)
+                {
+                    app.set_status("dsd-gain-db must be between -24 and +24 dB");
+                } else {
+                    app.convert.format.dsd_gain_db = parsed;
+                    app.convert
+                        .format
+                        .dsd_gain_mode
+                        .select_value(&DsdGainMode::Fixed);
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-gain-db = {}", parsed.render(false)));
+                }
+            }
+            Err(error) => app.set_status(format!("Invalid dsd-gain-db: {error}")),
+        },
+        "dsd-normalize-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
+            Ok(parsed) => {
+                if !(tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
+                    ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
+                    .contains(&parsed)
+                {
+                    app.set_status("dsd-normalize-target must be between -12 and 0 dBFS");
+                } else {
+                    app.convert.format.dsd_normalize_target_dbfs = parsed;
+                    app.convert
+                        .format
+                        .dsd_gain_mode
+                        .select_value(&DsdGainMode::NormalizePeak);
+                    app.preset.mark_modified();
+                    app.set_status(format!(
+                        "dsd-normalize-target = {}",
+                        parsed.render(false)
+                    ));
+                }
+            }
+            Err(error) => app.set_status(format!("Invalid dsd-normalize-target: {error}")),
+        },
         _ => {
             app.set_status(format!(
-                "Unknown setting: {}. Try: format, rate, depth, dither, rg",
+                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-normalize-target",
                 key
             ));
         }

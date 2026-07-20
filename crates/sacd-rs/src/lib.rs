@@ -53,6 +53,25 @@ pub mod source_model;
 pub mod stream_ops;
 pub mod stream_reader;
 
+/// Build-time identity of the complete `crates/sacd-rs/src` Rust source tree.
+/// The crate build script computes this deterministically; release qualification
+/// binds the exact value before the Reference front-end may execute.
+pub const REFERENCE_BUILD_ID: &str = env!("SACD_RS_REFERENCE_BUILD_ID");
+
+/// Build-time identity of the pinned DST decoder qualification fixture corpus.
+/// The build script hashes the admitted source/expected payloads, checksum manifest,
+/// provenance record, and deterministic raw-fixture generator with canonical path framing.
+pub const DST_REFERENCE_FIXTURE_CORPUS_ID: &str =
+    env!("SACD_RS_DST_FIXTURE_CORPUS_ID");
+
+/// Build-time identity of the P0 source/expected-output checksum manifest.
+pub const DST_REFERENCE_FIXTURE_MANIFEST_ID: &str =
+    env!("SACD_RS_DST_FIXTURE_MANIFEST_ID");
+
+/// Build-time identity of the immutable P0 fixture provenance record.
+pub const DST_REFERENCE_FIXTURE_PROVENANCE_ID: &str =
+    env!("SACD_RS_DST_FIXTURE_PROVENANCE_ID");
+
 #[cfg(test)]
 pub(crate) mod test_allocation_counter {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -124,7 +143,8 @@ pub use dsd_file::{
     inspect_dsf, open_dsd_as_decoded_reader, open_dsd_asset, open_dsd_file,
     open_dsd_file_with_policies, open_dsd_source, report_has_decoded_dst_coverage,
     validate_dsd_corpus_paths, validate_dsd_stream, write_decoded_dsd_to_dff,
-    write_decoded_dsd_to_dsf, CommonDsdSourceKind, DecodedDsdSource, DsdAsset,
+    write_decoded_dsd_to_dff_with_cancel, write_decoded_dsd_to_dsf,
+    CommonDsdSourceKind, DecodedDsdSource, DsdAsset,
     DsdAssetError, DsdAssetInfo, DsdAssetKind, DsdAssetMetadata, DsdAssetProvenance,
     DsdAudioStreamInfo, DsdByteOrder, DsdChannelFrame, DsdCompression,
     DsdContainerDiagnostic, DsdContainerDiagnosticSeverity, DsdContainerError,

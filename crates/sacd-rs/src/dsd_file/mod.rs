@@ -37,7 +37,8 @@ pub use inspect::{
 };
 pub use metadata::DsdFileMetadata;
 pub use ops::{
-    describe_container, validate_dsd_stream, write_decoded_dsd_to_dff, write_decoded_dsd_to_dsf,
+    describe_container, validate_dsd_stream, write_decoded_dsd_to_dff,
+    write_decoded_dsd_to_dff_with_cancel, write_decoded_dsd_to_dsf,
     DsdSourceKind as ValidationDsdSourceKind, DsdStreamCopyStats, DsdValidationFailure,
     DsdValidationFailureKind, DsdValidationMode, DsdValidationOptions, DsdValidationReport,
 };

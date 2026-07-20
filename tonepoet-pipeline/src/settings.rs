@@ -10,6 +10,10 @@ use crate::enums::{
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcPdfType, SsrcProfile, WavPackMode,
 };
+use crate::dsd_reference::{
+    reference_error_text, DbNano, DsdReconstructionSelection, DsdReferencePolicyVersion,
+    DsdSourceGainMode, DsdSourcePathway, DsdSourceSettings, ReferenceErrorCode,
+};
 use crate::error::{PlanningError, Result};
 use crate::mapping;
 
@@ -387,99 +391,149 @@ fn validate_metadata(settings: &PipelineSettings) -> Result<()> {
 }
 
 fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
-    validate_finite_f32(
-        "dsd.dsd_to_pcm_auto_gain_margin_db",
-        settings.dsd_to_pcm_auto_gain_margin_db,
-    )?;
-    if !(0.0..=6.0).contains(&settings.dsd_to_pcm_auto_gain_margin_db) {
-        return Err(PlanningError::invalid_settings(
+    if let Some(legacy) = settings.legacy_wire() {
+        validate_finite_f32(
             "dsd.dsd_to_pcm_auto_gain_margin_db",
-            "auto gain safety margin must be between 0 and 6 dB",
-        ));
-    }
-    if let Some(gain_db) = settings.dsd_to_pcm_gain_db {
-        validate_finite_f32("dsd.dsd_to_pcm_gain_db", gain_db)?;
-        if !(-24.0..=24.0).contains(&gain_db) {
+            legacy.dsd_to_pcm_auto_gain_margin_db,
+        )?;
+        if !(0.0..=6.0).contains(&legacy.dsd_to_pcm_auto_gain_margin_db) {
+            return Err(PlanningError::invalid_settings(
+                "dsd.dsd_to_pcm_auto_gain_margin_db",
+                "auto gain safety margin must be between 0 and 6 dB",
+            ));
+        }
+        if let Some(gain_db) = legacy.dsd_to_pcm_gain_db {
+            validate_finite_f32("dsd.dsd_to_pcm_gain_db", gain_db)?;
+            if !(-24.0..=24.0).contains(&gain_db) {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.dsd_to_pcm_gain_db",
+                    "gain must be between -24 and +24 dB",
+                ));
+            }
+        }
+        if legacy.dsd_to_pcm_gain_mode == DsdToPcmGainMode::Manual
+            && legacy.dsd_to_pcm_gain_db.is_none()
+        {
             return Err(PlanningError::invalid_settings(
                 "dsd.dsd_to_pcm_gain_db",
-                "gain must be between -24 and +24 dB",
+                "manual DSD-to-PCM gain requires a dB value",
+            ));
+        }
+    } else {
+        if settings.from_dsd.pathway == DsdSourcePathway::Manual {
+            return Err(PlanningError::invalid_settings(
+                "dsd.from_dsd.pathway",
+                reference_error_text(ReferenceErrorCode::ManualUnavailable),
+            ));
+        }
+        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V3 {
+            return Err(PlanningError::invalid_settings(
+                "dsd.from_dsd.reference_policy",
+                reference_error_text(ReferenceErrorCode::Toolchain),
+            ));
+        }
+        match settings.from_dsd.gain_mode {
+            DsdSourceGainMode::Fixed => {
+                let value = settings.from_dsd.fixed_gain_db.ok_or_else(|| {
+                    PlanningError::invalid_settings(
+                        "dsd.from_dsd.fixed_gain_db",
+                        "fixed DSD gain requires a dB value",
+                    )
+                })?;
+                if !(DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&value) {
+                    return Err(PlanningError::invalid_settings(
+                        "dsd.from_dsd.fixed_gain_db",
+                        "fixed gain must be between -24.000000000 and +24.000000000 dB",
+                    ));
+                }
+            }
+            DsdSourceGainMode::Reference
+            | DsdSourceGainMode::NativeLevel
+            | DsdSourceGainMode::NormalizePeak => {
+                if settings.from_dsd.fixed_gain_db.is_some() {
+                    return Err(PlanningError::invalid_settings(
+                        "dsd.from_dsd.fixed_gain_db",
+                        "fixed gain is valid only when dsd gain mode is fixed",
+                    ));
+                }
+            }
+        }
+        if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET)
+            .contains(&settings.from_dsd.normalize_peak_target_dbfs)
+        {
+            return Err(PlanningError::invalid_settings(
+                "dsd.from_dsd.normalize_peak_target_dbfs",
+                "normalize target must be between -12.000000000 and 0.000000000 dBFS",
             ));
         }
     }
-    if settings.dsd_to_pcm_gain_mode == DsdToPcmGainMode::Manual
-        && settings.dsd_to_pcm_gain_db.is_none()
-    {
-        return Err(PlanningError::invalid_settings(
-            "dsd.dsd_to_pcm_gain_db",
-            "manual DSD-to-PCM gain requires a dB value",
-        ));
-    }
-    match settings.gain_compensation {
+
+    match settings.pcm_to_dsd.gain_compensation {
         GainCompensation::Linear(value) => {
-            validate_finite_f32("dsd.gain_compensation", value)?;
+            validate_finite_f32("dsd.pcm_to_dsd.gain_compensation", value)?;
             if !(0.0..=64.0).contains(&value) {
                 return Err(PlanningError::invalid_settings(
-                    "dsd.gain_compensation",
+                    "dsd.pcm_to_dsd.gain_compensation",
                     "linear gain must be between 0 and 64",
                 ));
             }
         }
         GainCompensation::Decibels(value) => {
-            validate_finite_f32("dsd.gain_compensation", value)?;
+            validate_finite_f32("dsd.pcm_to_dsd.gain_compensation", value)?;
             if !(-48.0..=48.0).contains(&value) {
                 return Err(PlanningError::invalid_settings(
-                    "dsd.gain_compensation",
+                    "dsd.pcm_to_dsd.gain_compensation",
                     "decibel gain must be between -48 and +48 dB",
                 ));
             }
         }
         GainCompensation::Auto | GainCompensation::Disabled => {}
     }
-    if let Some(trellis) = settings.trellis {
+    if let Some(trellis) = settings.pcm_to_dsd.trellis {
         if trellis.lookahead == 0 || trellis.nodes == 0 {
             return Err(PlanningError::invalid_settings(
-                "dsd.trellis",
+                "dsd.pcm_to_dsd.trellis",
                 "lookahead and nodes must be greater than zero",
             ));
         }
         if trellis.lookahead > 64 || trellis.nodes > 64 {
             return Err(PlanningError::invalid_settings(
-                "dsd.trellis",
+                "dsd.pcm_to_dsd.trellis",
                 "lookahead and nodes must be at most 64",
             ));
         }
     }
-    let sinc = settings.sinc;
+    let sinc = settings.pcm_to_dsd.sinc;
     if sinc.oversample_factor == 0 || sinc.oversample_factor.count_ones() != 1 {
         return Err(PlanningError::invalid_settings(
-            "dsd.sinc.oversample_factor",
+            "dsd.pcm_to_dsd.sinc.oversample_factor",
             "oversample factor must be a positive power of two",
         ));
     }
     if sinc.taps < 1024 || sinc.taps.count_ones() != 1 {
         return Err(PlanningError::invalid_settings(
-            "dsd.sinc.taps",
+            "dsd.pcm_to_dsd.sinc.taps",
             "tap count must be a power of two and at least 1024",
         ));
     }
-    validate_finite_f32("dsd.sinc.passband_hz", sinc.passband_hz)?;
-    validate_finite_f32("dsd.sinc.transition_hz", sinc.transition_hz)?;
-    validate_finite_f32("dsd.sinc.kaiser_beta", sinc.kaiser_beta)?;
+    validate_finite_f32("dsd.pcm_to_dsd.sinc.passband_hz", sinc.passband_hz)?;
+    validate_finite_f32("dsd.pcm_to_dsd.sinc.transition_hz", sinc.transition_hz)?;
+    validate_finite_f32("dsd.pcm_to_dsd.sinc.kaiser_beta", sinc.kaiser_beta)?;
     if !(0.0..=220_000.0).contains(&sinc.passband_hz) || sinc.passband_hz == 0.0 {
         return Err(PlanningError::invalid_settings(
-            "dsd.sinc.passband_hz",
+            "dsd.pcm_to_dsd.sinc.passband_hz",
             "passband must be greater than zero and no more than 220000 Hz",
         ));
     }
     if !(1.0..=5_000.0).contains(&sinc.transition_hz) {
         return Err(PlanningError::invalid_settings(
-            "dsd.sinc.transition_hz",
+            "dsd.pcm_to_dsd.sinc.transition_hz",
             "transition must be between 1 and 5000 Hz",
         ));
     }
     if !(0.0..=32.0).contains(&sinc.kaiser_beta) {
         return Err(PlanningError::invalid_settings(
-            "dsd.sinc.kaiser_beta",
+            "dsd.pcm_to_dsd.sinc.kaiser_beta",
             "kaiser beta must be between 0 and 32",
         ));
     }
@@ -713,11 +767,22 @@ impl Default for SoxrResamplerSettings {
     }
 }
 
-/// DSD-specific conversion settings. The target DSD rate lives in
-/// [`PipelineSettings::target_sample_rate`] to avoid duplicate rate fields.
+/// DSD-specific conversion settings split by conversion direction.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DsdSettings {
+    /// Existing PCM-to-DSD controls, behaviorally unchanged.
+    pub pcm_to_dsd: PcmToDsdSettings,
+    /// Native-v2 DSD-source Reference controls.
+    pub from_dsd: DsdSourceSettings,
+    /// Private wire/behavior origin. Only exact legacy deserialization may create
+    /// `LegacyFlatV1`.
+    pub(crate) origin: DsdSettingsOrigin,
+}
+
+/// Existing PCM-to-DSD controls separated from DSD-source policy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct PcmToDsdSettings {
     /// SoX-DSD noise-shaper family.
     pub noise_shaper: DsdNoiseShaper,
     /// Modulator order.
@@ -725,31 +790,67 @@ pub struct DsdSettings {
     /// Optional trellis optimization.
     pub trellis: Option<TrellisSettings>,
     /// PCM-to-DSD filter preset.
-    pub pcm_to_dsd_filter: DsdFilterPreset,
-    /// DSD-to-PCM low-pass method.
-    pub dsd_to_pcm_lowpass: DsdLowpassMethod,
-    /// DSD-to-PCM gain strategy.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub dsd_to_pcm_gain_mode: DsdToPcmGainMode,
-    /// Auto-gain peak safety margin in dB. `0.15` means normalize to -0.15 dBFS.
-    #[cfg_attr(feature = "serde", serde(default = "default_dsd_to_pcm_auto_gain_margin_db"))]
-    pub dsd_to_pcm_auto_gain_margin_db: f32,
-    /// Optional fixed DSD-to-PCM gain in dB for manual mode.
-    ///
-    /// When `dsd_to_pcm_gain_mode` is `Disabled`, a `Some` value is still honored
-    /// as a compatibility path for older callers that set only this field.
-    pub dsd_to_pcm_gain_db: Option<f32>,
-    /// Sinc-filter parameters used when a sinc preset is selected.
-    pub sinc: SincFilterSettings,
+    pub filter: DsdFilterPreset,
+    /// PCM-to-DSD sinc filter parameters.
+    pub sinc: PcmToDsdSincSettings,
     /// Gain compensation for PCM-to-DSD sinc upsampling.
     pub gain_compensation: GainCompensation,
 }
 
-fn default_dsd_to_pcm_auto_gain_margin_db() -> f32 {
-    0.15
+impl Default for PcmToDsdSettings {
+    fn default() -> Self {
+        Self {
+            noise_shaper: DsdNoiseShaper::Clans,
+            modulator_order: ModulatorOrder::Order8,
+            trellis: None,
+            filter: DsdFilterPreset::Auto,
+            sinc: PcmToDsdSincSettings::default(),
+            gain_compensation: GainCompensation::Auto,
+        }
+    }
 }
 
-impl Default for DsdSettings {
+/// Exact native-v2 DSD settings wire.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct DsdSettingsWireV2 {
+    /// Wire version; exactly 2.
+    pub schema_version: u32,
+    /// PCM-to-DSD controls.
+    pub pcm_to_dsd: PcmToDsdSettings,
+    /// DSD-source controls.
+    pub from_dsd: DsdSourceSettings,
+}
+
+/// Frozen legacy flat settings wire.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub(crate) struct LegacyDsdSettingsWireV1 {
+    /// Legacy PCM-to-DSD noise shaper.
+    pub noise_shaper: DsdNoiseShaper,
+    /// Legacy modulator order.
+    pub modulator_order: ModulatorOrder,
+    /// Legacy trellis settings.
+    pub trellis: Option<TrellisSettings>,
+    /// Legacy PCM-to-DSD filter.
+    pub pcm_to_dsd_filter: DsdFilterPreset,
+    /// Legacy DSD-to-PCM low-pass method.
+    pub dsd_to_pcm_lowpass: DsdLowpassMethod,
+    /// Legacy DSD-to-PCM gain mode.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dsd_to_pcm_gain_mode: DsdToPcmGainMode,
+    /// Legacy auto-normalize margin.
+    #[cfg_attr(feature = "serde", serde(default = "default_dsd_to_pcm_auto_gain_margin_db"))]
+    pub dsd_to_pcm_auto_gain_margin_db: f32,
+    /// Legacy fixed gain.
+    pub dsd_to_pcm_gain_db: Option<f32>,
+    /// Legacy shared sinc settings.
+    pub sinc: PcmToDsdSincSettings,
+    /// Legacy PCM-to-DSD gain compensation.
+    pub gain_compensation: GainCompensation,
+}
+
+impl Default for LegacyDsdSettingsWireV1 {
     fn default() -> Self {
         Self {
             noise_shaper: DsdNoiseShaper::Clans,
@@ -760,9 +861,329 @@ impl Default for DsdSettings {
             dsd_to_pcm_gain_mode: DsdToPcmGainMode::Disabled,
             dsd_to_pcm_auto_gain_margin_db: default_dsd_to_pcm_auto_gain_margin_db(),
             dsd_to_pcm_gain_db: None,
-            sinc: SincFilterSettings::default(),
+            sinc: PcmToDsdSincSettings::default(),
             gain_compensation: GainCompensation::Auto,
         }
+    }
+}
+
+
+/// Read-only legacy behavior summary used by logging and compatibility policy.
+///
+/// This type cannot construct legacy settings. Exact legacy wire dispatch is the
+/// only authority that can create `DsdSettingsOrigin::LegacyFlatV1`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegacyDsdBehavior {
+    /// Frozen legacy DSD-to-PCM low-pass method.
+    pub lowpass: DsdLowpassMethod,
+    /// Frozen legacy gain mode.
+    pub gain_mode: DsdToPcmGainMode,
+    /// Frozen legacy auto-normalize margin.
+    pub auto_gain_margin_db: f32,
+    /// Frozen legacy fixed gain.
+    pub gain_db: Option<f32>,
+}
+
+/// Private behavior origin for exact legacy preservation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DsdSettingsOrigin {
+    /// Native directional settings.
+    NativeV2,
+    /// Exact legacy flat wire and semantics.
+    LegacyFlatV1(LegacyDsdSettingsWireV1),
+}
+
+fn default_dsd_to_pcm_auto_gain_margin_db() -> f32 {
+    0.15
+}
+
+impl Default for DsdSettings {
+    fn default() -> Self {
+        Self {
+            pcm_to_dsd: PcmToDsdSettings::default(),
+            from_dsd: DsdSourceSettings::default(),
+            origin: DsdSettingsOrigin::NativeV2,
+        }
+    }
+}
+
+impl DsdSettings {
+    /// Construct the exact frozen legacy settings representation.
+    #[must_use]
+    pub(crate) fn from_legacy_wire(wire: LegacyDsdSettingsWireV1) -> Self {
+        Self {
+            pcm_to_dsd: legacy_pcm_to_dsd(wire),
+            from_dsd: legacy_from_dsd_mirror(wire),
+            origin: DsdSettingsOrigin::LegacyFlatV1(wire),
+        }
+    }
+
+    /// True only for native directional settings.
+    #[must_use]
+    pub const fn is_native_v2(&self) -> bool {
+        matches!(self.origin, DsdSettingsOrigin::NativeV2)
+    }
+
+    /// Return the frozen legacy wire when this value came from exact v1 input.
+    #[must_use]
+    pub(crate) const fn legacy_wire(&self) -> Option<&LegacyDsdSettingsWireV1> {
+        match &self.origin {
+            DsdSettingsOrigin::LegacyFlatV1(wire) => Some(wire),
+            DsdSettingsOrigin::NativeV2 => None,
+        }
+    }
+
+    /// Explicitly migrate a legacy value to native-v2 defaults while preserving
+    /// behaviorally unrelated PCM-to-DSD controls.
+    #[must_use]
+    pub fn migrate_to_native_v2(self) -> Self {
+        Self {
+            pcm_to_dsd: match self.origin {
+                DsdSettingsOrigin::NativeV2 => self.pcm_to_dsd,
+                DsdSettingsOrigin::LegacyFlatV1(wire) => legacy_pcm_to_dsd(wire),
+            },
+            from_dsd: DsdSourceSettings::default(),
+            origin: DsdSettingsOrigin::NativeV2,
+        }
+    }
+
+    /// Materialize the exact flat compatibility view used by the frozen v1
+    /// fingerprint and legacy planner.
+    #[must_use]
+    pub(crate) fn legacy_compat_wire(&self) -> LegacyDsdSettingsWireV1 {
+        match self.origin {
+            DsdSettingsOrigin::LegacyFlatV1(wire) => wire,
+            DsdSettingsOrigin::NativeV2 => LegacyDsdSettingsWireV1 {
+                noise_shaper: self.pcm_to_dsd.noise_shaper,
+                modulator_order: self.pcm_to_dsd.modulator_order,
+                trellis: self.pcm_to_dsd.trellis,
+                pcm_to_dsd_filter: self.pcm_to_dsd.filter,
+                dsd_to_pcm_lowpass: DsdLowpassMethod::Auto,
+                dsd_to_pcm_gain_mode: DsdToPcmGainMode::Disabled,
+                dsd_to_pcm_auto_gain_margin_db: default_dsd_to_pcm_auto_gain_margin_db(),
+                dsd_to_pcm_gain_db: None,
+                sinc: self.pcm_to_dsd.sinc,
+                gain_compensation: self.pcm_to_dsd.gain_compensation,
+            },
+        }
+    }
+
+    /// Read-only compatibility behavior for legacy logging and inherited-tag policy.
+    #[must_use]
+    pub fn legacy_behavior(&self) -> Option<LegacyDsdBehavior> {
+        self.legacy_wire().map(|wire| LegacyDsdBehavior {
+            lowpass: wire.dsd_to_pcm_lowpass,
+            gain_mode: wire.dsd_to_pcm_gain_mode,
+            auto_gain_margin_db: wire.dsd_to_pcm_auto_gain_margin_db,
+            gain_db: wire.dsd_to_pcm_gain_db,
+        })
+    }
+
+    /// Legacy low-pass method for the private compatibility planner.
+    #[must_use]
+    pub(crate) fn legacy_dsd_to_pcm_lowpass(&self) -> DsdLowpassMethod {
+        self.legacy_compat_wire().dsd_to_pcm_lowpass
+    }
+
+    /// Legacy gain mode for the private compatibility planner.
+    #[must_use]
+    pub(crate) fn legacy_dsd_to_pcm_gain_mode(&self) -> DsdToPcmGainMode {
+        self.legacy_compat_wire().dsd_to_pcm_gain_mode
+    }
+
+    /// Legacy auto-gain margin for the private compatibility planner.
+    #[must_use]
+    pub(crate) fn legacy_dsd_to_pcm_auto_gain_margin_db(&self) -> f32 {
+        self.legacy_compat_wire().dsd_to_pcm_auto_gain_margin_db
+    }
+
+    /// Legacy fixed gain for the private compatibility planner.
+    #[must_use]
+    pub(crate) fn legacy_dsd_to_pcm_gain_db(&self) -> Option<f32> {
+        self.legacy_compat_wire().dsd_to_pcm_gain_db
+    }
+
+}
+
+fn legacy_pcm_to_dsd(wire: LegacyDsdSettingsWireV1) -> PcmToDsdSettings {
+    PcmToDsdSettings {
+        noise_shaper: wire.noise_shaper,
+        modulator_order: wire.modulator_order,
+        trellis: wire.trellis,
+        filter: wire.pcm_to_dsd_filter,
+        sinc: wire.sinc,
+        gain_compensation: wire.gain_compensation,
+    }
+}
+
+fn legacy_from_dsd_mirror(wire: LegacyDsdSettingsWireV1) -> DsdSourceSettings {
+    let gain_mode = match wire.dsd_to_pcm_gain_mode {
+        DsdToPcmGainMode::Disabled if wire.dsd_to_pcm_gain_db.is_some() => DsdSourceGainMode::Fixed,
+        DsdToPcmGainMode::Disabled => DsdSourceGainMode::NativeLevel,
+        DsdToPcmGainMode::Auto => DsdSourceGainMode::NormalizePeak,
+        DsdToPcmGainMode::Manual => DsdSourceGainMode::Fixed,
+    };
+    DsdSourceSettings {
+        pathway: DsdSourcePathway::Reference,
+        reference_policy: DsdReferencePolicyVersion::SoxNg14801V3,
+        profile: DsdReconstructionSelection::Reference,
+        gain_mode,
+        fixed_gain_db: wire
+            .dsd_to_pcm_gain_db
+            .and_then(|value| format!("{value:.9}").parse().ok()),
+        normalize_peak_target_dbfs: format!(
+            "-{:.9}",
+            wire.dsd_to_pcm_auto_gain_margin_db.abs()
+        )
+        .parse()
+        .unwrap_or(DbNano::DEFAULT_NORMALIZE_TARGET),
+    }
+}
+
+fn legacy_mirror_matches(settings: &DsdSettings, wire: LegacyDsdSettingsWireV1) -> bool {
+    settings.pcm_to_dsd == legacy_pcm_to_dsd(wire)
+        && settings.from_dsd == legacy_from_dsd_mirror(wire)
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for DsdSettings {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.origin {
+            DsdSettingsOrigin::NativeV2 => DsdSettingsWireV2 {
+                schema_version: 2,
+                pcm_to_dsd: self.pcm_to_dsd,
+                from_dsd: self.from_dsd,
+            }
+            .serialize(serializer),
+            DsdSettingsOrigin::LegacyFlatV1(wire) => {
+                if !legacy_mirror_matches(self, wire) {
+                    return Err(serde::ser::Error::custom(
+                        "legacy DSD settings were edited; explicitly migrate them to native v2 before serialization",
+                    ));
+                }
+                wire.serialize(serializer)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for DsdSettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+        use std::marker::PhantomData;
+
+        struct DsdSettingsVisitor(PhantomData<()>);
+        impl<'de> Visitor<'de> for DsdSettingsVisitor {
+            type Value = DsdSettings;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an exact native-v2 or legacy-v1 DSD settings map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut schema_version = None;
+                let mut pcm_to_dsd = None;
+                let mut from_dsd = None;
+                let mut noise_shaper = None;
+                let mut modulator_order = None;
+                let mut trellis = None;
+                let mut trellis_seen = false;
+                let mut pcm_to_dsd_filter = None;
+                let mut dsd_to_pcm_lowpass = None;
+                let mut dsd_to_pcm_gain_mode = None;
+                let mut dsd_to_pcm_auto_gain_margin_db = None;
+                let mut dsd_to_pcm_gain_db = None;
+                let mut dsd_to_pcm_gain_db_seen = false;
+                let mut sinc = None;
+                let mut gain_compensation = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    macro_rules! unique {
+                        ($slot:expr, $value:expr) => {{
+                            if $slot.is_some() {
+                                return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                            }
+                            $slot = Some($value);
+                        }};
+                    }
+                    match key.as_str() {
+                        "schema_version" => unique!(schema_version, map.next_value::<u32>()?),
+                        "pcm_to_dsd" => unique!(pcm_to_dsd, map.next_value::<PcmToDsdSettings>()?),
+                        "from_dsd" => unique!(from_dsd, map.next_value::<DsdSourceSettings>()?),
+                        "noise_shaper" => unique!(noise_shaper, map.next_value::<DsdNoiseShaper>()?),
+                        "modulator_order" => unique!(modulator_order, map.next_value::<ModulatorOrder>()?),
+                        "trellis" => {
+                            if trellis_seen { return Err(A::Error::duplicate_field("trellis")); }
+                            trellis_seen = true;
+                            trellis = map.next_value::<Option<TrellisSettings>>()?;
+                        }
+                        "pcm_to_dsd_filter" => unique!(pcm_to_dsd_filter, map.next_value::<DsdFilterPreset>()?),
+                        "dsd_to_pcm_lowpass" => unique!(dsd_to_pcm_lowpass, map.next_value::<DsdLowpassMethod>()?),
+                        "dsd_to_pcm_gain_mode" => unique!(dsd_to_pcm_gain_mode, map.next_value::<DsdToPcmGainMode>()?),
+                        "dsd_to_pcm_auto_gain_margin_db" => unique!(dsd_to_pcm_auto_gain_margin_db, map.next_value::<f32>()?),
+                        "dsd_to_pcm_gain_db" => {
+                            if dsd_to_pcm_gain_db_seen { return Err(A::Error::duplicate_field("dsd_to_pcm_gain_db")); }
+                            dsd_to_pcm_gain_db_seen = true;
+                            dsd_to_pcm_gain_db = map.next_value::<Option<f32>>()?;
+                        }
+                        "sinc" => unique!(sinc, map.next_value::<PcmToDsdSincSettings>()?),
+                        "gain_compensation" => unique!(gain_compensation, map.next_value::<GainCompensation>()?),
+                        _ => return Err(A::Error::unknown_field(&key, &[
+                            "schema_version", "pcm_to_dsd", "from_dsd", "noise_shaper",
+                            "modulator_order", "trellis", "pcm_to_dsd_filter",
+                            "dsd_to_pcm_lowpass", "dsd_to_pcm_gain_mode",
+                            "dsd_to_pcm_auto_gain_margin_db", "dsd_to_pcm_gain_db", "sinc",
+                            "gain_compensation",
+                        ])),
+                    }
+                }
+
+                if schema_version.is_some() || pcm_to_dsd.is_some() || from_dsd.is_some() {
+                    if noise_shaper.is_some() || modulator_order.is_some() || trellis_seen
+                        || pcm_to_dsd_filter.is_some() || dsd_to_pcm_lowpass.is_some()
+                        || dsd_to_pcm_gain_mode.is_some() || dsd_to_pcm_auto_gain_margin_db.is_some()
+                        || dsd_to_pcm_gain_db_seen || sinc.is_some() || gain_compensation.is_some()
+                    {
+                        return Err(A::Error::custom("native-v2 and legacy-v1 DSD keys may not be mixed"));
+                    }
+                    let version = schema_version.ok_or_else(|| A::Error::missing_field("schema_version"))?;
+                    if version != 2 {
+                        return Err(A::Error::custom("DSD settings schema_version must be exactly 2"));
+                    }
+                    return Ok(DsdSettings {
+                        pcm_to_dsd: pcm_to_dsd.ok_or_else(|| A::Error::missing_field("pcm_to_dsd"))?,
+                        from_dsd: from_dsd.ok_or_else(|| A::Error::missing_field("from_dsd"))?,
+                        origin: DsdSettingsOrigin::NativeV2,
+                    });
+                }
+
+                let wire = LegacyDsdSettingsWireV1 {
+                    noise_shaper: noise_shaper.ok_or_else(|| A::Error::missing_field("noise_shaper"))?,
+                    modulator_order: modulator_order.ok_or_else(|| A::Error::missing_field("modulator_order"))?,
+                    trellis: if trellis_seen { trellis } else { return Err(A::Error::missing_field("trellis")); },
+                    pcm_to_dsd_filter: pcm_to_dsd_filter.ok_or_else(|| A::Error::missing_field("pcm_to_dsd_filter"))?,
+                    dsd_to_pcm_lowpass: dsd_to_pcm_lowpass.ok_or_else(|| A::Error::missing_field("dsd_to_pcm_lowpass"))?,
+                    dsd_to_pcm_gain_mode: dsd_to_pcm_gain_mode.unwrap_or_default(),
+                    dsd_to_pcm_auto_gain_margin_db: dsd_to_pcm_auto_gain_margin_db.unwrap_or_else(default_dsd_to_pcm_auto_gain_margin_db),
+                    dsd_to_pcm_gain_db: if dsd_to_pcm_gain_db_seen { dsd_to_pcm_gain_db } else { None },
+                    sinc: sinc.ok_or_else(|| A::Error::missing_field("sinc"))?,
+                    gain_compensation: gain_compensation.ok_or_else(|| A::Error::missing_field("gain_compensation"))?,
+                };
+                Ok(DsdSettings::from_legacy_wire(wire))
+            }
+        }
+
+        deserializer.deserialize_map(DsdSettingsVisitor(PhantomData))
     }
 }
 
@@ -778,10 +1199,10 @@ pub struct TrellisSettings {
     pub latency: Option<u16>,
 }
 
-/// FIR sinc parameters for DSD conversion paths.
+/// FIR sinc parameters for PCM-to-DSD conversion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct SincFilterSettings {
+pub struct PcmToDsdSincSettings {
     /// Zero-insertion upsample factor for PCM-to-DSD sinc mode.
     pub oversample_factor: u32,
     /// FIR tap count.
@@ -798,7 +1219,7 @@ pub struct SincFilterSettings {
     pub allow_aliasing: bool,
 }
 
-impl Default for SincFilterSettings {
+impl Default for PcmToDsdSincSettings {
     fn default() -> Self {
         Self {
             oversample_factor: 8,
@@ -811,6 +1232,9 @@ impl Default for SincFilterSettings {
         }
     }
 }
+
+/// Compatibility alias for source code that has not yet adopted the directional name.
+pub type SincFilterSettings = PcmToDsdSincSettings;
 
 /// Metadata behavior consumed by encoder and tagging stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

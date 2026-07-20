@@ -2186,6 +2186,9 @@ pub struct TrackArtifact {
     /// Used by the manifest for rerun identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_command_hash: Option<String>,
+    /// Native-v2 Reference source, plan, measurement, and toolchain authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_evidence: Option<super::track_executor::ReferenceExecutionEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

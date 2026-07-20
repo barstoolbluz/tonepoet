@@ -7,8 +7,10 @@ use tonepoet_pipeline::settings::PipelineSettings;
 
 use super::manifest::{
     file_sha256, manifest_path, metadata_mtime_secs, read_manifest, resolve_manifest_output_path,
-    ConversionManifest, ManifestError,
+    ConversionManifest, ManifestError, ManifestRouteIdentityV2,
+    ManifestTrackExecutionIdentityV2, ValidationStatus,
 };
+use super::track_executor::ReferenceRerunPreflightAuthority;
 use super::types::OverwritePolicy;
 
 #[derive(Debug, Clone)]
@@ -42,7 +44,15 @@ pub enum RerunReason {
         found: SettingsFingerprint,
     },
     ManifestPathEscapesAlbum(PathBuf),
+    NativeAuthorityRequiresPreflight,
+    NativeAuthorityMismatch(String),
+    NativePreflightFailed(String),
     OutputMissing(PathBuf),
+    OutputHashMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
     OutputSizeMismatch {
         path: PathBuf,
         expected: u64,
@@ -168,11 +178,26 @@ pub fn decide_rerun_with_options(
         }
     };
 
-    if manifest.settings_fingerprint != current_fingerprint {
+    let Some(found_fingerprint) = manifest.legacy_settings_fingerprint() else {
+        // Native-v2 skip/verify authority includes source content, semantic
+        // plan, qualification, executable identities, and runtime dispatch.
+        // The generic preflight does not yet possess those current facts, so
+        // it must never infer equivalence from settings alone.
+        return RerunDecision::Redo {
+            reason: RerunReason::NativeAuthorityRequiresPreflight,
+            warning: Some(
+                "native Reference manifest requires exact source/toolchain preflight; album will be regenerated"
+                    .to_string(),
+            ),
+            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+        };
+    };
+
+    if found_fingerprint != current_fingerprint {
         return RerunDecision::Redo {
             reason: RerunReason::ManifestFingerprintMismatch {
                 expected: current_fingerprint,
-                found: manifest.settings_fingerprint,
+                found: found_fingerprint,
             },
             warning: None,
             publish_overwrite: OverwritePolicy::ReplaceWithBackup,
@@ -197,6 +222,134 @@ pub fn decide_rerun_with_options(
         };
     }
 
+    matched_manifest_decision(manifest, path, overwrite)
+}
+
+pub(crate) fn decide_rerun_with_reference_preflight(
+    album_dir: &Path,
+    settings: &PipelineSettings,
+    overwrite: OverwritePolicy,
+    authority: &ReferenceRerunPreflightAuthority,
+) -> RerunDecision {
+    if !album_dir.exists() {
+        return RerunDecision::Proceed {
+            reason: RerunReason::AlbumMissing,
+        };
+    }
+    if overwrite == OverwritePolicy::AlwaysRedo {
+        return RerunDecision::Redo {
+            reason: RerunReason::AlwaysRedo,
+            warning: None,
+            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+        };
+    }
+
+    let path = manifest_path(album_dir);
+    let manifest = match read_manifest(album_dir) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return missing_manifest_decision(overwrite),
+        Err(err) => {
+            return RerunDecision::Redo {
+                reason: RerunReason::ManifestCorrupt(err.to_string()),
+                warning: Some(format!(
+                    "manifest {} could not be read; album will be regenerated",
+                    path.display()
+                )),
+                publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+            };
+        }
+    };
+
+    let route_matches = matches!(
+        &manifest.route_identity,
+        ManifestRouteIdentityV2::DsdReferenceV2 {
+            settings_snapshot_fingerprint_v2,
+            resolved_output_target,
+            policy,
+            qualification_manifest_digest,
+        } if *settings_snapshot_fingerprint_v2 == authority.settings_snapshot_fingerprint_v2
+            && *resolved_output_target == authority.resolved_output_target
+            && *policy == authority.policy
+            && *qualification_manifest_digest == authority.qualification_manifest_digest
+    );
+    if !route_matches {
+        return native_authority_redo(
+            "route, settings, target, policy, or qualification identity changed",
+        );
+    }
+    if &manifest.settings != settings {
+        return native_authority_redo(
+            "manifest audit settings differ from the current native-v2 settings",
+        );
+    }
+    if manifest.tracks.len() != 1 {
+        return native_authority_redo("P0 Reference manifest is not a singleton");
+    }
+    let track = &manifest.tracks[0];
+    if track.track_identity != authority.track_identity
+        || track.source_content_sha256 != Some(authority.source_content_sha256)
+        || track.source_probe_digest != Some(authority.source_probe_digest)
+        || track.original_dsd_source_kind.as_ref() != Some(&authority.original_source_kind)
+        || track.dsd_front_end != Some(authority.front_end)
+        || track.output_hash.is_none()
+        || track.validation_status != ValidationStatus::Passed
+    {
+        return native_authority_redo(
+            "track, source, front-end, validation, or output-hash authority changed",
+        );
+    }
+    let execution_matches = matches!(
+        &track.execution_identity,
+        ManifestTrackExecutionIdentityV2::NativeDsdV2 {
+            behavior_fingerprint_v1,
+            execution_fingerprint_v1,
+            semantic_plan_hash_v1,
+            ..
+        } if *behavior_fingerprint_v1 == authority.behavior_fingerprint_v1
+            && *execution_fingerprint_v1 == authority.execution_fingerprint_v1
+            && *semantic_plan_hash_v1 == authority.semantic_plan_hash_v1
+    );
+    if !execution_matches {
+        return native_authority_redo(
+            "behavior, semantic-plan, or execution identity changed",
+        );
+    }
+    if let Err(reason) = manifest_outputs_match(album_dir, &manifest) {
+        return RerunDecision::Redo {
+            reason,
+            warning: Some(
+                "native Reference authority matched, but published output bytes did not"
+                    .to_string(),
+            ),
+            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+        };
+    }
+
+    if overwrite == OverwritePolicy::VerifyIfManifestMatch {
+        return RerunDecision::Skip {
+            manifest,
+            manifest_path: path,
+        };
+    }
+    matched_manifest_decision(manifest, path, overwrite)
+}
+
+fn native_authority_redo(detail: impl Into<String>) -> RerunDecision {
+    let detail = detail.into();
+    RerunDecision::Redo {
+        reason: RerunReason::NativeAuthorityMismatch(detail.clone()),
+        warning: Some(format!(
+            "native Reference rerun authority mismatch; album will be regenerated: {detail}"
+        )),
+        publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+    }
+}
+
+fn matched_manifest_decision(
+    manifest: ConversionManifest,
+    path: PathBuf,
+    overwrite: OverwritePolicy,
+) -> RerunDecision {
     match overwrite {
         OverwritePolicy::SkipIfManifestMatch => RerunDecision::Skip {
             manifest,
@@ -254,6 +407,18 @@ pub fn manifest_outputs_match(
                 expected: track.output_size,
                 actual,
             });
+        }
+        if let Some(expected) = track.output_hash {
+            let actual_hash = file_sha256(&output)
+                .map_err(|err| RerunReason::ManifestCorrupt(err.to_string()))?;
+            let expected_hash = expected.to_hex();
+            if actual_hash != expected_hash {
+                return Err(RerunReason::OutputHashMismatch {
+                    path: output,
+                    expected: expected_hash,
+                    actual: actual_hash,
+                });
+            }
         }
     }
 
@@ -350,10 +515,11 @@ pub async fn verify_manifest_outputs_at_album_dir<V: ExistingOutputVerifier + Sy
                 },
             })?;
 
-            if &actual != expected {
+            let expected = expected.to_hex();
+            if actual != expected {
                 return Err(ExistingOutputVerificationError::HashMismatch {
                     path,
-                    expected: expected.clone(),
+                    expected,
                     actual,
                 });
             }
@@ -409,14 +575,21 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
                 source_size: source_metadata.len(),
                 source_mtime_secs: metadata_mtime_secs(&source_metadata).expect("source mtime"),
                 source_audio_md5: None,
+                source_content_sha256: None,
+                source_probe_digest: None,
+                original_dsd_source_kind: None,
+                dsd_front_end: None,
+                canonical_materialization_sha256: None,
                 track_identity: TrackIdentity {
                     source_ordinal: 1,
                     disc_number: None,
                     track_number: Some(1),
                 },
-                settings_fingerprint: settings_fingerprint(settings),
-                planner_version: "test".to_string(),
-                planned_command_hash: "plan-hash".to_string(),
+                execution_identity: super::super::manifest::ManifestTrackExecutionIdentityV2::LegacyPipelineV1 {
+                    settings_fingerprint_v1: settings_fingerprint(settings),
+                    planner_version: "test".to_string(),
+                    planned_command_hash: "plan-hash".to_string(),
+                },
                 output_path: output_rel.to_path_buf(),
                 output_size,
                 output_hash: None,
@@ -442,10 +615,17 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
                 source_size: source_metadata.len(),
                 source_mtime_secs: metadata_mtime_secs(&source_metadata).expect("source mtime"),
                 source_audio_md5: None,
+                source_content_sha256: None,
+                source_probe_digest: None,
+                original_dsd_source_kind: None,
+                dsd_front_end: None,
+                canonical_materialization_sha256: None,
                 track_identity: TrackIdentity::merged_output(),
-                settings_fingerprint: settings_fingerprint(settings),
-                planner_version: "test".to_string(),
-                planned_command_hash: "merge-plan-hash".to_string(),
+                execution_identity: super::super::manifest::ManifestTrackExecutionIdentityV2::LegacyPipelineV1 {
+                    settings_fingerprint_v1: settings_fingerprint(settings),
+                    planner_version: "test".to_string(),
+                    planned_command_hash: "merge-plan-hash".to_string(),
+                },
                 output_path: output_rel.to_path_buf(),
                 output_size,
                 output_hash: None,
@@ -476,8 +656,9 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
         }
 
         let fingerprint = value
-            .get_mut("settings_fingerprint")
-            .expect("settings fingerprint field");
+            .get_mut("route_identity")
+            .and_then(|route| route.get_mut("settings_fingerprint_v1"))
+            .expect("legacy route settings fingerprint field");
         assert!(alter_value(fingerprint), "fingerprint JSON must contain a mutable component");
     }
 

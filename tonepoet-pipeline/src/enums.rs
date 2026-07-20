@@ -711,7 +711,7 @@ pub enum DsdToPcmGainMode {
     Disabled,
     /// Peak-normalize after DSD decoding and low-pass filtering.
     Auto,
-    /// Apply the fixed dB value in `DsdSettings::dsd_to_pcm_gain_db`.
+    /// Apply the fixed dB value retained by the private legacy-v1 DSD wire.
     Manual,
 }
 

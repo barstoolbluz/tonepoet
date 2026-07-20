@@ -14,6 +14,7 @@ use tonepoet::convert::{
 use tonepoet_pipeline::{
     AacProfile, AacSettings, AudioFormat, BitDepthTarget, DitherType,
     DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings, DsdToPcmGainMode, FlacSettings,
+    LegacyDsdBehavior,
     GainCompensation, MetadataSettings, ModulatorOrder, Mp3Mode, Mp3Settings,
     NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
@@ -106,6 +107,43 @@ use tonepoet_pipeline::{
 /// - replay_gain.mode: Some(Both)
 /// - replay_gain.prevent_clipping: false
 /// - replay_gain.existing_tags: SkipIfComplete
+fn legacy_dsd_behavior(settings: &DsdSettings) -> LegacyDsdBehavior {
+    settings.legacy_behavior().unwrap_or(LegacyDsdBehavior {
+        lowpass: DsdLowpassMethod::Auto,
+        gain_mode: DsdToPcmGainMode::Disabled,
+        auto_gain_margin_db: 0.15,
+        gain_db: None,
+    })
+}
+
+fn sentinel_dsd_settings() -> DsdSettings {
+    serde_json::from_value(serde_json::json!({
+        "noise_shaper": DsdNoiseShaper::Crfb,
+        "modulator_order": ModulatorOrder::Order7,
+        "trellis": TrellisSettings {
+            lookahead: 17,
+            nodes: 9,
+            latency: Some(321),
+        },
+        "pcm_to_dsd_filter": DsdFilterPreset::Sinc,
+        "dsd_to_pcm_lowpass": DsdLowpassMethod::Sinc,
+        "dsd_to_pcm_gain_mode": DsdToPcmGainMode::Manual,
+        "dsd_to_pcm_auto_gain_margin_db": 0.50,
+        "dsd_to_pcm_gain_db": -3.25,
+        "sinc": SincFilterSettings {
+            oversample_factor: 16,
+            taps: 131_072,
+            passband_hz: 30_000.0,
+            transition_hz: 750.0,
+            kaiser_beta: 12.5,
+            linear_phase: false,
+            allow_aliasing: true,
+        },
+        "gain_compensation": GainCompensation::Decibels(1.5),
+    }))
+    .expect("valid complete legacy DSD sentinel")
+}
+
 fn raw_all_non_default_sentinel() -> PipelineSettings {
     PipelineSettings {
         target_format: AudioFormat::Custom {
@@ -170,30 +208,7 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             cutoff: Some(0.97),
             phase: Some(25),
         },
-        dsd: DsdSettings {
-            noise_shaper: DsdNoiseShaper::Crfb,
-            modulator_order: ModulatorOrder::Order7,
-            trellis: Some(TrellisSettings {
-                lookahead: 17,
-                nodes: 9,
-                latency: Some(321),
-            }),
-            pcm_to_dsd_filter: DsdFilterPreset::Sinc,
-            dsd_to_pcm_lowpass: DsdLowpassMethod::Sinc,
-            dsd_to_pcm_gain_mode: DsdToPcmGainMode::Manual,
-            dsd_to_pcm_auto_gain_margin_db: 0.50,
-            dsd_to_pcm_gain_db: Some(-3.25),
-            sinc: SincFilterSettings {
-                oversample_factor: 16,
-                taps: 131_072,
-                passband_hz: 30_000.0,
-                transition_hz: 750.0,
-                kaiser_beta: 12.5,
-                linear_phase: false,
-                allow_aliasing: true,
-            },
-            gain_compensation: GainCompensation::Decibels(1.5),
-        },
+        dsd: sentinel_dsd_settings(),
         metadata: MetadataSettings {
             transfer_tags: false,
             preserve_artwork: false,
@@ -313,25 +328,22 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.ssrc.min_phase, &expected.ssrc.min_phase, "ssrc.min_phase");
     assert_eq!(&actual.ssrc.dither_id, &expected.ssrc.dither_id, "ssrc.dither_id");
     assert_eq!(&actual.ssrc.pdf_type, &expected.ssrc.pdf_type, "ssrc.pdf_type");
-    assert_eq!(&actual.dsd.noise_shaper, &expected.dsd.noise_shaper, "dsd.noise_shaper");
-    assert_eq!(&actual.dsd.modulator_order, &expected.dsd.modulator_order, "dsd.modulator_order");
-    assert_eq!(&actual.dsd.trellis, &expected.dsd.trellis, "dsd.trellis");
-    assert_eq!(&actual.dsd.trellis.map(|trellis| trellis.lookahead), &expected.dsd.trellis.map(|trellis| trellis.lookahead), "dsd.trellis.lookahead");
-    assert_eq!(&actual.dsd.trellis.map(|trellis| trellis.nodes), &expected.dsd.trellis.map(|trellis| trellis.nodes), "dsd.trellis.nodes");
-    assert_eq!(&actual.dsd.trellis.and_then(|trellis| trellis.latency), &expected.dsd.trellis.and_then(|trellis| trellis.latency), "dsd.trellis.latency");
-    assert_eq!(&actual.dsd.pcm_to_dsd_filter, &expected.dsd.pcm_to_dsd_filter, "dsd.pcm_to_dsd_filter");
-    assert_eq!(&actual.dsd.dsd_to_pcm_lowpass, &expected.dsd.dsd_to_pcm_lowpass, "dsd.dsd_to_pcm_lowpass");
-    assert_eq!(&actual.dsd.dsd_to_pcm_gain_mode, &expected.dsd.dsd_to_pcm_gain_mode, "dsd.dsd_to_pcm_gain_mode");
-    assert_eq!(&actual.dsd.dsd_to_pcm_auto_gain_margin_db, &expected.dsd.dsd_to_pcm_auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
-    assert_eq!(&actual.dsd.dsd_to_pcm_gain_db, &expected.dsd.dsd_to_pcm_gain_db, "dsd.dsd_to_pcm_gain_db");
-    assert_eq!(&actual.dsd.sinc.oversample_factor, &expected.dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
-    assert_eq!(&actual.dsd.sinc.taps, &expected.dsd.sinc.taps, "dsd.sinc.taps");
-    assert_eq!(&actual.dsd.sinc.passband_hz, &expected.dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
-    assert_eq!(&actual.dsd.sinc.transition_hz, &expected.dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
-    assert_eq!(&actual.dsd.sinc.kaiser_beta, &expected.dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
-    assert_eq!(&actual.dsd.sinc.linear_phase, &expected.dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
-    assert_eq!(&actual.dsd.sinc.allow_aliasing, &expected.dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
-    assert_eq!(&actual.dsd.gain_compensation, &expected.dsd.gain_compensation, "dsd.gain_compensation");
+    assert_eq!(&actual.dsd.pcm_to_dsd.noise_shaper, &expected.dsd.pcm_to_dsd.noise_shaper, "dsd.noise_shaper");
+    assert_eq!(&actual.dsd.pcm_to_dsd.modulator_order, &expected.dsd.pcm_to_dsd.modulator_order, "dsd.modulator_order");
+    assert_eq!(&actual.dsd.pcm_to_dsd.trellis, &expected.dsd.pcm_to_dsd.trellis, "dsd.trellis");
+    assert_eq!(&actual.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), &expected.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), "dsd.trellis.lookahead");
+    assert_eq!(&actual.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), &expected.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), "dsd.trellis.nodes");
+    assert_eq!(&actual.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), &expected.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), "dsd.trellis.latency");
+    assert_eq!(&actual.dsd.pcm_to_dsd.filter, &expected.dsd.pcm_to_dsd.filter, "dsd.pcm_to_dsd_filter");
+    assert_eq!(legacy_dsd_behavior(&actual.dsd), legacy_dsd_behavior(&expected.dsd), "legacy DSD behavior");
+    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.oversample_factor, &expected.dsd.pcm_to_dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
+    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.taps, &expected.dsd.pcm_to_dsd.sinc.taps, "dsd.sinc.taps");
+    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.passband_hz, &expected.dsd.pcm_to_dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
+    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.transition_hz, &expected.dsd.pcm_to_dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
+    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.kaiser_beta, &expected.dsd.pcm_to_dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
+    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.linear_phase, &expected.dsd.pcm_to_dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
+    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.allow_aliasing, &expected.dsd.pcm_to_dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
+    assert_eq!(&actual.dsd.pcm_to_dsd.gain_compensation, &expected.dsd.pcm_to_dsd.gain_compensation, "dsd.gain_compensation");
     assert_eq!(&actual.metadata.transfer_tags, &expected.metadata.transfer_tags, "metadata.transfer_tags");
     assert_eq!(&actual.metadata.preserve_artwork, &expected.metadata.preserve_artwork, "metadata.preserve_artwork");
     assert_eq!(&actual.metadata.store_source_audio_md5, &expected.metadata.store_source_audio_md5, "metadata.store_source_audio_md5");
@@ -490,25 +502,25 @@ fn field_differs_from_default(
         "ssrc.min_phase" => settings.ssrc.min_phase != default.ssrc.min_phase,
         "ssrc.dither_id" => settings.ssrc.dither_id != default.ssrc.dither_id,
         "ssrc.pdf_type" => settings.ssrc.pdf_type != default.ssrc.pdf_type,
-        "dsd.noise_shaper" => settings.dsd.noise_shaper != default.dsd.noise_shaper,
-        "dsd.modulator_order" => settings.dsd.modulator_order != default.dsd.modulator_order,
-        "dsd.trellis" => settings.dsd.trellis != default.dsd.trellis,
-        "dsd.trellis.lookahead" => settings.dsd.trellis.map(|trellis| trellis.lookahead) != default.dsd.trellis.map(|trellis| trellis.lookahead),
-        "dsd.trellis.nodes" => settings.dsd.trellis.map(|trellis| trellis.nodes) != default.dsd.trellis.map(|trellis| trellis.nodes),
-        "dsd.trellis.latency" => settings.dsd.trellis.and_then(|trellis| trellis.latency) != default.dsd.trellis.and_then(|trellis| trellis.latency),
-        "dsd.pcm_to_dsd_filter" => settings.dsd.pcm_to_dsd_filter != default.dsd.pcm_to_dsd_filter,
-        "dsd.dsd_to_pcm_lowpass" => settings.dsd.dsd_to_pcm_lowpass != default.dsd.dsd_to_pcm_lowpass,
-        "dsd.dsd_to_pcm_gain_mode" => settings.dsd.dsd_to_pcm_gain_mode != default.dsd.dsd_to_pcm_gain_mode,
-        "dsd.dsd_to_pcm_auto_gain_margin_db" => (settings.dsd.dsd_to_pcm_auto_gain_margin_db - default.dsd.dsd_to_pcm_auto_gain_margin_db).abs() > f32::EPSILON,
-        "dsd.dsd_to_pcm_gain_db" => settings.dsd.dsd_to_pcm_gain_db != default.dsd.dsd_to_pcm_gain_db,
-        "dsd.sinc.oversample_factor" => settings.dsd.sinc.oversample_factor != default.dsd.sinc.oversample_factor,
-        "dsd.sinc.taps" => settings.dsd.sinc.taps != default.dsd.sinc.taps,
-        "dsd.sinc.passband_hz" => settings.dsd.sinc.passband_hz != default.dsd.sinc.passband_hz,
-        "dsd.sinc.transition_hz" => settings.dsd.sinc.transition_hz != default.dsd.sinc.transition_hz,
-        "dsd.sinc.kaiser_beta" => settings.dsd.sinc.kaiser_beta != default.dsd.sinc.kaiser_beta,
-        "dsd.sinc.linear_phase" => settings.dsd.sinc.linear_phase != default.dsd.sinc.linear_phase,
-        "dsd.sinc.allow_aliasing" => settings.dsd.sinc.allow_aliasing != default.dsd.sinc.allow_aliasing,
-        "dsd.gain_compensation" => settings.dsd.gain_compensation != default.dsd.gain_compensation,
+        "dsd.noise_shaper" => settings.dsd.pcm_to_dsd.noise_shaper != default.dsd.pcm_to_dsd.noise_shaper,
+        "dsd.modulator_order" => settings.dsd.pcm_to_dsd.modulator_order != default.dsd.pcm_to_dsd.modulator_order,
+        "dsd.trellis" => settings.dsd.pcm_to_dsd.trellis != default.dsd.pcm_to_dsd.trellis,
+        "dsd.trellis.lookahead" => settings.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead) != default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead),
+        "dsd.trellis.nodes" => settings.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes) != default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes),
+        "dsd.trellis.latency" => settings.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency) != default.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency),
+        "dsd.pcm_to_dsd_filter" => settings.dsd.pcm_to_dsd.filter != default.dsd.pcm_to_dsd.filter,
+        "dsd.dsd_to_pcm_lowpass" => legacy_dsd_behavior(&settings.dsd).lowpass != legacy_dsd_behavior(&default.dsd).lowpass,
+        "dsd.dsd_to_pcm_gain_mode" => legacy_dsd_behavior(&settings.dsd).gain_mode != legacy_dsd_behavior(&default.dsd).gain_mode,
+        "dsd.dsd_to_pcm_auto_gain_margin_db" => (legacy_dsd_behavior(&settings.dsd).auto_gain_margin_db - legacy_dsd_behavior(&default.dsd).auto_gain_margin_db).abs() > f32::EPSILON,
+        "dsd.dsd_to_pcm_gain_db" => legacy_dsd_behavior(&settings.dsd).gain_db != legacy_dsd_behavior(&default.dsd).gain_db,
+        "dsd.sinc.oversample_factor" => settings.dsd.pcm_to_dsd.sinc.oversample_factor != default.dsd.pcm_to_dsd.sinc.oversample_factor,
+        "dsd.sinc.taps" => settings.dsd.pcm_to_dsd.sinc.taps != default.dsd.pcm_to_dsd.sinc.taps,
+        "dsd.sinc.passband_hz" => settings.dsd.pcm_to_dsd.sinc.passband_hz != default.dsd.pcm_to_dsd.sinc.passband_hz,
+        "dsd.sinc.transition_hz" => settings.dsd.pcm_to_dsd.sinc.transition_hz != default.dsd.pcm_to_dsd.sinc.transition_hz,
+        "dsd.sinc.kaiser_beta" => settings.dsd.pcm_to_dsd.sinc.kaiser_beta != default.dsd.pcm_to_dsd.sinc.kaiser_beta,
+        "dsd.sinc.linear_phase" => settings.dsd.pcm_to_dsd.sinc.linear_phase != default.dsd.pcm_to_dsd.sinc.linear_phase,
+        "dsd.sinc.allow_aliasing" => settings.dsd.pcm_to_dsd.sinc.allow_aliasing != default.dsd.pcm_to_dsd.sinc.allow_aliasing,
+        "dsd.gain_compensation" => settings.dsd.pcm_to_dsd.gain_compensation != default.dsd.pcm_to_dsd.gain_compensation,
         "metadata.transfer_tags" => settings.metadata.transfer_tags != default.metadata.transfer_tags,
         "metadata.preserve_artwork" => settings.metadata.preserve_artwork != default.metadata.preserve_artwork,
         "metadata.store_source_audio_md5" => settings.metadata.store_source_audio_md5 != default.metadata.store_source_audio_md5,
@@ -631,22 +643,24 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, ssrc.min_phase, "ssrc.min_phase");
     assert_covered_by_non_default!(default, raw, raw, ssrc.dither_id, "ssrc.dither_id");
     assert_covered_by_non_default!(default, raw, raw, ssrc.pdf_type, "ssrc.pdf_type");
-    assert_covered_by_non_default!(default, raw, raw, dsd.noise_shaper, "dsd.noise_shaper");
-    assert_covered_by_non_default!(default, raw, raw, dsd.modulator_order, "dsd.modulator_order");
-    assert_covered_by_non_default!(default, raw, raw, dsd.trellis, "dsd.trellis");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd_filter, "dsd.pcm_to_dsd_filter");
-    assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_lowpass, "dsd.dsd_to_pcm_lowpass");
-    assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_gain_mode, "dsd.dsd_to_pcm_gain_mode");
-    assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
-    assert_covered_by_non_default!(default, raw, raw, dsd.dsd_to_pcm_gain_db, "dsd.dsd_to_pcm_gain_db");
-    assert_covered_by_non_default!(default, raw, raw, dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
-    assert_covered_by_non_default!(default, raw, raw, dsd.sinc.taps, "dsd.sinc.taps");
-    assert_covered_by_non_default!(default, raw, raw, dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
-    assert_covered_by_non_default!(default, raw, raw, dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
-    assert_covered_by_non_default!(default, raw, raw, dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
-    assert_covered_by_non_default!(default, raw, raw, dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
-    assert_covered_by_non_default!(default, raw, raw, dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
-    assert_covered_by_non_default!(default, raw, raw, dsd.gain_compensation, "dsd.gain_compensation");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.noise_shaper, "dsd.noise_shaper");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.modulator_order, "dsd.modulator_order");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.trellis, "dsd.trellis");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.filter, "dsd.pcm_to_dsd_filter");
+    let default_legacy = legacy_dsd_behavior(&default.dsd);
+    let raw_legacy = legacy_dsd_behavior(&raw.dsd);
+    assert_ne!(raw_legacy.lowpass, default_legacy.lowpass, "dsd.dsd_to_pcm_lowpass");
+    assert_ne!(raw_legacy.gain_mode, default_legacy.gain_mode, "dsd.dsd_to_pcm_gain_mode");
+    assert_ne!(raw_legacy.auto_gain_margin_db, default_legacy.auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
+    assert_ne!(raw_legacy.gain_db, default_legacy.gain_db, "dsd.dsd_to_pcm_gain_db");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.taps, "dsd.sinc.taps");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
+    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.gain_compensation, "dsd.gain_compensation");
     assert_covered_by_non_default!(default, raw, raw, metadata.transfer_tags, "metadata.transfer_tags");
     assert_covered_by_non_default!(default, raw, raw, metadata.preserve_artwork, "metadata.preserve_artwork");
     assert_covered_by_non_default!(default, raw, raw, metadata.store_source_audio_md5, "metadata.store_source_audio_md5");
@@ -712,22 +726,25 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, ssrc.min_phase, "ssrc.min_phase");
     assert_covered_by_non_default!(default, flac, custom, ssrc.dither_id, "ssrc.dither_id");
     assert_covered_by_non_default!(default, flac, custom, ssrc.pdf_type, "ssrc.pdf_type");
-    assert_covered_by_non_default!(default, flac, custom, dsd.noise_shaper, "dsd.noise_shaper");
-    assert_covered_by_non_default!(default, flac, custom, dsd.modulator_order, "dsd.modulator_order");
-    assert_covered_by_non_default!(default, flac, custom, dsd.trellis, "dsd.trellis");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd_filter, "dsd.pcm_to_dsd_filter");
-    assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_lowpass, "dsd.dsd_to_pcm_lowpass");
-    assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_gain_mode, "dsd.dsd_to_pcm_gain_mode");
-    assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
-    assert_covered_by_non_default!(default, flac, custom, dsd.dsd_to_pcm_gain_db, "dsd.dsd_to_pcm_gain_db");
-    assert_covered_by_non_default!(default, flac, custom, dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
-    assert_covered_by_non_default!(default, flac, custom, dsd.sinc.taps, "dsd.sinc.taps");
-    assert_covered_by_non_default!(default, flac, custom, dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
-    assert_covered_by_non_default!(default, flac, custom, dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
-    assert_covered_by_non_default!(default, flac, custom, dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
-    assert_covered_by_non_default!(default, flac, custom, dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
-    assert_covered_by_non_default!(default, flac, custom, dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
-    assert_covered_by_non_default!(default, flac, custom, dsd.gain_compensation, "dsd.gain_compensation");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.noise_shaper, "dsd.noise_shaper");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.modulator_order, "dsd.modulator_order");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.trellis, "dsd.trellis");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.filter, "dsd.pcm_to_dsd_filter");
+    let default_legacy = legacy_dsd_behavior(&default.dsd);
+    let flac_legacy = legacy_dsd_behavior(&flac.dsd);
+    let custom_legacy = legacy_dsd_behavior(&custom.dsd);
+    assert!(flac_legacy.lowpass != default_legacy.lowpass || custom_legacy.lowpass != default_legacy.lowpass, "dsd.dsd_to_pcm_lowpass");
+    assert!(flac_legacy.gain_mode != default_legacy.gain_mode || custom_legacy.gain_mode != default_legacy.gain_mode, "dsd.dsd_to_pcm_gain_mode");
+    assert!(flac_legacy.auto_gain_margin_db != default_legacy.auto_gain_margin_db || custom_legacy.auto_gain_margin_db != default_legacy.auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
+    assert!(flac_legacy.gain_db != default_legacy.gain_db || custom_legacy.gain_db != default_legacy.gain_db, "dsd.dsd_to_pcm_gain_db");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.taps, "dsd.sinc.taps");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
+    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.gain_compensation, "dsd.gain_compensation");
     assert_covered_by_non_default!(default, flac, custom, metadata.transfer_tags, "metadata.transfer_tags");
     assert_covered_by_non_default!(default, flac, custom, metadata.preserve_artwork, "metadata.preserve_artwork");
     assert_covered_by_non_default!(default, flac, custom, metadata.store_source_audio_md5, "metadata.store_source_audio_md5");
@@ -1055,25 +1072,25 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_unrepresentable!(covered, "ssrc.min_phase", flac.ssrc.min_phase, default.ssrc.min_phase, sentinel.ssrc.min_phase);
     assert_legacy_unrepresentable!(covered, "ssrc.dither_id", flac.ssrc.dither_id, default.ssrc.dither_id, sentinel.ssrc.dither_id);
     assert_legacy_unrepresentable!(covered, "ssrc.pdf_type", flac.ssrc.pdf_type, default.ssrc.pdf_type, sentinel.ssrc.pdf_type);
-    assert_legacy_unrepresentable!(covered, "dsd.noise_shaper", flac.dsd.noise_shaper, default.dsd.noise_shaper, sentinel.dsd.noise_shaper);
-    assert_legacy_unrepresentable!(covered, "dsd.modulator_order", flac.dsd.modulator_order, default.dsd.modulator_order, sentinel.dsd.modulator_order);
-    assert_legacy_unrepresentable!(covered, "dsd.trellis", flac.dsd.trellis, default.dsd.trellis, sentinel.dsd.trellis);
-    assert_legacy_unrepresentable!(covered, "dsd.trellis.lookahead", flac.dsd.trellis.map(|trellis| trellis.lookahead), default.dsd.trellis.map(|trellis| trellis.lookahead), sentinel.dsd.trellis.map(|trellis| trellis.lookahead));
-    assert_legacy_unrepresentable!(covered, "dsd.trellis.nodes", flac.dsd.trellis.map(|trellis| trellis.nodes), default.dsd.trellis.map(|trellis| trellis.nodes), sentinel.dsd.trellis.map(|trellis| trellis.nodes));
-    assert_legacy_unrepresentable!(covered, "dsd.trellis.latency", flac.dsd.trellis.and_then(|trellis| trellis.latency), default.dsd.trellis.and_then(|trellis| trellis.latency), sentinel.dsd.trellis.and_then(|trellis| trellis.latency));
-    assert_legacy_unrepresentable!(covered, "dsd.pcm_to_dsd_filter", flac.dsd.pcm_to_dsd_filter, default.dsd.pcm_to_dsd_filter, sentinel.dsd.pcm_to_dsd_filter);
-    assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_lowpass", flac.dsd.dsd_to_pcm_lowpass, default.dsd.dsd_to_pcm_lowpass, sentinel.dsd.dsd_to_pcm_lowpass);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_gain_mode", flac.dsd.dsd_to_pcm_gain_mode, DsdToPcmGainMode::Disabled);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_auto_gain_margin_db", flac.dsd.dsd_to_pcm_auto_gain_margin_db, 0.15_f32);
-    assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_gain_db", flac.dsd.dsd_to_pcm_gain_db, default.dsd.dsd_to_pcm_gain_db, sentinel.dsd.dsd_to_pcm_gain_db);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.oversample_factor", flac.dsd.sinc.oversample_factor, default.dsd.sinc.oversample_factor, sentinel.dsd.sinc.oversample_factor);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.taps", flac.dsd.sinc.taps, default.dsd.sinc.taps, sentinel.dsd.sinc.taps);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.passband_hz", flac.dsd.sinc.passband_hz, default.dsd.sinc.passband_hz, sentinel.dsd.sinc.passband_hz);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.transition_hz", flac.dsd.sinc.transition_hz, default.dsd.sinc.transition_hz, sentinel.dsd.sinc.transition_hz);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.kaiser_beta", flac.dsd.sinc.kaiser_beta, default.dsd.sinc.kaiser_beta, sentinel.dsd.sinc.kaiser_beta);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.linear_phase", flac.dsd.sinc.linear_phase, default.dsd.sinc.linear_phase, sentinel.dsd.sinc.linear_phase);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.allow_aliasing", flac.dsd.sinc.allow_aliasing, default.dsd.sinc.allow_aliasing, sentinel.dsd.sinc.allow_aliasing);
-    assert_legacy_unrepresentable!(covered, "dsd.gain_compensation", flac.dsd.gain_compensation, default.dsd.gain_compensation, sentinel.dsd.gain_compensation);
+    assert_legacy_unrepresentable!(covered, "dsd.noise_shaper", flac.dsd.pcm_to_dsd.noise_shaper, default.dsd.pcm_to_dsd.noise_shaper, sentinel.dsd.pcm_to_dsd.noise_shaper);
+    assert_legacy_unrepresentable!(covered, "dsd.modulator_order", flac.dsd.pcm_to_dsd.modulator_order, default.dsd.pcm_to_dsd.modulator_order, sentinel.dsd.pcm_to_dsd.modulator_order);
+    assert_legacy_unrepresentable!(covered, "dsd.trellis", flac.dsd.pcm_to_dsd.trellis, default.dsd.pcm_to_dsd.trellis, sentinel.dsd.pcm_to_dsd.trellis);
+    assert_legacy_unrepresentable!(covered, "dsd.trellis.lookahead", flac.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), sentinel.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead));
+    assert_legacy_unrepresentable!(covered, "dsd.trellis.nodes", flac.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), sentinel.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes));
+    assert_legacy_unrepresentable!(covered, "dsd.trellis.latency", flac.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), default.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), sentinel.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency));
+    assert_legacy_unrepresentable!(covered, "dsd.pcm_to_dsd_filter", flac.dsd.pcm_to_dsd.filter, default.dsd.pcm_to_dsd.filter, sentinel.dsd.pcm_to_dsd.filter);
+    assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_lowpass", legacy_dsd_behavior(&flac.dsd).lowpass, legacy_dsd_behavior(&default.dsd).lowpass, legacy_dsd_behavior(&sentinel.dsd).lowpass);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_gain_mode", legacy_dsd_behavior(&flac.dsd).gain_mode, DsdToPcmGainMode::Disabled);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_auto_gain_margin_db", legacy_dsd_behavior(&flac.dsd).auto_gain_margin_db, 0.15_f32);
+    assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_gain_db", legacy_dsd_behavior(&flac.dsd).gain_db, legacy_dsd_behavior(&default.dsd).gain_db, legacy_dsd_behavior(&sentinel.dsd).gain_db);
+    assert_legacy_unrepresentable!(covered, "dsd.sinc.oversample_factor", flac.dsd.pcm_to_dsd.sinc.oversample_factor, default.dsd.pcm_to_dsd.sinc.oversample_factor, sentinel.dsd.pcm_to_dsd.sinc.oversample_factor);
+    assert_legacy_unrepresentable!(covered, "dsd.sinc.taps", flac.dsd.pcm_to_dsd.sinc.taps, default.dsd.pcm_to_dsd.sinc.taps, sentinel.dsd.pcm_to_dsd.sinc.taps);
+    assert_legacy_unrepresentable!(covered, "dsd.sinc.passband_hz", flac.dsd.pcm_to_dsd.sinc.passband_hz, default.dsd.pcm_to_dsd.sinc.passband_hz, sentinel.dsd.pcm_to_dsd.sinc.passband_hz);
+    assert_legacy_unrepresentable!(covered, "dsd.sinc.transition_hz", flac.dsd.pcm_to_dsd.sinc.transition_hz, default.dsd.pcm_to_dsd.sinc.transition_hz, sentinel.dsd.pcm_to_dsd.sinc.transition_hz);
+    assert_legacy_unrepresentable!(covered, "dsd.sinc.kaiser_beta", flac.dsd.pcm_to_dsd.sinc.kaiser_beta, default.dsd.pcm_to_dsd.sinc.kaiser_beta, sentinel.dsd.pcm_to_dsd.sinc.kaiser_beta);
+    assert_legacy_unrepresentable!(covered, "dsd.sinc.linear_phase", flac.dsd.pcm_to_dsd.sinc.linear_phase, default.dsd.pcm_to_dsd.sinc.linear_phase, sentinel.dsd.pcm_to_dsd.sinc.linear_phase);
+    assert_legacy_unrepresentable!(covered, "dsd.sinc.allow_aliasing", flac.dsd.pcm_to_dsd.sinc.allow_aliasing, default.dsd.pcm_to_dsd.sinc.allow_aliasing, sentinel.dsd.pcm_to_dsd.sinc.allow_aliasing);
+    assert_legacy_unrepresentable!(covered, "dsd.gain_compensation", flac.dsd.pcm_to_dsd.gain_compensation, default.dsd.pcm_to_dsd.gain_compensation, sentinel.dsd.pcm_to_dsd.gain_compensation);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "metadata.transfer_tags", flac.metadata.transfer_tags, false);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "metadata.preserve_artwork", flac.metadata.preserve_artwork, false);
     assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "metadata.store_source_audio_md5", flac.metadata.store_source_audio_md5, false);
@@ -1084,4 +1101,20 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "replay_gain.existing_tags", flac.replay_gain.existing_tags, tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan);
 
     assert_legacy_coverage(&covered);
+}
+
+#[test]
+fn native_v2_dsd_settings_use_a_separate_complete_snapshot_inventory() {
+    let mut paths = tonepoet_pipeline::SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS.to_vec();
+    paths.sort_unstable();
+    let original_len = paths.len();
+    paths.dedup();
+    assert_eq!(paths.len(), original_len, "duplicate native-v2 DSD snapshot path");
+    assert_eq!(
+        paths.len(),
+        tonepoet_pipeline::SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT
+    );
+    assert!(paths.contains(&"dsd.schema"));
+    assert!(paths.contains(&"dsd.from_dsd.reference_policy"));
+    assert!(paths.contains(&"dsd.from_dsd.normalize_peak_target_dbfs"));
 }

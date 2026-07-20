@@ -4053,6 +4053,7 @@ mod tests {
                         verified_output_bit_depth: None,
                     },
                     artifact: Some(TrackArtifact {
+                    reference_evidence: None,
                         track_id,
                         staged_path,
                         final_path,
@@ -4390,6 +4391,7 @@ mod tests {
                 verified_output_bit_depth: None,
             },
             artifact: Some(TrackArtifact {
+                    reference_evidence: None,
                 track_id,
                 staged_path,
                 final_path,

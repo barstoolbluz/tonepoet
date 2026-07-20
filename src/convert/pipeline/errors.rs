@@ -171,6 +171,8 @@ pub enum PublishError {
     BackupFailed(String),
     #[error("rollback after failed publish failed: {0}")]
     RollbackFailed(String),
+    #[error("manifest authority failed: {0}")]
+    Manifest(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// An IO failure with the operation and path attached. Publish runs many

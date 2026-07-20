@@ -93,9 +93,33 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
+        TuiButton::DsdPathPill(index) => format.select_row_index(
+            FormatField::DsdPath,
+            index,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::DsdProfilePill(index) => format.select_row_index(
+            FormatField::DsdProfile,
+            index,
+            source_bits,
+            source_rate,
+        ),
         TuiButton::DsdGainPill(index) => format.select_row_index(
             FormatField::DsdGain,
             index,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::DsdGainDbField => format.select_row_index(
+            FormatField::DsdGainDb,
+            0,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::DsdNormalizeTargetField => format.select_row_index(
+            FormatField::DsdNormalizeTarget,
+            0,
             source_bits,
             source_rate,
         ),

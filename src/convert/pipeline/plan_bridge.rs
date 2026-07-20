@@ -5,14 +5,17 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use sacd_rs::{
     inspect_dsd_container, DsdCompression, DsdContainerError, DsdContainerFormat,
     DsdContainerInfo,
 };
 use tonepoet_pipeline::{
     default_pcm_depth_for_format, AudioCodec as PlannerCodec, AudioFormat as PlannerFormat,
-    BitDepthTarget, PcmBitDepth, PipelineSettings, PlanRequest, PreferredTool, SampleKind,
-    SourceInfo, SourceRepresentationKind,
+    BitDepthTarget, DsdSourceKind, PcmBitDepth, PipelineSettings, PlanRequest, PreferredTool,
+    ReferenceProgrammeScope, ResolvedOutputTarget, SacdAreaKind, SacdFrameEncoding,
+    SacdTrackSelection, SampleKind, Sha256Digest, SourceInfo, SourceRepresentationKind,
 };
 
 use super::errors::ConvertError;
@@ -22,6 +25,92 @@ use super::types::{
     TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
 };
 
+fn planned_riff_non_audio_upper_bound(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    target: Option<ResolvedOutputTarget>,
+) -> Result<Option<u64>, ConvertError> {
+    if target != Some(ResolvedOutputTarget::WavRiff) {
+        return Ok(None);
+    }
+
+    let riff_size_error = || {
+        ConvertError::Backend(
+            tonepoet_pipeline::reference_error_text(
+                tonepoet_pipeline::ReferenceErrorCode::RiffSize,
+            )
+            .to_string(),
+        )
+    };
+    let expanded_len = |len: usize| {
+        u64::try_from(len)
+            .ok()
+            .and_then(|value| {
+                value.checked_mul(
+                    tonepoet_pipeline::REFERENCE_RIFF_METADATA_EXPANSION_FACTOR,
+                )
+            })
+            .ok_or_else(riff_size_error)
+    };
+
+    let metadata_bytes = serde_json::to_vec(&track.metadata).map_err(|error| {
+        ConvertError::Backend(format!(
+            "cannot serialize exact RIFF metadata plan for size admission: {error}"
+        ))
+    })?;
+    let mut upper = tonepoet_pipeline::REFERENCE_RIFF_MUXER_STRUCTURE_UPPER_BOUND_BYTES
+        .checked_add(expanded_len(metadata_bytes.len())?)
+        .ok_or_else(riff_size_error)?;
+
+    if request.settings.metadata.transfer_tags || request.settings.metadata.preserve_artwork {
+        let mut source = File::open(realized_input).map_err(|error| {
+            ConvertError::Backend(format!(
+                "cannot open verified source for RIFF metadata/artwork admission {}: {error}",
+                realized_input.display()
+            ))
+        })?;
+        let source_bytes = source
+            .metadata()
+            .map_err(|error| {
+                ConvertError::Backend(format!(
+                    "cannot inspect verified source for RIFF metadata/artwork admission {}: {error}",
+                    realized_input.display()
+                ))
+            })?
+            .len();
+        let source_non_audio_bytes = match inspect_dsd_container(&mut source) {
+            Ok(info) => source_bytes.checked_sub(info.data_size).ok_or_else(|| {
+                ConvertError::Backend(format!(
+                    "verified DSD source {} declares {} audio bytes in a {}-byte file",
+                    realized_input.display(),
+                    info.data_size,
+                    source_bytes
+                ))
+            })?,
+            Err(DsdContainerError::NotDsdContainer { .. }) => source_bytes,
+            Err(error) => {
+                return Err(ConvertError::Backend(format!(
+                    "cannot establish the source-derived RIFF chunk bound for {}: {error}",
+                    realized_input.display()
+                )));
+            }
+        };
+        // The verified container's complete non-audio region is an upper bound
+        // for source-derived text and artwork. Four-times expansion covers the
+        // frozen worst-case text encoding expansion; binary artwork is copied
+        // byte-for-byte and is therefore also covered.
+        let expanded_source_non_audio = source_non_audio_bytes
+            .checked_mul(tonepoet_pipeline::REFERENCE_RIFF_METADATA_EXPANSION_FACTOR)
+            .ok_or_else(riff_size_error)?;
+        upper = upper
+            .checked_add(expanded_source_non_audio)
+            .ok_or_else(riff_size_error)?;
+    }
+
+    Ok(Some(upper))
+}
+
 pub fn plan_request_for_track(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -29,7 +118,10 @@ pub fn plan_request_for_track(
     staged_output: &Path,
     intermediate_dir: PathBuf,
 ) -> Result<PlanRequest, ConvertError> {
-    let source = source_info_for_realized_track(track, realized_input)?;
+    let mut source = source_info_for_realized_track(track, realized_input)?;
+    if request.settings.dsd.is_native_v2() && source.codec.is_dsd() {
+        source.dsd_source_kind = Some(reference_source_kind(track, realized_input)?);
+    }
     source
         .validate()
         .map_err(|err| ConvertError::Backend(format!("invalid source facts for planner: {err}")))?;
@@ -139,18 +231,224 @@ pub fn plan_request_for_track(
             }
         }
     }
-    settings
-        .validate()
-        .map_err(|err| ConvertError::Backend(format!("invalid pipeline settings: {err}")))?;
+    let native_reference = request.settings.dsd.is_native_v2() && source.codec.is_dsd();
+    if !native_reference {
+        settings
+            .validate()
+            .map_err(|err| ConvertError::Backend(format!("invalid pipeline settings: {err}")))?;
+    }
 
     // settings-sentinel-allow: settings originates from request.settings.clone() above
+    // Native-v2 admission resolves through the static enabled product catalog.
+    // Raw caller strings are accepted only when they identify exactly one trusted
+    // catalog entry; arbitrary flags never become planner authority.
+    let resolved_output_target = if native_reference {
+        Some(resolve_reference_catalog_target(request).ok_or_else(|| {
+            ConvertError::Backend(
+                tonepoet_pipeline::reference_error_text(
+                    tonepoet_pipeline::ReferenceErrorCode::CanonicalTarget,
+                )
+                .to_string(),
+            )
+        })?)
+    } else {
+        None
+    };
+    let reference_programme_scope = reference_programme_scope(request, track);
+
+    let planned_riff_non_audio_upper_bound_bytes = planned_riff_non_audio_upper_bound(
+        request,
+        track,
+        realized_input,
+        resolved_output_target,
+    )?;
+
     Ok(PlanRequest {
+        resolved_output_target,
+        reference_programme_scope,
+        planned_riff_non_audio_upper_bound_bytes,
         input_path: realized_input.to_path_buf(),
         output_path: staged_output.to_path_buf(),
         source,
         settings,
         intermediate_dir: Some(intermediate_dir),
         container_ffmpeg_flags: request.container_ffmpeg_flags.clone(),
+    })
+}
+
+
+fn resolve_reference_catalog_target(request: &PipelineRequest) -> Option<ResolvedOutputTarget> {
+    let format = main_format_from_planner(&request.settings.target_format)?;
+    let extension = request
+        .container_extension
+        .as_deref()
+        .unwrap_or_else(|| format.extension())
+        .trim_start_matches('.');
+    let flags: Vec<&str> = request
+        .container_ffmpeg_flags
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut matches = format
+        .available_containers()
+        .iter()
+        .filter(|candidate| {
+            candidate.enabled
+                && candidate.extension.eq_ignore_ascii_case(extension)
+                && candidate.ffmpeg_flags == flags.as_slice()
+        });
+    let selected = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    format.resolved_output_target(selected)
+}
+
+fn main_format_from_planner(format: &PlannerFormat) -> Option<crate::convert::AudioFormat> {
+    Some(match format {
+        PlannerFormat::Flac => crate::convert::AudioFormat::Flac,
+        PlannerFormat::Wav => crate::convert::AudioFormat::Wav,
+        PlannerFormat::Aiff => crate::convert::AudioFormat::Aiff,
+        PlannerFormat::WavPack => crate::convert::AudioFormat::WavPack,
+        PlannerFormat::Mp3 => crate::convert::AudioFormat::Mp3,
+        PlannerFormat::Aac => crate::convert::AudioFormat::Aac,
+        PlannerFormat::Opus => crate::convert::AudioFormat::Opus,
+        PlannerFormat::Alac => crate::convert::AudioFormat::Alac,
+        PlannerFormat::Dsf => crate::convert::AudioFormat::Dsf,
+        PlannerFormat::Dff => crate::convert::AudioFormat::Dff,
+        PlannerFormat::Dts => crate::convert::AudioFormat::Dts,
+        PlannerFormat::Ac3 => crate::convert::AudioFormat::Ac3,
+        PlannerFormat::Custom { .. } => return None,
+    })
+}
+
+
+fn reference_programme_scope(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+) -> ReferenceProgrammeScope {
+    if request.merge
+        || matches!(
+            &track.source_ref,
+            TrackSourceRef::CueSegmentCarrier { .. } | TrackSourceRef::ImageSegment { .. }
+        )
+    {
+        return ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing;
+    }
+    if let Some(batch) = request.album_batch.as_ref() {
+        if let Some(expected_members) = std::num::NonZeroUsize::new(batch.expected_track_count) {
+            if expected_members.get() > 1 {
+                let mut hasher = Sha256::new();
+                hasher.update(b"tonepoet-reference-programme-paths/v1\0");
+                for path in batch.source_paths() {
+                    let normalized = path.to_string_lossy().replace('\\', "/");
+                    hasher.update((normalized.len() as u64).to_be_bytes());
+                    hasher.update(normalized.as_bytes());
+                }
+                let digest = hasher.finalize();
+                let mut bytes = [0_u8; 32];
+                bytes.copy_from_slice(&digest);
+                return ReferenceProgrammeScope::IndependentAlbumBatch {
+                    conversion_log_batch_id: batch.conversion_log_batch_id.clone(),
+                    expected_members,
+                    ordered_source_paths_digest: Sha256Digest(bytes),
+                };
+            }
+        }
+    }
+    ReferenceProgrammeScope::Singleton
+}
+
+fn reference_source_kind(
+    track: &PreparedTrack,
+    realized_input: &Path,
+) -> Result<DsdSourceKind, ConvertError> {
+    if let TrackSourceRef::SacdTrack {
+        iso,
+        track_index,
+        area,
+    } = &track.source_ref
+    {
+        return reference_sacd_source_kind(iso, *track_index, *area);
+    }
+    let metadata = dsd_source_metadata_from_path(realized_input)?.ok_or_else(|| {
+        ConvertError::Backend(format!(
+            "Reference source {} is not a recognized DSF/DSDIFF container",
+            realized_input.display()
+        ))
+    })?;
+    Ok(match metadata.source_kind {
+        DsdPlannerSourceKind::Dsf => DsdSourceKind::DsfUncompressed,
+        DsdPlannerSourceKind::DsdiffDsd => DsdSourceKind::DsdiffUncompressed,
+        DsdPlannerSourceKind::DsdiffDst => DsdSourceKind::DsdiffDst,
+    })
+}
+
+pub(super) fn reference_sacd_source_kind(
+    iso: &Path,
+    track_index: u32,
+    area: super::types::SacdArea,
+) -> Result<DsdSourceKind, ConvertError> {
+    use crate::tui::sacd::parse_sacd_iso;
+    let metadata = parse_sacd_iso(iso)
+        .map_err(|err| ConvertError::Backend(format!("failed to read SACD TOC for Reference: {err}")))?;
+    let (area_kind, area_info) = match area {
+        super::types::SacdArea::Stereo => (
+            SacdAreaKind::Stereo,
+            metadata.stereo.as_ref(),
+        ),
+        super::types::SacdArea::MultiChannel => (
+            SacdAreaKind::Multichannel,
+            metadata.multi_channel.as_ref(),
+        ),
+    };
+    let area_info = area_info.ok_or_else(|| {
+        ConvertError::Backend("selected SACD area is absent during Reference admission".to_string())
+    })?;
+    let entry = area_info.tracks.get(track_index as usize).ok_or_else(|| {
+        ConvertError::Backend(format!(
+            "selected SACD track index {track_index} is outside the admitted area"
+        ))
+    })?;
+    if entry.length_lsn == 0 {
+        return Err(ConvertError::Backend(
+            "selected SACD track has a zero frame count".to_string(),
+        ));
+    }
+
+    let frame_format = if area_info.extraction_frame_format().is_dst_encoded() {
+        SacdFrameEncoding::Dst
+    } else {
+        SacdFrameEncoding::Dsd
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-sacd-toc-selection/v1\0");
+    hasher.update(match area_kind {
+        SacdAreaKind::Stereo => b"stereo".as_slice(),
+        SacdAreaKind::Multichannel => b"multichannel".as_slice(),
+    });
+    hasher.update([area_info.header.frame_format.as_nibble()]);
+    hasher.update([area_info.header.channel_count]);
+    hasher.update((area_info.tracks.len() as u64).to_be_bytes());
+    for toc_entry in &area_info.tracks {
+        hasher.update(toc_entry.start_lsn.to_be_bytes());
+        hasher.update(toc_entry.length_lsn.to_be_bytes());
+        hasher.update([toc_entry.start_time.minutes, toc_entry.start_time.seconds, toc_entry.start_time.frames]);
+        hasher.update([toc_entry.duration.minutes, toc_entry.duration.seconds, toc_entry.duration.frames]);
+    }
+    let digest = hasher.finalize();
+    let mut toc_digest = [0_u8; 32];
+    toc_digest.copy_from_slice(&digest);
+
+    Ok(DsdSourceKind::SacdTrack {
+        frame_format,
+        selection: SacdTrackSelection {
+            area: area_kind,
+            track_index_zero_based: track_index,
+            start_frame: u64::from(entry.start_lsn),
+            frame_count: u64::from(entry.length_lsn),
+            toc_digest: Sha256Digest(toc_digest),
+        },
     })
 }
 
@@ -581,12 +879,22 @@ pub fn source_info_for_realized_track(
         .as_ref()
         .map(|metadata| metadata.sample_rate_hz)
         .or(track.sample_rate);
-    let channels = dsd_metadata.as_ref().map(|metadata| metadata.channels);
+    let channels = dsd_metadata
+        .as_ref()
+        .map(|metadata| metadata.channels)
+        .or_else(|| match &track.source_ref {
+            TrackSourceRef::SacdTrack { area: super::types::SacdArea::Stereo, .. } => Some(2),
+            // Multichannel Reference is rejected by policy; a non-stereo value
+            // keeps preflight and execution on the same deterministic error cell.
+            TrackSourceRef::SacdTrack { area: super::types::SacdArea::MultiChannel, .. } => Some(6),
+            _ => None,
+        });
     let duration = dsd_metadata
         .as_ref()
         .and_then(DsdPlannerSourceMetadata::duration);
 
     Ok(SourceInfo {
+        dsd_source_kind: None,
         format,
         codec,
         sample_rate_hz,
@@ -1931,6 +2239,10 @@ mod tests {
         req.settings.metadata.transfer_tags = true;
         let track = track(TrackSourceRef::StagedFile(input.clone()));
         let planned = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: input.clone(),
             output_path: output,
             source: source_info_for_realized_track(&track, &input).expect("source facts"),

@@ -61,9 +61,9 @@ fn dsd_format_state_suppresses_hidden_pcm_and_replaygain_state() {
     assert_eq!(settings.target_bit_depth, BitDepthTarget::Source);
     assert_eq!(settings.dither_type, tonepoet_pipeline::enums::DitherType::None);
     assert_eq!(settings.replay_gain.mode, None);
-    assert_eq!(settings.dsd.noise_shaper, DsdNoiseShaper::Crfb);
-    assert_eq!(settings.dsd.modulator_order, ModulatorOrder::Order6);
-    assert_eq!(settings.dsd.pcm_to_dsd_filter, DsdFilterPreset::Sinc);
+    assert_eq!(settings.dsd.pcm_to_dsd.noise_shaper, DsdNoiseShaper::Crfb);
+    assert_eq!(settings.dsd.pcm_to_dsd.modulator_order, ModulatorOrder::Order6);
+    assert_eq!(settings.dsd.pcm_to_dsd.filter, DsdFilterPreset::Sinc);
     settings.validate().unwrap();
 }
 

@@ -973,6 +973,31 @@ pub fn extract_track_with_area_frame_format<W: Write + Seek>(
     )
 }
 
+/// Extract one ISO track with authoritative area-frame routing and cooperative
+/// frame-boundary cancellation. Cancellation returns an interrupted I/O error;
+/// path-owning callers must discard their uncommitted temporary output.
+pub fn extract_track_with_area_frame_format_and_cancel<W, F>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    area_frame_format: FrameFormat,
+    integrity_options: ExtractIntegrityOptions,
+    mut is_cancelled: F,
+) -> Result<ExtractReport, ExtractError>
+where
+    W: Write + Seek,
+    F: FnMut() -> bool,
+{
+    extract_track_impl_with_cancel(
+        iso,
+        output,
+        opts,
+        integrity_options.with_frame_format(area_frame_format),
+        DstExtractionOptions::default(),
+        &mut is_cancelled,
+    )
+}
+
 /// Extract one ISO track with explicit DSDIFF/DST handling while preserving
 /// the source-compatible [`ExtractOptions`] shape.
 ///
@@ -1108,6 +1133,31 @@ fn extract_track_impl<W: Write + Seek>(
     integrity_options: ExtractIntegrityOptions,
     dst_options: DstExtractionOptions,
 ) -> Result<ExtractReport, ExtractError> {
+    extract_track_impl_with_cancel(
+        iso,
+        output,
+        opts,
+        integrity_options,
+        dst_options,
+        &mut || false,
+    )
+}
+
+fn extract_track_impl_with_cancel<W, F>(
+    iso: &mut IsoReader,
+    output: &mut W,
+    opts: ExtractOptions,
+    integrity_options: ExtractIntegrityOptions,
+    dst_options: DstExtractionOptions,
+    is_cancelled: &mut F,
+) -> Result<ExtractReport, ExtractError>
+where
+    W: Write + Seek,
+    F: FnMut() -> bool,
+{
+    if is_cancelled() {
+        return Err(extraction_cancelled_error());
+    }
     let mut source_opts = IsoTrackSourceOptions::new(
         opts.start_lsn,
         opts.end_lsn,
@@ -1131,8 +1181,16 @@ fn extract_track_impl<W: Write + Seek>(
     let mut sink_options = DsdSourceExtractOptions::from(&opts);
     sink_options.dst = dst_options;
     sink_options.recover_decode_errors = integrity_options.recover_sector_errors;
-    let mut report = write_dsd_source(&mut source, output, sink_options)?;
+    let mut report = write_dsd_source_with_cancel(
+        &mut source,
+        output,
+        sink_options,
+        is_cancelled,
+    )?;
     report.integrity = ExtractIntegrityReport::from_reader_stats(source.frame_reader_stats());
+    if is_cancelled() {
+        return Err(extraction_cancelled_error());
+    }
     Ok(report)
 }
 
@@ -1152,6 +1210,24 @@ where
     S: DsdSource + ?Sized,
     W: Write + Seek,
 {
+    write_dsd_source_with_cancel(source, output, opts, &mut || false)
+}
+
+/// Write any common DSD source with cooperative frame-boundary cancellation.
+pub fn write_dsd_source_with_cancel<S, W, F>(
+    source: &mut S,
+    output: &mut W,
+    opts: DsdSourceExtractOptions,
+    is_cancelled: &mut F,
+) -> Result<ExtractReport, ExtractError>
+where
+    S: DsdSource + ?Sized,
+    W: Write + Seek,
+    F: FnMut() -> bool,
+{
+    if is_cancelled() {
+        return Err(extraction_cancelled_error());
+    }
     let channel_count = source_channel_count_u8(source.source_info().channel_count)?;
     let sample_rate = source.source_info().sample_rate;
 
@@ -1161,9 +1237,12 @@ where
             if let Some(ref meta) = opts.id3_metadata {
                 writer.set_id3_footer(render_id3v24(meta));
             }
-            let report = drain_source_decoded(source, opts.recover_decode_errors, |frame| {
-                writer.write_interleaved(&frame.data).map_err(ExtractError::Io)
-            })?;
+            let report = drain_source_decoded(
+                source,
+                opts.recover_decode_errors,
+                is_cancelled,
+                |frame| writer.write_interleaved(&frame.data).map_err(ExtractError::Io),
+            )?;
             writer.finish()?;
             Ok(report)
         }
@@ -1172,9 +1251,12 @@ where
             if let Some(ref meta) = opts.dff_metadata {
                 writer.set_footer_bytes(render_dff_footer(meta));
             }
-            let report = drain_source_decoded(source, opts.recover_decode_errors, |frame| {
-                writer.write_frame(&frame.data).map_err(ExtractError::Io)
-            })?;
+            let report = drain_source_decoded(
+                source,
+                opts.recover_decode_errors,
+                is_cancelled,
+                |frame| writer.write_frame(&frame.data).map_err(ExtractError::Io),
+            )?;
             writer.finish()?;
             Ok(report)
         }
@@ -1190,9 +1272,12 @@ where
                 if let Some(ref meta) = opts.dff_metadata {
                     writer.set_footer_bytes(render_dff_footer(meta));
                 }
-                let report = drain_source_decoded(source, opts.recover_decode_errors, |frame| {
-                    writer.write_frame(&frame.data).map_err(ExtractError::Io)
-                })?;
+                let report = drain_source_decoded(
+                    source,
+                    opts.recover_decode_errors,
+                    is_cancelled,
+                    |frame| writer.write_frame(&frame.data).map_err(ExtractError::Io),
+                )?;
                 writer.finish()?;
                 return Ok(report);
             }
@@ -1201,12 +1286,24 @@ where
             if let Some(ref meta) = opts.dff_metadata {
                 writer.set_footer_bytes(render_dff_footer(meta));
             }
-            let mut report = drain_source_to_dff_dst(source, &mut writer, &opts.dst)?;
+            let mut report = drain_source_to_dff_dst(
+                source,
+                &mut writer,
+                &opts.dst,
+                is_cancelled,
+            )?;
             report.dff_dst = Some(writer.stats().clone());
             writer.finish()?;
             Ok(report)
         }
     }
+}
+
+fn extraction_cancelled_error() -> ExtractError {
+    ExtractError::Io(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "SACD/DSD extraction cancelled",
+    ))
 }
 
 fn source_channel_count_u8(channel_count: u16) -> Result<u8, ExtractError> {
@@ -1225,22 +1322,30 @@ fn source_channel_count_u8(channel_count: u16) -> Result<u8, ExtractError> {
     Ok(channels)
 }
 
-fn drain_source_decoded<S, F>(
+fn drain_source_decoded<S, FWrite, FCancel>(
     source: &mut S,
     recover_decode_errors: bool,
-    mut write_frame: F,
+    is_cancelled: &mut FCancel,
+    mut write_frame: FWrite,
 ) -> Result<ExtractReport, ExtractError>
 where
     S: DsdSource + ?Sized,
-    F: FnMut(&SourceDsdFrame) -> Result<(), ExtractError>,
+    FWrite: FnMut(&SourceDsdFrame) -> Result<(), ExtractError>,
+    FCancel: FnMut() -> bool,
 {
     use crate::dsd_file::inspect::DsdByteOrder;
 
     let mut stats = ExtractStats::default();
     let mut integrity = ExtractIntegrityReport::default();
-    while let Some(frame) = source.next_source_frame()? {
+    loop {
+        if is_cancelled() {
+            return Err(extraction_cancelled_error());
+        }
+        let Some(frame) = source.next_source_frame()? else {
+            break;
+        };
         let decoded = match frame.into_decoded_dsd() {
-            Ok(d) => d,
+            Ok(decoded) => decoded,
             Err(err) if recover_decode_errors => {
                 // DST decode failed — write DSD silence (0x55, alternating
                 // bits) for the expected frame size and continue. Matches the
@@ -1248,7 +1353,15 @@ where
                 // aborting. The silence frame preserves frame count and
                 // duration so downstream validation doesn't drift.
                 eprintln!("DST decode error (recovered with silence): {err}");
-                integrity.frames_dropped_incomplete += 1;
+                integrity.frames_dropped_incomplete = integrity
+                    .frames_dropped_incomplete
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        ExtractError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "extract dropped-frame counter overflow",
+                        ))
+                    })?;
                 let info = source.source_info();
                 let silence_len = expected_decoded_frame_len(info.channel_count, info.sample_rate);
                 let silence_frame = SourceDsdFrame {
@@ -1261,21 +1374,53 @@ where
                     is_final: false,
                 };
                 write_frame(&silence_frame)?;
-                stats.frames_read += 1;
-                stats.audio_bytes += silence_len as u64;
+                if is_cancelled() {
+                    return Err(extraction_cancelled_error());
+                }
+                stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
+                    ExtractError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "extract frame counter overflow",
+                    ))
+                })?;
+                stats.audio_bytes = stats
+                    .audio_bytes
+                    .checked_add(silence_len as u64)
+                    .ok_or_else(|| {
+                        ExtractError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "extract byte counter overflow",
+                        ))
+                    })?;
                 continue;
             }
             Err(err) => return Err(err.into()),
         };
         write_frame(&decoded)?;
+        if is_cancelled() {
+            return Err(extraction_cancelled_error());
+        }
         stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
-            ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract frame counter overflow"))
+            ExtractError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extract frame counter overflow",
+            ))
         })?;
-        stats.audio_bytes = stats.audio_bytes.checked_add(decoded.data.len() as u64).ok_or_else(|| {
-            ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract byte counter overflow"))
-        })?;
+        stats.audio_bytes = stats
+            .audio_bytes
+            .checked_add(decoded.data.len() as u64)
+            .ok_or_else(|| {
+                ExtractError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "extract byte counter overflow",
+                ))
+            })?;
     }
-    Ok(ExtractReport { stats, integrity, dff_dst: None })
+    Ok(ExtractReport {
+        stats,
+        integrity,
+        dff_dst: None,
+    })
 }
 
 /// Expected decoded frame size in bytes for a given channel count and sample rate.
@@ -1286,18 +1431,26 @@ fn expected_decoded_frame_len(channel_count: u16, sample_rate: u32) -> usize {
     FRAME_SIZE_UNCOMPRESSED * channels * rate_multiplier as usize
 }
 
-fn drain_source_to_dff_dst<S, W>(
+fn drain_source_to_dff_dst<S, W, F>(
     source: &mut S,
     writer: &mut DffDstWriter<W>,
     dst_options: &DstExtractionOptions,
+    is_cancelled: &mut F,
 ) -> Result<ExtractReport, ExtractError>
 where
     S: DsdSource + ?Sized,
     W: Write + Seek,
+    F: FnMut() -> bool,
 {
     let mut stats = ExtractStats::default();
-    while let Some(frame) = source.next_source_frame()? {
-        match frame {
+    loop {
+        if is_cancelled() {
+            return Err(extraction_cancelled_error());
+        }
+        let Some(frame) = source.next_source_frame()? else {
+            break;
+        };
+        let frame_bytes = match frame {
             DsdSourceFrame::Dst(dst) => {
                 let decoded = dst.decode_checked()?;
                 match dst_options.source_dst {
@@ -1308,7 +1461,10 @@ where
                     }
                     SourceDstHandling::AnalyzeThenPassthroughExistingDst => {
                         writer
-                            .analyze_interleaved_frame_with_options(&decoded.data, &dst_options.encoder)
+                            .analyze_interleaved_frame_with_options(
+                                &decoded.data,
+                                &dst_options.encoder,
+                            )
                             .map_err(ExtractError::Io)?;
                         writer
                             .write_passthrough_frame(&dst.encoded, &decoded.data)
@@ -1316,7 +1472,10 @@ where
                     }
                     SourceDstHandling::ReencodeDst => {
                         writer
-                            .write_interleaved_frame_with_options(&decoded.data, &dst_options.encoder)
+                            .write_interleaved_frame_with_options(
+                                &decoded.data,
+                                &dst_options.encoder,
+                            )
                             .map_err(ExtractError::Io)?;
                     }
                     SourceDstHandling::DecodeToDsdiffDsd => {
@@ -1332,12 +1491,7 @@ where
                         )));
                     }
                 }
-                stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
-                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract frame counter overflow"))
-                })?;
-                stats.audio_bytes = stats.audio_bytes.checked_add(decoded.data.len() as u64).ok_or_else(|| {
-                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract byte counter overflow"))
-                })?;
+                decoded.data.len()
             }
             DsdSourceFrame::Dsd(dsd) => {
                 match dst_options.plain_dsd {
@@ -1361,16 +1515,33 @@ where
                             .map_err(ExtractError::Io)?;
                     }
                 }
-                stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
-                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract frame counter overflow"))
-                })?;
-                stats.audio_bytes = stats.audio_bytes.checked_add(dsd.data.len() as u64).ok_or_else(|| {
-                    ExtractError::Io(io::Error::new(io::ErrorKind::InvalidData, "extract byte counter overflow"))
-                })?;
+                dsd.data.len()
             }
+        };
+        if is_cancelled() {
+            return Err(extraction_cancelled_error());
         }
+        stats.frames_read = stats.frames_read.checked_add(1).ok_or_else(|| {
+            ExtractError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extract frame counter overflow",
+            ))
+        })?;
+        stats.audio_bytes = stats
+            .audio_bytes
+            .checked_add(frame_bytes as u64)
+            .ok_or_else(|| {
+                ExtractError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "extract byte counter overflow",
+                ))
+            })?;
     }
-    Ok(ExtractReport { stats, integrity: ExtractIntegrityReport::default(), dff_dst: None })
+    Ok(ExtractReport {
+        stats,
+        integrity: ExtractIntegrityReport::default(),
+        dff_dst: None,
+    })
 }
 
 #[cfg(test)]

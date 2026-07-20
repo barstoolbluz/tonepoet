@@ -4,11 +4,32 @@ use tonepoet_pipeline::{
     GainCompensation, MetadataSettings, ModulatorOrder, Mp3Mode, Mp3Settings,
     DsdToPcmGainMode, NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
-    SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
+    SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS,
     SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings,
-    TrellisSettings,
     VerificationSettings, WavPackMode, WavPackSettings,
 };
+
+fn legacy_dsd_settings(
+    lowpass: DsdLowpassMethod,
+    gain_mode: DsdToPcmGainMode,
+    margin_db: f32,
+    gain_db: Option<f32>,
+) -> DsdSettings {
+    let native = DsdSettings::default();
+    serde_json::from_value(serde_json::json!({
+        "noise_shaper": native.pcm_to_dsd.noise_shaper,
+        "modulator_order": native.pcm_to_dsd.modulator_order,
+        "trellis": native.pcm_to_dsd.trellis,
+        "pcm_to_dsd_filter": native.pcm_to_dsd.filter,
+        "dsd_to_pcm_lowpass": lowpass,
+        "dsd_to_pcm_gain_mode": gain_mode,
+        "dsd_to_pcm_auto_gain_margin_db": margin_db,
+        "dsd_to_pcm_gain_db": gain_db,
+        "sinc": native.pcm_to_dsd.sinc,
+        "gain_compensation": native.pcm_to_dsd.gain_compensation,
+    }))
+    .expect("valid frozen legacy DSD wire")
+}
 
 /// Valid fingerprint base with named fields for compile-time drift detection.
 ///
@@ -79,6 +100,34 @@ use tonepoet_pipeline::{
 /// - verification.prefer_native_flac_verify: false
 /// - replay_gain.mode: Some(Both)
 /// - replay_gain.prevent_clipping: false
+fn sentinel_dsd_settings() -> DsdSettings {
+    serde_json::from_value(serde_json::json!({
+        "noise_shaper": DsdNoiseShaper::Crfb,
+        "modulator_order": ModulatorOrder::Order7,
+        "trellis": {
+            "lookahead": 17,
+            "nodes": 9,
+            "latency": 321,
+        },
+        "pcm_to_dsd_filter": DsdFilterPreset::Sinc,
+        "dsd_to_pcm_lowpass": DsdLowpassMethod::Sinc,
+        "dsd_to_pcm_gain_mode": DsdToPcmGainMode::Manual,
+        "dsd_to_pcm_auto_gain_margin_db": 0.50,
+        "dsd_to_pcm_gain_db": -3.25,
+        "sinc": {
+            "oversample_factor": 16,
+            "taps": 131_072,
+            "passband_hz": 30_000.0,
+            "transition_hz": 750.0,
+            "kaiser_beta": 12.5,
+            "linear_phase": false,
+            "allow_aliasing": true,
+        },
+        "gain_compensation": GainCompensation::Decibels(1.5),
+    }))
+    .expect("valid frozen legacy DSD sentinel wire")
+}
+
 fn flac_md5_sentinel() -> PipelineSettings {
     PipelineSettings {
         target_format: AudioFormat::Flac,
@@ -140,30 +189,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
             cutoff: Some(0.97),
             phase: Some(25),
         },
-        dsd: DsdSettings {
-            noise_shaper: DsdNoiseShaper::Crfb,
-            modulator_order: ModulatorOrder::Order7,
-            trellis: Some(TrellisSettings {
-                lookahead: 17,
-                nodes: 9,
-                latency: Some(321),
-            }),
-            pcm_to_dsd_filter: DsdFilterPreset::Sinc,
-            dsd_to_pcm_lowpass: DsdLowpassMethod::Sinc,
-            dsd_to_pcm_gain_mode: DsdToPcmGainMode::Manual,
-            dsd_to_pcm_auto_gain_margin_db: 0.50,
-            dsd_to_pcm_gain_db: Some(-3.25),
-            sinc: SincFilterSettings {
-                oversample_factor: 16,
-                taps: 131_072,
-                passband_hz: 30_000.0,
-                transition_hz: 750.0,
-                kaiser_beta: 12.5,
-                linear_phase: false,
-                allow_aliasing: true,
-            },
-            gain_compensation: GainCompensation::Decibels(1.5),
-        },
+        dsd: sentinel_dsd_settings(),
         metadata: MetadataSettings {
             transfer_tags: true,
             preserve_artwork: false,
@@ -416,63 +442,81 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
         settings.soxr_resampler.phase = Some(50);
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.noise_shaper", |settings| {
-        settings.dsd.noise_shaper = DsdNoiseShaper::Sdm;
+        settings.dsd.pcm_to_dsd.noise_shaper = DsdNoiseShaper::Sdm;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.modulator_order", |settings| {
-        settings.dsd.modulator_order = ModulatorOrder::Order6;
+        settings.dsd.pcm_to_dsd.modulator_order = ModulatorOrder::Order6;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.trellis", |settings| {
-        settings.dsd.trellis = None;
+        settings.dsd.pcm_to_dsd.trellis = None;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.trellis.lookahead", |settings| {
-        settings.dsd.trellis.as_mut().unwrap().lookahead = 18;
+        settings.dsd.pcm_to_dsd.trellis.as_mut().unwrap().lookahead = 18;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.trellis.nodes", |settings| {
-        settings.dsd.trellis.as_mut().unwrap().nodes = 10;
+        settings.dsd.pcm_to_dsd.trellis.as_mut().unwrap().nodes = 10;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.trellis.latency", |settings| {
-        settings.dsd.trellis.as_mut().unwrap().latency = Some(322);
+        settings.dsd.pcm_to_dsd.trellis.as_mut().unwrap().latency = Some(322);
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.pcm_to_dsd_filter", |settings| {
-        settings.dsd.pcm_to_dsd_filter = DsdFilterPreset::Auto;
+        settings.dsd.pcm_to_dsd.filter = DsdFilterPreset::Auto;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_lowpass", |settings| {
-        settings.dsd.dsd_to_pcm_lowpass = DsdLowpassMethod::SoxUltra;
+        settings.dsd = legacy_dsd_settings(
+            DsdLowpassMethod::SoxUltra,
+            DsdToPcmGainMode::Manual,
+            0.50,
+            Some(-3.25),
+        );
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_gain_mode", |settings| {
-        settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+        settings.dsd = legacy_dsd_settings(
+            DsdLowpassMethod::Sinc,
+            DsdToPcmGainMode::Auto,
+            0.50,
+            None,
+        );
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_auto_gain_margin_db", |settings| {
-        // Switch to Auto mode so margin is fingerprinted, then change it.
-        settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
-        settings.dsd.dsd_to_pcm_auto_gain_margin_db = 1.0;
+        settings.dsd = legacy_dsd_settings(
+            DsdLowpassMethod::Sinc,
+            DsdToPcmGainMode::Auto,
+            1.0,
+            None,
+        );
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.dsd_to_pcm_gain_db", |settings| {
-        settings.dsd.dsd_to_pcm_gain_db = Some(-2.75);
+        settings.dsd = legacy_dsd_settings(
+            DsdLowpassMethod::Sinc,
+            DsdToPcmGainMode::Manual,
+            0.50,
+            Some(-2.75),
+        );
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.sinc.oversample_factor", |settings| {
-        settings.dsd.sinc.oversample_factor = 32;
+        settings.dsd.pcm_to_dsd.sinc.oversample_factor = 32;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.sinc.taps", |settings| {
-        settings.dsd.sinc.taps = 65_536;
+        settings.dsd.pcm_to_dsd.sinc.taps = 65_536;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.sinc.passband_hz", |settings| {
-        settings.dsd.sinc.passband_hz = 31_000.0;
+        settings.dsd.pcm_to_dsd.sinc.passband_hz = 31_000.0;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.sinc.transition_hz", |settings| {
-        settings.dsd.sinc.transition_hz = 800.0;
+        settings.dsd.pcm_to_dsd.sinc.transition_hz = 800.0;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.sinc.kaiser_beta", |settings| {
-        settings.dsd.sinc.kaiser_beta = 13.0;
+        settings.dsd.pcm_to_dsd.sinc.kaiser_beta = 13.0;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.sinc.linear_phase", |settings| {
-        settings.dsd.sinc.linear_phase = true;
+        settings.dsd.pcm_to_dsd.sinc.linear_phase = true;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.sinc.allow_aliasing", |settings| {
-        settings.dsd.sinc.allow_aliasing = false;
+        settings.dsd.pcm_to_dsd.sinc.allow_aliasing = false;
     });
     assert_mutation_changes_fingerprint!(covered, base, "dsd.gain_compensation", |settings| {
-        settings.dsd.gain_compensation = GainCompensation::Linear(2.0);
+        settings.dsd.pcm_to_dsd.gain_compensation = GainCompensation::Linear(2.0);
     });
     assert_mutation_changes_fingerprint!(covered, base, "metadata.transfer_tags", |settings| {
         settings.metadata.transfer_tags = false;
@@ -516,15 +560,15 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
 #[cfg(feature = "serde")]
 #[test]
 fn serde_recursive_field_count_matches_checked_inventory_for_known_shapes() {
-    // Counts re-baselined 2026-07-15 (79/86), then +1 each for
-    // replay_gain.existing_tags (F3 skip-if-present policy). The
+    // Counts re-baselined for directional DSD native-v2 serialization: the
+    // nested schema adds five keys relative to the frozen flat-v1 wire. The
     // mutation-inventory test above is the authoritative drift guard; this
     // pins raw serialized shape.
     let default = serde_json::to_value(PipelineSettings::default()).unwrap();
     let sentinel = serde_json::to_value(flac_md5_sentinel()).unwrap();
 
-    assert_eq!(recursive_object_key_count(&default), 80);
-    assert_eq!(recursive_object_key_count(&sentinel), 87);
+    assert_eq!(recursive_object_key_count(&default), 85);
+    assert_eq!(recursive_object_key_count(&sentinel), 92);
 }
 
 #[cfg(feature = "serde")]

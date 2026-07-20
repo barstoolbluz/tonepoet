@@ -1569,7 +1569,7 @@ fn add_sox_pcm_to_dsd_effects(
             args.push(target_rate.hz().to_string());
         }
         DsdFilterPreset::Sinc => {
-            let sinc = context.request.settings.dsd.sinc;
+            let sinc = context.request.settings.dsd.pcm_to_dsd.sinc;
             args.push("upsample".into());
             args.push(sinc.oversample_factor.to_string());
             args.push("sinc".into());
@@ -1588,7 +1588,7 @@ fn add_sox_pcm_to_dsd_effects(
             if sinc.allow_aliasing {
                 args.push("-a".into());
             }
-            match context.request.settings.dsd.gain_compensation {
+            match context.request.settings.dsd.pcm_to_dsd.gain_compensation {
                 GainCompensation::Auto => {
                     args.push("vol".into());
                     args.push(sinc.oversample_factor.to_string());
@@ -1620,7 +1620,7 @@ fn add_sox_dsd_to_pcm_effects(
 ) -> Result<()> {
     match lowpass {
         DsdLowpassMethod::Sinc => {
-            let sinc = context.request.settings.dsd.sinc;
+            let sinc = context.request.settings.dsd.pcm_to_dsd.sinc;
             args.push("sinc".into());
             args.push(format!("-{:.0}", sinc.passband_hz));
             args.push("-n".into());
@@ -1713,13 +1713,13 @@ fn add_sox_dsd_to_pcm_gain(
     dsd: &crate::settings::DsdSettings,
     args: &mut Vec<String>,
 ) -> Result<()> {
-    match dsd.dsd_to_pcm_gain_mode {
+    match dsd.legacy_dsd_to_pcm_gain_mode() {
         DsdToPcmGainMode::Auto => {
             args.push("norm".into());
-            args.push(format!("-{:.2}", dsd.dsd_to_pcm_auto_gain_margin_db));
+            args.push(format!("-{:.2}", dsd.legacy_dsd_to_pcm_auto_gain_margin_db()));
         }
         DsdToPcmGainMode::Manual => {
-            let gain_db = dsd.dsd_to_pcm_gain_db.ok_or_else(|| {
+            let gain_db = dsd.legacy_dsd_to_pcm_gain_db().ok_or_else(|| {
                 PlanningError::invalid_settings(
                     "dsd.dsd_to_pcm_gain_db",
                     "Manual DSD-to-PCM gain requires a finite dB value",
@@ -1731,7 +1731,7 @@ fn add_sox_dsd_to_pcm_gain(
         DsdToPcmGainMode::Disabled => {
             // Backward compatibility: older callers only had this optional
             // field. Keep honoring it without making auto gain the default.
-            if let Some(gain_db) = dsd.dsd_to_pcm_gain_db {
+            if let Some(gain_db) = dsd.legacy_dsd_to_pcm_gain_db() {
                 args.push("gain".into());
                 args.push(format!("{gain_db:+.2}"));
             }
@@ -1748,7 +1748,7 @@ fn add_sox_dsd_rate_change_effects(
 ) {
     match lowpass {
         DsdLowpassMethod::Sinc => {
-            let sinc = context.request.settings.dsd.sinc;
+            let sinc = context.request.settings.dsd.pcm_to_dsd.sinc;
             args.push("sinc".into());
             args.push(format!("-{:.0}", sinc.passband_hz));
             args.push("-n".into());
@@ -1779,10 +1779,10 @@ fn add_sox_sdm_args(context: &PlanContext<'_>, args: &mut Vec<String>) {
     args.push("sdm".into());
     args.push("-f".into());
     args.push(mapping::dsd_shaper_name(
-        dsd.noise_shaper,
-        dsd.modulator_order,
+        dsd.pcm_to_dsd.noise_shaper,
+        dsd.pcm_to_dsd.modulator_order,
     ));
-    if let Some(trellis) = dsd.trellis {
+    if let Some(trellis) = dsd.pcm_to_dsd.trellis {
         args.push("-t".into());
         args.push(trellis.lookahead.to_string());
         args.push("-n".into());
@@ -1824,6 +1824,18 @@ fn format_float(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_dsd(
+        gain_mode: DsdToPcmGainMode,
+        margin_db: f32,
+        gain_db: Option<f32>,
+    ) -> DsdSettings {
+        let mut wire = crate::settings::LegacyDsdSettingsWireV1::default();
+        wire.dsd_to_pcm_gain_mode = gain_mode;
+        wire.dsd_to_pcm_auto_gain_margin_db = margin_db;
+        wire.dsd_to_pcm_gain_db = gain_db;
+        DsdSettings::from_legacy_wire(wire)
+    }
     use crate::plan::{InputSource, MetadataPlanEffect, OutputSink, PlanOperation, PlanRequest, PlanStep};
     use crate::settings::{DsdSettings, PipelineSettings};
     use crate::enums::SsrcPdfType;
@@ -1836,6 +1848,8 @@ mod tests {
         target_bit_depth: Option<PcmBitDepth>,
     ) -> Result<PlannedCommand> {
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Wav,
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
@@ -1848,6 +1862,10 @@ mod tests {
             audio_md5: None,
         };
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("source.wav"),
             output_path: PathBuf::from("output.wav"),
             source,
@@ -2057,6 +2075,8 @@ mod tests {
         // ffmpeg's wavpack encoder cannot write 24-bit (it stores true
         // 32-bit ints) — the plan must never route this cell to ffmpeg.
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Flac,
             codec: crate::enums::AudioCodec::Flac,
             sample_rate_hz: Some(44_100),
@@ -2072,6 +2092,10 @@ mod tests {
         settings.target_format = AudioFormat::WavPack;
         settings.target_bit_depth = crate::enums::BitDepthTarget::Pcm(PcmBitDepth::Int24);
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("realized.flac"),
             output_path: PathBuf::from("track.wv"),
             source,
@@ -2135,6 +2159,10 @@ mod tests {
             crate::enums::BitDepthTarget::Pcm(PcmBitDepth::Int24);
         hybrid_settings.wavpack.hybrid = true;
         let hybrid_request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("realized.flac"),
             output_path: PathBuf::from("track.wv"),
             source: request.source.clone(),
@@ -2153,6 +2181,8 @@ mod tests {
     #[test]
     fn ffmpeg_aac_command_rejects_raw_aac_suffix_without_raw_mode() {
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Wav,
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
@@ -2167,6 +2197,10 @@ mod tests {
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Aac;
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("realized.wav"),
             output_path: PathBuf::from("track.aac"),
             source,
@@ -2198,6 +2232,8 @@ mod tests {
     #[test]
     fn ffmpeg_aac_and_alac_commands_pin_mp4_m4a_muxer() {
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Flac,
             codec: crate::enums::AudioCodec::Flac,
             sample_rate_hz: Some(44_100),
@@ -2213,6 +2249,10 @@ mod tests {
         let mut aac_settings = PipelineSettings::default();
         aac_settings.target_format = AudioFormat::Aac;
         let aac_request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("realized.flac"),
             output_path: PathBuf::from("track.m4a"),
             source: source.clone(),
@@ -2237,6 +2277,10 @@ mod tests {
         let mut alac_settings = PipelineSettings::default();
         alac_settings.target_format = AudioFormat::Alac;
         let alac_request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("realized.flac"),
             output_path: PathBuf::from("track.m4a"),
             source,
@@ -2267,6 +2311,8 @@ mod tests {
         settings.metadata.transfer_tags = true;
         settings.metadata.preserve_artwork = true;
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Dsf,
             codec: crate::enums::AudioCodec::Dsd,
             sample_rate_hz: Some(2_822_400),
@@ -2279,6 +2325,10 @@ mod tests {
             audio_md5: None,
         };
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("source.dsf"),
             output_path: PathBuf::from("output.flac"),
             source,
@@ -2318,6 +2368,8 @@ mod tests {
         settings.metadata.transfer_tags = true;
         settings.metadata.preserve_artwork = true;
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Wav,
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
@@ -2330,6 +2382,10 @@ mod tests {
             audio_md5: None,
         };
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("source.wav"),
             output_path: PathBuf::from("output.flac"),
             source,
@@ -2375,6 +2431,8 @@ mod tests {
         settings.metadata.transfer_tags = true;
         settings.metadata.preserve_artwork = true;
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Wav,
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
@@ -2387,6 +2445,10 @@ mod tests {
             audio_md5: None,
         };
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("source.wav"),
             output_path: PathBuf::from("output.flac"),
             source,
@@ -2431,6 +2493,8 @@ mod tests {
         settings.target_format = AudioFormat::Flac;
         settings.metadata.store_source_audio_md5 = true;
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Flac,
             codec: crate::enums::AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
@@ -2443,6 +2507,10 @@ mod tests {
             audio_md5: Some("0123456789abcdef0123456789abcdef".into()),
         };
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("source.flac"),
             output_path: PathBuf::from("output.flac"),
             source,
@@ -2474,9 +2542,7 @@ mod tests {
 
     #[test]
     fn dsd_to_pcm_manual_gain_without_value_fails_loudly() {
-        let mut dsd = DsdSettings::default();
-        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
-        dsd.dsd_to_pcm_gain_db = None;
+        let dsd = legacy_dsd(DsdToPcmGainMode::Manual, 0.15, None);
         let mut args = Vec::new();
 
         let result = add_sox_dsd_to_pcm_gain(&dsd, &mut args);
@@ -2487,9 +2553,7 @@ mod tests {
 
     #[test]
     fn dsd_to_pcm_manual_gain_with_value_emits_gain() {
-        let mut dsd = DsdSettings::default();
-        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
-        dsd.dsd_to_pcm_gain_db = Some(2.25);
+        let dsd = legacy_dsd(DsdToPcmGainMode::Manual, 0.15, Some(2.25));
         let mut args = Vec::new();
 
         add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
@@ -2499,10 +2563,7 @@ mod tests {
 
     #[test]
     fn dsd_to_pcm_auto_gain_emits_norm_margin() {
-        let mut dsd = DsdSettings::default();
-        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
-        dsd.dsd_to_pcm_auto_gain_margin_db = 0.50;
-        dsd.dsd_to_pcm_gain_db = None;
+        let dsd = legacy_dsd(DsdToPcmGainMode::Auto, 0.50, None);
         let mut args = Vec::new();
 
         add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
@@ -2512,9 +2573,7 @@ mod tests {
 
     #[test]
     fn dsd_to_pcm_disabled_gain_preserves_legacy_fixed_db() {
-        let mut dsd = DsdSettings::default();
-        dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-        dsd.dsd_to_pcm_gain_db = Some(-1.5);
+        let dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 0.15, Some(-1.5));
         let mut args = Vec::new();
 
         add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
@@ -2527,6 +2586,8 @@ mod tests {
         settings.target_format = AudioFormat::Flac;
         settings.dither_type = DitherType::None;
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Dsf,
             codec: crate::enums::AudioCodec::Dsd,
             sample_rate_hz: Some(source_hz),
@@ -2539,6 +2600,10 @@ mod tests {
             audio_md5: None,
         };
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("input.dsf"),
             output_path: PathBuf::from("output.flac"),
             source,
@@ -2616,11 +2681,18 @@ mod tests {
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Flac;
         settings.dither_type = DitherType::Shibata;
-        settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
-        settings.dsd.dsd_to_pcm_auto_gain_margin_db = 0.15;
-        settings.dsd.dsd_to_pcm_gain_db = None;
+        settings.dsd = crate::settings::DsdSettings::from_legacy_wire(
+            crate::settings::LegacyDsdSettingsWireV1 {
+                dsd_to_pcm_gain_mode: DsdToPcmGainMode::Auto,
+                dsd_to_pcm_auto_gain_margin_db: 0.15,
+                dsd_to_pcm_gain_db: None,
+                ..Default::default()
+            },
+        );
 
         let source = SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Dsf,
             codec: crate::enums::AudioCodec::Dsd,
             sample_rate_hz: Some(2_822_400),
@@ -2634,6 +2706,10 @@ mod tests {
         };
 
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("input.dsf"),
             output_path: PathBuf::from("output.flac"),
             source,

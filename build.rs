@@ -10,4 +10,13 @@ fn main() {
         .and_then(|line| line.split('"').nth(1))
         .unwrap_or("unknown");
     println!("cargo:rustc-env=TONEPOET_PIPELINE_VERSION={version}");
+    for variable in [
+        "TONEPOET_REFERENCE_SOX_STORE_PATH",
+        "TONEPOET_REFERENCE_FFMPEG_STORE_PATH",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+        if let Ok(value) = std::env::var(variable) {
+            println!("cargo:rustc-env={variable}={value}");
+        }
+    }
 }

@@ -61,7 +61,8 @@ use super::materializer_single::SingleFileMaterializer;
 use super::memory_budget::{estimate_job_peak_bytes, write_staging_owner_marker, ScratchAdmissionFailureKind, ScratchReservation};
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
-    execute_planned_track_conversion, run_tool_command_with_concurrency,
+    execute_planned_track_conversion, preflight_reference_rerun_authority,
+    run_tool_command_with_concurrency, verify_reference_output_after_metadata,
 };
 pub use super::track_executor::ToolConcurrencyLimits;
 use super::plan_bridge::{metadata_obligations_for_request, orchestrator_metadata_stage_required};
@@ -84,7 +85,7 @@ use crate::tui::sacd::{
     SACD_SAMPLE_RATE_HZ,
 };
 use sacd_rs::dsd_file::{validate_dsd_stream, DsdValidationMode, DsdValidationOptions, DsdValidationReport};
-use sacd_rs::extract::{extract_track_with_area_frame_format, ExtractIntegrityOptions, ExtractReport, ExtractStats, OutputFormat};
+use sacd_rs::extract::{ExtractIntegrityOptions, ExtractReport, ExtractStats, OutputFormat};
 use sacd_rs::iso_reader::IsoReader;
 
 const DEFAULT_CONVERT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
@@ -973,7 +974,38 @@ async fn realize_track_with_tool_limits_and_stats(
             iso,
             track_index,
             area,
-        } => realize_sacd_track(iso, *track_index, *area, &req.settings.target_format, staging, cancel, progress_tracker).await,
+        } if req.settings.dsd.is_native_v2()
+            && req.settings.dsd.from_dsd.pathway
+                == tonepoet_pipeline::DsdSourcePathway::Reference =>
+        {
+            // Reference SACD admission must remain pure until the immutable
+            // policy/toolchain attestation has passed. Return a typed,
+            // deterministic carrier placeholder; the executor performs the
+            // qualified extraction inside its private work directory after
+            // attestation and re-plans against the resulting DSF.
+            let area_label = sacd_area_label(*area);
+            let path_hash = stable_path_hash(iso);
+            Ok(RealizedTrackInfo::without_stats(
+                staging.root.join("reference-deferred-sacd").join(format!(
+                    "sacd_{path_hash:016x}_{area_label}_track_{:03}.dsf",
+                    track_index + 1
+                )),
+            ))
+        }
+        TrackSourceRef::SacdTrack {
+            iso,
+            track_index,
+            area,
+        } => realize_sacd_track(
+            iso,
+            *track_index,
+            *area,
+            &req.settings.target_format,
+            staging,
+            cancel,
+            progress_tracker,
+        )
+        .await,
         TrackSourceRef::DvdVideoTrack { .. } => realize_dvdv_track(
             src,
             staging,
@@ -2011,6 +2043,45 @@ fn realize_sacd_track_blocking(
     target_format: &tonepoet_pipeline::AudioFormat,
     staging_root: &Path,
 ) -> Result<RealizedTrackInfo, ConvertError> {
+    realize_sacd_track_blocking_with_cancel(
+        iso,
+        track_index,
+        area,
+        target_format,
+        staging_root,
+        || false,
+    )
+}
+
+pub(super) fn realize_reference_sacd_track_blocking(
+    iso: &Path,
+    track_index: u32,
+    area: SacdArea,
+    staging_root: &Path,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, ConvertError> {
+    realize_sacd_track_blocking_with_cancel(
+        iso,
+        track_index,
+        area,
+        &tonepoet_pipeline::AudioFormat::Dsf,
+        staging_root,
+        || cancel.is_cancelled(),
+    )
+    .map(|realized| realized.path)
+}
+
+fn realize_sacd_track_blocking_with_cancel<F>(
+    iso: &Path,
+    track_index: u32,
+    area: SacdArea,
+    target_format: &tonepoet_pipeline::AudioFormat,
+    staging_root: &Path,
+    mut is_cancelled: F,
+) -> Result<RealizedTrackInfo, ConvertError>
+where
+    F: FnMut() -> bool,
+{
     let metadata = parse_sacd_iso(iso).map_err(sacd_error_to_convert)?;
     let area_info = sacd_area_info(&metadata, area).ok_or_else(|| {
         ConvertError::TrackValidation(format!(
@@ -2082,12 +2153,13 @@ fn realize_sacd_track_blocking(
         let options = area_info
             .track_extract_options(track_index as usize, output_format)
             .map_err(|err| ConvertError::TrackValidation(err.to_string()))?;
-        let report = extract_track_with_area_frame_format(
+        let report = sacd_rs::extract::extract_track_with_area_frame_format_and_cancel(
             &mut iso_reader,
             &mut writer,
             options,
             area_info.extraction_frame_format(),
             ExtractIntegrityOptions::strict(),
+            || is_cancelled(),
         )
         .map_err(|err| {
             ConvertError::Realize(format!(
@@ -3256,6 +3328,7 @@ async fn convert_one_track_work(
                     dsd_dst_stats,
                 };
                 let artifact = TrackArtifact {
+                    reference_evidence: executed.reference,
                     planned_command_hash: executed.command_hash,
                     track_id: track.id.clone(),
                     staged_path,
@@ -7393,6 +7466,26 @@ mod replaygain_existing_tag_policy_tests {
         AudioFormat, ReplayGainExistingTagPolicy, ReplayGainMode,
     };
 
+    fn legacy_dsd_settings(
+        gain_mode: tonepoet_pipeline::DsdToPcmGainMode,
+        gain_db: Option<f32>,
+    ) -> tonepoet_pipeline::DsdSettings {
+        let native = tonepoet_pipeline::DsdSettings::default();
+        serde_json::from_value(serde_json::json!({
+            "noise_shaper": native.pcm_to_dsd.noise_shaper,
+            "modulator_order": native.pcm_to_dsd.modulator_order,
+            "trellis": native.pcm_to_dsd.trellis,
+            "pcm_to_dsd_filter": native.pcm_to_dsd.filter,
+            "dsd_to_pcm_lowpass": tonepoet_pipeline::DsdLowpassMethod::Auto,
+            "dsd_to_pcm_gain_mode": gain_mode,
+            "dsd_to_pcm_auto_gain_margin_db": 0.15,
+            "dsd_to_pcm_gain_db": gain_db,
+            "sinc": native.pcm_to_dsd.sinc,
+            "gain_compensation": native.pcm_to_dsd.gain_compensation,
+        }))
+        .expect("exact legacy DSD settings fixture")
+    }
+
     fn tag_with(values: &[(ItemKey, &str)]) -> Tag {
         let mut tag = Tag::new(TagType::VorbisComments);
         for (key, value) in values {
@@ -7451,6 +7544,7 @@ mod replaygain_existing_tag_policy_tests {
 
     fn track_artifact(path: PathBuf, ordinal: u32) -> TrackArtifact {
         TrackArtifact {
+                    reference_evidence: None,
             track_id: TrackId {
                 source_ordinal: ordinal,
                 disc_number: None,
@@ -7751,8 +7845,10 @@ mod replaygain_existing_tag_policy_tests {
         );
         req.settings.target_format = AudioFormat::Flac;
         req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Disabled;
-        req.settings.dsd.dsd_to_pcm_gain_db = None;
+        req.settings.dsd = legacy_dsd_settings(
+            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
+            None,
+        );
         let source = super::pipeline_test_helpers::log_test_source();
 
         assert_eq!(
@@ -7777,7 +7873,10 @@ mod replaygain_existing_tag_policy_tests {
         );
 
         req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Auto;
+        req.settings.dsd = legacy_dsd_settings(
+            tonepoet_pipeline::DsdToPcmGainMode::Auto,
+            None,
+        );
         assert_eq!(
             inherited_replaygain_tag_policy(None, &req.settings),
             ReplayGainInheritedTagPolicy::Recompute {
@@ -7961,8 +8060,10 @@ mod replaygain_existing_tag_policy_tests {
         );
         req.settings.target_format = AudioFormat::Flac;
         req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Disabled;
-        req.settings.dsd.dsd_to_pcm_gain_db = None;
+        req.settings.dsd = legacy_dsd_settings(
+            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
+            None,
+        );
 
         req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         assert!(matches!(
@@ -8043,8 +8144,10 @@ mod replaygain_existing_tag_policy_tests {
         req.settings.target_format = AudioFormat::Flac;
         req.settings.target_sample_rate = RateTarget::Source;
         req.settings.target_bit_depth = BitDepthTarget::Source;
-        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Disabled;
-        req.settings.dsd.dsd_to_pcm_gain_db = None;
+        req.settings.dsd = legacy_dsd_settings(
+            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
+            None,
+        );
 
         assert!(matches!(
             inherited_replaygain_tag_policy(Some(&source), &req.settings),
@@ -8177,8 +8280,10 @@ mod replaygain_existing_tag_policy_tests {
         req.settings.target_format = AudioFormat::Flac;
         req.settings.target_sample_rate = RateTarget::Source;
         req.settings.target_bit_depth = BitDepthTarget::Source;
-        req.settings.dsd.dsd_to_pcm_gain_mode = tonepoet_pipeline::DsdToPcmGainMode::Disabled;
-        req.settings.dsd.dsd_to_pcm_gain_db = None;
+        req.settings.dsd = legacy_dsd_settings(
+            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
+            None,
+        );
         let record = super::pipeline_test_helpers::ok_record();
 
         let mut trusted = String::new();
@@ -8285,19 +8390,25 @@ fn inherited_replaygain_tag_policy(
         reasons.push("lossy encoding changes the output signal".to_string());
     }
 
-    let gain_configured = settings.dsd.dsd_to_pcm_gain_mode
-        != tonepoet_pipeline::DsdToPcmGainMode::Disabled
-        || settings.dsd.dsd_to_pcm_gain_db.is_some();
-    if gain_configured && !settings.target_format.is_dsd() {
+    let legacy_gain_configured = settings.dsd.legacy_behavior().is_some_and(|legacy| {
+        legacy.gain_mode != tonepoet_pipeline::DsdToPcmGainMode::Disabled
+            || legacy.gain_db.is_some()
+    });
+    if !settings.target_format.is_dsd() {
         match source {
             Some(source) if source_is_dsd(source) => {
-                reasons.push("DSD-to-PCM gain changes output level".to_string());
+                // Native-v2 Reference always applies an explicit terminal level
+                // policy; legacy applies one only when its frozen controls say so.
+                if settings.dsd.is_native_v2() || legacy_gain_configured {
+                    reasons.push("DSD-to-PCM gain changes output level".to_string());
+                }
             }
             Some(_) => {}
-            None => reasons.push(
+            None if legacy_gain_configured => reasons.push(
                 "source coding facts are unavailable while DSD-to-PCM gain is configured"
                     .to_string(),
             ),
+            None => {}
         }
     }
 
@@ -15983,35 +16094,79 @@ fn append_dsd_settings(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) {
     if source_is_dsd(source) && !settings.target_format.is_dsd() {
-        push_kv_line(log, "DSD gain mode", dsd_gain_mode_label(settings.dsd.dsd_to_pcm_gain_mode));
-        if settings.dsd.dsd_to_pcm_gain_mode
-            == tonepoet_pipeline::DsdToPcmGainMode::Auto
-        {
+        if let Some(legacy) = settings.dsd.legacy_behavior() {
+            push_kv_line(log, "DSD path", "legacy-v1 compatibility");
+            push_kv_line(log, "DSD gain mode", dsd_gain_mode_label(legacy.gain_mode));
+            if legacy.gain_mode == tonepoet_pipeline::DsdToPcmGainMode::Auto {
+                push_kv_line(
+                    log,
+                    "DSD auto gain margin",
+                    format!("{} dB", decimal_label(legacy.auto_gain_margin_db)),
+                );
+            }
+            if legacy.gain_mode == tonepoet_pipeline::DsdToPcmGainMode::Manual {
+                if let Some(gain) = legacy.gain_db {
+                    push_kv_line(log, "DSD manual gain", format!("{} dB", decimal_label(gain)));
+                }
+            }
             push_kv_line(
                 log,
-                "DSD auto gain margin",
-                format!("{} dB", decimal_label(settings.dsd.dsd_to_pcm_auto_gain_margin_db)),
+                "DSD→PCM lowpass method",
+                dsd_lowpass_method_label(legacy.lowpass),
+            );
+        } else {
+            let native = settings.dsd.from_dsd;
+            push_kv_line(
+                log,
+                "DSD path",
+                match native.pathway {
+                    tonepoet_pipeline::DsdSourcePathway::Reference => "reference",
+                    tonepoet_pipeline::DsdSourcePathway::Manual => "manual (not available)",
+                },
+            );
+            push_kv_line(
+                log,
+                "DSD profile",
+                match native.profile {
+                    tonepoet_pipeline::DsdReconstructionSelection::Reference => "reference",
+                    tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband",
+                },
+            );
+            push_kv_line(
+                log,
+                "DSD gain mode",
+                match native.gain_mode {
+                    tonepoet_pipeline::DsdSourceGainMode::Reference => "reference",
+                    tonepoet_pipeline::DsdSourceGainMode::NativeLevel => "native",
+                    tonepoet_pipeline::DsdSourceGainMode::Fixed => "fixed",
+                    tonepoet_pipeline::DsdSourceGainMode::NormalizePeak => "normalize",
+                },
+            );
+            if native.gain_mode == tonepoet_pipeline::DsdSourceGainMode::Fixed {
+                if let Some(gain) = native.fixed_gain_db {
+                    push_kv_line(log, "DSD fixed gain", format!("{} dB", gain));
+                }
+            }
+            if native.gain_mode == tonepoet_pipeline::DsdSourceGainMode::NormalizePeak {
+                push_kv_line(
+                    log,
+                    "DSD normalize target",
+                    format!("{} dBFS", native.normalize_peak_target_dbfs),
+                );
+            }
+            push_kv_line(
+                log,
+                "DSD Reference policy",
+                tonepoet_pipeline::DSD_REFERENCE_POLICY_V1_KEY,
             );
         }
-        if settings.dsd.dsd_to_pcm_gain_mode
-            == tonepoet_pipeline::DsdToPcmGainMode::Manual
-        {
-            if let Some(gain) = settings.dsd.dsd_to_pcm_gain_db {
-                push_kv_line(log, "DSD manual gain", format!("{} dB", decimal_label(gain)));
-            }
-        }
-        push_kv_line(
-            log,
-            "DSD→PCM lowpass method",
-            dsd_lowpass_method_label(settings.dsd.dsd_to_pcm_lowpass),
-        );
     }
 
     if settings.target_format.is_dsd() {
         push_kv_line(
             log,
             "PCM→DSD filter preset",
-            format!("{:?}", settings.dsd.pcm_to_dsd_filter),
+            format!("{:?}", settings.dsd.pcm_to_dsd.filter),
         );
     }
 }
@@ -19243,8 +19398,15 @@ fn publish_album_output_bound(
         let relativization_album_dir = manifest_album_dir.unwrap_or(plan.album_dir.as_path());
         match super::manifest::write_manifest_for_publish(&temp_dir, relativization_album_dir, manifest) {
             Ok(_written_manifest_path) => Some(super::manifest::manifest_path(&plan.album_dir)),
+            Err(err) if matches!(
+                &manifest.route_identity,
+                super::manifest::ManifestRouteIdentityV2::DsdReferenceV2 { .. }
+            ) => {
+                let _ = fs::remove_dir_all(&temp_dir);
+                return Err(PublishError::Manifest(err.to_string()));
+            }
             Err(err) => {
-                log::warn!("manifest write failed (non-fatal): {err}");
+                log::warn!("manifest write failed (non-fatal for legacy route): {err}");
                 None
             }
         }
@@ -19525,6 +19687,24 @@ fn publish_incremental_album_output(
         return cleanup_publish_temp(temp_dir, err);
     }
 
+    let native_manifest_path = match write_native_incremental_manifest_transactionally(
+        plan,
+        manifest,
+        &mut rollback,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            if let Err(rollback_err) = rollback.rollback_best_effort() {
+                let _ = fs::remove_dir_all(temp_dir);
+                return Err(PublishError::RollbackFailed(format!(
+                    "incremental native manifest publish failed with {err:?}; rollback failed with {rollback_err:?}; recovery marker left at {}",
+                    marker_path.display()
+                )));
+            }
+            return cleanup_publish_temp(temp_dir, err);
+        }
+    };
+
     if let Err(err) = rollback.commit() {
         if let Err(rollback_err) = rollback.rollback_best_effort() {
             let _ = fs::remove_dir_all(temp_dir);
@@ -19572,7 +19752,10 @@ fn publish_incremental_album_output(
         );
     }
 
-    Ok(write_incremental_manifest_nonfatal(plan, manifest))
+    match native_manifest_path {
+        Some(path) => Ok(Some(path)),
+        None => write_incremental_manifest(plan, manifest),
+    }
 }
 
 #[derive(Debug)]
@@ -20065,16 +20248,44 @@ fn should_fallback_to_remove_then_rename_for_replace(err: &io::Error, dst: &Path
     }
 }
 
-fn write_incremental_manifest_nonfatal(
+fn write_native_incremental_manifest_transactionally(
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
-) -> Option<PathBuf> {
-    let manifest = manifest?;
+    rollback: &mut IncrementalPublishRollback,
+) -> Result<Option<PathBuf>, PublishError> {
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    if !matches!(
+        &manifest.route_identity,
+        super::manifest::ManifestRouteIdentityV2::DsdReferenceV2 { .. }
+    ) {
+        return Ok(None);
+    }
+
+    let final_manifest_path = super::manifest::manifest_path(&plan.album_dir);
+    rollback.snapshot_destination(&final_manifest_path)?;
+    super::manifest::write_manifest_for_publish(&plan.album_dir, &plan.album_dir, manifest)
+        .map_err(|err| PublishError::Manifest(err.to_string()))?;
+    Ok(Some(final_manifest_path))
+}
+
+fn write_incremental_manifest(
+    plan: &PublishPlan,
+    manifest: Option<&super::manifest::ConversionManifest>,
+) -> Result<Option<PathBuf>, PublishError> {
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
     match super::manifest::write_manifest_for_publish(&plan.album_dir, &plan.album_dir, manifest) {
-        Ok(_written_manifest_path) => Some(super::manifest::manifest_path(&plan.album_dir)),
+        Ok(_written_manifest_path) => Ok(Some(super::manifest::manifest_path(&plan.album_dir))),
+        Err(err) if matches!(
+            &manifest.route_identity,
+            super::manifest::ManifestRouteIdentityV2::DsdReferenceV2 { .. }
+        ) => Err(PublishError::Manifest(err.to_string())),
         Err(err) => {
-            log::warn!("manifest write failed during incremental publish (non-fatal): {err}");
-            None
+            log::warn!("manifest write failed during incremental legacy publish (non-fatal): {err}");
+            Ok(None)
         }
     }
 }
@@ -20814,6 +21025,87 @@ async fn finalize_pre_materialization_manifest_skip(
     finalize_report(req, reporter, None, Some(plan), None, published, outcome).await
 }
 
+async fn decide_rerun_after_reference_preflight(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    album_plan: &AlbumPlan,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> super::rerun::RerunDecision {
+    if !req.settings.dsd.is_native_v2()
+        || req.settings.dsd.from_dsd.pathway
+            != tonepoet_pipeline::DsdSourcePathway::Reference
+    {
+        return super::rerun::decide_rerun(
+            &album_plan.album_dir,
+            &req.settings,
+            req.publish.overwrite,
+        );
+    }
+    let Some(track) = source.tracks.first().filter(|_| source.tracks.len() == 1) else {
+        return super::rerun::RerunDecision::Redo {
+            reason: super::rerun::RerunReason::NativePreflightFailed(
+                "P0 Reference rerun preflight requires exactly one singleton track".to_string(),
+            ),
+            warning: Some(
+                "native Reference rerun preflight could not establish singleton authority; conversion will be replanned"
+                    .to_string(),
+            ),
+            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+        };
+    };
+    let Some(entry) = album_plan
+        .entries
+        .iter()
+        .find(|entry| entry.track_id == track.id)
+    else {
+        return super::rerun::RerunDecision::Redo {
+            reason: super::rerun::RerunReason::NativePreflightFailed(
+                "P0 Reference album plan has no output for its singleton track".to_string(),
+            ),
+            warning: Some(
+                "native Reference rerun preflight could not bind the planned output; conversion will be replanned"
+                    .to_string(),
+            ),
+            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+        };
+    };
+
+    match preflight_reference_rerun_authority(
+        req,
+        track,
+        &entry.final_path,
+        runner,
+        cancel,
+    )
+    .await
+    {
+        Ok(Some(authority)) => super::rerun::decide_rerun_with_reference_preflight(
+            &album_plan.album_dir,
+            &req.settings,
+            req.publish.overwrite,
+            &authority,
+        ),
+        Ok(None) => super::rerun::RerunDecision::Redo {
+            reason: super::rerun::RerunReason::NativePreflightFailed(
+                "native-v2 settings did not produce Reference preflight authority".to_string(),
+            ),
+            warning: Some(
+                "native Reference rerun authority was unavailable; conversion will be replanned"
+                    .to_string(),
+            ),
+            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+        },
+        Err(err) => super::rerun::RerunDecision::Redo {
+            reason: super::rerun::RerunReason::NativePreflightFailed(err.to_string()),
+            warning: Some(format!(
+                "native Reference rerun preflight failed; conversion will proceed through the same fail-closed execution gate: {err}"
+            )),
+            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
+        },
+    }
+}
+
 /// For a batch with pre-actions, perform the rerun decision and elected pre
 /// phase before any worker enters source materialization. The dispatcher must
 /// have persisted an album directory produced by the canonical planner; a
@@ -20827,6 +21119,17 @@ async fn prepare_batch_pre_actions_before_materialization(
     stages: &mut Vec<StageRecord>,
 ) -> PreMaterializationActionOutcome {
     if req.actions.pre.is_empty() || req.album_batch.is_none() {
+        return PreMaterializationActionOutcome::Continue {
+            ran_pre_actions: false,
+        };
+    }
+    if req.settings.dsd.is_native_v2()
+        && req.settings.dsd.from_dsd.pathway
+            == tonepoet_pipeline::DsdSourcePathway::Reference
+    {
+        // Native Reference skip authority cannot be established from settings
+        // alone. Defer PRE actions until source planning and the exact
+        // source/toolchain preflight have proved this is not a manifest skip.
         return PreMaterializationActionOutcome::Continue {
             ran_pre_actions: false,
         };
@@ -22683,11 +22986,15 @@ pub async fn prepare_pipeline_item_for_scheduler(
     if let super::rerun::RerunDecision::Skip {
         manifest,
         manifest_path,
-    } = super::rerun::decide_rerun(
-        &album_plan.album_dir,
-        &req.settings,
-        req.publish.overwrite,
-    ) {
+    } = decide_rerun_after_reference_preflight(
+        &req,
+        &prepared,
+        &album_plan,
+        runner,
+        cancel,
+    )
+    .await
+    {
         if !pre_actions_ran_before_materialization {
             return ScheduledMaterialization::Finished(
                 finalize_manifest_skip(
@@ -23117,6 +23424,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                     dsd_dst_stats,
                 };
                 let artifact = TrackArtifact {
+                    reference_evidence: executed.reference,
                     track_id: realized.track.id.clone(),
                     staged_path,
                     final_path: realized.final_path,
@@ -23450,6 +23758,26 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         stages.push(record);
     }
 
+    if let Some(artifacts_mut) = artifacts.as_mut() {
+        if let Err(err) = verify_reference_artifacts_after_metadata(
+            artifacts_mut,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+        )
+        .await
+        {
+            let record = stage_record(
+                PipelineStage::Metadata,
+                StageOutcome::Failed(format!(
+                    "Reference decoded-sample verification after metadata failed: {err}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+        }
+    }
+
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
         return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
@@ -23531,25 +23859,25 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
     }
 
-    // Build manifest from audio artifacts only when the publish policy
-    // requests it. The manifest is used by the rerun gate to detect
-    // identical conversions; most users don't need it.
-    let conversion_manifest = if req.publish.write_manifest {
-        match build_manifest_for_album(&req, &source_value, &artifacts, &plan_value) {
-            Ok(manifest) => Some(manifest),
-            Err(err) => {
-                log::warn!("manifest build failed (non-fatal): {err}");
-                None
-            }
-        }
+    // Native Reference publication always carries manifest-v2 authority.
+    // Existing routes retain the opt-in legacy manifest policy.
+    let reference_manifest_required = artifacts.as_ref().is_some_and(|artifact_set| match &artifact_set.audio {
+        AudioArtifacts::Tracks(tracks) => tracks.iter().any(|track| track.reference_evidence.is_some()),
+        AudioArtifacts::Merged(_) => false,
+    });
+    let conversion_manifest = if req.publish.write_manifest || reference_manifest_required {
+        build_manifest_for_album(&req, &source_value, &artifacts, &plan_value)
+            .map(Some)
+            .map_err(PublishError::Manifest)
     } else {
-        None
+        Ok(None)
     };
 
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
     let container_companion_snapshot =
         container_companion_snapshot_before_publish_best_effort(&req, &source_value);
-    match artifacts
+    match conversion_manifest.and_then(|conversion_manifest| {
+        artifacts
         .as_ref()
         .ok_or(PublishError::StagingMissing)
         .and_then(|artifact_set| {
@@ -23582,7 +23910,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             };
             Ok((album, transition_album, identity_lock, binding))
         })
-    {
+    }) {
         Ok((album, transition_album, mut identity_lock, binding)) => {
             publication_binding = binding;
             attest_publication_album_scope_best_effort(&req, publication_binding.as_ref());
@@ -24051,11 +24379,15 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     if let super::rerun::RerunDecision::Skip {
         manifest,
         manifest_path,
-    } = super::rerun::decide_rerun(
-        &plan.as_ref().expect("plan present").album_dir,
-        &req.settings,
-        req.publish.overwrite,
-    ) {
+    } = decide_rerun_after_reference_preflight(
+        &req,
+        source.as_ref().expect("source present"),
+        plan.as_ref().expect("plan present"),
+        runner,
+        cancel,
+    )
+    .await
+    {
         if !pre_actions_ran_before_materialization {
             return finalize_manifest_skip(
                 &req,
@@ -24345,6 +24677,26 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         let record = stage_record(PipelineStage::ReplayGain, StageOutcome::Skipped);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
+    }
+
+    if let Some(artifacts_mut) = artifacts.as_mut() {
+        if let Err(err) = verify_reference_artifacts_after_metadata(
+            artifacts_mut,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+        )
+        .await
+        {
+            let record = stage_record(
+                PipelineStage::Metadata,
+                StageOutcome::Failed(format!(
+                    "Reference decoded-sample verification after metadata failed: {err}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+        }
     }
 
     current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
@@ -28957,6 +29309,7 @@ mod companion_copy_hardening_tests {
                 paths
                     .into_iter()
                     .map(|(track_id, final_path)| TrackArtifact {
+                    reference_evidence: None,
                         track_id,
                         staged_path: final_path.with_extension("staged"),
                         final_path,
@@ -37176,6 +37529,31 @@ mod scratch_staging_parent_tests {
     }
 }
 
+async fn verify_reference_artifacts_after_metadata(
+    artifacts: &mut ArtifactSet,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), ConvertError> {
+    let AudioArtifacts::Tracks(tracks) = &mut artifacts.audio else {
+        return Ok(());
+    };
+    for track in tracks {
+        let Some(evidence) = track.reference_evidence.as_mut() else {
+            continue;
+        };
+        verify_reference_output_after_metadata(
+            &track.staged_path,
+            evidence,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Build a conversion manifest from audio artifacts and source metadata.
 /// Handles both per-track and merged artifact sets.
 fn build_manifest_for_album(
@@ -37232,6 +37610,7 @@ fn build_manifest_for_album(
                     staged_output_path: artifact.staged_path.clone(),
                     validation_status: ValidationStatus::Passed,
                     record_output_hash: req.settings.verification.verify_after_encode,
+                    reference_evidence: artifact.reference_evidence.clone(),
                 });
             }
             inputs
@@ -37549,6 +37928,7 @@ mod pipeline_test_helpers {
         ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![
                 TrackArtifact {
+                    reference_evidence: None,
                     track_id: TrackId {
                         source_ordinal: 1,
                         disc_number: Some(1),
@@ -37562,6 +37942,7 @@ mod pipeline_test_helpers {
                     planned_command_hash: None,
                 },
                 TrackArtifact {
+                    reference_evidence: None,
                     track_id: TrackId {
                         source_ordinal: 2,
                         disc_number: Some(1),
@@ -37685,6 +38066,7 @@ mod m4a_freeform_invocation_tests {
         };
         let artifacts = ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                    reference_evidence: None,
                 track_id,
                 staged_path: staged.clone(),
                 final_path: staged,
@@ -37831,6 +38213,7 @@ mod build_cue_sheet_tests {
 
     fn track_artifact(number: u32, name: &str) -> TrackArtifact {
         TrackArtifact {
+                    reference_evidence: None,
             track_id: TrackId { source_ordinal: 1, disc_number: None, track_number: number },
             staged_path: PathBuf::from(format!("/encoded/{name}")),
             final_path: PathBuf::from(format!("/out/{name}")),
@@ -38079,6 +38462,26 @@ mod conversion_log_tests {
     use super::*;
     use super::pipeline_test_helpers::*;
 
+    fn legacy_dsd_settings(
+        gain_mode: DsdToPcmGainMode,
+        gain_db: Option<f32>,
+    ) -> tonepoet_pipeline::DsdSettings {
+        let native = tonepoet_pipeline::DsdSettings::default();
+        serde_json::from_value(serde_json::json!({
+            "noise_shaper": native.pcm_to_dsd.noise_shaper,
+            "modulator_order": native.pcm_to_dsd.modulator_order,
+            "trellis": native.pcm_to_dsd.trellis,
+            "pcm_to_dsd_filter": native.pcm_to_dsd.filter,
+            "dsd_to_pcm_lowpass": tonepoet_pipeline::DsdLowpassMethod::Auto,
+            "dsd_to_pcm_gain_mode": gain_mode,
+            "dsd_to_pcm_auto_gain_margin_db": 0.15,
+            "dsd_to_pcm_gain_db": gain_db,
+            "sinc": native.pcm_to_dsd.sinc,
+            "gain_compensation": native.pcm_to_dsd.gain_compensation,
+        }))
+        .expect("exact legacy DSD settings fixture")
+    }
+
     struct VersionOnlyRunner(HashMap<ToolBinary, String>);
 
     #[async_trait::async_trait]
@@ -38323,7 +38726,7 @@ mod conversion_log_tests {
         dsd_source.tracks[0].sample_rate = Some(2_822_400);
         dsd_source.tracks[0].bit_depth = None;
         let mut dsd_req = log_test_request();
-        dsd_req.settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Auto;
+        dsd_req.settings.dsd = legacy_dsd_settings(DsdToPcmGainMode::Auto, None);
         let dsd_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
         assert!(dsd_log.contains("DSD gain mode: auto"));
         assert!(dsd_log.contains("DSD auto gain margin"));
@@ -38332,14 +38735,13 @@ mod conversion_log_tests {
         assert!(!dsd_log.contains("DSD filter preset"));
         assert!(!dsd_log.contains("PCM→DSD filter preset"));
 
-        dsd_req.settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Disabled;
-        dsd_req.settings.dsd.dsd_to_pcm_gain_db = Some(6.0);
+        dsd_req.settings.dsd = legacy_dsd_settings(DsdToPcmGainMode::Disabled, Some(6.0));
         let disabled_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
         assert!(disabled_log.contains("DSD gain mode: disabled"));
         assert!(!disabled_log.contains("DSD auto gain margin"));
         assert!(!disabled_log.contains("DSD manual gain"));
 
-        dsd_req.settings.dsd.dsd_to_pcm_gain_mode = DsdToPcmGainMode::Manual;
+        dsd_req.settings.dsd = legacy_dsd_settings(DsdToPcmGainMode::Manual, Some(6.0));
         let manual_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
         assert!(manual_log.contains("DSD gain mode: manual"));
         assert!(!manual_log.contains("DSD auto gain margin"));
@@ -39139,6 +39541,7 @@ mod naming_template_tests {
         std::fs::write(&staged_path, b"audio").expect("staged audio");
         ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                    reference_evidence: None,
                 track_id: plan.entries[0].track_id.clone(),
                 staged_path,
                 final_path: plan.entries[0].final_path.clone(),
@@ -39701,6 +40104,7 @@ mod naming_template_tests {
             let staged_path = staging.root.join(format!("track-{index}.flac"));
             std::fs::write(&staged_path, format!("audio-{index}")).expect("staged audio");
             tracks.push(TrackArtifact {
+                    reference_evidence: None,
                 track_id: entry.track_id.clone(),
                 staged_path,
                 final_path: entry.final_path.clone(),
@@ -39970,6 +40374,7 @@ mod naming_template_tests {
             let staged_path = staging.root.join(format!("track-{index}.flac"));
             std::fs::write(&staged_path, format!("audio-{index}")).expect("staged audio");
             tracks.push(TrackArtifact {
+                    reference_evidence: None,
                 track_id: entry.track_id.clone(),
                 staged_path,
                 final_path: entry.final_path.clone(),
@@ -41327,6 +41732,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             index,
             record: track_record(id.clone(), true, Some(fixture.staged_paths[index].clone())),
             artifact: Some(TrackArtifact {
+                    reference_evidence: None,
                 track_id: id,
                 staged_path: fixture.staged_paths[index].clone(),
                 final_path: fixture.final_paths[index].clone(),
@@ -43349,6 +43755,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 let staged_audio = staging.root.join("01.flac");
                 std::fs::write(&staged_audio, b"audio").expect("staged audio");
                 AudioArtifacts::Tracks(vec![TrackArtifact {
+                    reference_evidence: None,
                     track_id: TrackId {
                         source_ordinal: 1,
                         disc_number: Some(1),
@@ -43491,6 +43898,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         std::fs::write(&staged_audio, b"audio").expect("staged audio");
         let artifacts = ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                    reference_evidence: None,
                 track_id: TrackId {
                     source_ordinal: 1,
                     disc_number: Some(1),
@@ -43874,6 +44282,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         std::fs::write(&staged_audio, audio_bytes).expect("real fragment staged audio");
         ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                    reference_evidence: None,
                 track_id: TrackId {
                     source_ordinal,
                     disc_number,
@@ -44075,6 +44484,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             std::fs::write(&staged_audio, audio_bytes).expect("staged audio");
             let artifacts = ArtifactSet {
                 audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                    reference_evidence: None,
                     track_id: TrackId {
                         source_ordinal: disc,
                         disc_number: Some(disc),
@@ -44326,6 +44736,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
         let artifacts = ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![TrackArtifact {
+                    reference_evidence: None,
                 track_id: TrackId {
                     source_ordinal: 1,
                     disc_number: Some(1),
@@ -47022,6 +47433,7 @@ Source-aware setting: yes
         let artifacts = ArtifactSet {
             audio: AudioArtifacts::Tracks(vec![
                 TrackArtifact {
+                    reference_evidence: None,
                     track_id: source.tracks[0].id.clone(),
                     staged_path: temp.path().join("cue-stage/01.flac"),
                     final_path: album_dir.join("01.flac"),
@@ -47031,6 +47443,7 @@ Source-aware setting: yes
                     planned_command_hash: None,
                 },
                 TrackArtifact {
+                    reference_evidence: None,
                     track_id: source.tracks[1].id.clone(),
                     staged_path: temp.path().join("cue-stage/02.flac"),
                     final_path: album_dir.join("02.flac"),

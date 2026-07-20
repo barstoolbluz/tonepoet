@@ -336,6 +336,69 @@ impl AudioFormat {
         }
     }
 
+    /// Resolve the exact trusted codec/container product identity.
+    ///
+    /// This method is exhaustive over enabled catalog entries. Disabled or
+    /// caller-authored entries return `None` and must fail closed for native-v2
+    /// Reference DSD admission.
+    #[must_use]
+    pub fn resolved_output_target(
+        &self,
+        container: &ContainerOption,
+    ) -> Option<tonepoet_pipeline::ResolvedOutputTarget> {
+        use tonepoet_pipeline::ResolvedOutputTarget as T;
+        if !container.enabled {
+            return None;
+        }
+        let key = (container.extension, container.display_name, container.ffmpeg_flags);
+        match (self, key) {
+            (Self::Flac, ("flac", "FLAC", &[])) => Some(T::FlacNative),
+            (Self::Flac, ("ogg", "OGG", &[])) => Some(T::FlacOgg),
+            (Self::Flac, ("mka", "MKA", &[])) => Some(T::FlacMka),
+            (Self::Flac, ("mkv", "MKV", &[])) => Some(T::FlacMkv),
+            (Self::Wav, ("wav", "WAV", &[])) => Some(T::WavRiff),
+            (Self::Wav, ("wav", "RF64", &["-rf64", "auto"])) => Some(T::WavRf64),
+            (Self::Wav, ("w64", "W64", &[])) => Some(T::WavW64),
+            (Self::Wav, ("mka", "MKA", &[])) => Some(T::WavMka),
+            (Self::Wav, ("mkv", "MKV", &[])) => Some(T::WavMkv),
+            (Self::Aiff, ("aiff", "AIFF", &[])) => Some(T::AiffNative),
+            (Self::Aiff, ("mka", "MKA", &[])) => Some(T::AiffMka),
+            (Self::Aiff, ("mkv", "MKV", &[])) => Some(T::AiffMkv),
+            (Self::WavPack, ("wv", "WavPack", &[])) => Some(T::WavPackNative),
+            (Self::WavPack, ("mka", "MKA", &[])) => Some(T::WavPackMka),
+            (Self::WavPack, ("mkv", "MKV", &[])) => Some(T::WavPackMkv),
+            (Self::Mp3, ("mp3", "MP3", &[])) => Some(T::Mp3Native),
+            (Self::Mp3, ("mka", "MKA", &[])) => Some(T::Mp3Mka),
+            (Self::Mp3, ("mkv", "MKV", &[])) => Some(T::Mp3Mkv),
+            (Self::Aac, ("m4a", "M4A", &[])) => Some(T::AacM4a),
+            (Self::Aac, ("mp4", "MP4", &[])) => Some(T::AacMp4),
+            (Self::Aac, ("m4b", "M4B", &[])) => Some(T::AacM4b),
+            (Self::Aac, ("mka", "MKA", &[])) => Some(T::AacMka),
+            (Self::Aac, ("mkv", "MKV", &[])) => Some(T::AacMkv),
+            (Self::Opus, ("opus", "Opus", &[])) => Some(T::OpusNative),
+            (Self::Opus, ("webm", "WebM", &[])) => Some(T::OpusWebM),
+            (Self::Opus, ("weba", "WebA", &["-f", "webm"])) => Some(T::OpusWebA),
+            (Self::Opus, ("mka", "MKA", &[])) => Some(T::OpusMka),
+            (Self::Opus, ("mkv", "MKV", &[])) => Some(T::OpusMkv),
+            (Self::Alac, ("m4a", "M4A", &[])) => Some(T::AlacM4a),
+            (Self::Alac, ("mp4", "MP4", &[])) => Some(T::AlacMp4),
+            (Self::Dsf, ("dsf", "DSF", &[])) => Some(T::DsfNative),
+            (Self::Dsf, ("dff", "DFF", &[])) => Some(T::DsfAsDff),
+            (Self::Dff, ("dff", "DFF", &[])) => Some(T::DffNative),
+            (Self::Dts, ("dts", "DTS", &[])) => Some(T::DtsNative),
+            (Self::Dts, ("mka", "MKA", &[])) => Some(T::DtsMka),
+            (Self::Dts, ("mkv", "MKV", &[])) => Some(T::DtsMkv),
+            (Self::Dts, ("mp4", "MP4", &[])) => Some(T::DtsMp4),
+            (Self::Ac3, ("ac3", "AC3", &[])) => Some(T::Ac3Native),
+            (Self::Ac3, ("mka", "MKA", &[])) => Some(T::Ac3Mka),
+            (Self::Ac3, ("mkv", "MKV", &[])) => Some(T::Ac3Mkv),
+            (Self::Ac3, ("mp4", "MP4", &[])) => Some(T::Ac3Mp4),
+            (Self::Lpcm, ("wav", "WAV", &[])) => Some(T::LpcmRiff),
+            (Self::Lpcm, ("aiff", "AIFF", &[])) => Some(T::LpcmAiff),
+            _ => None,
+        }
+    }
+
     /// Enabled output containers for this codec. Decode-only source formats
     /// intentionally return an empty list even though `available_containers()`
     /// keeps a disabled legacy sentinel for safe rendering of stale presets.

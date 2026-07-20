@@ -1,0 +1,204 @@
+{
+  "schema_version": 2,
+  "authority": "commission_attestation_plus_content_addressed_independent_oracles_and_standards_literal_outputs",
+  "oracle": {
+    "name": "sacd_extract",
+    "implementation": "Sound-Linux-More/sacd-extract",
+    "upstream": "https://github.com/Sound-Linux-More/sacd-extract",
+    "scope": "compressed DSD64 stereo and six-channel cases frame_001 through frame_003",
+    "oracle_output_set_identity": "sha256:1375f3c65a04a81f59cf944b3be9b9e4565f9d43cccf3356af570358c237c2fe",
+    "executable_identity_retained": false,
+    "authority": "The accepted commission attests byte-exact validation against sacd_extract for real stereo and six-channel SACD material. This corpus pins every input and expected output by SHA-256; it does not invent an unavailable historical executable hash."
+  },
+  "standards_literal_authority": {
+    "syntax": "ISO/IEC 14496-3 DSTCoded=0 frame: one zero header byte followed by interleaved DSD bytes verbatim",
+    "generator": "generate_p0_raw_fixtures.py",
+    "generator_sha256": "f7be9a59c4baed275c7888522b36af36c95a9f3f1807ec54bcca69812c9fdf45",
+    "independent_oracle": "verify_p0_raw_oracle.py",
+    "independent_oracle_sha256": "db9e5781a33e7893bac38bb0ef9935f0ad490d0498f31e26140c8e4247054a17",
+    "scope": "DSD64 mono/six-channel, DSD128 mono/stereo, and DSD256 mono/stereo",
+    "note": "The source-controlled oracle is independent of the production Rust codec. It validates the canonical header and decodes the standards-literal payload without importing or invoking sacd-rs."
+  },
+  "attestation": {
+    "document": "docs/brief_dsd_reference_p0_scope_and_commission.md",
+    "document_sha256": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",
+    "decoder_validation_statement": "The commission accepts byte-exact sacd_extract validation and directs a pinned fixture corpus for P0."
+  },
+  "scope": {
+    "rates": [
+      "dsd64",
+      "dsd128",
+      "dsd256"
+    ],
+    "channels": [
+      1,
+      2,
+      6
+    ],
+    "compressed_arithmetic_coverage": "DSD64 stereo and six-channel commissioned independent-oracle frames",
+    "raw_geometry_coverage": "DSD64 mono/six-channel; DSD128 mono/stereo; DSD256 mono/stereo",
+    "policy_note": "six-channel decode is qualified as decoder geometry; Reference admission still rejects channels 3-6"
+  },
+  "cases": [
+    {
+      "case_id": "frame_001",
+      "authority_kind": "commissioned_sacd_extract_oracle",
+      "source_payload": "frame_001.dst.bin",
+      "source_sha256": "a788eb38dd9cf5bf5313ed521dabca62107332e2ffa02bc0943384fe5b1e87e4",
+      "expected_dsd": "frame_001.dsd.bin",
+      "expected_sha256": "4ba636974ba4217e348137a0ff9dda2df3f5ec1d80df03ad71c369a7a4f45ef7",
+      "expected_bytes": 9408,
+      "dsd_rate": "dsd64",
+      "channels": 2,
+      "dst_coded": true
+    },
+    {
+      "case_id": "frame_001_6ch",
+      "authority_kind": "commissioned_sacd_extract_six_channel_oracle",
+      "source_payload": "frame_001_6ch.dst.bin",
+      "source_sha256": "59e54dd6a45fd543e96ad10d106ce254931b93a391424d82af5549f1528799bc",
+      "expected_dsd": "frame_001_6ch.dsd.bin",
+      "expected_sha256": "f5a8b3f86aad452c166ab3f86a71d8355222f92735458f959328271f9f33765c",
+      "expected_bytes": 28224,
+      "dsd_rate": "dsd64",
+      "channels": 6,
+      "dst_coded": true,
+      "reference_admission": "rejected_channels_3_to_6"
+    },
+    {
+      "case_id": "frame_002",
+      "authority_kind": "commissioned_sacd_extract_oracle",
+      "source_payload": "frame_002.dst.bin",
+      "source_sha256": "fd77fa6f66e793eb309963fcda75fecbd5927dd816538d158d3440359c40efc9",
+      "expected_dsd": "frame_002.dsd.bin",
+      "expected_sha256": "d138a1d886e52c6fcd741d3eaf7ffe482b1bcb460e7a10062fa78bdf6e48d913",
+      "expected_bytes": 9408,
+      "dsd_rate": "dsd64",
+      "channels": 2,
+      "dst_coded": true
+    },
+    {
+      "case_id": "frame_002_6ch",
+      "authority_kind": "commissioned_sacd_extract_six_channel_oracle",
+      "source_payload": "frame_002_6ch.dst.bin",
+      "source_sha256": "4931e8ebd786ec0a62d1290877e51796ba17ada62009fbc2c3fc5012f234bbd0",
+      "expected_dsd": "frame_002_6ch.dsd.bin",
+      "expected_sha256": "43882f0757dddd92de08252057ed6d3c1ee2d75f25823bcae28490dee7994eea",
+      "expected_bytes": 28224,
+      "dsd_rate": "dsd64",
+      "channels": 6,
+      "dst_coded": true,
+      "reference_admission": "rejected_channels_3_to_6"
+    },
+    {
+      "case_id": "frame_003",
+      "authority_kind": "commissioned_sacd_extract_oracle",
+      "source_payload": "frame_003.dst.bin",
+      "source_sha256": "9a788271fa0893b190ea180d47bf14019612b6f97c9680f71e80df41982ee921",
+      "expected_dsd": "frame_003.dsd.bin",
+      "expected_sha256": "506f08c2eb6c82cd5ead58328f6b9a77c2676a391c49b90782ac3cda3fa4ff21",
+      "expected_bytes": 9408,
+      "dsd_rate": "dsd64",
+      "channels": 2,
+      "dst_coded": true
+    },
+    {
+      "case_id": "frame_003_6ch",
+      "authority_kind": "commissioned_sacd_extract_six_channel_oracle",
+      "source_payload": "frame_003_6ch.dst.bin",
+      "source_sha256": "7bcd510c01d54f8cd26677619cddc2c04cf83ff8077b534377536e5df54e95ba",
+      "expected_dsd": "frame_003_6ch.dsd.bin",
+      "expected_sha256": "36fbd17cca9ff410070673f4870673d708fda5398ccebb0d8888c4ebebdbba06",
+      "expected_bytes": 28224,
+      "dsd_rate": "dsd64",
+      "channels": 6,
+      "dst_coded": true,
+      "reference_admission": "rejected_channels_3_to_6"
+    },
+    {
+      "case_id": "raw_dsd64_mono",
+      "authority_kind": "iso_dstcoded_zero_literal",
+      "source_payload": "raw_dsd64_mono.dst.bin",
+      "source_sha256": "5b84fd1e849f6f053766718ed92d8995aab65b4f35d093da6cc51ce60b3cdd56",
+      "expected_dsd": "raw_dsd64_mono.dsd.bin",
+      "expected_sha256": "dfaf79171361dc37640ca9927e6db4686aceeaedc74da155e8914837ecf92328",
+      "expected_bytes": 4704,
+      "dsd_rate": "dsd64",
+      "channels": 1,
+      "dst_coded": false,
+      "construction": "one zero DST header byte followed by deterministic expected interleaved DSD bytes",
+      "independence": "expected bytes are fixed by the ISO/IEC 14496-3 DSTCoded=0 syntax and generated without invoking production encoder or decoder code"
+    },
+    {
+      "case_id": "raw_dsd64_6ch",
+      "authority_kind": "iso_dstcoded_zero_literal",
+      "source_payload": "raw_dsd64_6ch.dst.bin",
+      "source_sha256": "b4ccbca5b11b715cae3bebc920c1e82da416663f9034662aa072658cbb7f012b",
+      "expected_dsd": "raw_dsd64_6ch.dsd.bin",
+      "expected_sha256": "ec8a5f9730a27a3182e39bd7a5cbe20e721934892d2a852d8d53951e41c9e5ce",
+      "expected_bytes": 28224,
+      "dsd_rate": "dsd64",
+      "channels": 6,
+      "dst_coded": false,
+      "construction": "one zero DST header byte followed by deterministic expected interleaved DSD bytes",
+      "independence": "expected bytes are fixed by the ISO/IEC 14496-3 DSTCoded=0 syntax and generated without invoking production encoder or decoder code",
+      "reference_admission": "rejected_channels_3_to_6"
+    },
+    {
+      "case_id": "raw_dsd128_mono",
+      "authority_kind": "iso_dstcoded_zero_literal",
+      "source_payload": "raw_dsd128_mono.dst.bin",
+      "source_sha256": "1ee1193da34c9622290594c513cec099074dd98bc82a84edc8fcbdacfae78815",
+      "expected_dsd": "raw_dsd128_mono.dsd.bin",
+      "expected_sha256": "19272788af9bc14c112020157e08d8444f52de9bd9b2b435b6aa7592b9f1b0c2",
+      "expected_bytes": 9408,
+      "dsd_rate": "dsd128",
+      "channels": 1,
+      "dst_coded": false,
+      "construction": "one zero DST header byte followed by deterministic expected interleaved DSD bytes",
+      "independence": "expected bytes are fixed by the ISO/IEC 14496-3 DSTCoded=0 syntax and generated without invoking production encoder or decoder code"
+    },
+    {
+      "case_id": "raw_dsd128_stereo",
+      "authority_kind": "iso_dstcoded_zero_literal",
+      "source_payload": "raw_dsd128_stereo.dst.bin",
+      "source_sha256": "7fbe369f5d7e3945acdbe5212e1b1f5d87cf41c30e59d146e37404b8abe58aad",
+      "expected_dsd": "raw_dsd128_stereo.dsd.bin",
+      "expected_sha256": "beecaa4868aa08ffc6089ecb1e7d5ad1765b95d69d64b7ef9e292cc8f103f2bc",
+      "expected_bytes": 18816,
+      "dsd_rate": "dsd128",
+      "channels": 2,
+      "dst_coded": false,
+      "construction": "one zero DST header byte followed by deterministic expected interleaved DSD bytes",
+      "independence": "expected bytes are fixed by the ISO/IEC 14496-3 DSTCoded=0 syntax and generated without invoking production encoder or decoder code"
+    },
+    {
+      "case_id": "raw_dsd256_mono",
+      "authority_kind": "iso_dstcoded_zero_literal",
+      "source_payload": "raw_dsd256_mono.dst.bin",
+      "source_sha256": "10b10c8404d491845b3339094b49d5488e3848827c6c2fb29e790f88e24309c6",
+      "expected_dsd": "raw_dsd256_mono.dsd.bin",
+      "expected_sha256": "6f6262eb6771efe7c6d514f566991073b1d551d10bc7814a102d94b572c63b88",
+      "expected_bytes": 18816,
+      "dsd_rate": "dsd256",
+      "channels": 1,
+      "dst_coded": false,
+      "construction": "one zero DST header byte followed by deterministic expected interleaved DSD bytes",
+      "independence": "expected bytes are fixed by the ISO/IEC 14496-3 DSTCoded=0 syntax and generated without invoking production encoder or decoder code"
+    },
+    {
+      "case_id": "raw_dsd256_stereo",
+      "authority_kind": "iso_dstcoded_zero_literal",
+      "source_payload": "raw_dsd256_stereo.dst.bin",
+      "source_sha256": "43153c4c5eab1b32f9e1a795bdfdabc81d8a403487aa52f539812abfe1001abd",
+      "expected_dsd": "raw_dsd256_stereo.dsd.bin",
+      "expected_sha256": "8578c09c3f86bf70a9235e623867a73f2b568258d2c524b95ceee25b7beda38d",
+      "expected_bytes": 37632,
+      "dsd_rate": "dsd256",
+      "channels": 2,
+      "dst_coded": false,
+      "construction": "one zero DST header byte followed by deterministic expected interleaved DSD bytes",
+      "independence": "expected bytes are fixed by the ISO/IEC 14496-3 DSTCoded=0 syntax and generated without invoking production encoder or decoder code"
+    }
+  ]
+}

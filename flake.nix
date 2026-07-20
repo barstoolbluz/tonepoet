@@ -68,12 +68,17 @@
           NIX_CFLAGS_COMPILE = "-Wno-error -Wno-deprecated-declarations";
         });
 
+        # Policy-owned Reference tools. Keep these bindings singular so the
+        # wrapper, build inputs, dev shell, and runtime PATH cannot drift.
+        referenceSox = sox_ng.packages.${system}.default;
+        referenceFfmpeg = pkgs.ffmpeg_7-full.override { withUnfree = true; };
+
         # Runtime dependencies for audio conversion
         runtimeDeps = [
           opustags.packages.${system}.default
-          sox_ng.packages.${system}.default
+          referenceSox
           ssrc.packages.${system}.default
-          (pkgs.ffmpeg_7-full.override { withUnfree = true; })
+          referenceFfmpeg
           loudgain
         ] ++ [
           opus-tools-fixed
@@ -105,16 +110,20 @@
             pkgs.llvmPackages.libclang
             pkgs.clang
           ];
-          buildInputs = buildInputs ++ [
-            (pkgs.ffmpeg_7-full.override { withUnfree = true; })
-          ];
+          buildInputs = buildInputs ++ [ referenceFfmpeg ];
 
           env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           env.BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.getVersion pkgs.llvmPackages.clang}/include -isystem ${pkgs.glibc.dev}/include";
+          # Compile the exact policy-owned derivations into the binary. Runtime
+          # activation variables may point only into these derivations.
+          env.TONEPOET_REFERENCE_SOX_STORE_PATH = "${referenceSox}";
+          env.TONEPOET_REFERENCE_FFMPEG_STORE_PATH = "${referenceFfmpeg}";
 
           postInstall = ''
             wrapProgram $out/bin/tonepoet \
-              --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
+              --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps} \
+              --set TONEPOET_REFERENCE_SOX_PATH ${referenceSox}/bin/sox \
+              --set TONEPOET_REFERENCE_FFMPEG_PATH ${referenceFfmpeg}/bin/ffmpeg
           '';
 
           meta = with pkgs.lib; {
@@ -140,6 +149,10 @@
             # libaacs is loaded by libbluray via dlopen(); ensure it's discoverable
             # stdenv.cc.cc.lib provides libstdc++.so.6 for test binaries that spawn dynamically-linked subprocesses
             export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.libaacs}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export TONEPOET_REFERENCE_SOX_PATH="${referenceSox}/bin/sox"
+            export TONEPOET_REFERENCE_FFMPEG_PATH="${referenceFfmpeg}/bin/ffmpeg"
+            export TONEPOET_REFERENCE_SOX_STORE_PATH="${referenceSox}"
+            export TONEPOET_REFERENCE_FFMPEG_STORE_PATH="${referenceFfmpeg}"
             echo "tonepoet development environment"
             echo ""
             echo "  cargo build    - Build the project"

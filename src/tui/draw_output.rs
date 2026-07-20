@@ -8,14 +8,14 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{DsdGainMode, FormatField, FormatState, ResamplerChoice};
+use super::app::{BitDepthChoice, DsdGainMode, FormatField, FormatState, ResamplerChoice};
 use super::pill::render_pill_spans;
 
 /// Draw the format pane with green border.
 ///
-/// Height is 10 rows for DSD targets, 9 rows for ordinary PCM targets, and 11
-/// rows for DSD-to-PCM targets. DSD-to-PCM targets include both the gain mode
-/// row and its manual dB value row so Manual mode is directly user-editable.
+/// DSD-to-PCM targets expose the complete P0 Reference control surface. The
+/// generic resampler and dither rows remain visible but are rendered as locked
+/// policy facts; their staged values are preserved and inactive.
 pub fn draw_format_pane(
     f: &mut Frame,
     area: Rect,
@@ -126,32 +126,51 @@ pub fn draw_format_pane(
                 theme,
             ));
         }
-        lines.push(pill_row(
-            border_color,
-            w,
-            "resampler  ",
-            "",
-            &render_pill_spans(
-                &format_state.resampler,
-                focused && format_state.field_focus == FormatField::Resampler, theme),
-            focused && format_state.field_focus == FormatField::Resampler, theme));
-        let ssrc_dither_override = format_state.ssrc_dither_override_active();
-        let dither_focused = focused
-            && format_state.field_focus == FormatField::Dither
-            && !ssrc_dither_override;
-        let rendered_dither = render_pill_spans(&format_state.dither, dither_focused, theme);
-        let dither_spans = if ssrc_dither_override {
-            dim_pill_spans(&rendered_dither, theme)
+        if format_state.dsd_to_pcm_gain_available() {
+            lines.push(static_row(
+                border_color,
+                w,
+                "resampler  ",
+                "SoX-ng Reference (rate -u) — locked",
+                focused && format_state.field_focus == FormatField::Resampler,
+                theme,
+            ));
+            lines.push(static_row(
+                border_color,
+                w,
+                "dither     ",
+                reference_dither_label(*format_state.bit_depth.selected_value()),
+                focused && format_state.field_focus == FormatField::Dither,
+                theme,
+            ));
         } else {
-            rendered_dither
-        };
-        lines.push(pill_row(
-            border_color,
-            w,
-            "dither     ",
-            format_state.ssrc_dither_status_label().unwrap_or(""),
-            &dither_spans,
-            dither_focused, theme));
+            lines.push(pill_row(
+                border_color,
+                w,
+                "resampler  ",
+                "",
+                &render_pill_spans(
+                    &format_state.resampler,
+                    focused && format_state.field_focus == FormatField::Resampler, theme),
+                focused && format_state.field_focus == FormatField::Resampler, theme));
+            let ssrc_dither_override = format_state.ssrc_dither_override_active();
+            let dither_focused = focused
+                && format_state.field_focus == FormatField::Dither
+                && !ssrc_dither_override;
+            let rendered_dither = render_pill_spans(&format_state.dither, dither_focused, theme);
+            let dither_spans = if ssrc_dither_override {
+                dim_pill_spans(&rendered_dither, theme)
+            } else {
+                rendered_dither
+            };
+            lines.push(pill_row(
+                border_color,
+                w,
+                "dither     ",
+                format_state.ssrc_dither_status_label().unwrap_or(""),
+                &dither_spans,
+                dither_focused, theme));
+        }
         lines.push(pill_row(
             border_color,
             w,
@@ -165,18 +184,58 @@ pub fn draw_format_pane(
             lines.push(pill_row(
                 border_color,
                 w,
+                "DSD path   ",
+                "",
+                &render_pill_spans(
+                    &format_state.dsd_pathway,
+                    focused && format_state.field_focus == FormatField::DsdPath,
+                    theme,
+                ),
+                focused && format_state.field_focus == FormatField::DsdPath,
+                theme,
+            ));
+            lines.push(pill_row(
+                border_color,
+                w,
+                "DSD profile",
+                "",
+                &render_pill_spans(
+                    &format_state.dsd_profile,
+                    focused && format_state.field_focus == FormatField::DsdProfile,
+                    theme,
+                ),
+                focused && format_state.field_focus == FormatField::DsdProfile,
+                theme,
+            ));
+            lines.push(pill_row(
+                border_color,
+                w,
                 "DSD gain  ",
                 "",
                 &render_pill_spans(
                     &format_state.dsd_gain_mode,
                     focused && format_state.field_focus == FormatField::DsdGain, theme),
                 focused && format_state.field_focus == FormatField::DsdGain, theme));
-            lines.push(dsd_gain_db_row(
+            lines.push(dsd_db_value_row(
                 border_color,
                 w,
+                "gain dB    ",
                 format_state.dsd_gain_db,
-                *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Manual,
-                focused && format_state.field_focus == FormatField::DsdGainDb, theme));
+                *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Fixed,
+                focused && format_state.field_focus == FormatField::DsdGainDb,
+                "select fixed to apply",
+                theme,
+            ));
+            lines.push(dsd_db_value_row(
+                border_color,
+                w,
+                "normalize  ",
+                format_state.dsd_normalize_target_dbfs,
+                *format_state.dsd_gain_mode.selected_value() == DsdGainMode::NormalizePeak,
+                focused && format_state.field_focus == FormatField::DsdNormalizeTarget,
+                "select normalize to apply",
+                theme,
+            ));
         }
     }
 
@@ -369,23 +428,25 @@ fn static_row<'a>(
     Line::from(spans)
 }
 
-fn dsd_gain_db_row(
+fn dsd_db_value_row(
     border_color: ratatui::style::Color,
     width: usize,
-    gain_db: f32,
-    manual_enabled: bool,
+    label: &'static str,
+    value: tonepoet_pipeline::DbNano,
+    enabled: bool,
     focused: bool,
+    disabled_hint: &'static str,
     theme: super::theme::Theme,
 ) -> Line<'static> {
     let label_style = if focused { theme.bright() } else { theme.muted() };
     let control_style = if focused {
         theme.bright().add_modifier(Modifier::BOLD)
-    } else if manual_enabled {
+    } else if enabled {
         theme.muted()
     } else {
         Style::default().fg(theme.text_dim)
     };
-    let hint_style = if manual_enabled {
+    let hint_style = if enabled {
         theme.muted()
     } else {
         Style::default().fg(theme.text_dim)
@@ -393,14 +454,14 @@ fn dsd_gain_db_row(
 
     let mut spans = vec![
         Span::styled("│", theme.border(border_color)),
-        Span::styled("   gain dB    ", label_style),
+        Span::styled(format!("   {label}"), label_style),
         Span::styled("< ", control_style),
-        Span::styled(format!("{gain_db:+.2} dB"), control_style),
+        Span::styled(format!("{} dB", value.render(true)), control_style),
         Span::styled(" >", control_style),
     ];
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
-        if manual_enabled { "left/right adjust" } else { "select manual to apply" },
+        if enabled { "left/right adjust" } else { disabled_hint },
         hint_style,
     ));
 
@@ -410,6 +471,15 @@ fn dsd_gain_db_row(
     spans.push(Span::styled("│", theme.border(border_color)));
 
     Line::from(spans)
+}
+
+fn reference_dither_label(depth: BitDepthChoice) -> &'static str {
+    match depth {
+        BitDepthChoice::Int16 => "Shibata (Reference) — locked",
+        BitDepthChoice::Int24 | BitDepthChoice::Source => "TPDF (Reference) — locked",
+        BitDepthChoice::Float32 | BitDepthChoice::Float64 => "none (float) — locked",
+        BitDepthChoice::Int32 => "unsupported Reference depth",
+    }
 }
 
 fn lossy_preset_spans(

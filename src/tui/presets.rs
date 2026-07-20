@@ -1,6 +1,7 @@
 //! TUI preset management: save/load pill state to TOML files
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,12 +27,13 @@ fn normalize_optional_text_override(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+
 /// A TUI-native preset that stores pill values directly
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiPreset {
     pub name: String,
     pub description: Option<String>,
-    pub version: u32, // 2 = legacy TUI preset, 3 = dynamic format-pane preset
+    pub version: u32, // 2 = legacy TUI, 3 = dynamic pane, 4 = native DSD Reference
 
     // Format pane
     pub format: String, // "flac", "opus", etc.
@@ -47,6 +49,24 @@ pub struct TuiPreset {
     pub modulator_order: Option<u8>, // 4-8
     #[serde(default)]
     pub dsd_filter_preset: Option<String>, // "auto", "sinc"
+    /// Canonical resolved codec/container identity. Required by v4.
+    #[serde(default)]
+    pub output_target: Option<String>,
+    /// Native-v2 DSD-source pathway reservation.
+    #[serde(default)]
+    pub dsd_path: Option<String>,
+    /// Native-v2 DSD reconstruction profile.
+    #[serde(default)]
+    pub dsd_profile: Option<String>,
+    /// Native-v2 DSD gain mode.
+    #[serde(default)]
+    pub dsd_gain: Option<String>,
+    /// Canonical fixed gain text.
+    #[serde(default)]
+    pub dsd_gain_db: Option<String>,
+    /// Canonical NormalizePeak target text.
+    #[serde(default)]
+    pub dsd_normalize_target_dbfs: Option<String>,
 
     // Metadata pane
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +92,213 @@ pub struct TuiPreset {
     pub write_log: bool,
     #[serde(default, skip_serializing_if = "crate::convert::pipeline::ActionPipeline::is_empty")]
     pub actions: crate::convert::pipeline::ActionPipeline,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetWireLegacy {
+    name: String,
+    description: Option<String>,
+    version: u32,
+    format: String,
+    sample_rate: u32,
+    bit_depth: String,
+    dither: String,
+    replaygain: String,
+    #[serde(default = "default_resampler")]
+    resampler: String,
+    #[serde(default)]
+    noise_shaper: Option<String>,
+    #[serde(default)]
+    modulator_order: Option<u8>,
+    #[serde(default)]
+    dsd_filter_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    album_artist_for_conversion: Option<String>,
+    #[serde(default)]
+    dest_path: Option<String>,
+    folder_template: String,
+    filename_template: String,
+    merge: String,
+    #[serde(default = "default_companion_extensions")]
+    companion_extensions: String,
+    #[serde(default)]
+    companion_folders: String,
+    #[serde(default)]
+    companion_exclude_files: String,
+    #[serde(default)]
+    force_encode: bool,
+    #[serde(default)]
+    disc_subfolders: bool,
+    #[serde(default)]
+    write_log: bool,
+    #[serde(default)]
+    actions: crate::convert::pipeline::ActionPipeline,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetWireV4 {
+    name: String,
+    description: Option<String>,
+    version: u32,
+    format: String,
+    sample_rate: u32,
+    bit_depth: String,
+    dither: String,
+    replaygain: String,
+    #[serde(default = "default_resampler")]
+    resampler: String,
+    #[serde(default)]
+    noise_shaper: Option<String>,
+    #[serde(default)]
+    modulator_order: Option<u8>,
+    #[serde(default)]
+    dsd_filter_preset: Option<String>,
+    output_target: String,
+    #[serde(default)]
+    dsd_path: Option<String>,
+    #[serde(default)]
+    dsd_profile: Option<String>,
+    #[serde(default)]
+    dsd_gain: Option<String>,
+    #[serde(default)]
+    dsd_gain_db: Option<String>,
+    #[serde(default)]
+    dsd_normalize_target_dbfs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    album_artist_for_conversion: Option<String>,
+    #[serde(default)]
+    dest_path: Option<String>,
+    folder_template: String,
+    filename_template: String,
+    merge: String,
+    #[serde(default = "default_companion_extensions")]
+    companion_extensions: String,
+    #[serde(default)]
+    companion_folders: String,
+    #[serde(default)]
+    companion_exclude_files: String,
+    #[serde(default)]
+    force_encode: bool,
+    #[serde(default)]
+    disc_subfolders: bool,
+    #[serde(default)]
+    write_log: bool,
+    #[serde(default)]
+    actions: crate::convert::pipeline::ActionPipeline,
+}
+
+// V2 and V3 deliberately retain the same historical field schema, but use
+// distinct transparent wire types. Dispatch and migration can therefore evolve
+// independently without allowing one version to fall through to another.
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct PresetWireV2(PresetWireLegacy);
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct PresetWireV3(PresetWireLegacy);
+
+impl PresetWireV2 {
+    fn version(&self) -> u32 {
+        self.0.version
+    }
+
+    fn into_preset(self) -> TuiPreset {
+        self.0.into_preset()
+    }
+}
+
+impl PresetWireV3 {
+    fn version(&self) -> u32 {
+        self.0.version
+    }
+
+    fn into_preset(self) -> TuiPreset {
+        self.0.into_preset()
+    }
+}
+
+impl PresetWireLegacy {
+    fn into_preset(self) -> TuiPreset {
+        TuiPreset {
+            name: self.name,
+            description: self.description,
+            version: self.version,
+            format: self.format,
+            sample_rate: self.sample_rate,
+            bit_depth: self.bit_depth,
+            dither: self.dither,
+            replaygain: self.replaygain,
+            resampler: self.resampler,
+            noise_shaper: self.noise_shaper,
+            modulator_order: self.modulator_order,
+            dsd_filter_preset: self.dsd_filter_preset,
+            output_target: None,
+            dsd_path: None,
+            dsd_profile: None,
+            dsd_gain: None,
+            dsd_gain_db: None,
+            dsd_normalize_target_dbfs: None,
+            album_artist_for_conversion: self.album_artist_for_conversion,
+            dest_path: self.dest_path,
+            folder_template: self.folder_template,
+            filename_template: self.filename_template,
+            merge: self.merge,
+            companion_extensions: self.companion_extensions,
+            companion_folders: self.companion_folders,
+            companion_exclude_files: self.companion_exclude_files,
+            force_encode: self.force_encode,
+            disc_subfolders: self.disc_subfolders,
+            write_log: self.write_log,
+            actions: self.actions,
+        }
+    }
+}
+
+impl PresetWireV4 {
+    fn into_preset(self, path: &Path) -> Result<TuiPreset, String> {
+        let output_target = self.output_target.trim();
+        if output_target.is_empty() {
+            return Err(format!(
+                "Preset v4 '{}' has an empty required output_target",
+                path.display()
+            ));
+        }
+        Ok(TuiPreset {
+            name: self.name,
+            description: self.description,
+            version: self.version,
+            format: self.format,
+            sample_rate: self.sample_rate,
+            bit_depth: self.bit_depth,
+            dither: self.dither,
+            replaygain: self.replaygain,
+            resampler: self.resampler,
+            noise_shaper: self.noise_shaper,
+            modulator_order: self.modulator_order,
+            dsd_filter_preset: self.dsd_filter_preset,
+            output_target: Some(output_target.to_string()),
+            dsd_path: self.dsd_path,
+            dsd_profile: self.dsd_profile,
+            dsd_gain: self.dsd_gain,
+            dsd_gain_db: self.dsd_gain_db,
+            dsd_normalize_target_dbfs: self.dsd_normalize_target_dbfs,
+            album_artist_for_conversion: self.album_artist_for_conversion,
+            dest_path: self.dest_path,
+            folder_template: self.folder_template,
+            filename_template: self.filename_template,
+            merge: self.merge,
+            companion_extensions: self.companion_extensions,
+            companion_folders: self.companion_folders,
+            companion_exclude_files: self.companion_exclude_files,
+            force_encode: self.force_encode,
+            disc_subfolders: self.disc_subfolders,
+            write_log: self.write_log,
+            actions: self.actions,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,7 +339,7 @@ impl TuiPreset {
         Self {
             name: name.to_string(),
             description: None,
-            version: 3,
+            version: 4,
             // Store a stable, canonical key rather than the UI label. Labels are
             // presentation strings and may change (for example, DSF was previously
             // displayed as a generic "DSD" family label), while preset files need
@@ -126,6 +353,26 @@ impl TuiPreset {
             noise_shaper: Some(format.noise_shaper.selected_label().to_lowercase()),
             modulator_order: Some(format.modulator_order.selected_value().value()),
             dsd_filter_preset: Some(format.conversion_preset.selected_label().to_lowercase()),
+            output_target: format
+                .format
+                .selected_value()
+                .resolved_output_target(format.selected_container())
+                .map(|target| target.key().to_string()),
+            dsd_path: Some(match *format.dsd_pathway.selected_value() {
+                tonepoet_pipeline::DsdSourcePathway::Reference => "reference",
+                tonepoet_pipeline::DsdSourcePathway::Manual => "manual",
+            }
+            .to_string()),
+            dsd_profile: Some(match *format.dsd_profile.selected_value() {
+                tonepoet_pipeline::DsdReconstructionSelection::Reference => "reference",
+                tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband",
+            }
+            .to_string()),
+            dsd_gain: Some(format.dsd_gain_mode.selected_label().to_string()),
+            dsd_gain_db: Some(format.dsd_gain_db.render(false)),
+            dsd_normalize_target_dbfs: Some(
+                format.dsd_normalize_target_dbfs.render(false),
+            ),
             album_artist_for_conversion: normalize_optional_text_override(
                 metadata.album_artist_for_conversion.as_deref(),
             ),
@@ -181,6 +428,101 @@ impl TuiPreset {
             return report;
         }
         format_state.apply_format_constraints();
+        if self.version < 4 {
+            format_state.reference_target_confirmed = false;
+        }
+
+        if self.version >= 4 {
+            let target_applied = self.output_target.as_deref().is_some_and(|wanted| {
+                let containers = preset_format.available_containers();
+                containers.iter().enumerate().find_map(|(index, container)| {
+                    preset_format
+                        .resolved_output_target(container)
+                        .filter(|target| target.key() == wanted)
+                        .map(|_| index)
+                })
+                .map(|index| {
+                    format_state.selected_container_index = index;
+                    format_state.reference_target_confirmed = true;
+                    true
+                })
+                .unwrap_or(false)
+            });
+            report.record("output_target", target_applied);
+
+            match self.dsd_path.as_deref().unwrap_or("reference") {
+                "reference" => {
+                    report.record(
+                        "dsd_path",
+                        format_state
+                            .dsd_pathway
+                            .select_value(&tonepoet_pipeline::DsdSourcePathway::Reference),
+                    );
+                }
+                "manual" => report.record("dsd_path", false),
+                _ => report.record("dsd_path", false),
+            }
+            match self.dsd_profile.as_deref().unwrap_or("reference") {
+                "reference" => {
+                    report.record(
+                        "dsd_profile",
+                        format_state.dsd_profile.select_value(
+                            &tonepoet_pipeline::DsdReconstructionSelection::Reference,
+                        ),
+                    );
+                }
+                "wideband" => {
+                    report.record(
+                        "dsd_profile",
+                        format_state.dsd_profile.select_value(
+                            &tonepoet_pipeline::DsdReconstructionSelection::Wideband,
+                        ),
+                    );
+                }
+                _ => report.record("dsd_profile", false),
+            }
+            let gain_mode = match self.dsd_gain.as_deref().unwrap_or("reference") {
+                "reference" => Some(DsdGainMode::Reference),
+                "native" => Some(DsdGainMode::NativeLevel),
+                "fixed" => Some(DsdGainMode::Fixed),
+                "normalize" => Some(DsdGainMode::NormalizePeak),
+                _ => None,
+            };
+            if let Some(mode) = gain_mode {
+                report.record(
+                    "dsd_gain",
+                    format_state.dsd_gain_mode.select_value(&mode),
+                );
+            } else {
+                report.record("dsd_gain", false);
+            }
+            if let Some(raw) = self.dsd_gain_db.as_deref() {
+                match raw.parse::<tonepoet_pipeline::DbNano>() {
+                    Ok(value)
+                        if (tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
+                            ..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN)
+                            .contains(&value) =>
+                    {
+                        format_state.dsd_gain_db = value;
+                        report.record("dsd_gain_db", true);
+                    }
+                    _ => report.record("dsd_gain_db", false),
+                }
+            }
+            if let Some(raw) = self.dsd_normalize_target_dbfs.as_deref() {
+                match raw.parse::<tonepoet_pipeline::DbNano>() {
+                    Ok(value)
+                        if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
+                            ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
+                            .contains(&value) =>
+                    {
+                        format_state.dsd_normalize_target_dbfs = value;
+                        report.record("dsd_normalize_target_dbfs", true);
+                    }
+                    _ => report.record("dsd_normalize_target_dbfs", false),
+                }
+            }
+        }
 
         let is_dsd = matches!(preset_format, AudioFormat::Dsf | AudioFormat::Dff);
         let pcm_depth_is_meaningful = matches!(
@@ -457,6 +799,12 @@ impl TuiPreset {
             noise_shaper: Some("clans".to_string()),
             modulator_order: Some(8),
             dsd_filter_preset: Some("auto".to_string()),
+            output_target: None,
+            dsd_path: None,
+            dsd_profile: None,
+            dsd_gain: None,
+            dsd_gain_db: None,
+            dsd_normalize_target_dbfs: None,
             album_artist_for_conversion: None,
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
@@ -580,16 +928,66 @@ pub fn load_preset_from_path(path: &Path) -> Result<TuiPreset, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read preset '{}': {}", path.display(), e))?;
 
-    // Try parsing as TuiPreset (version 2) first.
-    if let Ok(mut preset) = toml::from_str::<TuiPreset>(&contents) {
+    let root = contents
+        .parse::<toml::Value>()
+        .map_err(|error| format!("Failed to parse preset '{}': {error}", path.display()))?;
+    let version = root.get("version").and_then(toml::Value::as_integer);
+    if let Some(version) = version {
+        let version = u32::try_from(version).map_err(|_| {
+            format!("Invalid negative preset version in '{}'", path.display())
+        })?;
+        let mut preset = match version {
+            2 => {
+                let wire = toml::from_str::<PresetWireV2>(&contents).map_err(|error| {
+                    format!("Invalid preset v2 '{}': {error}", path.display())
+                })?;
+                if wire.version() != 2 {
+                    return Err(format!(
+                        "Preset version changed while parsing '{}'",
+                        path.display()
+                    ));
+                }
+                wire.into_preset()
+            }
+            3 => {
+                let wire = toml::from_str::<PresetWireV3>(&contents).map_err(|error| {
+                    format!("Invalid preset v3 '{}': {error}", path.display())
+                })?;
+                if wire.version() != 3 {
+                    return Err(format!(
+                        "Preset version changed while parsing '{}'",
+                        path.display()
+                    ));
+                }
+                wire.into_preset()
+            }
+            4 => {
+                let wire = toml::from_str::<PresetWireV4>(&contents).map_err(|error| {
+                    format!("Invalid preset v4 '{}': {error}", path.display())
+                })?;
+                if wire.version != 4 {
+                    return Err(format!(
+                        "Preset version changed while parsing '{}'",
+                        path.display()
+                    ));
+                }
+                wire.into_preset(path)?
+            }
+            _ => {
+                return Err(format!(
+                    "Unsupported preset version {version} in '{}'; supported versions are 2, 3, and 4",
+                    path.display()
+                ));
+            }
+        };
         preset.name = display_name.to_string();
         return Ok(preset);
     }
 
-    // Fall back to legacy wizard preset.
+    // Versionless files are the only inputs eligible for the legacy wizard wire.
     let mut preset = TuiPreset::from_legacy(
         &toml::from_str::<tonepoet_wizard::ConversionPreset>(&contents)
-            .map_err(|e| format!("Failed to parse preset '{}': {}", path.display(), e))?,
+            .map_err(|error| format!("Invalid versionless legacy preset '{}': {error}", path.display()))?,
     );
     preset.name = display_name.to_string();
     Ok(preset)
@@ -607,11 +1005,29 @@ pub fn save_preset_to_path(preset: &TuiPreset, path: &Path) -> Result<(), String
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create preset directory '{}': {}", parent.display(), e))?;
     }
-    let contents =
-        toml::to_string_pretty(preset).map_err(|e| format!("Failed to serialize preset: {}", e))?;
-
-    fs::write(path, contents)
-        .map_err(|e| format!("Failed to write preset '{}': {}", path.display(), e))?;
+    if preset.version != 4 {
+        return Err(format!(
+            "Refusing to save preset version {}; current saves require version 4",
+            preset.version
+        ));
+    }
+    if preset.output_target.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none() {
+        return Err("Refusing to save preset v4 without output_target".to_string());
+    }
+    let contents = toml::to_string_pretty(preset)
+        .map_err(|error| format!("Failed to serialize preset: {error}"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Failed to create preset temporary file in '{}': {error}", parent.display()))?;
+    temp.write_all(contents.as_bytes())
+        .and_then(|_| temp.as_file_mut().flush())
+        .and_then(|_| temp.as_file().sync_all())
+        .map_err(|error| format!("Failed to durably write preset '{}': {error}", path.display()))?;
+    temp.persist(path)
+        .map_err(|error| format!("Failed to atomically replace preset '{}': {}", path.display(), error.error))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Failed to sync preset directory '{}': {error}", parent.display()))?;
 
     Ok(())
 }
@@ -896,6 +1312,121 @@ fn parse_merge(s: &str) -> Option<MergeMode> {
 #[cfg(test)]
 mod companion_preset_tests {
     use super::*;
+
+    #[test]
+    fn legacy_v3_preset_requires_explicit_reference_target_reconfirmation() {
+        let preset: TuiPreset = toml::from_str(
+            r#"
+name = "legacy-reference"
+version = 3
+format = "flac"
+sample_rate = 176400
+bit_depth = "24"
+dither = "tpdf"
+replaygain = "off"
+folder_template = "%ARTIST%/%ALBUM%"
+filename_template = "%TRACKNN% - %TITLE%.%EXT%"
+merge = "multi-file"
+"#,
+        )
+        .expect("legacy preset parses");
+        let mut format = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        let report = preset.apply_to_pills(&mut format, &mut output, &mut metadata);
+        assert!(report.is_complete());
+        assert!(!format.reference_target_confirmed);
+    }
+
+    #[test]
+    fn native_v4_preset_confirms_exact_reference_target() {
+        let format = FormatState::new();
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let preset = TuiPreset::from_pill_state("native-reference", &format, &output, &metadata);
+        assert_eq!(preset.version, 4);
+        assert!(preset.output_target.is_some());
+
+        let mut restored_format = FormatState::new();
+        restored_format.reference_target_confirmed = false;
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+        assert!(report.is_complete());
+        assert!(restored_format.reference_target_confirmed);
+    }
+
+    #[test]
+    fn versioned_preset_loader_rejects_unknown_and_cross_version_fields() {
+        let temp = tempfile::tempdir().expect("preset tempdir");
+        let v3 = temp.path().join("bad-v3.toml");
+        std::fs::write(
+            &v3,
+            r#"
+name = "bad-v3"
+version = 3
+format = "flac"
+sample_rate = 176400
+bit_depth = "24"
+dither = "tpdf"
+replaygain = "off"
+output_target = "flac_native"
+folder_template = "%ARTIST%/%ALBUM%"
+filename_template = "%TRACKNN% - %TITLE%.%EXT%"
+merge = "multi-file"
+"#,
+        )
+        .expect("write bad v3 preset");
+        let error = load_preset_from_path(&v3).expect_err("v3 must reject v4 fields");
+        assert!(error.contains("output_target"));
+
+        let v4 = temp.path().join("bad-v4.toml");
+        std::fs::write(
+            &v4,
+            r#"
+name = "bad-v4"
+version = 4
+format = "flac"
+sample_rate = 176400
+bit_depth = "24"
+dither = "tpdf"
+replaygain = "off"
+output_target = "flac_native"
+folder_template = "%ARTIST%/%ALBUM%"
+filename_template = "%TRACKNN% - %TITLE%.%EXT%"
+merge = "multi-file"
+future_field = true
+"#,
+        )
+        .expect("write bad v4 preset");
+        let error = load_preset_from_path(&v4).expect_err("v4 must reject unknown fields");
+        assert!(error.contains("future_field"));
+
+        let missing_target = temp.path().join("missing-target-v4.toml");
+        std::fs::write(
+            &missing_target,
+            r#"
+name = "missing-target-v4"
+version = 4
+format = "flac"
+sample_rate = 176400
+bit_depth = "24"
+dither = "tpdf"
+replaygain = "off"
+folder_template = "%ARTIST%/%ALBUM%"
+filename_template = "%TRACKNN% - %TITLE%.%EXT%"
+merge = "multi-file"
+"#,
+        )
+        .expect("write v4 preset without output target");
+        let error = load_preset_from_path(&missing_target)
+            .expect_err("v4 must require an exact output_target");
+        assert!(error.contains("output_target"));
+    }
 
     #[test]
     fn legacy_presets_without_companion_fields_get_backward_compatible_defaults() {

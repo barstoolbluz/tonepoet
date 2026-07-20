@@ -3,35 +3,181 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tonepoet_pipeline::fingerprint::{settings_fingerprint, SettingsFingerprint};
+use tonepoet_pipeline::fingerprint::{
+    legacy_settings_fingerprint_v1, settings_snapshot_fingerprint_v2, BehaviorFingerprintV1, ExecutionFingerprintV1,
+    LegacySettingsFingerprintV1, SemanticPlanHashV1, SettingsSnapshotFingerprintV2,
+};
 use tonepoet_pipeline::plan::ConversionPlan;
 use tonepoet_pipeline::settings::PipelineSettings;
+use tonepoet_pipeline::{
+    DsdInputFrontEnd, DsdReferencePolicyVersion, DsdSourceKind, ResolvedOutputTarget,
+    Sha256Digest,
+};
 
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 pub const MANIFEST_FILE_NAME: &str = ".tonepoet-manifest.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn zero_sha256_digest() -> Sha256Digest {
+    Sha256Digest([0; 32])
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ConversionManifest {
     pub manifest_version: u32,
     pub album_dir: PathBuf,
     pub total_tracks: usize,
     pub settings: PipelineSettings,
-    pub settings_fingerprint: SettingsFingerprint,
+    pub route_identity: ManifestRouteIdentityV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub programme_identity: Option<ProgrammeManifestIdentityV1>,
     pub tracks: Vec<ConversionManifestTrack>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "route", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManifestRouteIdentityV2 {
+    LegacyPipelineV1 {
+        settings_fingerprint_v1: LegacySettingsFingerprintV1,
+    },
+    DsdReferenceV2 {
+        settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2,
+        resolved_output_target: ResolvedOutputTarget,
+        policy: DsdReferencePolicyVersion,
+        qualification_manifest_digest: Sha256Digest,
+    },
+    DsdManualV2 {
+        settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2,
+        resolved_output_target: ResolvedOutputTarget,
+        workflow_execution_digest: Sha256Digest,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManifestTrackExecutionIdentityV2 {
+    LegacyPipelineV1 {
+        settings_fingerprint_v1: LegacySettingsFingerprintV1,
+        planner_version: String,
+        planned_command_hash: String,
+    },
+    NativeDsdV2 {
+        behavior_fingerprint_v1: BehaviorFingerprintV1,
+        execution_fingerprint_v1: ExecutionFingerprintV1,
+        semantic_plan_hash_v1: SemanticPlanHashV1,
+        /// Digest of the executed measurements, fully resolved argv, carrier probes,
+        /// and pre/post-metadata decoded-sample verification. Missing on an
+        /// early native-v2 candidate manifest deserializes as zero and is
+        /// rejected as insufficient authority rather than reported as corrupt JSON.
+        #[serde(default = "zero_sha256_digest")]
+        executed_evidence_digest_v1: Sha256Digest,
+        /// V3-and-later executed authority. This preserves the frozen v1 digest
+        /// while additionally binding original source kind, admitted source
+        /// content, and canonical materialization identity.
+        #[serde(default = "zero_sha256_digest")]
+        executed_evidence_digest_v2: Sha256Digest,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceProgrammeGrouping {
+    ResolvedAlbumRelease,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProgrammeManifestIdentityV1 {
+    pub policy: DsdReferencePolicyVersion,
+    pub grouping_rule: ReferenceProgrammeGrouping,
+    pub semantic_programme_id: Sha256Digest,
+    pub programme_digest: Sha256Digest,
+    pub expected_members: NonZeroUsize,
+    pub ordered_member_content_ids: Vec<Sha256Digest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversionManifestTrack {
+    pub source_path: PathBuf,
+    pub source_size: u64,
+    pub source_mtime_secs: i64,
+    pub source_audio_md5: Option<String>,
+    pub source_content_sha256: Option<Sha256Digest>,
+    pub source_probe_digest: Option<Sha256Digest>,
+    pub original_dsd_source_kind: Option<DsdSourceKind>,
+    pub dsd_front_end: Option<DsdInputFrontEnd>,
+    pub canonical_materialization_sha256: Option<Sha256Digest>,
+    pub track_identity: TrackIdentity,
+    pub execution_identity: ManifestTrackExecutionIdentityV2,
+    /// Always album-relative. Never store staging, temp, or arbitrary absolute paths here.
+    pub output_path: PathBuf,
+    pub output_size: u64,
+    pub output_hash: Option<Sha256Digest>,
+    pub validation_status: ValidationStatus,
+    pub publish_timestamp: DateTime<Utc>,
+}
+
 impl ConversionManifest {
-    pub fn new(album_dir: PathBuf, settings: PipelineSettings, tracks: Vec<ConversionManifestTrack>) -> Self {
-        let settings_fingerprint = settings_fingerprint(&settings);
+    pub fn new(
+        album_dir: PathBuf,
+        settings: PipelineSettings,
+        tracks: Vec<ConversionManifestTrack>,
+    ) -> Self {
+        Self::new_legacy(album_dir, settings, tracks)
+    }
+
+    pub fn new_legacy(
+        album_dir: PathBuf,
+        settings: PipelineSettings,
+        tracks: Vec<ConversionManifestTrack>,
+    ) -> Self {
+        let settings_fingerprint_v1 = legacy_settings_fingerprint_v1(&settings);
         Self {
             manifest_version: MANIFEST_VERSION,
             album_dir,
             total_tracks: tracks.len(),
             settings,
-            settings_fingerprint,
+            route_identity: ManifestRouteIdentityV2::LegacyPipelineV1 {
+                settings_fingerprint_v1,
+            },
+            programme_identity: None,
             tracks,
+        }
+    }
+
+    pub fn new_reference(
+        album_dir: PathBuf,
+        settings: PipelineSettings,
+        route_identity: ManifestRouteIdentityV2,
+        tracks: Vec<ConversionManifestTrack>,
+    ) -> Result<Self, ManifestError> {
+        if !matches!(&route_identity, ManifestRouteIdentityV2::DsdReferenceV2 { .. }) {
+            return Err(ManifestError::InvalidAuthority(
+                "native Reference manifest requires a DsdReferenceV2 route".to_string(),
+            ));
+        }
+        let manifest = Self {
+            manifest_version: MANIFEST_VERSION,
+            album_dir,
+            total_tracks: tracks.len(),
+            settings,
+            route_identity,
+            programme_identity: None,
+            tracks,
+        };
+        validate_manifest_authority(&manifest)?;
+        Ok(manifest)
+    }
+
+    pub fn legacy_settings_fingerprint(&self) -> Option<LegacySettingsFingerprintV1> {
+        match &self.route_identity {
+            ManifestRouteIdentityV2::LegacyPipelineV1 {
+                settings_fingerprint_v1,
+            } => Some(*settings_fingerprint_v1),
+            _ => None,
         }
     }
 
@@ -42,25 +188,6 @@ impl ConversionManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversionManifestTrack {
-    pub source_path: PathBuf,
-    pub source_size: u64,
-    pub source_mtime_secs: i64,
-    pub source_audio_md5: Option<String>,
-    pub track_identity: TrackIdentity,
-    pub settings_fingerprint: SettingsFingerprint,
-    pub planner_version: String,
-    pub planned_command_hash: String,
-
-    /// Always album-relative. Never store staging, temp, or arbitrary absolute paths here.
-    pub output_path: PathBuf,
-    pub output_size: u64,
-    pub output_hash: Option<String>,
-    pub validation_status: ValidationStatus,
-    pub publish_timestamp: DateTime<Utc>,
-}
-
 impl ConversionManifestTrack {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -68,7 +195,7 @@ impl ConversionManifestTrack {
         source_metadata: &fs::Metadata,
         source_audio_md5: Option<String>,
         track_identity: TrackIdentity,
-        settings_fingerprint: SettingsFingerprint,
+        settings_fingerprint: LegacySettingsFingerprintV1,
         planner_version: String,
         planned_command_hash: String,
         album_relative_output_path: PathBuf,
@@ -76,18 +203,71 @@ impl ConversionManifestTrack {
         output_hash: Option<String>,
         validation_status: ValidationStatus,
     ) -> Result<Self, ManifestError> {
+        let output_hash = output_hash
+            .map(|value| Sha256Digest::from_hex(&value))
+            .transpose()
+            .map_err(ManifestError::InvalidAuthority)?;
         Ok(Self {
             source_path,
             source_size: source_metadata.len(),
             source_mtime_secs: metadata_mtime_secs(source_metadata)?,
             source_audio_md5,
+            source_content_sha256: None,
+            source_probe_digest: None,
+            original_dsd_source_kind: None,
+            dsd_front_end: None,
+            canonical_materialization_sha256: None,
             track_identity,
-            settings_fingerprint,
-            planner_version,
-            planned_command_hash,
+            execution_identity: ManifestTrackExecutionIdentityV2::LegacyPipelineV1 {
+                settings_fingerprint_v1: settings_fingerprint,
+                planner_version,
+                planned_command_hash,
+            },
             output_path: album_relative_output_path,
             output_size,
             output_hash,
+            validation_status,
+            publish_timestamp: Utc::now(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_reference(
+        source_path: PathBuf,
+        source_metadata: &fs::Metadata,
+        source_audio_md5: Option<String>,
+        source_content_sha256: Sha256Digest,
+        source_probe_digest: Sha256Digest,
+        original_dsd_source_kind: DsdSourceKind,
+        dsd_front_end: DsdInputFrontEnd,
+        canonical_materialization_sha256: Option<Sha256Digest>,
+        track_identity: TrackIdentity,
+        execution_identity: ManifestTrackExecutionIdentityV2,
+        album_relative_output_path: PathBuf,
+        output_size: u64,
+        output_hash: Sha256Digest,
+        validation_status: ValidationStatus,
+    ) -> Result<Self, ManifestError> {
+        if !matches!(&execution_identity, ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. }) {
+            return Err(ManifestError::InvalidAuthority(
+                "native Reference track requires NativeDsdV2 execution identity".to_string(),
+            ));
+        }
+        Ok(Self {
+            source_path,
+            source_size: source_metadata.len(),
+            source_mtime_secs: metadata_mtime_secs(source_metadata)?,
+            source_audio_md5,
+            source_content_sha256: Some(source_content_sha256),
+            source_probe_digest: Some(source_probe_digest),
+            original_dsd_source_kind: Some(original_dsd_source_kind),
+            dsd_front_end: Some(dsd_front_end),
+            canonical_materialization_sha256,
+            track_identity,
+            execution_identity,
+            output_path: album_relative_output_path,
+            output_size,
+            output_hash: Some(output_hash),
             validation_status,
             publish_timestamp: Utc::now(),
         })
@@ -102,11 +282,6 @@ pub struct TrackIdentity {
 }
 
 impl TrackIdentity {
-    /// Identity marker for one output file produced from a merged source set.
-    ///
-    /// Existing manifest schema already permits `track_number: None`, so merged
-    /// albums can use a single `ConversionManifestTrack` without changing
-    /// `MANIFEST_VERSION` or teaching rerun code a second output collection.
     pub fn merged_output() -> Self {
         Self {
             source_ordinal: 0,
@@ -125,6 +300,133 @@ pub enum ValidationStatus {
     Passed,
     Skipped,
     Failed { reason: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversionManifestV2Wire {
+    manifest_version: u32,
+    album_dir: PathBuf,
+    total_tracks: usize,
+    settings: PipelineSettings,
+    route_identity: ManifestRouteIdentityV2,
+    #[serde(default)]
+    programme_identity: Option<ProgrammeManifestIdentityV1>,
+    tracks: Vec<ConversionManifestTrack>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversionManifestV1Wire {
+    manifest_version: u32,
+    album_dir: PathBuf,
+    total_tracks: usize,
+    settings: PipelineSettings,
+    settings_fingerprint: LegacySettingsFingerprintV1,
+    tracks: Vec<ConversionManifestTrackV1Wire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversionManifestTrackV1Wire {
+    source_path: PathBuf,
+    source_size: u64,
+    source_mtime_secs: i64,
+    source_audio_md5: Option<String>,
+    track_identity: TrackIdentity,
+    settings_fingerprint: LegacySettingsFingerprintV1,
+    planner_version: String,
+    planned_command_hash: String,
+    output_path: PathBuf,
+    output_size: u64,
+    output_hash: Option<String>,
+    validation_status: ValidationStatus,
+    publish_timestamp: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for ConversionManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let version = value
+            .get("manifest_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| serde::de::Error::missing_field("manifest_version"))?;
+        match version {
+            2 => {
+                let wire: ConversionManifestV2Wire =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                if wire.manifest_version != 2 {
+                    return Err(serde::de::Error::custom("manifest_version must be exactly 2"));
+                }
+                Ok(Self {
+                    manifest_version: 2,
+                    album_dir: wire.album_dir,
+                    total_tracks: wire.total_tracks,
+                    settings: wire.settings,
+                    route_identity: wire.route_identity,
+                    programme_identity: wire.programme_identity,
+                    tracks: wire.tracks,
+                })
+            }
+            1 => {
+                let wire: ConversionManifestV1Wire =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                if wire.manifest_version != 1 {
+                    return Err(serde::de::Error::custom("manifest_version must be exactly 1"));
+                }
+                let tracks = wire
+                    .tracks
+                    .into_iter()
+                    .map(|track| {
+                        let output_hash = track
+                            .output_hash
+                            .map(|value| Sha256Digest::from_hex(&value))
+                            .transpose()
+                            .map_err(serde::de::Error::custom)?;
+                        Ok(ConversionManifestTrack {
+                            source_path: track.source_path,
+                            source_size: track.source_size,
+                            source_mtime_secs: track.source_mtime_secs,
+                            source_audio_md5: track.source_audio_md5,
+                            source_content_sha256: None,
+                            source_probe_digest: None,
+                            original_dsd_source_kind: None,
+                            dsd_front_end: None,
+                            canonical_materialization_sha256: None,
+                            track_identity: track.track_identity,
+                            execution_identity: ManifestTrackExecutionIdentityV2::LegacyPipelineV1 {
+                                settings_fingerprint_v1: track.settings_fingerprint,
+                                planner_version: track.planner_version,
+                                planned_command_hash: track.planned_command_hash,
+                            },
+                            output_path: track.output_path,
+                            output_size: track.output_size,
+                            output_hash,
+                            validation_status: track.validation_status,
+                            publish_timestamp: track.publish_timestamp,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, D::Error>>()?;
+                Ok(Self {
+                    manifest_version: 2,
+                    album_dir: wire.album_dir,
+                    total_tracks: wire.total_tracks,
+                    settings: wire.settings,
+                    route_identity: ManifestRouteIdentityV2::LegacyPipelineV1 {
+                        settings_fingerprint_v1: wire.settings_fingerprint,
+                    },
+                    programme_identity: None,
+                    tracks,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unsupported manifest version {other}; expected 1 or 2"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +473,9 @@ pub enum ManifestError {
     #[error("manifest track count mismatch: total_tracks={total_tracks}, tracks.len()={tracks_len}")]
     TrackCountMismatch { total_tracks: usize, tracks_len: usize },
 
+    #[error("invalid manifest authority: {0}")]
+    InvalidAuthority(String),
+
     #[error("manifest album_dir mismatch: manifest={manifest_album_dir:?}, actual={actual_album_dir:?}")]
     AlbumDirMismatch {
         manifest_album_dir: PathBuf,
@@ -209,20 +514,21 @@ pub fn read_manifest(album_dir: &Path) -> Result<Option<ConversionManifest>, Man
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(ManifestError::Io { path, source }),
     };
-
     let mut manifest: ConversionManifest = serde_json::from_slice(&bytes).map_err(|source| {
         ManifestError::Json {
             path: path.clone(),
             source,
         }
     })?;
-
     validate_manifest_for_album(album_dir, &manifest, true)?;
     manifest.album_dir = album_dir.to_path_buf();
     Ok(Some(manifest))
 }
 
-pub fn validate_manifest(album_dir: &Path, manifest: &ConversionManifest) -> Result<(), ManifestError> {
+pub fn validate_manifest(
+    album_dir: &Path,
+    manifest: &ConversionManifest,
+) -> Result<(), ManifestError> {
     validate_manifest_for_album(album_dir, manifest, true)
 }
 
@@ -244,25 +550,166 @@ fn validate_manifest_for_album(
             expected: MANIFEST_VERSION,
         });
     }
-
     if manifest.total_tracks != manifest.tracks.len() {
         return Err(ManifestError::TrackCountMismatch {
             total_tracks: manifest.total_tracks,
             tracks_len: manifest.tracks.len(),
         });
     }
-
     if check_album_dir && !same_path_lexical(&manifest.album_dir, actual_album_dir) {
         return Err(ManifestError::AlbumDirMismatch {
             manifest_album_dir: manifest.album_dir.clone(),
             actual_album_dir: actual_album_dir.to_path_buf(),
         });
     }
-
     for track in &manifest.tracks {
         validate_album_relative_output_path(&track.output_path)?;
     }
+    validate_manifest_authority(manifest)
+}
 
+fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), ManifestError> {
+    if manifest.programme_identity.is_some() {
+        return Err(ManifestError::InvalidAuthority(
+            "programme identity is reserved and unavailable in P0".to_string(),
+        ));
+    }
+    match &manifest.route_identity {
+        ManifestRouteIdentityV2::LegacyPipelineV1 { settings_fingerprint_v1 } => {
+            for track in &manifest.tracks {
+                match &track.execution_identity {
+                    ManifestTrackExecutionIdentityV2::LegacyPipelineV1 {
+                        settings_fingerprint_v1: track_fingerprint,
+                        ..
+                    } if track_fingerprint == settings_fingerprint_v1 => {}
+                    _ => {
+                        return Err(ManifestError::InvalidAuthority(
+                            "legacy route contains a nonmatching track identity".to_string(),
+                        ));
+                    }
+                }
+                if track.source_content_sha256.is_some()
+                    || track.source_probe_digest.is_some()
+                    || track.original_dsd_source_kind.is_some()
+                    || track.dsd_front_end.is_some()
+                    || track.canonical_materialization_sha256.is_some()
+                {
+                    return Err(ManifestError::InvalidAuthority(
+                        "legacy route contains native-only source authority".to_string(),
+                    ));
+                }
+            }
+        }
+        ManifestRouteIdentityV2::DsdReferenceV2 {
+            settings_snapshot_fingerprint_v2: route_settings_snapshot,
+            resolved_output_target,
+            policy,
+            qualification_manifest_digest,
+        } => {
+            if manifest.total_tracks != 1 {
+                return Err(ManifestError::InvalidAuthority(
+                    "P0 Reference manifest must contain exactly one track".to_string(),
+                ));
+            }
+            if *route_settings_snapshot != settings_snapshot_fingerprint_v2(&manifest.settings) {
+                return Err(ManifestError::InvalidAuthority(
+                    "Reference route settings snapshot does not match manifest settings".to_string(),
+                ));
+            }
+            if !manifest.settings.dsd.is_native_v2()
+                || manifest.settings.dsd.from_dsd.pathway
+                    != tonepoet_pipeline::DsdSourcePathway::Reference
+                || manifest.settings.dsd.from_dsd.reference_policy != *policy
+            {
+                return Err(ManifestError::InvalidAuthority(
+                    "Reference route settings do not match native-v2 policy".to_string(),
+                ));
+            }
+            if !resolved_output_target.is_p0_reference_lossless() {
+                return Err(ManifestError::InvalidAuthority(
+                    "Reference route target is not a P0 lossless target".to_string(),
+                ));
+            }
+            for track in &manifest.tracks {
+                if track.source_content_sha256.is_none()
+                    || track.source_probe_digest.is_none()
+                    || track.original_dsd_source_kind.is_none()
+                    || track.dsd_front_end.is_none()
+                    || track.output_hash.is_none()
+                {
+                    return Err(ManifestError::InvalidAuthority(
+                        "Reference track is missing required native authority".to_string(),
+                    ));
+                }
+                match track.dsd_front_end {
+                    Some(DsdInputFrontEnd::NativeUncompressed) => {
+                        if track.canonical_materialization_sha256.is_some() {
+                            return Err(ManifestError::InvalidAuthority(
+                                "native Reference front-end must not claim a decoded materialization"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Some(
+                        DsdInputFrontEnd::DsdiffDst { .. }
+                        | DsdInputFrontEnd::SacdDsd { .. }
+                        | DsdInputFrontEnd::SacdDst { .. },
+                    ) => {
+                        if track.canonical_materialization_sha256.is_none() {
+                            return Err(ManifestError::InvalidAuthority(
+                                "decoded Reference front-end is missing canonical materialization authority"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    None => unreachable!("required above"),
+                }
+                match &track.execution_identity {
+                    ManifestTrackExecutionIdentityV2::NativeDsdV2 {
+                        executed_evidence_digest_v1,
+                        executed_evidence_digest_v2,
+                        ..
+                    } if *executed_evidence_digest_v1 != Sha256Digest([0; 32])
+                        && (*policy != DsdReferencePolicyVersion::SoxNg14801V3
+                            || *executed_evidence_digest_v2 != Sha256Digest([0; 32])) => {}
+                    ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
+                        return Err(ManifestError::InvalidAuthority(
+                            if *policy == DsdReferencePolicyVersion::SoxNg14801V3 {
+                                "Reference v3 track is missing v1 or v2 executed verification authority"
+                            } else {
+                                "Reference track is missing executed verification authority"
+                            }
+                            .to_string(),
+                        ));
+                    }
+                    ManifestTrackExecutionIdentityV2::LegacyPipelineV1 { .. } => {
+                        return Err(ManifestError::InvalidAuthority(
+                            "Reference route contains a legacy track identity".to_string(),
+                        ));
+                    }
+                }
+                if let Some(DsdSourceKind::SacdTrack { selection, .. }) =
+                    track.original_dsd_source_kind.as_ref()
+                {
+                    if selection.frame_count == 0 || selection.toc_digest == Sha256Digest([0; 32]) {
+                        return Err(ManifestError::InvalidAuthority(
+                            "SACD Reference identity has an incomplete track selection".to_string(),
+                        ));
+                    }
+                }
+            }
+            if *qualification_manifest_digest == Sha256Digest([0; 32]) {
+                return Err(ManifestError::InvalidAuthority(
+                    "Reference qualification digest is empty".to_string(),
+                ));
+            }
+        }
+        ManifestRouteIdentityV2::DsdManualV2 { .. } => {
+            return Err(ManifestError::InvalidAuthority(
+                "Manual DSD manifest authority is reserved and unavailable in P0".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -349,6 +796,10 @@ pub fn refresh_manifest_output_facts_for_publish(
     manifest.album_dir = final_album_dir.to_path_buf();
     manifest.total_tracks = manifest.tracks.len();
     manifest.stamp_publish_timestamp(Utc::now());
+    let native_reference_requires_hash = matches!(
+        &manifest.route_identity,
+        ManifestRouteIdentityV2::DsdReferenceV2 { .. }
+    );
 
     for track in &mut manifest.tracks {
         let relative = validate_album_relative_output_path(&track.output_path)?;
@@ -359,8 +810,8 @@ pub fn refresh_manifest_output_facts_for_publish(
         })?;
         track.output_path = relative;
         track.output_size = metadata.len();
-        track.output_hash = if record_output_hash {
-            Some(file_sha256(&staged_output)?)
+        track.output_hash = if record_output_hash || native_reference_requires_hash {
+            Some(file_sha256_digest(&staged_output)?)
         } else {
             None
         };
@@ -444,6 +895,11 @@ pub fn file_sha256(path: &Path) -> Result<String, ManifestError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+pub fn file_sha256_digest(path: &Path) -> Result<Sha256Digest, ManifestError> {
+    let value = file_sha256(path)?;
+    Sha256Digest::from_hex(&value).map_err(ManifestError::InvalidAuthority)
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(digest)
@@ -495,7 +951,107 @@ fn sync_parent_dir_best_effort(path: &Path) {
 #[cfg(test)]
 mod manifest_merge_gap_tests {
     use super::*;
-    use tonepoet_pipeline::fingerprint::settings_fingerprint;
+    use tonepoet_pipeline::fingerprint::{
+        settings_fingerprint, settings_snapshot_fingerprint_v2, BehaviorFingerprintV1,
+        ExecutionFingerprintV1, SemanticPlanHashV1,
+    };
+
+    fn native_identity(v1: Sha256Digest, v2: Sha256Digest) -> ManifestTrackExecutionIdentityV2 {
+        ManifestTrackExecutionIdentityV2::NativeDsdV2 {
+            behavior_fingerprint_v1: BehaviorFingerprintV1(Sha256Digest([1; 32])),
+            execution_fingerprint_v1: ExecutionFingerprintV1(Sha256Digest([2; 32])),
+            semantic_plan_hash_v1: SemanticPlanHashV1(Sha256Digest([3; 32])),
+            executed_evidence_digest_v1: v1,
+            executed_evidence_digest_v2: v2,
+        }
+    }
+
+    fn reference_manifest_with_evidence(
+        policy: DsdReferencePolicyVersion,
+        v1: Sha256Digest,
+        v2: Sha256Digest,
+    ) -> Result<ConversionManifest, ManifestError> {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("source.dsf");
+        fs::write(&source, b"reference source").expect("write source");
+        let metadata = fs::metadata(&source).expect("source metadata");
+        let mut settings = PipelineSettings::default();
+        settings.dsd.from_dsd.reference_policy = policy;
+        let track = ConversionManifestTrack::new_reference(
+            source,
+            &metadata,
+            None,
+            Sha256Digest([4; 32]),
+            Sha256Digest([5; 32]),
+            DsdSourceKind::DsfUncompressed,
+            DsdInputFrontEnd::NativeUncompressed,
+            None,
+            TrackIdentity {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: Some(1),
+            },
+            native_identity(v1, v2),
+            PathBuf::from("01.w64"),
+            16,
+            Sha256Digest([6; 32]),
+            ValidationStatus::Passed,
+        )?;
+        let route = ManifestRouteIdentityV2::DsdReferenceV2 {
+            settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&settings),
+            resolved_output_target: ResolvedOutputTarget::WavW64,
+            policy,
+            qualification_manifest_digest: Sha256Digest([7; 32]),
+        };
+        ConversionManifest::new_reference(album_dir, settings, route, vec![track])
+    }
+
+    #[test]
+    fn native_identity_missing_v2_digest_deserializes_as_zero_for_historical_compatibility() {
+        let identity = native_identity(Sha256Digest([8; 32]), Sha256Digest([9; 32]));
+        let mut value = serde_json::to_value(identity).expect("serialize native identity");
+        value
+            .as_object_mut()
+            .expect("identity object")
+            .remove("executed_evidence_digest_v2");
+        let parsed: ManifestTrackExecutionIdentityV2 =
+            serde_json::from_value(value).expect("deserialize historical native identity");
+        assert!(matches!(
+            parsed,
+            ManifestTrackExecutionIdentityV2::NativeDsdV2 {
+                executed_evidence_digest_v2,
+                ..
+            } if executed_evidence_digest_v2 == Sha256Digest([0; 32])
+        ));
+    }
+
+    #[test]
+    fn v3_manifest_requires_v2_source_materialization_evidence_without_retroactively_changing_v2() {
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V2,
+            Sha256Digest([8; 32]),
+            Sha256Digest([0; 32]),
+        )
+        .is_ok());
+
+        let error = reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V3,
+            Sha256Digest([8; 32]),
+            Sha256Digest([0; 32]),
+        )
+        .expect_err("v3 must bind source/materialization evidence");
+        assert!(error
+            .to_string()
+            .contains("missing v1 or v2 executed verification authority"));
+
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V3,
+            Sha256Digest([8; 32]),
+            Sha256Digest([9; 32]),
+        )
+        .is_ok());
+    }
 
     #[test]
     fn merged_identity_marks_one_manifest_entry_for_merged_output() {
@@ -506,8 +1062,6 @@ mod manifest_merge_gap_tests {
         assert_eq!(identity.disc_number, None);
         assert_eq!(identity.track_number, None);
     }
-
-
 
     #[test]
     fn album_relative_output_path_rejects_paths_outside_album_dir() {
@@ -630,12 +1184,16 @@ mod manifest_merge_gap_tests {
         assert_eq!(parsed.manifest_version, MANIFEST_VERSION);
         assert_eq!(parsed.total_tracks, 1);
         assert_eq!(parsed.tracks.len(), 1);
-        assert_eq!(parsed.settings_fingerprint, settings_fingerprint);
+        assert_eq!(parsed.legacy_settings_fingerprint(), Some(settings_fingerprint));
         assert_eq!(parsed.tracks[0].track_identity.source_ordinal, 1);
         assert_eq!(parsed.tracks[0].track_identity.disc_number, None);
         assert_eq!(parsed.tracks[0].track_identity.track_number, Some(1));
         assert!(!parsed.tracks[0].track_identity.is_merged_output());
         assert_eq!(parsed.tracks[0].output_path, PathBuf::from("01.flac"));
-        assert_eq!(parsed.tracks[0].planned_command_hash, "pre-change-planned-command-hash");
+        assert!(matches!(
+            &parsed.tracks[0].execution_identity,
+            ManifestTrackExecutionIdentityV2::LegacyPipelineV1 { planned_command_hash, .. }
+                if planned_command_hash == "pre-change-planned-command-hash"
+        ));
     }
 }

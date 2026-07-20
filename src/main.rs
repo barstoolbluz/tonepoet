@@ -114,6 +114,26 @@ enum Commands {
         #[arg(long)]
         backend: Option<String>,
 
+        /// DSD-source pathway (reference or reserved manual).
+        #[arg(long = "dsd-path", value_name = "reference|manual")]
+        dsd_path: Option<String>,
+
+        /// Reference DSD reconstruction profile.
+        #[arg(long = "dsd-profile", value_name = "reference|wideband")]
+        dsd_profile: Option<String>,
+
+        /// Reference DSD gain policy.
+        #[arg(long = "dsd-gain", value_name = "reference|native|fixed|normalize")]
+        dsd_gain: Option<String>,
+
+        /// Fixed DSD gain in dB; valid only with --dsd-gain fixed.
+        #[arg(long = "dsd-gain-db", value_name = "DB")]
+        dsd_gain_db: Option<String>,
+
+        /// NormalizePeak target in dBFS; valid only with --dsd-gain normalize.
+        #[arg(long = "dsd-normalize-target-dbfs", value_name = "DBFS")]
+        dsd_normalize_target_dbfs: Option<String>,
+
         /// Append Lineage.txt content to COMMENT tag
         #[arg(long)]
         append_lineage: bool,
@@ -499,6 +519,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             reencode_flac,
             merge,
             backend,
+            dsd_path,
+            dsd_profile,
+            dsd_gain,
+            dsd_gain_db,
+            dsd_normalize_target_dbfs,
             append_lineage,
             write_log,
             disc_subfolders,
@@ -531,6 +556,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 reencode_flac,
                 merge,
                 backend,
+                dsd_path,
+                dsd_profile,
+                dsd_gain,
+                dsd_gain_db,
+                dsd_normalize_target_dbfs,
                 append_lineage,
                 write_log,
                 generate_cue,
@@ -861,9 +891,15 @@ mod bit_depth_cli_tests {
         assert_eq!(settings.target_bit_depth, BitDepthTarget::Source);
 
         let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("album.dsf"),
             output_path: PathBuf::from("album.flac"),
             source: SourceInfo {
+                dsd_source_kind: None,
+
                 format: tonepoet_pipeline::AudioFormat::Dsf,
                 codec: AudioCodec::Dsd,
                 sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -963,6 +999,85 @@ fn parse_dvda_downmix_policy(s: &str) -> Result<DvdaDownmixPolicy, String> {
     }
 }
 
+fn apply_cli_dsd_reference_settings(
+    settings: &mut tonepoet_pipeline::PipelineSettings,
+    output_format: AudioFormat,
+    pathway: Option<&str>,
+    profile: Option<&str>,
+    gain: Option<&str>,
+    fixed_gain: Option<&str>,
+    normalize_target: Option<&str>,
+) -> anyhow::Result<()> {
+    use tonepoet_pipeline::{
+        DbNano, DsdReconstructionSelection, DsdSourceGainMode, DsdSourcePathway,
+        ReferenceErrorCode,
+    };
+
+    let any_flag = pathway.is_some()
+        || profile.is_some()
+        || gain.is_some()
+        || fixed_gain.is_some()
+        || normalize_target.is_some();
+    if any_flag && matches!(output_format, AudioFormat::Dsf | AudioFormat::Dff) {
+        anyhow::bail!(
+            "DSD Reference flags apply only to DSD-to-PCM conversions, not PCM-to-DSD targets"
+        );
+    }
+
+    settings.dsd.from_dsd.pathway = match pathway.unwrap_or("reference").to_ascii_lowercase().as_str() {
+        "reference" => DsdSourcePathway::Reference,
+        "manual" => {
+            anyhow::bail!(tonepoet_pipeline::reference_error_text(
+                ReferenceErrorCode::ManualUnavailable,
+            ));
+        }
+        other => anyhow::bail!("invalid --dsd-path '{other}'; expected reference or manual"),
+    };
+    settings.dsd.from_dsd.profile = match profile.unwrap_or("reference").to_ascii_lowercase().as_str() {
+        "reference" => DsdReconstructionSelection::Reference,
+        "wideband" => DsdReconstructionSelection::Wideband,
+        other => anyhow::bail!(
+            "invalid --dsd-profile '{other}'; expected reference or wideband"
+        ),
+    };
+    settings.dsd.from_dsd.gain_mode = match gain.unwrap_or("reference").to_ascii_lowercase().as_str() {
+        "reference" => DsdSourceGainMode::Reference,
+        "native" | "native-level" => DsdSourceGainMode::NativeLevel,
+        "fixed" => DsdSourceGainMode::Fixed,
+        "normalize" | "normalize-peak" => DsdSourceGainMode::NormalizePeak,
+        other => anyhow::bail!(
+            "invalid --dsd-gain '{other}'; expected reference, native, fixed, or normalize"
+        ),
+    };
+
+    if fixed_gain.is_some() && settings.dsd.from_dsd.gain_mode != DsdSourceGainMode::Fixed {
+        anyhow::bail!("--dsd-gain-db requires --dsd-gain fixed");
+    }
+    if normalize_target.is_some()
+        && settings.dsd.from_dsd.gain_mode != DsdSourceGainMode::NormalizePeak
+    {
+        anyhow::bail!(
+            "--dsd-normalize-target-dbfs requires --dsd-gain normalize"
+        );
+    }
+    settings.dsd.from_dsd.fixed_gain_db = match fixed_gain {
+        Some(value) => Some(value.parse::<DbNano>().map_err(anyhow::Error::msg)?),
+        None => None,
+    };
+    if let Some(value) = normalize_target {
+        settings.dsd.from_dsd.normalize_peak_target_dbfs =
+            value.parse::<DbNano>().map_err(anyhow::Error::msg)?;
+    }
+    if matches!(output_format, AudioFormat::WavPack) && !settings.wavpack.hybrid {
+        settings.wavpack.correction_file = false;
+    }
+    // Native-v2 Reference validation is planner-owned so every unsupported
+    // cell reaches the stable DSD-REF-P0 error selected by the immutable
+    // policy. Generic legacy validation can otherwise preempt those errors
+    // with a format/depth message before the Reference planner runs.
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_convert(
     paths: Vec<PathBuf>,
@@ -978,6 +1093,11 @@ async fn run_convert(
     reencode_flac: bool,
     merge: bool,
     backend: Option<String>,
+    dsd_path: Option<String>,
+    dsd_profile: Option<String>,
+    dsd_gain: Option<String>,
+    dsd_gain_db: Option<String>,
+    dsd_normalize_target_dbfs: Option<String>,
     append_lineage: bool,
     write_log: bool,
     generate_cue: bool,
@@ -1125,9 +1245,18 @@ async fn run_convert(
     // Materialize the CLI's complete planner settings through the checked
     // compatibility bridge. This is where `--bit-depth source` remains Source,
     // while malformed numeric requests are rejected rather than substituted.
-    let cli_pipeline_settings =
+    let mut cli_pipeline_settings =
         tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options)
             .map_err(|error| anyhow::anyhow!("invalid conversion settings: {error}"))?;
+    apply_cli_dsd_reference_settings(
+        &mut cli_pipeline_settings,
+        output_format,
+        dsd_path.as_deref(),
+        dsd_profile.as_deref(),
+        dsd_gain.as_deref(),
+        dsd_gain_db.as_deref(),
+        dsd_normalize_target_dbfs.as_deref(),
+    )?;
     options.pipeline_settings = Some(cli_pipeline_settings);
 
     // Build pipeline request template from CLI flags (PR 10).

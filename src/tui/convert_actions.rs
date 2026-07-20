@@ -291,6 +291,12 @@ pub fn try_pills_to_options(
 /// This is the lossless handoff from dynamic TUI rows into command planning.
 /// It validates on every build, including release builds.
 pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<PipelineSettings, String> {
+    if format.dsd_to_pcm_gain_available() && !format.reference_target_confirmed {
+        return Err(tonepoet_pipeline::reference_error_text(
+            tonepoet_pipeline::ReferenceErrorCode::CanonicalTarget,
+        )
+        .to_string());
+    }
     let container_ext = if format.selected_container_index > 0 {
         Some(format.selected_extension())
     } else {
@@ -373,32 +379,38 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     // codec-specific sub-structs (flac, mp3, aac, etc.) use defaults until the TUI
     // exposes those settings.
     let mut dsd: tonepoet_pipeline::DsdSettings = Default::default();
+    dsd.from_dsd.pathway = *format.dsd_pathway.selected_value();
+    dsd.from_dsd.profile = *format.dsd_profile.selected_value();
     if format.dsd_to_pcm_gain_available() {
-        dsd.dsd_to_pcm_gain_mode = *format.dsd_gain_mode.selected_value();
-        dsd.dsd_to_pcm_auto_gain_margin_db = format.dsd_auto_gain_margin_db;
-        dsd.dsd_to_pcm_gain_db = if *format.dsd_gain_mode.selected_value()
-            == pipeline_enums::DsdToPcmGainMode::Manual
-        {
-            Some(if format.dsd_gain_db.is_finite() {
-                format
-                    .dsd_gain_db
-                    .clamp(DSD_TO_PCM_GAIN_DB_MIN, DSD_TO_PCM_GAIN_DB_MAX)
-            } else {
-                0.0
-            })
-        } else {
-            None
-        };
-    } else {
-        dsd.dsd_to_pcm_gain_mode = pipeline_enums::DsdToPcmGainMode::Disabled;
-        dsd.dsd_to_pcm_gain_db = None;
+        match *format.dsd_gain_mode.selected_value() {
+            DsdGainMode::Reference => {
+                dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Reference;
+                dsd.from_dsd.fixed_gain_db = None;
+            }
+            DsdGainMode::NativeLevel => {
+                dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NativeLevel;
+                dsd.from_dsd.fixed_gain_db = None;
+            }
+            DsdGainMode::NormalizePeak => {
+                dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
+                dsd.from_dsd.fixed_gain_db = None;
+                dsd.from_dsd.normalize_peak_target_dbfs =
+                    format.dsd_normalize_target_dbfs;
+            }
+            DsdGainMode::Fixed => {
+                dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Fixed;
+                dsd.from_dsd.fixed_gain_db = Some(format.dsd_gain_db);
+            }
+        }
     }
     if is_dsd {
-        dsd.noise_shaper = *format.noise_shaper.selected_value();
-        dsd.modulator_order = *format.modulator_order.selected_value();
-        dsd.pcm_to_dsd_filter = *format.conversion_preset.selected_value();
+        dsd.pcm_to_dsd.noise_shaper = *format.noise_shaper.selected_value();
+        dsd.pcm_to_dsd.modulator_order = *format.modulator_order.selected_value();
+        dsd.pcm_to_dsd.filter = *format.conversion_preset.selected_value();
     }
 
+    let target_format_is_wavpack =
+        matches!(target_format, pipeline_enums::AudioFormat::WavPack);
     let settings = PipelineSettings {
         target_format,
         target_sample_rate,
@@ -432,7 +444,18 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             mode: format.wavpack_mode,
             hybrid: format.wavpack_hybrid,
             hybrid_bitrate_kbps: format.wavpack_bitrate_kbps,
-            correction_file: format.wavpack_correction,
+            // The generic WavPack UI defaults this dormant flag on. Native
+            // Reference canonicalizes non-hybrid WavPack to no correction
+            // sidecar; an actually hybrid request remains visible to the
+            // planner and is rejected fail-closed.
+            correction_file: if format.dsd_to_pcm_gain_available()
+                && target_format_is_wavpack
+                && !format.wavpack_hybrid
+            {
+                false
+            } else {
+                format.wavpack_correction
+            },
         },
         ssrc: tonepoet_pipeline::SsrcSettings {
             force: false,
@@ -480,9 +503,14 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         },
     };
 
-    settings
-        .validate()
-        .map_err(|err| format!("invalid PipelineSettings from TUI state: {err}"))?;
+    if !format.dsd_to_pcm_gain_available() {
+        settings
+            .validate()
+            .map_err(|err| format!("invalid PipelineSettings from TUI state: {err}"))?;
+    }
+    // DSD-source Reference validation remains planner-owned so unsupported
+    // cells surface the stable DSD-REF-P0 error rather than a legacy generic
+    // format/depth error. The TUI fields themselves are typed and bounded.
     Ok(settings)
 }
 
@@ -768,61 +796,70 @@ mod lifecycle_forwarder_tests {
     fn format_state_to_pipeline_settings_maps_dsd_to_pcm_gain() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
-        format.dsd_gain_mode.select_value(&DsdGainMode::Auto);
-        format.dsd_auto_gain_margin_db = 0.5;
+        format.dsd_gain_mode.select_value(&DsdGainMode::NormalizePeak);
+        format.dsd_normalize_target_dbfs = "-0.500000000".parse().unwrap();
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
         assert_eq!(
-            settings.dsd.dsd_to_pcm_gain_mode,
-            pipeline_enums::DsdToPcmGainMode::Auto
+            settings.dsd.from_dsd.gain_mode,
+            tonepoet_pipeline::DsdSourceGainMode::NormalizePeak
         );
-        assert!((settings.dsd.dsd_to_pcm_auto_gain_margin_db - 0.5).abs() < f32::EPSILON);
-        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, None);
+        assert_eq!(
+            settings.dsd.from_dsd.normalize_peak_target_dbfs,
+            "-0.500000000".parse().expect("fixed point")
+        );
+        assert_eq!(settings.dsd.from_dsd.fixed_gain_db, None);
     }
 
     #[test]
     fn format_state_to_pipeline_settings_maps_manual_dsd_to_pcm_gain() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
-        format.dsd_gain_mode.select_value(&DsdGainMode::Manual);
-        format.dsd_gain_db = 2.25;
+        format.dsd_gain_mode.select_value(&DsdGainMode::Fixed);
+        format.dsd_gain_db = "2.250000000".parse().unwrap();
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
         assert_eq!(
-            settings.dsd.dsd_to_pcm_gain_mode,
-            pipeline_enums::DsdToPcmGainMode::Manual
+            settings.dsd.from_dsd.gain_mode,
+            tonepoet_pipeline::DsdSourceGainMode::Fixed
         );
-        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, Some(2.25));
+        assert_eq!(
+            settings.dsd.from_dsd.fixed_gain_db,
+            Some("2.250000000".parse().expect("fixed point"))
+        );
     }
 
 
     #[test]
     fn format_state_to_pipeline_settings_disables_hidden_dsd_gain_for_pcm_source() {
         let mut format = FormatState::new();
-        format.dsd_gain_mode.select_value(&DsdGainMode::Manual);
-        format.dsd_gain_db = 2.25;
+        format.dsd_gain_mode.select_value(&DsdGainMode::Fixed);
+        format.dsd_gain_db = "2.250000000".parse().unwrap();
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
         assert_eq!(
-            settings.dsd.dsd_to_pcm_gain_mode,
-            pipeline_enums::DsdToPcmGainMode::Disabled
+            settings.dsd.from_dsd.gain_mode,
+            tonepoet_pipeline::DsdSourceGainMode::Reference
         );
-        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, None);
+        assert_eq!(settings.dsd.from_dsd.fixed_gain_db, None);
     }
 
     #[test]
     fn format_state_to_pipeline_settings_clamps_manual_dsd_to_pcm_gain() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
-        format.dsd_gain_mode.select_value(&DsdGainMode::Manual);
-        format.dsd_gain_db = DSD_TO_PCM_GAIN_DB_MAX + 99.0;
+        format.dsd_gain_mode.select_value(&DsdGainMode::Fixed);
+        format.dsd_gain_db = tonepoet_pipeline::DbNano(123_000_000_000);
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
-        assert_eq!(settings.dsd.dsd_to_pcm_gain_db, Some(DSD_TO_PCM_GAIN_DB_MAX));
+        assert_eq!(
+            settings.dsd.from_dsd.fixed_gain_db,
+            Some("24.000000000".parse().expect("fixed point"))
+        );
     }
 
     #[test]

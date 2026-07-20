@@ -1,5 +1,9 @@
 //! Deterministic conversion-chain planner.
 
+use crate::dsd_reference::{
+    plan_reference_dsd, DsdReferencePlanSummary, PlannedDeferredCommand, PlannedMeasurement,
+    ReferenceProgrammeScope, ResolvedOutputTarget,
+};
 use crate::enums::{
     AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdRate, NyquistTransition, PcmBitDepth, RateTarget, ReplayGainMode, SampleKind, SsrcProfile,
@@ -33,6 +37,17 @@ pub struct PlanRequest {
     /// Inserted before the output path in the ffmpeg command. Empty for most containers.
     #[cfg_attr(feature = "serde", serde(default))]
     pub container_ffmpeg_flags: Vec<String>,
+    /// Exact format/container product identity resolved by the trusted catalog.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub resolved_output_target: Option<ResolvedOutputTarget>,
+    /// Dispatcher-authored programme classification. P0 accepts only Singleton.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub reference_programme_scope: ReferenceProgrammeScope,
+    /// Conservative upper bound for every non-audio RIFF byte that the complete
+    /// metadata/artwork plan may add. Required for Reference RIFF admission;
+    /// computed by the orchestrator from the exact source and metadata plan.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub planned_riff_non_audio_upper_bound_bytes: Option<u64>,
 }
 
 impl PlanRequest {
@@ -282,6 +297,31 @@ impl PlannedCommand {
     }
 }
 
+/// One executable P0 step. Existing plans use `Command`; Reference plans may
+/// additionally measure and bind a later command without replanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PlannedExecutionStep {
+    /// Ordinary fully resolved command.
+    Command(PlannedCommand),
+    /// Typed measurement whose result is recorded under a stable ID.
+    Measurement(PlannedMeasurement),
+    /// Command with one or more typed arguments resolved from measurements.
+    DeferredCommand(PlannedDeferredCommand),
+}
+
+impl PlannedExecutionStep {
+    /// Logical output path, when path-backed.
+    #[must_use]
+    pub fn output_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Command(command) => command.output.as_path(),
+            Self::Measurement(measurement) => measurement.command.output.as_path(),
+            Self::DeferredCommand(command) => command.output.as_path(),
+        }
+    }
+}
+
 /// Post-command finalization the caller performs atomically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -316,8 +356,11 @@ pub enum PlanAction {
     },
     /// Execute commands in order, then perform finalization.
     Execute {
-        /// Planned command list.
+        /// Legacy/static planned command list. Empty for a native-v2 Reference plan.
         commands: Vec<PlannedCommand>,
+        /// Measurement-aware execution steps. Empty for existing legacy/static plans.
+        #[cfg_attr(feature = "serde", serde(default))]
+        steps: Vec<PlannedExecutionStep>,
         /// Deterministic work files the executor may delete after success or failure.
         /// Paths are listed here so interrupted reruns can clean or overwrite known
         /// stage files instead of leaving untracked outputs.
@@ -333,6 +376,9 @@ pub enum PlanAction {
 pub struct ConversionPlan {
     /// Chosen action.
     pub action: PlanAction,
+    /// Native-v2 Reference policy facts, absent for legacy/general plans.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub reference: Option<DsdReferencePlanSummary>,
 }
 
 impl ConversionPlan {
@@ -357,6 +403,7 @@ impl ConversionPlan {
                 finalization,
                 reason: reason.into(),
             },
+            reference: None,
         }
     }
 
@@ -376,9 +423,30 @@ impl ConversionPlan {
         Self {
             action: PlanAction::Execute {
                 commands,
+                steps: Vec::new(),
                 cleanup_paths,
                 finalization,
             },
+            reference: None,
+        }
+    }
+
+    /// Create a measurement-aware Reference plan.
+    #[must_use]
+    pub fn execute_steps_with_cleanup(
+        steps: Vec<PlannedExecutionStep>,
+        cleanup_paths: Vec<PathBuf>,
+        finalization: Option<Finalization>,
+        reference: DsdReferencePlanSummary,
+    ) -> Self {
+        Self {
+            action: PlanAction::Execute {
+                commands: Vec::new(),
+                steps,
+                cleanup_paths,
+                finalization,
+            },
+            reference: Some(reference),
         }
     }
 
@@ -388,6 +456,15 @@ impl ConversionPlan {
         match &self.action {
             PlanAction::PassthroughCopy { .. } => &[],
             PlanAction::Execute { commands, .. } => commands,
+        }
+    }
+
+    /// Return measurement-aware steps, or an empty slice for legacy plans.
+    #[must_use]
+    pub fn steps(&self) -> &[PlannedExecutionStep] {
+        match &self.action {
+            PlanAction::PassthroughCopy { .. } => &[],
+            PlanAction::Execute { steps, .. } => steps,
         }
     }
 
@@ -654,6 +731,12 @@ pub fn plan_conversion_with_registry(
     request: &PlanRequest,
     registry: &ToolRegistry,
 ) -> Result<ConversionPlan> {
+    if request.source.is_dsd()
+        && !request.settings.target_format.is_dsd()
+        && request.settings.dsd.is_native_v2()
+    {
+        return plan_reference_dsd(request);
+    }
     match plan_topology(request)? {
         TopologyPlan::Passthrough { reason } => {
             let work_path = request.context().final_work_path();
@@ -1138,13 +1221,13 @@ fn plan_to_dsd(
         PlanOperation::DsdRateChange {
             target_format: request.settings.target_format.clone(),
             target_rate,
-            lowpass: request.settings.dsd.dsd_to_pcm_lowpass,
+            lowpass: request.settings.dsd.legacy_dsd_to_pcm_lowpass(),
         }
     } else {
         PlanOperation::PcmToDsd {
             target_format: request.settings.target_format.clone(),
             target_rate,
-            filter: request.settings.dsd.pcm_to_dsd_filter,
+            filter: request.settings.dsd.pcm_to_dsd.filter,
         }
     };
     push_step(
@@ -1207,7 +1290,7 @@ fn plan_from_dsd(
                 target_format: request.settings.target_format.clone(),
                 target_rate_hz,
                 target_bit_depth: target_depth,
-                lowpass: request.settings.dsd.dsd_to_pcm_lowpass,
+                lowpass: request.settings.dsd.legacy_dsd_to_pcm_lowpass(),
             },
             current_input.clone(),
             OutputSink::Path(final_work.clone()),
@@ -1224,7 +1307,7 @@ fn plan_from_dsd(
             target_format: AudioFormat::Wav,
             target_rate_hz,
             target_bit_depth: target_depth,
-            lowpass: request.settings.dsd.dsd_to_pcm_lowpass,
+            lowpass: request.settings.dsd.legacy_dsd_to_pcm_lowpass(),
         },
         current_input.clone(),
         OutputSink::Path(pcm_intermediate.clone()),
@@ -1725,14 +1808,21 @@ mod metadata_pruning_tests {
     }
 
     fn metadata_pruning_request() -> PlanRequest {
+
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Flac;
         settings.metadata.transfer_tags = true;
         settings.metadata.preserve_artwork = false;
         PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+
             input_path: PathBuf::from("source.wav"),
             output_path: PathBuf::from("output.flac"),
             source: SourceInfo {
+                dsd_source_kind: None,
+
                 format: AudioFormat::Wav,
                 codec: AudioCodec::PcmSigned,
                 sample_rate_hz: Some(44_100),

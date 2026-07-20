@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use tonepoet_pipeline::*;
 
 fn flac_source() -> SourceInfo {
+
     SourceInfo {
+        dsd_source_kind: None,
+
         format: AudioFormat::Flac,
         codec: AudioCodec::Flac,
         sample_rate_hz: Some(96_000),
@@ -18,8 +21,36 @@ fn flac_source() -> SourceInfo {
     }
 }
 
+fn legacy_dsd_settings(
+    lowpass: DsdLowpassMethod,
+    gain_mode: DsdToPcmGainMode,
+    margin_db: f32,
+    gain_db: Option<f32>,
+) -> DsdSettings {
+    let native = DsdSettings::default();
+    serde_json::from_value(serde_json::json!({
+        "noise_shaper": native.pcm_to_dsd.noise_shaper,
+        "modulator_order": native.pcm_to_dsd.modulator_order,
+        "trellis": native.pcm_to_dsd.trellis,
+        "pcm_to_dsd_filter": native.pcm_to_dsd.filter,
+        "dsd_to_pcm_lowpass": lowpass,
+        "dsd_to_pcm_gain_mode": gain_mode,
+        "dsd_to_pcm_auto_gain_margin_db": margin_db,
+        "dsd_to_pcm_gain_db": gain_db,
+        "sinc": native.pcm_to_dsd.sinc,
+        "gain_compensation": native.pcm_to_dsd.gain_compensation,
+    }))
+    .expect("valid frozen legacy DSD wire")
+}
+
+
 fn request(settings: PipelineSettings) -> PlanRequest {
+
     PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.flac"),
         output_path: PathBuf::from("out.flac"),
         source: flac_source(),
@@ -268,6 +299,8 @@ fn legacy_unspecified_representation_keeps_single_depth_fact_authoritative() {
 #[test]
 fn high_rate_pcm_is_not_misclassified_as_dsd() {
     let source = SourceInfo {
+        dsd_source_kind: None,
+
         format: AudioFormat::Wav,
         codec: AudioCodec::PcmSigned,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -300,9 +333,15 @@ fn dsd_to_pcm_uses_sox() {
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     let req = PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.dsf"),
         output_path: PathBuf::from("out.flac"),
         source: SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Dsf,
             codec: AudioCodec::Dsd,
             sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -329,9 +368,15 @@ fn dsd_to_pcm_source_depth_uses_documented_target_default() {
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Source;
     let req = PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.dsf"),
         output_path: PathBuf::from("out.flac"),
         source: SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Dsf,
             codec: AudioCodec::Dsd,
             sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -368,9 +413,15 @@ fn lossy_source_depth_uses_documented_target_default() {
     settings.target_bit_depth = BitDepthTarget::Source;
     settings.force_encode = true;
     let req = PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.mp3"),
         output_path: PathBuf::from("out.wav"),
         source: SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Mp3,
             codec: AudioCodec::Mp3,
             sample_rate_hz: Some(44_100),
@@ -407,9 +458,15 @@ fn lossy_source_default_ignores_decoded_integer_carrier_width() {
     settings.target_bit_depth = BitDepthTarget::Source;
     settings.force_encode = true;
     let req = PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("decoded-lossy.wav"),
         output_path: PathBuf::from("out.wav"),
         source: SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Wav,
             codec: AudioCodec::PcmSigned,
             sample_rate_hz: Some(44_100),
@@ -458,9 +515,15 @@ fn lossy_same_format_never_passes_through_without_proven_encoder_settings() {
     settings.mp3.mode = Mp3Mode::Cbr;
     settings.mp3.bitrate_kbps = 192;
     let req = PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.mp3"),
         output_path: PathBuf::from("out.mp3"),
         source: SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Mp3,
             codec: AudioCodec::Mp3,
             sample_rate_hz: Some(44_100),
@@ -693,8 +756,8 @@ fn dsd_sinc_transition_width_shapes_sox_command() {
     settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd128);
     settings.metadata.transfer_tags = false;
     settings.metadata.preserve_artwork = false;
-    settings.dsd.pcm_to_dsd_filter = DsdFilterPreset::Sinc;
-    settings.dsd.sinc.transition_hz = 750.0;
+    settings.dsd.pcm_to_dsd.filter = DsdFilterPreset::Sinc;
+    settings.dsd.pcm_to_dsd.sinc.transition_hz = 750.0;
     let req = request(settings);
     let plan = plan_conversion(&req).unwrap();
     let args = &plan.commands()[0].args;
@@ -711,9 +774,11 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
     auto.target_sample_rate = RateTarget::PcmHz(88_200);
     auto.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     auto.resample_quality = ResampleQuality::Low;
-    auto.dsd.dsd_to_pcm_lowpass = DsdLowpassMethod::Auto;
+    auto.dsd = legacy_dsd_settings(DsdLowpassMethod::Auto, DsdToPcmGainMode::Disabled, 0.15, None);
 
     let source = SourceInfo {
+        dsd_source_kind: None,
+
         format: AudioFormat::Dsf,
         codec: AudioCodec::Dsd,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -727,6 +792,10 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
     };
 
     let req_auto = PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.dsf"),
         output_path: PathBuf::from("out.flac"),
         source: source.clone(),
@@ -736,7 +805,7 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
     };
 
     let mut ultra = req_auto.clone();
-    ultra.settings.dsd.dsd_to_pcm_lowpass = DsdLowpassMethod::SoxUltra;
+    ultra.settings.dsd = legacy_dsd_settings(DsdLowpassMethod::SoxUltra, DsdToPcmGainMode::Disabled, 0.15, None);
 
     let auto_plan = plan_conversion(&req_auto).unwrap();
     let ultra_plan = plan_conversion(&ultra).unwrap();
@@ -752,6 +821,8 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
 #[test]
 fn dsd_source_rejects_pcm_bit_depth_fact() {
     let source = SourceInfo {
+        dsd_source_kind: None,
+
         format: AudioFormat::Dsf,
         codec: AudioCodec::Dsd,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -836,17 +907,28 @@ fn passthrough_plan_includes_atomic_work_path_and_cleanup() {
 }
 
 #[test]
-fn non_finite_dsd_gain_is_rejected() {
-    let mut settings = PipelineSettings::default();
-    settings.dsd.dsd_to_pcm_gain_db = Some(f32::NAN);
-    let req = request(settings);
-    assert!(matches!(
-        plan_conversion(&req),
-        Err(PlanningError::InvalidSettings {
-            field: "dsd.dsd_to_pcm_gain_db",
-            ..
-        })
-    ));
+fn non_finite_legacy_dsd_gain_is_rejected_at_wire_boundary() {
+    let encoded = r#"{
+        "noise_shaper":"Clans",
+        "modulator_order":"Order8",
+        "trellis":null,
+        "pcm_to_dsd_filter":"Auto",
+        "dsd_to_pcm_lowpass":"Auto",
+        "dsd_to_pcm_gain_mode":"Manual",
+        "dsd_to_pcm_auto_gain_margin_db":0.15,
+        "dsd_to_pcm_gain_db":1e400,
+        "sinc":{
+            "oversample_factor":8,
+            "taps":65536,
+            "passband_hz":20000.0,
+            "transition_hz":1000.0,
+            "kaiser_beta":14.0,
+            "linear_phase":true,
+            "allow_aliasing":false
+        },
+        "gain_compensation":"Auto"
+    }"#;
+    assert!(serde_json::from_str::<DsdSettings>(encoded).is_err());
 }
 
 #[test]
@@ -951,6 +1033,8 @@ fn metadata_pruning_updates_later_verify_input() {
 #[test]
 fn dsd_source_rejects_bit_depth_even_without_sample_kind() {
     let source = SourceInfo {
+        dsd_source_kind: None,
+
         format: AudioFormat::Dsf,
         codec: AudioCodec::Dsd,
         sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -986,15 +1070,22 @@ fn ssrc_force_without_rate_change_is_rejected() {
 }
 
 fn dsd_request_for(format: AudioFormat, depth: PcmBitDepth, extension: &str) -> PlanRequest {
+
     let mut settings = PipelineSettings::default();
     settings.target_format = format;
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
     settings.force_encode = true;
     PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.dsf"),
         output_path: PathBuf::from(format!("out.{extension}")),
         source: SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Dsf,
             codec: AudioCodec::Dsd,
             sample_rate_hz: Some(DsdRate::Dsd64.hz()),
@@ -1019,9 +1110,15 @@ fn source_resolved_int32_alac_is_rejected_through_public_planner() {
     settings.target_bit_depth = BitDepthTarget::Source;
     settings.force_encode = true;
     let req = PlanRequest {
+        resolved_output_target: None,
+        reference_programme_scope: Default::default(),
+        planned_riff_non_audio_upper_bound_bytes: None,
+
         input_path: PathBuf::from("in.wav"),
         output_path: PathBuf::from("out.m4a"),
         source: SourceInfo {
+            dsd_source_kind: None,
+
             format: AudioFormat::Wav,
             codec: AudioCodec::PcmSigned,
             sample_rate_hz: Some(96_000),

@@ -70,9 +70,11 @@ The crate root re-exports the public items from these modules.
 - `SsrcSettings`: `force`, `insane_mode`, `profile`
 - `SoxResamplerSettings`: `chebyshev`, `bandwidth_pct`, `phase`, `allow_aliasing`, `sinc_taps`, `sinc_attenuation_db`, `sinc_passband_hz`, `sinc_transition_hz`, `sinc_kaiser_beta`, `sinc_phase`
 - `SoxrResamplerSettings`: `chebyshev`, `cutoff`, `phase`
-- `DsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `pcm_to_dsd_filter`, `dsd_to_pcm_lowpass`, `dsd_to_pcm_gain_db`, `sinc`, `gain_compensation`
+- `DsdSettings`: `pcm_to_dsd`, `from_dsd`; legacy-v1 origin and wire are private compatibility state
+- `PcmToDsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `filter`, `sinc`, `gain_compensation`
+- `DsdSourceSettings`: `pathway`, `reference_policy`, `profile`, `gain_mode`, `fixed_gain_db`, `normalize_peak_target_dbfs`
 - `TrellisSettings`: `lookahead`, `nodes`, `latency`
-- `SincFilterSettings`: `oversample_factor`, `taps`, `passband_hz`, `transition_hz`, `kaiser_beta`, `linear_phase`, `allow_aliasing`
+- `PcmToDsdSincSettings`: `oversample_factor`, `taps`, `passband_hz`, `transition_hz`, `kaiser_beta`, `linear_phase`, `allow_aliasing`
 - `MetadataSettings`: `transfer_tags`, `preserve_artwork`, `store_source_audio_md5` (validated against target-aware built-in tag/artwork support)
 - `VerificationSettings`: `verify_after_encode`, `prefer_native_flac_verify`
 - `ReplayGainSettings`: `mode`, `prevent_clipping` (built-in support is target-aware)

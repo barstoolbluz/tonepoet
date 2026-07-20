@@ -1245,4 +1245,37 @@ mod tests {
             assert_eq!(rate.frame_bits_per_channel().unwrap(), bytes_per_channel * 8);
         }
     }
+
+    #[test]
+    fn pinned_stereo_dst_fixtures_decode_byte_exact() {
+        use sha2::{Digest as _, Sha256};
+
+        const CASES: [(&[u8], &[u8], &str, &str); 3] = [
+            (
+                include_bytes!("fixtures/frame_001.dst.bin"),
+                include_bytes!("fixtures/frame_001.dsd.bin"),
+                "a788eb38dd9cf5bf5313ed521dabca62107332e2ffa02bc0943384fe5b1e87e4",
+                "4ba636974ba4217e348137a0ff9dda2df3f5ec1d80df03ad71c369a7a4f45ef7",
+            ),
+            (
+                include_bytes!("fixtures/frame_002.dst.bin"),
+                include_bytes!("fixtures/frame_002.dsd.bin"),
+                "fd77fa6f66e793eb309963fcda75fecbd5927dd816538d158d3440359c40efc9",
+                "d138a1d886e52c6fcd741d3eaf7ffe482b1bcb460e7a10062fa78bdf6e48d913",
+            ),
+            (
+                include_bytes!("fixtures/frame_003.dst.bin"),
+                include_bytes!("fixtures/frame_003.dsd.bin"),
+                "9a788271fa0893b190ea180d47bf14019612b6f97c9680f71e80df41982ee921",
+                "506f08c2eb6c82cd5ead58328f6b9a77c2676a391c49b90782ac3cda3fa4ff21",
+            ),
+        ];
+
+        for (encoded, expected, encoded_sha256, decoded_sha256) in CASES {
+            assert_eq!(format!("{:x}", Sha256::digest(encoded)), encoded_sha256);
+            assert_eq!(format!("{:x}", Sha256::digest(expected)), decoded_sha256);
+            let actual = decode_frame(encoded, 2).expect("pinned DST fixture must decode");
+            assert_eq!(actual.as_slice(), expected);
+        }
+    }
 }

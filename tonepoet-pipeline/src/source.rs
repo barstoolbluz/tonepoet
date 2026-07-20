@@ -1,5 +1,6 @@
 //! Source facts supplied by the caller after probing or extraction.
 
+use crate::dsd_reference::DsdSourceKind;
 use crate::enums::{AudioCodec, AudioFormat, DsdRate, PcmBitDepth, SampleKind};
 use crate::error::{PlanningError, Result};
 use std::time::Duration;
@@ -59,6 +60,9 @@ pub struct SourceInfo {
     pub channels: Option<u16>,
     /// Duration when known.
     pub duration: Option<Duration>,
+    /// Qualified DSD container/front-end facts when the source is DSD.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dsd_source_kind: Option<DsdSourceKind>,
     /// Optional source-audio MD5 supplied by the caller when MD5 tagging is requested.
     pub audio_md5: Option<String>,
 }

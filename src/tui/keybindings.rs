@@ -30099,7 +30099,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::NoiseShaperPill(_)
             | TuiButton::ModulatorOrderPill(_)
             | TuiButton::ConversionPresetPill(_)
-            | TuiButton::DsdGainPill(_) => {
+            | TuiButton::DsdPathPill(_)
+            | TuiButton::DsdProfilePill(_)
+            | TuiButton::DsdGainPill(_)
+            | TuiButton::DsdGainDbField
+            | TuiButton::DsdNormalizeTargetField => {
                 app.convert.focus = ConvertFocus::Format;
                 if super::format_interactions::handle_convert_format_button(&mut app.convert, button) {
                     app.preset.mark_modified();
@@ -30110,6 +30114,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 let containers = app.convert.format.format.selected_value().available_containers();
                 if i < containers.len() && containers[i].enabled {
                     app.convert.format.selected_container_index = i;
+                    app.convert.format.reference_target_confirmed = true;
                     app.preset.mark_modified();
                 }
             }

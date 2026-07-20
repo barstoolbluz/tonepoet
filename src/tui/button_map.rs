@@ -33,7 +33,11 @@ pub enum TuiButton {
     NoiseShaperPill(usize),
     ModulatorOrderPill(usize),
     ConversionPresetPill(usize),
+    DsdPathPill(usize),
+    DsdProfilePill(usize),
     DsdGainPill(usize),
+    DsdGainDbField,
+    DsdNormalizeTargetField,
     MergePill(usize),
     ForceEncodePill(usize),
     DiscSubfoldersPill(usize),
@@ -464,7 +468,11 @@ impl TuiButton {
             | Self::NoiseShaperPill(_)
             | Self::ModulatorOrderPill(_)
             | Self::ConversionPresetPill(_)
+            | Self::DsdPathPill(_)
+            | Self::DsdProfilePill(_)
             | Self::DsdGainPill(_)
+            | Self::DsdGainDbField
+            | Self::DsdNormalizeTargetField
             | Self::MergePill(_)
             | Self::ForceEncodePill(_)
             | Self::DiscSubfoldersPill(_)
