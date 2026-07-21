@@ -727,11 +727,18 @@ before returning — a missing function should not reach us.
 `derive_dsd_reference_v14_*.py --check` fails post-v15:
 `planner: missing '"qualification/dsd_reference_sox_ng_14_8_0_1_v14.json"'`.
 Every previous generation kept ALL historical checkers green
-simultaneously (v9/v10/v11 verified together earlier). Either v15
-wrongly removed something v14 legitimately pins, or v14's checker
-wrongly asserts currency (that the planner embeds v14) rather than
-history. Fix whichever violates your append-only rules and state the
-lineage contract explicitly: every historical checker must pass forever.
+simultaneously (v9/v10/v11 verified together earlier). Diagnosed
+precisely: every other v14 marker still passes (V14_KEY, SoxNg14801V14,
+the 16x oversample constants, the sox-stats parser identifiers) — the
+ONLY failing marker is the embedded-artifact path
+`"qualification/dsd_reference_sox_ng_14_8_0_1_v14.json"`, which every
+successor policy must necessarily repoint (the planner now embeds
+v15's). A historical checker asserting the CURRENT embed path is an
+inherently non-append-only assertion. Fix: historical checkers assert
+their own persistent artifacts/constants, never the current embed
+pointer (and audit v15's checker so it does not repeat the pattern);
+state the lineage contract explicitly: every historical checker must
+pass forever.
 
 ### F9.2 — crossed-carrier contract validation no longer rejects a crossed producer input (REAL protection gap)
 
