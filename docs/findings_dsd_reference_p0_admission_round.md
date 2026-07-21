@@ -552,49 +552,74 @@ No decoder, analyzer, packaging, terminal, metadata, source-admission, or
 product-exposure scope changed.
 
 
-## F8 (v13 round) — analyzer under-reads stream-head peaks: oversampling filter warm-up, measured 3.007 dB
+## F8 (v13 round) — loudnorm performs NO inter-sample oversampling at high input rates: dBTP degrades to sample peak at ≥192 kHz
 
-Your v13 header-authority correction is applied and verified: the
-constant matches the measured 58-byte layout, the v13 checker is green,
-suite 4,613/0, live smoke passes, zero cold warnings, and the
-qualification battery now runs 1,159 s with 4 of 5 tests passing —
-including the new header-authority test. The remaining failure is in
-your analyzer accuracy sweep (`tests/dsd_reference_qualification.rs:4277`):
+Your v13 header-authority correction is applied and verified (constant
+matches the measured 58; v13 checker green; suite 4,613/0; smoke green;
+zero cold warnings; qualification 4/5 at 1,159 s). The remaining sweep
+failure (`tests/dsd_reference_qualification.rs:4277`, under-report
+3.007 dB at rate=192000, normalized_frequency=0.25, phase=π/4,
+position=early) has been mechanistically isolated on this toolchain —
+and the first hypothesis (filter warm-up) was tested and REFUTED, so do
+not pursue it:
 
 ```text
-loudnorm under-report 3.007000000 dB exceeded Q+E authority:
-rate=192000, channels=1, normalized_frequency=0.25,
-phase=0.7853981633974483, duration=0.125, position=early,
-level=-120.003
+fs/4 sine, phase π/4, amplitude 0.5 (analytic true peak −6.02 dBFS,
+sample maximum −9.03 dBFS = A·sin(π/4)):
+
+fed to loudnorm at 48 kHz:   input_tp = −5.42   (inter-sample detected)
+fed to loudnorm at 96 kHz:   input_tp = −5.42   (inter-sample detected)
+fed to loudnorm at 192 kHz:  input_tp = −9.03   (EXACTLY the sample max)
+
+isolated −6.02 dBFS single-sample peak at stream position 5, 192 kHz:
+input_tp = −6.02 — head position alone measures fine (warm-up refuted).
 ```
 
-Mechanism (consistent with all sweep evidence): `position=early` places
-the analytic peak at the head of the stream, inside the true-peak
-oversampling filter's warm-up window — a polyphase upsampler attenuates
-content before its taps are primed, so stream-head peaks are
-under-measured. The error is level-independent (the −120 dBFS fixture
-level is incidental; the deltas are in dB) and cannot be covered by any
-per-sample reporting/error bound: it is a boundary effect, exactly the
-finite-stream start/end behavior class your own evidence (v5 §9)
-requires qualifying.
+The behavior is rate-dependent and does NOT follow a simple threshold —
+the same normalized-fs/4 raw stream measured at every rate (analytic
+true peak −6.02, sample max −9.03):
+
+```text
+ 48,000 Hz: −5.42   inter-sample reconstruction working
+ 96,000 Hz: −5.42   working
+176,400 Hz: −5.94   working (mild under-read, near truth)
+192,000 Hz: −9.03   EXACTLY the sample peak — no reconstruction at all
+352,800 Hz: −3.58   OVER-read by 2.4 dB (content at 88.2 kHz here rides
+                    the analyzer's internal-resampling edge; over-read
+                    is at least ceiling-conservative, but unqualified)
+```
+
+So the measured degenerate case is exactly-192 kHz input (sample peak
+only — 3.007 dB blind spot for B5-passband content, matching your
+sweep), 176.4 kHz measured acceptable on this fixture, and 352.8 kHz
+exhibits a third behavior needing its own characterization. Do not
+trust any internal-target threshold story, including this note's:
+qualify each enabled target rate empirically with fixed-frequency
+in-band fixtures (the matrix above varies frequency with rate since it
+reuses one normalized-fs/4 stream). Low rates (44.1–96 kHz) measured
+unaffected.
 
 Resolution shapes, your choice with rationale under append-only rules:
 
-1. **Prime the filter (recommended shape):** the streamed producer
-   prepends a fixed run of digital-silence frames before the real
-   stream (and the direct route uses an equivalent primed measurement
-   path if available). Prepending true silence cannot raise or lower
-   the stream's true peak, so the measurement contract is unchanged
-   while the warm-up window never overlaps real content. Freeze the
-   padding length from the filter geometry (derive from the pinned
-   loudnorm/swresample oversampling filter length, then verify with the
-   sweep), extend the sweep to prove head-positioned peaks now measure
-   within Q+E, and mint the policy.
-2. Exclude a stated warm-up window from the qualified claim and reject
-   or pad plans whose content could place authoritative peaks inside
-   it — weaker, and interacts with programme boundaries; justify if
-   chosen over (1).
+1. **Qualified pre-oversampling producer:** extend the typed producer
+   stage to upsample the measurement view (e.g. SoX `rate` ×4, a
+   qualified resampler you already pin) before loudnorm, so the
+   consumer's sample peak approximates true peak with a derivable
+   residual bound (bandlimited content at 4× headroom); fold that
+   residual into Q/E with a derivation, and extend the sweep to prove
+   the high-rate cells within authority. Measurement-only: the audio
+   chain is untouched.
+2. **Per-cell analytic bound:** after the Reference profile sinc, the
+   signal is bandlimited to the profile stopband; where
+   stopband/Nyquist is small (e.g. 70 kHz/176.4 kHz), the maximum
+   inter-sample overshoot above sample peak is analytically boundable
+   and could be folded into the per-cell authority — but at B5's
+   48 kHz passband on a 192 kHz target the ratio permits the full
+   ~3 dB, so this shape alone cannot rescue those cells; justify any
+   hybrid precisely.
+3. A different qualified true-peak analyzer route with rate-independent
+   oversampling, if you can attest one within the pinned closure.
 
-Do not widen Q+E to absorb a boundary effect — 3 dB would gut the
-ceiling authority. The tail (`position=late`) symmetric case should be
-swept too while you are in there (flush/drain behavior).
+Do not widen Q+E; do not let dBTP silently mean sample peak at any
+enabled cell. Extend the sweep to cover the tail position and the
+352.8/384 kHz cells under whatever shape you choose.
