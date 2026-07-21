@@ -1,7 +1,7 @@
 # Current DSD Reference P0 Handoff
 
 **Date:** 2026-07-21
-**Current candidate policy:** `sox_ng_14_8_0_1_v12`
+**Current candidate policy:** `sox_ng_14_8_0_1_v13`
 **Runtime exposure:** fail-closed until promotion; ordinary defaults remain exact legacy behavior
 **Supersedes:** all earlier `handoff_dsd_reference_p0_*` snapshots for current-state claims
 
@@ -29,7 +29,7 @@ FFmpeg direct decode                         input_tp 166.64
 SoX W64 decode -> f64 WAV stream -> FFmpeg input_tp -20.00
 ```
 
-The two carrier depths require opposite measurement routes. Policy v12 inherits v6's frozen analyzer contract:
+The two carrier depths require opposite measurement routes. Policy v13 inherits v6's frozen analyzer contract:
 
 - R64 pre-final measurement: SoX f64-WAV stdout directly into FFmpeg stdin;
 - Float32 QPCM post-final measurement: direct path-backed W64 input to FFmpeg;
@@ -49,7 +49,7 @@ SoX:    -S -D <qpcm.w64> -t raw -e floating-point -b 64 -L -
 FFmpeg: -f f64le -ar <rate> -ac <channels> -i pipe:0 ... -c:a pcm_f64le -f wav [ -rf64 always ] <output>
 ```
 
-The packaging transport is headerless little-endian Float64 PCM over a direct stdout-to-stdin pipe. It introduces no disk-backed RIFF intermediate and does not itself impose RIFF's 4 GiB ceiling on RF64 or W64 delivery. Policy v12's separate streamed-WAV analyzer cap still applies to every Reference plan. Ordinary RIFF output also retains its final-container capacity admission.
+The packaging transport is headerless little-endian Float64 PCM over a direct stdout-to-stdin pipe. It introduces no disk-backed RIFF intermediate and does not itself impose RIFF's 4 GiB ceiling on RF64 or W64 delivery. Policy v13's corrected streamed-WAV analyzer cap still applies to every Reference plan. Ordinary RIFF output also retains its final-container capacity admission.
 
 The planner refuses to construct a one-process FFmpeg package command for Float64. The executor independently revalidates the exact producer and consumer tools, argv, typed endpoints, rate, channel count, target-specific RF64 flags, and environment before spawning the pipeline.
 
@@ -159,7 +159,7 @@ This includes carrier probes, direct decoded-sample hashes, both stages of Float
 - Float64 RIFF/RF64 uses the typed raw stream above.
 - Other non-W64 targets package from W64 QPCM through their qualified route.
 - Ordinary RIFF size admission applies to the final RIFF target.
-- Every Reference plan is admitted only when its required Float64 analyzer stream is bounded to at most 4,294,967,237 audio bytes.
+- Every Reference plan is admitted only when its required Float64 analyzer stream is bounded to at most 4,294,967,245 audio bytes; the largest whole-frame mono payload is 4,294,967,240 bytes.
 - The commissioned real-tool gate requires exact header fields at the largest frame-aligned admitted carrier, rejects the immediately following carrier, and scans the contiguous frame-aligned transition through the frozen 4 GiB + 8 witness to locate the actual first RIFF-field wrap.
 - At 768 kHz stereo, a five-minute programme remains below the cap; a six-minute programme is rejected with `DSD-REF-P0-025`. RF64 and W64 do not bypass this analyzer-carrier bound.
 - The public `-1.000000000 dBTP` ceiling is unchanged. Int24 and Float32 retain their v5 bounds; Float64 uses the corrected v8 signed-32-bit effects bound.
@@ -171,19 +171,21 @@ The shared same-directory FFmpeg rewrite primitive is an atomic content-and-attr
 
 ## Immutable policy identity
 
-Policy v12 is append-only. It inherits v11's runtime-bound metadata-mutator
-contract and all earlier numerical terminal bounds, package topology, decode
-routes, semantic plan normalization, and enabled audio-delivery cells. The new
-identity exists solely because F6 adds a fail-closed capacity boundary to the
-required unseekable Float64 WAV transport.
+Policy v13 is append-only. It inherits v12's runtime-bound metadata-mutator,
+production-route, container-preservation, sample-identity, W64-rejection,
+analyzer, terminal-bound, packaging, source-front-end, capacity-admission, and
+rewritten-file attribute authority. The new identity exists solely because F7
+corrects the measured streamed Float64 WAV header from 66 bytes to 58 bytes,
+its RIFF-size contribution from 58 bytes to 50 bytes, and the dependent
+capacity edge.
 
-Historical v1-v11 policy JSON, candidate, certification, and report artifacts
-remain byte-identical. The historical deterministic checkers are extended only
-to recognize v12 as the active successor while retaining their inherited
-policy assertions. New v12 current/candidate/report/certification artifacts and
-a deterministic v12 checker are present. The current and candidate v12
-manifests are byte-identical. V12 remains `qualification_candidate`; no
-promotion or release certification is claimed.
+Historical v1-v12 policy JSON, candidate, certification, report, and derivation
+artifacts remain byte-identical. V12's typed v2 evidence schema remains frozen
+with its historical constants; v13 adds a separate typed v3 evidence schema.
+New v13 current/candidate/report/certification artifacts and a deterministic
+v13 checker are present. The current and candidate v13 manifests are
+byte-identical. V13 remains `qualification_candidate`; no promotion or release
+certification is claimed.
 
 ## F2 legacy behavior inherited from the prior correction
 
@@ -195,7 +197,7 @@ Before promotion, a DSD source targeting PCM visibly exposes and executes the fr
 
 Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak remain hidden and disabled. Generic resampler and dither options remain available on the legacy route. Native-only selections are rejected rather than silently discarded. V4 preset acceptance/refusal behavior remains explicitly adjudicated and tested.
 
-## Source-level regressions retained through v12
+## Source-level regressions retained through v13
 
 - Float64 RIFF/RF64 plans contain the exact typed SoX-to-FFmpeg package pipeline.
 - Direct FFmpeg decoding of Float64 QPCM W64 is structurally forbidden.
@@ -218,18 +220,19 @@ Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak
 - The deterministic v12 checker binds the 32-bit streamed-WAV arithmetic,
   permanent modulo-wrap fixture, planner guard frame, `DSD-REF-P0-025`, and
   runtime report validation while forbidding the former sentinel/read-to-EOF claim.
+- The deterministic v13 checker freezes every v12 artifact, binds the measured
+  58-byte Float64 header, 50-byte RIFF-size contribution, corrected 4,294,967,245-byte
+  ceiling, nine-point boundary scan, typed v3 evidence, and current runtime identity.
 
 ## Required verification commands
 
+The v13 derivation checker freezes the complete v12 checker/artifact set and
+validates the inherited manifest fields before checking the corrected current
+source bindings. Historical checkers are not rerun against a newer active
+policy identity.
+
 ```text
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v5_terminal_bounds.py --check
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v6_terminal_bounds.py --check
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v7_terminal_bounds.py --check
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v8_terminal_bounds.py --check
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v9_metadata_admission.py --check
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v10_production_metadata.py --check
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v11_runtime_mutator_binding.py --check
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v12_streamed_wav_capacity.py --check
+python3 tonepoet-pipeline/qualification/derive_dsd_reference_v13_streamed_wav_header.py --check
 cargo fmt -p tonepoet -p tonepoet-pipeline -p sacd-rs -- --check
 cargo test -p tonepoet-pipeline
 cargo test -p sacd-rs
@@ -238,7 +241,7 @@ cargo test --workspace
 cargo clippy -p tonepoet -p tonepoet-pipeline -p sacd-rs \
   --all-targets --all-features -- -D warnings
 TONEPOET_REQUIRE_TOOLS=1 \
-TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_certification.json" \
+TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_certification.json" \
   cargo test -p tonepoet --test dsd_reference_qualification -- --nocapture
 ```
 
@@ -255,7 +258,7 @@ produce matching source/delivered identities while direct FFmpeg decode of the W
 The environment does not provide Cargo, rustc, rustfmt, Clippy, Nix, Flox, or
 the pinned SoX-ng 14.8.0.1 closure. Therefore Rust compilation, formatting, workspace tests, Clippy, pinned-tool
 qualification, live smoke, and release certification could not be executed here.
-V12 remains fail-closed and unpromoted.
+V13 remains fail-closed and unpromoted.
 
 ## V11/F5 runtime completion: certified mutator identity is executed
 
@@ -321,3 +324,25 @@ precedence. RF64, W64, and other containers remain subject to the analyzer
 stream cap. A later lift requires a new append-only policy backed by a corrected
 SoX-ng pin and renewed closure/behavior qualification, or by an independently
 qualified sample-exact transport beyond 4 GiB.
+
+## V13/F7 completion: measured Float64 streamed-WAV header
+
+F7 established that the reachable streamed Float64 WAV carrier has a 58-byte
+header: 12 bytes of RIFF/WAVE framing, an 8+18-byte IEEE-float `fmt` chunk, an
+8+4-byte `fact` chunk, and an 8-byte `data` header. Because the RIFF size field
+excludes the leading eight bytes, the fixed RIFF-size contribution is 50 bytes,
+not 58. The separately measured 80-byte Int24 streamed header is unreachable in
+this contract and is not introduced into policy.
+
+Policy v13 therefore admits an unaligned payload up to
+`u32::MAX - 50 = 4,294,967,245` bytes. The largest whole mono Float64 frame
+payload is 4,294,967,240 bytes (536,870,905 frames); the next payload,
+4,294,967,248 bytes, is rejected with `DSD-REF-P0-025`. The contiguous real-tool
+scan contains nine frame-aligned observations through the existing 4 GiB + 8
+byte witness.
+
+V12 and its checker, manifests, certification stub, and report remain
+byte-identical. Its v2 evidence type retains the historical 66-byte header and
+58-byte RIFF contribution. V13 uses a separate v3 evidence type and current
+runtime binding. No route, tool, metadata, analyzer, terminal, admission-scope,
+or enabled-cell behavior changed.

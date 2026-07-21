@@ -219,7 +219,7 @@ fn native_v2_immutable_identity_fields_are_serialized_and_hashed() {
     assert_eq!(encoded["dsd"]["schema_version"], 2);
     assert_eq!(
         encoded["dsd"]["from_dsd"]["reference_policy"],
-        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V12).unwrap()
+        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V13).unwrap()
     );
 
     // These fields have one legal P0 value. Pin their exact snapshot tokens so
@@ -227,4 +227,9 @@ fn native_v2_immutable_identity_fields_are_serialized_and_hashed() {
     let snapshot = settings_snapshot_fingerprint_v2(&settings);
     let expected = settings_snapshot_fingerprint_v2(&round_trip(&settings));
     assert_eq!(snapshot, expected);
+
+    assert_eq!(
+        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V12).unwrap(),
+        serde_json::Value::String("sox_ng_14_8_0_1_v12".to_string()),
+    );
 }

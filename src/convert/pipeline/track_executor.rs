@@ -1508,9 +1508,9 @@ fn validate_embedded_release_certification(
     let certification = &manifest.release_certification;
     if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
         || certification.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_certification.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_certification.json"
         || certification.candidate_manifest_path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_candidate.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_candidate.json"
     {
         return Err(reference_toolchain_error(
             "the embedded release-certification descriptor is not canonical",
@@ -1518,7 +1518,7 @@ fn validate_embedded_release_certification(
     }
     let report_sha256 = certification.report_sha256.as_deref().ok_or_else(|| {
         reference_toolchain_error(
-            "the embedded v12 policy has not bound a release-certification report",
+            "the embedded v13 policy has not bound a release-certification report",
         )
     })?;
     let candidate_manifest_sha256 = certification
@@ -1526,20 +1526,20 @@ fn validate_embedded_release_certification(
         .as_deref()
         .ok_or_else(|| {
             reference_toolchain_error(
-                "the embedded v12 policy has not bound its qualified candidate manifest",
+                "the embedded v13 policy has not bound its qualified candidate manifest",
             )
         })?;
     let current_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
     ));
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_certification.json"
     ));
     let candidate_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_candidate.json"
     ));
     let parse_digest = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -1563,13 +1563,13 @@ fn validate_embedded_release_certification(
     let mut normalized_current: serde_json::Value =
         serde_json::from_slice(current_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded current v12 manifest is invalid JSON: {error}"
+                "the embedded current v13 manifest is invalid JSON: {error}"
             ))
         })?;
     let candidate_value: serde_json::Value =
         serde_json::from_slice(candidate_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded preserved v12 candidate is invalid JSON: {error}"
+                "the embedded preserved v13 candidate is invalid JSON: {error}"
             ))
         })?;
     if candidate_value.get("status").and_then(serde_json::Value::as_str)
@@ -1582,7 +1582,7 @@ fn validate_embedded_release_certification(
             .is_none_or(|value| !value.is_null())
     {
         return Err(reference_toolchain_error(
-            "the preserved v12 candidate is not the canonical unpromoted policy snapshot",
+            "the preserved v13 candidate is not the canonical unpromoted policy snapshot",
         ));
     }
     normalized_current["status"] =
@@ -1593,7 +1593,7 @@ fn validate_embedded_release_certification(
         serde_json::Value::Null;
     if normalized_current != candidate_value {
         return Err(reference_toolchain_error(
-            "the promoted v12 manifest differs from its qualified candidate outside the permitted certification fields",
+            "the promoted v13 manifest differs from its qualified candidate outside the permitted certification fields",
         ));
     }
     let report: serde_json::Value = serde_json::from_slice(report_bytes).map_err(|error| {
@@ -1601,9 +1601,9 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report is invalid JSON: {error}"
         ))
     })?;
-    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(12)
+    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(13)
         || report.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V12_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V13_KEY)
         || report.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || report.get("outcome").and_then(serde_json::Value::as_str) != Some("pass")
         || report
@@ -1612,7 +1612,7 @@ fn validate_embedded_release_certification(
             != Some(candidate_manifest_sha256)
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report does not bind the qualified v12 candidate",
+            "the embedded release-certification report does not bind the qualified v13 candidate",
         ));
     }
     for required in [
@@ -1945,7 +1945,7 @@ fn validate_embedded_release_certification(
         .get("f1_reference_gain_regression")
         .and_then(serde_json::Value::as_object);
     let streamed_capacity: Option<
-        tonepoet_pipeline::ReferenceStreamedWavCapacityEvidenceV2,
+        tonepoet_pipeline::ReferenceStreamedWavCapacityEvidenceV3,
     > = carrier
         .get("streamed_wav_capacity")
         .and_then(|value| serde_json::from_value(value.clone()).ok());
@@ -2230,7 +2230,7 @@ fn validate_embedded_release_certification(
             .and_then(|value| value.get("package_argv"))
             .and_then(serde_json::Value::as_array)
             .is_none_or(Vec::is_empty)
-        || streamed_capacity.as_ref().is_none_or(|value| !value.is_canonical_v12())
+        || streamed_capacity.as_ref().is_none_or(|value| !value.is_canonical_v13())
         || report.get("streamed_wav_capacity") != carrier.get("streamed_wav_capacity")
         || report.get("streamed_wav_capacity_policy") != Some(&streamed_capacity_policy)
     {
@@ -2970,7 +2970,7 @@ fn validate_embedded_release_certification(
         {
             return Err(reference_toolchain_error(format!(
                 "the embedded release-certification report decode route {key} disagrees \
-                 with the compiled v12 authority",
+                 with the compiled v13 authority",
             )));
         }
     }
@@ -3104,7 +3104,7 @@ fn validate_embedded_reference_policy_tables(
             != "ffmpeg_direct_decode_of_float64_qpcm_w64"
     {
         return Err(reference_toolchain_error(
-            "embedded Float64 package contract disagrees with the compiled v12 policy",
+            "embedded Float64 package contract disagrees with the compiled v13 policy",
         ));
     }
     let direct_route = ReferenceDecodeMechanism::DirectFfmpeg.key();
@@ -3200,7 +3200,7 @@ fn validate_embedded_reference_policy_tables(
             != "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
     {
         return Err(reference_toolchain_error(
-            "embedded decoded-sample identity contract disagrees with the compiled v12 policy",
+            "embedded decoded-sample identity contract disagrees with the compiled v13 policy",
         ));
     }
     if manifest.subprocess_environment.schema
@@ -3254,7 +3254,7 @@ fn validate_embedded_reference_policy_tables(
             != "append_only_policy_with_corrected_sox_ng_pin_or_independently_qualified_transport"
     {
         return Err(reference_toolchain_error(
-            "embedded streamed-WAV capacity contract disagrees with the compiled v12 policy",
+            "embedded streamed-WAV capacity contract disagrees with the compiled v13 policy",
         ));
     }
 
@@ -3315,7 +3315,7 @@ fn validate_embedded_reference_policy_tables(
             != "sox_ng_14_8_0_1_misscales_its_float32_w64_on_decode"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v12 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v13 policy",
         ));
     }
     if manifest.analyzer.qualification_schema
@@ -3374,7 +3374,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.analyzer.aligned_multitone_duration_seconds != "0.250000000"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v12 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v13 policy",
         ));
     }
 
@@ -3489,7 +3489,7 @@ fn validate_embedded_reference_policy_tables(
     validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
     if b6.enabled {
         return Err(reference_toolchain_error(
-            "embedded B6 profile must remain typed but disabled under policy v12",
+            "embedded B6 profile must remain typed but disabled under policy v13",
         ));
     }
 
@@ -3581,7 +3581,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -3616,7 +3616,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -4042,17 +4042,17 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
     ));
     let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
         reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
     })?;
-    if manifest.schema_version != 12
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V12_KEY
+    if manifest.schema_version != 13
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V13_KEY
         || manifest.status != "qualified_release"
     {
         return Err(reference_toolchain_error(
-            "the embedded policy artifact is not a qualified v12 release",
+            "the embedded policy artifact is not a qualified v13 release",
         ));
     }
     let certified_metadata_mutators = validate_embedded_release_certification(&manifest)?;
@@ -6650,7 +6650,7 @@ fn validate_reference_package_pipeline(
     summary: &DsdReferencePlanSummary,
     pipeline: &PlannedCommandPipeline,
 ) -> Result<(), TrackExecutionError> {
-    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V12
+    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V13
         || summary.final_pcm.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64
         || !matches!(
             summary.target,
@@ -6661,7 +6661,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v12 package pipeline is bound to an invalid plan cell"
+                "Reference policy v13 package pipeline is bound to an invalid plan cell"
                     .to_string(),
             ),
             Vec::new(),
@@ -6695,7 +6695,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v12 package pipeline has a noncanonical SoX producer"
+                "Reference policy v13 package pipeline has a noncanonical SoX producer"
                     .to_string(),
             ),
             Vec::new(),
@@ -6746,7 +6746,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v12 package pipeline has a noncanonical FFmpeg consumer"
+                "Reference policy v13 package pipeline has a noncanonical FFmpeg consumer"
                     .to_string(),
             ),
             Vec::new(),
@@ -6829,7 +6829,7 @@ fn validate_reference_measurement_contract(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v12 measurement has a noncanonical FFmpeg analyzer command"
+                "Reference policy v13 measurement has a noncanonical FFmpeg analyzer command"
                     .to_string(),
             ),
             Vec::new(),
@@ -6840,7 +6840,7 @@ fn validate_reference_measurement_contract(
         let carrier = producer.input.as_path().ok_or_else(|| {
             TrackExecutionError::new(
                 ConvertError::Backend(
-                    "Reference policy v12 streamed measurement requires a path-backed W64 carrier"
+                    "Reference policy v13 streamed measurement requires a path-backed W64 carrier"
                         .to_string(),
                 ),
                 Vec::new(),
@@ -6870,7 +6870,7 @@ fn validate_reference_measurement_contract(
         {
             return Err(TrackExecutionError::new(
                 ConvertError::Backend(
-                    "Reference policy v12 measurement has a noncanonical typed SoX-to-FFmpeg f64 pipe contract"
+                    "Reference policy v13 measurement has a noncanonical typed SoX-to-FFmpeg f64 pipe contract"
                         .to_string(),
                 ),
                 Vec::new(),
@@ -6882,7 +6882,7 @@ fn validate_reference_measurement_contract(
     let carrier = measurement.command.input.as_path().ok_or_else(|| {
         TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v12 direct measurement requires a path-backed Float32 W64 carrier"
+                "Reference policy v13 direct measurement requires a path-backed Float32 W64 carrier"
                     .to_string(),
             ),
             Vec::new(),
@@ -6903,7 +6903,7 @@ fn validate_reference_measurement_contract(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v12 measurement has a noncanonical direct Float32-W64 FFmpeg contract"
+                "Reference policy v13 measurement has a noncanonical direct Float32-W64 FFmpeg contract"
                     .to_string(),
             ),
             Vec::new(),
@@ -8162,10 +8162,34 @@ mod tests {
     }
 
     #[test]
+    fn historical_v12_streamed_wav_capacity_schema_remains_linked() {
+        let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_candidate.json"
+        )))
+        .expect("historical v12 candidate JSON parses");
+        assert_eq!(manifest.schema_version, 12);
+        assert_eq!(
+            manifest.policy,
+            tonepoet_pipeline::DSD_REFERENCE_POLICY_V12_KEY,
+        );
+        assert_eq!(manifest.streamed_wav_capacity.riff_size_overhead_bytes, 58);
+        assert_eq!(
+            manifest.streamed_wav_capacity.max_audio_payload_bytes,
+            4_294_967_237,
+        );
+
+        let validator: fn(
+            &tonepoet_pipeline::ReferenceStreamedWavCapacityEvidenceV2,
+        ) -> bool = tonepoet_pipeline::ReferenceStreamedWavCapacityEvidenceV2::is_canonical_v12;
+        let _ = validator;
+    }
+
+    #[test]
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -8181,7 +8205,7 @@ mod tests {
         let mut reserve_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
             )))
             .expect("embedded Reference qualification JSON parses for drift test");
         reserve_drift.analyzer.reporting_uncertainty_db =
@@ -8198,7 +8222,7 @@ mod tests {
         let mut streamed_capacity_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
             )))
             .expect("embedded Reference qualification JSON parses for capacity drift test");
         streamed_capacity_drift.streamed_wav_capacity.max_audio_payload_bytes += 1;
@@ -8214,7 +8238,7 @@ mod tests {
         let mut hash_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
             )))
             .expect("embedded Reference qualification JSON parses for hash-contract drift test");
         hash_contract_drift.sample_identity.hash_format =
@@ -8231,7 +8255,7 @@ mod tests {
         let mut route_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
             )))
             .expect("embedded Reference qualification JSON parses for route-contract drift test");
         route_contract_drift
@@ -8249,9 +8273,9 @@ mod tests {
 
         let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_candidate.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_candidate.json"
         )))
-        .expect("preserved v12 candidate JSON parses");
+        .expect("preserved v13 candidate JSON parses");
         assert_eq!(
             candidate
                 .terminal_bounds

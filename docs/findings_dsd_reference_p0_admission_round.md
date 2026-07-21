@@ -527,3 +527,74 @@ constants such as the RIFF-size overhead) from the measured layout,
 and mint the correction under your append-only rules.
 Everything else in the v12 capacity contract verified against the real
 binary.
+
+### F7 resolution (policy v13 candidate, 2026-07-21)
+
+Resolved without reinterpreting policy v12. The reachable SoX-ng 14.8.0.1
+streamed Float64 WAV header is frozen at the measured 58 bytes. Because the
+RIFF size field excludes the leading eight bytes, policy v13 uses a 50-byte
+RIFF-size contribution and an unaligned maximum audio payload of
+4,294,967,245 bytes. The largest whole mono Float64 frame payload is
+4,294,967,240 bytes; the immediately following 4,294,967,248-byte payload is
+rejected with `DSD-REF-P0-025`. The contiguous boundary scan now contains nine
+frame-aligned observations through the unchanged 4 GiB + 8 byte wrap witness.
+
+The correction is append-only. Every v12 derivation, JSON manifest, candidate,
+certification stub, and report remains byte-identical. The historical typed v2
+capacity-evidence contract retains v12's 66-byte-header/58-byte-overhead values;
+v13 introduces a separate `ReferenceStreamedWavCapacityEvidenceV3` contract
+that binds the measured 58-byte header, 50-byte overhead, corrected arithmetic,
+and nine-point scan. Current policy/default/runtime bindings advance to v13,
+while release activation remains fail-closed until a passing schema-v13 pinned
+real-tool report is bound to the exact candidate manifest.
+
+No decoder, analyzer, packaging, terminal, metadata, source-admission, or
+product-exposure scope changed.
+
+
+## F8 (v13 round) — analyzer under-reads stream-head peaks: oversampling filter warm-up, measured 3.007 dB
+
+Your v13 header-authority correction is applied and verified: the
+constant matches the measured 58-byte layout, the v13 checker is green,
+suite 4,613/0, live smoke passes, zero cold warnings, and the
+qualification battery now runs 1,159 s with 4 of 5 tests passing —
+including the new header-authority test. The remaining failure is in
+your analyzer accuracy sweep (`tests/dsd_reference_qualification.rs:4277`):
+
+```text
+loudnorm under-report 3.007000000 dB exceeded Q+E authority:
+rate=192000, channels=1, normalized_frequency=0.25,
+phase=0.7853981633974483, duration=0.125, position=early,
+level=-120.003
+```
+
+Mechanism (consistent with all sweep evidence): `position=early` places
+the analytic peak at the head of the stream, inside the true-peak
+oversampling filter's warm-up window — a polyphase upsampler attenuates
+content before its taps are primed, so stream-head peaks are
+under-measured. The error is level-independent (the −120 dBFS fixture
+level is incidental; the deltas are in dB) and cannot be covered by any
+per-sample reporting/error bound: it is a boundary effect, exactly the
+finite-stream start/end behavior class your own evidence (v5 §9)
+requires qualifying.
+
+Resolution shapes, your choice with rationale under append-only rules:
+
+1. **Prime the filter (recommended shape):** the streamed producer
+   prepends a fixed run of digital-silence frames before the real
+   stream (and the direct route uses an equivalent primed measurement
+   path if available). Prepending true silence cannot raise or lower
+   the stream's true peak, so the measurement contract is unchanged
+   while the warm-up window never overlaps real content. Freeze the
+   padding length from the filter geometry (derive from the pinned
+   loudnorm/swresample oversampling filter length, then verify with the
+   sweep), extend the sweep to prove head-positioned peaks now measure
+   within Q+E, and mint the policy.
+2. Exclude a stated warm-up window from the qualified claim and reject
+   or pad plans whose content could place authoritative peaks inside
+   it — weaker, and interacts with programme boundaries; justify if
+   chosen over (1).
+
+Do not widen Q+E to absorb a boundary effect — 3 dB would gut the
+ceiling authority. The tail (`position=late`) symmetric case should be
+swept too while you are in there (flush/drain behavior).

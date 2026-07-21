@@ -46,7 +46,7 @@ use tonepoet_pipeline::{
     ReferenceDecodeMechanism, ReferenceDecodedCarrier, ReferenceDecodedCarrierSelector,
     ReferenceDecodedSampleRole, ReferenceDither, ReferenceErrorCode,
     ReferenceStreamedWavBoundaryObservationV2, ReferenceStreamedWavCapacityEvidenceV2,
-    ReferenceStreamedWavDataWrapWitnessV2,
+    ReferenceStreamedWavCapacityEvidenceV3, ReferenceStreamedWavDataWrapWitnessV2,
     ReferenceProgrammeScope, ReferenceSampleHashEncoding, ResolvedDsdProfile,
     ResolvedGainPolicy, ResolvedOutputTarget, SampleKind, SourceInfo, SourceRepresentationKind,
     ToolIdentifier, TruePeakMeasurement, TruePeakPurpose, TruePeakValue, WavPackMode,
@@ -69,6 +69,21 @@ const QUALIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn selected() -> bool {
     std::env::var(GATE).as_deref() == Ok("1")
+}
+
+#[test]
+fn historical_v12_streamed_wav_capacity_contract_remains_frozen() {
+    let transition_count = usize::try_from(
+        ReferenceStreamedWavCapacityEvidenceV2::expected_transition_count(),
+    )
+    .expect("historical v12 transition count fits usize");
+    assert_eq!(transition_count, 10);
+    assert_eq!(ReferenceStreamedWavCapacityEvidenceV2::STREAM_HEADER_BYTES, 66);
+    let identity = serde_json::json!({
+        "schema_version": 12,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V12_KEY,
+    });
+    assert_eq!(identity["policy"], "sox_ng_14_8_0_1_v12");
 }
 
 fn required_tool(variable: &str) -> PathBuf {
@@ -1768,7 +1783,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V12;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V13;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -2326,13 +2341,13 @@ fn capacity_boundary_plan_result(
     input: &Path,
     sample_frames: u64,
 ) -> tonepoet_pipeline::Result<ConversionPlan> {
-    const SAMPLE_RATE_HZ: u32 = ReferenceStreamedWavCapacityEvidenceV2::SAMPLE_RATE_HZ;
+    const SAMPLE_RATE_HZ: u32 = ReferenceStreamedWavCapacityEvidenceV3::SAMPLE_RATE_HZ;
     let mut settings = PipelineSettings::default();
     settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
     settings.target_format = target_format(ResolvedOutputTarget::WavW64);
     settings.target_sample_rate = RateTarget::PcmHz(SAMPLE_RATE_HZ);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V12;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V13;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
     settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Reference;
     let request = PlanRequest {
@@ -2756,19 +2771,19 @@ fn qualify_analyzer_carrier_contract() -> Value {
     require_sparse_file_support(&root);
     let bytes_per_sample = tonepoet_pipeline::REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE;
     let largest_admitted_payload =
-        ReferenceStreamedWavCapacityEvidenceV2::largest_frame_aligned_admitted_payload();
+        ReferenceStreamedWavCapacityEvidenceV3::largest_frame_aligned_admitted_payload();
     let first_policy_rejected_payload = largest_admitted_payload
         .checked_add(bytes_per_sample)
         .expect("first rejected payload arithmetic does not overflow");
-    let data_wrap_payload = ReferenceStreamedWavCapacityEvidenceV2::DATA_WRAP_PAYLOAD_BYTES;
+    let data_wrap_payload = ReferenceStreamedWavCapacityEvidenceV3::DATA_WRAP_PAYLOAD_BYTES;
     let transition_count = usize::try_from(
-        ReferenceStreamedWavCapacityEvidenceV2::expected_transition_count(),
+        ReferenceStreamedWavCapacityEvidenceV3::expected_transition_count(),
     )
     .expect("transition scan length fits usize");
-    assert_eq!(transition_count, 10);
+    assert_eq!(transition_count, 9);
 
-    let stream_header_bytes = ReferenceStreamedWavCapacityEvidenceV2::STREAM_HEADER_BYTES;
-    assert_eq!(stream_header_bytes, 66);
+    let stream_header_bytes = ReferenceStreamedWavCapacityEvidenceV3::STREAM_HEADER_BYTES;
+    assert_eq!(stream_header_bytes, 58);
 
     let mut transition_scan = Vec::with_capacity(transition_count);
     for offset_frames in 0..transition_count {
@@ -2832,7 +2847,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
                     );
                     (
                         "rejected".to_string(),
-                        Some(ReferenceStreamedWavCapacityEvidenceV2::ERROR_CODE.to_string()),
+                        Some(ReferenceStreamedWavCapacityEvidenceV3::ERROR_CODE.to_string()),
                     )
                 }
             };
@@ -2897,12 +2912,12 @@ fn qualify_analyzer_carrier_contract() -> Value {
     assert_eq!(expected_modulo_data_size_field, 8);
     assert_eq!(data_wrap.observed_data_size_field, expected_modulo_data_size_field);
 
-    let streamed_wav_capacity = ReferenceStreamedWavCapacityEvidenceV2 {
+    let streamed_wav_capacity = ReferenceStreamedWavCapacityEvidenceV3 {
         status: "passed".to_string(),
-        contract: ReferenceStreamedWavCapacityEvidenceV2::CONTRACT.to_string(),
+        contract: ReferenceStreamedWavCapacityEvidenceV3::CONTRACT.to_string(),
         sparse_source_container: "w64".to_string(),
-        sample_rate_hz: ReferenceStreamedWavCapacityEvidenceV2::SAMPLE_RATE_HZ,
-        channels: ReferenceStreamedWavCapacityEvidenceV2::CHANNELS,
+        sample_rate_hz: ReferenceStreamedWavCapacityEvidenceV3::SAMPLE_RATE_HZ,
+        channels: ReferenceStreamedWavCapacityEvidenceV3::CHANNELS,
         sample_encoding: "pcm_f64le".to_string(),
         bytes_per_sample,
         riff_size_field_max: tonepoet_pipeline::REFERENCE_STREAMED_WAV_RIFF_SIZE_FIELD_MAX,
@@ -2926,7 +2941,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
             wrapped_header_is_sentinel: false,
             consumer_completeness_claim: false,
         },
-        error_code: ReferenceStreamedWavCapacityEvidenceV2::ERROR_CODE.to_string(),
+        error_code: ReferenceStreamedWavCapacityEvidenceV3::ERROR_CODE.to_string(),
     };
 
     serde_json::json!({
@@ -3034,7 +3049,7 @@ fn run_planned_measurement(
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -5643,22 +5658,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v12 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v13 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -5673,7 +5688,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v12 policy status: {other:?}"),
+        other => panic!("unexpected v13 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
     assert_eq!(
@@ -6013,7 +6028,7 @@ fn complete_p0_reference_qualification_report() {
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -6040,8 +6055,8 @@ fn complete_p0_reference_qualification_report() {
     let production_metadata_mutation_evidence =
         sample_identity_oracle["production_metadata_mutation"].clone();
     let report = serde_json::json!({
-        "schema_version": 12,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V12_KEY,
+        "schema_version": 13,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V13_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
