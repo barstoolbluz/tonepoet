@@ -623,3 +623,151 @@ Resolution shapes, your choice with rationale under append-only rules:
 Do not widen Q+E; do not let dBTP silently mean sample peak at any
 enabled cell. Extend the sweep to cover the tail position and the
 352.8/384 kHz cells under whatever shape you choose.
+
+### F8 resolution (policy v14 candidate, 2026-07-21)
+
+Policy v14 removes FFmpeg `loudnorm` from production true-peak authority. Every
+measurement uses pinned SoX-ng to create a measurement-only 16x view and reads
+its peak through the strict, channel-count-bound `sox_stats_pk_lev_db_v1` parser. Int24 and Float64
+W64 carriers use direct path-backed SoX. Float32 W64 retains the previously
+qualified direct FFmpeg decode seam, emitting headerless f64le over a direct,
+shell-free pipe into the same SoX 16x measurement and `stats` stage.
+
+The unchanged one-sided authority remains `Q + E = 0.010000000 + 0.100000000 =
+0.110000000 dB`. For content bandlimited to the original Nyquist frequency, the
+16x sample grid has a worst-case sinusoidal miss of
+`-20 log10(cos(pi / 32)) = 0.041925956... dB`; policy rounds this upward to
+`0.041925957 dB`, which is contained within the existing analyzer residual.
+No ceiling or uncertainty budget is widened, and dBTP is not redefined as
+sample peak.
+
+The analyzer qualification schema advances append-only to v5 and expands from
+1,200 to 1,968 cases. It retains the normalized single-tone and phase-aligned
+multitone corpus, adds fixed 1, 20, 48, and 70 kHz in-band fixtures, covers
+both early and tail positions, and exercises every enabled target rate,
+including 352.8 and 384 kHz. Release activation remains fail-closed until the
+exact pinned SoX-ng 14.8.0.1/FFmpeg 7.1 gate passes and its report is bound.
+
+No render, terminal, QPCM, packaging, metadata, source-admission, enabled-cell,
+or delivered-audio scope changed. The v13 streamed-WAV capacity guard remains
+as a conservative inherited admission rule even though the v14 analyzer no
+longer uses that carrier.
+
+### F8 operational hardening (policy v15 candidate, 2026-07-21)
+
+The v14 analyzer architecture is retained, but its executor and evidence contract
+advance append-only to policy v15. No v14 artifact is reinterpreted or modified.
+
+All three production Reference pipelines now acquire their complete tool-family
+permit set through one composite RAII guard before either subprocess starts. The
+frozen global rank is SoX, then FFmpeg, then SSRC; FFprobe shares the FFmpeg
+family. The helper deduplicates families, acquires only in that rank, and drops
+every already-acquired permit if cancellation or semaphore closure prevents a
+later acquisition. A barrier-forced asynchronous regression first reconstructs
+the former FFmpeg-to-SoX versus SoX-to-FFmpeg circular wait with one permit per
+family, then proves both opposite-direction declarations complete under the
+composite protocol without sleep-based scheduling assumptions. A second test
+binds duplicate-family collapse and partial-acquisition release on cancellation.
+
+The unchanged one-sided authority is now decomposed explicitly:
+
+```text
+ideal 16x grid component:             0.041925957 dB
+pinned-resampler empirical component: 0.058074043 dB
+analyzer residual E:                  0.100000000 dB
+reporting quantization Q:              0.010000000 dB
+one-sided total Q + E:                0.110000000 dB
+```
+
+The first component is analytic. The second is not claimed from the grid
+derivation; it is a separate pinned-tool empirical authority that remains
+`requires_pinned_real_tool_qualification`. Analyzer schema v6 adds 200
+adversarial cases—impulse, near-band-edge burst, alternating-sign, deterministic
+broadband, and boundary-transient fixtures at both boundaries, all enabled
+rates, and mono/stereo—to the inherited 1,968 cases. The production 16x result
+is compared with a 64x pinned-SoX qualification oracle, for 2,168 total cases.
+This is deliberately recorded as empirical pinned-resampler evidence, not as a
+coefficient-derived universal filter proof. Activation remains fail-closed until
+the exact pinned matrix passes and is bound into certification.
+
+Analyzer deadlines no longer inherit the generic one-hour command timeout. The
+planner derives one deadline from guarded source frames, channel count, and the
+16x factor:
+
+```text
+workload = (ceil(duration_ns * rate / 1e9) + 1) * channels * 16
+deadline = 120 s + ceil(workload / 1,000,000 sample-values/s)
+```
+
+The existing streamed-WAV admission cap bounds the maximum workload at
+8,589,934,480 oversampled sample values and the maximum deadline at 8,710
+seconds. The same deadline is bound to both processes in the Float32 pipeline, stored
+in the plan summary, and included in the v15 semantic identity; runtime accepts
+only an exact command-to-summary match. The pinned release gate must demonstrate
+at least the frozen throughput floor and bind the maximum-admission arithmetic
+before promotion.
+
+No render, terminal, QPCM, packaging, metadata, source-admission, enabled-cell,
+or delivered-audio behavior changed. The assembly environment still lacks the
+Rust toolchain and pinned SoX-ng 14.8.0.1 closure, so policy v15 remains an
+unpromoted, fail-closed qualification candidate.
+
+
+## F9 (v15 round) — three regressions in the v14/v15 return; assembly quality dropped
+
+Applied state: suite 4,616/0 except item 2's test, v15 checker green,
+smoke green, zero cold warnings. Apply-side kept (review and keep): the
+`exact_string_array` helper you referenced but never shipped is
+implemented in `track_executor.rs`; two `ToolIdentifier` clones. This
+round also requires you to re-run your own static assembly checks
+before returning — a missing function should not reach us.
+
+### F9.1 — v14 checker breaks the append-only lineage
+
+`derive_dsd_reference_v14_*.py --check` fails post-v15:
+`planner: missing '"qualification/dsd_reference_sox_ng_14_8_0_1_v14.json"'`.
+Every previous generation kept ALL historical checkers green
+simultaneously (v9/v10/v11 verified together earlier). Either v15
+wrongly removed something v14 legitimately pins, or v14's checker
+wrongly asserts currency (that the planner embeds v14) rather than
+history. Fix whichever violates your append-only rules and state the
+lineage contract explicitly: every historical checker must pass forever.
+
+### F9.2 — crossed-carrier contract validation no longer rejects a crossed producer input (REAL protection gap)
+
+Your own negative test fails:
+`track_executor.rs:8247`:
+`assert!(validate_reference_measurement_contract(f32_summary, &crossed_path).is_err())`
+— the crossed path is ACCEPTED. Root cause shape: the F8/v14 analyzer
+correction added an upsampling producer stage to the Float32 post-final
+route; the test crosses `input_stage.input` and `args[6]` to the R64
+carrier, and the contract validator apparently does not validate the
+NEW producer stage's input path against the summary carrier. This is
+precisely the crossed-carrier protection class F1/F3 established.
+Restore full producer-stage path validation (binding correctly rejects;
+contract must too) and extend the negative coverage to every route that
+gained a producer in v14.
+
+### F9.3 — verified-silence scan uses the forbidden direct-ffmpeg f64-W64 route, and ffmpeg cannot even open the fixture
+
+`tests/dsd_reference_qualification.rs:451` (run helper), captured argv:
+
+```text
+ffmpeg -y -nostdin -hide_banner -loglevel error
+  -i <...>/verified_silence/work/.final-wav_w64-176400-2ch...stage-01.w64
+  -map 0:a:0 -f f64le -acodec pcm_f64le <...>/silence-1.f64le
+failed: Error opening input: Invalid data found when processing input
+```
+
+Two defects in one: (a) the silence-scan helper decodes a SoX-written
+f64 W64 via DIRECT FFmpeg — the route your own table forbids for f64
+carriers (the 2^31 defect class); route it through the qualified SoX
+raw-stream mechanism like every other f64 decode; (b) FFmpeg refuses to
+open this particular silence QPCM at all — characterize whether the
+zero-content/short data chunk is the trigger and record it with the
+other FFmpeg W64 defects if so.
+
+Terminal rules restated: all historical checkers green, the negative
+test passes unmodified in intent, the silence scan obeys the route
+table, no cell left predicted-failing, and re-run your static assembly
+verification before returning.

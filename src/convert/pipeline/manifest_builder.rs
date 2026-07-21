@@ -220,6 +220,8 @@ fn build_reference_manifest_track(
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V11
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V12
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V13
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V14
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V15
         ) {
             reference_executed_evidence_digest_v3(&evidence)?
         } else {

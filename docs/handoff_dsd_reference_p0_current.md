@@ -1,7 +1,7 @@
 # Current DSD Reference P0 Handoff
 
 **Date:** 2026-07-21
-**Current candidate policy:** `sox_ng_14_8_0_1_v13`
+**Current candidate policy:** `sox_ng_14_8_0_1_v15`
 **Runtime exposure:** fail-closed until promotion; ordinary defaults remain exact legacy behavior
 **Supersedes:** all earlier `handoff_dsd_reference_p0_*` snapshots for current-state claims
 
@@ -15,28 +15,98 @@
 
 Native-v2 DSD-to-DSD requests remain on the ordinary DSD topology. Pre-promotion defaults remain the exact legacy flat settings origin and do not enter the Reference planner.
 
-## F1 analyzer correction inherited from v6
+## V15/F8 operational hardening
 
-The failing Float32 qualification cell was not caused by fixture amplitude, per-cell directory reuse, or a crossed work path. An isolated same-file reproduction established a carrier-sensitive decoder crossing:
+Policy v15 retains v14's measurement-only 16x SoX true-peak architecture and
+changes only its executor-liveness, analyzer-evidence, and timeout authority.
+Historical v14 artifacts remain byte-identical.
+
+Every production Reference two-tool pipeline acquires a deduplicated family set
+through one RAII guard before process launch. The frozen global order is SoX,
+then FFmpeg, then SSRC; FFprobe shares the FFmpeg family. This order is
+independent of producer-to-consumer direction, so the Float32 FFmpeg-to-SoX
+analyzer cannot circular-wait with a SoX-to-FFmpeg Float64 package or
+verification pipeline. Cancellation or semaphore closure while acquiring a
+later family drops the complete partial set. Deterministic asynchronous tests
+use barriers to force the former circular ownership, prove both opposite route
+declarations complete under the new protocol, verify family deduplication, and
+verify partial-acquisition release without sleep-based interleaving.
+
+The analyzer authority is explicitly decomposed rather than inferred entirely
+from the ideal grid calculation:
 
 ```text
-SoX-written Float32 W64, analytic peak -20 dBFS
-FFmpeg direct decode                         input_tp -20.00
-SoX W64 decode -> f64 WAV stream -> FFmpeg input_tp  -0.00
-
-SoX-written Float64 W64, analytic peak -20 dBFS
-FFmpeg direct decode                         input_tp 166.64
-SoX W64 decode -> f64 WAV stream -> FFmpeg input_tp -20.00
+ideal 16x grid component:              0.041925957 dB
+pinned-resampler empirical component: 0.058074043 dB
+analyzer residual E:                   0.100000000 dB
+reporting quantization Q:              0.010000000 dB
+one-sided total Q + E:                 0.110000000 dB
 ```
 
-The two carrier depths require opposite measurement routes. Policy v13 inherits v6's frozen analyzer contract:
+The analytic grid term is source-derived. The pinned-resampler term remains a
+separate empirical authority requiring the exact SoX-ng 14.8.0.1 gate. Schema
+v6 retains the 1,968 analytic/fixed-frequency cases and adds 200 impulse,
+near-band-edge burst, alternating-sign, deterministic-broadband, and
+boundary-transient cases at early and late positions across all enabled rates
+and mono/stereo. Those cases compare the production 16x result with a 64x
+pinned-tool qualification oracle. The 2,168-case matrix is not represented as
+a coefficient-derived universal filter bound, and activation remains
+fail-closed until the empirical component passes and is certified.
 
-- R64 pre-final measurement: SoX f64-WAV stdout directly into FFmpeg stdin;
-- Float32 QPCM post-final measurement: direct path-backed W64 input to FFmpeg;
-- Int24 and Float64 QPCM post-final measurement: SoX f64-WAV stdout into FFmpeg stdin;
-- parser: `ffmpeg_loudnorm_input_tp_v3`.
+Analyzer timeouts are workload-derived. For guarded frames
+`ceil(duration_ns * rate / 1e9) + 1`, workload is frames times channels times
+16. The deadline is 120 seconds plus one second for each started block of one
+million oversampled sample values. Existing admission bounds cap the workload
+at 8,589,934,480 sample values and the deadline at 8,710 seconds. Both members
+of the Float32 FFmpeg-to-SoX pipeline receive the same deadline. The plan
+summary stores that exact value, the v15 semantic hash binds it, and runtime
+validation requires exact command-to-summary equality. The release gate must
+prove the pinned analyzer meets the one-million-sample-values/second throughput
+floor.
 
-The executor validates every measurement against the immutable `DsdReferencePlanSummary`: exact measurement ID, scope, purpose, carrier path, parser, environment, and carrier-sensitive decoder route. Canonical argv pointed at the wrong carrier or using the wrong decoder is rejected before execution.
+## V14/F8 foundation: rate-independent true-peak measurement
+
+FFmpeg 7.1 `loudnorm` is not a qualified true-peak authority across the enabled
+high-rate matrix. The fixed-frequency admission evidence showed sample-peak-only
+behavior at 192 kHz and a separate unqualified response at 352.8 kHz. Policy
+v14 therefore removes `loudnorm` from production true-peak measurement rather
+than widening the unchanged `Q + E = 0.110000000 dB` authority or redefining
+dBTP as sample peak.
+
+Every measurement now creates a measurement-only 16x view with pinned SoX-ng
+`rate -v -L -s` and reads the resulting `Pk lev dB` from `stats`:
+
+```text
+Int24/Float64 W64:
+  sox -S -D <carrier.w64> -n rate -v -L -s <sample_rate_x16> stats
+
+Float32 W64:
+  ffmpeg -nostdin -hide_banner -nostats -loglevel error -i <carrier.w64> \
+    -map 0:a:0 -vn -sn -dn -c:a pcm_f64le -f f64le pipe:1
+  | sox -S -D -t raw -e floating-point -b 64 -L \
+    -r <sample_rate> -c <channels> - -n \
+    rate -v -L -s <sample_rate_x16> stats
+```
+
+The Float32 producer retains the already-qualified FFmpeg decode seam because
+SoX-ng 14.8.0.1 mis-scales its Float32 W64 on readback. The transport is
+headerless f64le over a direct, shell-free stdout-to-stdin pipe; all other
+depths use the direct path-backed SoX route. Neither route changes the render,
+terminal realization, QPCM, packaging, metadata, or delivered audio.
+
+For a signal bandlimited to the original Nyquist frequency, sampling the
+reconstructed view at 16x has a worst-case sinusoidal grid miss of
+`-20 log10(cos(pi / 32)) = 0.041925956... dB`. Policy v14 rounds this upward
+to `0.041925957 dB`, which remains inside the inherited `0.100000000 dB`
+analyzer residual. The strict `sox_stats_pk_lev_db_v1` parser accepts exactly one C-locale
+`Pk lev dB` row, requires the mono or Overall-plus-per-channel shape bound to the
+planned channel count, and uses the Overall value; `-inf` still requires an
+independent signed-zero proof.
+
+The historical v14/v5 analyzer gate expanded from 1,200 to 1,968 cases. It retains normalized
+single-tone and phase-aligned multitone families, adds fixed 1, 20, 48, and
+70 kHz fixtures where in band, covers early and tail positions, and exercises
+every enabled target rate including 352.8 and 384 kHz.
 
 ## V7 correction: Float64 RIFF/RF64 packaging
 
@@ -49,7 +119,7 @@ SoX:    -S -D <qpcm.w64> -t raw -e floating-point -b 64 -L -
 FFmpeg: -f f64le -ar <rate> -ac <channels> -i pipe:0 ... -c:a pcm_f64le -f wav [ -rf64 always ] <output>
 ```
 
-The packaging transport is headerless little-endian Float64 PCM over a direct stdout-to-stdin pipe. It introduces no disk-backed RIFF intermediate and does not itself impose RIFF's 4 GiB ceiling on RF64 or W64 delivery. Policy v13's corrected streamed-WAV analyzer cap still applies to every Reference plan. Ordinary RIFF output also retains its final-container capacity admission.
+The packaging transport is headerless little-endian Float64 PCM over a direct stdout-to-stdin pipe. It introduces no disk-backed RIFF intermediate and does not itself impose RIFF's 4 GiB ceiling on RF64 or W64 delivery. Current policy v15 conservatively retains v13's corrected streamed-WAV capacity guard for every Reference plan, although the v15 analyzer itself no longer uses that carrier. Ordinary RIFF output also retains its final-container capacity admission.
 
 The planner refuses to construct a one-process FFmpeg package command for Float64. The executor independently revalidates the exact producer and consumer tools, argv, typed endpoints, rate, channel count, target-specific RF64 flags, and environment before spawning the pipeline.
 
@@ -159,9 +229,9 @@ This includes carrier probes, direct decoded-sample hashes, both stages of Float
 - Float64 RIFF/RF64 uses the typed raw stream above.
 - Other non-W64 targets package from W64 QPCM through their qualified route.
 - Ordinary RIFF size admission applies to the final RIFF target.
-- Every Reference plan is admitted only when its required Float64 analyzer stream is bounded to at most 4,294,967,245 audio bytes; the largest whole-frame mono payload is 4,294,967,240 bytes.
+- Every Reference plan conservatively retains v13's Float64 streamed-WAV admission bound of at most 4,294,967,245 audio bytes; the largest whole-frame mono payload is 4,294,967,240 bytes. The current v15 analyzer is path-backed or headerless raw and does not consume this allowance.
 - The commissioned real-tool gate requires exact header fields at the largest frame-aligned admitted carrier, rejects the immediately following carrier, and scans the contiguous frame-aligned transition through the frozen 4 GiB + 8 witness to locate the actual first RIFF-field wrap.
-- At 768 kHz stereo, a five-minute programme remains below the cap; a six-minute programme is rejected with `DSD-REF-P0-025`. RF64 and W64 do not bypass this analyzer-carrier bound.
+- At 768 kHz stereo, a five-minute programme remains below the retained cap; a six-minute programme is rejected with `DSD-REF-P0-025`. RF64 and W64 do not bypass this conservative inherited admission rule.
 - The public `-1.000000000 dBTP` ceiling is unchanged. Int24 and Float32 retain their v5 bounds; Float64 uses the corrected v8 signed-32-bit effects bound.
 
 
@@ -171,21 +241,19 @@ The shared same-directory FFmpeg rewrite primitive is an atomic content-and-attr
 
 ## Immutable policy identity
 
-Policy v13 is append-only. It inherits v12's runtime-bound metadata-mutator,
-production-route, container-preservation, sample-identity, W64-rejection,
-analyzer, terminal-bound, packaging, source-front-end, capacity-admission, and
-rewritten-file attribute authority. The new identity exists solely because F7
-corrects the measured streamed Float64 WAV header from 66 bytes to 58 bytes,
-its RIFF-size contribution from 58 bytes to 50 bytes, and the dependent
-capacity edge.
+Policy v15 is append-only. It inherits v14's render, analyzer commands and
+parser, terminal, packaging, source-front-end, capacity-admission,
+metadata-mutator, sample-identity, and rewritten-file attribute authority. The
+new identity exists solely because the F8 follow-up adds canonical composite
+tool-family acquisition, separates analytic and empirical analyzer residual
+authority, expands the adversarial gate, and binds workload-derived analyzer
+deadlines.
 
-Historical v1-v12 policy JSON, candidate, certification, report, and derivation
-artifacts remain byte-identical. V12's typed v2 evidence schema remains frozen
-with its historical constants; v13 adds a separate typed v3 evidence schema.
-New v13 current/candidate/report/certification artifacts and a deterministic
-v13 checker are present. The current and candidate v13 manifests are
-byte-identical. V13 remains `qualification_candidate`; no promotion or release
-certification is claimed.
+Historical v1-v14 policy JSON, candidate, certification, report, and derivation
+artifacts remain byte-identical. New v15 current/candidate/report/certification
+artifacts and a deterministic v15 checker are present. The current and candidate
+v15 manifests are byte-identical. V15 remains `qualification_candidate`; no
+promotion or release certification is claimed.
 
 ## F2 legacy behavior inherited from the prior correction
 
@@ -197,7 +265,7 @@ Before promotion, a DSD source targeting PCM visibly exposes and executes the fr
 
 Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak remain hidden and disabled. Generic resampler and dither options remain available on the legacy route. Native-only selections are rejected rather than silently discarded. V4 preset acceptance/refusal behavior remains explicitly adjudicated and tested.
 
-## Source-level regressions retained through v13
+## Source-level regressions retained through v15
 
 - Float64 RIFF/RF64 plans contain the exact typed SoX-to-FFmpeg package pipeline.
 - Direct FFmpeg decoding of Float64 QPCM W64 is structurally forbidden.
@@ -223,16 +291,27 @@ Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak
 - The deterministic v13 checker freezes every v12 artifact, binds the measured
   58-byte Float64 header, 50-byte RIFF-size contribution, corrected 4,294,967,245-byte
   ceiling, nine-point boundary scan, typed v3 evidence, and current runtime identity.
+- The deterministic v14 checker freezes every v13 artifact, binds the 16x
+  measurement-only SoX route and Float32 FFmpeg-to-raw seam, verifies the
+  conservative `0.041925957 dB` grid bound inside the unchanged `0.110000000 dB`
+  authority, and binds the 1,968-case matrix with fixed-frequency and tail cells.
+- The deterministic v15 checker freezes every v14 artifact, binds the frozen
+  SoX-before-FFmpeg-before-SSRC composite permit rank, cancellation-safe RAII
+  ownership, the 2,168-case analyzer schema, explicit grid/resampler/reporting
+  decomposition, and the workload-derived deadline constants and release gates.
+- Barrier-forced asynchronous regressions reconstruct the historical circular
+  wait and prove opposite-direction pipelines complete; a companion regression
+  verifies duplicate-family collapse and partial-permit release on cancellation.
 
 ## Required verification commands
 
-The v13 derivation checker freezes the complete v12 checker/artifact set and
-validates the inherited manifest fields before checking the corrected current
-source bindings. Historical checkers are not rerun against a newer active
+The v15 derivation checker freezes the complete v14 checker/artifact set and
+validates inherited manifest fields before checking the hardening source and
+evidence bindings. Historical checkers are not rerun against the newer active
 policy identity.
 
 ```text
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v13_streamed_wav_header.py --check
+python3 tonepoet-pipeline/qualification/derive_dsd_reference_v15_hardening.py
 cargo fmt -p tonepoet -p tonepoet-pipeline -p sacd-rs -- --check
 cargo test -p tonepoet-pipeline
 cargo test -p sacd-rs
@@ -241,7 +320,7 @@ cargo test --workspace
 cargo clippy -p tonepoet -p tonepoet-pipeline -p sacd-rs \
   --all-targets --all-features -- -D warnings
 TONEPOET_REQUIRE_TOOLS=1 \
-TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_certification.json" \
+TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15_certification.json" \
   cargo test -p tonepoet --test dsd_reference_qualification -- --nocapture
 ```
 
@@ -253,12 +332,12 @@ The assembly environment provides system SoX 14.4.2 and FFmpeg 7.1.3. An unpinne
 2. the typed SoX-to-FFmpeg RIFF package; and
 3. direct FFmpeg decode of the packaged RIFF
 
-produce matching source/delivered identities while direct FFmpeg decode of the W64 source differs. This is route evidence only, not pinned policy qualification.
+produce matching source/delivered identities while direct FFmpeg decode of the W64 source differs. The same unpinned environment also executed the v15 16x SoX `stats` route at 192, 352.8, 384, and 768 kHz, plus the Float32 FFmpeg-to-f64le-to-SoX route at 192 kHz; every process exited successfully and produced one parseable `Pk lev dB` result. These are route smokes only, not pinned policy qualification.
 
 The environment does not provide Cargo, rustc, rustfmt, Clippy, Nix, Flox, or
 the pinned SoX-ng 14.8.0.1 closure. Therefore Rust compilation, formatting, workspace tests, Clippy, pinned-tool
 qualification, live smoke, and release certification could not be executed here.
-V13 remains fail-closed and unpromoted.
+V15 remains fail-closed and unpromoted.
 
 ## V11/F5 runtime completion: certified mutator identity is executed
 

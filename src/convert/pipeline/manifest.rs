@@ -697,6 +697,8 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 | DsdReferencePolicyVersion::SoxNg14801V11
                                 | DsdReferencePolicyVersion::SoxNg14801V12
                                 | DsdReferencePolicyVersion::SoxNg14801V13
+                                | DsdReferencePolicyVersion::SoxNg14801V14
+                                | DsdReferencePolicyVersion::SoxNg14801V15
                         ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32]))
                         && (!matches!(
                             policy,
@@ -707,6 +709,8 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 | DsdReferencePolicyVersion::SoxNg14801V11
                                 | DsdReferencePolicyVersion::SoxNg14801V12
                                 | DsdReferencePolicyVersion::SoxNg14801V13
+                                | DsdReferencePolicyVersion::SoxNg14801V14
+                                | DsdReferencePolicyVersion::SoxNg14801V15
                         )
                             || *executed_evidence_digest_v3 != Sha256Digest([0; 32])) => {}
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
@@ -724,6 +728,8 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                     | DsdReferencePolicyVersion::SoxNg14801V11
                                     | DsdReferencePolicyVersion::SoxNg14801V12
                                     | DsdReferencePolicyVersion::SoxNg14801V13
+                                    | DsdReferencePolicyVersion::SoxNg14801V14
+                                    | DsdReferencePolicyVersion::SoxNg14801V15
                             ) {
                                 if matches!(
                                     policy,
@@ -734,6 +740,8 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                         | DsdReferencePolicyVersion::SoxNg14801V11
                                         | DsdReferencePolicyVersion::SoxNg14801V12
                                         | DsdReferencePolicyVersion::SoxNg14801V13
+                                        | DsdReferencePolicyVersion::SoxNg14801V14
+                                        | DsdReferencePolicyVersion::SoxNg14801V15
                                 ) {
                                     "Reference v7+ track is missing v1, v2, or v3 executed verification authority"
                                 } else {
@@ -1246,6 +1254,42 @@ mod manifest_merge_gap_tests {
             .contains("missing v1, v2, or v3 executed verification authority"));
         assert!(reference_manifest_with_evidence(
             DsdReferencePolicyVersion::SoxNg14801V13,
+            v1,
+            v2,
+            v3,
+        )
+        .is_ok());
+
+        let error = reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V14,
+            v1,
+            v2,
+            zero,
+        )
+        .expect_err("v14 must bind the ordered verification command pipeline");
+        assert!(error
+            .to_string()
+            .contains("missing v1, v2, or v3 executed verification authority"));
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V14,
+            v1,
+            v2,
+            v3,
+        )
+        .is_ok());
+
+        let error = reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V15,
+            v1,
+            v2,
+            zero,
+        )
+        .expect_err("v15 must bind the ordered verification command pipeline");
+        assert!(error
+            .to_string()
+            .contains("missing v1, v2, or v3 executed verification authority"));
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V15,
             v1,
             v2,
             v3,

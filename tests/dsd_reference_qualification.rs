@@ -36,13 +36,17 @@ use tonepoet::convert::pipeline::{
 };
 use tonepoet_pipeline::{
     build_reference_render_transcript_fixture, build_reference_silence_scan_command,
-    extract_single_loudnorm_report, parse_reference_true_peak_measurement, plan_conversion,
-    plan_reference_dsd, resolve_reference_deferred_command, validate_post_final_true_peak,
+    extract_single_loudnorm_report, extract_single_sox_stats_peak_report,
+    parse_reference_sox_stats_true_peak_measurement, parse_reference_true_peak_measurement,
+    plan_conversion,
+    plan_reference_dsd, reference_true_peak_measurement_deadline,
+    resolve_reference_deferred_command, validate_post_final_true_peak,
     validate_reference_decode_mechanism, validate_signed_zero_f64le, AudioCodec, AudioFormat,
     BitDepthTarget, ConversionPlan, DbNano, DsdInputFrontEnd, DsdReconstructionSelection,
     DsdReferencePolicyVersion, DsdSourceGainMode, DsdSourceKind, FinalPcmContract, Finalization,
     MeasurementId, MeasurementParser, PcmBitDepth, PlanAction, PipelineSettings, PlanRequest,
-    PlannedArg, PlannedCommand, PlannedExecutionStep, RateTarget, ReferenceDecodeAuthority,
+    PlannedArg, PlannedCommand, PlannedExecutionStep, PlannedMeasurement, RateTarget,
+    ReferenceDecodeAuthority,
     ReferenceDecodeMechanism, ReferenceDecodedCarrier, ReferenceDecodedCarrierSelector,
     ReferenceDecodedSampleRole, ReferenceDither, ReferenceErrorCode,
     ReferenceStreamedWavBoundaryObservationV2, ReferenceStreamedWavCapacityEvidenceV2,
@@ -51,6 +55,13 @@ use tonepoet_pipeline::{
     ResolvedGainPolicy, ResolvedOutputTarget, SampleKind, SourceInfo, SourceRepresentationKind,
     ToolIdentifier, TruePeakMeasurement, TruePeakPurpose, TruePeakValue, WavPackMode,
     REFERENCE_DECODE_ROUTE_RULES, REFERENCE_SAMPLE_HASH_FORMAT,
+    REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS, REFERENCE_TRUE_PEAK_GRID_BOUND,
+    REFERENCE_TRUE_PEAK_MAX_ADMITTED_WORKLOAD_SAMPLE_VALUES,
+    REFERENCE_TRUE_PEAK_ANALYZER_RESIDUAL,
+    REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS,
+    REFERENCE_TRUE_PEAK_MIN_OVERSAMPLED_SAMPLE_VALUES_PER_SECOND,
+    REFERENCE_TRUE_PEAK_ONE_SIDED_AUTHORITY, REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR,
+    REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT,
 };
 
 const GATE: &str = "TONEPOET_REQUIRE_TOOLS";
@@ -1497,6 +1508,176 @@ fn write_analytic_multitone_fixture(
     20.0 * sample_peak.log10()
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AdversarialAnalyzerFixture {
+    Impulse,
+    NearBandEdgeBurst,
+    AlternatingSign,
+    BroadbandDeterministic,
+    BoundaryTransient,
+}
+
+impl AdversarialAnalyzerFixture {
+    const ALL: [Self; 5] = [
+        Self::Impulse,
+        Self::NearBandEdgeBurst,
+        Self::AlternatingSign,
+        Self::BroadbandDeterministic,
+        Self::BoundaryTransient,
+    ];
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Impulse => "impulse",
+            Self::NearBandEdgeBurst => "near_band_edge_burst",
+            Self::AlternatingSign => "alternating_sign",
+            Self::BroadbandDeterministic => "broadband_deterministic",
+            Self::BoundaryTransient => "boundary_transient",
+        }
+    }
+}
+
+fn write_adversarial_analyzer_fixture(
+    sox: &Path,
+    output: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    fixture: AdversarialAnalyzerFixture,
+    peak_position: AnalyzerPeakPosition,
+) -> f64 {
+    const PEAK_DBFS: f64 = -0.500;
+    let amplitude = 10_f64.powf(PEAK_DBFS / 20.0);
+    let sample_count = ((f64::from(sample_rate_hz) * 0.050).ceil() as usize).max(4_096);
+    let active_len = (sample_count / 4).clamp(512, 8_192);
+    let active_start = match peak_position {
+        AnalyzerPeakPosition::Early => 16,
+        AnalyzerPeakPosition::Late => sample_count - active_len - 16,
+    };
+    let active_end = active_start + active_len;
+    let mut samples = vec![0.0_f64; sample_count * usize::from(channels)];
+
+    for channel in 0..usize::from(channels) {
+        let phase = channel as f64 * std::f64::consts::FRAC_PI_3;
+        for index in 0..sample_count {
+            let local = index.saturating_sub(active_start);
+            let inside = index >= active_start && index < active_end;
+            let value = match fixture {
+                AdversarialAnalyzerFixture::Impulse => {
+                    let center = match peak_position {
+                        AnalyzerPeakPosition::Early => active_start + 8 + channel,
+                        AnalyzerPeakPosition::Late => active_end - 9 - channel,
+                    };
+                    match index.abs_diff(center) {
+                        0 => 1.0,
+                        1 => -0.5,
+                        2 => 0.25,
+                        _ => 0.0,
+                    }
+                }
+                AdversarialAnalyzerFixture::NearBandEdgeBurst if inside => {
+                    let envelope = 0.5
+                        - 0.5
+                            * (std::f64::consts::TAU * local as f64
+                                / (active_len - 1) as f64)
+                                .cos();
+                    envelope
+                        * (std::f64::consts::TAU * 0.49 * local as f64 + phase).sin()
+                }
+                AdversarialAnalyzerFixture::AlternatingSign if inside => {
+                    if (local + channel) % 2 == 0 { 1.0 } else { -1.0 }
+                }
+                AdversarialAnalyzerFixture::BroadbandDeterministic if inside => {
+                    let t = local as f64;
+                    0.40 * (std::f64::consts::TAU * 0.03125 * t + phase).cos()
+                        + 0.25 * (std::f64::consts::TAU * 0.173 * t + phase * 0.5).sin()
+                        + 0.20 * (std::f64::consts::TAU * 0.307 * t - phase).cos()
+                        + 0.15 * (std::f64::consts::TAU * 0.463 * t + phase * 1.5).sin()
+                }
+                AdversarialAnalyzerFixture::BoundaryTransient => {
+                    let boundary = match peak_position {
+                        AnalyzerPeakPosition::Early => 0,
+                        AnalyzerPeakPosition::Late => sample_count - 1,
+                    };
+                    let distance = index.abs_diff(boundary);
+                    if distance < 64 {
+                        let sign = if (distance + channel) % 2 == 0 { 1.0 } else { -1.0 };
+                        sign * (1.0 - distance as f64 / 64.0)
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            samples[index * usize::from(channels) + channel] = value;
+        }
+    }
+
+    let unscaled_peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f64, f64::max);
+    assert!(unscaled_peak > 0.0, "adversarial fixture must contain signal");
+    let scale = amplitude / unscaled_peak;
+    let mut bytes = Vec::with_capacity(samples.len() * 8);
+    for sample in samples {
+        bytes.extend_from_slice(&(sample * scale).to_le_bytes());
+    }
+
+    let raw = output.with_extension(format!("{}.f64le", fixture.key()));
+    fs::write(&raw, bytes).expect("write adversarial analyzer fixture");
+    run(
+        sox,
+        &[
+            "-D".to_string(),
+            "-t".to_string(),
+            "f64".to_string(),
+            "-L".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-r".to_string(),
+            sample_rate_hz.to_string(),
+            "-c".to_string(),
+            channels.to_string(),
+            raw.display().to_string(),
+            "-t".to_string(),
+            "w64".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            output.display().to_string(),
+        ],
+    );
+    fs::remove_file(raw).expect("remove adversarial raw analyzer fixture");
+    PEAK_DBFS
+}
+
+fn measurement_with_oversample_factor(
+    measurement: &PlannedMeasurement,
+    sample_rate_hz: u32,
+    oversample_factor: u32,
+) -> PlannedMeasurement {
+    let mut oracle = measurement.clone();
+    let oversampled_rate = sample_rate_hz
+        .checked_mul(oversample_factor)
+        .expect("oracle oversampling rate fits u32");
+    let rate_index = oracle
+        .command
+        .args
+        .iter()
+        .position(|arg| arg == "-s")
+        .expect("SoX analyzer command contains -s")
+        + 1;
+    oracle.command.args[rate_index] = oversampled_rate.to_string();
+    oracle.command.description = format!(
+        "{} ({oversample_factor}x qualification oracle)",
+        oracle.command.description
+    );
+    oracle
+}
+
 fn target_format(target: ResolvedOutputTarget) -> AudioFormat {
     match target {
         ResolvedOutputTarget::FlacNative => AudioFormat::Flac,
@@ -1591,66 +1772,53 @@ fn assert_production_plan_structure(
     assert_eq!(measurements[1].purpose, TruePeakPurpose::PostFinalAcceptance);
     assert!(measurements
         .iter()
-        .all(|measurement| measurement.parser == MeasurementParser::FfmpegLoudnormInputTpV3));
+        .all(|measurement| measurement.parser == MeasurementParser::SoxStatsPkLevDbV1));
     for measurement in &measurements {
-        assert_eq!(measurement.command.tool, ToolIdentifier::Ffmpeg);
         let carrier = measurement
             .carrier_path()
             .expect("measurement carrier is path-backed")
             .to_string_lossy()
             .into_owned();
-        let direct_float32_post = summary.final_pcm.bit_depth == PcmBitDepth::Float32
+        let float32_post = summary.final_pcm.bit_depth == PcmBitDepth::Float32
             && measurement.purpose == TruePeakPurpose::PostFinalAcceptance;
-        if direct_float32_post {
-            assert!(measurement.input_stage.is_none());
-            assert_eq!(
-                measurement.command.input.as_path(),
-                measurement.carrier_path()
-            );
-            assert!(measurement
-                .command
-                .args
-                .windows(2)
-                .any(|window| window[0] == "-i" && window[1] == carrier));
-            assert!(!measurement
-                .command
-                .args
-                .windows(2)
-                .any(|window| window[0] == "-f" && window[1] == "wav"));
-        } else {
+        assert_eq!(measurement.parser, MeasurementParser::SoxStatsPkLevDbV1);
+        assert_eq!(measurement.command.tool, ToolIdentifier::Sox);
+        let deadline = measurement
+            .command
+            .expected_duration
+            .expect("policy v15 analyzer binds a workload-derived deadline");
+        assert_eq!(summary.analyzer_deadline, deadline);
+        assert!(
+            deadline >= Duration::from_secs(REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS)
+                && deadline <= Duration::from_secs(REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS)
+        );
+        assert!(measurement.command.args.iter().any(|arg| arg == "stats"));
+        assert!(measurement.command.args.windows(2).any(|window| {
+            window[0] == "-s"
+                && window[1]
+                    == (summary.final_pcm.sample_rate_hz
+                        * REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR)
+                        .to_string()
+        }));
+        if float32_post {
             let producer = measurement
                 .input_stage
                 .as_ref()
-                .expect("policy v8 f64 measurement has a typed producer");
-            assert_eq!(producer.tool, ToolIdentifier::Sox);
-            assert_eq!(producer.output, tonepoet_pipeline::OutputSink::Stdout);
-            assert_eq!(producer.args.get(0).map(String::as_str), Some("-S"));
-            assert_eq!(producer.args.get(1).map(String::as_str), Some("-D"));
-            assert!(producer
-                .args
-                .windows(2)
-                .any(|window| window[0] == "-t" && window[1] == "wav"));
-            assert!(producer
-                .args
-                .windows(2)
-                .any(|window| window[0] == "-e" && window[1] == "floating-point"));
-            assert!(producer
-                .args
-                .windows(2)
-                .any(|window| window[0] == "-b" && window[1] == "64"));
-            assert_eq!(producer.args.last().map(String::as_str), Some("-"));
+                .expect("policy v15 Float32 measurement has a typed FFmpeg producer");
+            assert_eq!(producer.expected_duration, measurement.command.expected_duration);
+            assert_eq!(producer.tool, ToolIdentifier::Ffmpeg);
+            assert_eq!(producer.input.as_path(), measurement.carrier_path());
             assert_eq!(measurement.command.input, tonepoet_pipeline::InputSource::Stdin);
-            assert!(measurement
-                .command
-                .args
-                .windows(2)
-                .any(|window| window[0] == "-f" && window[1] == "wav"));
-            assert!(measurement
-                .command
-                .args
-                .windows(2)
-                .any(|window| window[0] == "-i" && window[1] == "pipe:0"));
-            assert!(!measurement.command.args.iter().any(|arg| arg == &carrier));
+            assert!(producer.args.windows(2).any(|window| {
+                window[0] == "-c:a" && window[1] == "pcm_f64le"
+            }));
+            assert!(measurement.command.args.windows(2).any(|window| {
+                window[0] == "-t" && window[1] == "raw"
+            }));
+        } else {
+            assert!(measurement.input_stage.is_none());
+            assert_eq!(measurement.command.input.as_path(), measurement.carrier_path());
+            assert!(measurement.command.args.iter().any(|arg| arg == &carrier));
         }
     }
 
@@ -1783,7 +1951,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V13;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -2063,8 +2231,7 @@ fn run_streamed_measurement_pipeline(
     let producer = measurement
         .input_stage
         .as_ref()
-        .expect("streamed v7-inherited measurement has a typed input stage");
-    assert_eq!(producer.tool, ToolIdentifier::Sox);
+        .expect("streamed v15 measurement has a typed input stage");
     assert_eq!(producer.input.as_path(), measurement.carrier_path());
     assert_eq!(producer.output, tonepoet_pipeline::OutputSink::Stdout);
     assert_eq!(
@@ -2072,7 +2239,6 @@ fn run_streamed_measurement_pipeline(
         tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
     );
     assert_eq!(producer.environment, BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]));
-    assert_eq!(measurement.command.tool, ToolIdentifier::Ffmpeg);
     assert_eq!(measurement.command.input, tonepoet_pipeline::InputSource::Stdin);
     assert_eq!(
         measurement.command.environment_policy,
@@ -2083,7 +2249,15 @@ fn run_streamed_measurement_pipeline(
         BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
     );
 
-    let mut producer_command = Command::new(sox);
+    let tool_path = |tool: ToolIdentifier| match tool {
+        ToolIdentifier::Sox => sox,
+        ToolIdentifier::Ffmpeg => ffmpeg,
+        other => panic!("unexpected measurement pipeline tool {other:?}"),
+    };
+    let producer_path = tool_path(producer.tool.clone());
+    let consumer_path = tool_path(measurement.command.tool.clone());
+
+    let mut producer_command = Command::new(producer_path);
     producer_command
         .args(&producer.args)
         .stdin(Stdio::null())
@@ -2091,7 +2265,7 @@ fn run_streamed_measurement_pipeline(
         .stderr(Stdio::piped());
     apply_qualified_environment(&mut producer_command);
     let mut producer_child = producer_command.spawn().unwrap_or_else(|error| {
-        panic!("failed to spawn {} {:?}: {error}", sox.display(), producer.args)
+        panic!("failed to spawn {} {:?}: {error}", producer_path.display(), producer.args)
     });
     let producer_stderr_task = drain_child_stderr(&mut producer_child, "measurement producer");
     let producer_stdout = producer_child
@@ -2099,7 +2273,7 @@ fn run_streamed_measurement_pipeline(
         .take()
         .expect("measurement producer stdout is piped");
 
-    let mut consumer_command = Command::new(ffmpeg);
+    let mut consumer_command = Command::new(consumer_path);
     consumer_command
         .args(&measurement.command.args)
         .stdin(Stdio::from(producer_stdout))
@@ -2116,7 +2290,7 @@ fn run_streamed_measurement_pipeline(
             let (producer_stderr, producer_drain_error) = producer_stderr_task.finish();
             panic!(
                 "failed to spawn {} {:?}: {error}; producer_status={status}; producer_drain_error={producer_drain_error:?}; producer_stderr={}",
-                ffmpeg.display(),
+                consumer_path.display(),
                 measurement.command.args,
                 String::from_utf8_lossy(&producer_stderr),
             )
@@ -2131,14 +2305,14 @@ fn run_streamed_measurement_pipeline(
     assert!(
         output.producer.status.success(),
         "{} {:?} failed: stderr={}",
-        sox.display(),
+        producer_path.display(),
         producer.args,
         String::from_utf8_lossy(&output.producer.stderr),
     );
     assert!(
         output.consumer.status.success(),
         "{} {:?} failed: stdout={} stderr={}",
-        ffmpeg.display(),
+        consumer_path.display(),
         measurement.command.args,
         String::from_utf8_lossy(&output.consumer.stdout),
         String::from_utf8_lossy(&output.consumer.stderr),
@@ -2347,7 +2521,7 @@ fn capacity_boundary_plan_result(
     settings.target_format = target_format(ResolvedOutputTarget::WavW64);
     settings.target_sample_rate = RateTarget::PcmHz(SAMPLE_RATE_HZ);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V13;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
     settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Reference;
     let request = PlanRequest {
@@ -2481,10 +2655,9 @@ fn qualify_analyzer_carrier_contract() -> Value {
     let root = temp.path().join("carrier");
     fs::create_dir_all(&root).expect("create analyzer carrier root");
 
-    // Float64 W64: FFmpeg 7.1 applies an erroneous 2^31 scale when it reads
-    // SoX-ng's IEEE-f64 W64 directly. The canonical v6 route therefore keeps
-    // the exact SoX W64 QPCM but streams a sample-exact f64 RIFF/WAV view into
-    // FFmpeg. This is a transport, not a disk intermediate.
+    // Float64 W64: preserve the inherited FFmpeg direct-decode defect witness,
+    // while policy v15 measures the path-backed carrier directly with SoX-ng
+    // after creating a qualified 16x measurement-only view.
     let f64_source = root.join("f64-source-placeholder.dsf");
     let f64_plan = planned_reference_cell(
         &root,
@@ -2545,20 +2718,42 @@ fn qualify_analyzer_carrier_contract() -> Value {
         "pinned direct f64-W64 defect changed: analytic={f64_analytic_peak}, direct={f64_direct_input_tp}, delta={f64_defect_delta_db}"
     );
 
-    let f64_corrected = execute_measurement(f64_measurement, &sox, &ffmpeg, &root);
+    let f64_corrected = execute_measurement(f64_measurement, &sox, &ffmpeg, &root, 1);
     let f64_corrected_input_tp = match f64_corrected.reported {
         TruePeakValue::Finite(value) => value.0 as f64 / 1_000_000_000.0,
         TruePeakValue::VerifiedSilence => panic!("-20 dB f64 carrier measured as silence"),
     };
     assert!(
         (f64_corrected_input_tp - f64_analytic_peak).abs() <= 0.02,
-        "streamed f64 carrier changed true peak: analytic={f64_analytic_peak}, corrected={f64_corrected_input_tp}"
+        "v15 oversampled f64 measurement changed true peak: analytic={f64_analytic_peak}, corrected={f64_corrected_input_tp}"
     );
 
-    let f64_producer = f64_measurement
-        .input_stage
-        .as_ref()
-        .expect("policy v8 f64 producer stage");
+    // Retain the historical v13 streamed-WAV capacity probe as a separate,
+    // conservative admission witness. It is no longer the v15 analyzer route.
+    let mut f64_producer = PlannedCommand::new(
+        ToolIdentifier::Sox,
+        vec![
+            "-S".to_string(),
+            "-D".to_string(),
+            f64_summary.r64_path.display().to_string(),
+            "-t".to_string(),
+            "wav".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-".to_string(),
+        ],
+        tonepoet_pipeline::InputSource::Path(f64_summary.r64_path.clone()),
+        tonepoet_pipeline::OutputSink::Stdout,
+        None,
+        "historical v13 streamed-WAV capacity probe",
+    );
+    f64_producer.environment_policy =
+        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+    f64_producer
+        .environment
+        .insert("LC_ALL".to_string(), "C".to_string());
     let streamed = run(&sox, &f64_producer.args);
     assert!(
         streamed.status.success(),
@@ -2585,10 +2780,9 @@ fn qualify_analyzer_carrier_contract() -> Value {
         "f64 W64 to streamed f64 WAV re-container changed decoded sample bits"
     );
 
-    // Float32 W64: direct FFmpeg decoding is correct, while routing the same
-    // carrier through SoX's W64 decoder before loudnorm drives the analyzer
-    // result to full scale. The v6 post-terminal measurement must therefore be
-    // direct and path-backed. This is the crossed binding fixed by v6.
+    // Float32 W64: retain the qualified direct FFmpeg decode seam because SoX-ng
+    // mis-scales this carrier. Policy v15 pipes headerless f64le into SoX-ng,
+    // which creates and measures the same 16x view used by all other depths.
     let f32_root = root.join("float32");
     fs::create_dir_all(&f32_root).expect("create Float32 carrier root");
     let f32_source = f32_root.join("f32-source-placeholder.dsf");
@@ -2641,42 +2835,25 @@ fn qualify_analyzer_carrier_contract() -> Value {
             _ => None,
         })
         .expect("planner emits Float32 post measurement");
-    assert!(f32_post.input_stage.is_none());
-    assert_eq!(f32_post.command.input.as_path(), Some(f32_summary.qpcm_path.as_path()));
-    assert_eq!(f32_post.parser, MeasurementParser::FfmpegLoudnormInputTpV3);
-    let f32_direct = execute_measurement(f32_post, &sox, &ffmpeg, &f32_root);
+    let f32_producer = f32_post
+        .input_stage
+        .as_ref()
+        .expect("v15 Float32 post measurement has an FFmpeg raw producer");
+    assert_eq!(f32_producer.tool, ToolIdentifier::Ffmpeg);
+    assert_eq!(f32_producer.input.as_path(), Some(f32_summary.qpcm_path.as_path()));
+    assert_eq!(f32_post.command.tool, ToolIdentifier::Sox);
+    assert_eq!(f32_post.command.input, tonepoet_pipeline::InputSource::Stdin);
+    assert_eq!(f32_post.parser, MeasurementParser::SoxStatsPkLevDbV1);
+    let f32_direct = execute_measurement(f32_post, &sox, &ffmpeg, &f32_root, 1);
     let f32_direct_input_tp = match f32_direct.reported {
         TruePeakValue::Finite(value) => value.0 as f64 / 1_000_000_000.0,
         TruePeakValue::VerifiedSilence => panic!("-20 dB Float32 carrier measured as silence"),
     };
     assert!(
         (f32_direct_input_tp - f32_analytic_peak).abs() <= 0.02,
-        "direct Float32-W64 measurement changed true peak: analytic={f32_analytic_peak}, direct={f32_direct_input_tp}"
+        "v15 Float32 FFmpeg-to-SoX measurement changed true peak: analytic={f32_analytic_peak}, measured={f32_direct_input_tp}"
     );
 
-    let mut f32_sox_recontainer = f32_plan
-        .steps()
-        .iter()
-        .find_map(|step| match step {
-            PlannedExecutionStep::Measurement(measurement)
-                if measurement.purpose == TruePeakPurpose::GainAuthority => Some(measurement.clone()),
-            _ => None,
-        })
-        .expect("Float32 plan has streamed pre measurement");
-    let f32_recontainer_producer = f32_sox_recontainer
-        .input_stage
-        .as_mut()
-        .expect("pre measurement has SoX producer");
-    f32_recontainer_producer.input =
-        tonepoet_pipeline::InputSource::Path(f32_summary.qpcm_path.clone());
-    f32_recontainer_producer.args[2] = f32_summary.qpcm_path.display().to_string();
-    let f32_recontainer = run_streamed_measurement_pipeline(&f32_sox_recontainer, &sox, &ffmpeg);
-    let f32_sox_recontainer_input_tp = loudnorm_input_tp(&f32_recontainer.consumer.stderr);
-    let f32_sox_defect_delta_db = f32_sox_recontainer_input_tp - f32_direct_input_tp;
-    assert!(
-        f32_sox_recontainer_input_tp >= -0.10 && f32_sox_defect_delta_db > 10.0,
-        "pinned SoX Float32-W64 readback defect changed: direct={f32_direct_input_tp}, recontainer={f32_sox_recontainer_input_tp}, delta={f32_sox_defect_delta_db}"
-    );
 
     // Reproduce the exact admission failure shape independently: a -20 dBFS
     // Float32 cell, Reference-compensated gain, and a RIFF final target whose
@@ -2946,8 +3123,8 @@ fn qualify_analyzer_carrier_contract() -> Value {
 
     serde_json::json!({
         "status": "passed",
-        "contract": "tonepoet-reference-analyzer-carrier/v3",
-        "routing_rule": "float32_w64_direct_ffmpeg_else_sox_f64_wav_stream",
+        "contract": "tonepoet-reference-analyzer-carrier/v4",
+        "routing_rule": "float32_w64_ffmpeg_f64le_raw_to_sox_else_sox_path",
         "known_defect": {
             "status": "reproduced",
             "carrier": "sox_f64_w64_direct_to_ffmpeg_7_1",
@@ -2956,43 +3133,35 @@ fn qualify_analyzer_carrier_contract() -> Value {
             "scaling_delta_db": f64_defect_delta_db,
             "expected_scaling": "2^31",
         },
-        "corrected_path": {
+        "direct_sox_path": {
             "status": "passed",
             "carrier_depth": "float64",
-            "transport": "direct_stdout_to_stdin_no_shell",
-            "stream_encoding": "pcm_f64le",
-            "reported_input_tp_dbtp": f64_corrected_input_tp,
-            "sample_exact_recontainer": true,
-            "parser": "ffmpeg_loudnorm_input_tp_v3",
+            "reported_peak_dbtp": f64_corrected_input_tp,
+            "analytic_peak_dbfs": f64_analytic_peak,
+            "parser": "sox_stats_pk_lev_db_v1",
+            "oversample_factor": REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR,
+            "analytic_grid_bound_db": REFERENCE_TRUE_PEAK_GRID_BOUND.render(false),
             "environment_policy": "clear_and_set",
             "environment": {"LC_ALL": "C"},
-            "pipeline_deadline_seconds": QUALIFICATION_PIPELINE_TIMEOUT.as_secs(),
-            "termination_reap_deadline_seconds": QUALIFICATION_TERMINATION_TIMEOUT.as_secs(),
-            "failure_contract": "terminate_and_reap_or_fail",
-            "producer_argv": f64_producer.args.clone(),
-            "consumer_input_argv": ["-f", "wav", "-i", "pipe:0"],
-            "consumer_argv": f64_measurement.command.args.clone(),
+            "command_argv": f64_measurement.command.args.clone(),
         },
-        "float32_direct_path": {
+        "float32_pipe_path": {
             "status": "passed",
             "carrier_depth": "float32",
             "carrier_container": "w64",
             "disk_intermediate": false,
             "package_step": false,
-            "reported_input_tp_dbtp": f32_direct_input_tp,
+            "reported_peak_dbtp": f32_direct_input_tp,
             "analytic_peak_dbfs": f32_analytic_peak,
-            "parser": "ffmpeg_loudnorm_input_tp_v3",
+            "parser": "sox_stats_pk_lev_db_v1",
             "environment_policy": "clear_and_set",
             "environment": {"LC_ALL": "C"},
-            "input_stage": null,
+            "producer_argv": f32_producer.args.clone(),
             "consumer_argv": f32_post.command.args.clone(),
         },
-        "float32_sox_recontainer_defect": {
-            "status": "reproduced",
-            "carrier": "sox_float32_w64_to_f64_riff_stream",
-            "direct_reported_input_tp_dbtp": f32_direct_input_tp,
-            "recontainer_reported_input_tp_dbtp": f32_sox_recontainer_input_tp,
-            "scaling_delta_db": f32_sox_defect_delta_db,
+        "historical_streamed_wav_capacity_probe": {
+            "status": "retained_conservative_admission_witness",
+            "producer_argv": f64_producer.args.clone(),
         },
         "f1_reference_gain_regression": {
             "status": "passed",
@@ -3021,7 +3190,7 @@ fn run_planned_measurement(
     sox: &Path,
     ffmpeg: &Path,
 ) -> PlannedMeasurementOutput {
-    assert_eq!(measurement.parser, MeasurementParser::FfmpegLoudnormInputTpV3);
+    assert_eq!(measurement.parser, MeasurementParser::SoxStatsPkLevDbV1);
     assert_eq!(
         measurement.command.environment_policy,
         tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
@@ -3037,11 +3206,11 @@ fn run_planned_measurement(
             consumer: output.consumer,
         }
     } else {
-        assert_eq!(measurement.command.tool, ToolIdentifier::Ffmpeg);
+        assert_eq!(measurement.command.tool, ToolIdentifier::Sox);
         assert_eq!(measurement.command.input.as_path(), measurement.carrier_path());
         PlannedMeasurementOutput {
             producer: None,
-            consumer: run(ffmpeg, &measurement.command.args),
+            consumer: run(sox, &measurement.command.args),
         }
     }
 }
@@ -3049,7 +3218,7 @@ fn run_planned_measurement(
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -3070,16 +3239,16 @@ fn execute_measurement(
     sox: &Path,
     ffmpeg: &Path,
     root: &Path,
+    channels: u16,
 ) -> TruePeakMeasurement {
     let output = run_planned_measurement(measurement, sox, ffmpeg);
     if let Some(producer) = &output.producer {
         assert!(producer.stdout.is_empty());
     }
     let stderr = String::from_utf8_lossy(&output.consumer.stderr);
-    let raw = extract_single_loudnorm_report(&stderr)
-        .unwrap_or_else(|error| panic!("production loudnorm extraction failed: {error}"));
-    let report: Value = serde_json::from_str(&raw).expect("loudnorm report parses as JSON");
-    let silence = report["input_tp"] == "-inf";
+    let raw = extract_single_sox_stats_peak_report(&stderr, channels)
+        .unwrap_or_else(|error| panic!("production SoX stats extraction failed: {error}"));
+    let silence = raw == "-inf";
     if silence {
         let input = measurement
             .carrier_path()
@@ -3092,7 +3261,7 @@ fn execute_measurement(
         fs::remove_file(raw_path).expect("remove silence scan");
     }
     let (q, e) = policy_measurement_bounds();
-    let parsed = parse_reference_true_peak_measurement(
+    let parsed = parse_reference_sox_stats_true_peak_measurement(
         measurement.id,
         measurement.scope,
         measurement.purpose,
@@ -3183,7 +3352,13 @@ fn execute_planned_terminal_chain(
                 package_args = Some(pipeline.consumer.args.clone());
             }
             PlannedExecutionStep::Measurement(measurement) => {
-                let parsed = execute_measurement(measurement, sox, ffmpeg, root);
+                let parsed = execute_measurement(
+                    measurement,
+                    sox,
+                    ffmpeg,
+                    root,
+                    summary.final_pcm.channels,
+                );
                 if measurement.purpose == TruePeakPurpose::PostFinalAcceptance {
                     if let Err(error) =
                         validate_post_final_true_peak(parsed.conservative_upper, summary.gain_policy)
@@ -4170,6 +4345,9 @@ fn qualify_true_peak_analyzer_authority() -> Value {
     ];
     const CHANNELS: [u16; 2] = [1, 2];
     const NORMALIZED_FREQUENCIES: [f64; 2] = [0.25, 0.45];
+    const FIXED_FREQUENCIES_HZ: [u32; 4] = [1_000, 20_000, 48_000, 70_000];
+    const FIXED_FREQUENCY_MAX_NORMALIZED: f64 = 0.49;
+    const FIXED_FREQUENCY_DURATION_SECONDS: f64 = 0.250;
     const PHASES: [f64; 2] = [0.0, std::f64::consts::FRAC_PI_4];
     const TRUE_PEAK_LEVELS_DBFS: [f64; 3] = [-120.003, -12.003, -0.500];
     const DURATIONS_SECONDS: [f64; 2] = [0.125, 0.500];
@@ -4186,21 +4364,37 @@ fn qualify_true_peak_analyzer_authority() -> Value {
         * TRUE_PEAK_LEVELS_DBFS.len()
         * DURATIONS_SECONDS.len()
         * PEAK_POSITIONS.len();
+    // 32 valid rate/frequency cells: 1/20 kHz at all ten rates, plus
+    // 48/70 kHz at the six rates from 176.4 through 768 kHz.
+    const FIXED_FREQUENCY_CASE_COUNT: usize = 32
+        * CHANNELS.len()
+        * PHASES.len()
+        * TRUE_PEAK_LEVELS_DBFS.len()
+        * PEAK_POSITIONS.len();
     const MULTITONE_CASE_COUNT: usize = RATES.len()
         * CHANNELS.len()
         * MULTITONE_PEAK_OFFSETS.len()
         * TRUE_PEAK_LEVELS_DBFS.len()
         * PEAK_POSITIONS.len();
-    const REQUIRED_CASE_COUNT: usize = SINGLE_TONE_CASE_COUNT + MULTITONE_CASE_COUNT;
+    const ADVERSARIAL_CASE_COUNT: usize = RATES.len()
+        * CHANNELS.len()
+        * AdversarialAnalyzerFixture::ALL.len()
+        * PEAK_POSITIONS.len();
+    const ANALYTIC_CASE_COUNT: usize =
+        SINGLE_TONE_CASE_COUNT + FIXED_FREQUENCY_CASE_COUNT + MULTITONE_CASE_COUNT;
+    const REQUIRED_CASE_COUNT: usize =
+        ANALYTIC_CASE_COUNT + ADVERSARIAL_CASE_COUNT;
 
     let mut case_count = 0_usize;
     let mut worst_under_report_db = f64::NEG_INFINITY;
     let mut worst_over_report_db = f64::NEG_INFINITY;
     let mut maximum_intersample_delta_db = f64::NEG_INFINITY;
+    let mut maximum_adversarial_oracle_under_report_db = f64::NEG_INFINITY;
+    let mut maximum_empirical_resampler_component_db = f64::NEG_INFINITY;
     let mut near_silence_finite_count = 0_usize;
     let mut cell_summary: BTreeMap<String, (usize, f64, f64)> = BTreeMap::new();
     let mut evidence_hasher = Sha256::new();
-    evidence_hasher.update(b"tonepoet-reference-analyzer-qualification/v4\0");
+    evidence_hasher.update(b"tonepoet-reference-analyzer-qualification/v6\0");
 
     for sample_rate_hz in RATES {
         for channels in CHANNELS {
@@ -4261,6 +4455,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                                     &sox,
                                     &ffmpeg,
                                     &root,
+                                    channels,
                                 );
                                 let TruePeakValue::Finite(reported) = parsed.reported else {
                                     panic!(
@@ -4276,7 +4471,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                                 let over_report_db = reported_dbfs - true_peak_dbfs;
                                 assert!(
                                     under_report_db <= 0.110_000_001,
-                                    "loudnorm under-report {under_report_db:.9} dB exceeded Q+E authority: rate={sample_rate_hz}, channels={channels}, normalized_frequency={normalized_frequency}, phase={phase_radians}, duration={duration_seconds}, position={}, level={true_peak_dbfs}",
+                                    "oversampled analyzer under-report {under_report_db:.9} dB exceeded Q+E authority: rate={sample_rate_hz}, channels={channels}, normalized_frequency={normalized_frequency}, phase={phase_radians}, duration={duration_seconds}, position={}, level={true_peak_dbfs}",
                                     peak_position.key(),
                                 );
                                 assert!(
@@ -4319,6 +4514,119 @@ fn qualify_true_peak_analyzer_authority() -> Value {
             }
         }
     }
+    for sample_rate_hz in RATES {
+        for fixed_frequency_hz in FIXED_FREQUENCIES_HZ {
+            let normalized_frequency = f64::from(fixed_frequency_hz) / f64::from(sample_rate_hz);
+            if normalized_frequency > FIXED_FREQUENCY_MAX_NORMALIZED {
+                continue;
+            }
+            for channels in CHANNELS {
+                for phase_radians in PHASES {
+                    for peak_position in PEAK_POSITIONS {
+                        let mut prior_reported = None;
+                        for true_peak_dbfs in TRUE_PEAK_LEVELS_DBFS {
+                            let root = temp.path().join(format!(
+                                "analyzer-fixed-{sample_rate_hz}-{fixed_frequency_hz}hz-{channels}ch-{phase_radians:.6}-{}-{true_peak_dbfs:.3}",
+                                peak_position.key(),
+                            ));
+                            fs::create_dir_all(&root)
+                                .expect("create fixed-frequency analyzer qualification case root");
+                            let source = root.join("source-placeholder.dsf");
+                            let plan = planned_reference_cell(
+                                &root,
+                                &source,
+                                2_822_400,
+                                sample_rate_hz,
+                                channels,
+                                PcmBitDepth::Float64,
+                                ResolvedOutputTarget::WavW64,
+                                DsdReconstructionSelection::Reference,
+                                DsdSourceGainMode::Reference,
+                                None,
+                                DbNano::DEFAULT_NORMALIZE_TARGET,
+                                None,
+                            );
+                            let summary = plan.reference.as_ref().expect("Reference summary");
+                            let sample_peak_dbfs = write_analytic_analyzer_fixture(
+                                &sox,
+                                &summary.r64_path,
+                                sample_rate_hz,
+                                channels,
+                                true_peak_dbfs,
+                                normalized_frequency,
+                                phase_radians,
+                                FIXED_FREQUENCY_DURATION_SECONDS,
+                                peak_position,
+                            );
+                            let measurement = plan
+                                .steps()
+                                .iter()
+                                .find_map(|step| match step {
+                                    PlannedExecutionStep::Measurement(measurement)
+                                        if measurement.purpose == TruePeakPurpose::GainAuthority =>
+                                    {
+                                        Some(measurement)
+                                    }
+                                    _ => None,
+                                })
+                                .expect("planner emits pre-final true-peak measurement");
+                            let parsed =
+                                execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
+                            let TruePeakValue::Finite(reported) = parsed.reported else {
+                                panic!("fixed-frequency fixture was misclassified as silence");
+                            };
+                            let TruePeakValue::Finite(upper) = parsed.conservative_upper else {
+                                panic!("fixed-frequency fixture has a non-finite conservative bound");
+                            };
+                            let reported_dbfs = reported.0 as f64 / 1_000_000_000.0;
+                            let upper_dbfs = upper.0 as f64 / 1_000_000_000.0;
+                            let under_report_db = true_peak_dbfs - reported_dbfs;
+                            let over_report_db = reported_dbfs - true_peak_dbfs;
+                            assert!(
+                                under_report_db <= 0.110_000_001,
+                                "fixed-frequency analyzer under-report {under_report_db:.9} dB exceeded Q+E authority: rate={sample_rate_hz}, fixed_frequency_hz={fixed_frequency_hz}, channels={channels}, phase={phase_radians}, position={}, level={true_peak_dbfs}",
+                                peak_position.key(),
+                            );
+                            assert!(
+                                upper_dbfs + 1e-9 >= true_peak_dbfs,
+                                "fixed-frequency conservative bound fell below analytic truth"
+                            );
+                            if let Some(prior) = prior_reported {
+                                assert!(
+                                    reported_dbfs > prior,
+                                    "fixed-frequency true-peak sweep was not monotonic"
+                                );
+                            }
+                            prior_reported = Some(reported_dbfs);
+                            if true_peak_dbfs == TRUE_PEAK_LEVELS_DBFS[0] {
+                                near_silence_finite_count += 1;
+                            }
+                            let intersample_delta_db = reported_dbfs - sample_peak_dbfs;
+                            maximum_intersample_delta_db =
+                                maximum_intersample_delta_db.max(intersample_delta_db);
+                            worst_under_report_db = worst_under_report_db.max(under_report_db);
+                            worst_over_report_db = worst_over_report_db.max(over_report_db);
+                            let key = format!("{sample_rate_hz}/{channels}");
+                            let entry = cell_summary
+                                .entry(key)
+                                .or_insert((0, f64::NEG_INFINITY, f64::NEG_INFINITY));
+                            entry.0 += 1;
+                            entry.1 = entry.1.max(under_report_db);
+                            entry.2 = entry.2.max(over_report_db);
+                            evidence_hasher.update(format!(
+                                "fixed_frequency_single_tone|{sample_rate_hz}|{fixed_frequency_hz}|{channels}|{phase_radians:.9}|{}|{true_peak_dbfs:.9}|{sample_peak_dbfs:.9}|{reported_dbfs:.9}|{upper_dbfs:.9}\n",
+                                peak_position.key(),
+                            ));
+                            fs::remove_file(&summary.r64_path)
+                                .expect("remove fixed-frequency analyzer carrier");
+                            case_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for sample_rate_hz in RATES {
         for channels in CHANNELS {
             for peak_offset_samples in MULTITONE_PEAK_OFFSETS {
@@ -4368,7 +4676,8 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                                 _ => None,
                             })
                             .expect("planner emits pre-final true-peak measurement");
-                        let parsed = execute_measurement(measurement, &sox, &ffmpeg, &root);
+                        let parsed =
+                            execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
                         let TruePeakValue::Finite(reported) = parsed.reported else {
                             panic!("nonzero analytic multitone fixture was misclassified as silence");
                         };
@@ -4381,7 +4690,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                         let over_report_db = reported_dbfs - true_peak_dbfs;
                         assert!(
                             under_report_db <= 0.110_000_001,
-                            "multitone loudnorm under-report {under_report_db:.9} dB exceeded Q+E authority"
+                            "multitone oversampled analyzer under-report {under_report_db:.9} dB exceeded Q+E authority"
                         );
                         assert!(
                             upper_dbfs + 1e-9 >= true_peak_dbfs,
@@ -4422,8 +4731,129 @@ fn qualify_true_peak_analyzer_authority() -> Value {
         }
     }
 
+    for sample_rate_hz in RATES {
+        for channels in CHANNELS {
+            for fixture in AdversarialAnalyzerFixture::ALL {
+                for peak_position in PEAK_POSITIONS {
+                    let root = temp.path().join(format!(
+                        "analyzer-adversarial-{sample_rate_hz}-{channels}ch-{}-{}",
+                        fixture.key(),
+                        peak_position.key(),
+                    ));
+                    fs::create_dir_all(&root)
+                        .expect("create adversarial analyzer qualification case root");
+                    let source = root.join("source-placeholder.dsf");
+                    let plan = planned_reference_cell(
+                        &root,
+                        &source,
+                        2_822_400,
+                        sample_rate_hz,
+                        channels,
+                        PcmBitDepth::Float64,
+                        ResolvedOutputTarget::WavW64,
+                        DsdReconstructionSelection::Reference,
+                        DsdSourceGainMode::Reference,
+                        None,
+                        DbNano::DEFAULT_NORMALIZE_TARGET,
+                        None,
+                    );
+                    let summary = plan.reference.as_ref().expect("Reference summary");
+                    let sample_peak_dbfs = write_adversarial_analyzer_fixture(
+                        &sox,
+                        &summary.r64_path,
+                        sample_rate_hz,
+                        channels,
+                        fixture,
+                        peak_position,
+                    );
+                    let measurement = plan
+                        .steps()
+                        .iter()
+                        .find_map(|step| match step {
+                            PlannedExecutionStep::Measurement(measurement)
+                                if measurement.purpose == TruePeakPurpose::GainAuthority =>
+                            {
+                                Some(measurement)
+                            }
+                            _ => None,
+                        })
+                        .expect("planner emits adversarial true-peak measurement");
+                    let production =
+                        execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
+                    let oracle_measurement =
+                        measurement_with_oversample_factor(measurement, sample_rate_hz, 64);
+                    let oracle = execute_measurement(
+                        &oracle_measurement,
+                        &sox,
+                        &ffmpeg,
+                        &root,
+                        channels,
+                    );
+                    let TruePeakValue::Finite(production_reported) = production.reported else {
+                        panic!("adversarial fixture was misclassified as silence");
+                    };
+                    let TruePeakValue::Finite(production_upper) = production.conservative_upper else {
+                        panic!("adversarial fixture has no finite conservative bound");
+                    };
+                    let TruePeakValue::Finite(oracle_reported) = oracle.reported else {
+                        panic!("64x adversarial oracle was misclassified as silence");
+                    };
+                    let production_dbfs = production_reported.0 as f64 / 1_000_000_000.0;
+                    let production_upper_dbfs = production_upper.0 as f64 / 1_000_000_000.0;
+                    let oracle_dbfs = oracle_reported.0 as f64 / 1_000_000_000.0;
+                    let oracle_under_report_db = oracle_dbfs - production_dbfs;
+                    let empirical_resampler_component_db = (oracle_under_report_db
+                        - 0.010_000_000
+                        - REFERENCE_TRUE_PEAK_GRID_BOUND.0 as f64 / 1_000_000_000.0)
+                        .max(0.0);
+                    assert!(
+                        empirical_resampler_component_db
+                            <= REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT.0 as f64
+                                / 1_000_000_000.0
+                                + 1e-9,
+                        "adversarial pinned-resampler component {empirical_resampler_component_db:.9} dB exceeded policy authority: rate={sample_rate_hz}, channels={channels}, fixture={}, position={}",
+                        fixture.key(),
+                        peak_position.key(),
+                    );
+                    assert!(
+                        production_upper_dbfs + 1e-9 >= oracle_dbfs,
+                        "adversarial conservative bound fell below the 64x pinned-tool oracle"
+                    );
+                    maximum_adversarial_oracle_under_report_db =
+                        maximum_adversarial_oracle_under_report_db.max(oracle_under_report_db);
+                    maximum_empirical_resampler_component_db =
+                        maximum_empirical_resampler_component_db
+                            .max(empirical_resampler_component_db);
+                    maximum_intersample_delta_db = maximum_intersample_delta_db
+                        .max(oracle_dbfs - sample_peak_dbfs);
+                    worst_under_report_db = worst_under_report_db.max(oracle_under_report_db);
+                    worst_over_report_db = worst_over_report_db
+                        .max(production_dbfs - oracle_dbfs);
+                    let key = format!("{sample_rate_hz}/{channels}");
+                    let entry = cell_summary
+                        .entry(key)
+                        .or_insert((0, f64::NEG_INFINITY, f64::NEG_INFINITY));
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(oracle_under_report_db);
+                    entry.2 = entry.2.max(production_dbfs - oracle_dbfs);
+                    evidence_hasher.update(format!(
+                        "{}|{sample_rate_hz}|{channels}|{}|{sample_peak_dbfs:.9}|{production_dbfs:.9}|{oracle_dbfs:.9}|{production_upper_dbfs:.9}|{empirical_resampler_component_db:.9}\n",
+                        fixture.key(),
+                        peak_position.key(),
+                    ));
+                    fs::remove_file(&summary.r64_path)
+                        .expect("remove adversarial analyzer qualification carrier");
+                    case_count += 1;
+                }
+            }
+        }
+    }
+
     assert_eq!(case_count, REQUIRED_CASE_COUNT);
-    assert_eq!(near_silence_finite_count, REQUIRED_CASE_COUNT / TRUE_PEAK_LEVELS_DBFS.len());
+    assert_eq!(
+        near_silence_finite_count,
+        ANALYTIC_CASE_COUNT / TRUE_PEAK_LEVELS_DBFS.len()
+    );
     assert!(
         maximum_intersample_delta_db > 2.8,
         "analyzer corpus did not exercise a known material inter-sample peak"
@@ -4441,15 +4871,20 @@ fn qualify_true_peak_analyzer_authority() -> Value {
         .collect::<Vec<_>>();
     serde_json::json!({
         "status": "passed",
-        "method": "analytic single-tone and phase-aligned multitone bursts with raised-cosine boundaries; planner-emitted loudnorm command and production parser/conservative arithmetic",
-        "waveform_families": ["single_tone", "phase_aligned_multitone"],
+        "method": "analytic tones/multitones plus adversarial impulse, near-band-edge burst, alternating-sign, deterministic broadband, and boundary-transient fixtures; planner-emitted 16x SoX stats command; 64x pinned-tool adversarial oracle; production parser and conservative arithmetic",
+        "waveform_families": ["single_tone", "fixed_frequency_single_tone", "phase_aligned_multitone", "impulse", "near_band_edge_burst", "alternating_sign", "broadband_deterministic", "boundary_transient"],
         "single_tone_case_count": SINGLE_TONE_CASE_COUNT,
+        "fixed_frequency_single_tone_case_count": FIXED_FREQUENCY_CASE_COUNT,
         "phase_aligned_multitone_case_count": MULTITONE_CASE_COUNT,
+        "adversarial_case_count": ADVERSARIAL_CASE_COUNT,
         "case_count": case_count,
         "required_case_count": REQUIRED_CASE_COUNT,
         "rates_hz": RATES,
         "channels": CHANNELS,
         "normalized_frequencies_cycles_per_sample": NORMALIZED_FREQUENCIES,
+        "fixed_frequencies_hz": FIXED_FREQUENCIES_HZ,
+        "fixed_frequency_max_normalized": FIXED_FREQUENCY_MAX_NORMALIZED,
+        "fixed_frequency_duration_seconds": FIXED_FREQUENCY_DURATION_SECONDS,
         "phases_radians": PHASES,
         "analytic_true_peak_levels_dbfs": TRUE_PEAK_LEVELS_DBFS,
         "durations_seconds": DURATIONS_SECONDS,
@@ -4457,14 +4892,141 @@ fn qualify_true_peak_analyzer_authority() -> Value {
         "aligned_multitone_normalized_frequencies_cycles_per_sample": MULTITONE_FREQUENCIES,
         "aligned_multitone_peak_offsets_samples": MULTITONE_PEAK_OFFSETS,
         "aligned_multitone_duration_seconds": 0.250_f64,
+        "adversarial_peak_level_dbfs": -0.500_f64,
+        "adversarial_oracle_oversample_factor": 64,
+        "maximum_adversarial_oracle_under_report_db": maximum_adversarial_oracle_under_report_db,
+        "maximum_empirical_resampler_component_db": maximum_empirical_resampler_component_db,
         "worst_under_report_db": worst_under_report_db,
         "worst_over_report_db": worst_over_report_db,
         "maximum_intersample_delta_db": maximum_intersample_delta_db,
-        "one_sided_authority_db": 0.110000000_f64,
+        "oversample_factor": REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR,
+        "analytic_grid_bound_db": REFERENCE_TRUE_PEAK_GRID_BOUND.render(false),
+        "pinned_resampler_component_limit_db":
+            REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT.0 as f64 / 1_000_000_000.0,
+        "reporting_quantization_component_db":
+            DbNano::POST_FINAL_ACCEPTANCE_RESERVE.0 as f64 / 1_000_000_000.0,
+        "analyzer_residual_sum_db":
+            REFERENCE_TRUE_PEAK_ANALYZER_RESIDUAL.0 as f64 / 1_000_000_000.0,
+        "one_sided_authority_db":
+            REFERENCE_TRUE_PEAK_ONE_SIDED_AUTHORITY.0 as f64 / 1_000_000_000.0,
         "monotonic_per_cell": true,
         "nonzero_near_silence_remained_finite": true,
         "per_rate_channel": per_rate_channel,
         "evidence_digest": format!("{:x}", evidence_hasher.finalize()),
+    })
+}
+
+fn qualify_analyzer_deadline_model() -> Value {
+    let sox = required_tool(SOX_ENV);
+    let ffmpeg = required_tool(FFMPEG_ENV);
+    let temp = TempDir::new().expect("deadline qualification tempdir");
+    let root = temp.path().join("analyzer-deadline-throughput");
+    fs::create_dir_all(root.join("work")).expect("create deadline qualification root");
+    let source = root.join("source-placeholder.dsf");
+    let duration = Duration::from_secs(2);
+    let target_rate_hz = 768_000;
+    let channels = 2;
+
+    let mut settings = PipelineSettings::default();
+    settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+    settings.target_format = AudioFormat::Wav;
+    settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
+    let request = PlanRequest {
+        input_path: source,
+        output_path: root.join("deadline.w64"),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(channels),
+            duration: Some(duration),
+            dsd_source_kind: Some(DsdSourceKind::DsfUncompressed),
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(root.join("work")),
+        container_ffmpeg_flags: Vec::new(),
+        resolved_output_target: Some(ResolvedOutputTarget::WavW64),
+        reference_programme_scope: ReferenceProgrammeScope::Singleton,
+        planned_riff_non_audio_upper_bound_bytes: Some(0),
+    };
+    let plan = plan_reference_dsd(&request).expect("deadline benchmark plan is admitted");
+    let summary = plan.reference.as_ref().expect("deadline benchmark summary");
+    let measurement = plan
+        .steps()
+        .iter()
+        .find_map(|step| match step {
+            PlannedExecutionStep::Measurement(measurement)
+                if measurement.purpose == TruePeakPurpose::GainAuthority => Some(measurement),
+            _ => None,
+        })
+        .expect("deadline benchmark has pre-final measurement");
+    let expected_deadline = reference_true_peak_measurement_deadline(
+        Some(duration),
+        target_rate_hz,
+        channels,
+    )
+    .expect("deadline benchmark arithmetic resolves");
+    assert_eq!(measurement.command.expected_duration, Some(expected_deadline));
+    write_analytic_analyzer_fixture(
+        &sox,
+        &summary.r64_path,
+        target_rate_hz,
+        channels,
+        -0.500,
+        0.45,
+        std::f64::consts::FRAC_PI_4,
+        duration.as_secs_f64(),
+        AnalyzerPeakPosition::Late,
+    );
+    let started = Instant::now();
+    let measured = execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
+    let elapsed = started.elapsed();
+    assert!(matches!(measured.reported, TruePeakValue::Finite(_)));
+    assert!(elapsed < expected_deadline, "pinned analyzer exceeded its derived deadline");
+
+    let guarded_frames = duration.as_nanos() * u128::from(target_rate_hz)
+        / 1_000_000_000
+        + 1;
+    let workload_sample_values = guarded_frames
+        * u128::from(channels)
+        * u128::from(REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR);
+    let elapsed_seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let observed_sample_values_per_second = workload_sample_values as f64 / elapsed_seconds;
+    assert!(
+        observed_sample_values_per_second
+            >= REFERENCE_TRUE_PEAK_MIN_OVERSAMPLED_SAMPLE_VALUES_PER_SECOND as f64,
+        "pinned analyzer throughput {observed_sample_values_per_second:.3} sample-values/s is below the policy floor"
+    );
+    let max_workload_seconds = (REFERENCE_TRUE_PEAK_MAX_ADMITTED_WORKLOAD_SAMPLE_VALUES
+        + REFERENCE_TRUE_PEAK_MIN_OVERSAMPLED_SAMPLE_VALUES_PER_SECOND
+        - 1)
+        / REFERENCE_TRUE_PEAK_MIN_OVERSAMPLED_SAMPLE_VALUES_PER_SECOND;
+    let max_deadline =
+        REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS + max_workload_seconds;
+    assert_eq!(max_deadline, REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS);
+
+    fs::remove_file(&summary.r64_path).expect("remove deadline benchmark carrier");
+    serde_json::json!({
+        "status": "passed",
+        "schema": "tonepoet-reference-analyzer-deadline-qualification/v1",
+        "benchmark_rate_hz": target_rate_hz,
+        "benchmark_channels": channels,
+        "benchmark_duration_seconds": duration.as_secs(),
+        "benchmark_workload_sample_values": u64::try_from(workload_sample_values).expect("benchmark workload fits u64"),
+        "elapsed_seconds": elapsed_seconds,
+        "observed_oversampled_sample_values_per_second": observed_sample_values_per_second,
+        "required_minimum_oversampled_sample_values_per_second": REFERENCE_TRUE_PEAK_MIN_OVERSAMPLED_SAMPLE_VALUES_PER_SECOND,
+        "derived_deadline_seconds": expected_deadline.as_secs(),
+        "maximum_admitted_workload_sample_values": REFERENCE_TRUE_PEAK_MAX_ADMITTED_WORKLOAD_SAMPLE_VALUES,
+        "maximum_derived_deadline_seconds": max_deadline,
+        "planner_bound_identical_pipeline_deadlines": true,
     })
 }
 
@@ -5658,22 +6220,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v13 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v15 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -5688,7 +6250,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v13 policy status: {other:?}"),
+        other => panic!("unexpected v15 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
     assert_eq!(
@@ -6022,13 +6584,14 @@ fn complete_p0_reference_qualification_report() {
     } = qualify_lossless_package_cells(forbidden_route_regression);
     let analyzer_carrier_results = qualify_analyzer_carrier_contract();
     let analyzer_results = qualify_true_peak_analyzer_authority();
+    let analyzer_deadline_results = qualify_analyzer_deadline_model();
     let gain_terminal_results = qualify_production_measurement_gain_terminal_chain();
     let dst_counts = qualify_dst_oracle_fixture_authority();
     let source_front_end_results = qualify_production_source_front_end_integration();
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -6055,8 +6618,8 @@ fn complete_p0_reference_qualification_report() {
     let production_metadata_mutation_evidence =
         sample_identity_oracle["production_metadata_mutation"].clone();
     let report = serde_json::json!({
-        "schema_version": 13,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V13_KEY,
+        "schema_version": 15,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V15_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
@@ -6100,6 +6663,14 @@ fn complete_p0_reference_qualification_report() {
         "streamed_wav_capacity": analyzer_carrier_results["streamed_wav_capacity"].clone(),
         "analyzer_carrier": analyzer_carrier_results,
         "production_true_peak_analyzer": analyzer_results,
+        "analyzer_deadline_model": analyzer_deadline_results,
+        "executor_liveness": {
+            "status": "passed_by_workspace_gate",
+            "test": "reference_pipeline_composite_permits_prevent_opposite_direction_deadlock",
+            "global_tool_family_order": ["sox", "ffmpeg", "ssrc"],
+            "permit_set": "deduplicated_cancellation_safe_raii",
+            "interleaving": "barrier_forced_no_sleep"
+        },
         "production_source_front_end_integration": source_front_end_results,
         "production_measurement_gain_terminal_chain": gain_terminal_results,
         "analyzer_policy_bounds": qualification["analyzer"].clone(),
