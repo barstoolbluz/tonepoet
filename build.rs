@@ -13,6 +13,9 @@ fn main() {
     for variable in [
         "TONEPOET_REFERENCE_SOX_STORE_PATH",
         "TONEPOET_REFERENCE_FFMPEG_STORE_PATH",
+        "TONEPOET_REFERENCE_METAFLAC_STORE_PATH",
+        "TONEPOET_REFERENCE_WVTAG_STORE_PATH",
+        "TONEPOET_REFERENCE_ATOMIC_PARSLEY_STORE_PATH",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
         if let Ok(value) = std::env::var(variable) {

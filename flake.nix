@@ -118,12 +118,18 @@
           # activation variables may point only into these derivations.
           env.TONEPOET_REFERENCE_SOX_STORE_PATH = "${referenceSox}";
           env.TONEPOET_REFERENCE_FFMPEG_STORE_PATH = "${referenceFfmpeg}";
+          env.TONEPOET_REFERENCE_METAFLAC_STORE_PATH = "${pkgs.flac}";
+          env.TONEPOET_REFERENCE_WVTAG_STORE_PATH = "${pkgs.wavpack}";
+          env.TONEPOET_REFERENCE_ATOMIC_PARSLEY_STORE_PATH = "${pkgs.atomicparsley}";
 
           postInstall = ''
             wrapProgram $out/bin/tonepoet \
               --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps} \
               --set TONEPOET_REFERENCE_SOX_PATH ${referenceSox}/bin/sox \
-              --set TONEPOET_REFERENCE_FFMPEG_PATH ${referenceFfmpeg}/bin/ffmpeg
+              --set TONEPOET_REFERENCE_FFMPEG_PATH ${referenceFfmpeg}/bin/ffmpeg \
+              --set TONEPOET_REFERENCE_METAFLAC_PATH ${pkgs.flac}/bin/metaflac \
+              --set TONEPOET_REFERENCE_WVTAG_PATH ${pkgs.wavpack}/bin/wvtag \
+              --set TONEPOET_REFERENCE_ATOMIC_PARSLEY_PATH ${pkgs.atomicparsley}/bin/AtomicParsley
           '';
 
           meta = with pkgs.lib; {
@@ -151,8 +157,14 @@
             export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.libaacs}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export TONEPOET_REFERENCE_SOX_PATH="${referenceSox}/bin/sox"
             export TONEPOET_REFERENCE_FFMPEG_PATH="${referenceFfmpeg}/bin/ffmpeg"
+            export TONEPOET_REFERENCE_METAFLAC_PATH="${pkgs.flac}/bin/metaflac"
+            export TONEPOET_REFERENCE_WVTAG_PATH="${pkgs.wavpack}/bin/wvtag"
+            export TONEPOET_REFERENCE_ATOMIC_PARSLEY_PATH="${pkgs.atomicparsley}/bin/AtomicParsley"
             export TONEPOET_REFERENCE_SOX_STORE_PATH="${referenceSox}"
             export TONEPOET_REFERENCE_FFMPEG_STORE_PATH="${referenceFfmpeg}"
+            export TONEPOET_REFERENCE_METAFLAC_STORE_PATH="${pkgs.flac}"
+            export TONEPOET_REFERENCE_WVTAG_STORE_PATH="${pkgs.wavpack}"
+            export TONEPOET_REFERENCE_ATOMIC_PARSLEY_STORE_PATH="${pkgs.atomicparsley}"
             echo "tonepoet development environment"
             echo ""
             echo "  cargo build    - Build the project"
