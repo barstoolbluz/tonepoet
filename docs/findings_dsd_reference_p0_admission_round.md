@@ -506,11 +506,24 @@ data chunk header       8
 total                  58
 ```
 
-Your 66 presumably assumed an extra 8 bytes (a second chunk header or
-a 22-byte extensible cbSize block sox does not write here). Re-derive
-`stream_header_bytes` (and any dependent v12 constants such as the
-RIFF-size overhead) from the measured layout, note whether the value
-is encoding-dependent (integer PCM headers omit the fact chunk and the
-cbSize word: 12+8+16+8 = 44), and mint the correction under your
-append-only rules. Everything else in the v12 capacity contract
-verified against the real binary.
+The header size IS encoding-dependent, and both variants are now
+measured on this exact toolchain (hex dumps verified):
+
+```text
+Float64 streamed WAV:  RIFF 12 + fmt 8+18 (IEEE_FLOAT + cbSize=0)
+                       + fact 8+4 + data hdr 8            = 58 bytes
+Int24 streamed WAV:    RIFF 12 + fmt 8+40 (EXTENSIBLE)
+                       + fact 8+4 + data hdr 8            = 80 bytes
+```
+
+Note sox writes WAVE_FORMAT_EXTENSIBLE for streamed Int24 and emits a
+`fact` chunk for BOTH encodings — derive nothing; use these measured
+values. If your streamed-WAV contract only ever carries the f64
+re-container (as the frozen analyzer routes indicate), then 58 is the
+single normative value and the Int24 layout is recorded for
+completeness only — do not add per-encoding constants the contract
+cannot reach. Correct `stream_header_bytes` (and any dependent v12
+constants such as the RIFF-size overhead) from the measured layout,
+and mint the correction under your append-only rules.
+Everything else in the v12 capacity contract verified against the real
+binary.
