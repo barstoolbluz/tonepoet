@@ -1,7 +1,7 @@
 # Current DSD Reference P0 Handoff
 
 **Date:** 2026-07-20
-**Current candidate policy:** `sox_ng_14_8_0_1_v7`
+**Current candidate policy:** `sox_ng_14_8_0_1_v8`
 **Runtime exposure:** fail-closed until promotion; ordinary defaults remain exact legacy behavior
 **Supersedes:** all earlier `handoff_dsd_reference_p0_*` snapshots for current-state claims
 
@@ -29,7 +29,7 @@ FFmpeg direct decode                         input_tp 166.64
 SoX W64 decode -> f64 WAV stream -> FFmpeg input_tp -20.00
 ```
 
-The two carrier depths require opposite measurement routes. Policy v7 inherits v6's frozen analyzer contract:
+The two carrier depths require opposite measurement routes. Policy v8 inherits v6's frozen analyzer contract:
 
 - R64 pre-final measurement: SoX f64-WAV stdout directly into FFmpeg stdin;
 - Float32 QPCM post-final measurement: direct path-backed W64 input to FFmpeg;
@@ -64,7 +64,13 @@ The decoded-sample oracle is now carrier-sensitive:
 
 Consequently, Float64 RIFF/RF64 preservation compares a SoX-decoded W64 source identity with an FFmpeg-decoded delivered-file identity. The defective FFmpeg W64 decoder is not used on either side of that comparison and cannot produce a common-mode pass.
 
-Post-metadata verification records the complete ordered command transcript. A new optional `executed_evidence_digest_v3` binds the v2 authority plus every post-metadata verification command's description, binary, sanitized argv, cwd, environment policy, explicit environment, environment keys, and exit status. Historical v1-v6 manifests retain their exact serialized shape because the zero v3 field is omitted; v7 authority requires a nonzero v3 digest.
+Post-metadata verification records the complete ordered command transcript. A new optional `executed_evidence_digest_v3` binds the v2 authority plus every post-metadata verification command's description, binary, sanitized argv, cwd, environment policy, explicit environment, environment keys, and exit status. Historical v1-v6 manifests retain their exact serialized shape because the zero v3 field is omitted; v7-and-later authority requires a nonzero v3 digest.
+
+## V8 terminal correction: signed-32-bit effects boundary
+
+The terminal `gain` effect is not f64 arithmetic merely because R64 and Float64 QPCM use f64 carriers. SoX-ng executes the effect in its signed-32-bit internal sample domain. Policy v8 therefore replaces the unattainable Float64 `2^-51`-only terminal bound with the summed authority `2^-32 + 2^-51` (`Q1.63 = 2^31 + 2^12`): the signed-32-bit round-to-nearest half-step plus the inherited Float64 arithmetic allowance. The safe pre-terminal ceiling is `-1.010000003 dBTP`.
+
+The terminal audit retains Int24 at `2^-22` and Float32 at `2^-23`: both bounds already dominate the `2^-32` effects contribution with conservative margin. The per-depth decode audit retains the v7 typed route table unchanged. All enabled cells remain attainable; no enabled cell is left to fail a later qualification gate.
 
 ## Evidence subprocess environment
 
@@ -85,13 +91,13 @@ This includes carrier probes, direct decoded-sample hashes, both stages of Float
 - Other non-W64 targets package from W64 QPCM through their qualified route.
 - Ordinary RIFF size admission applies to the final RIFF target.
 - A 15-minute, 768-kHz, stereo Float64 W64/RF64 plan remains admissible without a RIFF intermediate.
-- The public `-1.000000000 dBTP` ceiling and inherited v5 terminal bounds are unchanged.
+- The public `-1.000000000 dBTP` ceiling is unchanged. Int24 and Float32 retain their v5 bounds; Float64 uses the corrected v8 signed-32-bit effects bound.
 
 ## Immutable policy identity
 
-The Float64 package topology, argv, typed pipeline step, sample-identity routes, semantic plan hash, runtime validation, and executed evidence changed. They are represented by the append-only identity `sox_ng_14_8_0_1_v7`.
+The Float64 terminal bound, safe pre-terminal ceiling, derivation digest, and the semantic plan/execution identities that bind the gain policy changed. They are represented by the append-only identity `sox_ng_14_8_0_1_v8`; the v7 package topology, argv, typed pipeline step, sample-identity routes, runtime validation model, and executed-evidence format are inherited unchanged.
 
-Historical v1-v6 policy artifacts and hash-bound documents are unchanged. New v7 current/candidate/report/certification artifacts and a deterministic v7 checker are present. The current and candidate v7 manifests are byte-identical. V7 remains `qualification_candidate`; no promotion or release certification is claimed.
+Historical v1-v7 policy artifacts and hash-bound documents are unchanged. New v8 current/candidate/report/certification artifacts and a deterministic v8 checker are present. The current and candidate v8 manifests are byte-identical. V8 remains `qualification_candidate`; no promotion or release certification is claimed.
 
 ## F2 legacy behavior inherited from the prior correction
 
@@ -103,7 +109,7 @@ Before promotion, a DSD source targeting PCM visibly exposes and executes the fr
 
 Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak remain hidden and disabled. Generic resampler and dither options remain available on the legacy route. Native-only selections are rejected rather than silently discarded. V4 preset acceptance/refusal behavior remains explicitly adjudicated and tested.
 
-## Source-level regressions added for v7
+## Source-level regressions retained from v7 and added for v8
 
 - Float64 RIFF/RF64 plans contain the exact typed SoX-to-FFmpeg package pipeline.
 - Direct FFmpeg decoding of Float64 QPCM W64 is structurally forbidden.
@@ -111,9 +117,10 @@ Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak
 - High-rate Float64 W64/RF64 planning proves there is no disk-backed RIFF intermediate.
 - Float64 QPCM/final-W64 hashes use the streamed SoX route; RIFF/RF64 output hashes use direct FFmpeg.
 - Carrier probes and every decoded-sample hash constructor assert exact `ClearAndSet` / `LC_ALL=C` semantics.
-- V7 manifest authority requires the complete ordered post-metadata transcript digest while historical manifest serialization remains compatible.
+- V8 manifest authority requires the complete ordered post-metadata transcript digest while historical manifest serialization remains compatible.
 - The v3 digest regression changes on command order, route, environment policy, or explicit environment drift, while ignoring diagnostic output tails and elapsed time.
-- The deterministic v7 checker binds the package route, sample-identity contract, environment policy, and v3 evidence markers to source.
+- The deterministic v7 checker continues to bind the historical package route, sample-identity contract, environment policy, and v3 evidence markers to source.
+- The deterministic v8 checker additionally binds the signed-32-bit effects derivation, corrected Float64 bound, unchanged per-depth route table, valid certification stub, and current v8 source markers.
 
 ## Required verification commands
 
@@ -121,6 +128,7 @@ Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak
 python3 tonepoet-pipeline/qualification/derive_dsd_reference_v5_terminal_bounds.py --check
 python3 tonepoet-pipeline/qualification/derive_dsd_reference_v6_terminal_bounds.py --check
 python3 tonepoet-pipeline/qualification/derive_dsd_reference_v7_terminal_bounds.py --check
+python3 tonepoet-pipeline/qualification/derive_dsd_reference_v8_terminal_bounds.py --check
 cargo fmt -p tonepoet -p tonepoet-pipeline -p sacd-rs -- --check
 cargo test -p tonepoet-pipeline
 cargo test -p sacd-rs
@@ -129,7 +137,7 @@ cargo test --workspace
 cargo clippy -p tonepoet -p tonepoet-pipeline -p sacd-rs \
   --all-targets --all-features -- -D warnings
 TONEPOET_REQUIRE_TOOLS=1 \
-TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_certification.json" \
+TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_certification.json" \
   cargo test -p tonepoet --test dsd_reference_qualification -- --nocapture
 ```
 
@@ -143,4 +151,4 @@ The assembly environment provides system SoX 14.4.2 and FFmpeg 7.1.3. An unpinne
 
 produce matching source/delivered identities while direct FFmpeg decode of the W64 source differs. This is route evidence only, not pinned policy qualification.
 
-The environment does not provide Cargo, rustc, rustfmt, Clippy, Nix, Flox, or the pinned SoX-ng 14.8.0.1 closure. Therefore Rust compilation, formatting, workspace tests, Clippy, pinned-tool qualification, live smoke, and release certification could not be executed here. V7 remains fail-closed and unpromoted.
+The environment does not provide Cargo, rustc, rustfmt, Clippy, Nix, Flox, or the pinned SoX-ng 14.8.0.1 closure. Therefore Rust compilation, formatting, workspace tests, Clippy, pinned-tool qualification, live smoke, and release certification could not be executed here. V8 remains fail-closed and unpromoted.

@@ -132,7 +132,7 @@ pub struct ReferencePcmVerificationEvidence {
     /// Historical single-command post-metadata transcript retained for backward decoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_metadata_verification_command: Option<CommandRecord>,
-    /// Exact ordered post-metadata verification transcript. Policy v7 records both
+    /// Exact ordered post-metadata verification transcript. Policy v8 records both
     /// stages when Float64 W64 requires the qualified SoX-to-FFmpeg stream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_metadata_verification_commands: Vec<CommandRecord>,
@@ -1117,15 +1117,244 @@ fn json_object_u64(
         .and_then(serde_json::Value::as_u64)
 }
 
+fn validate_terminal_effects_certification(
+    packages: &serde_json::Map<String, serde_json::Value>,
+    manifest: &EmbeddedReferenceQualification,
+) -> Result<(), TrackExecutionError> {
+    const Q63_SCALE: f64 = 9_223_372_036_854_775_808.0;
+    const SOURCE_PROOF_PATH: &str = "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_terminal_source_proof.md";
+
+    let expected_package_fields = BTreeSet::from([
+        "status",
+        "decode_route_table",
+        "case_count",
+        "empirical_terminal_bound_case_count",
+        "terminal_observed_max_error_by_depth",
+        "terminal_effects_boundary_audit",
+        "terminal_effects_source_proof",
+        "rates_hz",
+        "channels",
+        "depths",
+        "targets",
+        "flac_compression_levels",
+        "wavpack_compression_levels",
+        "wavpack_int24_required_args",
+        "package_stream_copy_metadata_sample_identity",
+        "production_metadata_mutator_qualification",
+        "command_authority",
+    ]);
+    let actual_package_fields = packages
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_package_fields != expected_package_fields {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification package evidence has a non-canonical field set",
+        ));
+    }
+
+    let observed = packages
+        .get("terminal_observed_max_error_by_depth")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report has no terminal maxima by depth",
+            )
+        })?;
+    let expected_depth_keys = BTreeSet::from(["int24", "float32", "float64"]);
+    if observed
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_depth_keys
+        || manifest.terminal_bounds.target_rates_hz.is_empty()
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification terminal maxima have a non-canonical depth set",
+        ));
+    }
+    for (key, depth) in [
+        ("int24", tonepoet_pipeline::PcmBitDepth::Int24),
+        ("float32", tonepoet_pipeline::PcmBitDepth::Float32),
+        ("float64", tonepoet_pipeline::PcmBitDepth::Float64),
+    ] {
+        let maximum = observed
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "the embedded release-certification {key} terminal maximum is not a finite non-negative number"
+                ))
+            })?;
+        for &rate_hz in &manifest.terminal_bounds.target_rates_hz {
+            let compiled = tonepoet_pipeline::terminal_realization_bound(rate_hz, depth);
+            let compiled_maximum = compiled.max_added_peak_fs_q63_ceil as f64 / Q63_SCALE;
+            if maximum > compiled_maximum {
+                return Err(reference_toolchain_error(format!(
+                    "the embedded release-certification {key} terminal maximum {maximum:e} exceeds the compiled {rate_hz} Hz bound {compiled_maximum:e}"
+                )));
+            }
+        }
+    }
+
+    let audit = packages
+        .get("terminal_effects_boundary_audit")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report has no terminal effects-boundary audit",
+            )
+        })?;
+    let expected_audit_fields = BTreeSet::from([
+        "sox_internal_sample_domain",
+        "round_to_nearest_half_step_peak_bound",
+        "inherited_float64_arithmetic_bound",
+        "combined_float64_peak_bound",
+        "int24_disposition",
+        "float32_disposition",
+        "float64_disposition",
+        "enabled_cells_rejected",
+    ]);
+    if audit.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != expected_audit_fields
+        || audit
+            .get("sox_internal_sample_domain")
+            .and_then(serde_json::Value::as_str)
+            != Some("signed_q1_31")
+        || audit
+            .get("round_to_nearest_half_step_peak_bound")
+            .and_then(serde_json::Value::as_str)
+            != Some("2^-32")
+        || audit
+            .get("inherited_float64_arithmetic_bound")
+            .and_then(serde_json::Value::as_str)
+            != Some("2^-51")
+        || audit
+            .get("combined_float64_peak_bound")
+            .and_then(serde_json::Value::as_str)
+            != Some("2^-32_plus_2^-51")
+        || audit
+            .get("int24_disposition")
+            .and_then(serde_json::Value::as_str)
+            != Some("retained_2^-22_bound_contains_effects_rounding")
+        || audit
+            .get("float32_disposition")
+            .and_then(serde_json::Value::as_str)
+            != Some("retained_2^-23_bound_contains_effects_and_carrier_rounding")
+        || audit
+            .get("float64_disposition")
+            .and_then(serde_json::Value::as_str)
+            != Some("corrected_to_2^-32_plus_2^-51")
+        || audit
+            .get("enabled_cells_rejected")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification terminal effects-boundary audit is not canonical",
+        ));
+    }
+
+    let source_proof = packages
+        .get("terminal_effects_source_proof")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report has no terminal effects source proof",
+            )
+        })?;
+    let expected_source_proof_fields = BTreeSet::from([
+        "schema",
+        "policy",
+        "sox_ng_revision",
+        "sox_ng_nar_hash",
+        "proof_path",
+        "proof_sha256",
+        "internal_sample_domain",
+        "float64_carrier_grid_round_trip",
+        "gain_rounding_site",
+        "non_clipping_rounding_bound",
+        "gain_mode_scope",
+        "combined_float64_bound",
+    ]);
+    let source_proof_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_terminal_source_proof.md"
+    ));
+    let source_proof_sha256 = Sha256Digest::of_bytes(source_proof_bytes).to_hex();
+    if source_proof
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_source_proof_fields
+        || source_proof.get("schema").and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-terminal-effects-source-proof/v1")
+        || source_proof.get("policy").and_then(serde_json::Value::as_str)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY)
+        || source_proof
+            .get("sox_ng_revision")
+            .and_then(serde_json::Value::as_str)
+            != Some("324b8cf873fd7836e8848bd87f7a90d8faa6f849")
+        || source_proof
+            .get("sox_ng_nar_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some("sha256-LjGx+yaWi5EcZsXhTmdRaf9utFXcCXASMmjRtm6vUc8=")
+        || source_proof
+            .get("proof_path")
+            .and_then(serde_json::Value::as_str)
+            != Some(SOURCE_PROOF_PATH)
+        || source_proof
+            .get("proof_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(source_proof_sha256.as_str())
+        || source_proof
+            .get("internal_sample_domain")
+            .and_then(serde_json::Value::as_str)
+            != Some("signed_twos_complement_int32_q1_31")
+        || source_proof
+            .get("float64_carrier_grid_round_trip")
+            .and_then(serde_json::Value::as_str)
+            != Some("exact_for_every_sox_sample_t_grid_value")
+        || source_proof
+            .get("gain_rounding_site")
+            .and_then(serde_json::Value::as_str)
+            != Some("gain.c:flow_gain:SOX_ROUND_CLIP_COUNT(*ibuf * mult, effp->clips)")
+        || source_proof
+            .get("non_clipping_rounding_bound")
+            .and_then(serde_json::Value::as_str)
+            != Some("one_half_internal_sample_equals_2^-32_fs")
+        || source_proof
+            .get("gain_mode_scope")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|modes| {
+                modes.len() != 3
+                    || modes[0].as_str() != Some("reference_compensated")
+                    || modes[1].as_str() != Some("native_level_exact")
+                    || modes[2].as_str() != Some("fixed_exact")
+            })
+        || source_proof
+            .get("combined_float64_bound")
+            .and_then(serde_json::Value::as_str)
+            != Some("2^-32_plus_2^-51")
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification terminal effects source proof is not canonical",
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_embedded_release_certification(
     manifest: &EmbeddedReferenceQualification,
 ) -> Result<(), TrackExecutionError> {
     let certification = &manifest.release_certification;
     if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
         || certification.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_certification.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_certification.json"
         || certification.candidate_manifest_path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
     {
         return Err(reference_toolchain_error(
             "the embedded release-certification descriptor is not canonical",
@@ -1133,7 +1362,7 @@ fn validate_embedded_release_certification(
     }
     let report_sha256 = certification.report_sha256.as_deref().ok_or_else(|| {
         reference_toolchain_error(
-            "the embedded v7 policy has not bound a release-certification report",
+            "the embedded v8 policy has not bound a release-certification report",
         )
     })?;
     let candidate_manifest_sha256 = certification
@@ -1141,20 +1370,20 @@ fn validate_embedded_release_certification(
         .as_deref()
         .ok_or_else(|| {
             reference_toolchain_error(
-                "the embedded v7 policy has not bound its qualified candidate manifest",
+                "the embedded v8 policy has not bound its qualified candidate manifest",
             )
         })?;
     let current_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
     ));
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_certification.json"
     ));
     let candidate_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
     ));
     let parse_digest = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -1178,13 +1407,13 @@ fn validate_embedded_release_certification(
     let mut normalized_current: serde_json::Value =
         serde_json::from_slice(current_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded current v7 manifest is invalid JSON: {error}"
+                "the embedded current v8 manifest is invalid JSON: {error}"
             ))
         })?;
     let candidate_value: serde_json::Value =
         serde_json::from_slice(candidate_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded preserved v7 candidate is invalid JSON: {error}"
+                "the embedded preserved v8 candidate is invalid JSON: {error}"
             ))
         })?;
     if candidate_value.get("status").and_then(serde_json::Value::as_str)
@@ -1197,7 +1426,7 @@ fn validate_embedded_release_certification(
             .is_none_or(|value| !value.is_null())
     {
         return Err(reference_toolchain_error(
-            "the preserved v7 candidate is not the canonical unpromoted policy snapshot",
+            "the preserved v8 candidate is not the canonical unpromoted policy snapshot",
         ));
     }
     normalized_current["status"] =
@@ -1208,7 +1437,7 @@ fn validate_embedded_release_certification(
         serde_json::Value::Null;
     if normalized_current != candidate_value {
         return Err(reference_toolchain_error(
-            "the promoted v7 manifest differs from its qualified candidate outside the permitted certification fields",
+            "the promoted v8 manifest differs from its qualified candidate outside the permitted certification fields",
         ));
     }
     let report: serde_json::Value = serde_json::from_slice(report_bytes).map_err(|error| {
@@ -1216,9 +1445,9 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report is invalid JSON: {error}"
         ))
     })?;
-    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(7)
+    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(8)
         || report.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V7_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY)
         || report.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || report.get("outcome").and_then(serde_json::Value::as_str) != Some("pass")
         || report
@@ -1227,7 +1456,7 @@ fn validate_embedded_release_certification(
             != Some(candidate_manifest_sha256)
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report does not bind the qualified v7 candidate",
+            "the embedded release-certification report does not bind the qualified v8 candidate",
         ));
     }
     for required in [
@@ -2150,6 +2379,12 @@ fn validate_embedded_release_certification(
     let packages = report
         .get("package_decode_back")
         .and_then(serde_json::Value::as_object);
+    let package_evidence = packages.ok_or_else(|| {
+        reference_toolchain_error(
+            "the embedded release-certification report has no package/terminal evidence",
+        )
+    })?;
+    validate_terminal_effects_certification(package_evidence, manifest)?;
     if packages
         .and_then(|value| value.get("status"))
         .and_then(serde_json::Value::as_str)
@@ -2360,7 +2595,7 @@ fn validate_embedded_release_certification(
         {
             return Err(reference_toolchain_error(format!(
                 "the embedded release-certification report decode route {key} disagrees \
-                 with the compiled v7 authority",
+                 with the compiled v8 authority",
             )));
         }
     }
@@ -2383,7 +2618,7 @@ fn validate_embedded_release_certification(
             != Some(manifest.cell_contract.expanded_supported_cell_digest.as_str())
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report disagrees with the v7 cell contract",
+            "the embedded release-certification report disagrees with the v8 cell contract",
         ));
     }
     Ok(())
@@ -2494,7 +2729,7 @@ fn validate_embedded_reference_policy_tables(
             != "ffmpeg_direct_decode_of_float64_qpcm_w64"
     {
         return Err(reference_toolchain_error(
-            "embedded Float64 package contract disagrees with the compiled v7 policy",
+            "embedded Float64 package contract disagrees with the compiled v8 policy",
         ));
     }
     let direct_route = ReferenceDecodeMechanism::DirectFfmpeg.key();
@@ -2529,7 +2764,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.sample_identity.environment != expected_environment
     {
         return Err(reference_toolchain_error(
-            "embedded decoded-sample identity contract disagrees with the compiled v7 policy",
+            "embedded decoded-sample identity contract disagrees with the compiled v8 policy",
         ));
     }
     if manifest.subprocess_environment.schema
@@ -2617,7 +2852,7 @@ fn validate_embedded_reference_policy_tables(
             != "sox_ng_14_8_0_1_misscales_its_float32_w64_on_decode"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v7 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v8 policy",
         ));
     }
     if manifest.analyzer.qualification_schema
@@ -2676,7 +2911,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.analyzer.aligned_multitone_duration_seconds != "0.250000000"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v7 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v8 policy",
         ));
     }
 
@@ -2791,7 +3026,7 @@ fn validate_embedded_reference_policy_tables(
     validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
     if b6.enabled {
         return Err(reference_toolchain_error(
-            "embedded B6 profile must remain typed but disabled under policy v7",
+            "embedded B6 profile must remain typed but disabled under policy v8",
         ));
     }
 
@@ -2845,7 +3080,7 @@ fn validate_embedded_reference_policy_tables(
             PcmBitDepth::Int16 => "int16-shibata-unqualified-no-conservative-bound",
             PcmBitDepth::Int24 => "int24-tpdf-2lsb",
             PcmBitDepth::Float32 => "float32-2^-23",
-            PcmBitDepth::Float64 => "float64-2^-51",
+            PcmBitDepth::Float64 => "float64-sox-s32-effects-half-lsb-plus-f64-2^-51",
             PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
                 return Err(reference_toolchain_error(
                     "compiled terminal-bound table contains an unsupported depth",
@@ -2883,7 +3118,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2918,7 +3153,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -3343,17 +3578,17 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
     ));
     let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
         reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
     })?;
-    if manifest.schema_version != 7
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V7_KEY
+    if manifest.schema_version != 8
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY
         || manifest.status != "qualified_release"
     {
         return Err(reference_toolchain_error(
-            "the embedded policy artifact is not a qualified v7 release",
+            "the embedded policy artifact is not a qualified v8 release",
         ));
     }
     validate_embedded_release_certification(&manifest)?;
@@ -5609,7 +5844,7 @@ fn validate_reference_package_pipeline(
     summary: &DsdReferencePlanSummary,
     pipeline: &PlannedCommandPipeline,
 ) -> Result<(), TrackExecutionError> {
-    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7
+    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V8
         || summary.final_pcm.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64
         || !matches!(
             summary.target,
@@ -5620,7 +5855,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v7 package pipeline is bound to an invalid plan cell"
+                "Reference policy v8 package pipeline is bound to an invalid plan cell"
                     .to_string(),
             ),
             Vec::new(),
@@ -5654,7 +5889,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v7 package pipeline has a noncanonical SoX producer"
+                "Reference policy v8 package pipeline has a noncanonical SoX producer"
                     .to_string(),
             ),
             Vec::new(),
@@ -5705,7 +5940,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v7 package pipeline has a noncanonical FFmpeg consumer"
+                "Reference policy v8 package pipeline has a noncanonical FFmpeg consumer"
                     .to_string(),
             ),
             Vec::new(),
@@ -5788,7 +6023,7 @@ fn validate_reference_measurement_contract(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v7 measurement has a noncanonical FFmpeg analyzer command"
+                "Reference policy v8 measurement has a noncanonical FFmpeg analyzer command"
                     .to_string(),
             ),
             Vec::new(),
@@ -5799,7 +6034,7 @@ fn validate_reference_measurement_contract(
         let carrier = producer.input.as_path().ok_or_else(|| {
             TrackExecutionError::new(
                 ConvertError::Backend(
-                    "Reference policy v7 streamed measurement requires a path-backed W64 carrier"
+                    "Reference policy v8 streamed measurement requires a path-backed W64 carrier"
                         .to_string(),
                 ),
                 Vec::new(),
@@ -5829,7 +6064,7 @@ fn validate_reference_measurement_contract(
         {
             return Err(TrackExecutionError::new(
                 ConvertError::Backend(
-                    "Reference policy v7 measurement has a noncanonical typed SoX-to-FFmpeg f64 pipe contract"
+                    "Reference policy v8 measurement has a noncanonical typed SoX-to-FFmpeg f64 pipe contract"
                         .to_string(),
                 ),
                 Vec::new(),
@@ -5841,7 +6076,7 @@ fn validate_reference_measurement_contract(
     let carrier = measurement.command.input.as_path().ok_or_else(|| {
         TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v7 direct measurement requires a path-backed Float32 W64 carrier"
+                "Reference policy v8 direct measurement requires a path-backed Float32 W64 carrier"
                     .to_string(),
             ),
             Vec::new(),
@@ -5862,7 +6097,7 @@ fn validate_reference_measurement_contract(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v7 measurement has a noncanonical direct Float32-W64 FFmpeg contract"
+                "Reference policy v8 measurement has a noncanonical direct Float32-W64 FFmpeg contract"
                     .to_string(),
             ),
             Vec::new(),
@@ -5900,7 +6135,7 @@ async fn execute_reference_measurement(
                 DEFAULT_PLANNED_COMMAND_TIMEOUT,
             )
             .map_err(TrackExecutionError::from)?;
-            // The v7 environment is semantic policy. Acquire permits without
+            // The v7-inherited environment is semantic policy. Acquire permits without
             // the generic SoX path's OMP_NUM_THREADS injection.
             let _producer_permit =
                 acquire_reference_pipeline_permit(producer.binary, limits, cancel)
@@ -7124,7 +7359,7 @@ mod tests {
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -7140,7 +7375,7 @@ mod tests {
         let mut reserve_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
             )))
             .expect("embedded Reference qualification JSON parses for drift test");
         reserve_drift.analyzer.reporting_uncertainty_db =
@@ -7157,7 +7392,7 @@ mod tests {
         let mut hash_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
             )))
             .expect("embedded Reference qualification JSON parses for hash-contract drift test");
         hash_contract_drift.sample_identity.hash_format =
@@ -7174,7 +7409,7 @@ mod tests {
         let mut route_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
             )))
             .expect("embedded Reference qualification JSON parses for route-contract drift test");
         route_contract_drift
@@ -7192,9 +7427,9 @@ mod tests {
 
         let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
         )))
-        .expect("preserved v7 candidate JSON parses");
+        .expect("preserved v8 candidate JSON parses");
         assert_eq!(
             candidate
                 .terminal_bounds

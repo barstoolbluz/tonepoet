@@ -6,6 +6,10 @@
 //! The test is inert unless explicitly selected. Release automation must set
 //! the gate while using the flake-owned SoX-ng and FFmpeg paths.
 
+// The terminal qualification report is one large `serde_json::json!` literal;
+// raise the macro recursion limit for this test crate to expand it.
+#![recursion_limit = "512"]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -1433,7 +1437,7 @@ fn assert_production_plan_structure(
             let producer = measurement
                 .input_stage
                 .as_ref()
-                .expect("policy v7 f64 measurement has a typed producer");
+                .expect("policy v8 f64 measurement has a typed producer");
             assert_eq!(producer.tool, ToolIdentifier::Sox);
             assert_eq!(producer.output, tonepoet_pipeline::OutputSink::Stdout);
             assert_eq!(producer.args.get(0).map(String::as_str), Some("-S"));
@@ -1595,7 +1599,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V7;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V8;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -2376,7 +2380,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
     let f64_producer = f64_measurement
         .input_stage
         .as_ref()
-        .expect("policy v7 f64 producer stage");
+        .expect("policy v8 f64 producer stage");
     let streamed = run(&sox, &f64_producer.args);
     assert!(
         streamed.status.success(),
@@ -2718,7 +2722,7 @@ fn run_planned_measurement(
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -3076,6 +3080,7 @@ fn package_stream_copy_metadata_args(input: &Path, output: &Path, target: &str) 
 struct PackageQualificationEvidence {
     case_count: usize,
     terminal_bound_case_count: usize,
+    terminal_observed_max_error_by_depth: BTreeMap<String, f64>,
     sample_identity_oracle: Value,
 }
 
@@ -3106,6 +3111,7 @@ fn qualify_lossless_package_cells(
     let mut route_counts = BTreeMap::<String, usize>::new();
     let mut encoding_counts = BTreeMap::<String, usize>::new();
     let mut terminal_route_counts = BTreeMap::<String, usize>::new();
+    let mut terminal_observed_max_error_by_depth = BTreeMap::<String, f64>::new();
     let mut independent_float64_riff_rf64_case_count = 0_usize;
     let mut package_identity_comparison_count = 0_usize;
     let mut post_metadata_identity_comparison_count = 0_usize;
@@ -3210,6 +3216,10 @@ fn qualify_lossless_package_cells(
                                 &chain.terminal_args,
                             );
                             assert!(observed.is_finite());
+                            terminal_observed_max_error_by_depth
+                                .entry(depth_key.to_string())
+                                .and_modify(|maximum| *maximum = (*maximum).max(observed))
+                                .or_insert(observed);
                         }
                         let packaged = &summary.packaged_path;
                         assert_exact_package_probe(
@@ -3381,11 +3391,19 @@ fn qualify_lossless_package_cells(
                         assert_eq!(tagged_carrier.authority(), post_metadata_authority);
                         let tagged_hash =
                             decoded_sample_hash(&tagged_carrier, &sox, &ffmpeg);
-                        assert_eq!(
-                            tagged_hash,
-                            qpcm_hash,
-                            "test-only package stream-copy metadata rewrite changed decoded samples"
-                        );
+                        if tagged_hash != qpcm_hash {
+                            let keep = std::path::Path::new("/tmp/qual_keep");
+                            let _ = fs::create_dir_all(keep);
+                            let _ = fs::copy(packaged, keep.join("packaged.bin"));
+                            let _ = fs::copy(&tagged, keep.join("tagged.bin"));
+                            panic!(
+                                "stream-copy rewrite hash mismatch ({target:?} {depth:?}); packaged={} ({} bytes) tagged={} ({} bytes); copies kept in /tmp/qual_keep",
+                                packaged.display(),
+                                fs::metadata(packaged).map(|m| m.len()).unwrap_or(0),
+                                tagged.display(),
+                                fs::metadata(&tagged).map(|m| m.len()).unwrap_or(0),
+                            );
+                        }
                         post_metadata_identity_comparison_count += 1;
                         let generated = BTreeSet::from([
                             summary.r64_path.clone(),
@@ -3445,9 +3463,15 @@ fn qualify_lossless_package_cells(
         ])
     );
 
+    assert_eq!(
+        terminal_observed_max_error_by_depth.keys().cloned().collect::<Vec<_>>(),
+        vec!["float32".to_string(), "float64".to_string(), "int24".to_string()]
+    );
+
     PackageQualificationEvidence {
         case_count,
         terminal_bound_case_count: terminal_bound_cells.len(),
+        terminal_observed_max_error_by_depth,
         sample_identity_oracle: serde_json::json!({
             "schema": "tonepoet-reference-sample-identity-oracle/v2",
             "status": "passed",
@@ -5002,22 +5026,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v7 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v8 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -5032,7 +5056,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v7 policy status: {other:?}"),
+        other => panic!("unexpected v8 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
     assert_eq!(
@@ -5317,6 +5341,7 @@ fn complete_p0_reference_qualification_report() {
     let PackageQualificationEvidence {
         case_count: package_case_count,
         terminal_bound_case_count,
+        terminal_observed_max_error_by_depth,
         sample_identity_oracle,
     } = qualify_lossless_package_cells(forbidden_route_regression);
     let analyzer_carrier_results = qualify_analyzer_carrier_contract();
@@ -5327,7 +5352,7 @@ fn complete_p0_reference_qualification_report() {
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -5352,8 +5377,8 @@ fn complete_p0_reference_qualification_report() {
         .count();
     let rejected_target_depth_cells = target_depth_cells.len() - supported_target_depth_cells;
     let report = serde_json::json!({
-        "schema_version": 7,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V7_KEY,
+        "schema_version": 8,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
@@ -5402,6 +5427,34 @@ fn complete_p0_reference_qualification_report() {
             "decode_route_table": decode_route_table,
             "case_count": package_case_count,
             "empirical_terminal_bound_case_count": terminal_bound_case_count,
+            "terminal_observed_max_error_by_depth": terminal_observed_max_error_by_depth,
+            "terminal_effects_boundary_audit": {
+                "sox_internal_sample_domain": "signed_q1_31",
+                "round_to_nearest_half_step_peak_bound": "2^-32",
+                "inherited_float64_arithmetic_bound": "2^-51",
+                "combined_float64_peak_bound": "2^-32_plus_2^-51",
+                "int24_disposition": "retained_2^-22_bound_contains_effects_rounding",
+                "float32_disposition": "retained_2^-23_bound_contains_effects_and_carrier_rounding",
+                "float64_disposition": "corrected_to_2^-32_plus_2^-51",
+                "enabled_cells_rejected": 0
+            },
+            "terminal_effects_source_proof": {
+                "schema": "tonepoet-reference-terminal-effects-source-proof/v1",
+                "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY,
+                "sox_ng_revision": "324b8cf873fd7836e8848bd87f7a90d8faa6f849",
+                "sox_ng_nar_hash": "sha256-LjGx+yaWi5EcZsXhTmdRaf9utFXcCXASMmjRtm6vUc8=",
+                "proof_path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_terminal_source_proof.md",
+                "proof_sha256": sha256_hex(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_terminal_source_proof.md"
+                ))),
+                "internal_sample_domain": "signed_twos_complement_int32_q1_31",
+                "float64_carrier_grid_round_trip": "exact_for_every_sox_sample_t_grid_value",
+                "gain_rounding_site": "gain.c:flow_gain:SOX_ROUND_CLIP_COUNT(*ibuf * mult, effp->clips)",
+                "non_clipping_rounding_bound": "one_half_internal_sample_equals_2^-32_fs",
+                "gain_mode_scope": ["reference_compensated", "native_level_exact", "fixed_exact"],
+                "combined_float64_bound": "2^-32_plus_2^-51"
+            },
             "rates_hz": [44100,48000,88200,96000,176400,192000,352800,384000,705600,768000],
             "channels": [1,2],
             "depths": ["int24","float32","float64"],

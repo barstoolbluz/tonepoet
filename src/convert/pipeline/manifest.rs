@@ -691,8 +691,13 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 | DsdReferencePolicyVersion::SoxNg14801V5
                                 | DsdReferencePolicyVersion::SoxNg14801V6
                                 | DsdReferencePolicyVersion::SoxNg14801V7
+                                | DsdReferencePolicyVersion::SoxNg14801V8
                         ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32]))
-                        && (!matches!(policy, DsdReferencePolicyVersion::SoxNg14801V7)
+                        && (!matches!(
+                            policy,
+                            DsdReferencePolicyVersion::SoxNg14801V7
+                                | DsdReferencePolicyVersion::SoxNg14801V8
+                        )
                             || *executed_evidence_digest_v3 != Sha256Digest([0; 32])) => {}
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
                         return Err(ManifestError::InvalidAuthority(
@@ -703,9 +708,14 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                     | DsdReferencePolicyVersion::SoxNg14801V5
                                     | DsdReferencePolicyVersion::SoxNg14801V6
                                     | DsdReferencePolicyVersion::SoxNg14801V7
+                                    | DsdReferencePolicyVersion::SoxNg14801V8
                             ) {
-                                if matches!(policy, DsdReferencePolicyVersion::SoxNg14801V7) {
-                                    "Reference v7 track is missing v1, v2, or v3 executed verification authority"
+                                if matches!(
+                                    policy,
+                                    DsdReferencePolicyVersion::SoxNg14801V7
+                                        | DsdReferencePolicyVersion::SoxNg14801V8
+                                ) {
+                                    "Reference v7+ track is missing v1, v2, or v3 executed verification authority"
                                 } else {
                                     "Reference v3+ track is missing v1 or v2 executed verification authority"
                                 }
@@ -1092,7 +1102,7 @@ mod manifest_merge_gap_tests {
     }
 
     #[test]
-    fn historical_policies_preserve_v1_v2_authority_and_v7_requires_v3() {
+    fn historical_policies_preserve_v1_v2_authority_and_v7_plus_require_v3() {
         let zero = Sha256Digest([0; 32]);
         let v1 = Sha256Digest([8; 32]);
         let v2 = Sha256Digest([9; 32]);
@@ -1144,6 +1154,24 @@ mod manifest_merge_gap_tests {
 
         assert!(reference_manifest_with_evidence(
             DsdReferencePolicyVersion::SoxNg14801V7,
+            v1,
+            v2,
+            v3,
+        )
+        .is_ok());
+
+        let error = reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V8,
+            v1,
+            v2,
+            zero,
+        )
+        .expect_err("v8 must bind the ordered verification command pipeline");
+        assert!(error
+            .to_string()
+            .contains("missing v1, v2, or v3 executed verification authority"));
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V8,
             v1,
             v2,
             v3,

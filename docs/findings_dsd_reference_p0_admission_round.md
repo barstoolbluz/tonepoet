@@ -217,3 +217,62 @@ operation to avoid the 32-bit quantization if a qualified route exists
 appear unaffected, but re-check all three cells' derivations against
 the same boundary while you are in there. Do not widen any bound
 without a derivation; do not soften the check.
+
+
+## F5 (v8 terminal round) — third ffmpeg W64 defect: the MUXER folds alignment padding into the data chunk, appending a phantom sample
+
+Your v8 terminal round otherwise lands: F4's summed 2^-32 + 2^-51 Float64
+bound verifies (v8 checker green), the workspace suite is fully green
+(4,587/0), the live smoke passes, warnings are zero, and the
+qualification gate now runs its longest chain yet (259 s) with every
+cell passing except one. Apply-side kept on our side: a crate-level
+`#![recursion_limit = "512"]` for your large terminal-report `json!`
+literal, and the failing assert was instrumented to preserve evidence
+(kept — it names the cell and copies the pair to /tmp/qual_keep; review
+and keep or replace with equivalent diagnostics).
+
+The remaining failure is a NEW empirical toolchain defect your gate
+caught honestly:
+
+```text
+cell: WavW64 Int24, mono, 88.2 kHz (8,820 samples = 26,460 data bytes,
+      not 8-byte aligned)
+packaged QPCM decodes to 8,820 samples; the ffmpeg -c:a copy -f w64
+metadata rewrite of that same file decodes to 8,821 samples
+(identical prefix, one phantom trailing sample; file sizes 26,564 vs
+26,592)
+```
+
+Isolated evidence: sox reads both files and reports 8,820 vs 8,821
+samples; ffmpeg hash-decodes disagree; byte comparison shows the
+original 26,460 bytes identical with extra trailing data on the copy.
+Stereo and 8-aligned fixtures round-trip cleanly (verified) — the
+trigger is a data chunk whose byte length is not a multiple of the W64
+8-byte alignment, where **ffmpeg's W64 muxer accounts the alignment
+padding as data**, so the next demux yields a phantom frame. This is
+distinct from the two decode-side W64 defects you already routed
+around; it is mux-side.
+
+Production impact is real, not harness-only: the production metadata
+stage rewrites tags via the same ffmpeg re-mux (temp-file rewrite path,
+pinned at `src/convert/pipeline/stages.rs:5967`), so tagging any
+delivered W64 whose data size is not 8-aligned appends a sample in
+production.
+
+Resolve in one pass under your rules — candidate shapes, your choice
+with rationale:
+
+- route W64 metadata mutation away from the ffmpeg W64 muxer entirely
+  (e.g. native RIFF/W64 chunk-level tag writing, or a qualified sox
+  re-container with exact-size proof), with the post-metadata decode
+  verification you already have as the acceptance gate;
+- or forbid metadata mutation for W64 targets in this policy with a
+  recorded reason and a user-facing message, if no qualified route
+  exists;
+- and in either case extend the qualification fixture set so at least
+  one non-8-aligned W64 cell (mono Int24) is exercised permanently.
+
+Do not accept the phantom sample; do not special-case the harness to
+look away. Per the terminal directive: every enabled cell must pass by
+construction in the returned bundle, and any cell you cannot make both
+attainable and correct must be rejected with its reason.

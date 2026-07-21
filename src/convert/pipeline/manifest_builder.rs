@@ -211,7 +211,11 @@ fn build_reference_manifest_track(
     let executed_evidence_digest_v1 = reference_executed_evidence_digest_v1(&evidence)?;
     let executed_evidence_digest_v2 = reference_executed_evidence_digest_v2(&evidence)?;
     let executed_evidence_digest_v3 =
-        if evidence.plan.policy == tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7 {
+        if matches!(
+            evidence.plan.policy,
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V8
+        ) {
             reference_executed_evidence_digest_v3(&evidence)?
         } else {
             Sha256Digest([0; 32])

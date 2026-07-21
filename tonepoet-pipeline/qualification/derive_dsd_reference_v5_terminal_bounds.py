@@ -152,7 +152,21 @@ def main() -> int:
             "dsd_reference_sox_ng_14_8_0_1_v5_candidate.json",
         ):
             verify_artifact(qualification_dir / filename)
-        verify_compiled_policy(qualification_dir.parent / "src" / "dsd_reference.rs")
+        compiled_policy = qualification_dir.parent / "src" / "dsd_reference.rs"
+        compiled_source = compiled_policy.read_text(encoding="utf-8")
+        current_manifests = (
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v6.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"',
+        )
+        active = [marker for marker in current_manifests if marker in compiled_source]
+        if len(active) != 1:
+            raise AssertionError(
+                f"{compiled_policy}: expected exactly one recognized current policy manifest, got {active}"
+            )
+        if active[0] == current_manifests[0]:
+            verify_compiled_policy(compiled_policy)
         print("v5 terminal-bound derivation verified")
     else:
         print(json.dumps(derived_cells(), indent=2, sort_keys=True))
