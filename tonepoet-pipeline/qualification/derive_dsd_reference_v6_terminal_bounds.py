@@ -212,6 +212,7 @@ def main() -> int:
             '"qualification/dsd_reference_sox_ng_14_8_0_1_v9.json"',
             '"qualification/dsd_reference_sox_ng_14_8_0_1_v10.json"',
             '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
         )
         active = [marker for marker in current_manifests if marker in compiled_source]
         if len(active) != 1:

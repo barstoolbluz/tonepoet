@@ -45,6 +45,8 @@ use tonepoet_pipeline::{
     PlannedArg, PlannedCommand, PlannedExecutionStep, RateTarget, ReferenceDecodeAuthority,
     ReferenceDecodeMechanism, ReferenceDecodedCarrier, ReferenceDecodedCarrierSelector,
     ReferenceDecodedSampleRole, ReferenceDither, ReferenceErrorCode,
+    ReferenceStreamedWavBoundaryObservationV2, ReferenceStreamedWavCapacityEvidenceV2,
+    ReferenceStreamedWavDataWrapWitnessV2,
     ReferenceProgrammeScope, ReferenceSampleHashEncoding, ResolvedDsdProfile,
     ResolvedGainPolicy, ResolvedOutputTarget, SampleKind, SourceInfo, SourceRepresentationKind,
     ToolIdentifier, TruePeakMeasurement, TruePeakPurpose, TruePeakValue, WavPackMode,
@@ -1766,7 +1768,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V11;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V12;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -2248,12 +2250,20 @@ fn require_sparse_file_support(_directory: &Path) {
     panic!("the mandatory >4 GiB analyzer-carrier qualification fixture requires Unix sparse-file accounting");
 }
 
-fn create_sparse_w64_capacity_fixture(seed: &Path, output: &Path) -> u64 {
+fn create_sparse_w64_capacity_fixture(
+    seed: &Path,
+    output: &Path,
+    audio_payload_bytes: u64,
+) -> u64 {
     const RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00\x00";
     const FACT_GUID: &[u8; 16] = b"fact\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
     const DATA_GUID: &[u8; 16] = b"data\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
-    const AUDIO_PAYLOAD_BYTES: u64 = (1_u64 << 32) + 8;
 
+    assert_eq!(
+        audio_payload_bytes % tonepoet_pipeline::REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE,
+        0,
+        "capacity fixture payload must be frame aligned",
+    );
     let seed_bytes = fs::read(seed).expect("read seed W64");
     assert_eq!(&seed_bytes[..16], RIFF_GUID, "seed is W64");
     let fact = seed_bytes
@@ -2266,26 +2276,94 @@ fn create_sparse_w64_capacity_fixture(seed: &Path, output: &Path) -> u64 {
         .expect("W64 data chunk");
     let payload_offset = data + 24;
     assert!(payload_offset <= seed_bytes.len(), "valid W64 data header");
-    let frame_count = AUDIO_PAYLOAD_BYTES / 8;
-    let file_size = u64::try_from(payload_offset).expect("W64 header size") + AUDIO_PAYLOAD_BYTES;
+    let frame_count =
+        audio_payload_bytes / tonepoet_pipeline::REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE;
+    let file_size = u64::try_from(payload_offset)
+        .expect("W64 header size")
+        .checked_add(audio_payload_bytes)
+        .expect("sparse W64 fixture size does not overflow");
+    let data_chunk_size = audio_payload_bytes
+        .checked_add(24)
+        .expect("sparse W64 data-chunk size does not overflow");
 
     let mut header = seed_bytes[..payload_offset].to_vec();
     header[16..24].copy_from_slice(&file_size.to_le_bytes());
     header[fact + 24..fact + 32].copy_from_slice(&frame_count.to_le_bytes());
-    header[data + 16..data + 24]
-        .copy_from_slice(&(AUDIO_PAYLOAD_BYTES + 24).to_le_bytes());
+    header[data + 16..data + 24].copy_from_slice(&data_chunk_size.to_le_bytes());
 
     let mut file = File::create(output).expect("create sparse W64 capacity fixture");
     file.write_all(&header).expect("write sparse W64 header");
     file.set_len(file_size).expect("size sparse W64 fixture");
     file.sync_all().expect("sync sparse W64 fixture");
-    assert!(AUDIO_PAYLOAD_BYTES > u64::from(u32::MAX));
-    AUDIO_PAYLOAD_BYTES
+    frame_count
 }
 
-fn inspect_streaming_wav_header(producer: &PlannedCommand, sox: &Path) -> (u32, u32) {
+fn duration_for_guarded_output_frames(sample_frames: u64, sample_rate_hz: u32) -> Duration {
+    let unguarded_frames = sample_frames
+        .checked_sub(tonepoet_pipeline::REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES)
+        .expect("capacity boundary includes the mandatory guard frame");
+    let duration_floor_frames = unguarded_frames
+        .checked_sub(1)
+        .expect("capacity-boundary duration requires at least one unguarded frame");
+    let nanos = u128::from(duration_floor_frames)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_div(u128::from(sample_rate_hz)))
+        .and_then(|value| value.checked_add(1))
+        .expect("capacity-boundary duration arithmetic does not overflow");
+    let duration = Duration::from_nanos(u64::try_from(nanos).expect("boundary duration fits u64"));
+    let planned_unguarded = duration
+        .as_nanos()
+        .checked_mul(u128::from(sample_rate_hz))
+        .and_then(|value| value.checked_add(999_999_999))
+        .map(|value| value / 1_000_000_000)
+        .expect("boundary duration arithmetic does not overflow");
+    assert_eq!(planned_unguarded, u128::from(unguarded_frames));
+    duration
+}
+
+fn capacity_boundary_plan_result(
+    root: &Path,
+    input: &Path,
+    sample_frames: u64,
+) -> tonepoet_pipeline::Result<ConversionPlan> {
+    const SAMPLE_RATE_HZ: u32 = ReferenceStreamedWavCapacityEvidenceV2::SAMPLE_RATE_HZ;
+    let mut settings = PipelineSettings::default();
+    settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+    settings.target_format = target_format(ResolvedOutputTarget::WavW64);
+    settings.target_sample_rate = RateTarget::PcmHz(SAMPLE_RATE_HZ);
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V12;
+    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Reference;
+    let request = PlanRequest {
+        input_path: input.to_path_buf(),
+        output_path: root.join(format!("capacity-{sample_frames}.w64")),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(1),
+            duration: Some(duration_for_guarded_output_frames(sample_frames, SAMPLE_RATE_HZ)),
+            dsd_source_kind: Some(DsdSourceKind::DsfUncompressed),
+            audio_md5: None,
+        },
+        settings,
+        intermediate_dir: Some(root.join("capacity-work")),
+        container_ffmpeg_flags: Vec::new(),
+        resolved_output_target: Some(ResolvedOutputTarget::WavW64),
+        reference_programme_scope: ReferenceProgrammeScope::Singleton,
+        planned_riff_non_audio_upper_bound_bytes: Some(0),
+    };
+    fs::create_dir_all(root.join("capacity-work")).expect("create capacity planner work directory");
+    plan_reference_dsd(&request)
+}
+
+fn inspect_streaming_wav_header(producer: &PlannedCommand, sox: &Path) -> (u32, u32, usize) {
     const HEADER_CAPTURE_BYTES: usize = 4096;
-    const STREAMING_SENTINEL_FLOOR: u32 = 0x7fff_0000;
 
     assert_eq!(
         producer.environment_policy,
@@ -2354,12 +2432,12 @@ fn inspect_streaming_wav_header(producer: &PlannedCommand, sox: &Path) -> (u32, 
     assert_eq!(&header[8..12], b"WAVE", "streaming carrier is RIFF/WAVE");
     let riff_size_field = u32::from_le_bytes(header[4..8].try_into().unwrap());
     let mut offset = 12_usize;
-    let mut data_size_field = None;
+    let mut data_header = None;
     while offset.checked_add(8).is_some_and(|end| end <= header.len()) {
         let chunk_id = &header[offset..offset + 4];
         let chunk_size = u32::from_le_bytes(header[offset + 4..offset + 8].try_into().unwrap());
         if chunk_id == b"data" {
-            data_size_field = Some(chunk_size);
+            data_header = Some((chunk_size, offset + 8));
             break;
         }
         let padded = usize::try_from(chunk_size)
@@ -2372,95 +2450,13 @@ fn inspect_streaming_wav_header(producer: &PlannedCommand, sox: &Path) -> (u32, 
             .and_then(|value| value.checked_add(padded))
             .expect("WAV chunk traversal does not overflow");
     }
-    let data_size_field = data_size_field.unwrap_or_else(|| {
+    let (data_size_field, data_payload_offset) = data_header.unwrap_or_else(|| {
         panic!(
             "streaming WAV data chunk was not present in the first {HEADER_CAPTURE_BYTES} bytes; stderr={}",
             String::from_utf8_lossy(&stderr)
         )
     });
-    assert!(
-        riff_size_field >= STREAMING_SENTINEL_FLOOR
-            && data_size_field >= STREAMING_SENTINEL_FLOOR,
-        "SoX-ng did not emit the frozen large streaming-WAV size sentinels: \
-         riff={riff_size_field:#010x}, data={data_size_field:#010x}, stderr={}",
-        String::from_utf8_lossy(&stderr),
-    );
-    (riff_size_field, data_size_field)
-}
-
-fn run_capacity_carrier_pipeline(
-    producer: &PlannedCommand,
-    sox: &Path,
-    ffmpeg: &Path,
-) -> PlannedPipelineOutput {
-    assert_eq!(
-        producer.environment_policy,
-        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
-    );
-    assert_eq!(producer.environment, BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]));
-    let mut producer_command = Command::new(sox);
-    producer_command
-        .args(&producer.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_qualified_environment(&mut producer_command);
-    let mut producer_child = producer_command.spawn().unwrap_or_else(|error| {
-        panic!(
-            "failed to spawn capacity producer {} {:?}: {error}",
-            sox.display(),
-            producer.args
-        )
-    });
-    let producer_stderr_task = drain_child_stderr(&mut producer_child, "capacity producer");
-    let producer_stdout = producer_child
-        .stdout
-        .take()
-        .expect("capacity producer stdout is piped");
-    let consumer_args = [
-        "-nostdin", "-hide_banner", "-nostats", "-loglevel", "info", "-f", "wav", "-i",
-        "pipe:0", "-map", "0:a:0", "-c:a", "copy", "-f", "null", "-",
-    ];
-    let mut consumer_command = Command::new(ffmpeg);
-    consumer_command
-        .args(consumer_args)
-        .stdin(Stdio::from(producer_stdout))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_qualified_environment(&mut consumer_command);
-    let consumer_child = match consumer_command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let status = terminate_and_reap(
-                &mut producer_child,
-                "capacity producer after consumer spawn failure",
-            );
-            let (producer_stderr, producer_drain_error) = producer_stderr_task.finish();
-            panic!(
-                "failed to spawn capacity consumer {}: {error}; producer_status={status}; \
-                 producer_drain_error={producer_drain_error:?}; producer_stderr={}",
-                ffmpeg.display(),
-                String::from_utf8_lossy(&producer_stderr),
-            )
-        }
-    };
-    let output = supervise_qualified_pipeline(
-        producer_child,
-        producer_stderr_task,
-        consumer_child,
-        "greater-than-4-GiB capacity pipeline",
-    );
-    assert!(
-        output.producer.status.success(),
-        "capacity producer failed: {}",
-        String::from_utf8_lossy(&output.producer.stderr)
-    );
-    assert!(
-        output.consumer.status.success(),
-        "capacity consumer failed: {}",
-        String::from_utf8_lossy(&output.consumer.stderr)
-    );
-    output
+    (riff_size_field, data_size_field, data_payload_offset)
 }
 
 fn qualify_analyzer_carrier_contract() -> Value {
@@ -2758,18 +2754,184 @@ fn qualify_analyzer_carrier_contract() -> Value {
     }
 
     require_sparse_file_support(&root);
-    let sparse = root.join("over-4-gib.w64");
-    let capacity_payload_bytes = create_sparse_w64_capacity_fixture(&f64_summary.r64_path, &sparse);
-    let mut capacity_producer = f64_producer.clone();
-    capacity_producer.input = tonepoet_pipeline::InputSource::Path(sparse.clone());
-    capacity_producer.args[2] = sparse.display().to_string();
-    let (riff_size_field, data_size_field) =
-        inspect_streaming_wav_header(&capacity_producer, &sox);
-    let capacity = run_capacity_carrier_pipeline(&capacity_producer, &sox, &ffmpeg);
+    let bytes_per_sample = tonepoet_pipeline::REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE;
+    let largest_admitted_payload =
+        ReferenceStreamedWavCapacityEvidenceV2::largest_frame_aligned_admitted_payload();
+    let first_policy_rejected_payload = largest_admitted_payload
+        .checked_add(bytes_per_sample)
+        .expect("first rejected payload arithmetic does not overflow");
+    let data_wrap_payload = ReferenceStreamedWavCapacityEvidenceV2::DATA_WRAP_PAYLOAD_BYTES;
+    let transition_count = usize::try_from(
+        ReferenceStreamedWavCapacityEvidenceV2::expected_transition_count(),
+    )
+    .expect("transition scan length fits usize");
+    assert_eq!(transition_count, 10);
+
+    let stream_header_bytes = ReferenceStreamedWavCapacityEvidenceV2::STREAM_HEADER_BYTES;
+    assert_eq!(stream_header_bytes, 66);
+
+    let mut transition_scan = Vec::with_capacity(transition_count);
+    for offset_frames in 0..transition_count {
+        let payload_bytes = largest_admitted_payload
+            .checked_add(
+                u64::try_from(offset_frames)
+                    .expect("transition offset fits u64")
+                    .checked_mul(bytes_per_sample)
+                    .expect("transition payload arithmetic does not overflow"),
+            )
+            .expect("transition payload arithmetic does not overflow");
+        let sparse = root.join(format!("stream-capacity-edge-{offset_frames:02}.w64"));
+        let sample_frames =
+            create_sparse_w64_capacity_fixture(&f64_summary.r64_path, &sparse, payload_bytes);
+        let mut producer = f64_producer.clone();
+        producer.input = tonepoet_pipeline::InputSource::Path(sparse.clone());
+        producer.args[2] = sparse.display().to_string();
+
+        let sparse_info = run(
+            &sox,
+            &["--i".to_string(), "-s".to_string(), sparse.display().to_string()],
+        );
+        assert!(
+            sparse_info.status.success(),
+            "SoX-ng could not read sparse W64 capacity fixture {offset_frames}: {}",
+            String::from_utf8_lossy(&sparse_info.stderr)
+        );
+        let reported_frames = String::from_utf8_lossy(&sparse_info.stdout)
+            .trim()
+            .parse::<u64>()
+            .expect("SoX-ng reports an integer sparse-fixture sample count");
+        assert_eq!(reported_frames, sample_frames);
+        assert_eq!(sample_frames, payload_bytes / bytes_per_sample);
+
+        let (observed_riff_size_field, observed_data_size_field, observed_header_bytes) =
+            inspect_streaming_wav_header(&producer, &sox);
+        assert_eq!(
+            observed_header_bytes,
+            usize::try_from(stream_header_bytes).expect("streamed header size fits usize"),
+        );
+        let structural_riff_size = payload_bytes
+            .checked_add(tonepoet_pipeline::REFERENCE_STREAMED_WAV_RIFF_SIZE_OVERHEAD_BYTES)
+            .expect("structural RIFF size does not overflow");
+        let structural_riff_size_representable =
+            structural_riff_size <= tonepoet_pipeline::REFERENCE_STREAMED_WAV_RIFF_SIZE_FIELD_MAX;
+        let header_fields_exact = structural_riff_size_representable
+            && observed_riff_size_field
+                == u32::try_from(structural_riff_size)
+                    .expect("representable structural RIFF size fits u32")
+            && observed_data_size_field
+                == u32::try_from(payload_bytes).expect("admitted payload fits u32");
+
+        let (planner_admission, planner_error_code) =
+            match capacity_boundary_plan_result(&root, &f64_source, sample_frames) {
+                Ok(_) => ("accepted".to_string(), None),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("DSD-REF-P0-025"),
+                        "capacity rejection did not carry the stable policy error: {message}"
+                    );
+                    (
+                        "rejected".to_string(),
+                        Some(ReferenceStreamedWavCapacityEvidenceV2::ERROR_CODE.to_string()),
+                    )
+                }
+            };
+        if offset_frames == 0 {
+            assert_eq!(planner_admission, "accepted");
+            assert!(
+                header_fields_exact,
+                "the largest admitted carrier must have exact, nonwrapped RIFF and data fields: riff={observed_riff_size_field}, data={observed_data_size_field}, structural_riff={structural_riff_size}, payload={payload_bytes}"
+            );
+        } else {
+            assert_eq!(planner_admission, "rejected");
+        }
+
+        transition_scan.push(ReferenceStreamedWavBoundaryObservationV2 {
+            sample_frames,
+            audio_payload_bytes: payload_bytes,
+            observed_riff_size_field,
+            observed_data_size_field,
+            structural_riff_size,
+            structural_riff_size_representable,
+            header_fields_exact,
+            planner_admission,
+            planner_error_code,
+        });
+    }
+
+    let accepted_edge = transition_scan
+        .first()
+        .expect("transition scan contains accepted edge")
+        .clone();
+    let first_policy_rejected_edge = transition_scan
+        .get(1)
+        .expect("transition scan contains first rejected edge")
+        .clone();
+    assert_eq!(accepted_edge.audio_payload_bytes, largest_admitted_payload);
+    assert_eq!(first_policy_rejected_edge.audio_payload_bytes, first_policy_rejected_payload);
+    assert!(accepted_edge.structural_riff_size_representable);
+    assert!(accepted_edge.header_fields_exact);
+    assert!(!first_policy_rejected_edge.structural_riff_size_representable);
+    assert!(!first_policy_rejected_edge.header_fields_exact);
+
+    let first_observed_riff_wrap_offset_frames = transition_scan
+        .windows(2)
+        .position(|pair| {
+            pair[1].observed_riff_size_field < pair[0].observed_riff_size_field
+        })
+        .map(|index| u64::try_from(index + 1).expect("wrap offset fits u64"))
+        .expect("the pinned writer must exhibit a RIFF-size field wrap in the boundary scan");
+    assert!(first_observed_riff_wrap_offset_frames >= 1);
+
+    let data_wrap = transition_scan
+        .last()
+        .expect("transition scan contains data-wrap witness")
+        .clone();
+    let expected_modulo_data_size_field = u32::try_from(
+        data_wrap_payload & u64::from(u32::MAX),
+    )
+    .expect("modulo-2^32 data size fits u32");
+    assert_eq!(data_wrap.audio_payload_bytes, data_wrap_payload);
+    assert_eq!(data_wrap.sample_frames, 536_870_913);
+    assert_eq!(data_wrap.observed_riff_size_field, 58);
+    assert_eq!(expected_modulo_data_size_field, 8);
+    assert_eq!(data_wrap.observed_data_size_field, expected_modulo_data_size_field);
+
+    let streamed_wav_capacity = ReferenceStreamedWavCapacityEvidenceV2 {
+        status: "passed".to_string(),
+        contract: ReferenceStreamedWavCapacityEvidenceV2::CONTRACT.to_string(),
+        sparse_source_container: "w64".to_string(),
+        sample_rate_hz: ReferenceStreamedWavCapacityEvidenceV2::SAMPLE_RATE_HZ,
+        channels: ReferenceStreamedWavCapacityEvidenceV2::CHANNELS,
+        sample_encoding: "pcm_f64le".to_string(),
+        bytes_per_sample,
+        riff_size_field_max: tonepoet_pipeline::REFERENCE_STREAMED_WAV_RIFF_SIZE_FIELD_MAX,
+        riff_size_overhead_bytes:
+            tonepoet_pipeline::REFERENCE_STREAMED_WAV_RIFF_SIZE_OVERHEAD_BYTES,
+        max_audio_payload_bytes:
+            tonepoet_pipeline::REFERENCE_STREAMED_WAV_MAX_AUDIO_PAYLOAD_BYTES,
+        duration_guard_frames:
+            tonepoet_pipeline::REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES,
+        stream_header_bytes,
+        accepted_edge,
+        first_policy_rejected_edge,
+        transition_scan,
+        first_observed_riff_wrap_offset_frames,
+        data_wrap_witness: ReferenceStreamedWavDataWrapWitnessV2 {
+            sample_frames: data_wrap.sample_frames,
+            audio_payload_bytes: data_wrap.audio_payload_bytes,
+            observed_riff_size_field: data_wrap.observed_riff_size_field,
+            observed_data_size_field: data_wrap.observed_data_size_field,
+            expected_modulo_data_size_field,
+            wrapped_header_is_sentinel: false,
+            consumer_completeness_claim: false,
+        },
+        error_code: ReferenceStreamedWavCapacityEvidenceV2::ERROR_CODE.to_string(),
+    };
 
     serde_json::json!({
         "status": "passed",
-        "contract": "tonepoet-reference-analyzer-carrier/v2",
+        "contract": "tonepoet-reference-analyzer-carrier/v3",
         "routing_rule": "float32_w64_direct_ffmpeg_else_sox_f64_wav_stream",
         "known_defect": {
             "status": "reproduced",
@@ -2835,24 +2997,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
             "terminal_argv": f1_chain.terminal_args.clone(),
             "package_argv": f1_chain.package_args.clone(),
         },
-        "greater_than_4_gib_stream": {
-            "status": "passed",
-            "sparse_source_container": "w64",
-            "environment_policy": "clear_and_set",
-            "environment": {"LC_ALL": "C"},
-            "pipeline_deadline_seconds": QUALIFICATION_PIPELINE_TIMEOUT.as_secs(),
-            "termination_reap_deadline_seconds": QUALIFICATION_TERMINATION_TIMEOUT.as_secs(),
-            "failure_contract": "terminate_and_reap_or_fail",
-            "audio_payload_bytes": capacity_payload_bytes,
-            "riff_u32_max_bytes": u32::MAX,
-            "streaming_sentinel_floor": 0x7fff_0000_u32,
-            "riff_size_field": riff_size_field,
-            "data_size_field": data_size_field,
-            "read_to_eof": true,
-            "consumer_mode": "stream_copy_to_null",
-            "producer_exit": capacity.producer.status.code(),
-            "consumer_exit": capacity.consumer.status.code(),
-        },
+        "streamed_wav_capacity": streamed_wav_capacity,
     })
 }
 
@@ -2889,7 +3034,7 @@ fn run_planned_measurement(
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -5498,22 +5643,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v11 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v12 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -5528,7 +5673,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v11 policy status: {other:?}"),
+        other => panic!("unexpected v12 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
     assert_eq!(
@@ -5868,7 +6013,7 @@ fn complete_p0_reference_qualification_report() {
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -5895,8 +6040,8 @@ fn complete_p0_reference_qualification_report() {
     let production_metadata_mutation_evidence =
         sample_identity_oracle["production_metadata_mutation"].clone();
     let report = serde_json::json!({
-        "schema_version": 11,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V11_KEY,
+        "schema_version": 12,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V12_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
@@ -5937,6 +6082,7 @@ fn complete_p0_reference_qualification_report() {
             "fixture_manifest_id": sacd_rs::DST_REFERENCE_FIXTURE_MANIFEST_ID,
             "fixture_provenance_id": sacd_rs::DST_REFERENCE_FIXTURE_PROVENANCE_ID,
         },
+        "streamed_wav_capacity": analyzer_carrier_results["streamed_wav_capacity"].clone(),
         "analyzer_carrier": analyzer_carrier_results,
         "production_true_peak_analyzer": analyzer_results,
         "production_source_front_end_integration": source_front_end_results,
@@ -5944,6 +6090,7 @@ fn complete_p0_reference_qualification_report() {
         "analyzer_policy_bounds": qualification["analyzer"].clone(),
         "terminal_bounds": qualification["terminal_bounds"].clone(),
         "riff_capacity": qualification["riff_capacity"].clone(),
+        "streamed_wav_capacity_policy": qualification["streamed_wav_capacity"].clone(),
         "float64_package_pipeline": qualification["packaging"].clone(),
         "sample_identity_oracle": sample_identity_oracle,
         "evidence_command_environment": {

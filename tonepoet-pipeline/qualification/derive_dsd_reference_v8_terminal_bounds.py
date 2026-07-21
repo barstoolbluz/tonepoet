@@ -462,7 +462,7 @@ def verify_compiled_v8_routes(repository_root: Path) -> None:
 
     if not any(
         marker in executor
-        for marker in ("manifest.schema_version != 8", "manifest.schema_version != 9", "manifest.schema_version != 10", "manifest.schema_version != 11")
+        for marker in ("manifest.schema_version != 8", "manifest.schema_version != 9", "manifest.schema_version != 10", "manifest.schema_version != 11", "manifest.schema_version != 12")
     ):
         raise AssertionError(
             "compiled executor has no recognized v8-or-later manifest-schema guard"
@@ -688,6 +688,7 @@ def main() -> int:
             '"qualification/dsd_reference_sox_ng_14_8_0_1_v9.json"',
             '"qualification/dsd_reference_sox_ng_14_8_0_1_v10.json"',
             '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
         )
         active = [marker for marker in current_manifests if marker in compiled_source]
         if len(active) != 1:

@@ -38,6 +38,7 @@ pub mod materializer_dvdv;
 pub mod materializer_bluray;
 pub mod materializer_sacd;
 pub mod materializer_single;
+pub(crate) mod metadata_rewrite;
 pub mod memory_budget;
 pub mod orchestrator_rerun_gate;
 pub mod plan_bridge;

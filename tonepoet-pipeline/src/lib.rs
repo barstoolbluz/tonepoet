@@ -11,6 +11,7 @@ pub mod error;
 pub mod mapping;
 pub mod plan;
 pub mod plugins;
+pub mod qualification_schema;
 pub mod settings;
 pub mod source;
 pub mod tools;
@@ -27,6 +28,7 @@ pub use plan::{
     InputSource, OutputSink, PlanAction, PlanContext, PlanOperation, PlanRequest, PlanStep,
     PlannedCommand, PlannedCommandPipeline, PlannedExecutionStep, TopologyPlan,
 };
+pub use qualification_schema::*;
 pub use plugins::{
     FfmpegPlugin, FlacPlugin, LoudgainPlugin, MetaflacPlugin, SoxPlugin, SsrcPlugin,
 };

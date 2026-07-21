@@ -423,3 +423,94 @@ rules:
 
 Do not accept a wrapped header as a sentinel; do not soften the
 transport proof.
+
+### F6 resolution (policy v12 candidate, 2026-07-21)
+
+Resolved by choosing the fail-closed capacity boundary rather than asserting an
+unproven downstream read-to-EOF behavior. The append-only
+`sox_ng_14_8_0_1_v12` candidate reproduces the pinned SoX-ng defect with the
+permanent sparse W64 fixture: 536,870,913 mono Float64 frames produce a
+4,294,967,304-byte audio payload, while the unseekable WAV header contains RIFF
+size `58` and data size `8`; the data field is the exact modulo-2^32 value,
+while the RIFF field collapses to the header-only size. Those values are
+recorded as a defect and are explicitly not accepted as sentinels or complete
+transport evidence.
+
+All Reference plans require the Float64 WAV stream used by the pre-terminal
+analyzer. V12 therefore admits a plan only when the checked upper bound
+
+```text
+(ceil(duration_ns * target_rate_hz / 1e9) + 1 guard frame)
+  * channels * 8 bytes
+  <= 4,294,967,237 bytes
+```
+
+holds. The maximum is `u32::MAX - 58`, where 58 is the fixed RIFF-size
+contribution of the pinned 66-byte streamed header. Missing duration, checked
+arithmetic overflow, or a larger carrier fails before execution with the new
+stable `DSD-REF-P0-025` error. Ordinary RIFF output keeps its existing
+`DSD-REF-P0-018` preflight and precedence; RF64, W64, and every other delivery
+container remain subject to the analyzer-stream cap.
+
+The qualification report and runtime release validator now bind the exact
+capacity constants, the one-frame guard, the negative sentinel/completeness
+claims, and the user-facing error. The hardened v2 evidence also runs the pinned
+producer at the largest frame-aligned admitted payload (4,294,967,232 bytes),
+requires exact nonwrapped RIFF/data fields there, rejects the immediately
+following frame with `DSD-REF-P0-025`, and scans every frame-aligned payload
+through the frozen 4 GiB + 8 witness to locate the writer's actual first
+RIFF-field wrap without assuming an unproved overflow formula. The qualification
+harness serializes this evidence from typed structures; the runtime validator
+deserializes it with `deny_unknown_fields` and validates arithmetic continuity
+and all edge relationships before accepting the report.
+
+The existing FFmpeg same-directory metadata rewrite now has an explicit
+attribute contract. It snapshots and revalidates the original regular-file
+identity, preserves permission state and access/modification timestamps,
+preserves uid/gid on Unix, preserves the complete xattr set (including POSIX
+ACL xattrs) on Linux, and verifies the published attributes after atomic
+replacement and parent-directory sync. Target substitution detected before
+publication, or any preservation failure, aborts closed.
+
+Removing the cap later is a pure append-only policy addition requiring either a
+corrected and repinned SoX-ng writer with renewed closure attestation or an
+independently qualified sample-exact transport beyond 4 GiB.
+
+
+## F7 (v12 round) — streamed-WAV header-size constant mis-derived: 66 vs the measured 58
+
+Your v12 capacity resolution is otherwise sound and applied: suite
+4,608/0, v12 checker green, live smoke passes, zero cold warnings.
+Apply-side kept: `sync_parent_dir` re-exported from the new
+`metadata_rewrite` module for the stages call sites, and one
+double-reference comparison fix.
+
+The single remaining qualification failure is one frozen constant
+(`tests/dsd_reference_qualification.rs:2808`):
+
+```text
+observed_header_bytes = 58
+policy stream_header_bytes = 66
+```
+
+Measured layout of SoX-ng 14.8.0.1's streamed float WAV header (hex
+dump verified on this toolchain):
+
+```text
+RIFF header            12   ("RIFF" + u32 size + "WAVE")
+fmt  chunk header       8
+fmt  body              18   (16-byte WAVE_FORMAT_IEEE_FLOAT + u16 cbSize=0)
+fact chunk header       8
+fact body               4   (u32 sample count)
+data chunk header       8
+total                  58
+```
+
+Your 66 presumably assumed an extra 8 bytes (a second chunk header or
+a 22-byte extensible cbSize block sox does not write here). Re-derive
+`stream_header_bytes` (and any dependent v12 constants such as the
+RIFF-size overhead) from the measured layout, note whether the value
+is encoding-dependent (integer PCM headers omit the fact chunk and the
+cbSize word: 12+8+16+8 = 44), and mint the correction under your
+append-only rules. Everything else in the v12 capacity contract
+verified against the real binary.

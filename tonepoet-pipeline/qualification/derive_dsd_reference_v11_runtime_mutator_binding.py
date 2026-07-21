@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 V10_HASHES = {
-    "derive_dsd_reference_v10_production_metadata.py": "c6a5761df969d79cb882e343aaa2768ed95bab105749bb4c16c88a155fbd45c8",
+    "derive_dsd_reference_v10_production_metadata.py": "e7b95cc166c4fce5e08614aba1be79d5b6dcde944d6dc003d0b353b6c5622659",
     "dsd_reference_sox_ng_14_8_0_1_v10.json": "9fadf78613baa1f170499764da0285088a0e5720ff7d22e24163170d3174aab3",
     "dsd_reference_sox_ng_14_8_0_1_v10_candidate.json": "9fadf78613baa1f170499764da0285088a0e5720ff7d22e24163170d3174aab3",
     "dsd_reference_sox_ng_14_8_0_1_v10_certification.json": "be1a41e509013909cb5915ae92c6e7b98cf4f4a848e30fc6c4aa983240c530f4",
@@ -116,11 +116,12 @@ def verify(root: Path) -> None:
 
     for marker in (
         'pub const DSD_REFERENCE_POLICY_V11_KEY: &str = "sox_ng_14_8_0_1_v11";',
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
         "SoxNg14801V11",
+        '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
+        "SoxNg14801V12",
     ):
         require(planner, marker, "planner")
-    require(settings, "SoxNg14801V11", "settings")
+    require(settings, "SoxNg14801V12", "settings")
 
     for env_name in (
         "TONEPOET_REFERENCE_METAFLAC_STORE_PATH",
@@ -191,8 +192,8 @@ def verify(root: Path) -> None:
         require(stages, marker, "production metadata execution")
 
     for marker in (
-        '"schema_version": 11',
-        "DSD_REFERENCE_POLICY_V11_KEY",
+        '"schema_version": 12',
+        "DSD_REFERENCE_POLICY_V12_KEY",
         "METAFLAC_STORE_ENV",
         "WVTAG_STORE_ENV",
         "ATOMIC_PARSLEY_STORE_ENV",

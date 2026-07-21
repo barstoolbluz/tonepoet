@@ -24,6 +24,10 @@ use super::errors::{
     PublishError, ReplayGainError, RequestValidationError, SourceDetectError, SourceDispatchError,
     ToolRunnerError,
 };
+use super::metadata_rewrite::{
+    metadata_rewrite_temp_path, replace_rewritten_metadata_file, sync_parent_dir,
+    MetadataRewriteTemp,
+};
 use super::actions::{
     acquire_blocking_album_publication_lock_for_album,
     acquire_blocking_album_publication_lock_for_album_in_output_root,
@@ -4554,72 +4558,6 @@ fn ffmpeg_authoritative_metadata_tags(tags: &[(String, String)]) -> Vec<(String,
     out
 }
 
-fn metadata_rewrite_temp_path(path: &Path) -> io::Result<PathBuf> {
-    let parent = parent_dir_or_current(path);
-    fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("audio");
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("tmp");
-    let prefix = format!(".{file_name}.tonepoet-metadata.");
-    let suffix = format!(".tmp.{ext}");
-    let temp = tempfile::Builder::new()
-        .prefix(&prefix)
-        .suffix(&suffix)
-        .tempfile_in(parent)?;
-    temp.into_temp_path().keep().map_err(|err| err.error)
-}
-
-fn sync_file_before_metadata_replace(path: &Path) -> io::Result<()> {
-    let file = fs::OpenOptions::new().read(true).open(path)?;
-    file.sync_all()
-}
-
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    let parent = parent_dir_or_current(path);
-    let dir = fs::File::open(parent)?;
-    match dir.sync_all() {
-        Ok(()) => Ok(()),
-        // Directory fsync is unsupported on descriptor-namespace routes
-        // (/proc/self/fd/N parents) and some special filesystems; real
-        // directories never report these errnos. Same tolerance as
-        // cap_fs::directory_sync_unsupported. (ENOTSUP aliases EOPNOTSUPP on
-        // Linux, hence the boolean form rather than a pattern.)
-        Err(error)
-            if error.raw_os_error().is_some_and(|code| {
-                code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
-            }) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn replace_rewritten_metadata_file(path: &Path, tmp: &Path) -> io::Result<()> {
-    if !tmp.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("metadata rewrite did not create temporary file: {}", tmp.display()),
-        ));
-    }
-    let metadata = fs::metadata(tmp)?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("metadata rewrite produced an empty or non-file temporary output: {}", tmp.display()),
-        ));
-    }
-
-    sync_file_before_metadata_replace(tmp)?;
-    // The rewrite temp is created in the same directory as the target, so this
-    // rename is same-filesystem. On POSIX platforms it atomically replaces an
-    // existing target and never exposes a target-absent window.
-    fs::rename(tmp, path)?;
-    sync_parent_dir(path)
-}
-
 const AUTHORITATIVE_CUE_MANAGED_TAG_KEYS: &[&str] = &[
     "TITLE",
     "ARTIST",
@@ -4971,15 +4909,15 @@ fn metadata_tag_command(
     ext: &str,
     tags: &[(String, String)],
     existing_keys: &BTreeSet<String>,
-) -> Result<(ToolCommand, Option<PathBuf>), MetadataError> {
+) -> Result<(ToolCommand, Option<MetadataRewriteTemp>), MetadataError> {
     let (binary, args, tmp_path) = match ext {
         "flac" => (ToolBinary::Metaflac, metaflac_tag_args(path, tags, existing_keys), None),
         "opus" | "ogg" => (ToolBinary::Opustags, opustags_tag_args(path, tags, existing_keys), None),
         "wv" => (ToolBinary::Wvtag, wvtag_tag_args(path, tags, existing_keys), None),
         "mp3" | "m4a" | "wav" | "aiff" | "aif" => {
-            let preserve_rf64 = ext == "wav" && wave_metadata_rewrite_requires_rf64(path)?;
             let tmp = metadata_rewrite_temp_path(path)?;
-            let args = ffmpeg_metadata_rewrite_args(path, &tmp, tags, preserve_rf64);
+            let preserve_rf64 = ext == "wav" && wave_metadata_rewrite_requires_rf64(path)?;
+            let args = ffmpeg_metadata_rewrite_args(path, tmp.path(), tags, preserve_rf64);
             (ToolBinary::Ffmpeg, args, Some(tmp))
         }
         "w64" => {
@@ -5079,13 +5017,13 @@ fn cue_artwork_embed_command(
     path: &Path,
     ext: &str,
     artwork: &CueArtworkSidecar,
-) -> Result<Option<(ToolCommand, Option<PathBuf>)>, MetadataError> {
+) -> Result<Option<(ToolCommand, Option<MetadataRewriteTemp>)>, MetadataError> {
     let (binary, args, tmp_path, timeout) = match ext {
         "flac" | "mp3" | "m4a" | "mp4" => {
             let tmp = metadata_rewrite_temp_path(path)?;
             (
                 ToolBinary::Ffmpeg,
-                ffmpeg_artwork_rewrite_args(path, artwork, &tmp, ext),
+                ffmpeg_artwork_rewrite_args(path, artwork, tmp.path(), ext),
                 Some(tmp),
                 Duration::from_secs(90),
             )
@@ -5153,12 +5091,12 @@ async fn embed_cue_artwork_for_file(
 
     if let Err(err) = result {
         if let Some(tmp) = tmp_path.as_ref() {
-            let _ = fs::remove_file(tmp);
+            tmp.cleanup_best_effort();
         }
         return Err(err);
     }
 
-    if let Some(tmp) = tmp_path.as_ref() {
+    if let Some(tmp) = tmp_path {
         replace_rewritten_metadata_file(path, tmp)?;
     }
 
@@ -5206,12 +5144,12 @@ async fn tag_audio_file(
 
     if let Err(err) = result {
         if let Some(tmp) = tmp_path.as_ref() {
-            let _ = fs::remove_file(tmp);
+            tmp.cleanup_best_effort();
         }
         return Err(err);
     }
 
-    if let Some(tmp) = tmp_path.as_ref() {
+    if let Some(tmp) = tmp_path {
         replace_rewritten_metadata_file(path, tmp)?;
     }
 
@@ -5430,6 +5368,9 @@ mod metadata_writer_command_tests {
         for (scope, tags) in [("single", &single_file_tags), ("album", &album_tags)] {
             for ext in ["flac", "opus", "wv", "mp3", "m4a"] {
                 let path = temp.path().join(format!("{scope}-output.{ext}"));
+                if matches!(ext, "mp3" | "m4a") {
+                    fs::write(&path, b"source audio").expect("write metadata rewrite source");
+                }
                 let (command, temporary) =
                     metadata_tag_command(&path, ext, tags, &existing).expect("metadata command");
                 match ext {
@@ -6291,6 +6232,7 @@ mod metadata_writer_command_tests {
     fn ffmpeg_metadata_command_uses_random_same_directory_sidecar_temp_file_for_replacement() {
         let dir = temp_test_dir("tonepoet-metadata-temp");
         let path = dir.join("track.mp3");
+        fs::write(&path, b"source audio").expect("write metadata source");
         let (track, album) = sample_metadata();
         let tags = authoritative_metadata_tags(&track, &album);
         let (cmd, tmp) = metadata_tag_command(&path, "mp3", &tags, &BTreeSet::new())
@@ -6298,22 +6240,23 @@ mod metadata_writer_command_tests {
         let tmp = tmp.expect("ffmpeg metadata rewrite must use a temp file");
 
         assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
-        assert_eq!(tmp.parent(), Some(dir.as_path()));
+        assert_eq!(tmp.path().parent(), Some(dir.as_path()));
         assert!(matches!(
-            tmp.extension().and_then(|ext| ext.to_str()),
+            tmp.path().extension().and_then(|ext| ext.to_str()),
             Some("mp3")
         ));
         assert!(
-            tmp.file_name()
+            tmp.path()
+                .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.contains(".tonepoet-metadata.") && name.ends_with(".tmp.mp3")),
             "temp path should use a random same-directory rewrite name with the target extension: {}",
-            tmp.display()
+            tmp.path().display()
         );
         assert_pair(&cmd.args, "-map_metadata", "-1");
         assert_pair(&cmd.args, "-c", "copy");
 
-        let _ = fs::remove_file(&tmp);
+        tmp.cleanup_best_effort();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6321,55 +6264,18 @@ mod metadata_writer_command_tests {
     fn ffmpeg_metadata_temp_paths_are_collision_resistant() {
         let dir = temp_test_dir("tonepoet-metadata-temp-unique");
         let path = dir.join("track.m4a");
+        fs::write(&path, b"source audio").expect("write metadata source");
         let first = metadata_rewrite_temp_path(&path).expect("first temp path");
         let second = metadata_rewrite_temp_path(&path).expect("second temp path");
 
-        assert_ne!(first, second, "metadata rewrite temp paths must not be pid-deterministic");
-        assert_eq!(first.parent(), Some(dir.as_path()));
-        assert_eq!(second.parent(), Some(dir.as_path()));
-        assert!(first.file_name().and_then(|name| name.to_str()).unwrap_or_default().ends_with(".tmp.m4a"));
-        assert!(second.file_name().and_then(|name| name.to_str()).unwrap_or_default().ends_with(".tmp.m4a"));
+        assert_ne!(first.path(), second.path(), "metadata rewrite temp paths must not be pid-deterministic");
+        assert_eq!(first.path().parent(), Some(dir.as_path()));
+        assert_eq!(second.path().parent(), Some(dir.as_path()));
+        assert!(first.path().file_name().and_then(|name| name.to_str()).unwrap_or_default().ends_with(".tmp.m4a"));
+        assert!(second.path().file_name().and_then(|name| name.to_str()).unwrap_or_default().ends_with(".tmp.m4a"));
 
-        let _ = fs::remove_file(first);
-        let _ = fs::remove_file(second);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn metadata_rewrite_replaces_target_atomically_and_syncs_visible_state() {
-        let dir = temp_test_dir("tonepoet-metadata-replace");
-        let target = dir.join("track.mp3");
-        fs::write(&target, b"old audio").expect("write old target");
-        let tmp = metadata_rewrite_temp_path(&target).expect("temp path");
-        fs::write(&tmp, b"new audio").expect("write rewritten temp");
-
-        replace_rewritten_metadata_file(&target, &tmp).expect("replace rewritten file");
-
-        assert_eq!(fs::read(&target).expect("read replaced target"), b"new audio");
-        assert!(!tmp.exists(), "temp file should be consumed by replacement");
-        assert!(
-            fs::read_dir(&dir)
-                .expect("read temp dir")
-                .all(|entry| !entry.expect("dir entry").file_name().to_string_lossy().contains(".bak")),
-            "metadata replacement should not create backup windows or backup files"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn metadata_rewrite_rejects_empty_temporary_output() {
-        let dir = temp_test_dir("tonepoet-metadata-empty-temp");
-        let target = dir.join("track.mp3");
-        fs::write(&target, b"old audio").expect("write old target");
-        let tmp = metadata_rewrite_temp_path(&target).expect("temp path");
-
-        let err = replace_rewritten_metadata_file(&target, &tmp)
-            .expect_err("empty metadata rewrite temp must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(fs::read(&target).expect("old target should remain"), b"old audio");
-
-        let _ = fs::remove_file(tmp);
+        first.cleanup_best_effort();
+        second.cleanup_best_effort();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6383,18 +6289,20 @@ mod metadata_writer_command_tests {
 
         for (target, ext) in [("track.flac", "flac"), ("track.mp3", "mp3"), ("track.m4a", "m4a")] {
             let path = dir.join(target);
+            fs::write(&path, b"source audio").expect("write artwork source");
             let (cmd, tmp) = cue_artwork_embed_command(&path, ext, &artwork)
                 .expect("artwork command allocation should succeed")
                 .expect("container supports post-encode CUE artwork embedding");
             assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
             let tmp = tmp.expect("FFmpeg artwork embedding must use sidecar temp replacement");
-            assert_eq!(tmp.parent(), Some(dir.as_path()));
+            assert_eq!(tmp.path().parent(), Some(dir.as_path()));
             assert!(
-                tmp.file_name()
+                tmp.path()
+                    .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.contains(".tonepoet-metadata.") && name.ends_with(&format!(".tmp.{ext}"))),
                 "artwork rewrite temp should preserve target extension: {}",
-                tmp.display()
+                tmp.path().display()
             );
             assert_pair(&cmd.args, "-map", "0:a");
             assert_pair(&cmd.args, "-map", "1:v:0");
@@ -6402,20 +6310,24 @@ mod metadata_writer_command_tests {
             assert_pair(&cmd.args, "-disposition:v:0", "attached_pic");
             assert_pair(&cmd.args, "-c:a", "copy");
             assert_pair(&cmd.args, "-c:v", "copy");
-            let _ = fs::remove_file(tmp);
+            tmp.cleanup_best_effort();
         }
 
-        let (m4a_cmd, m4a_tmp) = cue_artwork_embed_command(&dir.join("track.m4a"), "m4a", &artwork)
+        let m4a_path = dir.join("track.m4a");
+        fs::write(&m4a_path, b"source audio").expect("write m4a source");
+        let (m4a_cmd, m4a_tmp) = cue_artwork_embed_command(&m4a_path, "m4a", &artwork)
             .expect("m4a artwork command allocation")
             .expect("m4a artwork command");
         assert_pair(&m4a_cmd.args, "-f", "ipod");
-        if let Some(tmp) = m4a_tmp { let _ = fs::remove_file(tmp); }
+        if let Some(tmp) = m4a_tmp { tmp.cleanup_best_effort(); }
 
-        let (mp3_cmd, mp3_tmp) = cue_artwork_embed_command(&dir.join("track.mp3"), "mp3", &artwork)
+        let mp3_path = dir.join("track.mp3");
+        fs::write(&mp3_path, b"source audio").expect("write mp3 source");
+        let (mp3_cmd, mp3_tmp) = cue_artwork_embed_command(&mp3_path, "mp3", &artwork)
             .expect("mp3 artwork command allocation")
             .expect("mp3 artwork command");
         assert_pair(&mp3_cmd.args, "-id3v2_version", "3");
-        if let Some(tmp) = mp3_tmp { let _ = fs::remove_file(tmp); }
+        if let Some(tmp) = mp3_tmp { tmp.cleanup_best_effort(); }
 
         let (wv_cmd, wv_tmp) = cue_artwork_embed_command(&dir.join("track.wv"), "wv", &artwork)
             .expect("WavPack artwork command allocation")

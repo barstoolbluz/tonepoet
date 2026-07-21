@@ -132,16 +132,19 @@ def verify(root: Path) -> None:
     current_manifests = (
         '"qualification/dsd_reference_sox_ng_14_8_0_1_v10.json"',
         '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
+        '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
     )
     active = [marker for marker in current_manifests if marker in planner]
     if len(active) != 1:
         raise AssertionError(
             f"planner: expected exactly one recognized v10-or-later current manifest, got {active}"
         )
-    if active[0] == current_manifests[0]:
-        require(settings, "SoxNg14801V10", "settings")
-    else:
-        require(settings, "SoxNg14801V11", "settings")
+    active_settings = {
+        current_manifests[0]: "SoxNg14801V10",
+        current_manifests[1]: "SoxNg14801V11",
+        current_manifests[2]: "SoxNg14801V12",
+    }
+    require(settings, active_settings[active[0]], "settings")
 
     for marker in (
         "apply_production_metadata_to_file",
@@ -166,10 +169,10 @@ def verify(root: Path) -> None:
     ):
         require(tool_runner, marker, "production tool identity probe")
 
-    executor_schema_guards = ("manifest.schema_version != 10", "manifest.schema_version != 11")
+    executor_schema_guards = ("manifest.schema_version != 10", "manifest.schema_version != 11", "manifest.schema_version != 12")
     if not any(marker in executor for marker in executor_schema_guards):
         raise AssertionError("runtime validator has no recognized v10-or-later schema guard")
-    executor_policy_keys = ("DSD_REFERENCE_POLICY_V10_KEY", "DSD_REFERENCE_POLICY_V11_KEY")
+    executor_policy_keys = ("DSD_REFERENCE_POLICY_V10_KEY", "DSD_REFERENCE_POLICY_V11_KEY", "DSD_REFERENCE_POLICY_V12_KEY")
     if not any(marker in executor for marker in executor_policy_keys):
         raise AssertionError("runtime validator has no recognized v10-or-later policy key")
     for marker in (
@@ -207,12 +210,12 @@ def verify(root: Path) -> None:
         '"post_mutation_container_contract_rechecked": true',
         '"rf64_preservation": "source_magic_RF64_requires_ffmpeg_-rf64_always"',
         '"schema": "tonepoet-reference-sample-identity-oracle/v4"',
-        '"schema_version": 11',
+        '"schema_version": 12',
         'let atomic_parsley_version = combined(&run(&atomic_parsley, &[]));',
         'atomic_parsley_reported_version',
         'contains("atomicparsley version")',
         '"reported_version": atomic_parsley_reported_version',
-        "DSD_REFERENCE_POLICY_V11_KEY",
+        "DSD_REFERENCE_POLICY_V12_KEY",
     ):
         require(qualification, marker, "qualification harness")
     for env_name in (

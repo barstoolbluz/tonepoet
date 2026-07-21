@@ -38,8 +38,10 @@ pub const DSD_REFERENCE_POLICY_V8_KEY: &str = "sox_ng_14_8_0_1_v8";
 pub const DSD_REFERENCE_POLICY_V9_KEY: &str = "sox_ng_14_8_0_1_v9";
 /// Stable historical policy key for the v10 exact production-metadata evidence contract.
 pub const DSD_REFERENCE_POLICY_V10_KEY: &str = "sox_ng_14_8_0_1_v10";
-/// Stable policy key for the v11 runtime-bound production-metadata mutator contract.
+/// Stable historical policy key for the v11 runtime-bound production-metadata mutator contract.
 pub const DSD_REFERENCE_POLICY_V11_KEY: &str = "sox_ng_14_8_0_1_v11";
+/// Stable policy key for the v12 bounded streamed-WAV carrier contract.
+pub const DSD_REFERENCE_POLICY_V12_KEY: &str = "sox_ng_14_8_0_1_v12";
 /// Commissioned SoX-ng source revision.
 pub const DSD_REFERENCE_SOX_NG_REVISION: &str =
     "324b8cf873fd7836e8848bd87f7a90d8faa6f849";
@@ -47,7 +49,7 @@ pub const DSD_REFERENCE_SOX_NG_REVISION: &str =
 pub const DSD_REFERENCE_SOX_NG_VERSION: &str = "14.8.0.1";
 /// Stable policy qualification artifact path.
 pub const DSD_REFERENCE_QUALIFICATION_MANIFEST_PATH: &str =
-    "qualification/dsd_reference_sox_ng_14_8_0_1_v11.json";
+    "qualification/dsd_reference_sox_ng_14_8_0_1_v12.json";
 
 /// Signed nanodecibels used for policy arithmetic and canonical serialization.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -295,10 +297,13 @@ pub enum DsdReferencePolicyVersion {
     /// Corrected v10 exact production-metadata evidence contract. Retained for append-only decoding only.
     #[cfg_attr(feature = "serde", serde(rename = "sox_ng_14_8_0_1_v10"))]
     SoxNg14801V10,
-    /// Corrected v11 runtime-bound production-metadata mutator contract.
-    #[default]
+    /// Corrected v11 runtime-bound production-metadata mutator contract. Retained for append-only decoding only.
     #[cfg_attr(feature = "serde", serde(rename = "sox_ng_14_8_0_1_v11"))]
     SoxNg14801V11,
+    /// Corrected v12 bounded streamed-WAV carrier contract.
+    #[default]
+    #[cfg_attr(feature = "serde", serde(rename = "sox_ng_14_8_0_1_v12"))]
+    SoxNg14801V12,
 }
 
 impl DsdReferencePolicyVersion {
@@ -317,6 +322,7 @@ impl DsdReferencePolicyVersion {
             Self::SoxNg14801V9 => DSD_REFERENCE_POLICY_V9_KEY,
             Self::SoxNg14801V10 => DSD_REFERENCE_POLICY_V10_KEY,
             Self::SoxNg14801V11 => DSD_REFERENCE_POLICY_V11_KEY,
+            Self::SoxNg14801V12 => DSD_REFERENCE_POLICY_V12_KEY,
         }
     }
 }
@@ -380,7 +386,7 @@ impl Default for DsdSourceSettings {
     fn default() -> Self {
         Self {
             pathway: DsdSourcePathway::Reference,
-            reference_policy: DsdReferencePolicyVersion::SoxNg14801V11,
+            reference_policy: DsdReferencePolicyVersion::SoxNg14801V12,
             profile: DsdReconstructionSelection::Reference,
             gain_mode: DsdSourceGainMode::Reference,
             fixed_gain_db: None,
@@ -1853,6 +1859,8 @@ pub enum ReferenceErrorCode {
     SacdFrontEndIntegrationUnqualified,
     /// W64 metadata mutation is unsafe with the pinned muxer and has no qualified alternative.
     W64MetadataMutationUnqualified,
+    /// The required unseekable Float64 WAV carrier exceeds the proven 32-bit RIFF-size capacity.
+    StreamedWavCapacity,
     /// Managed destination authority mismatch.
     ManagedDestination,
 }
@@ -1863,30 +1871,31 @@ pub fn reference_error_text(code: ReferenceErrorCode) -> &'static str {
     match code {
         ReferenceErrorCode::ManualUnavailable => "DSD-REF-P0-001: Manual DSD workflows are not available in this P0 build. Use Reference with a supported lossless target, or wait for Manual workflow support.",
         ReferenceErrorCode::LossyUnavailable => "DSD-REF-P0-002: Reference DSD reconstruction currently supports lossless delivery only. Choose FLAC, RIFF/WAV, RF64, W64, AIFF, WavPack, or ALAC/M4A, or wait for Reference-front-end Opus/MP3/AAC delivery.",
-        ReferenceErrorCode::UnsupportedDsdRate => "DSD-REF-P0-003: Reference policy sox_ng_14_8_0_1_v11 supports DSD64, DSD128, and DSD256 only. Use a supported-rate source or wait for expanded-rate/Manual support.",
+        ReferenceErrorCode::UnsupportedDsdRate => "DSD-REF-P0-003: Reference policy sox_ng_14_8_0_1_v12 supports DSD64, DSD128, and DSD256 only. Use a supported-rate source or wait for expanded-rate/Manual support.",
         ReferenceErrorCode::UnknownEncoding => "DSD-REF-P0-004: The DSD container or compression mode could not be identified as DSF/DSD, DSDIFF/DSD, DSDIFF/DST, or a supported SACD area. Reference will not guess the decoder path.",
-        ReferenceErrorCode::UnsupportedChannels => "DSD-REF-P0-005: Reference policy sox_ng_14_8_0_1_v11 supports qualified mono and stereo cells only. Select a mono/stereo track or wait for multichannel qualification.",
-        ReferenceErrorCode::Target882 => "DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v11 has no qualified target-limited profile for {DSD128|DSD256} \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy.",
-        ReferenceErrorCode::Target96 => "DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v11 has no direct 96 kHz qualification for {DSD128|DSD256}. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy.",
+        ReferenceErrorCode::UnsupportedChannels => "DSD-REF-P0-005: Reference policy sox_ng_14_8_0_1_v12 supports qualified mono and stereo cells only. Select a mono/stereo track or wait for multichannel qualification.",
+        ReferenceErrorCode::Target882 => "DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v12 has no qualified target-limited profile for {DSD128|DSD256} \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy.",
+        ReferenceErrorCode::Target96 => "DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v12 has no direct 96 kHz qualification for {DSD128|DSD256}. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy.",
         ReferenceErrorCode::WidebandDsd64 => "DSD-REF-P0-008: No Wideband profile is defined for DSD64. Select the Reference profile.",
         ReferenceErrorCode::WidebandDsd128Target => "DSD-REF-P0-008: DSD128 Wideband uses B4W and requires a target rate of at least 176.4 kHz. Select the Reference profile or choose 176.4 kHz or higher.",
-        ReferenceErrorCode::WidebandDsd256Target => "DSD-REF-P0-008: DSD256 Wideband uses B6, whose 140 kHz stopband edge cannot fit this target; B6 is also unavailable under policy sox_ng_14_8_0_1_v11. Select Reference/B5.",
-        ReferenceErrorCode::B6Unavailable => "DSD-REF-P0-009: B6 is represented but unqualified and unavailable under policy sox_ng_14_8_0_1_v11. Select Reference/B5 or wait for a later immutable policy.",
-        ReferenceErrorCode::TerminalInt8 => "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v11 has no qualified 8-bit terminal realization. Choose 24-bit, Float32, or Float64 where supported.",
-        ReferenceErrorCode::TerminalInt32 => "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v11 has no qualified 32-bit integer terminal realization. Choose 24-bit, Float32, or Float64 where supported.",
-        ReferenceErrorCode::TargetDepth => "DSD-REF-P0-011: {target} does not support {depth} under Reference policy sox_ng_14_8_0_1_v11. Choose a target/depth pair listed by the policy.",
+        ReferenceErrorCode::WidebandDsd256Target => "DSD-REF-P0-008: DSD256 Wideband uses B6, whose 140 kHz stopband edge cannot fit this target; B6 is also unavailable under policy sox_ng_14_8_0_1_v12. Select Reference/B5.",
+        ReferenceErrorCode::B6Unavailable => "DSD-REF-P0-009: B6 is represented but unqualified and unavailable under policy sox_ng_14_8_0_1_v12. Select Reference/B5 or wait for a later immutable policy.",
+        ReferenceErrorCode::TerminalInt8 => "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v12 has no qualified 8-bit terminal realization. Choose 24-bit, Float32, or Float64 where supported.",
+        ReferenceErrorCode::TerminalInt32 => "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v12 has no qualified 32-bit integer terminal realization. Choose 24-bit, Float32, or Float64 where supported.",
+        ReferenceErrorCode::TargetDepth => "DSD-REF-P0-011: {target} does not support {depth} under Reference policy sox_ng_14_8_0_1_v12. Choose a target/depth pair listed by the policy.",
         ReferenceErrorCode::SingletonBatch => "DSD-REF-P0-012: Reference P0 supports singleton conversions only. Convert the selected files one at a time as independent singletons with independent gain, or wait for programme-wide Reference support.",
         ReferenceErrorCode::ContinuousProgramme => "DSD-REF-P0-013: Reference P0 cannot split a continuous DSD programme before reconstruction. This source must be processed as one programme before splitting; wait for programme-wide Reference support. Already independent files may be converted one at a time with independent gain.",
         ReferenceErrorCode::FrontEndUnattested => "DSD-REF-P0-014: Reference requires the qualified DST/SACD decode front-end for this source, but the decoder/extractor identity or qualification manifest does not match. Install the qualified toolchain or use an uncompressed DSF/DSDIFF source.",
-        ReferenceErrorCode::Toolchain => "DSD-REF-P0-015: The installed Reference toolchain does not match policy sox_ng_14_8_0_1_v11 or failed its behavior probes. Activate/install the qualified toolchain; tonepoet will not substitute another decoder, analyzer, resampler, or encoder.",
+        ReferenceErrorCode::Toolchain => "DSD-REF-P0-015: The installed Reference toolchain does not match policy sox_ng_14_8_0_1_v12 or failed its behavior probes. Activate/install the qualified toolchain; tonepoet will not substitute another decoder, analyzer, resampler, or encoder.",
         ReferenceErrorCode::UnsafeExactGain => "DSD-REF-P0-016: The requested {native-level|fixed} gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics.",
-        ReferenceErrorCode::UnsupportedTargetRate => "DSD-REF-P0-017: Reference policy sox_ng_14_8_0_1_v11 supports target sample rates 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, and 768 kHz only. Choose one of those rates or wait for a later immutable policy.",
+        ReferenceErrorCode::UnsupportedTargetRate => "DSD-REF-P0-017: Reference policy sox_ng_14_8_0_1_v12 supports target sample rates 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, and 768 kHz only. Choose one of those rates or wait for a later immutable policy.",
         ReferenceErrorCode::RiffSize => "DSD-REF-P0-018: The predicted RIFF/WAV output exceeds the qualified RIFF size limit. Choose RF64, W64, or another supported lossless target.",
         ReferenceErrorCode::CanonicalTarget => "DSD-REF-P0-019: The selected output container does not match the canonical Reference target or contains unrecognized output flags. Re-select the target.",
-        ReferenceErrorCode::CompressedDstRateUnqualified => "DSD-REF-P0-021: Reference policy sox_ng_14_8_0_1_v11 qualifies predictive compressed DST only for stereo DSD64. Mono DSD64 and all DSD128/DSD256 predictive-DST cells remain unavailable because no matching independent-oracle corpus is present. Use an uncompressed DSF/DSDIFF source, decode with an independently verified tool outside Reference, or wait for a later immutable policy.",
-        ReferenceErrorCode::Int16TerminalUnqualified => "DSD-REF-P0-022: Reference policy sox_ng_14_8_0_1_v11 does not enable Int16 because the commissioned SoX-ng Shibata realization has no qualified conservative worst-case peak bound. Choose Int24, Float32, or Float64, or wait for a later immutable policy with a derived Shibata bound.",
-        ReferenceErrorCode::SacdFrontEndIntegrationUnqualified => "DSD-REF-P0-023: Reference policy sox_ng_14_8_0_1_v11 does not enable SACD DSD or DST extraction because the production extraction/materialization path is not yet qualified by pinned end-to-end SACD fixtures. Extract to a qualified DSF/DSDIFF source first or wait for a later immutable policy.",
-        ReferenceErrorCode::W64MetadataMutationUnqualified => "DSD-REF-P0-024: Reference policy sox_ng_14_8_0_1_v11 cannot mutate metadata in W64 outputs because the pinned FFmpeg W64 muxer folds 8-byte alignment padding into the data chunk and can append a phantom sample. Disable the metadata stage for W64 delivery or choose another qualified lossless container; tonepoet will not invoke the unsafe muxer route.",
+        ReferenceErrorCode::CompressedDstRateUnqualified => "DSD-REF-P0-021: Reference policy sox_ng_14_8_0_1_v12 qualifies predictive compressed DST only for stereo DSD64. Mono DSD64 and all DSD128/DSD256 predictive-DST cells remain unavailable because no matching independent-oracle corpus is present. Use an uncompressed DSF/DSDIFF source, decode with an independently verified tool outside Reference, or wait for a later immutable policy.",
+        ReferenceErrorCode::Int16TerminalUnqualified => "DSD-REF-P0-022: Reference policy sox_ng_14_8_0_1_v12 does not enable Int16 because the commissioned SoX-ng Shibata realization has no qualified conservative worst-case peak bound. Choose Int24, Float32, or Float64, or wait for a later immutable policy with a derived Shibata bound.",
+        ReferenceErrorCode::SacdFrontEndIntegrationUnqualified => "DSD-REF-P0-023: Reference policy sox_ng_14_8_0_1_v12 does not enable SACD DSD or DST extraction because the production extraction/materialization path is not yet qualified by pinned end-to-end SACD fixtures. Extract to a qualified DSF/DSDIFF source first or wait for a later immutable policy.",
+        ReferenceErrorCode::W64MetadataMutationUnqualified => "DSD-REF-P0-024: Reference policy sox_ng_14_8_0_1_v12 cannot mutate metadata in W64 outputs because the pinned FFmpeg W64 muxer folds 8-byte alignment padding into the data chunk and can append a phantom sample. Disable the metadata stage for W64 delivery or choose another qualified lossless container; tonepoet will not invoke the unsafe muxer route.",
+        ReferenceErrorCode::StreamedWavCapacity => "DSD-REF-P0-025: The predicted Float64 WAV carrier exceeds the qualified unseekable-stream capacity of policy sox_ng_14_8_0_1_v12. The pinned SoX-ng writer wraps RIFF/data sizes past the 32-bit boundary, so Reference cannot prove complete analyzer transport for this programme. Shorten or split the source before Reference conversion, reduce the target sample rate, or wait for a later policy backed by a corrected SoX-ng toolchain.",
         ReferenceErrorCode::ManagedDestination => "DSD-REF-P0-020: The destination album has incompatible or incomplete tonepoet manifest authority. Choose a different output directory, repair/recover the existing transaction, or reconvert the album under one compatible Reference route; tonepoet will not merge or replace authority implicitly.",
     }
 }
@@ -1926,10 +1935,10 @@ fn invalid_target_profile(
     let source = source_rate_name(source_rate);
     let reason = match code {
         ReferenceErrorCode::Target882 => format!(
-            "DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v11 has no qualified target-limited profile for {source} \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
+            "DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v12 has no qualified target-limited profile for {source} \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
         ),
         ReferenceErrorCode::Target96 => format!(
-            "DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v11 has no direct 96 kHz qualification for {source}. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
+            "DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v12 has no direct 96 kHz qualification for {source}. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
         ),
         _ => return invalid_reference(field, code),
     };
@@ -1944,7 +1953,7 @@ fn invalid_target_depth(
     PlanningError::invalid_settings(
         field,
         format!(
-            "DSD-REF-P0-011: {} does not support {depth:?} under Reference policy sox_ng_14_8_0_1_v11. Choose a target/depth pair listed by the policy.",
+            "DSD-REF-P0-011: {} does not support {depth:?} under Reference policy sox_ng_14_8_0_1_v12. Choose a target/depth pair listed by the policy.",
             target.key()
         ),
     )
@@ -2193,7 +2202,7 @@ pub fn terminal_realization_bound(
     };
     let derivation = format!(
         "tonepoet-reference-terminal-bound/v3\0policy={}\0rate={}\0depth={:?}\0realization={}\0q63={}\0post_final_acceptance_reserve_dbnano={}\0safe_dbnano={}",
-        DsdReferencePolicyVersion::SoxNg14801V11.key(),
+        DsdReferencePolicyVersion::SoxNg14801V12.key(),
         target_rate_hz,
         depth,
         realization,
@@ -2608,6 +2617,59 @@ pub fn validate_post_final_true_peak(
     }
 }
 
+/// Largest RIFF chunk-size field value representable by the streamed WAV carrier.
+pub const REFERENCE_STREAMED_WAV_RIFF_SIZE_FIELD_MAX: u64 = u32::MAX as u64;
+/// Fixed non-audio contribution to SoX-ng's streamed Float64 WAV RIFF-size field.
+///
+/// The pinned writer emits a 66-byte header; RIFF size excludes the leading
+/// eight bytes, so the size field is `audio_payload_bytes + 58`.
+pub const REFERENCE_STREAMED_WAV_RIFF_SIZE_OVERHEAD_BYTES: u64 = 58;
+/// Largest admitted Float64 WAV audio payload before either 32-bit size field can wrap.
+pub const REFERENCE_STREAMED_WAV_MAX_AUDIO_PAYLOAD_BYTES: u64 =
+    REFERENCE_STREAMED_WAV_RIFF_SIZE_FIELD_MAX
+        - REFERENCE_STREAMED_WAV_RIFF_SIZE_OVERHEAD_BYTES;
+/// Bytes per sample in the required little-endian Float64 WAV carrier.
+pub const REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE: u64 = 8;
+/// One output frame reserved for nanosecond duration quantization and resampler endpoint rounding.
+pub const REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES: u64 = 1;
+
+fn validate_reference_streamed_wav_capacity(
+    duration: Option<std::time::Duration>,
+    contract: FinalPcmContract,
+) -> Result<()> {
+    let duration = duration.ok_or_else(|| {
+        invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
+    })?;
+    let sample_frames = duration
+        .as_nanos()
+        .checked_mul(u128::from(contract.sample_rate_hz))
+        .and_then(|value| value.checked_add(999_999_999))
+        .map(|value| value / 1_000_000_000)
+        .and_then(|value| {
+            value.checked_add(u128::from(
+                REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES,
+            ))
+        })
+        .ok_or_else(|| {
+            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
+        })?;
+    let audio_payload_bytes = sample_frames
+        .checked_mul(u128::from(contract.channels))
+        .and_then(|value| {
+            value.checked_mul(u128::from(REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE))
+        })
+        .ok_or_else(|| {
+            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
+        })?;
+    if audio_payload_bytes > u128::from(REFERENCE_STREAMED_WAV_MAX_AUDIO_PAYLOAD_BYTES) {
+        return Err(invalid_reference(
+            "source.duration",
+            ReferenceErrorCode::StreamedWavCapacity,
+        ));
+    }
+    Ok(())
+}
+
 /// Largest total byte size admitted for ordinary disk-backed RIFF under policy v6.
 pub const REFERENCE_RIFF_MAX_FILE_BYTES: u64 = u32::MAX as u64;
 /// Conservative upper bound for policy-owned FFmpeg RIFF structure/chunks.
@@ -2665,7 +2727,7 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
             ReferenceErrorCode::ManualUnavailable,
         ));
     }
-    if settings.reference_policy != DsdReferencePolicyVersion::SoxNg14801V11 {
+    if settings.reference_policy != DsdReferencePolicyVersion::SoxNg14801V12 {
         return Err(invalid_reference(
             "dsd.from_dsd.reference_policy",
             ReferenceErrorCode::Toolchain,
@@ -2795,6 +2857,7 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
             request.planned_riff_non_audio_upper_bound_bytes,
         )?;
     }
+    validate_reference_streamed_wav_capacity(request.source.duration, final_pcm)?;
 
     let context = request.context();
     // The pure planner consumes immutable source facts and a private-path
@@ -3415,12 +3478,12 @@ fn wavpack_compression_level(mode: crate::enums::WavPackMode) -> String {
     wavpack_compression_level_value(mode).to_string()
 }
 
-/// Canonical digest of the source-controlled v11 qualification artifact schema/content.
+/// Canonical digest of the source-controlled v12 qualification artifact schema/content.
 #[must_use]
 pub fn qualification_manifest_digest() -> Sha256Digest {
     Sha256Digest::of_bytes(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
+        "/qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"
     )))
 }
 
@@ -3451,7 +3514,8 @@ fn semantic_plan_hash(
         | DsdReferencePolicyVersion::SoxNg14801V8
         | DsdReferencePolicyVersion::SoxNg14801V9
         | DsdReferencePolicyVersion::SoxNg14801V10
-        | DsdReferencePolicyVersion::SoxNg14801V11 => {
+        | DsdReferencePolicyVersion::SoxNg14801V11
+        | DsdReferencePolicyVersion::SoxNg14801V12 => {
             text.push_str("environment_identity=clear_and_set/v1\n");
             normalize_step_for_hash_v4
         }
@@ -4108,6 +4172,10 @@ mod tests {
             r#""sox_ng_14_8_0_1_v11""#
         );
         assert_eq!(
+            serde_json::to_string(&DsdReferencePolicyVersion::SoxNg14801V12).unwrap(),
+            r#""sox_ng_14_8_0_1_v12""#
+        );
+        assert_eq!(
             serde_json::from_str::<DsdReferencePolicyVersion>(r#""sox_ng_14_8_0_1_v1""#)
                 .unwrap(),
             DsdReferencePolicyVersion::SoxNg14801V1
@@ -4162,6 +4230,11 @@ mod tests {
                 .unwrap(),
             DsdReferencePolicyVersion::SoxNg14801V11
         );
+        assert_eq!(
+            serde_json::from_str::<DsdReferencePolicyVersion>(r#""sox_ng_14_8_0_1_v12""#)
+                .unwrap(),
+            DsdReferencePolicyVersion::SoxNg14801V12
+        );
     }
 
     #[test]
@@ -4198,7 +4271,7 @@ mod tests {
             resolve_reference_profile(DsdRate::Dsd128, 88_200, DsdReconstructionSelection::Reference)
                 .unwrap_err()
                 .to_string(),
-            "invalid settings for dsd.from_dsd.profile: DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v11 has no qualified target-limited profile for DSD128 \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
+            "invalid settings for dsd.from_dsd.profile: DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v12 has no qualified target-limited profile for DSD128 \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
         );
         assert!(resolve_reference_profile(
             DsdRate::Dsd256,
@@ -4306,6 +4379,7 @@ mod tests {
             DsdReferencePolicyVersion::SoxNg14801V8,
             DsdReferencePolicyVersion::SoxNg14801V9,
             DsdReferencePolicyVersion::SoxNg14801V10,
+            DsdReferencePolicyVersion::SoxNg14801V11,
         ] {
             let mut request = request.clone();
             request.settings.dsd.from_dsd.reference_policy = historical;
@@ -4348,6 +4422,7 @@ mod tests {
             DsdReferencePolicyVersion::SoxNg14801V9,
             DsdReferencePolicyVersion::SoxNg14801V10,
             DsdReferencePolicyVersion::SoxNg14801V11,
+            DsdReferencePolicyVersion::SoxNg14801V12,
         ];
         let targets = [
             None,
@@ -4452,6 +4527,7 @@ mod tests {
             DsdReferencePolicyVersion::SoxNg14801V8,
             DsdReferencePolicyVersion::SoxNg14801V9,
             DsdReferencePolicyVersion::SoxNg14801V10,
+            DsdReferencePolicyVersion::SoxNg14801V11,
         ] {
             request.settings.dsd.from_dsd.reference_policy = policy;
             assert_eq!(
@@ -4893,7 +4969,7 @@ mod tests {
             );
             let plan = plan_reference_dsd(&request).expect("Float64 WAV plan");
             let summary = plan.reference.as_ref().expect("Reference summary");
-            assert_eq!(summary.policy, DsdReferencePolicyVersion::SoxNg14801V11);
+            assert_eq!(summary.policy, DsdReferencePolicyVersion::SoxNg14801V12);
             assert_eq!(summary.qpcm_path.extension().and_then(|value| value.to_str()), Some("w64"));
             let pipeline = plan
                 .steps()
@@ -5018,7 +5094,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
-            "invalid settings for dsd.from_dsd.profile: DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v11 has no direct 96 kHz qualification for DSD256. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
+            "invalid settings for dsd.from_dsd.profile: DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v12 has no direct 96 kHz qualification for DSD256. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy."
         );
 
         let request = reference_request(
@@ -5030,7 +5106,7 @@ mod tests {
         );
         assert_eq!(
             plan_reference_dsd(&request).unwrap_err().to_string(),
-            "invalid settings for target_bit_depth: DSD-REF-P0-011: flac_native does not support Float32 under Reference policy sox_ng_14_8_0_1_v11. Choose a target/depth pair listed by the policy."
+            "invalid settings for target_bit_depth: DSD-REF-P0-011: flac_native does not support Float32 under Reference policy sox_ng_14_8_0_1_v12. Choose a target/depth pair listed by the policy."
         );
 
         let mut source_settings = DsdSourceSettings::default();
@@ -5054,6 +5130,97 @@ mod tests {
                 .to_string(),
             "invalid settings for dsd.from_dsd.gain_mode: DSD-REF-P0-016: The requested fixed gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
         );
+    }
+
+    #[test]
+    fn streamed_wav_capacity_is_fail_closed_and_boundary_exact() {
+        let contract = FinalPcmContract {
+            sample_rate_hz: 1,
+            channels: 1,
+            sample_kind: SampleKind::Float,
+            bit_depth: PcmBitDepth::Float64,
+            dither: ReferenceDither::None,
+        };
+        let largest_admitted_duration_frames =
+            REFERENCE_STREAMED_WAV_MAX_AUDIO_PAYLOAD_BYTES
+                / REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE
+                - REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES;
+        validate_reference_streamed_wav_capacity(
+            Some(std::time::Duration::from_secs(largest_admitted_duration_frames)),
+            contract,
+        )
+        .expect("the exact bounded carrier must remain admitted");
+        assert_eq!(
+            validate_reference_streamed_wav_capacity(
+                Some(std::time::Duration::from_secs(
+                    largest_admitted_duration_frames + 1,
+                )),
+                contract,
+            )
+            .unwrap_err()
+            .to_string(),
+            format!(
+                "invalid settings for source.duration: {}",
+                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
+            )
+        );
+        assert_eq!(
+            validate_reference_streamed_wav_capacity(None, contract)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "invalid settings for source.duration: {}",
+                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
+            )
+        );
+
+        let overflow_contract = FinalPcmContract {
+            sample_rate_hz: u32::MAX,
+            channels: u16::MAX,
+            ..contract
+        };
+        assert_eq!(
+            validate_reference_streamed_wav_capacity(
+                Some(std::time::Duration::MAX),
+                overflow_contract,
+            )
+            .unwrap_err()
+            .to_string(),
+            format!(
+                "invalid settings for source.duration: {}",
+                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
+            )
+        );
+    }
+
+    #[test]
+    fn streamed_wav_capacity_applies_to_every_terminal_depth_and_delivery_container() {
+        for (target, depth) in [
+            (ResolvedOutputTarget::FlacNative, PcmBitDepth::Int24),
+            (ResolvedOutputTarget::WavRf64, PcmBitDepth::Float32),
+            (ResolvedOutputTarget::WavW64, PcmBitDepth::Float64),
+        ] {
+            let mut request = reference_request(
+                DsdRate::Dsd64,
+                768_000,
+                target,
+                depth,
+                DsdReconstructionSelection::Reference,
+            );
+            request.source.duration = Some(std::time::Duration::from_secs(5 * 60));
+            plan_reference_dsd(&request).unwrap_or_else(|error| {
+                panic!("valid sub-cap {target:?}/{depth:?} plan was rejected: {error}")
+            });
+
+            request.source.duration = Some(std::time::Duration::from_secs(6 * 60));
+            assert_eq!(
+                plan_reference_dsd(&request).unwrap_err().to_string(),
+                format!(
+                    "invalid settings for source.duration: {}",
+                    reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
+                )
+            );
+        }
     }
 
     #[test]
@@ -5193,7 +5360,13 @@ mod tests {
             )
         );
         request.resolved_output_target = Some(ResolvedOutputTarget::WavRf64);
-        assert!(plan_reference_dsd(&request).is_ok());
+        assert_eq!(
+            plan_reference_dsd(&request).unwrap_err().to_string(),
+            format!(
+                "invalid settings for source.duration: {}",
+                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
+            )
+        );
     }
 
     #[test]
@@ -5206,9 +5379,9 @@ mod tests {
                 PcmBitDepth::Float32,
                 DsdReconstructionSelection::Reference,
             );
-            request.source.duration = Some(std::time::Duration::from_secs(15 * 60));
+            request.source.duration = Some(std::time::Duration::from_secs(5 * 60));
             let plan = plan_reference_dsd(&request).unwrap_or_else(|error| {
-                panic!("valid high-rate Float32 {target:?} plan was rejected: {error}")
+                panic!("valid sub-cap high-rate Float32 {target:?} plan was rejected: {error}")
             });
             let summary = plan.reference.as_ref().expect("Reference summary");
             assert_eq!(
@@ -5286,9 +5459,9 @@ mod tests {
                 PcmBitDepth::Float64,
                 DsdReconstructionSelection::Reference,
             );
-            request.source.duration = Some(std::time::Duration::from_secs(15 * 60));
+            request.source.duration = Some(std::time::Duration::from_secs(5 * 60));
             let plan = plan_reference_dsd(&request).unwrap_or_else(|error| {
-                panic!("valid high-rate Float64 {target:?} plan was rejected: {error}")
+                panic!("valid sub-cap high-rate Float64 {target:?} plan was rejected: {error}")
             });
             let summary = plan.reference.as_ref().expect("Reference summary");
             assert_eq!(
@@ -5441,30 +5614,31 @@ mod tests {
         let expected = [
             (ReferenceErrorCode::ManualUnavailable, "DSD-REF-P0-001: Manual DSD workflows are not available in this P0 build. Use Reference with a supported lossless target, or wait for Manual workflow support."),
             (ReferenceErrorCode::LossyUnavailable, "DSD-REF-P0-002: Reference DSD reconstruction currently supports lossless delivery only. Choose FLAC, RIFF/WAV, RF64, W64, AIFF, WavPack, or ALAC/M4A, or wait for Reference-front-end Opus/MP3/AAC delivery."),
-            (ReferenceErrorCode::UnsupportedDsdRate, "DSD-REF-P0-003: Reference policy sox_ng_14_8_0_1_v11 supports DSD64, DSD128, and DSD256 only. Use a supported-rate source or wait for expanded-rate/Manual support."),
+            (ReferenceErrorCode::UnsupportedDsdRate, "DSD-REF-P0-003: Reference policy sox_ng_14_8_0_1_v12 supports DSD64, DSD128, and DSD256 only. Use a supported-rate source or wait for expanded-rate/Manual support."),
             (ReferenceErrorCode::UnknownEncoding, "DSD-REF-P0-004: The DSD container or compression mode could not be identified as DSF/DSD, DSDIFF/DSD, DSDIFF/DST, or a supported SACD area. Reference will not guess the decoder path."),
-            (ReferenceErrorCode::UnsupportedChannels, "DSD-REF-P0-005: Reference policy sox_ng_14_8_0_1_v11 supports qualified mono and stereo cells only. Select a mono/stereo track or wait for multichannel qualification."),
-            (ReferenceErrorCode::Target882, "DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v11 has no qualified target-limited profile for {DSD128|DSD256} \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy."),
-            (ReferenceErrorCode::Target96, "DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v11 has no direct 96 kHz qualification for {DSD128|DSD256}. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy."),
+            (ReferenceErrorCode::UnsupportedChannels, "DSD-REF-P0-005: Reference policy sox_ng_14_8_0_1_v12 supports qualified mono and stereo cells only. Select a mono/stereo track or wait for multichannel qualification."),
+            (ReferenceErrorCode::Target882, "DSD-REF-P0-006: Reference policy sox_ng_14_8_0_1_v12 has no qualified target-limited profile for {DSD128|DSD256} \u{2192} 88.2 kHz. Choose 44.1/48 kHz, choose 176.4 kHz or higher, or wait for a new policy."),
+            (ReferenceErrorCode::Target96, "DSD-REF-P0-007: Reference policy sox_ng_14_8_0_1_v12 has no direct 96 kHz qualification for {DSD128|DSD256}. Choose 48 kHz, choose 176.4 kHz or higher, or wait for a new policy."),
             (ReferenceErrorCode::WidebandDsd64, "DSD-REF-P0-008: No Wideband profile is defined for DSD64. Select the Reference profile."),
             (ReferenceErrorCode::WidebandDsd128Target, "DSD-REF-P0-008: DSD128 Wideband uses B4W and requires a target rate of at least 176.4 kHz. Select the Reference profile or choose 176.4 kHz or higher."),
-            (ReferenceErrorCode::WidebandDsd256Target, "DSD-REF-P0-008: DSD256 Wideband uses B6, whose 140 kHz stopband edge cannot fit this target; B6 is also unavailable under policy sox_ng_14_8_0_1_v11. Select Reference/B5."),
-            (ReferenceErrorCode::B6Unavailable, "DSD-REF-P0-009: B6 is represented but unqualified and unavailable under policy sox_ng_14_8_0_1_v11. Select Reference/B5 or wait for a later immutable policy."),
-            (ReferenceErrorCode::TerminalInt8, "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v11 has no qualified 8-bit terminal realization. Choose 24-bit, Float32, or Float64 where supported."),
-            (ReferenceErrorCode::TerminalInt32, "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v11 has no qualified 32-bit integer terminal realization. Choose 24-bit, Float32, or Float64 where supported."),
-            (ReferenceErrorCode::TargetDepth, "DSD-REF-P0-011: {target} does not support {depth} under Reference policy sox_ng_14_8_0_1_v11. Choose a target/depth pair listed by the policy."),
+            (ReferenceErrorCode::WidebandDsd256Target, "DSD-REF-P0-008: DSD256 Wideband uses B6, whose 140 kHz stopband edge cannot fit this target; B6 is also unavailable under policy sox_ng_14_8_0_1_v12. Select Reference/B5."),
+            (ReferenceErrorCode::B6Unavailable, "DSD-REF-P0-009: B6 is represented but unqualified and unavailable under policy sox_ng_14_8_0_1_v12. Select Reference/B5 or wait for a later immutable policy."),
+            (ReferenceErrorCode::TerminalInt8, "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v12 has no qualified 8-bit terminal realization. Choose 24-bit, Float32, or Float64 where supported."),
+            (ReferenceErrorCode::TerminalInt32, "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v12 has no qualified 32-bit integer terminal realization. Choose 24-bit, Float32, or Float64 where supported."),
+            (ReferenceErrorCode::TargetDepth, "DSD-REF-P0-011: {target} does not support {depth} under Reference policy sox_ng_14_8_0_1_v12. Choose a target/depth pair listed by the policy."),
             (ReferenceErrorCode::SingletonBatch, "DSD-REF-P0-012: Reference P0 supports singleton conversions only. Convert the selected files one at a time as independent singletons with independent gain, or wait for programme-wide Reference support."),
             (ReferenceErrorCode::ContinuousProgramme, "DSD-REF-P0-013: Reference P0 cannot split a continuous DSD programme before reconstruction. This source must be processed as one programme before splitting; wait for programme-wide Reference support. Already independent files may be converted one at a time with independent gain."),
             (ReferenceErrorCode::FrontEndUnattested, "DSD-REF-P0-014: Reference requires the qualified DST/SACD decode front-end for this source, but the decoder/extractor identity or qualification manifest does not match. Install the qualified toolchain or use an uncompressed DSF/DSDIFF source."),
-            (ReferenceErrorCode::Toolchain, "DSD-REF-P0-015: The installed Reference toolchain does not match policy sox_ng_14_8_0_1_v11 or failed its behavior probes. Activate/install the qualified toolchain; tonepoet will not substitute another decoder, analyzer, resampler, or encoder."),
+            (ReferenceErrorCode::Toolchain, "DSD-REF-P0-015: The installed Reference toolchain does not match policy sox_ng_14_8_0_1_v12 or failed its behavior probes. Activate/install the qualified toolchain; tonepoet will not substitute another decoder, analyzer, resampler, or encoder."),
             (ReferenceErrorCode::UnsafeExactGain, "DSD-REF-P0-016: The requested {native-level|fixed} gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."),
-            (ReferenceErrorCode::UnsupportedTargetRate, "DSD-REF-P0-017: Reference policy sox_ng_14_8_0_1_v11 supports target sample rates 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, and 768 kHz only. Choose one of those rates or wait for a later immutable policy."),
+            (ReferenceErrorCode::UnsupportedTargetRate, "DSD-REF-P0-017: Reference policy sox_ng_14_8_0_1_v12 supports target sample rates 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, and 768 kHz only. Choose one of those rates or wait for a later immutable policy."),
             (ReferenceErrorCode::RiffSize, "DSD-REF-P0-018: The predicted RIFF/WAV output exceeds the qualified RIFF size limit. Choose RF64, W64, or another supported lossless target."),
             (ReferenceErrorCode::CanonicalTarget, "DSD-REF-P0-019: The selected output container does not match the canonical Reference target or contains unrecognized output flags. Re-select the target."),
-            (ReferenceErrorCode::CompressedDstRateUnqualified, "DSD-REF-P0-021: Reference policy sox_ng_14_8_0_1_v11 qualifies predictive compressed DST only for stereo DSD64. Mono DSD64 and all DSD128/DSD256 predictive-DST cells remain unavailable because no matching independent-oracle corpus is present. Use an uncompressed DSF/DSDIFF source, decode with an independently verified tool outside Reference, or wait for a later immutable policy."),
-            (ReferenceErrorCode::Int16TerminalUnqualified, "DSD-REF-P0-022: Reference policy sox_ng_14_8_0_1_v11 does not enable Int16 because the commissioned SoX-ng Shibata realization has no qualified conservative worst-case peak bound. Choose Int24, Float32, or Float64, or wait for a later immutable policy with a derived Shibata bound."),
-            (ReferenceErrorCode::SacdFrontEndIntegrationUnqualified, "DSD-REF-P0-023: Reference policy sox_ng_14_8_0_1_v11 does not enable SACD DSD or DST extraction because the production extraction/materialization path is not yet qualified by pinned end-to-end SACD fixtures. Extract to a qualified DSF/DSDIFF source first or wait for a later immutable policy."),
-            (ReferenceErrorCode::W64MetadataMutationUnqualified, "DSD-REF-P0-024: Reference policy sox_ng_14_8_0_1_v11 cannot mutate metadata in W64 outputs because the pinned FFmpeg W64 muxer folds 8-byte alignment padding into the data chunk and can append a phantom sample. Disable the metadata stage for W64 delivery or choose another qualified lossless container; tonepoet will not invoke the unsafe muxer route."),
+            (ReferenceErrorCode::CompressedDstRateUnqualified, "DSD-REF-P0-021: Reference policy sox_ng_14_8_0_1_v12 qualifies predictive compressed DST only for stereo DSD64. Mono DSD64 and all DSD128/DSD256 predictive-DST cells remain unavailable because no matching independent-oracle corpus is present. Use an uncompressed DSF/DSDIFF source, decode with an independently verified tool outside Reference, or wait for a later immutable policy."),
+            (ReferenceErrorCode::Int16TerminalUnqualified, "DSD-REF-P0-022: Reference policy sox_ng_14_8_0_1_v12 does not enable Int16 because the commissioned SoX-ng Shibata realization has no qualified conservative worst-case peak bound. Choose Int24, Float32, or Float64, or wait for a later immutable policy with a derived Shibata bound."),
+            (ReferenceErrorCode::SacdFrontEndIntegrationUnqualified, "DSD-REF-P0-023: Reference policy sox_ng_14_8_0_1_v12 does not enable SACD DSD or DST extraction because the production extraction/materialization path is not yet qualified by pinned end-to-end SACD fixtures. Extract to a qualified DSF/DSDIFF source first or wait for a later immutable policy."),
+            (ReferenceErrorCode::W64MetadataMutationUnqualified, "DSD-REF-P0-024: Reference policy sox_ng_14_8_0_1_v12 cannot mutate metadata in W64 outputs because the pinned FFmpeg W64 muxer folds 8-byte alignment padding into the data chunk and can append a phantom sample. Disable the metadata stage for W64 delivery or choose another qualified lossless container; tonepoet will not invoke the unsafe muxer route."),
+            (ReferenceErrorCode::StreamedWavCapacity, "DSD-REF-P0-025: The predicted Float64 WAV carrier exceeds the qualified unseekable-stream capacity of policy sox_ng_14_8_0_1_v12. The pinned SoX-ng writer wraps RIFF/data sizes past the 32-bit boundary, so Reference cannot prove complete analyzer transport for this programme. Shorten or split the source before Reference conversion, reduce the target sample rate, or wait for a later policy backed by a corrected SoX-ng toolchain."),
             (ReferenceErrorCode::ManagedDestination, "DSD-REF-P0-020: The destination album has incompatible or incomplete tonepoet manifest authority. Choose a different output directory, repair/recover the existing transaction, or reconvert the album under one compatible Reference route; tonepoet will not merge or replace authority implicitly."),
         ];
         let mut messages = std::collections::BTreeSet::new();
