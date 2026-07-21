@@ -1,7 +1,7 @@
 # Current DSD Reference P0 Handoff
 
 **Date:** 2026-07-20
-**Current candidate policy:** `sox_ng_14_8_0_1_v8`
+**Current candidate policy:** `sox_ng_14_8_0_1_v10`
 **Runtime exposure:** fail-closed until promotion; ordinary defaults remain exact legacy behavior
 **Supersedes:** all earlier `handoff_dsd_reference_p0_*` snapshots for current-state claims
 
@@ -29,7 +29,7 @@ FFmpeg direct decode                         input_tp 166.64
 SoX W64 decode -> f64 WAV stream -> FFmpeg input_tp -20.00
 ```
 
-The two carrier depths require opposite measurement routes. Policy v8 inherits v6's frozen analyzer contract:
+The two carrier depths require opposite measurement routes. Policy v10 inherits v6's frozen analyzer contract:
 
 - R64 pre-final measurement: SoX f64-WAV stdout directly into FFmpeg stdin;
 - Float32 QPCM post-final measurement: direct path-backed W64 input to FFmpeg;
@@ -72,6 +72,75 @@ The terminal `gain` effect is not f64 arithmetic merely because R64 and Float64 
 
 The terminal audit retains Int24 at `2^-22` and Float32 at `2^-23`: both bounds already dominate the `2^-32` effects contribution with conservative margin. The per-depth decode audit retains the v7 typed route table unchanged. All enabled cells remain attainable; no enabled cell is left to fail a later qualification gate.
 
+
+## V9/F5 correction: W64 metadata mutation admission
+
+The pinned FFmpeg 7.1 W64 muxer has a third, independent W64 defect. When a
+mono Int24 W64 data chunk is not divisible by W64's eight-byte alignment,
+`ffmpeg -c:a copy -f w64` includes the alignment padding in the declared data
+extent. The permanent qualification probe uses 8,820 samples at 88.2 kHz:
+26,460 data bytes decode correctly before the rewrite, while the rewritten
+file decodes to 8,821 samples with an identical 8,820-sample prefix and one
+zero-valued phantom sample.
+
+Policy v9 does not accept or hide that corruption. W64 remains a qualified
+audio delivery target, but metadata mutation for W64 is unavailable by
+construction:
+
+- the Reference plan bridge rejects a W64 request with the metadata stage
+  enabled before conversion begins;
+- the metadata writer independently rejects the `w64` extension before
+  creating a rewrite tempfile or selecting a tool;
+- both paths use the stable, user-facing `DSD-REF-P0-024` authority;
+- disabling the metadata stage preserves ordinary W64 delivery; and
+- the commissioned gate requires all 60 W64 metadata cells to resolve to
+  P0-024 rather than treating them as successful mutations.
+
+The qualification matrix still contains 480 delivery cases. Post-metadata
+decoded-sample identity remains mandatory for the 420 non-W64 cases. A
+separate mono Int24 RIFF/WAV fixture uses 8,821 samples (26,463 odd data bytes)
+and must remain sample-exact after the FFmpeg metadata rewrite, directly
+qualifying the two-byte-alignment analog raised by F5.
+
+
+## V10/F5 evidence completion: exact production metadata routes
+
+V9's product behavior was correct, but its certification phrase overstated the
+mechanism exercised by the gate. The 420 admitted metadata cells had used a
+representative FFmpeg stream-copy remux even though production dispatches among
+FFmpeg, `metaflac`, `wvtag`, and an AtomicParsley M4A freeform follow-up. V10
+removes that surrogate authority.
+
+`apply_metadata` and the qualification seam now delegate to the same private
+per-file implementation. The commissioned matrix executes that implementation
+in place for every admitted cell and records the exact route counts:
+
+- FFmpeg primary mutation: 160 cells;
+- `metaflac`: 180 cells;
+- `wvtag`: 80 cells;
+- AtomicParsley freeform follow-up: 20 ALAC/M4A cells.
+
+Every admitted cell is probed again for its exact target/container contract and
+decoded-sample identity after mutation. The machine report also captures each
+production mutator's canonical executable path, SHA-256, and reported version.
+The runtime certification validator requires this structured evidence and no
+longer accepts the v9 universal claim string.
+The machine contract explicitly scopes this evidence to authoritative tag
+mutation without artwork embedding or ReplayGain; neither excluded operation is
+claimed by the F5 gate.
+
+The 60 W64 cells now traverse both actual enforcement implementations: the
+production planner entry (`plan_request_for_track`) and the shared production
+metadata implementation used by `apply_metadata`. Both must return
+`DSD-REF-P0-024` in every cell, before planned work or a mutator command is
+created.
+
+Exact-route qualification exposed one adjacent F5 container invariant. FFmpeg
+will normally rewrite a small RF64 input as ordinary RIFF when the output is a
+`.wav` temporary. The production command builder now detects the input `RF64`
+magic and emits `-rf64 always`; the matrix reruns the target probe after
+metadata mutation, so an RF64-to-RIFF downgrade fails certification.
+
 ## Evidence subprocess environment
 
 All Reference evidence-producing commands now use `ClearAndSet` with exactly:
@@ -80,7 +149,7 @@ All Reference evidence-producing commands now use `ClearAndSet` with exactly:
 LC_ALL=C
 ```
 
-This includes carrier probes, direct decoded-sample hashes, both stages of Float64-W64 streamed hashes, both stages of Float64 RIFF/RF64 packaging, measurements, toolchain probes, and post-metadata verification. Runtime tests reject inherited-environment or variable-set drift. The qualification harness also clears its environment before spawning tools.
+This includes carrier probes, direct decoded-sample hashes, both stages of Float64-W64 streamed hashes, both stages of Float64 RIFF/RF64 packaging, measurements, toolchain probes, the exact production metadata discovery/mutation commands, and post-metadata verification. Runtime tests reject inherited-environment or variable-set drift. The qualification harness also clears its environment before spawning tools.
 
 ## Capacity and topology invariants
 
@@ -95,9 +164,19 @@ This includes carrier probes, direct decoded-sample hashes, both stages of Float
 
 ## Immutable policy identity
 
-The Float64 terminal bound, safe pre-terminal ceiling, derivation digest, and the semantic plan/execution identities that bind the gain policy changed. They are represented by the append-only identity `sox_ng_14_8_0_1_v8`; the v7 package topology, argv, typed pipeline step, sample-identity routes, runtime validation model, and executed-evidence format are inherited unchanged.
+Policy v10 is append-only. It inherits v9's W64 admission behavior and all
+earlier numerical terminal bounds, package topology, decode routes, semantic
+plan normalization, and enabled audio-delivery cells. The new identity exists
+because the metadata qualification authority changed from a representative
+container remux to the exact shared production implementation, and because
+RF64 container preservation is now an enforced production and evidence
+contract.
 
-Historical v1-v7 policy artifacts and hash-bound documents are unchanged. New v8 current/candidate/report/certification artifacts and a deterministic v8 checker are present. The current and candidate v8 manifests are byte-identical. V8 remains `qualification_candidate`; no promotion or release certification is claimed.
+Historical v1-v9 policy JSON, candidate, certification, and report artifacts
+remain unchanged. New v10 current/candidate/report/certification artifacts and
+a deterministic v10 checker are present. The current and candidate v10
+manifests are byte-identical. V10 remains `qualification_candidate`; no
+promotion or release certification is claimed.
 
 ## F2 legacy behavior inherited from the prior correction
 
@@ -109,7 +188,7 @@ Before promotion, a DSD source targeting PCM visibly exposes and executes the fr
 
 Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak remain hidden and disabled. Generic resampler and dither options remain available on the legacy route. Native-only selections are rejected rather than silently discarded. V4 preset acceptance/refusal behavior remains explicitly adjudicated and tested.
 
-## Source-level regressions retained from v7 and added for v8
+## Source-level regressions retained through v10
 
 - Float64 RIFF/RF64 plans contain the exact typed SoX-to-FFmpeg package pipeline.
 - Direct FFmpeg decoding of Float64 QPCM W64 is structurally forbidden.
@@ -117,10 +196,16 @@ Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak
 - High-rate Float64 W64/RF64 planning proves there is no disk-backed RIFF intermediate.
 - Float64 QPCM/final-W64 hashes use the streamed SoX route; RIFF/RF64 output hashes use direct FFmpeg.
 - Carrier probes and every decoded-sample hash constructor assert exact `ClearAndSet` / `LC_ALL=C` semantics.
-- V8 manifest authority requires the complete ordered post-metadata transcript digest while historical manifest serialization remains compatible.
+- V10 manifest authority requires the complete ordered post-metadata transcript
+  digest while historical manifest serialization remains compatible.
 - The v3 digest regression changes on command order, route, environment policy, or explicit environment drift, while ignoring diagnostic output tails and elapsed time.
 - The deterministic v7 checker continues to bind the historical package route, sample-identity contract, environment policy, and v3 evidence markers to source.
-- The deterministic v8 checker additionally binds the signed-32-bit effects derivation, corrected Float64 bound, unchanged per-depth route table, valid certification stub, and current v8 source markers.
+- The deterministic v8 checker retains the signed-32-bit effects derivation and source proof.
+- The deterministic v9 checker retains the historical P0-024 admission proof.
+- The deterministic v10 checker binds the exact production implementation,
+  160/180/80 primary-route counts, 20 AtomicParsley follow-ups, both 60-cell
+  W64 production boundaries, RF64 preservation, tool identities, and the
+  narrowed structured certification fields.
 
 ## Required verification commands
 
@@ -129,6 +214,9 @@ python3 tonepoet-pipeline/qualification/derive_dsd_reference_v5_terminal_bounds.
 python3 tonepoet-pipeline/qualification/derive_dsd_reference_v6_terminal_bounds.py --check
 python3 tonepoet-pipeline/qualification/derive_dsd_reference_v7_terminal_bounds.py --check
 python3 tonepoet-pipeline/qualification/derive_dsd_reference_v8_terminal_bounds.py --check
+python3 tonepoet-pipeline/qualification/derive_dsd_reference_v9_metadata_admission.py --check
+python3 tonepoet-pipeline/qualification/derive_dsd_reference_v10_production_metadata.py --check
+python3 tonepoet-pipeline/qualification/derive_dsd_reference_v11_runtime_mutator_binding.py --check
 cargo fmt -p tonepoet -p tonepoet-pipeline -p sacd-rs -- --check
 cargo test -p tonepoet-pipeline
 cargo test -p sacd-rs
@@ -137,7 +225,7 @@ cargo test --workspace
 cargo clippy -p tonepoet -p tonepoet-pipeline -p sacd-rs \
   --all-targets --all-features -- -D warnings
 TONEPOET_REQUIRE_TOOLS=1 \
-TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_certification.json" \
+TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_certification.json" \
   cargo test -p tonepoet --test dsd_reference_qualification -- --nocapture
 ```
 
@@ -151,4 +239,48 @@ The assembly environment provides system SoX 14.4.2 and FFmpeg 7.1.3. An unpinne
 
 produce matching source/delivered identities while direct FFmpeg decode of the W64 source differs. This is route evidence only, not pinned policy qualification.
 
-The environment does not provide Cargo, rustc, rustfmt, Clippy, Nix, Flox, or the pinned SoX-ng 14.8.0.1 closure. Therefore Rust compilation, formatting, workspace tests, Clippy, pinned-tool qualification, live smoke, and release certification could not be executed here. V8 remains fail-closed and unpromoted.
+The environment does not provide Cargo, rustc, rustfmt, Clippy, Nix, Flox, or
+the pinned SoX-ng 14.8.0.1 closure. Therefore Rust compilation, formatting,
+workspace tests, Clippy, pinned-tool qualification, live smoke, and release
+certification could not be executed here. V11 remains fail-closed and
+unpromoted.
+
+## V11/F5 runtime completion: certified mutator identity is executed
+
+V10 qualified the exact production metadata routes and captured the identities
+of `metaflac`, `wvtag`, and AtomicParsley, but those report values were not yet
+a runtime execution boundary. V11 closes that final gap without changing any
+qualified audio cell or metadata-route count.
+
+For every Reference conversion with the metadata stage enabled:
+
+- the three mutator package/store paths are compiled into the Tonepoet binary;
+- the packaged activation path, compiled store executable, runner-resolved
+  executable, and report-certified canonical path must be identical;
+- custom `ProcessorConfig.tool_paths` entries or ambient `PATH` substitutions
+  that resolve any executable other than the certified canonical path are
+  rejected;
+- the certified executable SHA-256 and normalized reported version are checked
+  during Reference toolchain admission;
+- path, SHA-256, version, and closure identity are checked again immediately
+  before metadata mutation;
+- the production metadata runner executes FFmpeg, `metaflac`, `wvtag`, and
+  AtomicParsley through exact canonical-path-plus-SHA-256 authority;
+- alternate `ToolRunner` implementations fail closed unless they explicitly
+  implement the same bound-execution contract; and
+- the mutator identities are persisted in `ReferenceToolchainEvidence` and
+  included in `execution_fingerprint_v1`, binding them into per-output
+  execution authority.
+
+The v11 commissioned report must emit the structured
+`runtime_metadata_mutator_binding` contract. Runtime certification rejects a
+missing or altered contract, a report path/hash/version that differs from the
+compiled package, or an execution runner that resolves another binary.
+
+V11 remains an unpromoted append-only qualification candidate. Historical
+v1-v10 policy JSON, candidate, certification, and report artifacts remain
+byte-identical. Historical derivation checkers were updated only to recognize
+v11 as the active append-only successor while continuing to pin the exact
+historical artifact hashes. The current and candidate v11 manifests are
+byte-identical, and runtime activation remains fail-closed until a passing
+schema-v11 report is bound into a promoted manifest.

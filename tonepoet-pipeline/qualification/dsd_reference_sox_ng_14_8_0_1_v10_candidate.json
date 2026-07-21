@@ -1,0 +1,1209 @@
+{
+  "schema_version": 10,
+  "policy": "sox_ng_14_8_0_1_v10",
+  "status": "qualification_candidate",
+  "sox_ng": {
+    "version": "14.8.0.1",
+    "revision": "324b8cf873fd7836e8848bd87f7a90d8faa6f849",
+    "nar_hash": "sha256-LjGx+yaWi5EcZsXhTmdRaf9utFXcCXASMmjRtm6vUc8=",
+    "required_probe_markers": [
+      "sinc"
+    ]
+  },
+  "ffmpeg": {
+    "major_version": 7,
+    "package_attribute": "ffmpeg_7-full",
+    "nixpkgs_revision": "dd9b079222d43e1943b6ebd802f04fd959dc8e61",
+    "nixpkgs_nar_hash": "sha256-I45esRSssFtJ8p/gLHUZ1OUaaTaVLluNkABkk6arQwE=",
+    "required_probe_markers": [
+      "loudnorm",
+      "print_format"
+    ]
+  },
+  "in_process": {
+    "sacd_rs_build_identity": "sacd-rs-0.1.0-src-sha256:7d2d9c73d88d794d5676a1281bd466e46bab7a8d70bb78fcd4c9a62434f76a4d",
+    "dst_fixture_digest": "34345951590102f3095390dba47822cadf6612c6edceefe3a7fcc62f7b310652",
+    "dst_fixture_manifest_digest": "fb258189fbf5d6d97ccd4a0726f3472a4d17b9d9449356c5b05b829ae85df438",
+    "dst_fixture_provenance_digest": "5f4010ef51c29f18ecb04f40838377791a0523f9f5b149de8bfa169be1d569ce",
+    "commission_attestation_digest": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",
+    "qualification_method": "compressed_dsd64_independent_oracle_plus_standards_literal_geometry_corpus",
+    "dst_case_count": 12,
+    "six_channel_decoder_only_cases": 4,
+    "standards_literal_oracle_sha256": "db9e5781a33e7893bac38bb0ef9935f0ad490d0498f31e26140c8e4247054a17"
+  },
+  "analyzer": {
+    "reporting_uncertainty_db": "0.010000000",
+    "analyzer_residual_db": "0.100000000",
+    "qualification_schema": "tonepoet-reference-analyzer-qualification/v4",
+    "required_case_count": 1200,
+    "target_rates_hz": [
+      44100,
+      48000,
+      88200,
+      96000,
+      176400,
+      192000,
+      352800,
+      384000,
+      705600,
+      768000
+    ],
+    "channels": [
+      1,
+      2
+    ],
+    "normalized_frequencies_cycles_per_sample": [
+      "0.250000000",
+      "0.450000000"
+    ],
+    "phases_radians": [
+      "0.0000000000000000",
+      "0.7853981633974483"
+    ],
+    "analytic_true_peak_levels_dbfs": [
+      "-120.003000000",
+      "-12.003000000",
+      "-0.500000000"
+    ],
+    "durations_seconds": [
+      "0.125000000",
+      "0.500000000"
+    ],
+    "peak_positions": [
+      "early",
+      "late"
+    ],
+    "waveform_families": [
+      "single_tone",
+      "phase_aligned_multitone"
+    ],
+    "aligned_multitone_normalized_frequencies_cycles_per_sample": [
+      "0.031250000",
+      "0.117187500",
+      "0.273437500",
+      "0.445312500"
+    ],
+    "aligned_multitone_peak_offsets_samples": [
+      "0.250000000",
+      "0.750000000"
+    ],
+    "aligned_multitone_duration_seconds": "0.250000000",
+    "carrier": {
+      "schema": "tonepoet-reference-analyzer-carrier/v2",
+      "source_container": "carrier_sensitive_w64",
+      "producer_tool": "sox_ng",
+      "producer_args_template": [
+        "-S",
+        "-D",
+        "{carrier_w64}",
+        "-t",
+        "wav",
+        "-e",
+        "floating-point",
+        "-b",
+        "64",
+        "-"
+      ],
+      "transport": "direct_stdout_to_stdin_no_shell",
+      "consumer_tool": "ffmpeg",
+      "consumer_input_args": [
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0"
+      ],
+      "consumer_args_template": [
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "info",
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0",
+        "-filter:a",
+        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+        "-f",
+        "null",
+        "-"
+      ],
+      "parser": "ffmpeg_loudnorm_input_tp_v3",
+      "stream_encoding": "pcm_f64le",
+      "stream_header": "riff_wave_stream_read_to_eof",
+      "streaming_size_sentinel_floor": 2147418112,
+      "disk_intermediate": false,
+      "exact_recontainer": true,
+      "greater_than_4_gib_fixture_required": true,
+      "known_ffmpeg_w64_defect": "ffmpeg_7_1_scales_sox_ieee_float64_w64_by_2^31",
+      "environment_policy": "clear_and_set",
+      "environment": {
+        "LC_ALL": "C"
+      },
+      "routing_rule": "float32_w64_direct_ffmpeg_else_sox_f64_wav_stream",
+      "direct_float32_input": "path_backed_w64",
+      "direct_float32_consumer_args_template": [
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "info",
+        "-i",
+        "{carrier_w64}",
+        "-filter:a",
+        "loudnorm=I=-23.0:LRA=7.0:TP=-1.0:print_format=json",
+        "-f",
+        "null",
+        "-"
+      ],
+      "known_sox_float32_w64_defect": "sox_ng_14_8_0_1_misscales_its_float32_w64_on_decode"
+    }
+  },
+  "subprocess_environment": {
+    "schema": "tonepoet-reference-subprocess-environment/v1",
+    "policy": "clear_and_set",
+    "variables": {
+      "LC_ALL": "C"
+    },
+    "scope": "all_reference_external_commands"
+  },
+  "qualification_supervision": {
+    "schema": "tonepoet-reference-qualification-supervision/v1",
+    "command_deadline_seconds": 1200,
+    "pipeline_deadline_seconds": 3600,
+    "termination_reap_deadline_seconds": 10,
+    "poll_interval_milliseconds": 10,
+    "failure_contract": "terminate_and_reap_or_fail"
+  },
+  "profiles": {
+    "b1": {
+      "kind": "integrated_rate_u",
+      "target_rate_hz": 44100
+    },
+    "b2": {
+      "kind": "integrated_rate_u",
+      "target_rate_hz": 48000
+    },
+    "b3": {
+      "passband_hz": 25000,
+      "transition_hz": 10000,
+      "center_hz": 30000,
+      "stopband_hz": 35000,
+      "attenuation_db": 180
+    },
+    "b4": {
+      "passband_hz": 30000,
+      "transition_hz": 15000,
+      "center_hz": 37500,
+      "stopband_hz": 45000,
+      "attenuation_db": 180
+    },
+    "b4w": {
+      "passband_hz": 35000,
+      "transition_hz": 15000,
+      "center_hz": 42500,
+      "stopband_hz": 50000,
+      "attenuation_db": 180
+    },
+    "b5": {
+      "passband_hz": 48000,
+      "transition_hz": 22000,
+      "center_hz": 59000,
+      "stopband_hz": 70000,
+      "attenuation_db": 180
+    },
+    "b6": {
+      "passband_hz": 88200,
+      "transition_hz": 51800,
+      "center_hz": 114100,
+      "stopband_hz": 140000,
+      "attenuation_db": 180,
+      "enabled": false
+    }
+  },
+  "terminal_bounds": {
+    "target_rates_hz": [
+      44100,
+      48000,
+      88200,
+      96000,
+      176400,
+      192000,
+      352800,
+      384000,
+      705600,
+      768000
+    ],
+    "derivation_schema": "tonepoet-reference-terminal-bound/v3",
+    "int16_shibata": {
+      "realization": "int16-shibata-unqualified-no-conservative-bound",
+      "max_added_peak_fs_q63_ceil": 18446744073709551615,
+      "safe_pre_terminal_ceiling_dbtp": "-9223372036.854775808"
+    },
+    "int24_tpdf": {
+      "realization": "int24-tpdf-2lsb",
+      "max_added_peak_fs_q63_ceil": 2199023255552,
+      "safe_pre_terminal_ceiling_dbtp": "-1.010002327"
+    },
+    "float32": {
+      "realization": "float32-2^-23",
+      "max_added_peak_fs_q63_ceil": 1099511627776,
+      "safe_pre_terminal_ceiling_dbtp": "-1.010001164"
+    },
+    "float64": {
+      "realization": "float64-sox-s32-effects-half-lsb-plus-f64-2^-51",
+      "max_added_peak_fs_q63_ceil": 2147487744,
+      "safe_pre_terminal_ceiling_dbtp": "-1.010000003"
+    },
+    "post_final_acceptance_reserve_db": "0.010000000",
+    "post_final_acceptance_reserve_basis": "one_analyzer_reporting_quantum"
+  },
+  "qualification_basis": "Policy v10 is an unpromoted append-only evidence correction to v9. It inherits the complete v9 audio-delivery, analyzer, terminal-bound, packaging, W64-defect, and odd-byte RIFF authority. All 420 admitted non-W64 metadata cells execute the shared production per-file metadata implementation, including the actual FFmpeg, metaflac, wvtag, and AtomicParsley routes, then recheck container identity and decoded-sample identity. All 60 W64 cells traverse both the production planner boundary and the production metadata implementation and fail closed under DSD-REF-P0-024. RF64 inputs are explicitly preserved as RF64 during FFmpeg metadata rewrites.",
+  "runtime_activation": "Fail closed unless status is qualified_release and release certification binds this exact v10 candidate snapshot and the exact schema-version-10 machine report generated by the mandatory commissioned real-tool gate.",
+  "cell_contract": {
+    "schema": "tonepoet-dsd-reference-qualified-cells/v3",
+    "source_kinds": [
+      "dsf_uncompressed",
+      "dsdiff_uncompressed",
+      "dsdiff_dst",
+      "sacd_dsd",
+      "sacd_dst"
+    ],
+    "source_rates_hz": [
+      2822400,
+      5644800,
+      11289600
+    ],
+    "source_rate_channel_cells": [
+      {
+        "source_kind": "dsf_uncompressed",
+        "source_rate_hz": 2822400,
+        "channels": 1,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsf_uncompressed",
+        "source_rate_hz": 2822400,
+        "channels": 2,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsf_uncompressed",
+        "source_rate_hz": 5644800,
+        "channels": 1,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsf_uncompressed",
+        "source_rate_hz": 5644800,
+        "channels": 2,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsf_uncompressed",
+        "source_rate_hz": 11289600,
+        "channels": 1,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsf_uncompressed",
+        "source_rate_hz": 11289600,
+        "channels": 2,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_uncompressed",
+        "source_rate_hz": 2822400,
+        "channels": 1,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_uncompressed",
+        "source_rate_hz": 2822400,
+        "channels": 2,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_uncompressed",
+        "source_rate_hz": 5644800,
+        "channels": 1,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_uncompressed",
+        "source_rate_hz": 5644800,
+        "channels": 2,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_uncompressed",
+        "source_rate_hz": 11289600,
+        "channels": 1,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_uncompressed",
+        "source_rate_hz": 11289600,
+        "channels": 2,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_dst",
+        "source_rate_hz": 2822400,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-021"
+      },
+      {
+        "source_kind": "dsdiff_dst",
+        "source_rate_hz": 2822400,
+        "channels": 2,
+        "result": "supported"
+      },
+      {
+        "source_kind": "dsdiff_dst",
+        "source_rate_hz": 5644800,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-021"
+      },
+      {
+        "source_kind": "dsdiff_dst",
+        "source_rate_hz": 5644800,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-021"
+      },
+      {
+        "source_kind": "dsdiff_dst",
+        "source_rate_hz": 11289600,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-021"
+      },
+      {
+        "source_kind": "dsdiff_dst",
+        "source_rate_hz": 11289600,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-021"
+      },
+      {
+        "source_kind": "sacd_dsd",
+        "source_rate_hz": 2822400,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dsd",
+        "source_rate_hz": 2822400,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dsd",
+        "source_rate_hz": 5644800,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dsd",
+        "source_rate_hz": 5644800,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dsd",
+        "source_rate_hz": 11289600,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dsd",
+        "source_rate_hz": 11289600,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dst",
+        "source_rate_hz": 2822400,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dst",
+        "source_rate_hz": 2822400,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dst",
+        "source_rate_hz": 5644800,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dst",
+        "source_rate_hz": 5644800,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dst",
+        "source_rate_hz": 11289600,
+        "channels": 1,
+        "result": "error:DSD-REF-P0-023"
+      },
+      {
+        "source_kind": "sacd_dst",
+        "source_rate_hz": 11289600,
+        "channels": 2,
+        "result": "error:DSD-REF-P0-023"
+      }
+    ],
+    "channels": [
+      1,
+      2
+    ],
+    "gain_modes": [
+      "reference",
+      "native_level",
+      "fixed",
+      "normalize_peak"
+    ],
+    "profile_cells": [
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 44100,
+        "result": "b1"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 48000,
+        "result": "b2"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 88200,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 96000,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 176400,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 192000,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 352800,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 384000,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 705600,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "reference",
+        "target_rate_hz": 768000,
+        "result": "b3"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 44100,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 48000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 88200,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 96000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 176400,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 192000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 352800,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 384000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 705600,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 2822400,
+        "selection": "wideband",
+        "target_rate_hz": 768000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 44100,
+        "result": "b1"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 48000,
+        "result": "b2"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 88200,
+        "result": "error:DSD-REF-P0-006"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 96000,
+        "result": "error:DSD-REF-P0-007"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 176400,
+        "result": "b4"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 192000,
+        "result": "b4"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 352800,
+        "result": "b4"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 384000,
+        "result": "b4"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 705600,
+        "result": "b4"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "reference",
+        "target_rate_hz": 768000,
+        "result": "b4"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 44100,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 48000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 88200,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 96000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 176400,
+        "result": "b4w"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 192000,
+        "result": "b4w"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 352800,
+        "result": "b4w"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 384000,
+        "result": "b4w"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 705600,
+        "result": "b4w"
+      },
+      {
+        "source_rate_hz": 5644800,
+        "selection": "wideband",
+        "target_rate_hz": 768000,
+        "result": "b4w"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 44100,
+        "result": "b1"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 48000,
+        "result": "b2"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 88200,
+        "result": "error:DSD-REF-P0-006"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 96000,
+        "result": "error:DSD-REF-P0-007"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 176400,
+        "result": "b5"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 192000,
+        "result": "b5"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 352800,
+        "result": "b5"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 384000,
+        "result": "b5"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 705600,
+        "result": "b5"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "reference",
+        "target_rate_hz": 768000,
+        "result": "b5"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 44100,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 48000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 88200,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 96000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 176400,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 192000,
+        "result": "error:DSD-REF-P0-008"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 352800,
+        "result": "error:DSD-REF-P0-009"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 384000,
+        "result": "error:DSD-REF-P0-009"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 705600,
+        "result": "error:DSD-REF-P0-009"
+      },
+      {
+        "source_rate_hz": 11289600,
+        "selection": "wideband",
+        "target_rate_hz": 768000,
+        "result": "error:DSD-REF-P0-009"
+      }
+    ],
+    "target_depth_cells": [
+      {
+        "target": "flac_native",
+        "depth": "int16",
+        "result": "error:DSD-REF-P0-022"
+      },
+      {
+        "target": "flac_native",
+        "depth": "int24",
+        "result": "supported"
+      },
+      {
+        "target": "flac_native",
+        "depth": "float32",
+        "result": "error:DSD-REF-P0-011"
+      },
+      {
+        "target": "flac_native",
+        "depth": "float64",
+        "result": "error:DSD-REF-P0-011"
+      },
+      {
+        "target": "wav_riff",
+        "depth": "int16",
+        "result": "error:DSD-REF-P0-022"
+      },
+      {
+        "target": "wav_riff",
+        "depth": "int24",
+        "result": "supported"
+      },
+      {
+        "target": "wav_riff",
+        "depth": "float32",
+        "result": "supported"
+      },
+      {
+        "target": "wav_riff",
+        "depth": "float64",
+        "result": "supported"
+      },
+      {
+        "target": "wav_rf64",
+        "depth": "int16",
+        "result": "error:DSD-REF-P0-022"
+      },
+      {
+        "target": "wav_rf64",
+        "depth": "int24",
+        "result": "supported"
+      },
+      {
+        "target": "wav_rf64",
+        "depth": "float32",
+        "result": "supported"
+      },
+      {
+        "target": "wav_rf64",
+        "depth": "float64",
+        "result": "supported"
+      },
+      {
+        "target": "wav_w64",
+        "depth": "int16",
+        "result": "error:DSD-REF-P0-022"
+      },
+      {
+        "target": "wav_w64",
+        "depth": "int24",
+        "result": "supported"
+      },
+      {
+        "target": "wav_w64",
+        "depth": "float32",
+        "result": "supported"
+      },
+      {
+        "target": "wav_w64",
+        "depth": "float64",
+        "result": "supported"
+      },
+      {
+        "target": "aiff_native",
+        "depth": "int16",
+        "result": "error:DSD-REF-P0-022"
+      },
+      {
+        "target": "aiff_native",
+        "depth": "int24",
+        "result": "supported"
+      },
+      {
+        "target": "aiff_native",
+        "depth": "float32",
+        "result": "error:DSD-REF-P0-011"
+      },
+      {
+        "target": "aiff_native",
+        "depth": "float64",
+        "result": "error:DSD-REF-P0-011"
+      },
+      {
+        "target": "wavpack_native",
+        "depth": "int16",
+        "result": "error:DSD-REF-P0-022"
+      },
+      {
+        "target": "wavpack_native",
+        "depth": "int24",
+        "result": "supported"
+      },
+      {
+        "target": "wavpack_native",
+        "depth": "float32",
+        "result": "error:DSD-REF-P0-011"
+      },
+      {
+        "target": "wavpack_native",
+        "depth": "float64",
+        "result": "error:DSD-REF-P0-011"
+      },
+      {
+        "target": "alac_m4a",
+        "depth": "int16",
+        "result": "error:DSD-REF-P0-022"
+      },
+      {
+        "target": "alac_m4a",
+        "depth": "int24",
+        "result": "supported"
+      },
+      {
+        "target": "alac_m4a",
+        "depth": "float32",
+        "result": "error:DSD-REF-P0-011"
+      },
+      {
+        "target": "alac_m4a",
+        "depth": "float64",
+        "result": "error:DSD-REF-P0-011"
+      }
+    ],
+    "expanded_supported_cell_count": 13248,
+    "expanded_supported_cell_digest": "8655f32296e3ac0012357c321cae026eb0effbcb3e128d5a1fad673fe12927a3",
+    "qualification_dimensions": [
+      "source_kind",
+      "source_rate_hz",
+      "channels",
+      "profile_selection",
+      "target_rate_hz",
+      "resolved_profile",
+      "target",
+      "depth",
+      "package_compression_level",
+      "gain_mode"
+    ],
+    "package_compression_levels": [
+      {
+        "target": "flac_native",
+        "levels": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ]
+      },
+      {
+        "target": "wav_riff",
+        "levels": [
+          null
+        ]
+      },
+      {
+        "target": "wav_rf64",
+        "levels": [
+          null
+        ]
+      },
+      {
+        "target": "wav_w64",
+        "levels": [
+          null
+        ]
+      },
+      {
+        "target": "aiff_native",
+        "levels": [
+          null
+        ]
+      },
+      {
+        "target": "wavpack_native",
+        "levels": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "target": "alac_m4a",
+        "levels": [
+          null
+        ]
+      }
+    ],
+    "package_required_args": [
+      {
+        "target": "wavpack_native",
+        "depth": "int24",
+        "args": [
+          "-bits_per_raw_sample",
+          "24"
+        ]
+      }
+    ]
+  },
+  "qualification_report": {
+    "schema": "tonepoet-dsd-reference-policy-qualification-report/v1",
+    "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v10_report.md",
+    "sha256": "130e4ded9600559bfebab36e78ff9f94bf14c56516193d339fca68d1a6bdda41",
+    "guidance_sha256": "a5a5556c70b93c56d216c0d142ab5213920fa9f696caa48ea4110f382bf2e36f",
+    "decimation_report_sha256": "af6e6880003f2b3673d804b992a093700cd8141465ee0277f8689d48209055c7",
+    "commission_sha256": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",
+    "amendment_sha256": "fe283db73d357d4cc22c19dc6d364fd552b5ce80ebf9b211eff44b4e516abac8",
+    "expanded_supported_cell_count": 13248,
+    "expanded_supported_cell_digest": "8655f32296e3ac0012357c321cae026eb0effbcb3e128d5a1fad673fe12927a3",
+    "analyzer_corrective_brief_sha256": "ed9b4bae68aa57da1b268c44c4b56733905c0a9900324b0aafee12f5103be0f8",
+    "runtime_defaults_corrective_brief_sha256": "839cd1fccf591301aa87d86ebe33bfe17b51eb79c8de0155638bb79cc7da4ebf"
+  },
+  "release_certification": {
+    "schema": "tonepoet-dsd-reference-release-certification/v1",
+    "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v10_certification.json",
+    "candidate_manifest_path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v10_candidate.json",
+    "report_sha256": null,
+    "candidate_manifest_sha256": null
+  },
+  "riff_capacity": {
+    "max_file_bytes": 4294967295,
+    "muxer_structure_upper_bound_bytes": 65536,
+    "metadata_expansion_factor": 4,
+    "source_derived_tag_artwork_upper_bound": "four times the verified container's complete non-audio byte region when tag transfer or artwork preservation is planned",
+    "admission_rule": "ceil(duration_seconds * sample_rate_hz) * channels * bytes_per_sample + planned_non_audio_upper_bound <= max_file_bytes"
+  },
+  "packaging": {
+    "schema": "tonepoet-reference-lossless-packaging/v3",
+    "float64_wav_targets": [
+      "wav_riff",
+      "wav_rf64"
+    ],
+    "producer_tool": "sox_ng",
+    "producer_args_template": [
+      "-S",
+      "-D",
+      "{qpcm_w64}",
+      "-t",
+      "raw",
+      "-e",
+      "floating-point",
+      "-b",
+      "64",
+      "-L",
+      "-"
+    ],
+    "consumer_tool": "ffmpeg",
+    "consumer_args_template": [
+      "-y",
+      "-hide_banner",
+      "-nostdin",
+      "-f",
+      "f64le",
+      "-ar",
+      "{sample_rate_hz}",
+      "-ac",
+      "{channels}",
+      "-i",
+      "pipe:0",
+      "-map",
+      "0:a:0",
+      "-map_metadata",
+      "-1",
+      "-vn",
+      "-sn",
+      "-dn",
+      "-c:a",
+      "pcm_f64le",
+      "-f",
+      "wav",
+      "{rf64_args}",
+      "{output}"
+    ],
+    "rf64_args": [
+      "-rf64",
+      "always"
+    ],
+    "transport": "direct_stdout_to_stdin_no_shell",
+    "stream_encoding": "pcm_f64le",
+    "disk_intermediate": false,
+    "environment_policy": "clear_and_set",
+    "environment": {
+      "LC_ALL": "C"
+    },
+    "forbidden_route": "ffmpeg_direct_decode_of_float64_qpcm_w64",
+    "stream_framing": "headerless_raw_pcm",
+    "endianness": "little"
+  },
+  "sample_identity": {
+    "schema": "tonepoet-reference-sample-identity/v7",
+    "route_authority": "typed_plan_carrier_path_role_target_depth_v2",
+    "routes": {
+      "r64_float64_w64": "sox_f64le_raw_stream",
+      "qpcm_int24_w64": "ffmpeg_direct",
+      "qpcm_float32_w64": "ffmpeg_direct",
+      "qpcm_float64_w64": "sox_f64le_raw_stream",
+      "packaged_int24_w64": "ffmpeg_direct",
+      "packaged_float32_w64": "ffmpeg_direct",
+      "packaged_float64_w64": "sox_f64le_raw_stream",
+      "packaged_non_w64": "ffmpeg_direct",
+      "post_metadata_int24_w64": "ffmpeg_direct",
+      "post_metadata_float32_w64": "ffmpeg_direct",
+      "post_metadata_float64_w64": "sox_f64le_raw_stream",
+      "post_metadata_non_w64": "ffmpeg_direct"
+    },
+    "hash_format": "interleaved_depth_native_le_sha256",
+    "hash_codecs": {
+      "int24": "pcm_s24le",
+      "float32": "pcm_f32le",
+      "float64": "pcm_f64le"
+    },
+    "forbidden_route": "ffmpeg_direct_decode_of_float64_w64",
+    "oracle_independence": "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode",
+    "environment_policy": "clear_and_set",
+    "environment": {
+      "LC_ALL": "C"
+    },
+    "metadata_mutation": {
+      "w64": "error:DSD-REF-P0-024",
+      "production_entry_point": "tonepoet::convert::pipeline::qualify_production_metadata_mutation",
+      "shared_production_implementation": "apply_production_metadata_to_file",
+      "authoritative_tag_source": "authoritative_metadata_tags",
+      "qualification_scope": "authoritative_tag_mutation_without_artwork_or_replaygain",
+      "environment_policy": "clear_and_set",
+      "environment": {
+        "LC_ALL": "C"
+      },
+      "qualified_post_metadata_targets": [
+        "flac_native",
+        "wav_riff",
+        "wav_rf64",
+        "aiff_native",
+        "wavpack_native",
+        "alac_m4a"
+      ],
+      "admitted_cell_count": 420,
+      "primary_mutator_case_counts": {
+        "ffmpeg": 160,
+        "metaflac": 180,
+        "wvtag": 80
+      },
+      "m4a_atomicparsley_freeform_case_count": 20,
+      "w64_rejection": {
+        "planner_entry_point": "plan_request_for_track",
+        "planner_case_count": 60,
+        "metadata_entry_point": "qualify_production_metadata_mutation",
+        "metadata_case_count": 60,
+        "code": "DSD-REF-P0-024"
+      },
+      "post_mutation_container_contract_rechecked": true,
+      "rf64_preservation": "source_magic_RF64_requires_ffmpeg_-rf64_always",
+      "w64_non_8_aligned_int24_mono_probe": "known_muxer_defect_phantom_sample",
+      "riff_odd_byte_int24_mono_probe": "qualified_via_exact_production_ffmpeg_route"
+    }
+  }
+}

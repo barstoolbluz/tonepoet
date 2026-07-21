@@ -215,6 +215,9 @@ fn build_reference_manifest_track(
             evidence.plan.policy,
             tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V8
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V9
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V10
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V11
         ) {
             reference_executed_evidence_digest_v3(&evidence)?
         } else {

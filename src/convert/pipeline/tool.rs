@@ -14,10 +14,11 @@ use std::time::{Duration, Instant as StdInstant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tonepoet_pipeline::CommandEnvironmentPolicy;
+use tonepoet_pipeline::{CommandEnvironmentPolicy, Sha256Digest};
 
 use super::errors::ToolRunnerError;
 use super::types::SecretString;
@@ -86,6 +87,15 @@ pub struct ToolCommand {
     pub environment_policy: CommandEnvironmentPolicy,
     pub env: Vec<EnvVar>,
     pub timeout: Duration,
+}
+
+/// Exact executable authority for a command whose runtime binary identity is
+/// part of a qualified policy. The runner must reject path or content drift
+/// and execute this canonical path rather than performing a second PATH lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundToolExecutable {
+    pub canonical_path: PathBuf,
+    pub executable_sha256: Sha256Digest,
 }
 
 impl ToolCommand {
@@ -198,6 +208,21 @@ pub trait ToolRunner: Send + Sync {
         cmd: ToolCommand,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput, ToolRunnerError>;
+
+    /// Execute a command through an exact path-and-content authority. A runner
+    /// must explicitly implement this contract; the default fails closed rather
+    /// than silently degrading to ordinary configured-path/PATH execution.
+    async fn run_bound(
+        &self,
+        _cmd: ToolCommand,
+        _executable: &BoundToolExecutable,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolRunnerError> {
+        Err(ToolRunnerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "tool runner does not implement exact bound executable execution",
+        )))
+    }
 
     /// Run a typed producer-consumer pipeline. Implementations must either
     /// provide real producer-stdout-to-consumer-stdin transport or reject the
@@ -527,14 +552,16 @@ fn version_command_args(binary: ToolBinary) -> &'static [&'static str] {
     match binary {
         ToolBinary::SevenZip | ToolBinary::Ssrc => &[],
         ToolBinary::Sox | ToolBinary::Opustags => &["--help"],
+        // AtomicParsley emits its version banner on the zero-argument path;
+        // `--version` is not its canonical identity probe.
+        ToolBinary::AtomicParsley => &[],
         ToolBinary::Ffmpeg
         | ToolBinary::Ffprobe
         | ToolBinary::Loudgain
         | ToolBinary::Metaflac
         | ToolBinary::Flac
         | ToolBinary::Wvunpack
-        | ToolBinary::Wvtag
-        | ToolBinary::AtomicParsley => &["--version"],
+        | ToolBinary::Wvtag => &["--version"],
     }
 }
 
@@ -925,39 +952,27 @@ pub(crate) fn resolve_command_launch_path(
     }
 }
 
-#[async_trait]
-impl ToolRunner for RealToolRunner {
-    fn tool_version(&self, binary: ToolBinary) -> Option<String> {
-        let path = resolve_command_launch_path(
-            self.resolve_binary(binary),
-            CommandEnvironmentPolicy::ClearAndSet,
-        );
-        self.tool_version_for_resolved_path(binary, &path)
+fn executable_sha256(path: &Path) -> std::io::Result<Sha256Digest> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
     }
+    Ok(Sha256Digest(hasher.finalize().into()))
+}
 
-    fn tool_available(&self, binary: ToolBinary) -> bool {
-        executable_path_is_available(&self.resolve_binary(binary))
-    }
-
-    fn resolved_tool_path(&self, binary: ToolBinary) -> Option<PathBuf> {
-        resolve_executable_path(&self.resolve_binary(binary))
-    }
-
-    async fn run(
+impl RealToolRunner {
+    async fn run_with_binary_path(
         &self,
         cmd: ToolCommand,
+        binary_path: PathBuf,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput, ToolRunnerError> {
-        // A closed-environment Reference command must not launch an incidental
-        // inherited-environment version probe outside its recorded identity.
-        if cmd.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
-            let _ = self.tool_version(cmd.binary);
-        }
-
-        let binary_path = resolve_command_launch_path(
-            self.resolve_binary(cmd.binary),
-            cmd.environment_policy,
-        );
         let started = Instant::now();
         let mut process = tokio::process::Command::new(&binary_path);
         process
@@ -1095,6 +1110,87 @@ impl ToolRunner for RealToolRunner {
             }),
         }
     }
+}
+
+#[async_trait]
+impl ToolRunner for RealToolRunner {
+    fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+        let path = resolve_command_launch_path(
+            self.resolve_binary(binary),
+            CommandEnvironmentPolicy::ClearAndSet,
+        );
+        self.tool_version_for_resolved_path(binary, &path)
+    }
+
+    fn tool_available(&self, binary: ToolBinary) -> bool {
+        executable_path_is_available(&self.resolve_binary(binary))
+    }
+
+    fn resolved_tool_path(&self, binary: ToolBinary) -> Option<PathBuf> {
+        resolve_executable_path(&self.resolve_binary(binary))
+    }
+
+    async fn run(
+        &self,
+        cmd: ToolCommand,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolRunnerError> {
+        // A closed-environment Reference command must not launch an incidental
+        // inherited-environment version probe outside its recorded identity.
+        if cmd.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+            let _ = self.tool_version(cmd.binary);
+        }
+
+        let binary_path = resolve_command_launch_path(
+            self.resolve_binary(cmd.binary),
+            cmd.environment_policy,
+        );
+        self.run_with_binary_path(cmd, binary_path, cancel).await
+    }
+
+    async fn run_bound(
+        &self,
+        cmd: ToolCommand,
+        executable: &BoundToolExecutable,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolRunnerError> {
+        let resolved = self.resolved_tool_path(cmd.binary).ok_or_else(|| {
+            ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "cannot resolve {} for bound execution",
+                    cmd.binary.canonical_name()
+                ),
+            ))
+        })?;
+        if resolved != executable.canonical_path {
+            return Err(ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "bound {} path drift: expected {}, resolved {}",
+                    cmd.binary.canonical_name(),
+                    executable.canonical_path.display(),
+                    resolved.display(),
+                ),
+            )));
+        }
+        let actual_sha256 = executable_sha256(&executable.canonical_path)?;
+        if actual_sha256 != executable.executable_sha256 {
+            return Err(ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "bound {} executable digest drift at {}: expected {}, got {}",
+                    cmd.binary.canonical_name(),
+                    executable.canonical_path.display(),
+                    executable.executable_sha256,
+                    actual_sha256,
+                ),
+            )));
+        }
+        self.run_with_binary_path(cmd, executable.canonical_path.clone(), cancel)
+            .await
+    }
+
 
     async fn run_pipeline(
         &self,
@@ -1733,6 +1829,29 @@ pub(crate) mod blocking_test_runner {
                 env: Vec::new(),
                 timeout: Duration::from_secs(60),
             }
+        }
+
+        #[tokio::test]
+        async fn default_bound_execution_fails_closed() {
+            let runner = StubToolRunner::new();
+            let authority = BoundToolExecutable {
+                canonical_path: PathBuf::from("/qualified/store/bin/metaflac"),
+                executable_sha256: Sha256Digest::of_bytes(b"qualified-metaflac"),
+            };
+            let error = runner
+                .run_bound(
+                    cmd(ToolBinary::Metaflac, "--version"),
+                    &authority,
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("an unbound custom runner must fail closed");
+            assert!(matches!(
+                error,
+                ToolRunnerError::Io(ref io)
+                    if io.kind() == std::io::ErrorKind::Unsupported
+            ));
+            assert!(runner.transcript().is_empty());
         }
 
         #[tokio::test]
@@ -2443,6 +2562,12 @@ exec /bin/cat >/dev/null
             (ToolBinary::Opustags, "opustags version 1.10.1", "", "1.10.1"),
             (ToolBinary::Wvtag, "wvtag 5.8.1", "", "5.8.1"),
             (ToolBinary::Wvunpack, "wvunpack 5.8.1", "", "5.8.1"),
+            (
+                ToolBinary::AtomicParsley,
+                "AtomicParsley version: 20240608.083822.1ed9031",
+                "",
+                "20240608.083822.1ed9031",
+            ),
         ];
 
         for (binary, stdout, stderr, expected) in cases {
@@ -2456,6 +2581,11 @@ exec /bin/cat >/dev/null
             parse_tool_version_output(ToolBinary::Ffmpeg, "ffmpeg build info without a version", ""),
             None
         );
+    }
+
+    #[test]
+    fn atomic_parsley_version_probe_uses_zero_argument_banner() {
+        assert!(version_command_args(ToolBinary::AtomicParsley).is_empty());
     }
 
     #[test]
@@ -2522,6 +2652,111 @@ exec /bin/cat >/dev/null
             }
         }
         path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_execution_spawns_the_exact_attested_executable() {
+        let script = write_executable_script(
+            "bound-exact",
+            "#!/bin/sh
+printf 'bound-exact\n'
+",
+        );
+        let canonical = std::fs::canonicalize(&script).expect("canonical bound script");
+        let authority = BoundToolExecutable {
+            canonical_path: canonical.clone(),
+            executable_sha256: executable_sha256(&canonical).expect("hash bound script"),
+        };
+        let runner = runner_with_override(ToolBinary::Metaflac, canonical.to_str().unwrap());
+        let output = runner
+            .run_bound(
+                ToolCommand {
+                    environment_policy: CommandEnvironmentPolicy::ClearAndSet,
+                    binary: ToolBinary::Metaflac,
+                    args: Vec::new(),
+                    secret_args: Vec::new(),
+                    cwd: None,
+                    env: vec![EnvVar {
+                        key: "LC_ALL".to_string(),
+                        value: SecretString::new("C"),
+                        secret: false,
+                    }],
+                    timeout: Duration::from_secs(5),
+                },
+                &authority,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("bound execution succeeds");
+        assert_eq!(output.exit, ProcessExit::Code(0));
+        assert!(output.stdout_tail.contains("bound-exact"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_execution_rejects_runner_path_override_drift() {
+        let certified = write_executable_script("bound-certified", "#!/bin/sh
+exit 0
+");
+        let replacement = write_executable_script("bound-replacement", "#!/bin/sh
+exit 0
+");
+        let certified = std::fs::canonicalize(certified).expect("canonical certified script");
+        let replacement = std::fs::canonicalize(replacement).expect("canonical replacement script");
+        let authority = BoundToolExecutable {
+            canonical_path: certified.clone(),
+            executable_sha256: executable_sha256(&certified).expect("hash certified script"),
+        };
+        let runner = runner_with_override(ToolBinary::Wvtag, replacement.to_str().unwrap());
+        let error = runner
+            .run_bound(
+                ToolCommand {
+                    environment_policy: CommandEnvironmentPolicy::ClearAndSet,
+                    binary: ToolBinary::Wvtag,
+                    args: Vec::new(),
+                    secret_args: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    timeout: Duration::from_secs(5),
+                },
+                &authority,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("configured replacement must be rejected");
+        assert!(matches!(error, ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_execution_rejects_executable_content_drift() {
+        let script = write_executable_script("bound-digest", "#!/bin/sh
+exit 0
+");
+        let canonical = std::fs::canonicalize(script).expect("canonical bound script");
+        let authority = BoundToolExecutable {
+            canonical_path: canonical.clone(),
+            executable_sha256: Sha256Digest::of_bytes(b"not-the-executable"),
+        };
+        let runner = runner_with_override(ToolBinary::AtomicParsley, canonical.to_str().unwrap());
+        let error = runner
+            .run_bound(
+                ToolCommand {
+                    environment_policy: CommandEnvironmentPolicy::ClearAndSet,
+                    binary: ToolBinary::AtomicParsley,
+                    args: Vec::new(),
+                    secret_args: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    timeout: Duration::from_secs(5),
+                },
+                &authority,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("digest drift must be rejected");
+        assert!(matches!(error, ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
     }
 
     #[cfg(unix)]

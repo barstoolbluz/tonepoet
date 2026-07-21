@@ -455,11 +455,18 @@ def verify_compiled_v8_routes(repository_root: Path) -> None:
         "for rule in tonepoet_pipeline::REFERENCE_DECODE_ROUTE_RULES",
         "decode_routes.len()",
         "CommandEnvironmentPolicy::ClearAndSet",
-        "manifest.schema_version != 8",
     ]
     for marker in required_executor:
         if marker not in executor:
             raise AssertionError(f"compiled executor is missing v8 authority marker: {marker}")
+
+    if not any(
+        marker in executor
+        for marker in ("manifest.schema_version != 8", "manifest.schema_version != 9", "manifest.schema_version != 10", "manifest.schema_version != 11")
+    ):
+        raise AssertionError(
+            "compiled executor has no recognized v8-or-later manifest-schema guard"
+        )
 
     carrier_only_signatures = {
         "direct hash builder": (
@@ -674,7 +681,42 @@ def main() -> int:
             raise AssertionError(
                 "v8 current and candidate manifests differ before promotion"
             )
-        verify_compiled_policy(qualification_dir.parent / "src" / "dsd_reference.rs")
+        compiled_policy = qualification_dir.parent / "src" / "dsd_reference.rs"
+        compiled_source = compiled_policy.read_text(encoding="utf-8")
+        current_manifests = (
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v9.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v10.json"',
+            '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
+        )
+        active = [marker for marker in current_manifests if marker in compiled_source]
+        if len(active) != 1:
+            raise AssertionError(
+                f"{compiled_policy}: expected exactly one recognized current policy manifest, got {active}"
+            )
+        if active[0] == current_manifests[0]:
+            verify_compiled_policy(compiled_policy)
+        else:
+            inherited_source = "\n".join(
+                (
+                    compiled_source,
+                    (repository_root / "tests/dsd_reference_qualification.rs").read_text(
+                        encoding="utf-8"
+                    ),
+                    (repository_root / "src/convert/pipeline/track_executor.rs").read_text(
+                        encoding="utf-8"
+                    ),
+                )
+            )
+            for marker in (
+                'pub const DSD_REFERENCE_POLICY_V8_KEY: &str = "sox_ng_14_8_0_1_v8";',
+                'SoxNg14801V8',
+                '"tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_terminal_source_proof.md"',
+            ):
+                if marker not in inherited_source:
+                    raise AssertionError(
+                        f"{repository_root}: append-only v9 policy dropped inherited v8 authority {marker!r}"
+                    )
         verify_compiled_v8_routes(repository_root)
         print("v8 terminal-bound derivation, effects-boundary audit, and route contracts verified")
     else:

@@ -210,6 +210,32 @@ pub struct ExecutionFingerprintV1(pub Sha256Digest);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SemanticPlanHashV1(pub Sha256Digest);
 
+/// Exact identity of one policy-owned metadata mutator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct ReferenceMetadataMutatorIdentityInput {
+    /// Canonical resolved executable path.
+    pub canonical_path: String,
+    /// SHA-256 of the executable bytes.
+    pub executable_sha256: Sha256Digest,
+    /// Exact version string the tool reported at attestation.
+    pub reported_version: String,
+    /// Package/store closure digest binding the complete toolchain.
+    pub closure_digest: Sha256Digest,
+}
+
+/// Exact metadata-mutator closure admitted for a Reference execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct ReferenceMetadataMutatorToolchainInput {
+    /// FLAC tag mutator identity (metaflac).
+    pub metaflac: ReferenceMetadataMutatorIdentityInput,
+    /// WavPack tag mutator identity (wvtag).
+    pub wvtag: ReferenceMetadataMutatorIdentityInput,
+    /// M4A freeform tag mutator identity (AtomicParsley).
+    pub atomic_parsley: ReferenceMetadataMutatorIdentityInput,
+}
+
 /// Exact tool/runtime closure inputs for native-v2 execution identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
@@ -236,6 +262,9 @@ pub struct ReferenceExecutionIdentityInput {
     pub ffmpeg_closure_digest: Sha256Digest,
     /// Qualified FFmpeg behavior-probe identity.
     pub ffmpeg_behavior_probe_digest: Sha256Digest,
+    /// Exact policy-owned metadata mutators when metadata mutation is enabled.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub metadata_mutators: Option<ReferenceMetadataMutatorToolchainInput>,
     /// In-process DST/SACD build identity.
     pub sacd_rs_build_identity: String,
     /// Pinned byte-exact DST fixture corpus.
@@ -315,6 +344,30 @@ pub fn execution_fingerprint_v1(
         "ffmpeg_behavior_probe",
         &identity.ffmpeg_behavior_probe_digest.to_hex(),
     );
+    if let Some(mutators) = &identity.metadata_mutators {
+        for (name, mutator) in [
+            ("metaflac", &mutators.metaflac),
+            ("wvtag", &mutators.wvtag),
+            ("atomic_parsley", &mutators.atomic_parsley),
+        ] {
+            writer.field_string(
+                &format!("metadata_mutator.{name}.canonical_path"),
+                mutator.canonical_path.clone(),
+            );
+            writer.field_string(
+                &format!("metadata_mutator.{name}.sha256"),
+                mutator.executable_sha256.to_hex(),
+            );
+            writer.field_string(
+                &format!("metadata_mutator.{name}.version"),
+                mutator.reported_version.clone(),
+            );
+            writer.field_string(
+                &format!("metadata_mutator.{name}.closure"),
+                mutator.closure_digest.to_hex(),
+            );
+        }
+    }
     writer.field_static("sacd_rs_build", &identity.sacd_rs_build_identity);
     writer.field_static("dst_fixture", &identity.dst_fixture_digest.to_hex());
     writer.field_static(
@@ -1071,6 +1124,80 @@ mod tests {
         let mut settings = PipelineSettings::default();
         update(&mut settings);
         settings_fingerprint(&settings)
+    }
+
+    fn test_metadata_identity(name: &str) -> ReferenceMetadataMutatorIdentityInput {
+        ReferenceMetadataMutatorIdentityInput {
+            canonical_path: format!("/nix/store/{name}/bin/{name}"),
+            executable_sha256: Sha256Digest::of_bytes(format!("{name}-executable").as_bytes()),
+            reported_version: format!("{name} 1.0"),
+            closure_digest: Sha256Digest::of_bytes(format!("{name}-closure").as_bytes()),
+        }
+    }
+
+    fn test_reference_execution_identity() -> ReferenceExecutionIdentityInput {
+        ReferenceExecutionIdentityInput {
+            planner_build_identity: "planner".to_string(),
+            platform_abi_digest: Sha256Digest::of_bytes(b"platform"),
+            runtime_dispatch_digest: Sha256Digest::of_bytes(b"dispatch"),
+            sox_ng_sha256: Sha256Digest::of_bytes(b"sox"),
+            sox_ng_version: "sox 14.8.0.1".to_string(),
+            sox_ng_closure_digest: Sha256Digest::of_bytes(b"sox-closure"),
+            sox_ng_behavior_probe_digest: Sha256Digest::of_bytes(b"sox-probe"),
+            ffmpeg_sha256: Sha256Digest::of_bytes(b"ffmpeg"),
+            ffmpeg_version: "ffmpeg 7".to_string(),
+            ffmpeg_closure_digest: Sha256Digest::of_bytes(b"ffmpeg-closure"),
+            ffmpeg_behavior_probe_digest: Sha256Digest::of_bytes(b"ffmpeg-probe"),
+            metadata_mutators: Some(ReferenceMetadataMutatorToolchainInput {
+                metaflac: test_metadata_identity("metaflac"),
+                wvtag: test_metadata_identity("wvtag"),
+                atomic_parsley: test_metadata_identity("AtomicParsley"),
+            }),
+            sacd_rs_build_identity: "sacd-rs".to_string(),
+            dst_fixture_digest: Sha256Digest::of_bytes(b"dst"),
+            reporting_uncertainty: DbNano(1),
+            analyzer_residual: DbNano(2),
+        }
+    }
+
+    #[test]
+    fn execution_fingerprint_binds_every_metadata_mutator_identity_component() {
+        let behavior = BehaviorFingerprintV1(Sha256Digest::of_bytes(b"behavior"));
+        let semantic = SemanticPlanHashV1(Sha256Digest::of_bytes(b"semantic"));
+        let qualification = Sha256Digest::of_bytes(b"qualification");
+        let base = test_reference_execution_identity();
+        let base_fingerprint =
+            execution_fingerprint_v1(behavior, semantic, qualification, &base);
+
+        let mut variants = Vec::new();
+        for select in 0..3 {
+            for component in 0..4 {
+                let mut changed = base.clone();
+                let mutators = changed.metadata_mutators.as_mut().expect("metadata mutators");
+                let identity = match select {
+                    0 => &mut mutators.metaflac,
+                    1 => &mut mutators.wvtag,
+                    _ => &mut mutators.atomic_parsley,
+                };
+                match component {
+                    0 => identity.canonical_path.push_str("-changed"),
+                    1 => identity.executable_sha256 = Sha256Digest::of_bytes(b"changed-executable"),
+                    2 => identity.reported_version.push_str("-changed"),
+                    _ => identity.closure_digest = Sha256Digest::of_bytes(b"changed-closure"),
+                }
+                variants.push(changed);
+            }
+        }
+        let mut without_mutators = base.clone();
+        without_mutators.metadata_mutators = None;
+        variants.push(without_mutators);
+
+        for changed in variants {
+            assert_ne!(
+                base_fingerprint,
+                execution_fingerprint_v1(behavior, semantic, qualification, &changed),
+            );
+        }
     }
 
     #[test]

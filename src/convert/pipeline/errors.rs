@@ -134,6 +134,10 @@ pub enum MergeError {
 
 #[derive(Debug, Error)]
 pub enum MetadataError {
+    #[error("{0}")]
+    PolicyRejected(&'static str),
+    #[error("Reference metadata toolchain identity failed: {0}")]
+    ReferenceToolchain(String),
     #[error("unsupported tag format: {0}")]
     UnsupportedTagFormat(String),
     #[error("io error: {0}")]

@@ -62,7 +62,9 @@ use super::memory_budget::{estimate_job_peak_bytes, write_staging_owner_marker, 
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
     execute_planned_track_conversion, preflight_reference_rerun_authority,
-    run_tool_command_with_concurrency, verify_reference_output_after_metadata,
+    reference_bound_metadata_executable, reference_metadata_toolchains_match,
+    run_tool_command_with_concurrency, verify_reference_metadata_toolchain_before_mutation,
+    verify_reference_output_after_metadata, ReferenceToolchainEvidence,
 };
 pub use super::track_executor::ToolConcurrencyLimits;
 use super::plan_bridge::{metadata_obligations_for_request, orchestrator_metadata_stage_required};
@@ -70,7 +72,10 @@ use super::progress::{
     heartbeat, OperationProgressTracker,
 };
 use super::reporter::{PipelineEvent, PipelineReporter};
-use super::tool::{CommandRecord, RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{
+    BoundToolExecutable, CommandRecord, EnvVar, RealToolRunner, ToolBinary, ToolCommand,
+    ToolOutput, ToolPipelineError, ToolPipelineOutput, ToolRunner,
+};
 use super::types::*;
 use crate::convert::cap_fs::PinnedDirectoryCapability;
 use crate::convert::ConversionStatus;
@@ -4005,6 +4010,115 @@ fn cue_artwork_sidecar_from_album_metadata(album: &AlbumMetadata) -> Option<CueA
     })
 }
 
+struct ReferenceBoundMetadataRunner<'a> {
+    inner: &'a dyn ToolRunner,
+    toolchain: &'a ReferenceToolchainEvidence,
+}
+
+#[async_trait]
+impl ToolRunner for ReferenceBoundMetadataRunner<'_> {
+    async fn run(
+        &self,
+        cmd: ToolCommand,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolRunnerError> {
+        if let Some(executable) = reference_bound_metadata_executable(self.toolchain, cmd.binary) {
+            self.inner.run_bound(cmd, &executable, cancel).await
+        } else {
+            self.inner.run(cmd, cancel).await
+        }
+    }
+
+    async fn run_bound(
+        &self,
+        cmd: ToolCommand,
+        executable: &BoundToolExecutable,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolRunnerError> {
+        self.inner.run_bound(cmd, executable, cancel).await
+    }
+
+    async fn run_pipeline(
+        &self,
+        producer: ToolCommand,
+        consumer: ToolCommand,
+        cancel: &CancellationToken,
+    ) -> Result<ToolPipelineOutput, ToolPipelineError> {
+        self.inner.run_pipeline(producer, consumer, cancel).await
+    }
+
+    fn tool_version(&self, binary: ToolBinary) -> Option<String> {
+        self.inner.tool_version(binary)
+    }
+
+    fn tool_available(&self, binary: ToolBinary) -> bool {
+        self.inner.tool_available(binary)
+    }
+
+    fn resolved_tool_path(&self, binary: ToolBinary) -> Option<PathBuf> {
+        self.inner.resolved_tool_path(binary)
+    }
+}
+
+async fn apply_metadata_to_track_artifact(
+    artifact: &TrackArtifact,
+    metadata: Option<&TrackMetadata>,
+    album: &AlbumMetadata,
+    artwork: Option<&CueArtworkSidecar>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), MetadataError> {
+    if let Some(reference) = artifact.reference_evidence.as_ref() {
+        let bound_runner = ReferenceBoundMetadataRunner {
+            inner: runner,
+            toolchain: &reference.toolchain,
+        };
+        if let Some(metadata) = metadata {
+            apply_production_metadata_to_file(
+                &artifact.staged_path,
+                metadata,
+                album,
+                artwork,
+                &bound_runner,
+                cancel,
+                tool_concurrency_limits,
+            )
+            .await?;
+        } else if let Some(artwork) = artwork {
+            embed_cue_artwork_for_file(
+                &artifact.staged_path,
+                artwork,
+                &bound_runner,
+                cancel,
+                tool_concurrency_limits,
+            )
+            .await?;
+        }
+    } else if let Some(metadata) = metadata {
+        apply_production_metadata_to_file(
+            &artifact.staged_path,
+            metadata,
+            album,
+            artwork,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?;
+    } else if let Some(artwork) = artwork {
+        embed_cue_artwork_for_file(
+            &artifact.staged_path,
+            artwork,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Apply metadata tags and CUE artwork to staged audio artifacts.
 ///
 /// CUE tracks use an audio-only PCM WAV carrier whose integer/float class
@@ -4058,6 +4172,34 @@ pub async fn apply_metadata_with_tool_limits(
         None
     };
 
+    if let AudioArtifacts::Tracks(tracks) = &artifacts.audio {
+        let mut reference_authority: Option<&ReferenceToolchainEvidence> = None;
+        for artifact in tracks {
+            let Some(reference) = artifact.reference_evidence.as_ref() else {
+                continue;
+            };
+            if reference.toolchain.metadata_mutators.is_none() {
+                return Err(MetadataError::ReferenceToolchain(
+                    "Reference track has no attested metadata-mutator identities".to_string(),
+                ));
+            }
+            if let Some(authority) = reference_authority {
+                if !reference_metadata_toolchains_match(authority, &reference.toolchain) {
+                    return Err(MetadataError::ReferenceToolchain(
+                        "Reference tracks disagree on the attested metadata toolchain".to_string(),
+                    ));
+                }
+            } else {
+                reference_authority = Some(&reference.toolchain);
+            }
+        }
+        if let Some(authority) = reference_authority {
+            verify_reference_metadata_toolchain_before_mutation(authority, runner, cancel)
+                .await
+                .map_err(|error| MetadataError::ReferenceToolchain(error.to_string()))?;
+        }
+    }
+
     match &artifacts.audio {
         AudioArtifacts::Tracks(tracks) => {
             for artifact in tracks {
@@ -4084,38 +4226,16 @@ pub async fn apply_metadata_with_tool_limits(
                     .iter()
                     .find(|t| t.id == artifact.track_id)
                     .map(|t| &t.metadata);
-                if let Some(meta) = meta {
-                    tag_audio_file(
-                        &artifact.staged_path,
-                        meta,
-                        &source.album_metadata,
-                        runner,
-                        cancel,
-                        tool_concurrency_limits.as_ref(),
-                    )
-                    .await?;
-                }
-                if let Some(artwork) = cue_artwork.as_ref() {
-                    embed_cue_artwork_for_file(
-                        &artifact.staged_path,
-                        artwork,
-                        runner,
-                        cancel,
-                        tool_concurrency_limits.as_ref(),
-                    )
-                    .await?;
-                }
-                if let Some(meta) = meta {
-                    apply_m4a_freeform_tags(
-                        &artifact.staged_path,
-                        meta,
-                        &source.album_metadata,
-                        runner,
-                        cancel,
-                        tool_concurrency_limits.as_ref(),
-                    )
-                    .await?;
-                }
+                apply_metadata_to_track_artifact(
+                    artifact,
+                    meta,
+                    &source.album_metadata,
+                    cue_artwork.as_ref(),
+                    runner,
+                    cancel,
+                    tool_concurrency_limits.as_ref(),
+                )
+                .await?;
             }
         }
         AudioArtifacts::Merged(merged) => {
@@ -4127,29 +4247,11 @@ pub async fn apply_metadata_with_tool_limits(
                 date: source.album_metadata.date.clone(),
                 ..TrackMetadata::default()
             };
-            tag_audio_file(
+            apply_production_metadata_to_file(
                 &merged.staged_path,
                 &album_as_track,
                 &source.album_metadata,
-                runner,
-                cancel,
-                tool_concurrency_limits.as_ref(),
-            )
-            .await?;
-            if let Some(artwork) = cue_artwork.as_ref() {
-                embed_cue_artwork_for_file(
-                    &merged.staged_path,
-                    artwork,
-                    runner,
-                    cancel,
-                    tool_concurrency_limits.as_ref(),
-                )
-                .await?;
-            }
-            apply_m4a_freeform_tags(
-                &merged.staged_path,
-                &album_as_track,
-                &source.album_metadata,
+                cue_artwork.as_ref(),
                 runner,
                 cancel,
                 tool_concurrency_limits.as_ref(),
@@ -4576,6 +4678,14 @@ fn parse_native_tag_keys(text: &str) -> BTreeSet<String> {
     keys
 }
 
+fn deterministic_metadata_tool_environment() -> Vec<EnvVar> {
+    vec![EnvVar {
+        key: "LC_ALL".to_string(),
+        value: SecretString::new("C"),
+        secret: false,
+    }]
+}
+
 fn native_existing_tag_list_command(path: &Path, ext: &str) -> Option<ToolCommand> {
     let (binary, args) = match ext {
         "flac" => (
@@ -4594,12 +4704,12 @@ fn native_existing_tag_list_command(path: &Path, ext: &str) -> Option<ToolComman
     };
 
     Some(ToolCommand {
-        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
         binary,
         args,
         secret_args: vec![],
         cwd: None,
-        env: vec![],
+        env: deterministic_metadata_tool_environment(),
         timeout: Duration::from_secs(30),
     })
 }
@@ -4715,6 +4825,7 @@ fn ffmpeg_metadata_rewrite_args(
     path: &Path,
     tmp: &Path,
     tags: &[(String, String)],
+    preserve_rf64: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-y".into(),
@@ -4735,6 +4846,13 @@ fn ffmpeg_metadata_rewrite_args(
     }
     args.push("-c".into());
     args.push("copy".into());
+    if preserve_rf64 {
+        // A same-extension rewrite of a small RF64 file otherwise defaults back
+        // to ordinary RIFF. Container identity is part of the production
+        // metadata contract, so preserve the source RF64 dialect explicitly.
+        args.push("-rf64".into());
+        args.push("always".into());
+    }
     // NOTE: no `-movflags +use_metadata_tags` here. On ffmpeg 7.1 that flag
     // and an attached picture are mutually exclusive in ONE mov/ipod mux
     // (verified empirically: the flag stores arbitrary keys but silently
@@ -4800,6 +4918,26 @@ fn m4a_freeform_tag_pairs_for_file(
 /// AtomicParsley is intentionally a required dependency when `pairs` is
 /// non-empty. Failing the conversion is preferable to silently dropping keys
 /// after promising authoritative m4a custom-tag preservation.
+fn m4a_freeform_tag_command(path: &Path, pairs: &[(String, String)]) -> ToolCommand {
+    let mut args = vec![path.display().to_string()];
+    for (key, value) in pairs {
+        args.push("--rDNSatom".into());
+        args.push(value.clone());
+        args.push(format!("name={key}"));
+        args.push("domain=com.apple.iTunes".into());
+    }
+    args.push("--overWrite".into());
+    ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+        binary: ToolBinary::AtomicParsley,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: deterministic_metadata_tool_environment(),
+        timeout: Duration::from_secs(60),
+    }
+}
+
 async fn apply_m4a_freeform_tags(
     path: &Path,
     meta: &TrackMetadata,
@@ -4812,27 +4950,20 @@ async fn apply_m4a_freeform_tags(
     if pairs.is_empty() {
         return Ok(());
     }
-    let mut args = vec![path.display().to_string()];
-    for (key, value) in &pairs {
-        args.push("--rDNSatom".into());
-        args.push(value.clone());
-        args.push(format!("name={key}"));
-        args.push("domain=com.apple.iTunes".into());
-    }
-    args.push("--overWrite".into());
-    let cmd = ToolCommand {
-        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
-        binary: ToolBinary::AtomicParsley,
-        args,
-        secret_args: vec![],
-        cwd: None,
-        env: vec![],
-        timeout: Duration::from_secs(60),
-    };
+    let cmd = m4a_freeform_tag_command(path, &pairs);
     run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
         .await
         .map_err(MetadataError::Tool)?;
     Ok(())
+}
+
+fn wave_metadata_rewrite_requires_rf64(path: &Path) -> Result<bool, MetadataError> {
+    use std::io::Read as _;
+
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic)?;
+    Ok(magic == *b"RF64")
 }
 
 fn metadata_tag_command(
@@ -4846,9 +4977,17 @@ fn metadata_tag_command(
         "opus" | "ogg" => (ToolBinary::Opustags, opustags_tag_args(path, tags, existing_keys), None),
         "wv" => (ToolBinary::Wvtag, wvtag_tag_args(path, tags, existing_keys), None),
         "mp3" | "m4a" | "wav" | "aiff" | "aif" => {
+            let preserve_rf64 = ext == "wav" && wave_metadata_rewrite_requires_rf64(path)?;
             let tmp = metadata_rewrite_temp_path(path)?;
-            let args = ffmpeg_metadata_rewrite_args(path, &tmp, tags);
+            let args = ffmpeg_metadata_rewrite_args(path, &tmp, tags, preserve_rf64);
             (ToolBinary::Ffmpeg, args, Some(tmp))
+        }
+        "w64" => {
+            return Err(MetadataError::PolicyRejected(
+                tonepoet_pipeline::reference_error_text(
+                    tonepoet_pipeline::ReferenceErrorCode::W64MetadataMutationUnqualified,
+                ),
+            ));
         }
         _ => return Err(MetadataError::UnsupportedTagFormat(ext.to_string())),
     };
@@ -4860,12 +4999,12 @@ fn metadata_tag_command(
 
     Ok((
         ToolCommand {
-            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
             binary,
             args,
             secret_args: vec![],
             cwd: None,
-            env: vec![],
+            env: deterministic_metadata_tool_environment(),
             timeout,
         },
         tmp_path,
@@ -5026,6 +5165,12 @@ async fn embed_cue_artwork_for_file(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionMetadataMutationOutcome {
+    pub primary_mutator: Option<ToolBinary>,
+    pub m4a_freeform_mutator_applied: bool,
+}
+
 async fn tag_audio_file(
     path: &Path,
     meta: &TrackMetadata,
@@ -5033,7 +5178,7 @@ async fn tag_audio_file(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-) -> Result<(), MetadataError> {
+) -> Result<Option<ToolBinary>, MetadataError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -5042,7 +5187,7 @@ async fn tag_audio_file(
 
     let tags = authoritative_metadata_tags(meta, album);
     if tags.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let existing_keys = native_existing_tag_keys(
@@ -5054,6 +5199,7 @@ async fn tag_audio_file(
     )
     .await?;
     let (cmd, tmp_path) = metadata_tag_command(path, &ext, &tags, &existing_keys)?;
+    let primary_mutator = cmd.binary;
     let result = run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
         .await
         .map_err(MetadataError::Tool);
@@ -5069,7 +5215,70 @@ async fn tag_audio_file(
         replace_rewritten_metadata_file(path, tmp)?;
     }
 
-    Ok(())
+    Ok(Some(primary_mutator))
+}
+
+async fn apply_production_metadata_to_file(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    artwork: Option<&CueArtworkSidecar>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<ProductionMetadataMutationOutcome, MetadataError> {
+    let primary_mutator = tag_audio_file(
+        path,
+        meta,
+        album,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
+
+    if let Some(artwork) = artwork {
+        embed_cue_artwork_for_file(
+            path,
+            artwork,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?;
+    }
+
+    let m4a_freeform_mutator_applied = !m4a_freeform_tag_pairs_for_file(path, meta, album).is_empty();
+    apply_m4a_freeform_tags(
+        path,
+        meta,
+        album,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
+
+    Ok(ProductionMetadataMutationOutcome {
+        primary_mutator,
+        m4a_freeform_mutator_applied,
+    })
+}
+
+/// Execute the same authoritative per-file metadata mutation path used by
+/// `apply_metadata`, without an artwork sidecar. The commissioned Reference
+/// qualification uses this seam so its evidence covers the exact production
+/// command builders, existing-tag discovery, atomic replacement, and M4A
+/// freeform follow-up rather than a surrogate remux.
+#[doc(hidden)]
+pub async fn qualify_production_metadata_mutation(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<ProductionMetadataMutationOutcome, MetadataError> {
+    apply_production_metadata_to_file(path, meta, album, None, runner, cancel, None).await
 }
 
 #[cfg(test)]
@@ -5284,6 +5493,31 @@ mod metadata_writer_command_tests {
         )
         .expect_err("raw AAC cannot satisfy arbitrary metadata requirements");
         assert!(matches!(error, MetadataError::UnsupportedTagFormat(ref ext) if ext == "aac"));
+    }
+
+    #[test]
+    fn w64_metadata_mutation_fails_closed_before_tempfile_or_tool_selection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("reference.w64");
+        let error = metadata_tag_command(
+            &path,
+            "w64",
+            &[("TITLE".to_string(), "Reference qualification".to_string())],
+            &BTreeSet::new(),
+        )
+        .expect_err("W64 metadata mutation has no qualified route");
+        assert!(matches!(
+            error,
+            MetadataError::PolicyRejected(reason)
+                if reason == tonepoet_pipeline::reference_error_text(
+                    tonepoet_pipeline::ReferenceErrorCode::W64MetadataMutationUnqualified
+                )
+        ));
+        assert_eq!(
+            fs::read_dir(temp.path()).expect("read tempdir").count(),
+            0,
+            "policy rejection must not create a rewrite tempfile"
+        );
     }
 
     #[test]
@@ -5537,6 +5771,7 @@ mod metadata_writer_command_tests {
             Path::new("track.m4a"),
             Path::new(".track.m4a.tmp.m4a"),
             &tags,
+            false,
         );
 
         assert_pair(&args, "-map", "0");
@@ -5546,6 +5781,102 @@ mod metadata_writer_command_tests {
         assert_pair(&args, "-metadata", "disc=2/2");
         assert_pair(&args, "-c", "copy");
         assert_eq!(args.last().map(String::as_str), Some(".track.m4a.tmp.m4a"));
+    }
+
+    fn assert_closed_metadata_environment(command: &ToolCommand) {
+        assert_eq!(
+            command.environment_policy,
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
+        );
+        assert_eq!(command.env.len(), 1);
+        assert_eq!(command.env[0].key, "LC_ALL");
+        assert_eq!(command.env[0].value.expose(), "C");
+        assert!(!command.env[0].secret);
+    }
+
+    #[test]
+    fn production_metadata_commands_use_closed_locale_environment() {
+        let temp = tempfile::tempdir().expect("metadata test tempdir");
+        let input = temp.path().join("track.wav");
+        fs::write(&input, b"RIFF\0\0\0\0WAVE").expect("write RIFF marker");
+        let tags = vec![("TITLE".to_string(), "Reference".to_string())];
+        let (ffmpeg, _) = metadata_tag_command(&input, "wav", &tags, &BTreeSet::new())
+            .expect("build FFmpeg metadata command");
+        assert_closed_metadata_environment(&ffmpeg);
+
+        let metaflac_discovery = native_existing_tag_list_command(Path::new("track.flac"), "flac")
+            .expect("build metaflac discovery command");
+        assert_closed_metadata_environment(&metaflac_discovery);
+        let (metaflac_mutation, metaflac_temporary) = metadata_tag_command(
+            Path::new("track.flac"),
+            "flac",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("build metaflac mutation command");
+        assert_eq!(metaflac_mutation.binary, ToolBinary::Metaflac);
+        assert!(metaflac_temporary.is_none());
+        assert_closed_metadata_environment(&metaflac_mutation);
+
+        let wvtag_discovery = native_existing_tag_list_command(Path::new("track.wv"), "wv")
+            .expect("build wvtag discovery command");
+        assert_closed_metadata_environment(&wvtag_discovery);
+        let (wvtag_mutation, wvtag_temporary) = metadata_tag_command(
+            Path::new("track.wv"),
+            "wv",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("build wvtag mutation command");
+        assert_eq!(wvtag_mutation.binary, ToolBinary::Wvtag);
+        assert!(wvtag_temporary.is_none());
+        assert_closed_metadata_environment(&wvtag_mutation);
+
+        let atomic_parsley = m4a_freeform_tag_command(
+            Path::new("track.m4a"),
+            &[("MY_NOTE".to_string(), "Reference".to_string())],
+        );
+        assert_closed_metadata_environment(&atomic_parsley);
+    }
+
+    #[test]
+    fn wav_metadata_rewrite_preserves_rf64_container_identity() {
+        let temp = tempfile::tempdir().expect("metadata test tempdir");
+        let input = temp.path().join("track.wav");
+        fs::write(&input, b"RF64\0\0\0\0WAVE").expect("write RF64 marker");
+        let tags = vec![("TITLE".to_string(), "RF64".to_string())];
+        let (command, temporary) = metadata_tag_command(
+            &input,
+            "wav",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("build RF64 metadata command");
+
+        assert_eq!(command.binary, ToolBinary::Ffmpeg);
+        assert_pair(&command.args, "-rf64", "always");
+        assert!(temporary.is_some());
+    }
+
+    #[test]
+    fn wav_metadata_rewrite_does_not_force_rf64_for_riff_input() {
+        let temp = tempfile::tempdir().expect("metadata test tempdir");
+        let input = temp.path().join("track.wav");
+        fs::write(&input, b"RIFF\0\0\0\0WAVE").expect("write RIFF marker");
+        let tags = vec![("TITLE".to_string(), "RIFF".to_string())];
+        let (command, temporary) = metadata_tag_command(
+            &input,
+            "wav",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("build RIFF metadata command");
+
+        assert_eq!(command.binary, ToolBinary::Ffmpeg);
+        assert!(!command.args.windows(2).any(|window| {
+            window[0] == "-rf64" && window[1] == "always"
+        }));
+        assert!(temporary.is_some());
     }
 
     #[test]

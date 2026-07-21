@@ -10,7 +10,7 @@
 // raise the macro recursion limit for this test crate to expand it.
 #![recursion_limit = "512"]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,9 +23,16 @@ use sacd_rs::dsd_file::DsdFrameReader;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 use tonepoet::convert::pipeline::{
+    plan_request_for_track, qualify_production_metadata_mutation,
     qualify_reference_materialization_identity_digest,
-    qualify_reference_source_materialization,
+    qualify_reference_source_materialization, ActionPipeline, AlbumMetadata,
+    CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy,
+    NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PreparedTrack,
+    PublishPolicy, RealToolRunner, SacdArea, SourceAudioCoding, SourceAudioDescriptor,
+    SourceOptions, StagePolicy, StageRequirement, ToolBinary, TrackId, TrackMetadata,
+    TrackSelection, TrackSourceRef,
 };
 use tonepoet_pipeline::{
     build_reference_render_transcript_fixture, build_reference_silence_scan_command,
@@ -47,6 +54,12 @@ use tonepoet_pipeline::{
 const GATE: &str = "TONEPOET_REQUIRE_TOOLS";
 const SOX_ENV: &str = "TONEPOET_REFERENCE_SOX_PATH";
 const FFMPEG_ENV: &str = "TONEPOET_REFERENCE_FFMPEG_PATH";
+const METAFLAC_ENV: &str = "TONEPOET_REFERENCE_METAFLAC_PATH";
+const WVTAG_ENV: &str = "TONEPOET_REFERENCE_WVTAG_PATH";
+const ATOMIC_PARSLEY_ENV: &str = "TONEPOET_REFERENCE_ATOMIC_PARSLEY_PATH";
+const METAFLAC_STORE_ENV: &str = "TONEPOET_REFERENCE_METAFLAC_STORE_PATH";
+const WVTAG_STORE_ENV: &str = "TONEPOET_REFERENCE_WVTAG_STORE_PATH";
+const ATOMIC_PARSLEY_STORE_ENV: &str = "TONEPOET_REFERENCE_ATOMIC_PARSLEY_STORE_PATH";
 const QUALIFICATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUALIFICATION_PIPELINE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const QUALIFICATION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,6 +74,153 @@ fn required_tool(variable: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{variable} must be set by the qualified package or dev shell"));
     fs::canonicalize(&raw)
         .unwrap_or_else(|error| panic!("cannot canonicalize {variable}={}: {error}", Path::new(&raw).display()))
+}
+
+fn production_metadata_runner(
+    ffmpeg: &Path,
+    metaflac: &Path,
+    wvtag: &Path,
+    atomic_parsley: &Path,
+) -> RealToolRunner {
+    RealToolRunner::new(HashMap::from([
+        ("ffmpeg".to_string(), ffmpeg.to_path_buf()),
+        ("metaflac".to_string(), metaflac.to_path_buf()),
+        ("wvtag".to_string(), wvtag.to_path_buf()),
+        ("AtomicParsley".to_string(), atomic_parsley.to_path_buf()),
+    ]))
+}
+
+fn qualification_metadata() -> (TrackMetadata, AlbumMetadata) {
+    let mut track_extra = BTreeMap::new();
+    track_extra.insert("MY_NOTE".to_string(), "Reference production mutator".to_string());
+    let track = TrackMetadata {
+        title: Some("Reference qualification track".to_string()),
+        artist: Some("Reference qualification artist".to_string()),
+        album_artist: Some("Reference qualification album artist".to_string()),
+        composer: Some("Reference qualification composer".to_string()),
+        performer: Some("Reference qualification performer".to_string()),
+        genre: Some("Reference qualification genre".to_string()),
+        date: Some("2026".to_string()),
+        track_number: Some(1),
+        disc_number: Some(1),
+        isrc: Some("USRC17607839".to_string()),
+        publisher: Some("Reference qualification publisher".to_string()),
+        copyright: Some("Reference qualification copyright".to_string()),
+        comment: Some("Exact production metadata path".to_string()),
+        pre_emphasis: true,
+        extra: track_extra,
+    };
+    let mut album_extra = BTreeMap::new();
+    album_extra.insert("CATALOG".to_string(), "1234567890123".to_string());
+    let album = AlbumMetadata {
+        album: Some("Reference qualification album".to_string()),
+        album_artist: Some("Reference qualification album artist".to_string()),
+        genre: Some("Reference qualification genre".to_string()),
+        date: Some("2026".to_string()),
+        total_tracks: 1,
+        total_discs: Some(1),
+        disc_number: Some(1),
+        extra: album_extra,
+    };
+    (track, album)
+}
+
+fn w64_planner_request(root: &Path, sample_rate_hz: u32, depth: PcmBitDepth) -> PipelineRequest {
+    let mut settings = PipelineSettings::default();
+    settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+    settings.target_format = AudioFormat::Wav;
+    settings.target_sample_rate = RateTarget::PcmHz(sample_rate_hz);
+    settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+
+    PipelineRequest {
+        job_id: "reference-w64-matrix".to_string(),
+        actions: ActionPipeline::default(),
+        item_id: "reference-w64-matrix".to_string(),
+        container: root.join("source.dsf"),
+        source: SourceOptions {
+            archive_password: None,
+            sacd_area: Some(SacdArea::Stereo),
+            dvda_group_selection: DvdaGroupSelection::Default,
+            dvda_group: None,
+            dvda_assume_decrypted: false,
+            dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+            dvdv_vts: None,
+            dvdv_title: None,
+            dvdv_audio_stream: None,
+            dvdv_angle: None,
+            bluray_playlist: None,
+            bluray_audio_pid: None,
+            bluray_audio_stream: None,
+            bluray_angle: None,
+            cue_sidecar: CueSidecarPolicy::PreferSidecar,
+            track_selection: TrackSelection::All,
+        },
+        settings,
+        worker_count: Some(1),
+        scratch_staging: None,
+        merge: false,
+        output_root: root.join("out"),
+        naming: NamingPolicy {
+            template: "%NN% - %TITLE%".to_string(),
+            folder_template: None,
+            per_album_subdir: true,
+            collision_policy: NamingCollisionPolicy::Fail,
+        },
+        publish: PublishPolicy {
+            overwrite: OverwritePolicy::FailIfExists,
+            same_filesystem_required: false,
+            write_manifest: false,
+        },
+        log: LogPolicy {
+            root: root.join("logs"),
+            write_for_blocked: false,
+            write_json_log: false,
+            write_conversion_log: true,
+        },
+        stages: StagePolicy {
+            metadata: StageRequirement::Enabled,
+            replaygain: StageRequirement::Disabled,
+            features: StageRequirement::Disabled,
+            generate_cue: false,
+        },
+        failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        album_batch: None,
+        album_batch_track: None,
+        suppress_incremental_conversion_log_append: false,
+        companion: Default::default(),
+        pre_extracted_staging: None,
+        archive_metadata_overrides: Vec::new(),
+        expected_album_track_count: None,
+        container_extension: Some("w64".to_string()),
+        container_ffmpeg_flags: Vec::new(),
+        batch_resolved_identity: None,
+        metadata_overrides: Default::default(),
+    }
+}
+
+fn w64_planner_track(input: &Path, channels: u16) -> PreparedTrack {
+    PreparedTrack {
+        id: TrackId {
+            source_ordinal: 1,
+            disc_number: None,
+            track_number: 1,
+        },
+        source_ref: TrackSourceRef::StagedFile(input.to_path_buf()),
+        metadata: qualification_metadata().0,
+        expected_samples: Some(262_144),
+        sample_rate: Some(2_822_400),
+        source_audio: SourceAudioDescriptor::from_scalar(
+            Some(2_822_400),
+            None,
+            Some(SourceAudioCoding::Dsd),
+        ),
+        bit_depth: None,
+        warnings: if channels == 1 {
+            vec!["qualification mono fixture".to_string()]
+        } else {
+            Vec::new()
+        },
+    }
 }
 
 fn required_sibling_tool(tool: &Path, executable: &str) -> PathBuf {
@@ -308,6 +468,13 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn first_nonempty_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -1599,7 +1766,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V8;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V11;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -2722,7 +2889,7 @@ fn run_planned_measurement(
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -3043,8 +3210,8 @@ fn assert_terminal_realization_bound(
     observed
 }
 
-fn package_stream_copy_metadata_args(input: &Path, output: &Path, target: &str) -> Vec<String> {
-    let mut args = vec![
+fn known_defective_w64_metadata_remux_args(input: &Path, output: &Path) -> Vec<String> {
+    vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
@@ -3058,23 +3225,157 @@ fn package_stream_copy_metadata_args(input: &Path, output: &Path, target: &str) 
         "title=Reference qualification".to_string(),
         "-c:a".to_string(),
         "copy".to_string(),
-    ];
-    match target {
-        "wav_riff" => args.extend(["-f".to_string(), "wav".to_string()]),
-        "wav_rf64" => args.extend([
-            "-f".to_string(),
-            "wav".to_string(),
-            "-rf64".to_string(),
-            "always".to_string(),
-        ]),
-        "wav_w64" => args.extend(["-f".to_string(), "w64".to_string()]),
-        "aiff_native" => args.extend(["-f".to_string(), "aiff".to_string()]),
-        "alac_m4a" => args.extend(["-f".to_string(), "ipod".to_string()]),
-        "flac_native" | "wavpack_native" => {}
-        other => panic!("unknown metadata qualification target {other}"),
+        "-f".to_string(),
+        "w64".to_string(),
+        output.display().to_string(),
+    ]
+}
+
+
+fn deterministic_int24_mono_bytes(sample_count: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(sample_count * 3);
+    for index in 0..sample_count {
+        let unsigned = ((index as u32).wrapping_mul(7_919).wrapping_add(1_337)) & 0x00ff_ffff;
+        let value = unsigned as i32 - 0x0080_0000;
+        let encoded = value.to_le_bytes();
+        bytes.extend_from_slice(&encoded[..3]);
     }
-    args.push(output.display().to_string());
-    args
+    bytes
+}
+
+fn sox_raw_int24_mono_container(
+    sox: &Path,
+    raw: &Path,
+    output: &Path,
+    output_type: &str,
+) {
+    run(
+        sox,
+        &[
+            "-S".to_string(),
+            "-D".to_string(),
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "signed-integer".to_string(),
+            "-b".to_string(),
+            "24".to_string(),
+            "-L".to_string(),
+            "-r".to_string(),
+            "88200".to_string(),
+            "-c".to_string(),
+            "1".to_string(),
+            raw.display().to_string(),
+            "-t".to_string(),
+            output_type.to_string(),
+            "-e".to_string(),
+            "signed-integer".to_string(),
+            "-b".to_string(),
+            "24".to_string(),
+            output.display().to_string(),
+        ],
+    );
+}
+
+fn ffmpeg_decode_int24_bytes(ffmpeg: &Path, input: &Path) -> Vec<u8> {
+    run(
+        ffmpeg,
+        &[
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-i".to_string(),
+            input.display().to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-f".to_string(),
+            "s24le".to_string(),
+            "-c:a".to_string(),
+            "pcm_s24le".to_string(),
+            "pipe:1".to_string(),
+        ],
+    )
+    .stdout
+}
+
+fn qualify_alignment_metadata_mutation_probes(
+    sox: &Path,
+    ffmpeg: &Path,
+    root: &Path,
+    runtime: &tokio::runtime::Runtime,
+    metadata_runner: &RealToolRunner,
+    track_metadata: &TrackMetadata,
+    album_metadata: &AlbumMetadata,
+) -> Value {
+    let probe_root = root.join("metadata-alignment-probes");
+    fs::create_dir_all(&probe_root).expect("create metadata alignment probe root");
+
+    let w64_raw = probe_root.join("w64-int24-mono.raw");
+    let w64_original = probe_root.join("w64-int24-mono.w64");
+    let w64_rewrite = probe_root.join("w64-int24-mono-tagged.w64");
+    let w64_expected = deterministic_int24_mono_bytes(8_820);
+    assert_eq!(w64_expected.len(), 26_460);
+    assert_ne!(w64_expected.len() % 8, 0);
+    fs::write(&w64_raw, &w64_expected).expect("write W64 alignment probe raw PCM");
+    sox_raw_int24_mono_container(sox, &w64_raw, &w64_original, "w64");
+    run(
+        ffmpeg,
+        &known_defective_w64_metadata_remux_args(&w64_original, &w64_rewrite),
+    );
+    let w64_original_decoded = ffmpeg_decode_int24_bytes(ffmpeg, &w64_original);
+    let w64_rewrite_decoded = ffmpeg_decode_int24_bytes(ffmpeg, &w64_rewrite);
+    assert_eq!(w64_original_decoded, w64_expected);
+    assert_eq!(w64_rewrite_decoded.len(), w64_expected.len() + 3);
+    assert_eq!(&w64_rewrite_decoded[..w64_expected.len()], w64_expected.as_slice());
+    assert_eq!(&w64_rewrite_decoded[w64_expected.len()..], &[0, 0, 0]);
+
+    let riff_raw = probe_root.join("riff-int24-mono.raw");
+    let riff_original = probe_root.join("riff-int24-mono.wav");
+    let riff_expected = deterministic_int24_mono_bytes(8_821);
+    assert_eq!(riff_expected.len(), 26_463);
+    assert_eq!(riff_expected.len() % 2, 1);
+    fs::write(&riff_raw, &riff_expected).expect("write RIFF alignment probe raw PCM");
+    sox_raw_int24_mono_container(sox, &riff_raw, &riff_original, "wav");
+    let riff_original_decoded = ffmpeg_decode_int24_bytes(ffmpeg, &riff_original);
+    assert_eq!(riff_original_decoded, riff_expected);
+    let outcome = runtime
+        .block_on(qualify_production_metadata_mutation(
+            &riff_original,
+            track_metadata,
+            album_metadata,
+            metadata_runner,
+            &CancellationToken::new(),
+        ))
+        .expect("production RIFF metadata mutation probe");
+    assert_eq!(outcome.primary_mutator, Some(ToolBinary::Ffmpeg));
+    assert!(!outcome.m4a_freeform_mutator_applied);
+    let riff_post_metadata_decoded = ffmpeg_decode_int24_bytes(ffmpeg, &riff_original);
+    assert_eq!(riff_post_metadata_decoded, riff_expected);
+
+    serde_json::json!({
+        "schema": "tonepoet-reference-metadata-alignment-probes/v1",
+        "status": "passed",
+        "w64_non_8_aligned_int24_mono": {
+            "sample_rate_hz": 88200,
+            "channels": 1,
+            "sample_count_before": 8820,
+            "sample_count_after_ffmpeg_w64_remux": 8821,
+            "data_bytes_before": 26460,
+            "decoded_prefix_identity": "passed",
+            "phantom_trailing_sample": "000000",
+            "disposition": "known_muxer_defect_route_rejected",
+            "rejection_code": "DSD-REF-P0-024"
+        },
+        "riff_odd_byte_int24_mono": {
+            "sample_rate_hz": 88200,
+            "channels": 1,
+            "sample_count": 8821,
+            "data_bytes": 26463,
+            "post_metadata_sample_identity": "passed",
+            "production_entry_point": "qualify_production_metadata_mutation",
+            "production_primary_mutator": "ffmpeg",
+            "disposition": "qualified"
+        }
+    })
 }
 
 struct PackageQualificationEvidence {
@@ -3104,17 +3405,44 @@ fn qualify_lossless_package_cells(
 ) -> PackageQualificationEvidence {
     let sox = required_tool(SOX_ENV);
     let ffmpeg = required_tool(FFMPEG_ENV);
+    let metaflac = required_tool(METAFLAC_ENV);
+    let wvtag = required_tool(WVTAG_ENV);
+    let atomic_parsley = required_tool(ATOMIC_PARSLEY_ENV);
     let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
     let temp = TempDir::new().expect("package qualification tempdir");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("production metadata qualification runtime");
+    let metadata_runner = production_metadata_runner(&ffmpeg, &metaflac, &wvtag, &atomic_parsley);
+    let (track_metadata, album_metadata) = qualification_metadata();
+    let planner_mono_source = temp.path().join("planner-mono.dsf");
+    let planner_stereo_source = temp.path().join("planner-stereo.dsf");
+    write_dsf_reference_fixture(&planner_mono_source, 1, 2_822_400);
+    write_dsf_reference_fixture(&planner_stereo_source, 2, 2_822_400);
+
     let mut case_count = 0_usize;
     let mut terminal_bound_cells = BTreeSet::new();
     let mut route_counts = BTreeMap::<String, usize>::new();
     let mut encoding_counts = BTreeMap::<String, usize>::new();
     let mut terminal_route_counts = BTreeMap::<String, usize>::new();
     let mut terminal_observed_max_error_by_depth = BTreeMap::<String, f64>::new();
+    let mut production_primary_mutator_case_counts = BTreeMap::<String, usize>::new();
+    let mut production_m4a_freeform_case_count = 0_usize;
     let mut independent_float64_riff_rf64_case_count = 0_usize;
     let mut package_identity_comparison_count = 0_usize;
     let mut post_metadata_identity_comparison_count = 0_usize;
+    let mut w64_planner_entry_rejection_count = 0_usize;
+    let mut w64_metadata_entry_rejection_count = 0_usize;
+    let alignment_probes = qualify_alignment_metadata_mutation_probes(
+        &sox,
+        &ffmpeg,
+        temp.path(),
+        &runtime,
+        &metadata_runner,
+        &track_metadata,
+        &album_metadata,
+    );
 
     let rates = [
         44_100_u32, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
@@ -3367,49 +3695,134 @@ fn qualify_lossless_package_cells(
                             Some(TruePeakPurpose::PostFinalAcceptance)
                         ));
 
-                        let tagged = case_root.join(format!("tagged.{}", target_extension(target)));
-                        run(
-                            &ffmpeg,
-                            &package_stream_copy_metadata_args(packaged, &tagged, target_key(target)),
-                        );
-                        let post_metadata_authority =
-                            post_metadata_decode_authority(target, summary.final_pcm);
-                        record_decode_authority(
-                            &mut route_counts,
-                            &mut encoding_counts,
-                            "post_metadata",
-                            post_metadata_authority,
-                        );
-                        let mut post_metadata_summary = summary.clone();
-                        post_metadata_summary.delivered_path = tagged.clone();
-                        let tagged_carrier = post_metadata_summary
-                            .bind_decoded_carrier(
-                                ReferenceDecodedCarrierSelector::PostMetadataOutput,
-                                &tagged,
-                            )
-                            .expect("qualified post-metadata carrier binding");
-                        assert_eq!(tagged_carrier.authority(), post_metadata_authority);
-                        let tagged_hash =
-                            decoded_sample_hash(&tagged_carrier, &sox, &ffmpeg);
-                        if tagged_hash != qpcm_hash {
-                            let keep = std::path::Path::new("/tmp/qual_keep");
-                            let _ = fs::create_dir_all(keep);
-                            let _ = fs::copy(packaged, keep.join("packaged.bin"));
-                            let _ = fs::copy(&tagged, keep.join("tagged.bin"));
-                            panic!(
-                                "stream-copy rewrite hash mismatch ({target:?} {depth:?}); packaged={} ({} bytes) tagged={} ({} bytes); copies kept in /tmp/qual_keep",
-                                packaged.display(),
-                                fs::metadata(packaged).map(|m| m.len()).unwrap_or(0),
-                                tagged.display(),
-                                fs::metadata(&tagged).map(|m| m.len()).unwrap_or(0),
+                        if target == ResolvedOutputTarget::WavW64 {
+                            let rejection = tonepoet_pipeline::reference_error_text(
+                                ReferenceErrorCode::W64MetadataMutationUnqualified,
                             );
+                            assert_eq!(
+                                tonepoet_pipeline::reference_metadata_mutation_rejection(target),
+                                Some(rejection),
+                            );
+
+                            let planner_source = if channels == 1 {
+                                &planner_mono_source
+                            } else {
+                                &planner_stereo_source
+                            };
+                            let planner_output = case_root.join("planner-rejected.w64");
+                            let planner_work = case_root.join("planner-rejected-work");
+                            let planner_request =
+                                w64_planner_request(&case_root, sample_rate_hz, depth);
+                            let planner_track = w64_planner_track(planner_source, channels);
+                            let planner_error = plan_request_for_track(
+                                &planner_request,
+                                &planner_track,
+                                planner_source,
+                                &planner_output,
+                                planner_work.clone(),
+                            )
+                            .expect_err("W64 metadata admission must fail at the production planner entry");
+                            assert_eq!(
+                                planner_error.to_string(),
+                                format!("backend encode failed: {rejection}"),
+                            );
+                            assert!(!planner_output.exists());
+                            assert!(!planner_work.exists());
+                            w64_planner_entry_rejection_count += 1;
+
+                            let metadata_error = runtime
+                                .block_on(qualify_production_metadata_mutation(
+                                    packaged,
+                                    &track_metadata,
+                                    &album_metadata,
+                                    &metadata_runner,
+                                    &CancellationToken::new(),
+                                ))
+                                .expect_err("W64 metadata admission must fail at the production metadata entry");
+                            assert_eq!(metadata_error.to_string(), rejection);
+                            w64_metadata_entry_rejection_count += 1;
+                        } else {
+                            let outcome = runtime
+                                .block_on(qualify_production_metadata_mutation(
+                                    packaged,
+                                    &track_metadata,
+                                    &album_metadata,
+                                    &metadata_runner,
+                                    &CancellationToken::new(),
+                                ))
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "production metadata mutation failed for {}: {error}",
+                                        case_root.display()
+                                    )
+                                });
+                            let expected_mutator = match target {
+                                ResolvedOutputTarget::FlacNative => ToolBinary::Metaflac,
+                                ResolvedOutputTarget::WavPackNative => ToolBinary::Wvtag,
+                                ResolvedOutputTarget::WavRiff
+                                | ResolvedOutputTarget::WavRf64
+                                | ResolvedOutputTarget::AiffNative
+                                | ResolvedOutputTarget::AlacM4a => ToolBinary::Ffmpeg,
+                                ResolvedOutputTarget::WavW64 => unreachable!(),
+                                // The qualification loop iterates only the
+                                // seven enabled Reference targets above.
+                                other => unreachable!(
+                                    "non-Reference target {other:?} in metadata mutator qualification"
+                                ),
+                            };
+                            assert_eq!(outcome.primary_mutator, Some(expected_mutator));
+                            *production_primary_mutator_case_counts
+                                .entry(expected_mutator.canonical_name().to_string())
+                                .or_default() += 1;
+                            if target == ResolvedOutputTarget::AlacM4a {
+                                assert!(outcome.m4a_freeform_mutator_applied);
+                                production_m4a_freeform_case_count += 1;
+                            } else {
+                                assert!(!outcome.m4a_freeform_mutator_applied);
+                            }
+
+                            assert_exact_package_probe(
+                                &ffprobe,
+                                packaged,
+                                target_key(target),
+                                depth_key,
+                                sample_rate_hz,
+                                channels,
+                            );
+                            let post_metadata_authority =
+                                post_metadata_decode_authority(target, summary.final_pcm);
+                            record_decode_authority(
+                                &mut route_counts,
+                                &mut encoding_counts,
+                                "post_metadata",
+                                post_metadata_authority,
+                            );
+                            let mut post_metadata_summary = summary.clone();
+                            post_metadata_summary.delivered_path = packaged.clone();
+                            let post_metadata_carrier = post_metadata_summary
+                                .bind_decoded_carrier(
+                                    ReferenceDecodedCarrierSelector::PostMetadataOutput,
+                                    packaged,
+                                )
+                                .expect("qualified production post-metadata carrier binding");
+                            assert_eq!(
+                                post_metadata_carrier.authority(),
+                                post_metadata_authority
+                            );
+                            let post_metadata_hash =
+                                decoded_sample_hash(&post_metadata_carrier, &sox, &ffmpeg);
+                            assert_eq!(
+                                post_metadata_hash,
+                                qpcm_hash,
+                                "production metadata mutation changed decoded samples for {}",
+                                case_root.display()
+                            );
+                            post_metadata_identity_comparison_count += 1;
                         }
-                        post_metadata_identity_comparison_count += 1;
-                        let generated = BTreeSet::from([
+                        let mut generated = BTreeSet::from([
                             summary.r64_path.clone(),
                             summary.qpcm_path.clone(),
                             summary.packaged_path.clone(),
-                            tagged,
                         ]);
                         for path in generated {
                             if path.exists() {
@@ -3427,7 +3840,18 @@ fn qualify_lossless_package_cells(
     assert_eq!(case_count, 480);
     assert_eq!(terminal_bound_cells.len(), 60);
     assert_eq!(package_identity_comparison_count, 480);
-    assert_eq!(post_metadata_identity_comparison_count, 480);
+    assert_eq!(post_metadata_identity_comparison_count, 420);
+    assert_eq!(w64_planner_entry_rejection_count, 60);
+    assert_eq!(w64_metadata_entry_rejection_count, 60);
+    assert_eq!(
+        production_primary_mutator_case_counts,
+        BTreeMap::from([
+            ("ffmpeg".to_string(), 160),
+            ("metaflac".to_string(), 180),
+            ("wvtag".to_string(), 80),
+        ])
+    );
+    assert_eq!(production_m4a_freeform_case_count, 20);
     assert_eq!(independent_float64_riff_rf64_case_count, 40);
     assert_eq!(
         terminal_route_counts,
@@ -3442,8 +3866,7 @@ fn qualify_lossless_package_cells(
         BTreeMap::from([
             ("packaged:ffmpeg_direct".to_string(), 460),
             ("packaged:sox_f64le_raw_stream".to_string(), 20),
-            ("post_metadata:ffmpeg_direct".to_string(), 460),
-            ("post_metadata:sox_f64le_raw_stream".to_string(), 20),
+            ("post_metadata:ffmpeg_direct".to_string(), 420),
             ("qpcm:ffmpeg_direct".to_string(), 420),
             ("qpcm:sox_f64le_raw_stream".to_string(), 60),
         ])
@@ -3454,9 +3877,9 @@ fn qualify_lossless_package_cells(
             ("packaged:float32_le".to_string(), 60),
             ("packaged:float64_le".to_string(), 60),
             ("packaged:int24_le".to_string(), 360),
-            ("post_metadata:float32_le".to_string(), 60),
-            ("post_metadata:float64_le".to_string(), 60),
-            ("post_metadata:int24_le".to_string(), 360),
+            ("post_metadata:float32_le".to_string(), 40),
+            ("post_metadata:float64_le".to_string(), 40),
+            ("post_metadata:int24_le".to_string(), 340),
             ("qpcm:float32_le".to_string(), 60),
             ("qpcm:float64_le".to_string(), 60),
             ("qpcm:int24_le".to_string(), 360),
@@ -3473,7 +3896,7 @@ fn qualify_lossless_package_cells(
         terminal_bound_case_count: terminal_bound_cells.len(),
         terminal_observed_max_error_by_depth,
         sample_identity_oracle: serde_json::json!({
-            "schema": "tonepoet-reference-sample-identity-oracle/v2",
+            "schema": "tonepoet-reference-sample-identity-oracle/v4",
             "status": "passed",
             "route_authority": "typed_plan_carrier_path_role_target_depth_v2",
             "hash_format": REFERENCE_SAMPLE_HASH_FORMAT,
@@ -3487,6 +3910,29 @@ fn qualify_lossless_package_cells(
             "measured_terminal_realization_route_case_counts": terminal_route_counts,
             "package_identity_comparison_count": package_identity_comparison_count,
             "post_metadata_identity_comparison_count": post_metadata_identity_comparison_count,
+            "production_metadata_mutation": {
+                "schema": "tonepoet-reference-production-metadata-mutation/v1",
+                "entry_point": "tonepoet::convert::pipeline::qualify_production_metadata_mutation",
+                "shared_production_implementation": "apply_production_metadata_to_file",
+                "authoritative_tag_source": "authoritative_metadata_tags",
+                "qualification_scope": "authoritative_tag_mutation_without_artwork_or_replaygain",
+                "environment_policy": "clear_and_set",
+                "environment": {"LC_ALL": "C"},
+                "admitted_cell_count": post_metadata_identity_comparison_count,
+                "primary_mutator_case_counts": production_primary_mutator_case_counts,
+                "m4a_atomicparsley_freeform_case_count": production_m4a_freeform_case_count,
+                "post_mutation_sample_identity_count": post_metadata_identity_comparison_count,
+                "post_mutation_container_contract_rechecked": true,
+                "rf64_preservation": "source_magic_RF64_requires_ffmpeg_-rf64_always",
+                "w64_rejection": {
+                    "planner_entry_point": "plan_request_for_track",
+                    "planner_case_count": w64_planner_entry_rejection_count,
+                    "metadata_entry_point": "qualify_production_metadata_mutation",
+                    "metadata_case_count": w64_metadata_entry_rejection_count,
+                    "code": "DSD-REF-P0-024"
+                }
+            },
+            "metadata_alignment_probes": alignment_probes,
             "independent_float64_riff_rf64_case_count": independent_float64_riff_rf64_case_count,
             "forbidden_float64_w64_direct_route_regression": forbidden_route_regression,
             "oracle_independence":
@@ -4993,6 +5439,9 @@ fn assert_planned_w64_bridge(
 fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
     let sox = required_tool(SOX_ENV);
     let ffmpeg = required_tool(FFMPEG_ENV);
+    let metaflac = required_tool(METAFLAC_ENV);
+    let wvtag = required_tool(WVTAG_ENV);
+    let atomic_parsley = required_tool(ATOMIC_PARSLEY_ENV);
     let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
 
     let sox_version = combined(&run(&sox, &["--version".to_string()]));
@@ -5024,24 +5473,47 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
     ));
     assert!(loudnorm.contains("print_format"));
 
+    let metaflac_version = combined(&run(&metaflac, &["--version".to_string()]));
+    assert!(
+        metaflac_version.to_ascii_lowercase().contains("metaflac"),
+        "unexpected metaflac version response: {metaflac_version}"
+    );
+    let wvtag_version = combined(&run(&wvtag, &["--version".to_string()]));
+    assert!(
+        wvtag_version.to_ascii_lowercase().contains("wvtag"),
+        "unexpected wvtag version response: {wvtag_version}"
+    );
+    // AtomicParsley reports its version banner when invoked without arguments.
+    let atomic_parsley_version = combined(&run(&atomic_parsley, &[]));
+    let atomic_parsley_reported_version = atomic_parsley_version
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.to_ascii_lowercase()
+                .contains("atomicparsley version")
+        })
+        .unwrap_or_else(|| {
+            panic!("unexpected AtomicParsley version response: {atomic_parsley_version}")
+        });
+
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v8 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v11 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -5056,7 +5528,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v8 policy status: {other:?}"),
+        other => panic!("unexpected v11 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
     assert_eq!(
@@ -5229,6 +5701,12 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
         .expect("qualified package must expose the exact SoX-ng store path");
     let ffmpeg_store = std::env::var("TONEPOET_REFERENCE_FFMPEG_STORE_PATH")
         .expect("qualified package must expose the exact FFmpeg store path");
+    let metaflac_store = std::env::var(METAFLAC_STORE_ENV)
+        .expect("qualified package must expose the exact metaflac store path");
+    let wvtag_store = std::env::var(WVTAG_STORE_ENV)
+        .expect("qualified package must expose the exact wvtag store path");
+    let atomic_parsley_store = std::env::var(ATOMIC_PARSLEY_STORE_ENV)
+        .expect("qualified package must expose the exact AtomicParsley store path");
     assert_eq!(
         fs::canonicalize(Path::new(&sox_store).join("bin/sox"))
             .expect("qualified SoX-ng store must contain bin/sox"),
@@ -5246,6 +5724,24 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
             .expect("qualified FFmpeg store must contain bin/ffprobe"),
         ffprobe,
         "FFprobe does not belong to the qualified FFmpeg store"
+    );
+    assert_eq!(
+        fs::canonicalize(Path::new(&metaflac_store).join("bin/metaflac"))
+            .expect("qualified metaflac store must contain bin/metaflac"),
+        metaflac,
+        "metaflac activation path does not belong to the compiled qualification store"
+    );
+    assert_eq!(
+        fs::canonicalize(Path::new(&wvtag_store).join("bin/wvtag"))
+            .expect("qualified wvtag store must contain bin/wvtag"),
+        wvtag,
+        "wvtag activation path does not belong to the compiled qualification store"
+    );
+    assert_eq!(
+        fs::canonicalize(Path::new(&atomic_parsley_store).join("bin/AtomicParsley"))
+            .expect("qualified AtomicParsley store must contain bin/AtomicParsley"),
+        atomic_parsley,
+        "AtomicParsley activation path does not belong to the compiled qualification store"
     );
     serde_json::json!({
         "sox_ng": {
@@ -5265,6 +5761,26 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 "canonical_path": ffprobe.display().to_string(),
                 "executable_sha256": sha256_hex(&fs::read(&ffprobe).expect("read qualified FFprobe executable")),
                 "reported_version": ffprobe_first,
+            },
+        },
+        "production_metadata_mutators": {
+            "metaflac": {
+                "canonical_path": metaflac.display().to_string(),
+                "store_path": metaflac_store,
+                "executable_sha256": sha256_hex(&fs::read(&metaflac).expect("read qualified metaflac executable")),
+                "reported_version": first_nonempty_line(&metaflac_version),
+            },
+            "wvtag": {
+                "canonical_path": wvtag.display().to_string(),
+                "store_path": wvtag_store,
+                "executable_sha256": sha256_hex(&fs::read(&wvtag).expect("read qualified wvtag executable")),
+                "reported_version": first_nonempty_line(&wvtag_version),
+            },
+            "AtomicParsley": {
+                "canonical_path": atomic_parsley.display().to_string(),
+                "store_path": atomic_parsley_store,
+                "executable_sha256": sha256_hex(&fs::read(&atomic_parsley).expect("read qualified AtomicParsley executable")),
+                "reported_version": atomic_parsley_reported_version,
             },
         },
         "platform": {
@@ -5352,7 +5868,7 @@ fn complete_p0_reference_qualification_report() {
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -5376,12 +5892,25 @@ fn complete_p0_reference_qualification_report() {
         .filter(|cell| cell["result"] == "supported")
         .count();
     let rejected_target_depth_cells = target_depth_cells.len() - supported_target_depth_cells;
+    let production_metadata_mutation_evidence =
+        sample_identity_oracle["production_metadata_mutation"].clone();
     let report = serde_json::json!({
-        "schema_version": 8,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY,
+        "schema_version": 11,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V11_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
+        "runtime_metadata_mutator_binding": {
+            "schema": "tonepoet-reference-runtime-metadata-mutator-binding/v1",
+            "status": "passed",
+            "certified_identity_source": "toolchain.production_metadata_mutators",
+            "compiled_store_binding": "required_for_metaflac_wvtag_atomicparsley",
+            "activation_path_policy": "must_equal_compiled_store_and_certified_canonical_path",
+            "runner_resolution_policy": "resolved_canonical_path_must_equal_certified_path",
+            "execution_authority": "exact_canonical_path_plus_executable_sha256",
+            "pre_mutation_reverification": "path_sha256_version_closure",
+            "per_output_authority": "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
+        },
         "default_settings_live_smoke": default_settings_live_smoke,
         "in_process_backend": qualification["in_process"].clone(),
         "subprocess_environment": qualification["subprocess_environment"].clone(),
@@ -5462,9 +5991,9 @@ fn complete_p0_reference_qualification_report() {
             "flac_compression_levels": [0,1,2,3,4,5,6,7,8],
             "wavpack_compression_levels": [0,1,2,3],
             "wavpack_int24_required_args": ["-bits_per_raw_sample","24"],
-            "package_stream_copy_metadata_sample_identity": "passed",
-            "production_metadata_mutator_qualification": "not claimed; production retains mandatory post-mutation decoded-sample verification",
-            "command_authority": "exact PlannedExecutionStep vectors from plan_reference_dsd",
+            "container_level_post_mutation_sample_identity": "passed_for_420_admitted_non_w64_cells",
+            "production_metadata_mutation_qualification": production_metadata_mutation_evidence,
+            "command_authority": "exact PlannedExecutionStep vectors from plan_reference_dsd plus the shared production per-file metadata implementation",
         },
         "qualified_cell_contract": {
             "supported_profile_cells": supported_profile_cells,

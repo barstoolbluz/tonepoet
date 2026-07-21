@@ -255,6 +255,13 @@ pub fn plan_request_for_track(
     } else {
         None
     };
+    if request.stages.metadata == StageRequirement::Enabled {
+        if let Some(reason) = resolved_output_target
+            .and_then(tonepoet_pipeline::reference_metadata_mutation_rejection)
+        {
+            return Err(ConvertError::Backend(reason.to_string()));
+        }
+    }
     let reference_programme_scope = reference_programme_scope(request, track);
 
     let planned_riff_non_audio_upper_bound_bytes = planned_riff_non_audio_upper_bound(
@@ -2128,6 +2135,57 @@ mod tests {
             tonepoet_pipeline::plan_topology(&planned)
                 .expect("ordinary staged DSD-to-DSF topology must build");
         }
+    }
+
+    #[test]
+    fn reference_w64_metadata_is_rejected_before_conversion_planning() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        write_minimal_dsf(&input);
+        let output = temp.path().join("out.w64");
+        let mut req = request(temp.path());
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.target_format = PlannerFormat::Wav;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        req.container_extension = Some("w64".to_string());
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let rejected_work = temp.path().join("work-rejected");
+        let error = plan_request_for_track(
+            &req,
+            &track,
+            &input,
+            &output,
+            rejected_work.clone(),
+        )
+        .expect_err("Reference W64 metadata mutation must fail before conversion");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "backend encode failed: {}",
+                tonepoet_pipeline::reference_error_text(
+                    tonepoet_pipeline::ReferenceErrorCode::W64MetadataMutationUnqualified,
+                )
+            )
+        );
+        assert!(!rejected_work.exists(), "rejection must not create a work tree");
+        assert!(!output.exists(), "rejection must not create an output carrier");
+
+        req.stages.metadata = StageRequirement::Disabled;
+        let planned = plan_request_for_track(
+            &req,
+            &track,
+            &input,
+            &output,
+            temp.path().join("work-enabled"),
+        )
+        .expect("W64 audio delivery remains qualified when metadata mutation is disabled");
+        assert_eq!(
+            planned.resolved_output_target,
+            Some(tonepoet_pipeline::ResolvedOutputTarget::WavW64)
+        );
     }
 
     #[test]

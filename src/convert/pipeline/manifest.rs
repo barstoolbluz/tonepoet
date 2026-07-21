@@ -692,11 +692,17 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 | DsdReferencePolicyVersion::SoxNg14801V6
                                 | DsdReferencePolicyVersion::SoxNg14801V7
                                 | DsdReferencePolicyVersion::SoxNg14801V8
+                                | DsdReferencePolicyVersion::SoxNg14801V9
+                                | DsdReferencePolicyVersion::SoxNg14801V10
+                                | DsdReferencePolicyVersion::SoxNg14801V11
                         ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32]))
                         && (!matches!(
                             policy,
                             DsdReferencePolicyVersion::SoxNg14801V7
                                 | DsdReferencePolicyVersion::SoxNg14801V8
+                                | DsdReferencePolicyVersion::SoxNg14801V9
+                                | DsdReferencePolicyVersion::SoxNg14801V10
+                                | DsdReferencePolicyVersion::SoxNg14801V11
                         )
                             || *executed_evidence_digest_v3 != Sha256Digest([0; 32])) => {}
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
@@ -709,11 +715,17 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                     | DsdReferencePolicyVersion::SoxNg14801V6
                                     | DsdReferencePolicyVersion::SoxNg14801V7
                                     | DsdReferencePolicyVersion::SoxNg14801V8
+                                    | DsdReferencePolicyVersion::SoxNg14801V9
+                                    | DsdReferencePolicyVersion::SoxNg14801V10
+                                    | DsdReferencePolicyVersion::SoxNg14801V11
                             ) {
                                 if matches!(
                                     policy,
                                     DsdReferencePolicyVersion::SoxNg14801V7
                                         | DsdReferencePolicyVersion::SoxNg14801V8
+                                        | DsdReferencePolicyVersion::SoxNg14801V9
+                                        | DsdReferencePolicyVersion::SoxNg14801V10
+                                        | DsdReferencePolicyVersion::SoxNg14801V11
                                 ) {
                                     "Reference v7+ track is missing v1, v2, or v3 executed verification authority"
                                 } else {
@@ -1172,6 +1184,24 @@ mod manifest_merge_gap_tests {
             .contains("missing v1, v2, or v3 executed verification authority"));
         assert!(reference_manifest_with_evidence(
             DsdReferencePolicyVersion::SoxNg14801V8,
+            v1,
+            v2,
+            v3,
+        )
+        .is_ok());
+
+        let error = reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V11,
+            v1,
+            v2,
+            zero,
+        )
+        .expect_err("v11 must bind the ordered verification command pipeline");
+        assert!(error
+            .to_string()
+            .contains("missing v1, v2, or v3 executed verification authority"));
+        assert!(reference_manifest_with_evidence(
+            DsdReferencePolicyVersion::SoxNg14801V11,
             v1,
             v2,
             v3,

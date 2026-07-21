@@ -285,3 +285,141 @@ Do not accept the phantom sample; do not special-case the harness to
 look away. Per the terminal directive: every enabled cell must pass by
 construction in the returned bundle, and any cell you cannot make both
 attainable and correct must be rejected with its reason.
+
+### F5 resolution (policy v9 candidate, 2026-07-20)
+
+Resolved without accepting or masking the phantom sample. The append-only
+`sox_ng_14_8_0_1_v9` candidate retains W64 audio delivery but rejects W64
+metadata mutation before conversion whenever the metadata stage is enabled.
+The metadata writer independently rejects `.w64` with the same stable
+`DSD-REF-P0-024` message before allocating a rewrite tempfile or selecting
+FFmpeg, so alternate invocation paths cannot reach the defective muxer.
+
+The commissioned gate now permanently reproduces the non-eight-aligned mono
+Int24 W64 failure (8,820 samples / 26,460 bytes becoming 8,821 samples with an
+identical prefix and one zero-valued phantom sample). It separately exercises
+an odd-byte RIFF/WAV payload (8,821 mono Int24 samples / 26,463 bytes) and
+requires byte-exact decoded-sample identity after metadata rewriting. The 480
+qualified delivery cases remain enabled; post-metadata identity is required
+for 420 non-W64 cases, and the 60 W64 metadata cases must resolve to
+`DSD-REF-P0-024` by construction.
+
+
+### F5 evidence completion (policy v10 candidate, 2026-07-20)
+
+The v9 behavior correction remains valid, but its report described a surrogate
+FFmpeg stream-copy probe as qualification of the production metadata mutator.
+The append-only `sox_ng_14_8_0_1_v10` candidate corrects that evidentiary
+overstatement without changing the 480-cell audio-delivery contract.
+
+Qualification now invokes the shared per-file implementation used by production
+`apply_metadata` for all 420 admitted non-W64 cells. It executes and reports
+160 FFmpeg primary mutations, 180 `metaflac` mutations, 80 `wvtag` mutations,
+and 20 AtomicParsley M4A freeform follow-ups. Each cell is re-probed for exact
+container identity and decoded-sample identity after mutation. The report binds
+the canonical path, executable SHA-256, and reported version of every mutator.
+The machine claim is explicitly limited to authoritative tag mutation without
+artwork embedding or ReplayGain, so the report does not imply evidence it did
+not execute. The exact discovery and mutation commands use a closed environment
+containing only `LC_ALL=C`, and the runtime validator binds that policy.
+
+All 60 W64 cells traverse both production enforcement implementations: the
+planner entry and the shared production metadata implementation. Both must
+return `DSD-REF-P0-024`; merely calling the central policy helper is no longer
+sufficient evidence.
+
+Running the exact production FFmpeg path also exposed and closed RF64 container
+drift: a source whose first four bytes are `RF64` now forces `-rf64 always` on
+the same-extension rewrite, and the qualification matrix rechecks the RF64
+container contract after metadata mutation. The runtime validator requires the
+new structured evidence and rejects the former overbroad v9 claim.
+
+### F5 runtime identity completion (policy v11 candidate, 2026-07-20)
+
+The v10 route qualification remains valid, but the captured `metaflac`,
+`wvtag`, and AtomicParsley identities were descriptive rather than an enforced
+production execution boundary. The append-only `sox_ng_14_8_0_1_v11`
+candidate closes that gap.
+
+The policy-owned package/store paths for all three mutators are now compiled
+into the production binary. Reference admission compares the report-certified
+canonical path, executable SHA-256, and normalized version with the packaged
+activation path, compiled store executable, and the path the active runner
+would resolve. Any `ProcessorConfig.tool_paths` override or ambient `PATH`
+substitution that resolves a different executable fails before conversion.
+
+Immediately before metadata mutation, production rechecks the runner path,
+activation path, compiled path, executable SHA-256, normalized version, and
+closure digest. Every actual FFmpeg, `metaflac`, `wvtag`, and AtomicParsley
+metadata command then executes through exact canonical-path-plus-SHA-256
+authority rather than a second unconstrained lookup. The certified mutator
+closure is serialized in each Reference track's toolchain evidence and included
+in `execution_fingerprint_v1`, completing the per-output authority chain.
+
+The schema-v11 machine report contains a required
+`runtime_metadata_mutator_binding` object. Runtime validation rejects missing or
+altered binding fields and non-canonical mutator identity objects, including a
+store path that differs from the compiled package. The qualification source pins
+all mutator executables to their corresponding store paths. Unit regressions
+cover fail-closed alternate runners, exact bound execution, configured-path
+rejection, executable-digest rejection, and per-output fingerprint sensitivity
+to every mutator identity component.
+
+No metadata scope was added: the v10 authoritative-tag route matrix and counts
+remain unchanged, artwork and ReplayGain remain excluded from the F5 claim, and
+W64 metadata mutation remains rejected under `DSD-REF-P0-024`.
+
+
+## F6 (v11 round) — sox_ng's WAV writer wraps >4 GiB sizes on unseekable output instead of emitting streaming sentinels
+
+Your v9/v10/v11 F5 resolution is applied and verified: suite 4,598/0,
+all three deterministic checkers green, live smoke passes, zero cold
+warnings after documenting the new fingerprint fields, and the W64
+rejection + production-mutator-route qualification passes. Apply-side
+kept: a catch-all `unreachable!` arm for the widened target enum in the
+mutator match.
+
+The one remaining failure is the >4 GiB streaming transport proof:
+
+```text
+tests/dsd_reference_qualification.rs:2381
+SoX-ng did not emit the frozen large streaming-WAV size sentinels:
+riff=0x0000003a, data=0x00000008
+```
+
+Isolated with a minimal fixture (sparse W64, f64 mono 48 kHz, data
+chunk = 4 GiB + 8 bytes):
+
+- sox_ng READS the file correctly: 536,870,913 samples — the W64
+  reader is not implicated;
+- sox_ng WRITES the streamed WAV header with sizes wrapped modulo
+  2^32 (`RIFF 3a 00 00 00`, data size 8) instead of the streaming
+  sentinels your contract froze. (4 GiB + 8) mod 2^32 = 8 — exact.
+
+So the pinned SoX-ng 14.8.0.1 WAV writer truncates 64-bit sizes to
+32 bits when the output is unseekable and the payload exceeds 4 GiB.
+This affects the streamed analyzer/packaging routes only for carriers
+past 4 GiB (long high-rate float programmes; the Round-2 continuous
+albums are squarely in this class).
+
+Resolution shapes, your choice with rationale under the append-only
+rules:
+
+1. Re-pin the streamed-WAV contract IF you can empirically qualify
+   that the pinned FFmpeg consumer reads `pipe:0` to EOF and ignores
+   the declared RIFF/data sizes for wrapped >4 GiB streams — with a
+   permanent sparse-carrier fixture proving sample-exact consumption
+   past the 4 GiB boundary. The sentinel check then becomes a
+   consumption-completeness check.
+2. Reject streamed cells whose carrier exceeds the provable bound
+   (record a 4 GiB streamed-carrier capacity cap with its reason and a
+   user-facing error), keeping smaller carriers qualified.
+3. Note for the product owner (outside your scope): the defect lives
+   in the user-owned sox_ng fork; an upstream one-line-class fix
+   (emit 0xFFFFFFFF sentinels for unseekable >4 GiB output) plus a new
+   toolchain pin and closure re-attestation would lift any cap later
+   under a new policy ID. Design so that this later lift is a pure
+   policy addition.
+
+Do not accept a wrapped header as a sentinel; do not soften the
+transport proof.

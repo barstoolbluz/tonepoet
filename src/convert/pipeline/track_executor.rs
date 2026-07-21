@@ -35,6 +35,7 @@ use tonepoet_pipeline::fingerprint::{
     conversion_behavior_fingerprint_v1, execution_fingerprint_v1,
     reference_source_probe_digest_v1, settings_snapshot_fingerprint_v2,
     BehaviorFingerprintV1, ExecutionFingerprintV1, ReferenceExecutionIdentityInput,
+    ReferenceMetadataMutatorIdentityInput, ReferenceMetadataMutatorToolchainInput,
     SemanticPlanHashV1, SettingsSnapshotFingerprintV2,
 };
 
@@ -49,8 +50,8 @@ use super::progress::{
     StreamSource, StreamingHeartbeat,
 };
 use super::tool::{
-    parse_tool_version_output, CommandRecord, EnvVar, ProcessExit, ToolBinary, ToolCommand,
-    ToolOutput, ToolRunner,
+    parse_tool_version_output, BoundToolExecutable, CommandRecord, EnvVar, ProcessExit,
+    ToolBinary, ToolCommand, ToolOutput, ToolRunner,
 };
 use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack};
 
@@ -66,10 +67,48 @@ pub struct ReferenceToolIdentity {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceMetadataMutatorIdentity {
+    pub canonical_path: PathBuf,
+    pub executable_sha256: Sha256Digest,
+    pub reported_version: String,
+    pub version_probe_command: CommandRecord,
+    pub closure_digest: Sha256Digest,
+}
+
+impl ReferenceMetadataMutatorIdentity {
+    pub(crate) fn bound_executable(&self) -> BoundToolExecutable {
+        BoundToolExecutable {
+            canonical_path: self.canonical_path.clone(),
+            executable_sha256: self.executable_sha256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceMetadataMutatorToolchain {
+    pub metaflac: ReferenceMetadataMutatorIdentity,
+    pub wvtag: ReferenceMetadataMutatorIdentity,
+    pub atomic_parsley: ReferenceMetadataMutatorIdentity,
+}
+
+impl ReferenceMetadataMutatorToolchain {
+    pub(crate) fn identity(&self, binary: ToolBinary) -> Option<&ReferenceMetadataMutatorIdentity> {
+        match binary {
+            ToolBinary::Metaflac => Some(&self.metaflac),
+            ToolBinary::Wvtag => Some(&self.wvtag),
+            ToolBinary::AtomicParsley => Some(&self.atomic_parsley),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceToolchainEvidence {
     pub qualification_manifest_digest: Sha256Digest,
     pub sox_ng: ReferenceToolIdentity,
     pub ffmpeg: ReferenceToolIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_mutators: Option<ReferenceMetadataMutatorToolchain>,
     pub sacd_rs_build_identity: String,
     pub dst_fixture_digest: Sha256Digest,
     pub platform_abi_digest: Sha256Digest,
@@ -93,6 +132,21 @@ pub(crate) fn reference_execution_identity_input(
         ffmpeg_version: toolchain.ffmpeg.reported_version.clone(),
         ffmpeg_closure_digest: toolchain.ffmpeg.closure_digest,
         ffmpeg_behavior_probe_digest: toolchain.ffmpeg.behavior_probe_digest,
+        metadata_mutators: toolchain.metadata_mutators.as_ref().map(|mutators| {
+            let convert = |identity: &ReferenceMetadataMutatorIdentity| {
+                ReferenceMetadataMutatorIdentityInput {
+                    canonical_path: identity.canonical_path.display().to_string(),
+                    executable_sha256: identity.executable_sha256,
+                    reported_version: identity.reported_version.clone(),
+                    closure_digest: identity.closure_digest,
+                }
+            };
+            ReferenceMetadataMutatorToolchainInput {
+                metaflac: convert(&mutators.metaflac),
+                wvtag: convert(&mutators.wvtag),
+                atomic_parsley: convert(&mutators.atomic_parsley),
+            }
+        }),
         sacd_rs_build_identity: toolchain.sacd_rs_build_identity.clone(),
         dst_fixture_digest: toolchain.dst_fixture_digest,
         reporting_uncertainty: toolchain.reporting_uncertainty,
@@ -364,7 +418,13 @@ pub(crate) async fn preflight_reference_rerun_authority(
     let Some(summary) = plan.reference else {
         return Ok(None);
     };
-    let toolchain = attest_reference_toolchain(runner, cancel, summary.front_end).await?;
+    let toolchain = attest_reference_toolchain(
+        runner,
+        cancel,
+        summary.front_end,
+        request.stages.metadata == super::types::StageRequirement::Enabled,
+    )
+    .await?;
     let original_authority = match &track.source_ref {
         super::types::TrackSourceRef::SacdTrack { iso, .. } => iso.as_path(),
         _ => presented_input.as_path(),
@@ -481,7 +541,15 @@ pub async fn execute_planned_track_conversion(
     let admitted_plan = plan_conversion(&plan_request)
         .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
     let reference_toolchain = if let Some(summary) = admitted_plan.reference.as_ref() {
-        Some(attest_reference_toolchain(runner, cancel, summary.front_end).await?)
+        Some(
+            attest_reference_toolchain(
+                runner,
+                cancel,
+                summary.front_end,
+                request.stages.metadata == super::types::StageRequirement::Enabled,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -823,6 +891,50 @@ struct EmbeddedReferenceSampleIdentity {
     oracle_independence: String,
     environment_policy: String,
     environment: std::collections::BTreeMap<String, String>,
+    metadata_mutation: EmbeddedReferenceMetadataMutation,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReferenceMetadataMutation {
+    w64: String,
+    production_entry_point: String,
+    shared_production_implementation: String,
+    authoritative_tag_source: String,
+    qualification_scope: String,
+    environment_policy: String,
+    environment: BTreeMap<String, String>,
+    qualified_post_metadata_targets: Vec<String>,
+    admitted_cell_count: u64,
+    primary_mutator_case_counts: EmbeddedProductionMetadataMutatorCounts,
+    m4a_atomicparsley_freeform_case_count: u64,
+    w64_rejection: EmbeddedProductionW64RejectionEvidence,
+    post_mutation_container_contract_rechecked: bool,
+    rf64_preservation: String,
+    w64_non_8_aligned_int24_mono_probe: String,
+    riff_odd_byte_int24_mono_probe: String,
+    runtime_identity_binding: String,
+    execution_authority: String,
+    pre_mutation_reverification: String,
+    per_output_authority: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedProductionMetadataMutatorCounts {
+    ffmpeg: u64,
+    metaflac: u64,
+    wvtag: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedProductionW64RejectionEvidence {
+    planner_entry_point: String,
+    planner_case_count: u64,
+    metadata_entry_point: String,
+    metadata_case_count: u64,
+    code: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1139,8 +1251,8 @@ fn validate_terminal_effects_certification(
         "flac_compression_levels",
         "wavpack_compression_levels",
         "wavpack_int24_required_args",
-        "package_stream_copy_metadata_sample_identity",
-        "production_metadata_mutator_qualification",
+        "container_level_post_mutation_sample_identity",
+        "production_metadata_mutation_qualification",
         "command_authority",
     ]);
     let actual_package_fields = packages
@@ -1346,15 +1458,41 @@ fn validate_terminal_effects_certification(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct CertifiedMetadataMutatorIdentity {
+    store_path: PathBuf,
+    canonical_path: PathBuf,
+    executable_sha256: Sha256Digest,
+    reported_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct CertifiedMetadataMutatorToolchain {
+    metaflac: CertifiedMetadataMutatorIdentity,
+    wvtag: CertifiedMetadataMutatorIdentity,
+    atomic_parsley: CertifiedMetadataMutatorIdentity,
+}
+
+impl CertifiedMetadataMutatorToolchain {
+    fn identity(&self, binary: ToolBinary) -> Option<&CertifiedMetadataMutatorIdentity> {
+        match binary {
+            ToolBinary::Metaflac => Some(&self.metaflac),
+            ToolBinary::Wvtag => Some(&self.wvtag),
+            ToolBinary::AtomicParsley => Some(&self.atomic_parsley),
+            _ => None,
+        }
+    }
+}
+
 fn validate_embedded_release_certification(
     manifest: &EmbeddedReferenceQualification,
-) -> Result<(), TrackExecutionError> {
+) -> Result<CertifiedMetadataMutatorToolchain, TrackExecutionError> {
     let certification = &manifest.release_certification;
     if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
         || certification.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_certification.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_certification.json"
         || certification.candidate_manifest_path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_candidate.json"
     {
         return Err(reference_toolchain_error(
             "the embedded release-certification descriptor is not canonical",
@@ -1362,7 +1500,7 @@ fn validate_embedded_release_certification(
     }
     let report_sha256 = certification.report_sha256.as_deref().ok_or_else(|| {
         reference_toolchain_error(
-            "the embedded v8 policy has not bound a release-certification report",
+            "the embedded v11 policy has not bound a release-certification report",
         )
     })?;
     let candidate_manifest_sha256 = certification
@@ -1370,20 +1508,20 @@ fn validate_embedded_release_certification(
         .as_deref()
         .ok_or_else(|| {
             reference_toolchain_error(
-                "the embedded v8 policy has not bound its qualified candidate manifest",
+                "the embedded v11 policy has not bound its qualified candidate manifest",
             )
         })?;
     let current_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
     ));
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_certification.json"
     ));
     let candidate_manifest_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_candidate.json"
     ));
     let parse_digest = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -1407,13 +1545,13 @@ fn validate_embedded_release_certification(
     let mut normalized_current: serde_json::Value =
         serde_json::from_slice(current_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded current v8 manifest is invalid JSON: {error}"
+                "the embedded current v11 manifest is invalid JSON: {error}"
             ))
         })?;
     let candidate_value: serde_json::Value =
         serde_json::from_slice(candidate_manifest_bytes).map_err(|error| {
             reference_toolchain_error(format!(
-                "the embedded preserved v8 candidate is invalid JSON: {error}"
+                "the embedded preserved v11 candidate is invalid JSON: {error}"
             ))
         })?;
     if candidate_value.get("status").and_then(serde_json::Value::as_str)
@@ -1426,7 +1564,7 @@ fn validate_embedded_release_certification(
             .is_none_or(|value| !value.is_null())
     {
         return Err(reference_toolchain_error(
-            "the preserved v8 candidate is not the canonical unpromoted policy snapshot",
+            "the preserved v11 candidate is not the canonical unpromoted policy snapshot",
         ));
     }
     normalized_current["status"] =
@@ -1437,7 +1575,7 @@ fn validate_embedded_release_certification(
         serde_json::Value::Null;
     if normalized_current != candidate_value {
         return Err(reference_toolchain_error(
-            "the promoted v8 manifest differs from its qualified candidate outside the permitted certification fields",
+            "the promoted v11 manifest differs from its qualified candidate outside the permitted certification fields",
         ));
     }
     let report: serde_json::Value = serde_json::from_slice(report_bytes).map_err(|error| {
@@ -1445,9 +1583,9 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report is invalid JSON: {error}"
         ))
     })?;
-    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(8)
+    if report.get("schema_version").and_then(serde_json::Value::as_u64) != Some(11)
         || report.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V11_KEY)
         || report.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || report.get("outcome").and_then(serde_json::Value::as_str) != Some("pass")
         || report
@@ -1456,11 +1594,12 @@ fn validate_embedded_release_certification(
             != Some(candidate_manifest_sha256)
     {
         return Err(reference_toolchain_error(
-            "the embedded release-certification report does not bind the qualified v8 candidate",
+            "the embedded release-certification report does not bind the qualified v11 candidate",
         ));
     }
     for required in [
         "toolchain",
+        "runtime_metadata_mutator_binding",
         "default_settings_live_smoke",
         "subprocess_environment",
         "qualification_supervision",
@@ -1621,6 +1760,146 @@ fn validate_embedded_release_certification(
         return Err(reference_toolchain_error(
             "the embedded release-certification report has incomplete D1 profile evidence",
         ));
+    }
+    let production_mutators = toolchain
+        .and_then(|value| value.get("production_metadata_mutators"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report omits production metadata mutator identities",
+            )
+        })?;
+    let expected_mutators = BTreeSet::from(["AtomicParsley", "metaflac", "wvtag"]);
+    if production_mutators
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_mutators
+    {
+        return Err(reference_toolchain_error(
+            "the embedded release-certification report has a non-canonical production metadata mutator set",
+        ));
+    }
+    let mut certified_mutators = BTreeMap::new();
+    for name in ["metaflac", "wvtag", "AtomicParsley"] {
+        let identity = production_mutators
+            .get(name)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "the embedded release-certification report omits {name} identity evidence",
+                ))
+            })?;
+        let expected_identity_fields =
+            BTreeSet::from(["canonical_path", "store_path", "executable_sha256", "reported_version"]);
+        if identity
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected_identity_fields
+        {
+            return Err(reference_toolchain_error(format!(
+                "the embedded release-certification report has a non-canonical identity object for {name}",
+            )));
+        }
+        let store_path = identity
+            .get("store_path")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| Path::new(value).is_absolute())
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "the embedded release-certification report has no absolute store path for {name}",
+                ))
+            })?;
+        let canonical_path = identity
+            .get("canonical_path")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| Path::new(value).is_absolute())
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "the embedded release-certification report has no absolute canonical path for {name}",
+                ))
+            })?;
+        let executable_sha256 = identity
+            .get("executable_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "the embedded release-certification report has no executable digest for {name}",
+                ))
+            })?;
+        let executable_sha256 = Sha256Digest::from_hex(executable_sha256).map_err(|error| {
+            reference_toolchain_error(format!(
+                "the embedded release-certification report has an invalid executable digest for {name}: {error}",
+            ))
+        })?;
+        let reported_version = identity
+            .get("reported_version")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                reference_toolchain_error(format!(
+                    "the embedded release-certification report has no reported version for {name}",
+                ))
+            })?;
+        certified_mutators.insert(
+            name,
+            CertifiedMetadataMutatorIdentity {
+                store_path: PathBuf::from(store_path),
+                canonical_path: PathBuf::from(canonical_path),
+                executable_sha256,
+                reported_version: reported_version.to_string(),
+            },
+        );
+    }
+    let certified_mutators = CertifiedMetadataMutatorToolchain {
+        metaflac: certified_mutators
+            .remove("metaflac")
+            .expect("validated metaflac certification"),
+        wvtag: certified_mutators
+            .remove("wvtag")
+            .expect("validated wvtag certification"),
+        atomic_parsley: certified_mutators
+            .remove("AtomicParsley")
+            .expect("validated AtomicParsley certification"),
+    };
+    let runtime_binding = report
+        .get("runtime_metadata_mutator_binding")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            reference_toolchain_error(
+                "the embedded release-certification report omits runtime metadata-mutator binding evidence",
+            )
+        })?;
+    for (field, expected) in [
+        ("schema", "tonepoet-reference-runtime-metadata-mutator-binding/v1"),
+        ("status", "passed"),
+        ("certified_identity_source", "toolchain.production_metadata_mutators"),
+        ("compiled_store_binding", "required_for_metaflac_wvtag_atomicparsley"),
+        (
+            "activation_path_policy",
+            "must_equal_compiled_store_and_certified_canonical_path",
+        ),
+        ("runner_resolution_policy", "resolved_canonical_path_must_equal_certified_path"),
+        (
+            "execution_authority",
+            "exact_canonical_path_plus_executable_sha256",
+        ),
+        ("pre_mutation_reverification", "path_sha256_version_closure"),
+        (
+            "per_output_authority",
+            "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1",
+        ),
+    ] {
+        if runtime_binding
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            != Some(expected)
+        {
+            return Err(reference_toolchain_error(format!(
+                "the embedded release-certification runtime metadata-mutator binding has non-canonical {field}",
+            )));
+        }
     }
     let carrier = report
         .get("analyzer_carrier")
@@ -2398,17 +2677,13 @@ fn validate_embedded_release_certification(
             .and_then(serde_json::Value::as_u64)
             != Some(60)
         || packages
-            .and_then(|value| value.get("package_stream_copy_metadata_sample_identity"))
+            .and_then(|value| value.get("container_level_post_mutation_sample_identity"))
             .and_then(serde_json::Value::as_str)
-            != Some("passed")
-        || packages
-            .and_then(|value| value.get("production_metadata_mutator_qualification"))
-            .and_then(serde_json::Value::as_str)
-            != Some("not claimed; production retains mandatory post-mutation decoded-sample verification")
+            != Some("passed_for_420_admitted_non_w64_cells")
         || packages
             .and_then(|value| value.get("command_authority"))
             .and_then(serde_json::Value::as_str)
-            != Some("exact PlannedExecutionStep vectors from plan_reference_dsd")
+            != Some("exact PlannedExecutionStep vectors from plan_reference_dsd plus the shared production per-file metadata implementation")
     {
         return Err(reference_toolchain_error(
             "the embedded release-certification report has incomplete package/terminal evidence",
@@ -2437,14 +2712,32 @@ fn validate_embedded_release_certification(
     let forbidden = sample_identity
         .get("forbidden_float64_w64_direct_route_regression")
         .and_then(serde_json::Value::as_object);
-    if sample_identity.len() != 13
-        || route_counts.is_none_or(|value| value.len() != 6)
+    let alignment = sample_identity
+        .get("metadata_alignment_probes")
+        .and_then(serde_json::Value::as_object);
+    let w64_alignment = alignment
+        .and_then(|value| value.get("w64_non_8_aligned_int24_mono"))
+        .and_then(serde_json::Value::as_object);
+    let riff_alignment = alignment
+        .and_then(|value| value.get("riff_odd_byte_int24_mono"))
+        .and_then(serde_json::Value::as_object);
+    let production_metadata = sample_identity
+        .get("production_metadata_mutation")
+        .and_then(serde_json::Value::as_object);
+    let production_mutator_counts = production_metadata
+        .and_then(|value| value.get("primary_mutator_case_counts"))
+        .and_then(serde_json::Value::as_object);
+    let production_w64_rejection = production_metadata
+        .and_then(|value| value.get("w64_rejection"))
+        .and_then(serde_json::Value::as_object);
+    if sample_identity.len() != 15
+        || route_counts.is_none_or(|value| value.len() != 5)
         || encoding_counts.is_none_or(|value| value.len() != 9)
         || terminal_route_counts.is_none_or(|value| value.len() != 3)
         || hash_codecs.is_none_or(|value| value.len() != 3)
         || forbidden.is_none_or(|value| value.len() != 6)
         || sample_identity.get("schema").and_then(serde_json::Value::as_str)
-            != Some("tonepoet-reference-sample-identity-oracle/v2")
+            != Some("tonepoet-reference-sample-identity-oracle/v4")
         || sample_identity.get("status").and_then(serde_json::Value::as_str)
             != Some("passed")
         || sample_identity
@@ -2471,17 +2764,16 @@ fn validate_embedded_release_certification(
         || json_object_u64(route_counts, "qpcm:sox_f64le_raw_stream") != Some(60)
         || json_object_u64(route_counts, "packaged:ffmpeg_direct") != Some(460)
         || json_object_u64(route_counts, "packaged:sox_f64le_raw_stream") != Some(20)
-        || json_object_u64(route_counts, "post_metadata:ffmpeg_direct") != Some(460)
-        || json_object_u64(route_counts, "post_metadata:sox_f64le_raw_stream") != Some(20)
+        || json_object_u64(route_counts, "post_metadata:ffmpeg_direct") != Some(420)
         || json_object_u64(encoding_counts, "qpcm:int24_le") != Some(360)
         || json_object_u64(encoding_counts, "qpcm:float32_le") != Some(60)
         || json_object_u64(encoding_counts, "qpcm:float64_le") != Some(60)
         || json_object_u64(encoding_counts, "packaged:int24_le") != Some(360)
         || json_object_u64(encoding_counts, "packaged:float32_le") != Some(60)
         || json_object_u64(encoding_counts, "packaged:float64_le") != Some(60)
-        || json_object_u64(encoding_counts, "post_metadata:int24_le") != Some(360)
-        || json_object_u64(encoding_counts, "post_metadata:float32_le") != Some(60)
-        || json_object_u64(encoding_counts, "post_metadata:float64_le") != Some(60)
+        || json_object_u64(encoding_counts, "post_metadata:int24_le") != Some(340)
+        || json_object_u64(encoding_counts, "post_metadata:float32_le") != Some(40)
+        || json_object_u64(encoding_counts, "post_metadata:float64_le") != Some(40)
         || json_object_u64(terminal_route_counts, "r64:sox_f64le_raw_stream") != Some(60)
         || json_object_u64(terminal_route_counts, "qpcm:ffmpeg_direct") != Some(40)
         || json_object_u64(terminal_route_counts, "qpcm:sox_f64le_raw_stream") != Some(20)
@@ -2492,7 +2784,126 @@ fn validate_embedded_release_certification(
         || sample_identity
             .get("post_metadata_identity_comparison_count")
             .and_then(serde_json::Value::as_u64)
-            != Some(480)
+            != Some(420)
+        || production_metadata.is_none_or(|value| value.len() != 14)
+        || production_metadata
+            .and_then(|value| value.get("schema"))
+            .and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-production-metadata-mutation/v1")
+        || production_metadata
+            .and_then(|value| value.get("entry_point"))
+            .and_then(serde_json::Value::as_str)
+            != Some("tonepoet::convert::pipeline::qualify_production_metadata_mutation")
+        || production_metadata
+            .and_then(|value| value.get("shared_production_implementation"))
+            .and_then(serde_json::Value::as_str)
+            != Some("apply_production_metadata_to_file")
+        || production_metadata
+            .and_then(|value| value.get("authoritative_tag_source"))
+            .and_then(serde_json::Value::as_str)
+            != Some("authoritative_metadata_tags")
+        || production_metadata
+            .and_then(|value| value.get("qualification_scope"))
+            .and_then(serde_json::Value::as_str)
+            != Some("authoritative_tag_mutation_without_artwork_or_replaygain")
+        || production_metadata
+            .and_then(|value| value.get("environment_policy"))
+            .and_then(serde_json::Value::as_str)
+            != Some("clear_and_set")
+        || production_metadata
+            .and_then(|value| value.get("environment"))
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|environment| {
+                environment.len() != 1
+                    || environment.get("LC_ALL").and_then(serde_json::Value::as_str)
+                        != Some("C")
+            })
+        || json_object_u64(production_metadata, "admitted_cell_count") != Some(420)
+        || production_mutator_counts.is_none_or(|value| value.len() != 3)
+        || json_object_u64(production_mutator_counts, "ffmpeg") != Some(160)
+        || json_object_u64(production_mutator_counts, "metaflac") != Some(180)
+        || json_object_u64(production_mutator_counts, "wvtag") != Some(80)
+        || json_object_u64(production_metadata, "m4a_atomicparsley_freeform_case_count")
+            != Some(20)
+        || json_object_u64(production_metadata, "post_mutation_sample_identity_count")
+            != Some(420)
+        || production_metadata
+            .and_then(|value| value.get("post_mutation_container_contract_rechecked"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || production_metadata
+            .and_then(|value| value.get("rf64_preservation"))
+            .and_then(serde_json::Value::as_str)
+            != Some("source_magic_RF64_requires_ffmpeg_-rf64_always")
+        || production_w64_rejection.is_none_or(|value| value.len() != 5)
+        || production_w64_rejection
+            .and_then(|value| value.get("planner_entry_point"))
+            .and_then(serde_json::Value::as_str)
+            != Some("plan_request_for_track")
+        || json_object_u64(production_w64_rejection, "planner_case_count") != Some(60)
+        || production_w64_rejection
+            .and_then(|value| value.get("metadata_entry_point"))
+            .and_then(serde_json::Value::as_str)
+            != Some("qualify_production_metadata_mutation")
+        || json_object_u64(production_w64_rejection, "metadata_case_count") != Some(60)
+        || production_w64_rejection
+            .and_then(|value| value.get("code"))
+            .and_then(serde_json::Value::as_str)
+            != Some("DSD-REF-P0-024")
+        || package_evidence.get("production_metadata_mutation_qualification")
+            != sample_identity.get("production_metadata_mutation")
+        || alignment.is_none_or(|value| value.len() != 4)
+        || alignment
+            .and_then(|value| value.get("schema"))
+            .and_then(serde_json::Value::as_str)
+            != Some("tonepoet-reference-metadata-alignment-probes/v1")
+        || alignment
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || w64_alignment.is_none_or(|value| value.len() != 9)
+        || json_object_u64(w64_alignment, "sample_rate_hz") != Some(88_200)
+        || json_object_u64(w64_alignment, "channels") != Some(1)
+        || json_object_u64(w64_alignment, "sample_count_before") != Some(8_820)
+        || json_object_u64(w64_alignment, "sample_count_after_ffmpeg_w64_remux") != Some(8_821)
+        || json_object_u64(w64_alignment, "data_bytes_before") != Some(26_460)
+        || w64_alignment
+            .and_then(|value| value.get("decoded_prefix_identity"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || w64_alignment
+            .and_then(|value| value.get("phantom_trailing_sample"))
+            .and_then(serde_json::Value::as_str)
+            != Some("000000")
+        || w64_alignment
+            .and_then(|value| value.get("disposition"))
+            .and_then(serde_json::Value::as_str)
+            != Some("known_muxer_defect_route_rejected")
+        || w64_alignment
+            .and_then(|value| value.get("rejection_code"))
+            .and_then(serde_json::Value::as_str)
+            != Some("DSD-REF-P0-024")
+        || riff_alignment.is_none_or(|value| value.len() != 8)
+        || json_object_u64(riff_alignment, "sample_rate_hz") != Some(88_200)
+        || json_object_u64(riff_alignment, "channels") != Some(1)
+        || json_object_u64(riff_alignment, "sample_count") != Some(8_821)
+        || json_object_u64(riff_alignment, "data_bytes") != Some(26_463)
+        || riff_alignment
+            .and_then(|value| value.get("post_metadata_sample_identity"))
+            .and_then(serde_json::Value::as_str)
+            != Some("passed")
+        || riff_alignment
+            .and_then(|value| value.get("production_entry_point"))
+            .and_then(serde_json::Value::as_str)
+            != Some("qualify_production_metadata_mutation")
+        || riff_alignment
+            .and_then(|value| value.get("production_primary_mutator"))
+            .and_then(serde_json::Value::as_str)
+            != Some("ffmpeg")
+        || riff_alignment
+            .and_then(|value| value.get("disposition"))
+            .and_then(serde_json::Value::as_str)
+            != Some("qualified")
         || sample_identity
             .get("independent_float64_riff_rf64_case_count")
             .and_then(serde_json::Value::as_u64)
@@ -2595,7 +3006,7 @@ fn validate_embedded_release_certification(
         {
             return Err(reference_toolchain_error(format!(
                 "the embedded release-certification report decode route {key} disagrees \
-                 with the compiled v8 authority",
+                 with the compiled v11 authority",
             )));
         }
     }
@@ -2621,7 +3032,7 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report disagrees with the v8 cell contract",
         ));
     }
-    Ok(())
+    Ok(certified_mutators)
 }
 
 fn validate_embedded_reference_policy_tables(
@@ -2729,14 +3140,14 @@ fn validate_embedded_reference_policy_tables(
             != "ffmpeg_direct_decode_of_float64_qpcm_w64"
     {
         return Err(reference_toolchain_error(
-            "embedded Float64 package contract disagrees with the compiled v8 policy",
+            "embedded Float64 package contract disagrees with the compiled v11 policy",
         ));
     }
     let direct_route = ReferenceDecodeMechanism::DirectFfmpeg.key();
     let streamed_route = ReferenceDecodeMechanism::SoxFloat64W64RawStream.key();
     let routes = &manifest.sample_identity.routes;
     let codecs = &manifest.sample_identity.hash_codecs;
-    if manifest.sample_identity.schema != "tonepoet-reference-sample-identity/v5"
+    if manifest.sample_identity.schema != "tonepoet-reference-sample-identity/v7"
         || manifest.sample_identity.route_authority
             != "typed_plan_carrier_path_role_target_depth_v2"
         || routes.r64_float64_w64 != streamed_route
@@ -2762,9 +3173,70 @@ fn validate_embedded_reference_policy_tables(
             != "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode"
         || manifest.sample_identity.environment_policy != "clear_and_set"
         || manifest.sample_identity.environment != expected_environment
+        || manifest.sample_identity.metadata_mutation.w64 != "error:DSD-REF-P0-024"
+        || manifest.sample_identity.metadata_mutation.production_entry_point
+            != "tonepoet::convert::pipeline::qualify_production_metadata_mutation"
+        || manifest.sample_identity.metadata_mutation.shared_production_implementation
+            != "apply_production_metadata_to_file"
+        || manifest.sample_identity.metadata_mutation.authoritative_tag_source
+            != "authoritative_metadata_tags"
+        || manifest.sample_identity.metadata_mutation.qualification_scope
+            != "authoritative_tag_mutation_without_artwork_or_replaygain"
+        || manifest.sample_identity.metadata_mutation.environment_policy != "clear_and_set"
+        || manifest.sample_identity.metadata_mutation.environment != expected_environment
+        || !manifest
+            .sample_identity
+            .metadata_mutation
+            .qualified_post_metadata_targets
+            .iter()
+            .map(String::as_str)
+            .eq([
+                "flac_native",
+                "wav_riff",
+                "wav_rf64",
+                "aiff_native",
+                "wavpack_native",
+                "alac_m4a",
+            ])
+        || manifest.sample_identity.metadata_mutation.admitted_cell_count != 420
+        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.ffmpeg != 160
+        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.metaflac != 180
+        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.wvtag != 80
+        || manifest.sample_identity.metadata_mutation.m4a_atomicparsley_freeform_case_count != 20
+        || manifest.sample_identity.metadata_mutation.w64_rejection.planner_entry_point
+            != "plan_request_for_track"
+        || manifest.sample_identity.metadata_mutation.w64_rejection.planner_case_count != 60
+        || manifest.sample_identity.metadata_mutation.w64_rejection.metadata_entry_point
+            != "qualify_production_metadata_mutation"
+        || manifest.sample_identity.metadata_mutation.w64_rejection.metadata_case_count != 60
+        || manifest.sample_identity.metadata_mutation.w64_rejection.code != "DSD-REF-P0-024"
+        || !manifest
+            .sample_identity
+            .metadata_mutation
+            .post_mutation_container_contract_rechecked
+        || manifest.sample_identity.metadata_mutation.rf64_preservation
+            != "source_magic_RF64_requires_ffmpeg_-rf64_always"
+        || manifest
+            .sample_identity
+            .metadata_mutation
+            .w64_non_8_aligned_int24_mono_probe
+            != "known_muxer_defect_phantom_sample"
+        || manifest
+            .sample_identity
+            .metadata_mutation
+            .riff_odd_byte_int24_mono_probe
+            != "qualified_via_exact_production_ffmpeg_route"
+        || manifest.sample_identity.metadata_mutation.runtime_identity_binding
+            != "certified_report_to_compiled_store_to_runner_resolution"
+        || manifest.sample_identity.metadata_mutation.execution_authority
+            != "exact_canonical_path_plus_executable_sha256"
+        || manifest.sample_identity.metadata_mutation.pre_mutation_reverification
+            != "path_sha256_version_closure"
+        || manifest.sample_identity.metadata_mutation.per_output_authority
+            != "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
     {
         return Err(reference_toolchain_error(
-            "embedded decoded-sample identity contract disagrees with the compiled v8 policy",
+            "embedded decoded-sample identity contract disagrees with the compiled v11 policy",
         ));
     }
     if manifest.subprocess_environment.schema
@@ -2852,7 +3324,7 @@ fn validate_embedded_reference_policy_tables(
             != "sox_ng_14_8_0_1_misscales_its_float32_w64_on_decode"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v8 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v11 policy",
         ));
     }
     if manifest.analyzer.qualification_schema
@@ -2911,7 +3383,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.analyzer.aligned_multitone_duration_seconds != "0.250000000"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v8 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v11 policy",
         ));
     }
 
@@ -3026,7 +3498,7 @@ fn validate_embedded_reference_policy_tables(
     validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
     if b6.enabled {
         return Err(reference_toolchain_error(
-            "embedded B6 profile must remain typed but disabled under policy v8",
+            "embedded B6 profile must remain typed but disabled under policy v11",
         ));
     }
 
@@ -3118,7 +3590,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -3153,7 +3625,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -3575,23 +4047,24 @@ async fn attest_reference_toolchain(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     front_end: tonepoet_pipeline::DsdInputFrontEnd,
+    metadata_enabled: bool,
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
     ));
     let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
         reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
     })?;
-    if manifest.schema_version != 8
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V8_KEY
+    if manifest.schema_version != 11
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V11_KEY
         || manifest.status != "qualified_release"
     {
         return Err(reference_toolchain_error(
-            "the embedded policy artifact is not a qualified v8 release",
+            "the embedded policy artifact is not a qualified v11 release",
         ));
     }
-    validate_embedded_release_certification(&manifest)?;
+    let certified_metadata_mutators = validate_embedded_release_certification(&manifest)?;
     if manifest.qualification_basis.trim().is_empty()
         || manifest.runtime_activation.trim().is_empty()
     {
@@ -3702,6 +4175,39 @@ async fn attest_reference_toolchain(
         cancel,
     )
     .await?;
+    let metadata_mutators = if metadata_enabled {
+        Some(ReferenceMetadataMutatorToolchain {
+            metaflac: attest_certified_metadata_mutator(
+                ToolBinary::Metaflac,
+                certified_metadata_mutators
+                    .identity(ToolBinary::Metaflac)
+                    .expect("validated metaflac identity"),
+                runner,
+                cancel,
+            )
+            .await?,
+            wvtag: attest_certified_metadata_mutator(
+                ToolBinary::Wvtag,
+                certified_metadata_mutators
+                    .identity(ToolBinary::Wvtag)
+                    .expect("validated wvtag identity"),
+                runner,
+                cancel,
+            )
+            .await?,
+            atomic_parsley: attest_certified_metadata_mutator(
+                ToolBinary::AtomicParsley,
+                certified_metadata_mutators
+                    .identity(ToolBinary::AtomicParsley)
+                    .expect("validated AtomicParsley identity"),
+                runner,
+                cancel,
+            )
+            .await?,
+        })
+    } else {
+        None
+    };
 
     let platform_abi_digest = reference_platform_abi_digest();
     let runtime_dispatch_digest = reference_runtime_dispatch_digest();
@@ -3723,6 +4229,7 @@ async fn attest_reference_toolchain(
         qualification_manifest_digest,
         sox_ng,
         ffmpeg,
+        metadata_mutators,
         sacd_rs_build_identity: sacd_rs::REFERENCE_BUILD_ID.to_string(),
         dst_fixture_digest,
         platform_abi_digest,
@@ -3730,6 +4237,176 @@ async fn attest_reference_toolchain(
         reporting_uncertainty: manifest.analyzer.reporting_uncertainty_db,
         analyzer_residual: manifest.analyzer.analyzer_residual_db,
     })
+}
+
+pub(crate) fn reference_bound_metadata_executable(
+    toolchain: &ReferenceToolchainEvidence,
+    binary: ToolBinary,
+) -> Option<BoundToolExecutable> {
+    match binary {
+        ToolBinary::Ffmpeg => Some(BoundToolExecutable {
+            canonical_path: toolchain.ffmpeg.canonical_path.clone(),
+            executable_sha256: toolchain.ffmpeg.executable_sha256,
+        }),
+        ToolBinary::Metaflac | ToolBinary::Wvtag | ToolBinary::AtomicParsley => toolchain
+            .metadata_mutators
+            .as_ref()?
+            .identity(binary)
+            .map(ReferenceMetadataMutatorIdentity::bound_executable),
+        _ => None,
+    }
+}
+
+pub(crate) fn reference_metadata_toolchains_match(
+    left: &ReferenceToolchainEvidence,
+    right: &ReferenceToolchainEvidence,
+) -> bool {
+    let primary_matches = left.ffmpeg.canonical_path == right.ffmpeg.canonical_path
+        && left.ffmpeg.executable_sha256 == right.ffmpeg.executable_sha256
+        && left.ffmpeg.reported_version == right.ffmpeg.reported_version
+        && left.ffmpeg.closure_digest == right.ffmpeg.closure_digest;
+    let mutator_matches = match (&left.metadata_mutators, &right.metadata_mutators) {
+        (Some(left), Some(right)) => [
+            (&left.metaflac, &right.metaflac),
+            (&left.wvtag, &right.wvtag),
+            (&left.atomic_parsley, &right.atomic_parsley),
+        ]
+        .into_iter()
+        .all(|(left, right)| {
+            left.canonical_path == right.canonical_path
+                && left.executable_sha256 == right.executable_sha256
+                && left.reported_version == right.reported_version
+                && left.closure_digest == right.closure_digest
+        }),
+        (None, None) => true,
+        _ => false,
+    };
+    primary_matches && mutator_matches
+}
+
+pub(crate) async fn verify_reference_metadata_toolchain_before_mutation(
+    toolchain: &ReferenceToolchainEvidence,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), TrackExecutionError> {
+    let mutators = toolchain.metadata_mutators.as_ref().ok_or_else(|| {
+        reference_toolchain_error(
+            "Reference metadata mutation has no attested metadata-mutator toolchain",
+        )
+    })?;
+    for binary in [
+        ToolBinary::Ffmpeg,
+        ToolBinary::Metaflac,
+        ToolBinary::Wvtag,
+        ToolBinary::AtomicParsley,
+    ] {
+        let (canonical_path, executable_sha256, reported_version, closure_digest) = match binary {
+            ToolBinary::Ffmpeg => (
+                &toolchain.ffmpeg.canonical_path,
+                toolchain.ffmpeg.executable_sha256,
+                toolchain.ffmpeg.reported_version.as_str(),
+                toolchain.ffmpeg.closure_digest,
+            ),
+            _ => {
+                let identity = mutators.identity(binary).expect("closed mutator set");
+                (
+                    &identity.canonical_path,
+                    identity.executable_sha256,
+                    identity.reported_version.as_str(),
+                    identity.closure_digest,
+                )
+            }
+        };
+        let resolved_path = runner.resolved_tool_path(binary).ok_or_else(|| {
+            reference_toolchain_error(format!(
+                "{} runner cannot prove the executable path before metadata mutation",
+                binary.canonical_name()
+            ))
+        })?;
+        let activation_path = resolve_policy_owned_reference_tool_path(binary).map_err(|error| {
+            reference_toolchain_error(format!(
+                "could not resolve policy-owned {} before metadata mutation: {error}",
+                binary.canonical_name()
+            ))
+        })?;
+        let compiled_path = compiled_reference_executable_path(binary).map_err(|error| {
+            reference_toolchain_error(format!(
+                "could not resolve compiled {} before metadata mutation: {error}",
+                binary.canonical_name()
+            ))
+        })?;
+        if resolved_path.as_path() != canonical_path.as_path()
+            || activation_path.as_path() != canonical_path.as_path()
+            || compiled_path.as_path() != canonical_path.as_path()
+        {
+            return Err(reference_toolchain_error(format!(
+                "{} metadata path drift: attested {}, runtime {}, activation {}, compiled {}",
+                binary.canonical_name(),
+                canonical_path.display(),
+                resolved_path.display(),
+                activation_path.display(),
+                compiled_path.display(),
+            )));
+        }
+        let actual_sha256 = stable_file_sha256(canonical_path).map_err(|error| {
+            reference_toolchain_error(format!(
+                "could not re-hash {} before metadata mutation: {error}",
+                canonical_path.display()
+            ))
+        })?;
+        if actual_sha256 != executable_sha256 {
+            return Err(reference_toolchain_error(format!(
+                "{} metadata executable digest drift at {}",
+                binary.canonical_name(),
+                canonical_path.display()
+            )));
+        }
+        let actual_closure = reference_installation_identity(
+            binary,
+            canonical_path,
+            executable_sha256,
+            reported_version,
+        )?;
+        if actual_closure != closure_digest {
+            return Err(reference_toolchain_error(format!(
+                "{} metadata closure identity drift",
+                binary.canonical_name()
+            )));
+        }
+        let bound = BoundToolExecutable {
+            canonical_path: canonical_path.clone(),
+            executable_sha256,
+        };
+        let output = runner
+            .run_bound(reference_version_probe_command(binary)?, &bound, cancel)
+            .await
+            .map_err(|error| {
+                reference_toolchain_error(format!(
+                    "{} pre-mutation version probe failed: {error}",
+                    binary.canonical_name()
+                ))
+            })?;
+        let actual_version = parse_tool_version_output(
+            binary,
+            &output.stdout_tail,
+            &output.stderr_tail,
+        )
+        .ok_or_else(|| {
+            reference_toolchain_error(format!(
+                "{} pre-mutation version is not parseable",
+                binary.canonical_name()
+            ))
+        })?;
+        if actual_version != reported_version {
+            return Err(reference_toolchain_error(format!(
+                "{} pre-mutation version drift: attested {}, runtime {}",
+                binary.canonical_name(),
+                reported_version,
+                actual_version
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn embedded_flake_lock_input(input: &str) -> Result<(String, String), TrackExecutionError> {
@@ -3802,9 +4479,13 @@ async fn attest_external_reference_tool(
     let executable_sha256 = stable_file_sha256(&path).map_err(|err| {
         reference_toolchain_error(format!("could not hash {}: {err}", path.display()))
     })?;
+    let bound_executable = BoundToolExecutable {
+        canonical_path: path.clone(),
+        executable_sha256,
+    };
     let version_probe = reference_version_probe_command(binary)?;
     let version_output = runner
-        .run(version_probe, cancel)
+        .run_bound(version_probe, &bound_executable, cancel)
         .await
         .map_err(|err| reference_toolchain_error(format!(
             "{} version probe failed: {err}",
@@ -3858,7 +4539,7 @@ async fn attest_external_reference_tool(
 
     let probe = reference_behavior_probe_command(binary)?;
     let output = runner
-        .run(probe, cancel)
+        .run_bound(probe, &bound_executable, cancel)
         .await
         .map_err(|err| reference_toolchain_error(format!(
             "{} behavior probe failed: {err}",
@@ -3902,12 +4583,137 @@ async fn attest_external_reference_tool(
     })
 }
 
+async fn attest_certified_metadata_mutator(
+    binary: ToolBinary,
+    certified: &CertifiedMetadataMutatorIdentity,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<ReferenceMetadataMutatorIdentity, TrackExecutionError> {
+    if !runner.tool_available(binary) {
+        return Err(reference_toolchain_error(format!(
+            "{} is not available",
+            binary.canonical_name()
+        )));
+    }
+    let resolved_path = runner.resolved_tool_path(binary).ok_or_else(|| {
+        reference_toolchain_error(format!(
+            "{} runner cannot prove the executable path it will spawn",
+            binary.canonical_name()
+        ))
+    })?;
+    let activation_path = resolve_policy_owned_reference_tool_path(binary).map_err(|error| {
+        reference_toolchain_error(format!(
+            "could not resolve policy-owned {}: {error}",
+            binary.canonical_name()
+        ))
+    })?;
+    let compiled_store = compiled_reference_store_path(binary).ok_or_else(|| {
+        reference_toolchain_error(format!(
+            "{} has no compiled Reference store binding",
+            binary.canonical_name()
+        ))
+    })?;
+    let compiled_path = compiled_reference_executable_path(binary).map_err(|error| {
+        reference_toolchain_error(format!(
+            "could not resolve the compiled {} closure: {error}",
+            binary.canonical_name()
+        ))
+    })?;
+    if certified.store_path.as_path() != Path::new(compiled_store)
+        || resolved_path != activation_path
+        || resolved_path != compiled_path
+        || resolved_path.as_path() != certified.canonical_path.as_path()
+    {
+        return Err(reference_toolchain_error(format!(
+            "{} certified store {}, compiled store {}, runtime path {}, activation path {}, compiled closure path {}, and certified path {} do not match",
+            binary.canonical_name(),
+            certified.store_path.display(),
+            compiled_store,
+            resolved_path.display(),
+            activation_path.display(),
+            compiled_path.display(),
+            certified.canonical_path.display(),
+        )));
+    }
+    let executable_sha256 = stable_file_sha256(&resolved_path).map_err(|error| {
+        reference_toolchain_error(format!(
+            "could not hash certified {} at {}: {error}",
+            binary.canonical_name(),
+            resolved_path.display()
+        ))
+    })?;
+    if executable_sha256 != certified.executable_sha256 {
+        return Err(reference_toolchain_error(format!(
+            "{} executable digest drift at {}: certified {}, runtime {}",
+            binary.canonical_name(),
+            resolved_path.display(),
+            certified.executable_sha256,
+            executable_sha256,
+        )));
+    }
+    let bound_executable = BoundToolExecutable {
+        canonical_path: resolved_path.clone(),
+        executable_sha256,
+    };
+    let version_output = runner
+        .run_bound(reference_version_probe_command(binary)?, &bound_executable, cancel)
+        .await
+        .map_err(|error| {
+            reference_toolchain_error(format!(
+                "{} certified version probe failed: {error}",
+                binary.canonical_name()
+            ))
+        })?;
+    let reported_version = parse_tool_version_output(
+        binary,
+        &version_output.stdout_tail,
+        &version_output.stderr_tail,
+    )
+    .ok_or_else(|| {
+        reference_toolchain_error(format!(
+            "{} did not report a parseable version",
+            binary.canonical_name()
+        ))
+    })?;
+    let certified_version = parse_tool_version_output(binary, &certified.reported_version, "")
+        .ok_or_else(|| {
+            reference_toolchain_error(format!(
+                "the certified {} version {:?} is not canonical",
+                binary.canonical_name(),
+                certified.reported_version
+            ))
+        })?;
+    if reported_version != certified_version {
+        return Err(reference_toolchain_error(format!(
+            "{} reported version {}, certified {}",
+            binary.canonical_name(),
+            reported_version,
+            certified_version,
+        )));
+    }
+    let closure_digest = reference_installation_identity(
+        binary,
+        &resolved_path,
+        executable_sha256,
+        &reported_version,
+    )?;
+    Ok(ReferenceMetadataMutatorIdentity {
+        canonical_path: resolved_path,
+        executable_sha256,
+        reported_version,
+        version_probe_command: version_output.command,
+        closure_digest,
+    })
+}
+
 fn reference_version_probe_command(
     binary: ToolBinary,
 ) -> Result<ToolCommand, TrackExecutionError> {
     let args = match binary {
         ToolBinary::Sox => vec!["--version".to_string()],
         ToolBinary::Ffmpeg => vec!["-version".to_string()],
+        ToolBinary::Metaflac | ToolBinary::Wvtag => vec!["--version".to_string()],
+        ToolBinary::AtomicParsley => Vec::new(),
         _ => {
             return Err(reference_toolchain_error(format!(
                 "{} has no Reference version probe",
@@ -3966,6 +4772,9 @@ fn compiled_reference_store_path(binary: ToolBinary) -> Option<&'static str> {
     match binary {
         ToolBinary::Sox => option_env!("TONEPOET_REFERENCE_SOX_STORE_PATH"),
         ToolBinary::Ffmpeg => option_env!("TONEPOET_REFERENCE_FFMPEG_STORE_PATH"),
+        ToolBinary::Metaflac => option_env!("TONEPOET_REFERENCE_METAFLAC_STORE_PATH"),
+        ToolBinary::Wvtag => option_env!("TONEPOET_REFERENCE_WVTAG_STORE_PATH"),
+        ToolBinary::AtomicParsley => option_env!("TONEPOET_REFERENCE_ATOMIC_PARSLEY_STORE_PATH"),
         _ => None,
     }
 }
@@ -3983,6 +4792,9 @@ fn compiled_reference_executable_path(binary: ToolBinary) -> io::Result<PathBuf>
     let executable = match binary {
         ToolBinary::Sox => "sox",
         ToolBinary::Ffmpeg => "ffmpeg",
+        ToolBinary::Metaflac => "metaflac",
+        ToolBinary::Wvtag => "wvtag",
+        ToolBinary::AtomicParsley => "AtomicParsley",
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -4019,6 +4831,9 @@ fn resolve_policy_owned_reference_tool_path(binary: ToolBinary) -> io::Result<Pa
     let packaged_env = match binary {
         ToolBinary::Sox => Some("TONEPOET_REFERENCE_SOX_PATH"),
         ToolBinary::Ffmpeg => Some("TONEPOET_REFERENCE_FFMPEG_PATH"),
+        ToolBinary::Metaflac => Some("TONEPOET_REFERENCE_METAFLAC_PATH"),
+        ToolBinary::Wvtag => Some("TONEPOET_REFERENCE_WVTAG_PATH"),
+        ToolBinary::AtomicParsley => Some("TONEPOET_REFERENCE_ATOMIC_PARSLEY_PATH"),
         _ => None,
     };
     let variable = packaged_env.ok_or_else(|| {
@@ -5844,7 +6659,7 @@ fn validate_reference_package_pipeline(
     summary: &DsdReferencePlanSummary,
     pipeline: &PlannedCommandPipeline,
 ) -> Result<(), TrackExecutionError> {
-    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V8
+    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V11
         || summary.final_pcm.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64
         || !matches!(
             summary.target,
@@ -5855,7 +6670,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v8 package pipeline is bound to an invalid plan cell"
+                "Reference policy v11 package pipeline is bound to an invalid plan cell"
                     .to_string(),
             ),
             Vec::new(),
@@ -5889,7 +6704,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v8 package pipeline has a noncanonical SoX producer"
+                "Reference policy v11 package pipeline has a noncanonical SoX producer"
                     .to_string(),
             ),
             Vec::new(),
@@ -5940,7 +6755,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v8 package pipeline has a noncanonical FFmpeg consumer"
+                "Reference policy v11 package pipeline has a noncanonical FFmpeg consumer"
                     .to_string(),
             ),
             Vec::new(),
@@ -6023,7 +6838,7 @@ fn validate_reference_measurement_contract(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v8 measurement has a noncanonical FFmpeg analyzer command"
+                "Reference policy v11 measurement has a noncanonical FFmpeg analyzer command"
                     .to_string(),
             ),
             Vec::new(),
@@ -6034,7 +6849,7 @@ fn validate_reference_measurement_contract(
         let carrier = producer.input.as_path().ok_or_else(|| {
             TrackExecutionError::new(
                 ConvertError::Backend(
-                    "Reference policy v8 streamed measurement requires a path-backed W64 carrier"
+                    "Reference policy v11 streamed measurement requires a path-backed W64 carrier"
                         .to_string(),
                 ),
                 Vec::new(),
@@ -6064,7 +6879,7 @@ fn validate_reference_measurement_contract(
         {
             return Err(TrackExecutionError::new(
                 ConvertError::Backend(
-                    "Reference policy v8 measurement has a noncanonical typed SoX-to-FFmpeg f64 pipe contract"
+                    "Reference policy v11 measurement has a noncanonical typed SoX-to-FFmpeg f64 pipe contract"
                         .to_string(),
                 ),
                 Vec::new(),
@@ -6076,7 +6891,7 @@ fn validate_reference_measurement_contract(
     let carrier = measurement.command.input.as_path().ok_or_else(|| {
         TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v8 direct measurement requires a path-backed Float32 W64 carrier"
+                "Reference policy v11 direct measurement requires a path-backed Float32 W64 carrier"
                     .to_string(),
             ),
             Vec::new(),
@@ -6097,7 +6912,7 @@ fn validate_reference_measurement_contract(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v8 measurement has a noncanonical direct Float32-W64 FFmpeg contract"
+                "Reference policy v11 measurement has a noncanonical direct Float32-W64 FFmpeg contract"
                     .to_string(),
             ),
             Vec::new(),
@@ -7359,7 +8174,7 @@ mod tests {
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -7375,7 +8190,7 @@ mod tests {
         let mut reserve_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
             )))
             .expect("embedded Reference qualification JSON parses for drift test");
         reserve_drift.analyzer.reporting_uncertainty_db =
@@ -7392,7 +8207,7 @@ mod tests {
         let mut hash_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
             )))
             .expect("embedded Reference qualification JSON parses for hash-contract drift test");
         hash_contract_drift.sample_identity.hash_format =
@@ -7409,7 +8224,7 @@ mod tests {
         let mut route_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"
             )))
             .expect("embedded Reference qualification JSON parses for route-contract drift test");
         route_contract_drift
@@ -7427,9 +8242,9 @@ mod tests {
 
         let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_candidate.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v11_candidate.json"
         )))
-        .expect("preserved v8 candidate JSON parses");
+        .expect("preserved v11 candidate JSON parses");
         assert_eq!(
             candidate
                 .terminal_bounds
