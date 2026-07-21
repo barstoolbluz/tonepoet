@@ -253,11 +253,20 @@ padding as data**, so the next demux yields a phantom frame. This is
 distinct from the two decode-side W64 defects you already routed
 around; it is mux-side.
 
-Production impact is real, not harness-only: the production metadata
-stage rewrites tags via the same ffmpeg re-mux (temp-file rewrite path,
-pinned at `src/convert/pipeline/stages.rs:5967`), so tagging any
-delivered W64 whose data size is not 8-aligned appends a sample in
-production.
+Production impact, verified precisely: `metadata_tag_command`
+(`src/convert/pipeline/stages.rs:4838-4853`) dispatches by extension —
+`"wav"`/`"aiff"`/`"mp3"`/`"m4a"` route to the ffmpeg re-mux (temp-file
+rewrite), while `"w64"` is ABSENT and fails loudly as
+`UnsupportedTagFormat`. So there is no silent W64 corruption in
+production today; the consequences are instead: (1) a Reference W64
+delivery with the metadata stage enabled errors rather than tags —
+decide and encode the intended behavior (skip-with-provenance, native
+route, or documented rejection); (2) the muxer defect forecloses ever
+qualifying an ffmpeg-based W64 tag route; and (3) the analogous hazard
+for RIFF/WAV — which production DOES ffmpeg-remux — is untested: RIFF
+pads chunks to 2-byte alignment, and 24-bit mono WAV with an odd sample
+count produces an odd data size. Qualify or refute the 2-byte analog
+with a fixture while you are in this code.
 
 Resolve in one pass under your rules — candidate shapes, your choice
 with rationale:
