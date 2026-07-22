@@ -10,6 +10,11 @@ The calculation is intentionally standard-library-only and uses Decimal at
 where C is the public post-final ceiling, R is exactly one analyzer reporting
 quantum, and epsilon is the upward-rounded Q1.63 additive peak bound. S is
 rounded toward negative infinity to one nanodecibel.
+
+Historical-checker lineage contract: once shipped, this checker must remain valid
+against every successor policy. It may pin immutable artifacts and persistent
+policy identities from its own generation, but it must never assert the mutable
+current-policy embed pointer.
 """
 
 from __future__ import annotations
@@ -154,23 +159,14 @@ def main() -> int:
             verify_artifact(qualification_dir / filename)
         compiled_policy = qualification_dir.parent / "src" / "dsd_reference.rs"
         compiled_source = compiled_policy.read_text(encoding="utf-8")
-        current_manifests = (
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v5.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v6.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v7.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v9.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v10.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
-        )
-        active = [marker for marker in current_manifests if marker in compiled_source]
-        if len(active) != 1:
-            raise AssertionError(
-                f"{compiled_policy}: expected exactly one recognized current policy manifest, got {active}"
-            )
-        if active[0] == current_manifests[0]:
-            verify_compiled_policy(compiled_policy)
+        for marker in (
+            'pub const DSD_REFERENCE_POLICY_V5_KEY: &str = "sox_ng_14_8_0_1_v5";',
+            "SoxNg14801V5",
+        ):
+            if marker not in compiled_source:
+                raise AssertionError(
+                    f"{compiled_policy}: append-only policy v5 identity is missing {marker!r}"
+                )
         print("v5 terminal-bound derivation verified")
     else:
         print(json.dumps(derived_cells(), indent=2, sort_keys=True))

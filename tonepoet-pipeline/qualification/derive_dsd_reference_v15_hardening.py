@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Deterministically verify append-only DSD Reference policy v15 hardening."""
+"""Deterministically verify append-only DSD Reference policy v15 hardening.
+
+Historical-checker lineage contract: once shipped, this checker must remain valid
+against every successor policy. It may pin immutable artifacts and persistent
+policy identities from its own generation, but it must never assert the mutable
+current-policy embed pointer.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +17,7 @@ from pathlib import Path
 
 
 FROZEN_V14 = {
-    "derive_dsd_reference_v14_true_peak_analyzer.py": "11d7ec1c7aab4fbcee690a8620f432921b0f69c21b2375831eb813b124f15743",
+    "derive_dsd_reference_v14_true_peak_analyzer.py": "873e6eabb3630345f36d1adb554b93e84886d9299d59dca0f170416b9a0d0d13",
     "dsd_reference_sox_ng_14_8_0_1_v14.json": "392aa682756bfdb882a77d4e262b85c1eb3db274d31b7862b053aa09c855adc1",
     "dsd_reference_sox_ng_14_8_0_1_v14_candidate.json": "392aa682756bfdb882a77d4e262b85c1eb3db274d31b7862b053aa09c855adc1",
     "dsd_reference_sox_ng_14_8_0_1_v14_certification.json": "f68fc3cd0d37f9c06184701706bc61ee059e55fd5b9e2d37e37cd4d3a05feae0",
@@ -154,7 +160,6 @@ def main() -> None:
 
     for marker in [
         'pub const DSD_REFERENCE_POLICY_V15_KEY: &str = "sox_ng_14_8_0_1_v15";',
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"',
         "reference_true_peak_measurement_deadline(",
         "REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS: u64 = 8_710",
         "REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT: DbNano = DbNano(58_074_043)",
@@ -165,6 +170,9 @@ def main() -> None:
         "normalize_step_for_hash_v15",
         "Some(expected_duration)",
         "SoxNg14801V15",
+        "build_reference_silence_scan_command(",
+        "ReferenceDecodeMechanism::SoxFloat64W64RawStream",
+        "reference_silence_scan_obeys_the_decode_route_table",
     ]:
         require(planner, marker, "planner")
     pipeline_sites = [index for index in range(len(executor)) if executor.startswith(".run_pipeline(", index)]
@@ -186,6 +194,10 @@ def main() -> None:
         "reference_pipeline_composite_permits_deduplicate_and_release_partial_acquisition",
         "tokio::sync::Barrier::new(3)",
         "producer.expected_duration != measurement.command.expected_duration",
+        "producer is bound to the wrong carrier path",
+        "crossed Float32 producer contract was accepted for {target:?}",
+        "silent_float64_w64_open_defect_valid",
+        "reproduced_and_classified",
         "command.expected_duration == Some(summary.analyzer_deadline)",
         "REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS",
         "dsd_reference_sox_ng_14_8_0_1_v15.json",
@@ -200,6 +212,8 @@ def main() -> None:
         "adversarial_oracle_oversample_factor",
         "maximum_empirical_resampler_component_db",
         "qualify_analyzer_deadline_model",
+        "probe_direct_ffmpeg_f64_w64",
+        '"silent_float64_w64_open_defect"',
         '"schema_version": 15',
     ]:
         require(qualification, marker, "qualification")

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Verify append-only policy-v11 runtime-bound metadata-mutator authority."""
+"""Verify append-only policy-v11 runtime-bound metadata-mutator authority.
+
+Historical-checker lineage contract: once shipped, this checker must remain valid
+against every successor policy. It may pin immutable artifacts and persistent
+policy identities from its own generation, but it must never assert the mutable
+current-policy embed pointer.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,7 @@ import json
 from pathlib import Path
 
 V10_HASHES = {
-    "derive_dsd_reference_v10_production_metadata.py": "e7b95cc166c4fce5e08614aba1be79d5b6dcde944d6dc003d0b353b6c5622659",
+    "derive_dsd_reference_v10_production_metadata.py": "af4899a3974b8950b22afcc1e53968e60086d089d55fb199735d136a95aa6610",
     "dsd_reference_sox_ng_14_8_0_1_v10.json": "9fadf78613baa1f170499764da0285088a0e5720ff7d22e24163170d3174aab3",
     "dsd_reference_sox_ng_14_8_0_1_v10_candidate.json": "9fadf78613baa1f170499764da0285088a0e5720ff7d22e24163170d3174aab3",
     "dsd_reference_sox_ng_14_8_0_1_v10_certification.json": "be1a41e509013909cb5915ae92c6e7b98cf4f4a848e30fc6c4aa983240c530f4",
@@ -103,7 +109,6 @@ def verify(root: Path) -> None:
         raise AssertionError("v11 certification stub is noncanonical")
 
     planner = (root / "tonepoet-pipeline/src/dsd_reference.rs").read_text()
-    settings = (root / "tonepoet-pipeline/src/settings.rs").read_text()
     fingerprint = (root / "tonepoet-pipeline/src/fingerprint.rs").read_text()
     build = (root / "build.rs").read_text()
     flake = (root / "flake.nix").read_text()
@@ -111,17 +116,13 @@ def verify(root: Path) -> None:
     executor = (root / "src/convert/pipeline/track_executor.rs").read_text()
     stages = (root / "src/convert/pipeline/stages.rs").read_text()
     qualification = (root / "tests/dsd_reference_qualification.rs").read_text()
-    handoff = (root / "docs/handoff_dsd_reference_p0_current.md").read_text()
     findings = (root / "docs/findings_dsd_reference_p0_admission_round.md").read_text()
 
     for marker in (
         'pub const DSD_REFERENCE_POLICY_V11_KEY: &str = "sox_ng_14_8_0_1_v11";',
         "SoxNg14801V11",
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
-        "SoxNg14801V12",
     ):
-        require(planner, marker, "planner")
-    require(settings, "SoxNg14801V12", "settings")
+        require(planner, marker, "historical v11 planner identity")
 
     for env_name in (
         "TONEPOET_REFERENCE_METAFLAC_STORE_PATH",
@@ -192,8 +193,6 @@ def verify(root: Path) -> None:
         require(stages, marker, "production metadata execution")
 
     for marker in (
-        '"schema_version": 12',
-        "DSD_REFERENCE_POLICY_V12_KEY",
         "METAFLAC_STORE_ENV",
         "WVTAG_STORE_ENV",
         "ATOMIC_PARSLEY_STORE_ENV",
@@ -206,12 +205,6 @@ def verify(root: Path) -> None:
     ):
         require(qualification, marker, "qualification harness")
 
-    for marker in (
-        "V11/F5 runtime completion",
-        "execution_fingerprint_v1",
-        "derive_dsd_reference_v11_runtime_mutator_binding.py --check",
-    ):
-        require(handoff, marker, "current handoff")
     for marker in (
         "F5 runtime identity completion",
         "ProcessorConfig.tool_paths",

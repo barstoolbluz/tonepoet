@@ -9,7 +9,7 @@ use std::fs::{self, File};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use sacd_rs::{
@@ -20,15 +20,17 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::{
-    build_reference_silence_scan_command, extract_single_loudnorm_report,
+    build_reference_silence_scan_command,
     extract_single_sox_stats_peak_report, parse_reference_sox_stats_true_peak_measurement,
-    parse_reference_true_peak_measurement, plan_conversion, resolve_reference_deferred_command,
+    plan_conversion, resolve_reference_deferred_command,
     validate_post_final_true_peak, validate_reference_decode_mechanism,
-    validate_signed_zero_f64le, ConversionPlan, DsdReferencePlanSummary, DsdSourceKind,
+    validate_signed_zero_f64le, reference_scratch_paths, ConversionPlan,
+    DsdReferencePlanSummary, DsdSourceKind,
     Finalization, MeasurementId, MeasurementParser, PlanAction, PlanRequest, PlannedCommand,
     PlannedCommandPipeline, PlannedDeferredCommand, PlannedExecutionStep, PlannedMeasurement,
     ReferenceDecodeAuthority, ReferenceDecodeMechanism, ReferenceDecodedCarrier,
     ReferenceDecodedCarrierSelector, ReferenceSampleHashEncoding,
+    ReferenceScratchPaths,
     SacdAreaKind, SacdFrameEncoding, Sha256Digest, ToolIdentifier,
     TruePeakMeasurement, TruePeakPurpose,
 };
@@ -512,6 +514,181 @@ pub(crate) async fn preflight_reference_rerun_authority(
     }))
 }
 
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackExecutionFailurePoint {
+    PlanConstruction,
+    Attestation,
+    Materialization,
+    ProducerLaunch,
+    ConsumerLaunch,
+    Measurement,
+    TerminalProcessing,
+    Packaging,
+    Finalization,
+    Cancellation,
+}
+
+#[cfg(test)]
+impl TrackExecutionFailurePoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PlanConstruction => "plan-construction",
+            Self::Attestation => "attestation",
+            Self::Materialization => "materialization",
+            Self::ProducerLaunch => "producer-launch",
+            Self::ConsumerLaunch => "consumer-launch",
+            Self::Measurement => "measurement",
+            Self::TerminalProcessing => "terminal-processing",
+            Self::Packaging => "packaging",
+            Self::Finalization => "finalization",
+            Self::Cancellation => "cancellation",
+        }
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TRACK_EXECUTION_FAILURE_POINT: TrackExecutionFailurePoint;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TRACK_EXECUTION_USE_INJECTED_RUNNER: ();
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceMaterializationPausePoint {
+    BeforeScratchPathCreation,
+    DuringSourceCopy,
+    DuringDstDecode,
+    DuringSacdExtraction,
+}
+
+#[cfg(not(test))]
+struct ReferenceMaterializationPause;
+
+#[cfg(test)]
+struct ReferenceMaterializationPause {
+    point: ReferenceMaterializationPausePoint,
+    reached: std::sync::atomic::AtomicBool,
+    released: Mutex<bool>,
+    release_cv: std::sync::Condvar,
+    reached_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ReferenceMaterializationPause {
+    fn new(point: ReferenceMaterializationPausePoint) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            reached: std::sync::atomic::AtomicBool::new(false),
+            released: Mutex::new(false),
+            release_cv: std::sync::Condvar::new(),
+            reached_notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn pause_if_selected(&self, point: ReferenceMaterializationPausePoint) {
+        if self.point != point {
+            return;
+        }
+        if !self
+            .reached
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.reached_notify.notify_waiters();
+        }
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = self
+                .release_cv
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    async fn wait_until_reached(&self) {
+        loop {
+            let notified = self.reached_notify.notified();
+            if self.reached.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *released = true;
+        self.release_cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static REFERENCE_MATERIALIZATION_PAUSE: Arc<ReferenceMaterializationPause>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static REFERENCE_TEST_SKIP_ATTESTATION: ();
+}
+
+#[cfg(test)]
+fn inject_track_execution_failure(
+    point: TrackExecutionFailurePoint,
+    work_dir: &Path,
+    cleanup_paths: &[PathBuf],
+) -> Result<(), TrackExecutionError> {
+    let selected = TRACK_EXECUTION_FAILURE_POINT
+        .try_with(|selected| *selected)
+        .ok();
+    if selected != Some(point) {
+        return Ok(());
+    }
+
+    fs::create_dir_all(work_dir).map_err(|error| {
+        TrackExecutionError::new(ConvertError::Io(error), Vec::new())
+    })?;
+    fs::write(
+        work_dir.join(format!("injected-{}.partial", point.label())),
+        b"partial",
+    )
+    .map_err(|error| TrackExecutionError::new(ConvertError::Io(error), Vec::new()))?;
+
+    for path in cleanup_paths {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                TrackExecutionError::new(ConvertError::Io(error), Vec::new())
+            })?;
+        }
+        if !path.is_dir() {
+            fs::write(path, b"partial").map_err(|error| {
+                TrackExecutionError::new(ConvertError::Io(error), Vec::new())
+            })?;
+        }
+    }
+
+    let error = if point == TrackExecutionFailurePoint::Cancellation {
+        ConvertError::Realize("cancelled".to_string())
+    } else {
+        ConvertError::Backend(format!(
+            "injected track-execution failure at {}",
+            point.label()
+        ))
+    };
+    Err(TrackExecutionError::new(error, Vec::new()))
+}
+
 pub async fn execute_planned_track_conversion(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -527,174 +704,272 @@ pub async fn execute_planned_track_conversion(
     end_fraction: f32,
 ) -> Result<ExecutedTrackPlan, TrackExecutionError> {
     let work_dir = convert_root.join(format!(".track-{:04}.work", track.id.source_ordinal));
-    reset_track_work_dir(&work_dir)?;
+    let cleanup_guard = TrackExecutionCleanupGuard::acquire(work_dir.clone(), cancel).await?;
+    let result = async {
+        reset_track_work_dir(&work_dir)?;
 
-    let mut plan_request = plan_request_for_track(
-        request,
-        track,
-        realized_input,
-        staged_output,
-        work_dir.clone(),
-    )?;
-    // Run the pure planner first so unsupported cells fail deterministically
-    // before any source copy, DST decode, executable probe, or process launch.
-    let admitted_source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
-    let admitted_plan = plan_conversion(&plan_request)
-        .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
-    let reference_toolchain = if let Some(summary) = admitted_plan.reference.as_ref() {
-        Some(
-            attest_reference_toolchain(
-                runner,
-                cancel,
-                summary.front_end,
-                request.stages.metadata == super::types::StageRequirement::Enabled,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let reference_materialization = if admitted_plan.reference.is_some() {
-        let materialization = materialize_reference_source(
-            &plan_request,
+        #[cfg(test)]
+        inject_track_execution_failure(
+            TrackExecutionFailurePoint::PlanConstruction,
+            &work_dir,
+            &[],
+        )?;
+
+        let mut plan_request = plan_request_for_track(
+            request,
             track,
             realized_input,
+            staged_output,
+            work_dir.clone(),
+        )?;
+        // Run the pure planner first so unsupported cells fail deterministically
+        // before any source copy, DST decode, executable probe, or process launch.
+        let admitted_source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
+        let admitted_plan = plan_conversion(&plan_request)
+            .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+        cleanup_guard.add_planner_paths(admitted_plan.cleanup_paths());
+        let reference_scratch = if admitted_plan.reference.is_some() {
+            let scratch = reference_scratch_paths(&plan_request)
+                .map_err(|err| ConvertError::Backend(format!("planner failed to bind Reference scratch paths: {err}")))?;
+            validate_reference_scratch_cleanup_authority(&admitted_plan, &scratch)?;
+            Some(scratch)
+        } else {
+            None
+        };
+
+        #[cfg(test)]
+        inject_track_execution_failure(
+            TrackExecutionFailurePoint::Attestation,
             &work_dir,
-            cancel,
-        )
-        .await?;
-        let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
-        let admitted_target = plan_request.resolved_output_target;
-        let admitted_scope = plan_request.reference_programme_scope.clone();
-        let admitted_summary = admitted_plan.reference.as_ref().ok_or_else(|| {
-            TrackExecutionError::new(
-                ConvertError::Backend("Reference plan authority is missing".to_string()),
-                Vec::new(),
+            admitted_plan.cleanup_paths(),
+        )?;
+
+        #[cfg(test)]
+        let skip_reference_attestation = REFERENCE_TEST_SKIP_ATTESTATION
+            .try_with(|_| ())
+            .is_ok();
+        #[cfg(not(test))]
+        let skip_reference_attestation = false;
+        let reference_toolchain = if let Some(summary) = admitted_plan.reference.as_ref() {
+            if skip_reference_attestation {
+                None
+            } else {
+                Some(
+                    attest_reference_toolchain(
+                        runner,
+                        cancel,
+                        summary.front_end,
+                        request.stages.metadata == super::types::StageRequirement::Enabled,
+                    )
+                    .await?,
+                )
+            }
+        } else {
+            None
+        };
+
+        #[cfg(test)]
+        inject_track_execution_failure(
+            TrackExecutionFailurePoint::Materialization,
+            &work_dir,
+            admitted_plan.cleanup_paths(),
+        )?;
+
+        let reference_materialization = if admitted_plan.reference.is_some() {
+            let scratch = reference_scratch.as_ref().ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend("Reference scratch authority is missing".to_string()),
+                    Vec::new(),
+                )
+            })?;
+            let materialization = materialize_reference_source(
+                &plan_request,
+                track,
+                realized_input,
+                scratch,
+                cancel,
+                cleanup_guard.blocking_worker_lease()?,
             )
-        })?;
-        let materialized_source = source_info_for_realized_track(track, &materialization.path)?;
-        if !materialized_source.codec.is_dsd()
-            || materialized_source.sample_rate_hz != plan_request.source.sample_rate_hz
-            || materialized_source.channels != plan_request.source.channels
-            || materialized_source.sample_kind != Some(tonepoet_pipeline::SampleKind::Dsd)
-        {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference private materialization changed the admitted DSD rate, channel count, or representation"
-                        .to_string(),
-                ),
-                Vec::new(),
-            ));
+            .await?;
+            let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
+            let admitted_target = plan_request.resolved_output_target;
+            let admitted_scope = plan_request.reference_programme_scope.clone();
+            let admitted_summary = admitted_plan.reference.as_ref().ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend("Reference plan authority is missing".to_string()),
+                    Vec::new(),
+                )
+            })?;
+            let materialized_source = source_info_for_realized_track(track, &materialization.path)?;
+            if !materialized_source.codec.is_dsd()
+                || materialized_source.sample_rate_hz != plan_request.source.sample_rate_hz
+                || materialized_source.channels != plan_request.source.channels
+                || materialized_source.sample_kind != Some(tonepoet_pipeline::SampleKind::Dsd)
+            {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference private materialization changed the admitted DSD rate, channel count, or representation"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+
+            // Rebind only the immutable private input path and carrier facts. Keep
+            // the original container/front-end identity: DSDIFF/DST and SACD/DST
+            // must remain qualified decode operations even though their private
+            // carrier is now uncompressed DSDIFF/DSD or DSF.
+            let mut rematerialized = plan_request.clone();
+            rematerialized.input_path = materialization.path.clone();
+            rematerialized.source.format = materialized_source.format;
+            rematerialized.source.codec = materialized_source.codec;
+            rematerialized.source.sample_rate_hz = materialized_source.sample_rate_hz;
+            rematerialized.source.bit_depth = materialized_source.bit_depth;
+            rematerialized.source.true_source_depth = materialized_source.true_source_depth;
+            rematerialized.source.source_representation = materialized_source.source_representation;
+            rematerialized.source.sample_kind = materialized_source.sample_kind;
+            rematerialized.source.channels = materialized_source.channels;
+            rematerialized.source.duration = materialized_source.duration;
+            rematerialized.source.audio_md5 = materialized_source.audio_md5;
+            rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
+            if rematerialized.resolved_output_target != admitted_target
+                || rematerialized.reference_programme_scope != admitted_scope
+            {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference target or programme authority changed during materialization"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+            let rematerialized_plan = plan_conversion(&rematerialized)
+                .map_err(|err| ConvertError::Backend(format!("planner failed after materialization: {err}")))?;
+            cleanup_guard.add_planner_paths(rematerialized_plan.cleanup_paths());
+            validate_reference_scratch_cleanup_authority(&rematerialized_plan, scratch)?;
+            let rematerialized_summary = rematerialized_plan.reference.as_ref().ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference authority disappeared after source materialization".to_string(),
+                    ),
+                    Vec::new(),
+                )
+            })?;
+            if admitted_summary.semantic_plan_hash_v1 != rematerialized_summary.semantic_plan_hash_v1
+                || admitted_summary.policy != rematerialized_summary.policy
+                || admitted_summary.qualification_manifest_digest
+                    != rematerialized_summary.qualification_manifest_digest
+            {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference semantic plan changed during source materialization".to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+            plan_request = rematerialized;
+            Some((materialization, rematerialized_plan))
+        } else {
+            None
+        };
+        let plan = reference_materialization
+            .as_ref()
+            .map(|(_, plan)| plan.clone())
+            .unwrap_or(admitted_plan);
+        cleanup_guard.add_planner_paths(plan.cleanup_paths());
+        let command_hash = super::manifest::planned_command_hash(&plan).ok();
+        let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
+        let metadata_required = planner_metadata_obligations_for_track(request, &plan_request);
+
+        // These test-only failure checkpoints live in the production control-flow
+        // frame. They prove that an error or cancellation returned with `?` at each
+        // named phase cannot bypass cleanup; stage semantics remain covered by the
+        // dedicated executor and qualification tests.
+        #[cfg(test)]
+        for point in [
+            TrackExecutionFailurePoint::ProducerLaunch,
+            TrackExecutionFailurePoint::ConsumerLaunch,
+            TrackExecutionFailurePoint::Measurement,
+            TrackExecutionFailurePoint::TerminalProcessing,
+            TrackExecutionFailurePoint::Packaging,
+            TrackExecutionFailurePoint::Cancellation,
+        ] {
+            inject_track_execution_failure(point, &work_dir, plan.cleanup_paths())?;
         }
 
-        // Rebind only the immutable private input path and carrier facts. Keep
-        // the original container/front-end identity: DSDIFF/DST and SACD/DST
-        // must remain qualified decode operations even though their private
-        // carrier is now uncompressed DSDIFF/DSD or DSF.
-        let mut rematerialized = plan_request.clone();
-        rematerialized.input_path = materialization.path.clone();
-        rematerialized.source.format = materialized_source.format;
-        rematerialized.source.codec = materialized_source.codec;
-        rematerialized.source.sample_rate_hz = materialized_source.sample_rate_hz;
-        rematerialized.source.bit_depth = materialized_source.bit_depth;
-        rematerialized.source.true_source_depth = materialized_source.true_source_depth;
-        rematerialized.source.source_representation = materialized_source.source_representation;
-        rematerialized.source.sample_kind = materialized_source.sample_kind;
-        rematerialized.source.channels = materialized_source.channels;
-        rematerialized.source.duration = materialized_source.duration;
-        rematerialized.source.audio_md5 = materialized_source.audio_md5;
-        rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
-        if rematerialized.resolved_output_target != admitted_target
-            || rematerialized.reference_programme_scope != admitted_scope
-        {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference target or programme authority changed during materialization"
-                        .to_string(),
-                ),
-                Vec::new(),
-            ));
-        }
-        let rematerialized_plan = plan_conversion(&rematerialized)
-            .map_err(|err| ConvertError::Backend(format!("planner failed after materialization: {err}")))?;
-        let rematerialized_summary = rematerialized_plan.reference.as_ref().ok_or_else(|| {
-            TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference authority disappeared after source materialization".to_string(),
-                ),
-                Vec::new(),
-            )
-        })?;
-        if admitted_summary.semantic_plan_hash_v1 != rematerialized_summary.semantic_plan_hash_v1
-            || admitted_summary.policy != rematerialized_summary.policy
-            || admitted_summary.qualification_manifest_digest
-                != rematerialized_summary.qualification_manifest_digest
-        {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference semantic plan changed during source materialization".to_string(),
-                ),
-                Vec::new(),
-            ));
-        }
-        plan_request = rematerialized;
-        Some((materialization, rematerialized_plan))
-    } else {
-        None
-    };
-    let plan = reference_materialization
-        .as_ref()
-        .map(|(_, plan)| plan.clone())
-        .unwrap_or(admitted_plan);
-    let command_hash = super::manifest::planned_command_hash(&plan).ok();
-    let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
-    let metadata_required = planner_metadata_obligations_for_track(request, &plan_request);
-
-    cleanup_paths(plan.cleanup_paths());
-    let started = Instant::now();
-    let result = match &plan.action {
-        PlanAction::PassthroughCopy {
-            input,
-            work_path,
-            finalization,
-            reason,
-            ..
-        } => {
-            progress
-                .estimated_with_key(
-                    start_fraction,
-                    format!("passthrough-start:{}", track.id.source_ordinal),
-                    format!("Copying passthrough track {} ({reason})", track.id.source_ordinal),
-                )
-                .await;
-            copy_to_work_path(input, work_path)?;
-            apply_finalization(finalization)?;
-            progress
-                .estimated_with_key(
-                    end_fraction,
-                    format!("passthrough-finish:{}", track.id.source_ordinal),
-                    format!("Finished passthrough track {}", track.id.source_ordinal),
-                )
-                .await;
-            Ok(ExecutedTrackPlan {
-                commands: Vec::new(),
-                elapsed: started.elapsed(),
-                metadata_satisfaction,
-                metadata_required,
-                command_hash: command_hash.clone(),
-                reference: None,
-            })
-        }
-        PlanAction::Execute {
-            commands,
-            steps,
-            finalization,
-            ..
-        } => {
-            let (commands, reference_runtime) = if steps.is_empty() {
-                (
-                    execute_commands(
-                        commands,
+        let started = Instant::now();
+        match &plan.action {
+            PlanAction::PassthroughCopy {
+                input,
+                work_path,
+                finalization,
+                reason,
+                ..
+            } => {
+                progress
+                    .estimated_with_key(
+                        start_fraction,
+                        format!("passthrough-start:{}", track.id.source_ordinal),
+                        format!("Copying passthrough track {} ({reason})", track.id.source_ordinal),
+                    )
+                    .await;
+                copy_to_work_path(input, work_path)?;
+                #[cfg(test)]
+                inject_track_execution_failure(
+                    TrackExecutionFailurePoint::Finalization,
+                    &work_dir,
+                    plan.cleanup_paths(),
+                )?;
+                apply_finalization(finalization)?;
+                progress
+                    .estimated_with_key(
+                        end_fraction,
+                        format!("passthrough-finish:{}", track.id.source_ordinal),
+                        format!("Finished passthrough track {}", track.id.source_ordinal),
+                    )
+                    .await;
+                Ok(ExecutedTrackPlan {
+                    commands: Vec::new(),
+                    elapsed: started.elapsed(),
+                    metadata_satisfaction,
+                    metadata_required,
+                    command_hash: command_hash.clone(),
+                    reference: None,
+                })
+            }
+            PlanAction::Execute {
+                commands,
+                steps,
+                finalization,
+                ..
+            } => {
+                let (commands, reference_runtime) = if steps.is_empty() {
+                    (
+                        execute_commands(
+                            commands,
+                            runner,
+                            cancel,
+                            tool_paths,
+                            tool_concurrency_limits,
+                            progress,
+                            start_fraction,
+                            end_fraction,
+                            track_label(track),
+                        )
+                        .await?,
+                        None,
+                    )
+                } else {
+                    let runtime = execute_reference_steps(
+                        steps,
+                        plan.reference.as_ref().ok_or_else(|| {
+                            TrackExecutionError::new(
+                                ConvertError::Backend(
+                                    "measurement-aware plan is missing Reference authority".to_string(),
+                                ),
+                                Vec::new(),
+                            )
+                        })?,
                         runner,
                         cancel,
                         tool_paths,
@@ -703,100 +978,118 @@ pub async fn execute_planned_track_conversion(
                         start_fraction,
                         end_fraction,
                         track_label(track),
+                        &reference_scratch
+                            .as_ref()
+                            .ok_or_else(|| {
+                                TrackExecutionError::new(
+                                    ConvertError::Backend(
+                                        "Reference scratch authority is missing during execution"
+                                            .to_string(),
+                                    ),
+                                    Vec::new(),
+                                )
+                            })?
+                            .silence_scan,
+                        reference_toolchain.as_ref().ok_or_else(|| {
+                            TrackExecutionError::new(
+                                ConvertError::Backend("Reference toolchain evidence is missing".to_string()),
+                                Vec::new(),
+                            )
+                        })?,
                     )
-                    .await?,
-                    None,
-                )
-            } else {
-                let runtime = execute_reference_steps(
-                    steps,
-                    plan.reference.as_ref().ok_or_else(|| {
-                        TrackExecutionError::new(
+                    .await?;
+                    (runtime.commands.clone(), Some(runtime))
+                };
+                if let Some(finalization) = finalization {
+                    #[cfg(test)]
+                    inject_track_execution_failure(
+                        TrackExecutionFailurePoint::Finalization,
+                        &work_dir,
+                        plan.cleanup_paths(),
+                    )?;
+                    if let Err(err) = apply_finalization(finalization) {
+                        return Err(TrackExecutionError::new(err, commands));
+                    }
+                }
+                progress
+                    .estimated_with_key(
+                        end_fraction,
+                        format!("plan-finish:{}", track.id.source_ordinal),
+                        format!("Finished track {}", track.id.source_ordinal),
+                    )
+                    .await;
+                let reference = match (reference_materialization.as_ref(), reference_toolchain, reference_runtime, plan.reference.clone()) {
+                    (Some((materialization, _)), Some(toolchain), Some(runtime), Some(summary)) => Some(ReferenceExecutionEvidence {
+                        original_source_kind: plan_request.source.dsd_source_kind.clone().ok_or_else(|| {
+                            TrackExecutionError::new(
+                                ConvertError::Backend("Reference source identity is missing after materialization".to_string()),
+                                commands.clone(),
+                            )
+                        })?,
+                        source_content_sha256: materialization.source_content_sha256,
+                        source_probe_digest: admitted_source_probe_digest,
+                        canonical_materialization_sha256: materialization.canonical_materialization_sha256,
+                        plan: summary,
+                        measurements: runtime.measurements,
+                        toolchain,
+                        resolved_command_hash: runtime.resolved_command_hash,
+                        pcm_verification: runtime.pcm_verification,
+                    }),
+                    (None, None, None, None) => None,
+                    _ => {
+                        return Err(TrackExecutionError::new(
                             ConvertError::Backend(
-                                "measurement-aware plan is missing Reference authority".to_string(),
+                                "Reference plan/materialization/runtime authority is incomplete".to_string(),
                             ),
-                            Vec::new(),
-                        )
-                    })?,
-                    runner,
-                    cancel,
-                    tool_paths,
-                    tool_concurrency_limits,
-                    progress,
-                    start_fraction,
-                    end_fraction,
-                    track_label(track),
-                    &work_dir,
-                    reference_toolchain.as_ref().ok_or_else(|| {
-                        TrackExecutionError::new(
-                            ConvertError::Backend("Reference toolchain evidence is missing".to_string()),
-                            Vec::new(),
-                        )
-                    })?,
-                )
-                .await?;
-                (runtime.commands.clone(), Some(runtime))
-            };
-            if let Some(finalization) = finalization {
-                if let Err(err) = apply_finalization(finalization) {
-                    return Err(TrackExecutionError::new(err, commands));
-                }
+                            commands,
+                        ));
+                    }
+                };
+                Ok(ExecutedTrackPlan {
+                    commands,
+                    elapsed: started.elapsed(),
+                    metadata_satisfaction,
+                    metadata_required,
+                    command_hash,
+                    reference,
+                })
             }
-            progress
-                .estimated_with_key(
-                    end_fraction,
-                    format!("plan-finish:{}", track.id.source_ordinal),
-                    format!("Finished track {}", track.id.source_ordinal),
-                )
-                .await;
-            let reference = match (reference_materialization.as_ref(), reference_toolchain, reference_runtime, plan.reference.clone()) {
-                (Some((materialization, _)), Some(toolchain), Some(runtime), Some(summary)) => Some(ReferenceExecutionEvidence {
-                    original_source_kind: plan_request.source.dsd_source_kind.clone().ok_or_else(|| {
-                        TrackExecutionError::new(
-                            ConvertError::Backend("Reference source identity is missing after materialization".to_string()),
-                            commands.clone(),
-                        )
-                    })?,
-                    source_content_sha256: materialization.source_content_sha256,
-                    source_probe_digest: admitted_source_probe_digest,
-                    canonical_materialization_sha256: materialization.canonical_materialization_sha256,
-                    plan: summary,
-                    measurements: runtime.measurements,
-                    toolchain,
-                    resolved_command_hash: runtime.resolved_command_hash,
-                    pcm_verification: runtime.pcm_verification,
-                }),
-                (None, None, None, None) => None,
-                _ => {
-                    return Err(TrackExecutionError::new(
-                        ConvertError::Backend(
-                            "Reference plan/materialization/runtime authority is incomplete".to_string(),
-                        ),
-                        commands,
-                    ));
-                }
-            };
-            Ok(ExecutedTrackPlan {
-                commands,
-                elapsed: started.elapsed(),
-                metadata_satisfaction,
-                metadata_required,
-                command_hash,
-                reference,
-            })
         }
-    };
+    }
+    .await;
 
-    match result {
-        Ok(value) => {
-            cleanup_paths(plan.cleanup_paths());
-            cleanup_track_work_dir(&work_dir);
-            Ok(value)
+    let cleanup_result = match cleanup_guard.cleanup_now() {
+        Ok(TrackCleanupOutcome::Complete) => Ok(()),
+        Ok(TrackCleanupOutcome::DeferredToBlockingWorker) => Err(io::Error::other(
+            "track execution completed while a blocking materialization worker remained active",
+        )),
+        Err(error) => Err(error),
+    };
+    finish_track_execution(result, cleanup_result)
+}
+
+fn finish_track_execution(
+    result: Result<ExecutedTrackPlan, TrackExecutionError>,
+    cleanup_result: io::Result<()>,
+) -> Result<ExecutedTrackPlan, TrackExecutionError> {
+    match (result, cleanup_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Err(cleanup_error)) => {
+            let message = format!(
+                "track conversion completed, but governed scratch cleanup failed: {cleanup_error}"
+            );
+            Err(TrackExecutionError::new(
+                ConvertError::Io(cleanup_error),
+                value.commands,
+            )
+            .with_message(message))
         }
-        Err(err) => {
-            cleanup_paths(plan.cleanup_paths());
-            cleanup_track_work_dir(&work_dir);
-            Err(err)
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            let primary = error.to_string();
+            Err(error.with_message(format!(
+                "{primary}; governed scratch cleanup also failed: {cleanup_error}"
+            )))
         }
     }
 }
@@ -2081,6 +2374,9 @@ fn validate_embedded_release_certification(
     let known_defect = carrier
         .get("known_defect")
         .and_then(serde_json::Value::as_object);
+    let silent_float64_w64_open_defect = carrier
+        .get("silent_float64_w64_open_defect")
+        .and_then(serde_json::Value::as_object);
     let direct_sox_path = carrier
         .get("direct_sox_path")
         .and_then(serde_json::Value::as_object);
@@ -2188,6 +2484,70 @@ fn validate_embedded_release_certification(
     let scaling_delta = known_defect
         .and_then(|value| value.get("scaling_delta_db"))
         .and_then(serde_json::Value::as_f64);
+    let silent_short_silence_bytes = silent_float64_w64_open_defect
+        .and_then(|value| value.get("short_silence_file_bytes"))
+        .and_then(serde_json::Value::as_u64);
+    let silent_short_nonzero_bytes = silent_float64_w64_open_defect
+        .and_then(|value| value.get("short_nonzero_file_bytes"))
+        .and_then(serde_json::Value::as_u64);
+    let silent_long_silence_bytes = silent_float64_w64_open_defect
+        .and_then(|value| value.get("long_silence_file_bytes"))
+        .and_then(serde_json::Value::as_u64);
+    let silent_long_opened = silent_float64_w64_open_defect
+        .and_then(|value| value.get("long_silence_direct_ffmpeg_opened"))
+        .and_then(serde_json::Value::as_bool);
+    let silent_classification = silent_float64_w64_open_defect
+        .and_then(|value| value.get("trigger_classification"))
+        .and_then(serde_json::Value::as_str);
+    let silent_short_error = silent_float64_w64_open_defect
+        .and_then(|value| value.get("short_silence_error"))
+        .and_then(serde_json::Value::as_str);
+    let silent_long_error = silent_float64_w64_open_defect
+        .and_then(|value| value.get("long_silence_error"))
+        .and_then(serde_json::Value::as_str);
+    let silent_float64_w64_open_defect_valid = silent_float64_w64_open_defect
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("reproduced_and_classified")
+        && silent_float64_w64_open_defect
+            .and_then(|value| value.get("carrier"))
+            .and_then(serde_json::Value::as_str)
+            == Some("sox_float64_w64_direct_to_ffmpeg")
+        && silent_float64_w64_open_defect
+            .and_then(|value| value.get("short_duration_seconds"))
+            .and_then(serde_json::Value::as_str)
+            == Some("0.050000000")
+        && silent_float64_w64_open_defect
+            .and_then(|value| value.get("long_duration_seconds"))
+            .and_then(serde_json::Value::as_str)
+            == Some("1.000000000")
+        && silent_short_silence_bytes.is_some_and(|value| value > 0)
+        && silent_short_silence_bytes == silent_short_nonzero_bytes
+        && silent_short_silence_bytes
+            .zip(silent_long_silence_bytes)
+            .is_some_and(|(short, long)| long > short)
+        && silent_float64_w64_open_defect
+            .and_then(|value| value.get("short_silence_direct_ffmpeg_opened"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && silent_float64_w64_open_defect
+            .and_then(|value| value.get("matched_short_nonzero_direct_ffmpeg_opened"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && matches!(
+            (silent_classification, silent_long_opened),
+            (Some("zero_content"), Some(false))
+                | (Some("short_zero_content_interaction"), Some(true))
+        )
+        && silent_short_error.is_some_and(|value| !value.is_empty())
+        && (silent_long_opened == Some(true)
+            || silent_long_error.is_some_and(|value| !value.is_empty()))
+        && silent_float64_w64_open_defect
+            .and_then(|value| value.get("production_disposition"))
+            .and_then(serde_json::Value::as_str)
+            == Some(
+                "direct_ffmpeg_forbidden; silence_scan_uses_route_table_sox_f64le_raw_stream",
+            );
     let corrected_peak = direct_sox_path
         .and_then(|value| value.get("reported_peak_dbtp"))
         .and_then(serde_json::Value::as_f64);
@@ -2233,6 +2593,7 @@ fn validate_embedded_release_certification(
             .and_then(|value| value.get("expected_scaling"))
             .and_then(serde_json::Value::as_str)
             != Some("2^31")
+        || !silent_float64_w64_open_defect_valid
         || direct_input_tp.is_none_or(|value| value <= 100.0)
         || scaling_delta.is_none_or(|value| {
             (value - 20.0 * (2_f64.powi(31)).log10()).abs() > 0.02
@@ -5251,11 +5612,13 @@ pub fn qualify_reference_source_materialization(
     work_dir: &Path,
 ) -> io::Result<ReferenceSourceMaterializationQualification> {
     let cancel = CancellationToken::new();
+    let scratch = ReferenceScratchPaths::for_source_kind(work_dir, source_kind);
     let materialization = materialize_reference_presented_source(
         source_kind,
         source,
-        work_dir,
+        &scratch,
         &cancel,
+        None,
     )?;
     Ok(ReferenceSourceMaterializationQualification {
         materialized_path: materialization.path,
@@ -5342,25 +5705,59 @@ struct ReferenceRuntimeResult {
     pcm_verification: ReferencePcmVerificationEvidence,
 }
 
+fn validate_reference_scratch_cleanup_authority(
+    plan: &ConversionPlan,
+    scratch: &ReferenceScratchPaths,
+) -> Result<(), TrackExecutionError> {
+    let cleanup = plan.cleanup_paths();
+    let missing = scratch
+        .all()
+        .into_iter()
+        .filter(|path| !cleanup.iter().any(|candidate| candidate.as_path() == *path))
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference plan omitted governed scratch paths: {}",
+                missing.join(", ")
+            )),
+            Vec::new(),
+        ))
+    }
+}
+
 async fn materialize_reference_source(
     plan_request: &PlanRequest,
     track: &PreparedTrack,
     realized_input: &Path,
-    work_dir: &Path,
+    scratch: &ReferenceScratchPaths,
     cancel: &CancellationToken,
+    worker_lease: TrackExecutionBlockingWorkerLease,
 ) -> Result<ReferenceMaterialization, TrackExecutionError> {
     let plan_request = plan_request.clone();
     let track = track.clone();
     let realized_input = realized_input.to_path_buf();
-    let work_dir = work_dir.to_path_buf();
-    let cancel = cancel.clone();
-    tokio::task::spawn_blocking(move || {
+    let scratch = scratch.clone();
+    let worker_cancel = cancel.child_token();
+    let cancel_on_drop = worker_cancel.clone().drop_guard();
+    #[cfg(test)]
+    let materialization_pause = REFERENCE_MATERIALIZATION_PAUSE
+        .try_with(Arc::clone)
+        .ok();
+    #[cfg(not(test))]
+    let materialization_pause: Option<Arc<ReferenceMaterializationPause>> = None;
+    let result = tokio::task::spawn_blocking(move || {
+        let _worker_lease = worker_lease;
         materialize_reference_source_blocking(
             &plan_request,
             &track,
             &realized_input,
-            &work_dir,
-            &cancel,
+            &scratch,
+            &worker_cancel,
+            materialization_pause.as_deref(),
         )
     })
     .await
@@ -5371,15 +5768,18 @@ async fn materialize_reference_source(
             )),
             Vec::new(),
         )
-    })?
+    })?;
+    drop(cancel_on_drop);
+    result
 }
 
 fn materialize_reference_source_blocking(
     plan_request: &PlanRequest,
     track: &PreparedTrack,
     realized_input: &Path,
-    work_dir: &Path,
+    scratch: &ReferenceScratchPaths,
     cancel: &CancellationToken,
+    _materialization_pause: Option<&ReferenceMaterializationPause>,
 ) -> Result<ReferenceMaterialization, TrackExecutionError> {
     if cancel.is_cancelled() {
         return Err(reference_cancelled_error());
@@ -5453,8 +5853,17 @@ fn materialize_reference_source_blocking(
                 iso,
                 *track_index,
                 *area,
-                work_dir,
-                cancel,
+                &scratch.sacd_extracted_source,
+                &scratch.sacd_extracted_source_temporary,
+                || {
+                    #[cfg(test)]
+                    if let Some(pause) = _materialization_pause {
+                        pause.pause_if_selected(
+                            ReferenceMaterializationPausePoint::DuringSacdExtraction,
+                        );
+                    }
+                    cancel.is_cancelled()
+                },
             )
             .map_err(|err| {
                 if cancel.is_cancelled() {
@@ -5490,8 +5899,9 @@ fn materialize_reference_source_blocking(
     let materialized = materialize_reference_presented_source(
         source_kind,
         &presented_source,
-        work_dir,
+        scratch,
         cancel,
+        _materialization_pause,
     )
     .map_err(|err| {
         if err.kind() == io::ErrorKind::Interrupted {
@@ -5535,8 +5945,9 @@ fn materialize_reference_source_blocking(
 fn materialize_reference_presented_source(
     source_kind: &DsdSourceKind,
     presented_source: &Path,
-    work_dir: &Path,
+    scratch: &ReferenceScratchPaths,
     cancel: &CancellationToken,
+    _materialization_pause: Option<&ReferenceMaterializationPause>,
 ) -> io::Result<ReferenceMaterialization> {
     if cancel.is_cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -5581,21 +5992,32 @@ fn materialize_reference_presented_source(
         ));
     }
 
-    fs::create_dir_all(work_dir)?;
-    let extension = presented_source
-        .extension()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("dsd");
-    let admitted = work_dir.join(format!("reference-admitted-source.{extension}"));
-    let copied_sha256 = verified_private_copy(presented_source, &admitted, cancel)?;
+    #[cfg(test)]
+    if let Some(pause) = _materialization_pause {
+        pause.pause_if_selected(
+            ReferenceMaterializationPausePoint::BeforeScratchPathCreation,
+        );
+    }
+    let admitted = &scratch.admitted_source;
+    let copied_sha256 = verified_private_copy(
+        presented_source,
+        admitted,
+        &scratch.admitted_source_temporary,
+        cancel,
+        _materialization_pause,
+    )?;
     let (path, canonical_materialization_sha256) = if matches!(source_kind, DsdSourceKind::DsdiffDst) {
-        let canonical = work_dir.join("reference-canonical-dsd.dff");
-        decode_dsdiff_dst_to_canonical_dff(&admitted, &canonical, cancel)?;
-        let digest = stable_file_sha256_cancel(&canonical, cancel)?;
-        (canonical, digest)
+        decode_dsdiff_dst_to_canonical_dff(
+            admitted,
+            &scratch.canonical_dsd,
+            &scratch.canonical_dsd_temporary,
+            cancel,
+            _materialization_pause,
+        )?;
+        let digest = stable_file_sha256_cancel(&scratch.canonical_dsd, cancel)?;
+        (scratch.canonical_dsd.clone(), digest)
     } else {
-        (admitted, copied_sha256)
+        (admitted.clone(), copied_sha256)
     };
     Ok(ReferenceMaterialization {
         path,
@@ -5607,7 +6029,9 @@ fn materialize_reference_presented_source(
 fn verified_private_copy(
     source: &Path,
     destination: &Path,
+    temporary: &Path,
     cancel: &CancellationToken,
+    _materialization_pause: Option<&ReferenceMaterializationPause>,
 ) -> io::Result<Sha256Digest> {
     let resolved = fs::canonicalize(source)?;
     let mut input = File::open(&resolved)?;
@@ -5623,21 +6047,18 @@ fn verified_private_copy(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = destination.with_extension(format!(
-        "{}.tmp-{}",
-        destination
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("reference"),
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&tmp);
+    remove_cleanup_path(temporary)?;
     let result = (|| {
         let mut output = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
-        copy_reader_cancel(&mut input, &mut output, cancel)?;
+            .open(temporary)?;
+        copy_reader_cancel(
+            &mut input,
+            &mut output,
+            cancel,
+            _materialization_pause,
+        )?;
         output.sync_all()?;
         drop(output);
 
@@ -5649,7 +6070,7 @@ fn verified_private_copy(
                 "source bytes changed while materializing",
             ));
         }
-        let copied = stable_file_sha256_cancel(&tmp, cancel)?;
+        let copied = stable_file_sha256_cancel(temporary, cancel)?;
         if admitted != copied {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -5659,12 +6080,12 @@ fn verified_private_copy(
         if cancel.is_cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
-        let _ = fs::remove_file(destination);
-        fs::rename(&tmp, destination)?;
+        remove_cleanup_path(destination)?;
+        fs::rename(temporary, destination)?;
         Ok(admitted)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = remove_cleanup_path(temporary);
     }
     result
 }
@@ -5672,7 +6093,9 @@ fn verified_private_copy(
 fn decode_dsdiff_dst_to_canonical_dff(
     source: &Path,
     destination: &Path,
+    temporary: &Path,
     cancel: &CancellationToken,
+    _materialization_pause: Option<&ReferenceMaterializationPause>,
 ) -> io::Result<()> {
     if cancel.is_cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -5680,15 +6103,18 @@ fn decode_dsdiff_dst_to_canonical_dff(
     let input = File::open(source)?;
     let mut reader = open_dsd_as_decoded_reader(input)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    let tmp = destination.with_extension(format!("dff.tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
+    remove_cleanup_path(temporary)?;
     let mut output = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(&tmp)?;
+        .open(temporary)?;
     let result = (|| {
         let stats = write_decoded_dsd_to_dff_with_cancel(&mut reader, &mut output, || {
+            #[cfg(test)]
+            if let Some(pause) = _materialization_pause {
+                pause.pause_if_selected(ReferenceMaterializationPausePoint::DuringDstDecode);
+            }
             cancel.is_cancelled()
         })
         .map_err(|err| match err {
@@ -5716,12 +6142,12 @@ fn decode_dsdiff_dst_to_canonical_dff(
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
         drop(output);
-        let _ = fs::remove_file(destination);
-        fs::rename(&tmp, destination)?;
+        remove_cleanup_path(destination)?;
+        fs::rename(temporary, destination)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = remove_cleanup_path(temporary);
     }
     result
 }
@@ -5813,9 +6239,12 @@ fn copy_reader_cancel(
     input: &mut File,
     output: &mut File,
     cancel: &CancellationToken,
+    _materialization_pause: Option<&ReferenceMaterializationPause>,
 ) -> io::Result<u64> {
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 128 * 1024];
+    #[cfg(test)]
+    let mut copy_pause_reached = false;
     loop {
         if cancel.is_cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -5825,6 +6254,13 @@ fn copy_reader_cancel(
             break;
         }
         output.write_all(&buffer[..count])?;
+        #[cfg(test)]
+        if !copy_pause_reached {
+            if let Some(pause) = _materialization_pause {
+                pause.pause_if_selected(ReferenceMaterializationPausePoint::DuringSourceCopy);
+            }
+            copy_pause_reached = true;
+        }
         copied = copied
             .checked_add(count as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "copy size overflow"))?;
@@ -5861,7 +6297,7 @@ async fn execute_reference_steps(
     start_fraction: f32,
     end_fraction: f32,
     track_label: String,
-    work_dir: &Path,
+    silence_scan_path: &Path,
     toolchain: &ReferenceToolchainEvidence,
 ) -> Result<ReferenceRuntimeResult, TrackExecutionError> {
     let mut records = Vec::new();
@@ -6077,7 +6513,7 @@ async fn execute_reference_steps(
                     window_start,
                     window_end,
                     &track_label,
-                    work_dir,
+                    silence_scan_path,
                     toolchain.reporting_uncertainty,
                     toolchain.analyzer_residual,
                 )
@@ -7163,6 +7599,21 @@ fn validate_reference_measurement_contract<'a>(
         ));
     }
 
+    let expected_carrier = match measurement.purpose {
+        TruePeakPurpose::GainAuthority => summary.r64_path.as_path(),
+        TruePeakPurpose::PostFinalAcceptance => summary.qpcm_path.as_path(),
+    };
+    let expected_float32_pipe = measurement.purpose == TruePeakPurpose::PostFinalAcceptance
+        && summary.final_pcm.bit_depth == tonepoet_pipeline::PcmBitDepth::Float32;
+    if measurement.input_stage.is_some() != expected_float32_pipe {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference measurement {} uses a transport that is not authorized for {:?} {:?}",
+                measurement.id.0, measurement.purpose, summary.final_pcm.bit_depth
+            )),
+            Vec::new(),
+        ));
+    }
     let sample_rate = summary.final_pcm.sample_rate_hz.to_string();
     let channels = summary.final_pcm.channels.to_string();
     let oversampled_rate = summary
@@ -7190,7 +7641,16 @@ fn validate_reference_measurement_contract<'a>(
                 Vec::new(),
             )
         })?;
-        let carrier_arg = carrier.display().to_string();
+        if carrier != expected_carrier {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(format!(
+                    "Reference measurement {} producer is bound to the wrong carrier path",
+                    measurement.id.0
+                )),
+                Vec::new(),
+            ));
+        }
+        let carrier_arg = expected_carrier.display().to_string();
         let producer_args = [
             "-nostdin", "-hide_banner", "-nostats", "-loglevel", "error", "-i",
             carrier_arg.as_str(), "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a",
@@ -7237,7 +7697,16 @@ fn validate_reference_measurement_contract<'a>(
             Vec::new(),
         )
     })?;
-    let carrier_arg = carrier.display().to_string();
+    if carrier != expected_carrier {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference measurement {} direct analyzer is bound to the wrong carrier path",
+                measurement.id.0
+            )),
+            Vec::new(),
+        ));
+    }
+    let carrier_arg = expected_carrier.display().to_string();
     let direct_args = [
         "-S", "-D", carrier_arg.as_str(), "-n", "rate", "-v", "-L", "-s",
         oversampled_rate.as_str(), "stats",
@@ -7271,7 +7740,7 @@ async fn execute_reference_measurement(
     _window_start: f32,
     window_end: f32,
     track_label: &str,
-    work_dir: &Path,
+    silence_scan_path: &Path,
     reporting_uncertainty: tonepoet_pipeline::DbNano,
     analyzer_residual: tonepoet_pipeline::DbNano,
 ) -> Result<(Vec<CommandRecord>, TruePeakMeasurement), TrackExecutionError> {
@@ -7361,15 +7830,25 @@ async fn execute_reference_measurement(
         )?;
     let needs_silence_proof = raw_peak == "-inf";
     if needs_silence_proof {
-        let input = measurement.carrier_path().ok_or_else(|| {
+        let selector = match measurement.purpose {
+            TruePeakPurpose::GainAuthority => ReferenceDecodedCarrierSelector::ReconstructionR64,
+            TruePeakPurpose::PostFinalAcceptance => ReferenceDecodedCarrierSelector::TerminalQpcm,
+        };
+        let carrier = summary.decoded_carrier(selector).map_err(|error| {
             TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference silence verification requires a path-backed carrier".to_string(),
-                ),
+                ConvertError::Backend(format!(
+                    "Reference silence verification cannot authorize its carrier route: {error}"
+                )),
                 records.clone(),
             )
         })?;
-        let silence_record = verify_signed_zero_audio(input, runner, cancel, limits, work_dir)
+        let silence_record = verify_signed_zero_audio(
+            &carrier,
+            runner,
+            cancel,
+            limits,
+            silence_scan_path,
+        )
             .await
             .map_err(|err| {
                 let mut commands = records.clone();
@@ -7394,15 +7873,15 @@ async fn execute_reference_measurement(
 }
 
 async fn verify_signed_zero_audio(
-    input: &Path,
+    carrier: &ReferenceDecodedCarrier,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     limits: Option<&Arc<ToolConcurrencyLimits>>,
-    work_dir: &Path,
+    planned_raw_path: &Path,
 ) -> Result<CommandRecord, TrackExecutionError> {
-    let raw = work_dir.join("reference-silence-scan.f64le");
-    let _ = fs::remove_file(&raw);
-    let planned = build_reference_silence_scan_command(input, &raw);
+    let mut raw = TemporaryFileCleanupGuard::new(planned_raw_path.to_path_buf())
+    .map_err(|err| TrackExecutionError::new(ConvertError::Io(err), Vec::new()))?;
+    let planned = build_reference_silence_scan_command(carrier, raw.path());
     let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
         .map_err(TrackExecutionError::from)?;
     let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
@@ -7412,7 +7891,7 @@ async fn verify_signed_zero_audio(
             TrackExecutionError::new(ConvertError::Tool(err), record)
         })?;
     let scan_result = (|| -> Result<(), TrackExecutionError> {
-        let mut file = File::open(&raw).map_err(|err| {
+        let mut file = File::open(raw.path()).map_err(|err| {
             TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
         })?;
         let len = file
@@ -7453,16 +7932,10 @@ async fn verify_signed_zero_audio(
         }
         Ok(())
     })();
-    let cleanup_result = fs::remove_file(&raw);
     scan_result?;
-    if let Err(err) = cleanup_result {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            return Err(TrackExecutionError::new(
-                ConvertError::Io(err),
-                vec![output.command.clone()],
-            ));
-        }
-    }
+    raw.cleanup_now().map_err(|err| {
+        TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
+    })?;
     Ok(output.command)
 }
 
@@ -7798,6 +8271,11 @@ async fn run_planned_command(
     label: &str,
 ) -> Result<super::tool::ToolOutput, ToolRunnerError> {
     #[cfg(test)]
+    if TRACK_EXECUTION_USE_INJECTED_RUNNER.try_with(|_| ()).is_ok() {
+        return runner.run(cmd, cancel).await;
+    }
+
+    #[cfg(test)]
     if should_capture_planned_command_for_test(&cmd) {
         return Ok(successful_captured_tool_output_for_test(cmd));
     }
@@ -7878,6 +8356,253 @@ fn command_windows(
         .collect()
 }
 
+
+struct TrackExecutionCleanupState {
+    planner_paths: Vec<PathBuf>,
+    active_blocking_workers: usize,
+    cleanup_requested: bool,
+    cleanup_complete: bool,
+}
+
+struct TrackExecutionCleanupShared {
+    work_dir: PathBuf,
+    state: Mutex<TrackExecutionCleanupState>,
+    _work_permit: OwnedSemaphorePermit,
+}
+
+struct TrackExecutionCleanupGuard {
+    shared: Arc<TrackExecutionCleanupShared>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackCleanupOutcome {
+    Complete,
+    DeferredToBlockingWorker,
+}
+
+static TRACK_WORK_SEMAPHORES: OnceLock<Mutex<HashMap<PathBuf, Weak<Semaphore>>>> =
+    OnceLock::new();
+
+fn track_work_semaphore(work_dir: &Path) -> Arc<Semaphore> {
+    let registry = TRACK_WORK_SEMAPHORES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.retain(|_, semaphore| semaphore.strong_count() != 0);
+    if let Some(semaphore) = registry.get(work_dir).and_then(Weak::upgrade) {
+        return semaphore;
+    }
+    let semaphore = Arc::new(Semaphore::new(1));
+    registry.insert(work_dir.to_path_buf(), Arc::downgrade(&semaphore));
+    semaphore
+}
+
+impl TrackExecutionCleanupGuard {
+    async fn acquire(
+        work_dir: PathBuf,
+        cancel: &CancellationToken,
+    ) -> Result<Self, TrackExecutionError> {
+        if cancel.is_cancelled() {
+            return Err(TrackExecutionError::new(
+                ConvertError::Realize("cancelled".to_string()),
+                Vec::new(),
+            ));
+        }
+
+        let semaphore = track_work_semaphore(&work_dir);
+        let work_permit = tokio::select! {
+            biased;
+
+            _ = cancel.cancelled() => {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Realize("cancelled".to_string()),
+                    Vec::new(),
+                ));
+            }
+            permit = semaphore.acquire_owned() => permit.map_err(|_| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "track work-directory coordination semaphore was closed".to_string(),
+                    ),
+                    Vec::new(),
+                )
+            })?,
+        };
+        Ok(Self {
+            shared: Arc::new(TrackExecutionCleanupShared {
+                work_dir,
+                state: Mutex::new(TrackExecutionCleanupState {
+                    planner_paths: Vec::new(),
+                    active_blocking_workers: 0,
+                    cleanup_requested: false,
+                    cleanup_complete: false,
+                }),
+                _work_permit: work_permit,
+            }),
+        })
+    }
+
+    fn add_planner_paths(&self, paths: &[PathBuf]) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for path in paths {
+            if !state.planner_paths.contains(path) {
+                state.planner_paths.push(path.clone());
+            }
+        }
+    }
+
+    fn blocking_worker_lease(&self) -> Result<TrackExecutionBlockingWorkerLease, TrackExecutionError> {
+        let mut state = self.shared.state.lock().map_err(|_| {
+            TrackExecutionError::new(
+                ConvertError::Backend("track cleanup authority lock was poisoned".to_string()),
+                Vec::new(),
+            )
+        })?;
+        if state.cleanup_requested || state.cleanup_complete {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "cannot start Reference materialization after cleanup was requested".to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+        state.active_blocking_workers = state
+            .active_blocking_workers
+            .checked_add(1)
+            .ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend("track cleanup worker count overflow".to_string()),
+                    Vec::new(),
+                )
+            })?;
+        drop(state);
+        Ok(TrackExecutionBlockingWorkerLease {
+            shared: self.shared.clone(),
+            released: false,
+        })
+    }
+
+    fn cleanup_now(&self) -> io::Result<TrackCleanupOutcome> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("track cleanup authority lock was poisoned"))?;
+        if state.cleanup_complete {
+            return Ok(TrackCleanupOutcome::Complete);
+        }
+        state.cleanup_requested = true;
+        if state.active_blocking_workers != 0 {
+            return Ok(TrackCleanupOutcome::DeferredToBlockingWorker);
+        }
+        cleanup_declared_paths_and_work_dir(&state.planner_paths, &self.shared.work_dir)?;
+        state.cleanup_complete = true;
+        Ok(TrackCleanupOutcome::Complete)
+    }
+}
+
+impl Drop for TrackExecutionCleanupGuard {
+    fn drop(&mut self) {
+        match self.cleanup_now() {
+            Ok(TrackCleanupOutcome::Complete | TrackCleanupOutcome::DeferredToBlockingWorker) => {}
+            Err(error) => log::warn!(
+                "best-effort track cleanup failed for {}: {error}",
+                self.shared.work_dir.display()
+            ),
+        }
+    }
+}
+
+struct TrackExecutionBlockingWorkerLease {
+    shared: Arc<TrackExecutionCleanupShared>,
+    released: bool,
+}
+
+impl TrackExecutionBlockingWorkerLease {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_blocking_workers = state.active_blocking_workers.saturating_sub(1);
+        if state.active_blocking_workers == 0
+            && state.cleanup_requested
+            && !state.cleanup_complete
+        {
+            match cleanup_declared_paths_and_work_dir(
+                &state.planner_paths,
+                &self.shared.work_dir,
+            ) {
+                Ok(()) => state.cleanup_complete = true,
+                Err(error) => log::warn!(
+                    "deferred track cleanup failed for {} after blocking materialization exited: {error}",
+                    self.shared.work_dir.display()
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for TrackExecutionBlockingWorkerLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct TemporaryFileCleanupGuard {
+    path: PathBuf,
+    cleaned: bool,
+}
+
+impl TemporaryFileCleanupGuard {
+    fn new(path: PathBuf) -> io::Result<Self> {
+        remove_cleanup_path(&path)?;
+        Ok(Self {
+            path,
+            cleaned: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup_now(&mut self) -> io::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        remove_cleanup_path(&self.path)?;
+        if cleanup_path_is_present(&self.path)? {
+            return Err(io::Error::other(format!(
+                "temporary cleanup path remains: {}",
+                self.path.display()
+            )));
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryFileCleanupGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup_now() {
+            log::warn!(
+                "best-effort temporary cleanup failed for {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 fn reset_track_work_dir(work_dir: &Path) -> Result<(), ConvertError> {
     if work_dir.exists() {
         fs::remove_dir_all(work_dir)?;
@@ -7886,12 +8611,108 @@ fn reset_track_work_dir(work_dir: &Path) -> Result<(), ConvertError> {
     Ok(())
 }
 
-fn cleanup_track_work_dir(work_dir: &Path) {
-    // Best-effort: all planner-declared intermediate files are already removed
-    // above. Removing the deterministic per-track directory prevents interrupted
-    // runs from leaving orphan scratch trees, while ignoring errors avoids
-    // masking the primary conversion outcome.
-    let _ = fs::remove_dir_all(work_dir);
+fn remove_cleanup_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "planner-declared file cleanup path is a directory: {}",
+                path.display()
+            ),
+        )),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_path_is_present(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_paths_checked(paths: &[PathBuf]) -> io::Result<()> {
+    let mut failures = Vec::new();
+    for path in paths {
+        if let Err(error) = remove_cleanup_path(path) {
+            failures.push(format!("{}: {error}", path.display()));
+        }
+    }
+    let mut remaining = Vec::new();
+    for path in paths {
+        match cleanup_path_is_present(path) {
+            Ok(true) => remaining.push(path.display().to_string()),
+            Ok(false) => {}
+            Err(error) => failures.push(format!(
+                "could not verify cleanup of {}: {error}",
+                path.display()
+            )),
+        }
+    }
+    if failures.is_empty() && remaining.is_empty() {
+        Ok(())
+    } else {
+        let mut details = failures;
+        if !remaining.is_empty() {
+            details.push(format!("paths remain: {}", remaining.join(", ")));
+        }
+        Err(io::Error::other(format!(
+            "planner cleanup failed: {}",
+            details.join("; ")
+        )))
+    }
+}
+
+fn cleanup_track_work_dir(work_dir: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(work_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(work_dir)?,
+        Ok(_) => fs::remove_file(work_dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if cleanup_path_is_present(work_dir)? {
+        Err(io::Error::other(format!(
+            "track work directory remains: {}",
+            work_dir.display()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_declared_paths_and_work_dir(
+    paths: &[PathBuf],
+    work_dir: &Path,
+) -> io::Result<()> {
+    let mut first_error = cleanup_paths_checked(paths).err();
+    if let Err(error) = cleanup_track_work_dir(work_dir) {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+
+    let mut remaining = Vec::new();
+    for path in paths {
+        if cleanup_path_is_present(path).unwrap_or(true) {
+            remaining.push(path.display().to_string());
+        }
+    }
+    if cleanup_path_is_present(work_dir).unwrap_or(true) {
+        remaining.push(work_dir.display().to_string());
+    }
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(first_error.unwrap_or_else(|| {
+            io::Error::other(format!(
+                "track cleanup left governed paths: {}",
+                remaining.join(", ")
+            ))
+        }))
+    }
 }
 
 fn copy_to_work_path(input: &Path, work_path: &Path) -> Result<(), ConvertError> {
@@ -7928,12 +8749,6 @@ fn apply_finalization(finalization: &Finalization) -> Result<(), ConvertError> {
             fs::rename(from, to)?;
             Ok(())
         }
-    }
-}
-
-fn cleanup_paths(paths: &[PathBuf]) {
-    for path in paths {
-        let _ = fs::remove_file(path);
     }
 }
 
@@ -8043,6 +8858,7 @@ fn track_label(track: &PreparedTrack) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use tonepoet_pipeline::{extract_single_loudnorm_report, parse_reference_true_peak_measurement};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -8055,8 +8871,8 @@ mod tests {
     use crate::convert::pipeline::types::{
         CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy,
         NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineStage, PublishPolicy,
-        SacdArea, SourceAudioDescriptor, SourceOptions, StagePolicy, StageRequirement, TrackId,
-        TrackMetadata, TrackSelection, TrackSourceRef,
+        SacdArea, SourceAudioCoding, SourceAudioDescriptor, SourceOptions, StagePolicy,
+        StageRequirement, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
     };
     use tempfile::TempDir;
     use tonepoet_pipeline::{AudioFormat, InputSource, OutputSink, PipelineSettings, ToolIdentifier};
@@ -8214,37 +9030,49 @@ mod tests {
 
     #[test]
     fn reference_measurements_are_bound_to_their_summary_carrier_and_route() {
-        let f32 = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float32);
-        let f32_summary = f32.reference.as_ref().expect("Reference summary");
-        let f32_measurements = f32
-            .steps()
-            .iter()
-            .filter_map(|step| match step {
-                tonepoet_pipeline::PlannedExecutionStep::Measurement(value) => Some(value),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(f32_measurements.len(), 2);
-        for measurement in &f32_measurements {
-            validate_reference_measurement_binding(f32_summary, measurement)
-                .expect("planner measurement binding is canonical");
-            validate_reference_measurement_contract(f32_summary, measurement)
-                .expect("planner measurement transport is canonical");
-        }
+        for target in [
+            tonepoet_pipeline::ResolvedOutputTarget::WavW64,
+            tonepoet_pipeline::ResolvedOutputTarget::WavRiff,
+            tonepoet_pipeline::ResolvedOutputTarget::WavRf64,
+        ] {
+            let f32 = reference_wav_plan(tonepoet_pipeline::PcmBitDepth::Float32, target);
+            let f32_summary = f32.reference.as_ref().expect("Reference summary");
+            let f32_measurements = f32
+                .steps()
+                .iter()
+                .filter_map(|step| match step {
+                    tonepoet_pipeline::PlannedExecutionStep::Measurement(value) => Some(value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(f32_measurements.len(), 2);
+            for measurement in &f32_measurements {
+                validate_reference_measurement_binding(f32_summary, measurement)
+                    .expect("planner measurement binding is canonical");
+                validate_reference_measurement_contract(f32_summary, measurement)
+                    .expect("planner measurement transport is canonical");
+            }
 
-        let mut crossed_path = (*f32_measurements
-            .iter()
-            .find(|measurement| {
-                measurement.purpose == TruePeakPurpose::PostFinalAcceptance
-            })
-            .expect("Float32 post measurement"))
-        .clone();
-        let wrong_path = f32_summary.r64_path.display().to_string();
-        crossed_path.input_stage.as_mut().unwrap().input =
-            InputSource::Path(f32_summary.r64_path.clone());
-        crossed_path.input_stage.as_mut().unwrap().args[6] = wrong_path;
-        assert!(validate_reference_measurement_binding(f32_summary, &crossed_path).is_err());
-        assert!(validate_reference_measurement_contract(f32_summary, &crossed_path).is_err());
+            let mut crossed_path = (*f32_measurements
+                .iter()
+                .find(|measurement| {
+                    measurement.purpose == TruePeakPurpose::PostFinalAcceptance
+                })
+                .expect("Float32 post measurement"))
+            .clone();
+            let wrong_path = f32_summary.r64_path.display().to_string();
+            crossed_path.input_stage.as_mut().unwrap().input =
+                InputSource::Path(f32_summary.r64_path.clone());
+            crossed_path.input_stage.as_mut().unwrap().args[6] = wrong_path;
+            assert!(
+                validate_reference_measurement_binding(f32_summary, &crossed_path).is_err(),
+                "crossed Float32 producer binding was accepted for {target:?}"
+            );
+            assert!(
+                validate_reference_measurement_contract(f32_summary, &crossed_path).is_err(),
+                "crossed Float32 producer contract was accepted for {target:?}"
+            );
+        }
 
         let f64 = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
         let f64_summary = f64.reference.as_ref().expect("Reference summary");
@@ -9682,7 +10510,7 @@ mod tests {
 
         assert!(root.is_dir());
         assert!(!stale.exists());
-        cleanup_track_work_dir(&root);
+        cleanup_track_work_dir(&root).unwrap();
     }
 
     #[test]
@@ -9724,12 +10552,12 @@ mod tests {
         std::fs::write(&second, b"b").unwrap();
         let paths = vec![first.clone(), second.clone()];
 
-        cleanup_paths(&paths);
-        cleanup_paths(&paths);
+        cleanup_paths_checked(&paths).unwrap();
+        cleanup_paths_checked(&paths).unwrap();
 
         assert!(!first.exists());
         assert!(!second.exists());
-        cleanup_track_work_dir(&root);
+        cleanup_track_work_dir(&root).unwrap();
     }
 
     #[test]
@@ -9754,9 +10582,991 @@ mod tests {
         std::fs::write(&input, b"newer").unwrap();
         copy_to_work_path(&input, &work).unwrap();
         assert_eq!(std::fs::read(&work).unwrap(), b"newer");
-        cleanup_track_work_dir(&root);
+        cleanup_track_work_dir(&root).unwrap();
     }
 
+
+
+    struct ProductionCleanupFixture {
+        _temp: TempDir,
+        request: PipelineRequest,
+        track: PreparedTrack,
+        realized_input: PathBuf,
+        staged_output: PathBuf,
+        convert_root: PathBuf,
+        work_dir: PathBuf,
+        cleanup_paths: Vec<PathBuf>,
+    }
+
+    impl ProductionCleanupFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let realized_input = temp.path().join("input.wav");
+            std::fs::write(&realized_input, b"pcm").expect("write source placeholder");
+            let staged_output = temp.path().join("staged-output.flac");
+            let convert_root = temp.path().join("convert");
+            let work_dir = convert_root.join(".track-0001.work");
+
+            let mut request = metadata_test_request(temp.path());
+            request.settings.force_encode = true;
+            request.settings.metadata.transfer_tags = false;
+            request.settings.metadata.preserve_artwork = false;
+            request.settings.metadata.store_source_audio_md5 = false;
+            request.stages.metadata = StageRequirement::Disabled;
+
+            let track = PreparedTrack {
+                id: TrackId {
+                    source_ordinal: 1,
+                    disc_number: None,
+                    track_number: 1,
+                },
+                source_ref: TrackSourceRef::StagedFile(realized_input.clone()),
+                metadata: TrackMetadata {
+                    title: Some("Cleanup Fixture".to_string()),
+                    track_number: Some(1),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(44_100),
+                sample_rate: Some(44_100),
+                bit_depth: Some(16),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(44_100),
+                    Some(16),
+                    Some(SourceAudioCoding::Pcm),
+                ),
+                warnings: Vec::new(),
+            };
+            let plan_request = plan_request_for_track(
+                &request,
+                &track,
+                &realized_input,
+                &staged_output,
+                work_dir.clone(),
+            )
+            .expect("cleanup fixture plan request");
+            let plan = plan_conversion(&plan_request).expect("cleanup fixture plan");
+            match &plan.action {
+                PlanAction::Execute {
+                    commands,
+                    steps,
+                    finalization,
+                    ..
+                } => {
+                    assert!(
+                        !commands.is_empty() || !steps.is_empty(),
+                        "cleanup fixture must exercise production command execution"
+                    );
+                    assert!(
+                        finalization.is_some(),
+                        "cleanup fixture must exercise production finalization"
+                    );
+                }
+                PlanAction::PassthroughCopy { .. } => {
+                    panic!("cleanup fixture unexpectedly planned passthrough")
+                }
+            }
+            let cleanup_paths = plan.cleanup_paths().to_vec();
+
+            Self {
+                _temp: temp,
+                request,
+                track,
+                realized_input,
+                staged_output,
+                convert_root,
+                work_dir,
+                cleanup_paths,
+            }
+        }
+
+        fn assert_clean(&self) {
+            assert!(!self.work_dir.exists(), "deterministic track work directory remains");
+            for path in &self.cleanup_paths {
+                assert!(!path.exists(), "planner cleanup path remains: {}", path.display());
+            }
+        }
+
+        fn progress(&self) -> OperationProgressTracker<'static> {
+            OperationProgressTracker::new(
+                "production-cleanup".to_string(),
+                PipelineStage::Convert,
+                None,
+            )
+        }
+    }
+
+
+    fn reference_materialization_request(
+        source: &Path,
+        work_dir: &Path,
+        source_kind: tonepoet_pipeline::DsdSourceKind,
+    ) -> tonepoet_pipeline::PlanRequest {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Float64,
+        );
+        let format = match &source_kind {
+            tonepoet_pipeline::DsdSourceKind::DsfUncompressed
+            | tonepoet_pipeline::DsdSourceKind::SacdTrack { .. } => {
+                tonepoet_pipeline::AudioFormat::Dsf
+            }
+            tonepoet_pipeline::DsdSourceKind::DsdiffUncompressed
+            | tonepoet_pipeline::DsdSourceKind::DsdiffDst
+            | tonepoet_pipeline::DsdSourceKind::UnknownDsdContainer => {
+                tonepoet_pipeline::AudioFormat::Dff
+            }
+        };
+        tonepoet_pipeline::PlanRequest {
+            input_path: source.to_path_buf(),
+            output_path: work_dir
+                .parent()
+                .unwrap_or(work_dir)
+                .join("reference-output.w64"),
+            source: tonepoet_pipeline::SourceInfo {
+                format,
+                codec: tonepoet_pipeline::AudioCodec::Dsd,
+                sample_rate_hz: Some(2_822_400),
+                bit_depth: None,
+                true_source_depth: None,
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Dsd,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
+                channels: Some(2),
+                duration: Some(Duration::from_secs(1)),
+                dsd_source_kind: Some(source_kind),
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: Some(work_dir.to_path_buf()),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: Some(tonepoet_pipeline::ResolvedOutputTarget::WavW64),
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: Some(0),
+        }
+    }
+
+    fn reference_materialization_track(source_ref: TrackSourceRef) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref,
+            metadata: TrackMetadata {
+                title: Some("Reference cleanup fixture".to_string()),
+                track_number: Some(1),
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: Some(2_822_400),
+            bit_depth: None,
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(2_822_400),
+                None,
+                Some(SourceAudioCoding::Dsd),
+            ),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn write_reference_dsf_fixture(path: &Path) {
+        let file = std::fs::File::create(path).expect("create DSF cleanup fixture");
+        let mut writer = sacd_rs::dsf_writer::DsfWriter::new(file, 2, 2_822_400)
+            .expect("create DSF cleanup writer");
+        writer
+            .write_interleaved(&vec![0x69; 2 * 256 * 1024])
+            .expect("write DSF cleanup payload");
+        writer.finish().expect("finish DSF cleanup fixture");
+    }
+
+    fn write_reference_dst_fixture(path: &Path) {
+        let file = std::fs::File::create(path).expect("create DST cleanup fixture");
+        let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, 2, 2_822_400)
+            .expect("create DST cleanup writer");
+        writer
+            .write_encoded_frame(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/crates/sacd-rs/src/dst/fixtures/frame_001.dst.bin"
+                )),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/crates/sacd-rs/src/dst/fixtures/frame_001.dsd.bin"
+                )),
+            )
+            .expect("write DST cleanup frame");
+        writer.finish().expect("finish DST cleanup fixture");
+    }
+
+    fn write_reference_sacd_fixture(path: &Path) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        const SECTOR_SIZE: u64 = 2048;
+        let file = std::fs::File::create(path).expect("create SACD cleanup fixture");
+        file.set_len(700 * SECTOR_SIZE)
+            .expect("size SACD cleanup fixture");
+        drop(file);
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open SACD cleanup fixture");
+
+        let mut master = vec![0_u8; 0xa8];
+        master[0..8].copy_from_slice(b"SACDMTOC");
+        master[0x08] = 1;
+        master[0x09] = 20;
+        master[0x10..0x12].copy_from_slice(&1_u16.to_be_bytes());
+        master[0x12..0x14].copy_from_slice(&1_u16.to_be_bytes());
+        master[0x40..0x44].copy_from_slice(&540_u32.to_be_bytes());
+        master[0x54..0x56].copy_from_slice(&3_u16.to_be_bytes());
+        master[0x80] = 1;
+        master[0x88..0x8a].copy_from_slice(b"en");
+        master[0x8a] = 2;
+        file.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        file.write_all(&master).unwrap();
+
+        let mut area = vec![0_u8; SECTOR_SIZE as usize];
+        area[0..8].copy_from_slice(b"TWOCHTOC");
+        area[0x08] = 1;
+        area[0x09] = 20;
+        area[0x0a..0x0c].copy_from_slice(&3_u16.to_be_bytes());
+        area[0x10..0x14].copy_from_slice(&64_000_u32.to_be_bytes());
+        area[0x14] = 0x04;
+        area[0x15] = 2;
+        area[0x20] = 2;
+        area[0x22] = 2;
+        area[0x40] = 0;
+        area[0x41] = 0;
+        area[0x42] = 8;
+        area[0x45] = 1;
+        area[0x48..0x4c].copy_from_slice(&650_u32.to_be_bytes());
+        area[0x4c..0x50].copy_from_slice(&658_u32.to_be_bytes());
+        area[0x50] = 1;
+        area[0x58..0x5a].copy_from_slice(b"en");
+        area[0x5a] = 2;
+        file.seek(SeekFrom::Start(540 * SECTOR_SIZE)).unwrap();
+        file.write_all(&area).unwrap();
+
+        let mut track_lsns = vec![0_u8; SECTOR_SIZE as usize];
+        track_lsns[0..8].copy_from_slice(b"SACDTRL1");
+        track_lsns[8..12].copy_from_slice(&650_u32.to_be_bytes());
+        let length_offset = 8 + 255 * 4;
+        track_lsns[length_offset..length_offset + 4]
+            .copy_from_slice(&8_u32.to_be_bytes());
+        file.seek(SeekFrom::Start(541 * SECTOR_SIZE)).unwrap();
+        file.write_all(&track_lsns).unwrap();
+
+        let mut track_times = vec![0_u8; SECTOR_SIZE as usize];
+        track_times[0..8].copy_from_slice(b"SACDTRL2");
+        let duration_offset = 8 + 255 * 4;
+        track_times[duration_offset + 2] = 8;
+        file.seek(SeekFrom::Start(542 * SECTOR_SIZE)).unwrap();
+        file.write_all(&track_times).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    async fn wait_for_reference_cleanup(work_dir: &Path, cleanup_paths: &[PathBuf]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !work_dir.exists() && cleanup_paths.iter().all(|path| !path.exists()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocking materializer exits and performs deferred cleanup");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!work_dir.exists(), "work directory was recreated after cleanup");
+        for path in cleanup_paths {
+            assert!(!path.exists(), "Reference scratch path remains: {}", path.display());
+        }
+    }
+
+    fn reference_production_request(root: &Path) -> PipelineRequest {
+        let mut request = metadata_test_request(root);
+        request.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        request.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        request.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        request.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Float64,
+        );
+        request.settings.force_encode = true;
+        request.settings.metadata.transfer_tags = false;
+        request.settings.metadata.preserve_artwork = false;
+        request.settings.metadata.store_source_audio_md5 = false;
+        request.stages.metadata = StageRequirement::Disabled;
+        request.container_extension = Some("w64".to_string());
+        request.container_ffmpeg_flags.clear();
+        request
+    }
+
+    async fn assert_reference_production_abort_cleanup(
+        source: PathBuf,
+        source_kind: tonepoet_pipeline::DsdSourceKind,
+        point: ReferenceMaterializationPausePoint,
+    ) {
+        let temp = tempfile::tempdir().expect("Reference production abort tempdir");
+        let staged_output = temp.path().join("reference-output.w64");
+        let convert_root = temp.path().join("convert");
+        let work_dir = convert_root.join(".track-0001.work");
+        let request = reference_production_request(temp.path());
+        let track = reference_materialization_track(TrackSourceRef::StagedFile(source.clone()));
+        let plan_request = plan_request_for_track(
+            &request,
+            &track,
+            &source,
+            &staged_output,
+            work_dir.clone(),
+        )
+        .expect("Reference production abort plan request");
+        assert_eq!(
+            plan_request.source.dsd_source_kind.as_ref(),
+            Some(&source_kind),
+            "production plan bridge must classify the intended Reference source kind"
+        );
+        let plan = tonepoet_pipeline::plan_conversion(&plan_request)
+            .expect("Reference production abort fixture plans");
+        assert!(plan.reference.is_some(), "fixture must select Reference execution");
+        let scratch = reference_scratch_paths(&plan_request).expect("planned scratch paths");
+        validate_reference_scratch_cleanup_authority(&plan, &scratch)
+            .expect("planner owns every Reference scratch path");
+        let cleanup_paths = plan.cleanup_paths().to_vec();
+
+        let pause = ReferenceMaterializationPause::new(point);
+        let task_pause = pause.clone();
+        let task_request = Arc::new(request);
+        let task_track = Arc::new(track);
+        let task_source = source.clone();
+        let task_staged_output = staged_output.clone();
+        let task_convert_root = convert_root.clone();
+        let handle = tokio::spawn(REFERENCE_TEST_SKIP_ATTESTATION.scope(
+            (),
+            REFERENCE_MATERIALIZATION_PAUSE.scope(task_pause, async move {
+                let runner = StubToolRunner::new();
+                let cancel = CancellationToken::new();
+                let mut progress = OperationProgressTracker::new(
+                    "reference-production-abort".to_string(),
+                    PipelineStage::Convert,
+                    None,
+                );
+                execute_planned_track_conversion(
+                    task_request.as_ref(),
+                    task_track.as_ref(),
+                    &task_source,
+                    &task_staged_output,
+                    &task_convert_root,
+                    &runner,
+                    &cancel,
+                    &HashMap::new(),
+                    None,
+                    &mut progress,
+                    0.0,
+                    1.0,
+                )
+                .await
+            }),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_reached())
+            .await
+            .expect("production Reference materializer reached abort barrier");
+        handle.abort();
+        let join_error = handle.await.expect_err("outer production executor is aborted");
+        assert!(join_error.is_cancelled());
+        assert!(
+            work_dir.exists(),
+            "outer abort must defer work-root removal until the blocking worker exits"
+        );
+
+        let retry_cancel = CancellationToken::new();
+        let retry_acquire = TrackExecutionCleanupGuard::acquire(work_dir.clone(), &retry_cancel);
+        tokio::pin!(retry_acquire);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), retry_acquire.as_mut())
+                .await
+                .is_err(),
+            "a retry must not reset the deterministic work root while the old worker is live"
+        );
+
+        pause.release();
+        let retry_guard = tokio::time::timeout(Duration::from_secs(5), retry_acquire.as_mut())
+            .await
+            .expect("retry authority becomes available after the old worker exits")
+            .expect("retry authority acquisition succeeds");
+        wait_for_reference_cleanup(&work_dir, &cleanup_paths).await;
+        drop(retry_guard);
+    }
+
+    async fn assert_reference_sacd_materialization_abort_cleanup(
+        source: PathBuf,
+        source_kind: tonepoet_pipeline::DsdSourceKind,
+        source_ref: TrackSourceRef,
+    ) {
+        let temp = tempfile::tempdir().expect("Reference SACD abort tempdir");
+        let work_dir = temp.path().join("convert/.track-0001.work");
+        let request = reference_materialization_request(&source, &work_dir, source_kind);
+        let scratch = reference_scratch_paths(&request).expect("planned scratch paths");
+        // SACD remains an intentionally unadmitted v15 cell. Exercise the
+        // production blocking extractor seam with the same deterministic
+        // planner namespace so future admission cannot regress ownership.
+        let cleanup_paths = scratch
+            .all()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        let track = reference_materialization_track(source_ref);
+        let pause = ReferenceMaterializationPause::new(
+            ReferenceMaterializationPausePoint::DuringSacdExtraction,
+        );
+        let task_pause = pause.clone();
+        let task_work_dir = work_dir.clone();
+        let task_source = source.clone();
+        let task_cleanup_paths = cleanup_paths.clone();
+        let handle = tokio::spawn(REFERENCE_MATERIALIZATION_PAUSE.scope(task_pause, async move {
+            let cancel = CancellationToken::new();
+            let cleanup_guard =
+                TrackExecutionCleanupGuard::acquire(task_work_dir.clone(), &cancel).await?;
+            reset_track_work_dir(&task_work_dir)?;
+            cleanup_guard.add_planner_paths(&task_cleanup_paths);
+            materialize_reference_source(
+                &request,
+                &track,
+                &task_source,
+                &scratch,
+                &cancel,
+                cleanup_guard.blocking_worker_lease()?,
+            )
+            .await
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_reached())
+            .await
+            .expect("Reference SACD materializer reached abort barrier");
+        handle.abort();
+        let join_error = handle.await.expect_err("outer SACD materialization task is aborted");
+        assert!(join_error.is_cancelled());
+        assert!(
+            work_dir.exists(),
+            "outer abort must defer work-root removal until the blocking worker exits"
+        );
+
+        let retry_cancel = CancellationToken::new();
+        let retry_acquire = TrackExecutionCleanupGuard::acquire(work_dir.clone(), &retry_cancel);
+        tokio::pin!(retry_acquire);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), retry_acquire.as_mut())
+                .await
+                .is_err(),
+            "a retry must not reset the deterministic work root while the old worker is live"
+        );
+
+        pause.release();
+        let retry_guard = tokio::time::timeout(Duration::from_secs(5), retry_acquire.as_mut())
+            .await
+            .expect("retry authority becomes available after the old worker exits")
+            .expect("retry authority acquisition succeeds");
+        wait_for_reference_cleanup(&work_dir, &cleanup_paths).await;
+        drop(retry_guard);
+    }
+
+    #[test]
+    fn reference_plan_declares_every_materialization_and_verification_path() {
+        for source_kind in [
+            tonepoet_pipeline::DsdSourceKind::DsfUncompressed,
+            tonepoet_pipeline::DsdSourceKind::DsdiffUncompressed,
+            tonepoet_pipeline::DsdSourceKind::DsdiffDst,
+        ] {
+            let request = reference_materialization_request(
+                Path::new("source.dsd"),
+                Path::new("work"),
+                source_kind,
+            );
+            let plan = tonepoet_pipeline::plan_conversion(&request)
+                .expect("Reference scratch declaration fixture plans");
+            let scratch = reference_scratch_paths(&request).unwrap();
+            validate_reference_scratch_cleanup_authority(&plan, &scratch).unwrap();
+            assert_eq!(
+                scratch
+                    .all()
+                    .into_iter()
+                    .filter(|path| plan.cleanup_paths().iter().any(|item| item.as_path() == *path))
+                    .count(),
+                scratch.all().len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_abort_before_materialization_creation_cannot_race_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.dsf");
+        write_reference_dsf_fixture(&source);
+        assert_reference_production_abort_cleanup(
+            source,
+            tonepoet_pipeline::DsdSourceKind::DsfUncompressed,
+            ReferenceMaterializationPausePoint::BeforeScratchPathCreation,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reference_abort_during_source_copy_cannot_recreate_work_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.dsf");
+        write_reference_dsf_fixture(&source);
+        assert_reference_production_abort_cleanup(
+            source,
+            tonepoet_pipeline::DsdSourceKind::DsfUncompressed,
+            ReferenceMaterializationPausePoint::DuringSourceCopy,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reference_abort_during_dst_decode_cannot_recreate_work_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.dff");
+        write_reference_dst_fixture(&source);
+        assert_reference_production_abort_cleanup(
+            source,
+            tonepoet_pipeline::DsdSourceKind::DsdiffDst,
+            ReferenceMaterializationPausePoint::DuringDstDecode,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reference_abort_during_sacd_extraction_cannot_recreate_work_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.iso");
+        write_reference_sacd_fixture(&source);
+        let source_kind = reference_sacd_source_kind(&source, 0, SacdArea::Stereo)
+            .expect("synthetic SACD cleanup fixture parses");
+        assert_reference_sacd_materialization_abort_cleanup(
+            source.clone(),
+            source_kind,
+            TrackSourceRef::SacdTrack {
+                iso: source,
+                track_index: 0,
+                area: SacdArea::Stereo,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_track_work_authority_returns_promptly() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("work");
+        let owner_cancel = CancellationToken::new();
+        let owner = TrackExecutionCleanupGuard::acquire(work_dir.clone(), &owner_cancel)
+            .await
+            .expect("initial track work authority is acquired");
+        reset_track_work_dir(&work_dir).unwrap();
+        let worker_lease = owner
+            .blocking_worker_lease()
+            .expect("blocking worker retains cleanup authority");
+        drop(owner);
+        assert!(
+            work_dir.exists(),
+            "blocking worker defers cleanup while retaining the work-root permit"
+        );
+
+        let waiter_cancel = CancellationToken::new();
+        let task_cancel = waiter_cancel.clone();
+        let task_work_dir = work_dir.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            TrackExecutionCleanupGuard::acquire(task_work_dir, &task_cancel).await
+        });
+
+        started_rx
+            .await
+            .expect("retry reached track work-authority acquisition");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        waiter_cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled retry wakes while the blocking worker still owns the permit")
+            .expect("retry task joins");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled retry must not acquire track work authority"),
+        };
+        assert!(
+            matches!(error.error, ConvertError::Realize(message) if message == "cancelled"),
+            "waiting cleanup-authority acquisition reports cancellation"
+        );
+        assert!(
+            work_dir.exists(),
+            "cancelling the waiter must not disturb the active worker's work root"
+        );
+
+        drop(worker_lease);
+        assert!(
+            !work_dir.exists(),
+            "the final worker release performs the previously deferred cleanup"
+        );
+    }
+
+    #[test]
+    fn successful_command_transcript_is_preserved_when_final_cleanup_fails() {
+        let command = test_tool_command(ToolBinary::Ffmpeg);
+        let record = command_record_for_unstarted_command(&command);
+        let error = finish_track_execution(
+            Ok(ExecutedTrackPlan {
+                commands: vec![record.clone()],
+                elapsed: Duration::from_millis(10),
+                metadata_satisfaction: PlannedMetadataSatisfaction::default(),
+                metadata_required: PlannedMetadataSatisfaction::default(),
+                command_hash: None,
+                reference: None,
+            }),
+            Err(io::Error::other("injected governed cleanup failure")),
+        )
+        .expect_err("cleanup failure converts successful execution into an error");
+
+        assert_eq!(error.commands.len(), 1);
+        assert_eq!(error.commands[0].binary, record.binary);
+        assert_eq!(error.commands[0].sanitized_args, record.sanitized_args);
+        assert!(
+            error.to_string().contains("governed scratch cleanup failed"),
+            "cleanup failure remains explicit while preserving the transcript"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn governed_cleanup_failure_is_reported_by_execution_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("work");
+        let cancel = CancellationToken::new();
+        let cleanup_guard = TrackExecutionCleanupGuard::acquire(work_dir.clone(), &cancel)
+            .await
+            .unwrap();
+        reset_track_work_dir(&work_dir).unwrap();
+        cleanup_guard.add_planner_paths(&[PathBuf::from("/proc/self/status")]);
+
+        let error = cleanup_guard
+            .cleanup_now()
+            .expect_err("an unremovable governed path must make cleanup fail");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!work_dir.exists(), "independent work-root cleanup still runs");
+        let state = cleanup_guard
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.cleanup_requested);
+        assert!(
+            !state.cleanup_complete,
+            "failed cleanup must remain retryable instead of being marked complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_executor_cleans_every_injected_failure_and_cancellation_boundary() {
+        for point in [
+            TrackExecutionFailurePoint::PlanConstruction,
+            TrackExecutionFailurePoint::Attestation,
+            TrackExecutionFailurePoint::Materialization,
+            TrackExecutionFailurePoint::ProducerLaunch,
+            TrackExecutionFailurePoint::ConsumerLaunch,
+            TrackExecutionFailurePoint::Measurement,
+            TrackExecutionFailurePoint::TerminalProcessing,
+            TrackExecutionFailurePoint::Packaging,
+            TrackExecutionFailurePoint::Finalization,
+            TrackExecutionFailurePoint::Cancellation,
+        ] {
+            let fixture = ProductionCleanupFixture::new();
+            let runner = StubToolRunner::new();
+            let cancel = CancellationToken::new();
+            let mut progress = fixture.progress();
+            let result = TRACK_EXECUTION_USE_INJECTED_RUNNER
+                .scope(
+                    (),
+                    TRACK_EXECUTION_FAILURE_POINT.scope(
+                        point,
+                        execute_planned_track_conversion(
+                            &fixture.request,
+                            &fixture.track,
+                            &fixture.realized_input,
+                            &fixture.staged_output,
+                            &fixture.convert_root,
+                            &runner,
+                            &cancel,
+                            &HashMap::new(),
+                            None,
+                            &mut progress,
+                            0.0,
+                            1.0,
+                        ),
+                    ),
+                )
+                .await;
+
+            let error = result.expect_err("injected production failure must abort execution");
+            if point == TrackExecutionFailurePoint::Cancellation {
+                assert!(error.to_string().contains("cancelled"));
+            } else {
+                assert!(error.to_string().contains(point.label()));
+            }
+            fixture.assert_clean();
+        }
+    }
+
+    #[tokio::test]
+    async fn production_executor_cleans_partial_output_on_real_tool_failure() {
+        let fixture = ProductionCleanupFixture::new();
+        let partial = fixture.work_dir.join("runner.partial");
+        let runner = BlockingToolRunner::with_behaviors([ToolBehavior::FailAfterWriting {
+            path: partial.clone(),
+            bytes: b"partial".to_vec(),
+            stderr: "injected tool failure".to_string(),
+        }]);
+        let cancel = CancellationToken::new();
+        let mut progress = fixture.progress();
+
+        TRACK_EXECUTION_USE_INJECTED_RUNNER
+            .scope(
+                (),
+                execute_planned_track_conversion(
+                    &fixture.request,
+                    &fixture.track,
+                    &fixture.realized_input,
+                    &fixture.staged_output,
+                    &fixture.convert_root,
+                    &runner,
+                    &cancel,
+                    &HashMap::new(),
+                    None,
+                    &mut progress,
+                    0.0,
+                    1.0,
+                ),
+            )
+            .await
+            .expect_err("tool failure must abort production execution");
+
+        assert!(!partial.exists());
+        fixture.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn production_executor_cleans_when_real_finalization_fails() {
+        let fixture = ProductionCleanupFixture::new();
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let mut progress = fixture.progress();
+
+        TRACK_EXECUTION_USE_INJECTED_RUNNER
+            .scope(
+                (),
+                execute_planned_track_conversion(
+                    &fixture.request,
+                    &fixture.track,
+                    &fixture.realized_input,
+                    &fixture.staged_output,
+                    &fixture.convert_root,
+                    &runner,
+                    &cancel,
+                    &HashMap::new(),
+                    None,
+                    &mut progress,
+                    0.0,
+                    1.0,
+                ),
+            )
+            .await
+            .expect_err("missing command output must fail finalization");
+
+        fixture.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn production_executor_cleans_partial_output_on_real_cancellation() {
+        let fixture = Arc::new(ProductionCleanupFixture::new());
+        let partial = fixture.work_dir.join("cancelled.partial");
+        let (gate, blocker) = tool_gate();
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_fixture = fixture.clone();
+        let run_runner = runner.clone();
+        let handle = tokio::spawn(async move {
+            let mut progress = run_fixture.progress();
+            TRACK_EXECUTION_USE_INJECTED_RUNNER
+                .scope(
+                    (),
+                    execute_planned_track_conversion(
+                        &run_fixture.request,
+                        &run_fixture.track,
+                        &run_fixture.realized_input,
+                        &run_fixture.staged_output,
+                        &run_fixture.convert_root,
+                        run_runner.as_ref(),
+                        &run_cancel,
+                        &HashMap::new(),
+                        None,
+                        &mut progress,
+                        0.0,
+                        1.0,
+                    ),
+                )
+                .await
+        });
+
+        let release = gate.wait_started().await;
+        std::fs::write(&partial, b"partial").expect("seed partial output before cancellation");
+        cancel.cancel();
+        let error = handle
+            .await
+            .expect("production execution task joins")
+            .expect_err("cancellation must abort production execution");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!partial.exists());
+        fixture.assert_clean();
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn dropping_production_executor_future_runs_cleanup_guard() {
+        let fixture = Arc::new(ProductionCleanupFixture::new());
+        let (gate, blocker) = tool_gate();
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let run_fixture = fixture.clone();
+        let run_runner = runner.clone();
+        let handle = tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            let mut progress = run_fixture.progress();
+            TRACK_EXECUTION_USE_INJECTED_RUNNER
+                .scope(
+                    (),
+                    execute_planned_track_conversion(
+                        &run_fixture.request,
+                        &run_fixture.track,
+                        &run_fixture.realized_input,
+                        &run_fixture.staged_output,
+                        &run_fixture.convert_root,
+                        run_runner.as_ref(),
+                        &cancel,
+                        &HashMap::new(),
+                        None,
+                        &mut progress,
+                        0.0,
+                        1.0,
+                    ),
+                )
+                .await
+        });
+
+        let release = gate.wait_started().await;
+        std::fs::write(fixture.work_dir.join("aborted.partial"), b"partial")
+            .expect("seed partial output before abort");
+        handle.abort();
+        let join_error = handle.await.expect_err("aborted task must not join successfully");
+        assert!(join_error.is_cancelled());
+        fixture.assert_clean();
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn silence_scan_temporary_is_removed_on_failure_and_success() {
+        let plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
+        let carrier = plan
+            .reference
+            .as_ref()
+            .expect("Reference summary")
+            .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+            .expect("qualified Float64 W64 carrier");
+
+        for behavior in [
+            ToolBehavior::FailAfterWriting {
+                path: PathBuf::from("placeholder"),
+                bytes: vec![0; 8],
+                stderr: "decoder failed".to_string(),
+            },
+            ToolBehavior::SucceedAndWrite {
+                path: PathBuf::from("placeholder"),
+                bytes: vec![0; 8],
+            },
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let raw = temp.path().join("reference-silence-scan.f64le");
+            let behavior = match behavior {
+                ToolBehavior::FailAfterWriting { bytes, stderr, .. } => {
+                    ToolBehavior::FailAfterWriting {
+                        path: raw.clone(),
+                        bytes,
+                        stderr,
+                    }
+                }
+                ToolBehavior::SucceedAndWrite { bytes, .. } => ToolBehavior::SucceedAndWrite {
+                    path: raw.clone(),
+                    bytes,
+                },
+                _ => unreachable!(),
+            };
+            let runner = BlockingToolRunner::with_behaviors([behavior]);
+            let cancel = CancellationToken::new();
+            let _ = verify_signed_zero_audio(&carrier, &runner, &cancel, None, &raw).await;
+            assert!(!raw.exists(), "silence scan raw stream remains after return");
+        }
+    }
+
+    #[tokio::test]
+    async fn silence_scan_temporary_is_removed_on_decoder_cancellation() {
+        let plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
+        let carrier = plan
+            .reference
+            .as_ref()
+            .expect("Reference summary")
+            .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+            .expect("qualified Float64 W64 carrier");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let raw = temp.path().join("reference-silence-scan.f64le");
+        let (gate, blocker) = tool_gate();
+        let runner = Arc::new(BlockingToolRunner::with_behaviors([
+            ToolBehavior::BlockThenSucceed(blocker),
+        ]));
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_runner = runner.clone();
+        let run_carrier = carrier.clone();
+        let planned_raw_path = raw.clone();
+        let handle = tokio::spawn(async move {
+            verify_signed_zero_audio(
+                &run_carrier,
+                run_runner.as_ref(),
+                &run_cancel,
+                None,
+                &planned_raw_path,
+            )
+            .await
+        });
+
+        let release = gate.wait_started().await;
+        std::fs::write(&raw, vec![0; 8]).expect("seed partial silence stream");
+        cancel.cancel();
+        let error = handle
+            .await
+            .expect("silence task joins")
+            .expect_err("decoder cancellation must fail silence verification");
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!raw.exists());
+        drop(release);
+    }
 
     #[test]
     fn weighted_windows_handle_ffmpeg_ssrc_sox_chain_deterministically() {
@@ -9812,7 +11622,7 @@ mod tests {
 
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"new-output");
-        cleanup_track_work_dir(&root);
+        cleanup_track_work_dir(&root).unwrap();
     }
 
 }
@@ -9908,7 +11718,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
         cancel: &CancellationToken,
     ) -> Result<Vec<CommandRecord>, TrackExecutionError> {
         reset_track_work_dir(&chain.work_dir)?;
-        cleanup_paths(chain.plan.cleanup_paths());
+        cleanup_paths_checked(chain.plan.cleanup_paths()).map_err(ConvertError::Io)?;
         let mut progress = OperationProgressTracker::new(
             "chunk-2-1-3".to_string(),
             PipelineStage::Convert,
@@ -9950,13 +11760,20 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
 
         match result {
             Ok(records) => {
-                cleanup_paths(chain.plan.cleanup_paths());
-                cleanup_track_work_dir(&chain.work_dir);
+                cleanup_paths_checked(chain.plan.cleanup_paths()).map_err(ConvertError::Io)?;
+                cleanup_track_work_dir(&chain.work_dir).map_err(ConvertError::Io)?;
                 Ok(records)
             }
             Err(err) => {
-                cleanup_paths(chain.plan.cleanup_paths());
-                cleanup_track_work_dir(&chain.work_dir);
+                if let Err(cleanup_error) = cleanup_declared_paths_and_work_dir(
+                    chain.plan.cleanup_paths(),
+                    &chain.work_dir,
+                ) {
+                    let primary = err.to_string();
+                    return Err(err.with_message(format!(
+                        "{primary}; synthetic cleanup also failed: {cleanup_error}"
+                    )));
+                }
                 Err(err)
             }
         }

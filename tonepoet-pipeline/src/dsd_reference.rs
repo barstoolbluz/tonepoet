@@ -2591,32 +2591,62 @@ pub fn parse_reference_true_peak_measurement(
     })
 }
 
-/// Build the exact independent signed-zero scan command used after a loudnorm `-inf` report.
+/// Build the exact independent signed-zero scan command used after a `-inf` report.
+///
+/// The opaque carrier binds both the planner-owned path and the immutable decode
+/// route. Float64 W64 is decoded only through the qualified SoX-ng raw-stream
+/// mechanism; direct FFmpeg remains authorized for the other route-table cells.
 #[must_use]
-pub fn build_reference_silence_scan_command(input: &Path, output: &Path) -> PlannedCommand {
-    let mut command = PlannedCommand::new(
-        ToolIdentifier::Ffmpeg,
-        vec![
-            "-y".to_string(),
-            "-nostdin".to_string(),
-            "-hide_banner".to_string(),
-            "-loglevel".to_string(),
-            "error".to_string(),
-            "-i".to_string(),
-            input.display().to_string(),
-            "-map".to_string(),
-            "0:a:0".to_string(),
-            "-f".to_string(),
-            "f64le".to_string(),
-            "-acodec".to_string(),
-            "pcm_f64le".to_string(),
-            output.display().to_string(),
-        ],
-        InputSource::Path(input.to_path_buf()),
-        OutputSink::Path(output.to_path_buf()),
-        None,
-        "Verify Reference signed-zero silence",
-    );
+pub fn build_reference_silence_scan_command(
+    carrier: &ReferenceDecodedCarrier,
+    output: &Path,
+) -> PlannedCommand {
+    let input = carrier.path();
+    let mut command = match carrier.authority().mechanism() {
+        ReferenceDecodeMechanism::DirectFfmpeg => PlannedCommand::new(
+            ToolIdentifier::Ffmpeg,
+            vec![
+                "-y".to_string(),
+                "-nostdin".to_string(),
+                "-hide_banner".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-i".to_string(),
+                input.display().to_string(),
+                "-map".to_string(),
+                "0:a:0".to_string(),
+                "-f".to_string(),
+                "f64le".to_string(),
+                "-acodec".to_string(),
+                "pcm_f64le".to_string(),
+                output.display().to_string(),
+            ],
+            InputSource::Path(input.to_path_buf()),
+            OutputSink::Path(output.to_path_buf()),
+            None,
+            "Verify Reference signed-zero silence through FFmpeg",
+        ),
+        ReferenceDecodeMechanism::SoxFloat64W64RawStream => PlannedCommand::new(
+            ToolIdentifier::Sox,
+            vec![
+                "-S".to_string(),
+                "-D".to_string(),
+                input.display().to_string(),
+                "-t".to_string(),
+                "raw".to_string(),
+                "-e".to_string(),
+                "floating-point".to_string(),
+                "-b".to_string(),
+                "64".to_string(),
+                "-L".to_string(),
+                output.display().to_string(),
+            ],
+            InputSource::Path(input.to_path_buf()),
+            OutputSink::Path(output.to_path_buf()),
+            None,
+            "Verify Reference signed-zero silence through SoX-ng",
+        ),
+    };
     command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
     command.environment.insert("LC_ALL".to_string(), "C".to_string());
     command
@@ -2963,6 +2993,80 @@ fn validate_reference_riff_capacity(
     Ok(())
 }
 
+/// Planner-owned deterministic scratch paths for one Reference execution.
+///
+/// Runtime materialization and verification must consume these exact paths;
+/// they are included in [`ConversionPlan::cleanup_paths`] so no executor-only
+/// temporary can escape the pure plan's cleanup authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceScratchPaths {
+    /// Verified private copy of the admitted DSF/DSDIFF carrier.
+    pub admitted_source: PathBuf,
+    /// Publication temporary for the admitted private copy.
+    pub admitted_source_temporary: PathBuf,
+    /// Canonical uncompressed DSDIFF produced from an admitted DST source.
+    pub canonical_dsd: PathBuf,
+    /// Publication temporary for canonical DST decoding.
+    pub canonical_dsd_temporary: PathBuf,
+    /// Deterministic DSF extracted from a selected SACD track.
+    pub sacd_extracted_source: PathBuf,
+    /// Publication temporary for SACD extraction.
+    pub sacd_extracted_source_temporary: PathBuf,
+    /// Headerless f64le stream used for signed-zero verification.
+    pub silence_scan: PathBuf,
+}
+
+impl ReferenceScratchPaths {
+    /// Build the deterministic namespace for a work directory and admitted
+    /// source class. Qualification uses this constructor to exercise the exact
+    /// production paths without synthesizing a full conversion request.
+    #[must_use]
+    pub fn for_source_kind(work_dir: &Path, source_kind: &DsdSourceKind) -> Self {
+        let extension = match source_kind {
+            DsdSourceKind::DsfUncompressed | DsdSourceKind::SacdTrack { .. } => "dsf",
+            DsdSourceKind::DsdiffUncompressed | DsdSourceKind::DsdiffDst => "dff",
+            DsdSourceKind::UnknownDsdContainer => "dsd",
+        };
+        Self {
+            admitted_source: work_dir.join(format!("reference-admitted-source.{extension}")),
+            admitted_source_temporary: work_dir
+                .join(format!("reference-admitted-source.tmp.{extension}")),
+            canonical_dsd: work_dir.join("reference-canonical-dsd.dff"),
+            canonical_dsd_temporary: work_dir.join("reference-canonical-dsd.tmp.dff"),
+            sacd_extracted_source: work_dir.join("reference-sacd-track.dsf"),
+            sacd_extracted_source_temporary: work_dir.join("reference-sacd-track.tmp.dsf"),
+            silence_scan: work_dir.join("reference-silence-scan.f64le"),
+        }
+    }
+
+    /// Return every deterministic scratch file in stable order.
+    #[must_use]
+    pub fn all(&self) -> [&Path; 7] {
+        [
+            self.admitted_source.as_path(),
+            self.admitted_source_temporary.as_path(),
+            self.canonical_dsd.as_path(),
+            self.canonical_dsd_temporary.as_path(),
+            self.sacd_extracted_source.as_path(),
+            self.sacd_extracted_source_temporary.as_path(),
+            self.silence_scan.as_path(),
+        ]
+    }
+}
+
+/// Derive the complete deterministic Reference scratch namespace from trusted
+/// planner inputs. Runtime code must not invent sibling paths or PID-derived
+/// names.
+pub fn reference_scratch_paths(request: &PlanRequest) -> Result<ReferenceScratchPaths> {
+    let work_dir = request.intermediate_dir.clone().ok_or_else(|| {
+        invalid_reference("intermediate_dir", ReferenceErrorCode::CanonicalTarget)
+    })?;
+    let source_kind = request.source.dsd_source_kind.as_ref().ok_or_else(|| {
+        invalid_reference("source.dsd_source_kind", ReferenceErrorCode::UnknownEncoding)
+    })?;
+    Ok(ReferenceScratchPaths::for_source_kind(&work_dir, source_kind))
+}
+
 /// Build a deterministic P0 Reference plan.
 pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
     let settings = request.settings.dsd.from_dsd;
@@ -3228,7 +3332,14 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
         from: final_work.clone(),
         to: request.output_path.clone(),
     });
+    let scratch_paths = reference_scratch_paths(request)?;
     let mut cleanup_paths = vec![r64.clone(), qpcm.clone()];
+    cleanup_paths.extend(
+        scratch_paths
+            .all()
+            .into_iter()
+            .map(Path::to_path_buf),
+    );
     if final_work != request.output_path {
         cleanup_paths.push(final_work.clone());
     }
@@ -4257,6 +4368,125 @@ mod tests {
             .expect_err("direct FFmpeg must not authorize Float64 W64");
             assert!(error.to_string().contains("required route is sox_f64le_raw_stream"));
         }
+    }
+
+    #[test]
+    fn reference_silence_scan_obeys_the_decode_route_table() {
+        for (depth, expected_mechanism, expected_tool) in [
+            (
+                PcmBitDepth::Int24,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ToolIdentifier::Ffmpeg,
+            ),
+            (
+                PcmBitDepth::Float32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ToolIdentifier::Ffmpeg,
+            ),
+            (
+                PcmBitDepth::Float64,
+                ReferenceDecodeMechanism::SoxFloat64W64RawStream,
+                ToolIdentifier::Sox,
+            ),
+        ] {
+            let request = reference_request(
+                DsdRate::Dsd64,
+                88_200,
+                ResolvedOutputTarget::WavW64,
+                depth,
+                DsdReconstructionSelection::Reference,
+            );
+            let plan = plan_reference_dsd(&request).expect("Reference W64 plan");
+            let summary = plan.reference.as_ref().expect("Reference summary");
+            let carrier = summary
+                .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
+                .expect("terminal QPCM carrier route");
+            assert_eq!(carrier.authority().mechanism(), expected_mechanism);
+            let output = PathBuf::from("silence-scan.f64le");
+            let command = build_reference_silence_scan_command(&carrier, &output);
+            assert_eq!(command.tool, expected_tool);
+            assert_eq!(command.input.as_path(), Some(carrier.path()));
+            assert_eq!(command.output.as_path(), Some(output.as_path()));
+            let input_arg = carrier.path().display().to_string();
+            let output_arg = output.display().to_string();
+            match expected_mechanism {
+                ReferenceDecodeMechanism::DirectFfmpeg => assert!(
+                    command.args.iter().map(String::as_str).eq([
+                        "-y",
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        input_arg.as_str(),
+                        "-map",
+                        "0:a:0",
+                        "-f",
+                        "f64le",
+                        "-acodec",
+                        "pcm_f64le",
+                        output_arg.as_str(),
+                    ])
+                ),
+                ReferenceDecodeMechanism::SoxFloat64W64RawStream => assert!(
+                    command.args.iter().map(String::as_str).eq([
+                        "-S",
+                        "-D",
+                        input_arg.as_str(),
+                        "-t",
+                        "raw",
+                        "-e",
+                        "floating-point",
+                        "-b",
+                        "64",
+                        "-L",
+                        output_arg.as_str(),
+                    ])
+                ),
+            }
+            assert_eq!(
+                command.environment_policy,
+                CommandEnvironmentPolicy::ClearAndSet
+            );
+            assert_eq!(command.environment.get("LC_ALL").map(String::as_str), Some("C"));
+        }
+
+        let request = reference_request(
+            DsdRate::Dsd64,
+            88_200,
+            ResolvedOutputTarget::WavW64,
+            PcmBitDepth::Int24,
+            DsdReconstructionSelection::Reference,
+        );
+        let plan = plan_reference_dsd(&request).expect("Reference W64 plan");
+        let summary = plan.reference.as_ref().expect("Reference summary");
+        let reconstruction = summary
+            .decoded_carrier(ReferenceDecodedCarrierSelector::ReconstructionR64)
+            .expect("reconstruction R64 carrier route");
+        assert_eq!(
+            reconstruction.authority().mechanism(),
+            ReferenceDecodeMechanism::SoxFloat64W64RawStream
+        );
+        let output = PathBuf::from("r64-silence-scan.f64le");
+        let command = build_reference_silence_scan_command(&reconstruction, &output);
+        assert_eq!(command.tool, ToolIdentifier::Sox);
+        assert_eq!(command.input.as_path(), Some(reconstruction.path()));
+        assert_eq!(command.output.as_path(), Some(output.as_path()));
+        let input_arg = reconstruction.path().display().to_string();
+        let output_arg = output.display().to_string();
+        assert!(command.args.iter().map(String::as_str).eq([
+            "-S",
+            "-D",
+            input_arg.as_str(),
+            "-t",
+            "raw",
+            "-e",
+            "floating-point",
+            "-b",
+            "64",
+            "-L",
+            output_arg.as_str(),
+        ]));
     }
 
     #[test]

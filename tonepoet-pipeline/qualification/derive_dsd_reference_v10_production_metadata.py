@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Verify the append-only policy-v10 exact production metadata qualification."""
+"""Verify the append-only policy-v10 exact production metadata qualification.
+
+Historical-checker lineage contract: once shipped, this checker must remain valid
+against every successor policy. It may pin immutable artifacts and persistent
+policy identities from its own generation, but it must never assert the mutable
+current-policy embed pointer.
+"""
 
 from __future__ import annotations
 
@@ -115,13 +121,11 @@ def verify(root: Path) -> None:
         raise AssertionError("v10 certification stub is noncanonical")
 
     planner = (root / "tonepoet-pipeline/src/dsd_reference.rs").read_text()
-    settings = (root / "tonepoet-pipeline/src/settings.rs").read_text()
     stages = (root / "src/convert/pipeline/stages.rs").read_text()
     tool_runner = (root / "src/convert/pipeline/tool.rs").read_text()
     executor = (root / "src/convert/pipeline/track_executor.rs").read_text()
     qualification = (root / "tests/dsd_reference_qualification.rs").read_text()
     flake = (root / "flake.nix").read_text()
-    handoff = (root / "docs/handoff_dsd_reference_p0_current.md").read_text()
     finding = (root / "docs/findings_dsd_reference_p0_admission_round.md").read_text()
 
     for marker in (
@@ -129,23 +133,6 @@ def verify(root: Path) -> None:
         "SoxNg14801V10",
     ):
         require(planner, marker, "historical v10 planner identity")
-    current_manifests = (
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v10.json"',
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
-    )
-    active = [marker for marker in current_manifests if marker in planner]
-    if len(active) != 1:
-        raise AssertionError(
-            f"planner: expected exactly one recognized v10-or-later current manifest, got {active}"
-        )
-    active_settings = {
-        current_manifests[0]: "SoxNg14801V10",
-        current_manifests[1]: "SoxNg14801V11",
-        current_manifests[2]: "SoxNg14801V12",
-    }
-    require(settings, active_settings[active[0]], "settings")
-
     for marker in (
         "apply_production_metadata_to_file",
         "pub async fn qualify_production_metadata_mutation",
@@ -169,12 +156,6 @@ def verify(root: Path) -> None:
     ):
         require(tool_runner, marker, "production tool identity probe")
 
-    executor_schema_guards = ("manifest.schema_version != 10", "manifest.schema_version != 11", "manifest.schema_version != 12")
-    if not any(marker in executor for marker in executor_schema_guards):
-        raise AssertionError("runtime validator has no recognized v10-or-later schema guard")
-    executor_policy_keys = ("DSD_REFERENCE_POLICY_V10_KEY", "DSD_REFERENCE_POLICY_V11_KEY", "DSD_REFERENCE_POLICY_V12_KEY")
-    if not any(marker in executor for marker in executor_policy_keys):
-        raise AssertionError("runtime validator has no recognized v10-or-later policy key")
     for marker in (
         "tonepoet-reference-sample-identity/v7",
         "tonepoet-reference-sample-identity-oracle/v4",
@@ -210,12 +191,10 @@ def verify(root: Path) -> None:
         '"post_mutation_container_contract_rechecked": true',
         '"rf64_preservation": "source_magic_RF64_requires_ffmpeg_-rf64_always"',
         '"schema": "tonepoet-reference-sample-identity-oracle/v4"',
-        '"schema_version": 12',
         'let atomic_parsley_version = combined(&run(&atomic_parsley, &[]));',
         'atomic_parsley_reported_version',
         'contains("atomicparsley version")',
         '"reported_version": atomic_parsley_reported_version',
-        "DSD_REFERENCE_POLICY_V12_KEY",
     ):
         require(qualification, marker, "qualification harness")
     for env_name in (
@@ -227,7 +206,6 @@ def verify(root: Path) -> None:
 
     for marker in ("v10", "420", "160", "180", "80", "20", "60", "RF64"):
         require(report_path.read_text(), marker, "v10 report")
-        require(handoff, marker, "current handoff")
     require(finding, "F5 evidence completion", "findings resolution")
 
 

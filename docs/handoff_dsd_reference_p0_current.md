@@ -15,11 +15,36 @@
 
 Native-v2 DSD-to-DSD requests remain on the ordinary DSD topology. Pre-promotion defaults remain the exact legacy flat settings origin and do not enter the Reference planner.
 
+## F9 corrective return
+
+The append-only checker lineage is restored. Every v5-v15 checker validates its
+own immutable artifacts and persistent policy identity without asserting the
+mutable current-policy embed pointer, and the complete historical chain passes
+together.
+
+Measurement-contract validation now derives the expected carrier from the
+trusted Reference summary and measurement purpose. Direct inputs and Float32
+producer inputs must match that authority, and the producer transport shape is
+validated independently. Crossed-carrier negative coverage spans W64, RIFF, and
+RF64.
+
+Verified-silence decoding now consumes an opaque decoded-carrier authority and
+obeys the existing route table. Float64 W64 uses SoX to emit headerless f64le;
+it is never opened directly by FFmpeg. Qualification records a matched
+short-silence/short-nonzero probe plus a long-silence probe, classifies the
+pinned FFmpeg open defect, and runtime certification validation requires the
+canonical evidence and production disposition.
+
+Static assembly and all historical derivation checkers were rerun. The assembly
+container lacks the Rust toolchain and pinned real-tool closure, so v15 remains
+a fail-closed, unpromoted candidate pending commissioned qualification.
+
 ## V15/F8 operational hardening
 
 Policy v15 retains v14's measurement-only 16x SoX true-peak architecture and
 changes only its executor-liveness, analyzer-evidence, and timeout authority.
-Historical v14 artifacts remain byte-identical.
+Historical v14 qualification and certification artifacts remain byte-identical;
+the checker-only mutable-pointer assertion is corrected.
 
 Every production Reference two-tool pipeline acquires a deduplicated family set
 through one RAII guard before process launch. The frozen global order is SoX,
@@ -235,6 +260,60 @@ This includes carrier probes, direct decoded-sample hashes, both stages of Float
 - The public `-1.000000000 dBTP` ceiling is unchanged. Int24 and Float32 retain their v5 bounds; Float64 uses the corrected v8 signed-32-bit effects bound.
 
 
+## Executor cleanup ownership
+
+The production per-track executor establishes shared RAII cleanup ownership
+before resetting its deterministic work directory. Its complete fallible body
+runs inside one nested async block; planner cleanup paths are registered as soon
+as each authoritative plan exists, and normal completion performs checked
+cleanup exactly once. A successful conversion is converted to an explicit error
+if governed scratch cleanup fails while retaining the complete successful
+command transcript for diagnostics and audit; a primary conversion error
+retains its own identity and reports any additional cleanup failure.
+
+Reference source materialization runs in `spawn_blocking`, so the executor gives
+the worker a cleanup lease and a child cancellation token guarded by
+`CancellationToken::drop_guard()`. Dropping or aborting the outer future requests
+cancellation immediately, but work-root removal is deferred until the blocking
+worker has exited and surrendered its lease. A process-local per-work-root
+semaphore remains owned by that shared supervisor, so a retry cannot reset the
+deterministic directory until the prior blocking worker has exited and deferred
+cleanup has run. Cleanup-authority acquisition selects between that semaphore and
+the job cancellation token, with cancellation taking precedence, so a cancelled
+duplicate or retry does not remain parked behind a pathological blocking worker.
+The worker therefore cannot race completed cleanup or a later attempt by
+recreating or writing beneath the shared work root. Cleanup during task
+destruction remains best-effort and emits a warning on failure because no caller
+remains to receive an error.
+
+The pure planner declares the admitted source, admitted-source temporary,
+canonical DST output and temporary, SACD extraction output and temporary, and
+signed-zero raw stream in the authoritative cleanup vector. Runtime derives no
+PID- or clock-named Reference materialization files and validates the complete
+scratch set against both the admitted and rematerialized plans before use. The
+signed-zero verifier retains its incremental scan and gives the planned raw
+stream a dedicated RAII guard.
+
+Production-path tests invoke `execute_planned_track_conversion()` itself for the
+ordinary execution boundaries and for the three admitted Reference barriers:
+before scratch-path creation, during source copying, and during DST decoding.
+Because the supplied v15 artifact remains deliberately unpromoted, those three
+tests use a `cfg(test)` task-local seam to skip release attestation only; they
+still enter the real planner, cleanup supervisor, `spawn_blocking` materializer,
+and outer production-executor lifetime. A fourth harness exercises the same
+blocking-worker lease directly at the intentionally unadmitted SACD extraction
+seam, so later SACD admission cannot regress lifetime ownership. Each test
+aborts the outer task, proves cleanup is not allowed to race ahead of the live
+worker, proves a retry cannot acquire the deterministic work root, releases the
+worker, and proves that the work root and every governed scratch path remain
+absent. Signed-zero tests cover decoder failure, decoder cancellation, and
+success, a cancellation test proves a retry blocked behind retained work-root
+authority wakes promptly without disturbing the active worker, and cleanup-error
+tests prove both that an unremovable governed path is reported and that a
+successful command transcript is retained on that terminal error. These tests
+are included in the workspace but were not executed in the assembly environment
+described below.
+
 ## FFmpeg rewrite attribute contract
 
 The shared same-directory FFmpeg rewrite primitive is an atomic content-and-attribute replacement, not a disposable-file shortcut. It snapshots the original regular file before the mutator runs, rejects target substitution, restores and verifies permissions and access/modification timestamps, preserves uid/gid on Unix, preserves the complete Linux xattr set including POSIX ACL xattrs, syncs the replacement, atomically renames it, and syncs the parent directory. Any identity or governed-attribute drift detected by the two pre-publication checks fails closed before replacement.
@@ -249,11 +328,15 @@ tool-family acquisition, separates analytic and empirical analyzer residual
 authority, expands the adversarial gate, and binds workload-derived analyzer
 deadlines.
 
-Historical v1-v14 policy JSON, candidate, certification, report, and derivation
-artifacts remain byte-identical. New v15 current/candidate/report/certification
-artifacts and a deterministic v15 checker are present. The current and candidate
-v15 manifests are byte-identical. V15 remains `qualification_candidate`; no
-promotion or release certification is claimed.
+Historical v1-v14 policy JSON, candidate, certification, and report artifacts
+remain byte-identical. Historical checker source is not claimed byte-identical:
+the affected v5-v14 derivation checkers were intentionally corrected to stop
+asserting mutable current-policy and successor-sensitive runtime pointers, while
+retaining their immutable historical artifact and policy-identity checks. New
+v15 current/candidate/report/certification artifacts and a deterministic v15
+checker are present. The current and candidate v15 manifests are byte-identical.
+V15 remains `qualification_candidate`; no promotion or release certification is
+claimed.
 
 ## F2 legacy behavior inherited from the prior correction
 

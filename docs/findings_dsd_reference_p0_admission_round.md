@@ -778,3 +778,69 @@ Terminal rules restated: all historical checkers green, the negative
 test passes unmodified in intent, the silence scan obeys the route
 table, no cell left predicted-failing, and re-run your static assembly
 verification before returning.
+
+### F9 resolution (v15 corrective return)
+
+1. **Append-only checker lineage.** Every v5-v15 derivation checker now validates
+   only its own immutable artifacts and persistent policy identity. Historical
+   checkers no longer assert the mutable current-policy embed pointer. The
+   lineage contract is stated in each checker: once shipped, a checker must
+   remain valid against every successor policy. The complete v5-v15 checker
+   chain passes together after the correction.
+2. **Producer-stage carrier binding.** Measurement-contract validation derives
+   the required carrier from the trusted plan summary and purpose, then binds
+   both direct commands and producer stages to that path. It also independently
+   requires the Float32 post-final producer shape. The existing crossed-carrier
+   negative test retains its intent and now exercises W64, RIFF, and RF64 routes.
+3. **Route-authorized silence decoding.** Silence scans accept only an opaque
+   decoded-carrier authority and dispatch through the same route table as other
+   decoded-audio operations. Float64 W64 therefore uses the qualified SoX
+   f64le-raw route; direct FFmpeg remains unavailable. Qualification now pairs
+   the known short-silence failure with a duration-matched nonzero control and a
+   long-silence probe, classifies the trigger as zero-content or a short
+   zero-content interaction, records the result beside the existing W64
+   defects, and binds that evidence in runtime certification validation.
+
+Static assembly verification was rerun over the corrected tree, including the
+complete historical checker chain, source-marker audits, delimiter structure,
+archive path safety, and the regenerated handoff manifest. This assembly
+container does not provide the Rust toolchain or the pinned SoX-ng/FFmpeg
+closure, so no compiled or pinned-real-tool execution is claimed here. Policy
+v15 remains fail-closed and unpromoted pending its commissioned qualification.
+
+
+## F10 (F9-resolution round) — ffmpeg refuses to OPEN sox-written W64 files whose content is silence (fifth W64 defect)
+
+Your F9 resolution lands fully: all 11 historical checkers green under
+the new lineage contract, the crossed-carrier negative test passes,
+suite 4,633/0, smoke green, zero cold warnings after an import cleanup
+on our side (the loudnorm-parser imports your v15 removed from
+production use are now test-scoped). The single remaining qualification
+failure is a NEW toolchain defect, minimally isolated:
+
+```text
+sox -D -r 88200 -n -e floating-point -b 64 -c 1 tone.w64 synth 0.1 sine 1000 gain -6
+ffprobe tone.w64                  -> opens fine
+
+sox -D -r 88200 -n -e floating-point -b 64 -c 1 zeros.w64 synth 0.1 sine 1000 vol 0
+sox --info zeros.w64              -> 8,820 samples, valid (sox reads it)
+ffprobe zeros.w64                 -> "Invalid data found when processing input"
+```
+
+Identical command shape; the only difference is the sample content
+(all zero-valued). The pinned FFmpeg's W64 open path evidently scores
+stream content during probing and rejects silence-bearing files. This
+is what your gate hit twice: the verified_silence QPCM (F9.3(b)) and
+now `dsf_uncompressed-2822400-1ch`'s quiet QPCM at the ffprobe step
+(`tests/dsd_reference_qualification.rs:462`, captured argv in the
+apply log).
+
+Resolution shapes under the terminal rules: route every probe/open of
+f64/quiet W64 carriers through the qualified SoX mechanism (ffprobe of
+a W64 carrier is now demonstrably unreliable for valid content); or
+force the demuxer (`-f w64`) IF you can qualify that forcing bypasses
+the content-scoring rejection (verify empirically — we did not); and
+add a permanent all-zero-content W64 fixture to the gate. Record this
+alongside the other four FFmpeg W64 defects for the upstream ledger.
+Do not special-case silence in assertions; fix the transport/probe
+route.

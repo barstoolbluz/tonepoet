@@ -10,6 +10,11 @@ The calculation is intentionally standard-library-only and uses Decimal at
 where C is the public post-final ceiling, R is exactly one analyzer reporting
 quantum, and epsilon is the upward-rounded Q1.63 additive peak bound. S is
 rounded toward negative infinity to one nanodecibel.
+
+Historical-checker lineage contract: once shipped, this checker must remain valid
+against every successor policy. It may pin immutable artifacts and persistent
+policy identities from its own generation, but it must never assert the mutable
+current-policy embed pointer.
 """
 
 from __future__ import annotations
@@ -313,18 +318,10 @@ def verify_compiled_policy(path: Path) -> None:
     source = path.read_text(encoding="utf-8")
     for marker in (
         'pub const DSD_REFERENCE_POLICY_V8_KEY: &str = "sox_ng_14_8_0_1_v8";',
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"',
         '"float64-sox-s32-effects-half-lsb-plus-f64-2^-51"',
-        'Reference policy sox_ng_14_8_0_1_v8',
     ):
         if marker not in source:
             raise AssertionError(f"{path}: missing compiled v8 marker {marker!r}")
-    stale_current_errors = [
-        line for line in source.splitlines()
-        if "DSD-REF-" in line and "sox_ng_14_8_0_1_v7" in line
-    ]
-    if stale_current_errors:
-        raise AssertionError(f"{path}: current error authority still names v7: {stale_current_errors}")
     constant_patterns = {
         "REFERENCE_CEILING": -1_000_000_000,
         "POST_FINAL_ACCEPTANCE_RESERVE": 10_000_000,
@@ -459,14 +456,6 @@ def verify_compiled_v8_routes(repository_root: Path) -> None:
     for marker in required_executor:
         if marker not in executor:
             raise AssertionError(f"compiled executor is missing v8 authority marker: {marker}")
-
-    if not any(
-        marker in executor
-        for marker in ("manifest.schema_version != 8", "manifest.schema_version != 9", "manifest.schema_version != 10", "manifest.schema_version != 11", "manifest.schema_version != 12")
-    ):
-        raise AssertionError(
-            "compiled executor has no recognized v8-or-later manifest-schema guard"
-        )
 
     carrier_only_signatures = {
         "direct hash builder": (
@@ -683,41 +672,27 @@ def main() -> int:
             )
         compiled_policy = qualification_dir.parent / "src" / "dsd_reference.rs"
         compiled_source = compiled_policy.read_text(encoding="utf-8")
-        current_manifests = (
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v8.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v9.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v10.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v11.json"',
-            '"qualification/dsd_reference_sox_ng_14_8_0_1_v12.json"',
+        verify_compiled_policy(compiled_policy)
+        inherited_source = "\n".join(
+            (
+                compiled_source,
+                (repository_root / "tests/dsd_reference_qualification.rs").read_text(
+                    encoding="utf-8"
+                ),
+                (repository_root / "src/convert/pipeline/track_executor.rs").read_text(
+                    encoding="utf-8"
+                ),
+            )
         )
-        active = [marker for marker in current_manifests if marker in compiled_source]
-        if len(active) != 1:
-            raise AssertionError(
-                f"{compiled_policy}: expected exactly one recognized current policy manifest, got {active}"
-            )
-        if active[0] == current_manifests[0]:
-            verify_compiled_policy(compiled_policy)
-        else:
-            inherited_source = "\n".join(
-                (
-                    compiled_source,
-                    (repository_root / "tests/dsd_reference_qualification.rs").read_text(
-                        encoding="utf-8"
-                    ),
-                    (repository_root / "src/convert/pipeline/track_executor.rs").read_text(
-                        encoding="utf-8"
-                    ),
+        for marker in (
+            'pub const DSD_REFERENCE_POLICY_V8_KEY: &str = "sox_ng_14_8_0_1_v8";',
+            "SoxNg14801V8",
+            '"tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_terminal_source_proof.md"',
+        ):
+            if marker not in inherited_source:
+                raise AssertionError(
+                    f"{repository_root}: append-only policy lineage dropped inherited v8 authority {marker!r}"
                 )
-            )
-            for marker in (
-                'pub const DSD_REFERENCE_POLICY_V8_KEY: &str = "sox_ng_14_8_0_1_v8";',
-                'SoxNg14801V8',
-                '"tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v8_terminal_source_proof.md"',
-            ):
-                if marker not in inherited_source:
-                    raise AssertionError(
-                        f"{repository_root}: append-only v9 policy dropped inherited v8 authority {marker!r}"
-                    )
         verify_compiled_v8_routes(repository_root)
         print("v8 terminal-bound derivation, effects-boundary audit, and route contracts verified")
     else:

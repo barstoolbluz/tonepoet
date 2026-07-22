@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Verify the preserved append-only policy-v9 W64 admission artifacts."""
+"""Verify the preserved append-only policy-v9 W64 admission artifacts.
+
+Historical-checker lineage contract: once shipped, this checker must remain valid
+against every successor policy. It may pin immutable artifacts and persistent
+policy identities from its own generation, but it must never assert the mutable
+current-policy embed pointer.
+"""
 
 from __future__ import annotations
 

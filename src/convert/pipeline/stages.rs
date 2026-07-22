@@ -2061,27 +2061,42 @@ fn realize_sacd_track_blocking(
         track_index,
         area,
         target_format,
-        staging_root,
+        SacdRealizationPaths::StagingRoot(staging_root),
         || false,
     )
 }
 
-pub(super) fn realize_reference_sacd_track_blocking(
+pub(super) fn realize_reference_sacd_track_blocking<F>(
     iso: &Path,
     track_index: u32,
     area: SacdArea,
-    staging_root: &Path,
-    cancel: &CancellationToken,
-) -> Result<PathBuf, ConvertError> {
+    output_path: &Path,
+    temporary_path: &Path,
+    is_cancelled: F,
+) -> Result<PathBuf, ConvertError>
+where
+    F: FnMut() -> bool,
+{
     realize_sacd_track_blocking_with_cancel(
         iso,
         track_index,
         area,
         &tonepoet_pipeline::AudioFormat::Dsf,
-        staging_root,
-        || cancel.is_cancelled(),
+        SacdRealizationPaths::Explicit {
+            output: output_path,
+            temporary: temporary_path,
+        },
+        is_cancelled,
     )
     .map(|realized| realized.path)
+}
+
+enum SacdRealizationPaths<'a> {
+    StagingRoot(&'a Path),
+    Explicit {
+        output: &'a Path,
+        temporary: &'a Path,
+    },
 }
 
 fn realize_sacd_track_blocking_with_cancel<F>(
@@ -2089,7 +2104,7 @@ fn realize_sacd_track_blocking_with_cancel<F>(
     track_index: u32,
     area: SacdArea,
     target_format: &tonepoet_pipeline::AudioFormat,
-    staging_root: &Path,
+    paths: SacdRealizationPaths<'_>,
     mut is_cancelled: F,
 ) -> Result<RealizedTrackInfo, ConvertError>
 where
@@ -2135,9 +2150,22 @@ where
         _ => "dsf",
     };
 
-    let realized_dir = staging_root.join("realized-sacd-tracks");
-    fs::create_dir_all(&realized_dir)?;
-    let out_path = realized_dir.join(sacd_track_output_name(iso, area, track_index, entry, output_ext));
+    let (out_path, tmp_path) = match paths {
+        SacdRealizationPaths::StagingRoot(staging_root) => {
+            let realized_dir = staging_root.join("realized-sacd-tracks");
+            fs::create_dir_all(&realized_dir)?;
+            let out_path = realized_dir
+                .join(sacd_track_output_name(iso, area, track_index, entry, output_ext));
+            let tmp_path = unique_sacd_tmp_path(&out_path);
+            (out_path, tmp_path)
+        }
+        SacdRealizationPaths::Explicit { output, temporary } => {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            (output.to_path_buf(), temporary.to_path_buf())
+        }
+    };
 
     if sacd_output_is_ready(&out_path, output_format, area_info, entry.duration) {
         let stats = dsd_dst_stats_from_file(
@@ -2151,8 +2179,11 @@ where
         });
     }
 
-    let tmp_path = unique_sacd_tmp_path(&out_path);
-    let _ = fs::remove_file(&tmp_path);
+    match fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ConvertError::Io(error)),
+    }
 
     let extraction_result = (|| {
         let mut iso_reader = IsoReader::open(iso).map_err(|err| {

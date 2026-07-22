@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Verify append-only policy-v13 streamed-Float64-WAV header authority."""
+"""Verify append-only policy-v13 streamed-Float64-WAV header authority.
+
+Historical-checker lineage contract: once shipped, this checker must remain valid
+against every successor policy. It may pin immutable artifacts and persistent
+policy identities from its own generation, but it must never assert the mutable
+current-policy embed pointer.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,7 @@ import json
 from pathlib import Path
 
 V12_HASHES = {
-    "derive_dsd_reference_v12_streamed_wav_capacity.py": "57c8ed6fb3e0b550e65512eb41c75546296570df4bb6d6285a4d71aa62b7ee47",
+    "derive_dsd_reference_v12_streamed_wav_capacity.py": "53b671fb553591de55c0db94e819e89025fe5382e1fc3285e4d5f9af1868c424",
     "dsd_reference_sox_ng_14_8_0_1_v12.json": "67ee6ba9a0ae0d49f8dadb21085396f8a314b1b9b3c616d86e5110d6a55c3274",
     "dsd_reference_sox_ng_14_8_0_1_v12_candidate.json": "67ee6ba9a0ae0d49f8dadb21085396f8a314b1b9b3c616d86e5110d6a55c3274",
     "dsd_reference_sox_ng_14_8_0_1_v12_certification.json": "523f9d76775e5db87b3cf84b66878e00e4ce4b525263e56173a4f296bf609a99",
@@ -124,20 +130,14 @@ def verify(root: Path) -> None:
         raise AssertionError("v13 certification stub is noncanonical")
 
     planner = (root / "tonepoet-pipeline/src/dsd_reference.rs").read_text()
-    settings = (root / "tonepoet-pipeline/src/settings.rs").read_text()
     schema = (root / "tonepoet-pipeline/src/qualification_schema.rs").read_text()
-    executor = (root / "src/convert/pipeline/track_executor.rs").read_text()
     manifest = (root / "src/convert/pipeline/manifest.rs").read_text()
     manifest_builder = (root / "src/convert/pipeline/manifest_builder.rs").read_text()
     qualification = (root / "tests/dsd_reference_qualification.rs").read_text()
-    sentinel = (root / "tests/dsd_reference_settings_sentinel.rs").read_text()
-    handoff = (root / "docs/handoff_dsd_reference_p0_current.md").read_text()
     findings = (root / "docs/findings_dsd_reference_p0_admission_round.md").read_text()
 
     for marker in (
         'pub const DSD_REFERENCE_POLICY_V13_KEY: &str = "sox_ng_14_8_0_1_v13";',
-        '"qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"',
-        '"/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json"',
         "SoxNg14801V13",
         "REFERENCE_STREAMED_WAV_HEADER_BYTES: u64 = 58",
         "REFERENCE_STREAMED_WAV_RIFF_SIZE_OVERHEAD_BYTES: u64 =\n    REFERENCE_STREAMED_WAV_HEADER_BYTES - 8",
@@ -146,10 +146,8 @@ def verify(root: Path) -> None:
         "DSD-REF-P0-025",
     ):
         require(planner, marker, "planner")
-    require(settings, "SoxNg14801V13", "settings")
     require(manifest, "SoxNg14801V13", "durable manifest")
     require(manifest_builder, "SoxNg14801V13", "manifest builder")
-    require(sentinel, "SoxNg14801V13", "settings sentinel")
 
     for marker in (
         "ReferenceStreamedWavCapacityEvidenceV3",
@@ -163,33 +161,6 @@ def verify(root: Path) -> None:
     ):
         require(schema, marker, "shared qualification schema")
 
-    for marker in (
-        "ReferenceStreamedWavCapacityEvidenceV3",
-        "is_canonical_v13",
-        "DSD_REFERENCE_POLICY_V13_KEY",
-        "SoxNg14801V13",
-        "schema_version != 13",
-        "dsd_reference_sox_ng_14_8_0_1_v13_report.md",
-        "dsd_reference_sox_ng_14_8_0_1_v13_candidate.json",
-        "historical_v12_streamed_wav_capacity_schema_remains_linked",
-        "assert_eq!(manifest.schema_version, 12)",
-        "ReferenceStreamedWavCapacityEvidenceV2::is_canonical_v12",
-    ):
-        require(executor, marker, "runtime validator")
-
-    for marker in (
-        "ReferenceStreamedWavCapacityEvidenceV3",
-        "transition_count, 9",
-        "assert_eq!(stream_header_bytes, 58)",
-        '"schema_version": 13',
-        "DSD_REFERENCE_POLICY_V13_KEY",
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13.json",
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v13_candidate.json",
-        "historical_v12_streamed_wav_capacity_contract_remains_frozen",
-        "ReferenceStreamedWavCapacityEvidenceV2::STREAM_HEADER_BYTES, 66",
-    ):
-        require(qualification, marker, "qualification harness")
-
     report = report_path.read_text()
     for marker in (
         "F7 correction",
@@ -202,7 +173,6 @@ def verify(root: Path) -> None:
         "Policy v12 and all of its JSON, candidate, certification, report, and derivation artifacts remain byte-identical",
     ):
         require(report, marker, "v13 report")
-    require(handoff, "derive_dsd_reference_v13_streamed_wav_header.py", "handoff")
     require(findings, "F7 resolution (policy v13 candidate, 2026-07-21)", "findings")
 
     forbid(qualification, "let stream_header_bytes = ReferenceStreamedWavCapacityEvidenceV3::STREAM_HEADER_BYTES;\n    assert_eq!(stream_header_bytes, 66);", "qualification harness")

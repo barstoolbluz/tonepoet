@@ -406,7 +406,11 @@ fn wait_with_deadline(
     }
 }
 
-fn run_configured_command<F>(path: &Path, args: &[String], configure_environment: F) -> Output
+fn run_configured_command_unchecked<F>(
+    path: &Path,
+    args: &[String],
+    configure_environment: F,
+) -> Output
 where
     F: FnOnce(&mut Command),
 {
@@ -443,11 +447,18 @@ where
         stdout_drain_error.is_none() && stderr_drain_error.is_none(),
         "qualified command output drain failed: stdout={stdout_drain_error:?} stderr={stderr_drain_error:?}"
     );
-    let output = Output {
+    Output {
         status,
         stdout,
         stderr,
-    };
+    }
+}
+
+fn run_configured_command<F>(path: &Path, args: &[String], configure_environment: F) -> Output
+where
+    F: FnOnce(&mut Command),
+{
+    let output = run_configured_command_unchecked(path, args, configure_environment);
     assert!(
         output.status.success(),
         "{} {:?} failed: stdout={} stderr={}",
@@ -488,6 +499,10 @@ fn run_planned_legacy_command(path: &Path, planned: &PlannedCommand) -> Output {
 
 fn run(path: &Path, args: &[String]) -> Output {
     run_with_pre_clear_environment(path, args, &[])
+}
+
+fn run_unchecked(path: &Path, args: &[String]) -> Output {
+    run_configured_command_unchecked(path, args, apply_qualified_environment)
 }
 
 fn combined(output: &Output) -> String {
@@ -1075,6 +1090,26 @@ fn synth_r64_fixture(
     amplitude: &str,
     silence: bool,
 ) {
+    synth_r64_fixture_duration(
+        sox,
+        output,
+        sample_rate_hz,
+        channels,
+        amplitude,
+        silence,
+        "0.05",
+    );
+}
+
+fn synth_r64_fixture_duration(
+    sox: &Path,
+    output: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    amplitude: &str,
+    silence: bool,
+    duration_seconds: &str,
+) {
     let mut args = vec![
         "-S".to_string(),
         "-D".to_string(),
@@ -1092,11 +1127,15 @@ fn synth_r64_fixture(
         output.display().to_string(),
     ];
     if silence {
-        args.extend(["trim".to_string(), "0".to_string(), "0.05".to_string()]);
+        args.extend([
+            "trim".to_string(),
+            "0".to_string(),
+            duration_seconds.to_string(),
+        ]);
     } else {
         args.extend([
             "synth".to_string(),
-            "0.05".to_string(),
+            duration_seconds.to_string(),
             "sine".to_string(),
             "997".to_string(),
             "vol".to_string(),
@@ -1104,6 +1143,29 @@ fn synth_r64_fixture(
         ]);
     }
     run(sox, &args);
+}
+
+fn probe_direct_ffmpeg_f64_w64(ffmpeg: &Path, input: &Path) -> Output {
+    let args = vec![
+        "-nostdin".to_string(),
+        "-hide_banner".to_string(),
+        "-nostats".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        input.display().to_string(),
+        "-map".to_string(),
+        "0:a:0".to_string(),
+        "-vn".to_string(),
+        "-sn".to_string(),
+        "-dn".to_string(),
+        "-c:a".to_string(),
+        "pcm_f64le".to_string(),
+        "-f".to_string(),
+        "f64le".to_string(),
+        "pipe:1".to_string(),
+    ];
+    run_unchecked(ffmpeg, &args)
 }
 
 fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) {
@@ -2718,7 +2780,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
         "pinned direct f64-W64 defect changed: analytic={f64_analytic_peak}, direct={f64_direct_input_tp}, delta={f64_defect_delta_db}"
     );
 
-    let f64_corrected = execute_measurement(f64_measurement, &sox, &ffmpeg, &root, 1);
+    let f64_corrected = execute_measurement(f64_summary, f64_measurement, &sox, &ffmpeg, &root, 1);
     let f64_corrected_input_tp = match f64_corrected.reported {
         TruePeakValue::Finite(value) => value.0 as f64 / 1_000_000_000.0,
         TruePeakValue::VerifiedSilence => panic!("-20 dB f64 carrier measured as silence"),
@@ -2727,6 +2789,52 @@ fn qualify_analyzer_carrier_contract() -> Value {
         (f64_corrected_input_tp - f64_analytic_peak).abs() <= 0.02,
         "v15 oversampled f64 measurement changed true peak: analytic={f64_analytic_peak}, corrected={f64_corrected_input_tp}"
     );
+
+    // Characterize the second pinned FFmpeg/Float64-W64 defect independently of
+    // the production route. The policy never executes these direct probes; it
+    // records whether the open failure follows zero content generally or only a
+    // short zero-content carrier.
+    let silence_defect_root = root.join("f64-w64-silence-open-defect");
+    fs::create_dir_all(&silence_defect_root).expect("create silence defect probe root");
+    let short_silence_path = silence_defect_root.join("short-silence.w64");
+    let short_nonzero_path = silence_defect_root.join("short-nonzero.w64");
+    let long_silence_path = silence_defect_root.join("long-silence.w64");
+    synth_r64_fixture_duration(&sox, &short_silence_path, 48_000, 1, "0", true, "0.05");
+    synth_r64_fixture_duration(&sox, &short_nonzero_path, 48_000, 1, "0.25", false, "0.05");
+    synth_r64_fixture_duration(&sox, &long_silence_path, 48_000, 1, "0", true, "1.0");
+    let short_silence_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &short_silence_path);
+    let short_nonzero_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &short_nonzero_path);
+    let long_silence_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &long_silence_path);
+    assert!(
+        !short_silence_direct.status.success(),
+        "pinned FFmpeg unexpectedly opened the known short silent Float64 W64 witness"
+    );
+    assert!(
+        short_nonzero_direct.status.success(),
+        "matched short nonzero Float64 W64 control failed: {}",
+        String::from_utf8_lossy(&short_nonzero_direct.stderr)
+    );
+    let silence_trigger_classification = if long_silence_direct.status.success() {
+        "short_zero_content_interaction"
+    } else {
+        "zero_content"
+    };
+    let silent_f64_w64_open_defect = serde_json::json!({
+        "status": "reproduced_and_classified",
+        "carrier": "sox_float64_w64_direct_to_ffmpeg",
+        "short_duration_seconds": "0.050000000",
+        "long_duration_seconds": "1.000000000",
+        "short_silence_file_bytes": fs::metadata(&short_silence_path).expect("short silence metadata").len(),
+        "short_nonzero_file_bytes": fs::metadata(&short_nonzero_path).expect("short nonzero metadata").len(),
+        "long_silence_file_bytes": fs::metadata(&long_silence_path).expect("long silence metadata").len(),
+        "short_silence_direct_ffmpeg_opened": short_silence_direct.status.success(),
+        "matched_short_nonzero_direct_ffmpeg_opened": short_nonzero_direct.status.success(),
+        "long_silence_direct_ffmpeg_opened": long_silence_direct.status.success(),
+        "trigger_classification": silence_trigger_classification,
+        "short_silence_error": first_nonempty_line(&String::from_utf8_lossy(&short_silence_direct.stderr)).to_string(),
+        "long_silence_error": first_nonempty_line(&String::from_utf8_lossy(&long_silence_direct.stderr)).to_string(),
+        "production_disposition": "direct_ffmpeg_forbidden; silence_scan_uses_route_table_sox_f64le_raw_stream",
+    });
 
     // Retain the historical v13 streamed-WAV capacity probe as a separate,
     // conservative admission witness. It is no longer the v15 analyzer route.
@@ -2844,7 +2952,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
     assert_eq!(f32_post.command.tool, ToolIdentifier::Sox);
     assert_eq!(f32_post.command.input, tonepoet_pipeline::InputSource::Stdin);
     assert_eq!(f32_post.parser, MeasurementParser::SoxStatsPkLevDbV1);
-    let f32_direct = execute_measurement(f32_post, &sox, &ffmpeg, &f32_root, 1);
+    let f32_direct = execute_measurement(f32_summary, f32_post, &sox, &ffmpeg, &f32_root, 1);
     let f32_direct_input_tp = match f32_direct.reported {
         TruePeakValue::Finite(value) => value.0 as f64 / 1_000_000_000.0,
         TruePeakValue::VerifiedSilence => panic!("-20 dB Float32 carrier measured as silence"),
@@ -3133,6 +3241,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
             "scaling_delta_db": f64_defect_delta_db,
             "expected_scaling": "2^31",
         },
+        "silent_float64_w64_open_defect": silent_f64_w64_open_defect,
         "direct_sox_path": {
             "status": "passed",
             "carrier_depth": "float64",
@@ -3235,6 +3344,7 @@ fn policy_measurement_bounds() -> (DbNano, DbNano) {
 }
 
 fn execute_measurement(
+    summary: &tonepoet_pipeline::DsdReferencePlanSummary,
     measurement: &tonepoet_pipeline::PlannedMeasurement,
     sox: &Path,
     ffmpeg: &Path,
@@ -3250,11 +3360,16 @@ fn execute_measurement(
         .unwrap_or_else(|error| panic!("production SoX stats extraction failed: {error}"));
     let silence = raw == "-inf";
     if silence {
-        let input = measurement
-            .carrier_path()
-            .expect("measurement carrier is path-backed");
+        let selector = match measurement.purpose {
+            TruePeakPurpose::GainAuthority => ReferenceDecodedCarrierSelector::ReconstructionR64,
+            TruePeakPurpose::PostFinalAcceptance => ReferenceDecodedCarrierSelector::TerminalQpcm,
+        };
+        let carrier = summary
+            .decoded_carrier(selector)
+            .expect("measurement silence carrier has an admitted decode route");
+        assert_eq!(carrier.path(), measurement.carrier_path().unwrap());
         let raw_path = root.join(format!("silence-{}.f64le", measurement.id.0));
-        let scan = build_reference_silence_scan_command(input, &raw_path);
+        let scan = build_reference_silence_scan_command(&carrier, &raw_path);
         run_planned_command(&scan, sox, ffmpeg);
         let bytes = fs::read(&raw_path).expect("read production silence scan");
         validate_signed_zero_f64le(&bytes).expect("production signed-zero proof");
@@ -3353,6 +3468,7 @@ fn execute_planned_terminal_chain(
             }
             PlannedExecutionStep::Measurement(measurement) => {
                 let parsed = execute_measurement(
+                    summary,
                     measurement,
                     sox,
                     ffmpeg,
@@ -4451,6 +4567,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                                     })
                                     .expect("planner emits pre-final true-peak measurement");
                                 let parsed = execute_measurement(
+                                    summary,
                                     measurement,
                                     &sox,
                                     &ffmpeg,
@@ -4571,7 +4688,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                                 })
                                 .expect("planner emits pre-final true-peak measurement");
                             let parsed =
-                                execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
+                                execute_measurement(summary, measurement, &sox, &ffmpeg, &root, channels);
                             let TruePeakValue::Finite(reported) = parsed.reported else {
                                 panic!("fixed-frequency fixture was misclassified as silence");
                             };
@@ -4677,7 +4794,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                             })
                             .expect("planner emits pre-final true-peak measurement");
                         let parsed =
-                            execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
+                            execute_measurement(summary, measurement, &sox, &ffmpeg, &root, channels);
                         let TruePeakValue::Finite(reported) = parsed.reported else {
                             panic!("nonzero analytic multitone fixture was misclassified as silence");
                         };
@@ -4779,10 +4896,11 @@ fn qualify_true_peak_analyzer_authority() -> Value {
                         })
                         .expect("planner emits adversarial true-peak measurement");
                     let production =
-                        execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
+                        execute_measurement(summary, measurement, &sox, &ffmpeg, &root, channels);
                     let oracle_measurement =
                         measurement_with_oversample_factor(measurement, sample_rate_hz, 64);
                     let oracle = execute_measurement(
+                        summary,
                         &oracle_measurement,
                         &sox,
                         &ffmpeg,
@@ -4986,7 +5104,7 @@ fn qualify_analyzer_deadline_model() -> Value {
         AnalyzerPeakPosition::Late,
     );
     let started = Instant::now();
-    let measured = execute_measurement(measurement, &sox, &ffmpeg, &root, channels);
+    let measured = execute_measurement(summary, measurement, &sox, &ffmpeg, &root, channels);
     let elapsed = started.elapsed();
     assert!(matches!(measured.reported, TruePeakValue::Finite(_)));
     assert!(elapsed < expected_deadline, "pinned analyzer exceeded its derived deadline");
