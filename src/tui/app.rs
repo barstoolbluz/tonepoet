@@ -5490,6 +5490,9 @@ pub enum ActiveOverlay {
     FileTaskProgress(FileTaskProgressSession),
     /// Full metadata tag editor overlay.
     MetadataEditor(Box<MetadataEditorState>),
+    /// Custom metadata auto-number preview/editor. The owning metadata editor
+    /// remains parked in `pending_metadata_editor` and is rendered behind it.
+    MetadataAutoNumber(Box<crate::tui::metadata_autonumber::AutoNumberOverlayState>),
     /// Read-only preview of a proposed CUE sheet (from `:cue-mb` /
     /// `:cue-mb!` / `:cue-fill`). User reviews + presses `s` to commit
     /// the write, `q`/`Esc` to cancel.

@@ -5389,6 +5389,19 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 }
             }
         }
+        ActiveOverlay::MetadataAutoNumber(_) => {
+            let first_line = text.lines().next().unwrap_or("");
+            let overlay =
+                std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            if let ActiveOverlay::MetadataAutoNumber(mut state) = overlay {
+                if let Some(input) = state.prefix_input.as_mut() {
+                    for character in first_line.chars() {
+                        input.insert_char(character);
+                    }
+                }
+                app.active_overlay = ActiveOverlay::MetadataAutoNumber(state);
+            }
+        }
         ActiveOverlay::MetadataEditor(_) => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             if let ActiveOverlay::MetadataEditor(mut state) = overlay {

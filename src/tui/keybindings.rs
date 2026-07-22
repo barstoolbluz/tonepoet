@@ -4688,6 +4688,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             let action = super::theme_builder::handle_theme_builder_key(&mut *state, key);
             complete_theme_builder_action(app, state, action);
         }
+        ActiveOverlay::MetadataAutoNumber(mut state) => {
+            handle_metadata_autonumber_key(app, &mut state, key);
+        }
         ActiveOverlay::ConversionActionsWizard(state) => {
             let preview_rect = app.button_map.find_button_rect(&TuiButton::ActionsConfigPreview);
             let result = super::conversion_actions_ui::handle_wizard_key_with_preview_rect(*state, key, preview_rect);
@@ -6024,9 +6027,170 @@ fn prefetch_current_mb_row(
     );
 }
 
-/// Close the active context-menu overlay and restore any parked
-/// stateful overlay (metadata editor / cue preview / mb select). When
-/// no overlay was parked, leaves `active_overlay = None`.
+/// Close the custom auto-number overlay and restore its owning editor.
+fn close_metadata_autonumber_restoring_editor(app: &mut AppState) {
+    app.active_overlay = ActiveOverlay::None;
+    if let Some(editor) = app.pending_metadata_editor.take() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+    }
+}
+
+fn apply_metadata_autonumber_overlay(
+    app: &mut AppState,
+    overlay: &super::metadata_autonumber::AutoNumberOverlayState,
+) {
+    let Some(mut editor) = app.pending_metadata_editor.take() else {
+        app.active_overlay = ActiveOverlay::None;
+        app.set_status("Auto-number: owning metadata editor is no longer available");
+        return;
+    };
+    match super::metadata_autonumber::apply_numbering_with_assignments(
+        &mut editor,
+        overlay.target,
+        overlay.scheme,
+        &overlay.assignments,
+    ) {
+        Ok(report) => {
+            app.set_status(report.status("Auto-numbered"));
+            app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+        }
+        Err(error) => {
+            app.pending_metadata_editor = Some(editor);
+            app.active_overlay = ActiveOverlay::MetadataAutoNumber(Box::new(overlay.clone()));
+            app.set_status(format!("Auto-number: {error}"));
+        }
+    }
+}
+
+fn handle_metadata_autonumber_key(
+    app: &mut AppState,
+    state: &mut Box<super::metadata_autonumber::AutoNumberOverlayState>,
+    key: KeyEvent,
+) {
+    if state.prefix_input.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                state.prefix_input = None;
+            }
+            KeyCode::Enter => match state.commit_prefix_edit() {
+                Ok(count) => app.set_status(format!(
+                    "Auto-number: prefix assigned to {} row{}",
+                    count,
+                    if count == 1 { "" } else { "s" },
+                )),
+                Err(error) => app.set_status(format!("Auto-number: {error}")),
+            },
+            _ => {
+                if let Some(input) = state.prefix_input.as_mut() {
+                    super::text_input::handle_text_input_key(input, &key);
+                }
+            }
+        }
+        app.active_overlay = ActiveOverlay::MetadataAutoNumber(state.clone());
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            close_metadata_autonumber_restoring_editor(app);
+            return;
+        }
+        KeyCode::Enter => {
+            apply_metadata_autonumber_overlay(app, state);
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+            state.move_cursor(-1, key.modifiers.contains(KeyModifiers::SHIFT));
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+            state.move_cursor(1, key.modifiers.contains(KeyModifiers::SHIFT));
+        }
+        KeyCode::Home => state.move_cursor(-(state.len() as isize), false),
+        KeyCode::End => state.move_cursor(state.len() as isize, false),
+        KeyCode::Char(' ') => state.toggle_current_selection(),
+        KeyCode::Char('p') | KeyCode::Char('P') => state.begin_prefix_edit(),
+        KeyCode::Tab | KeyCode::Right => state.scheme = state.scheme.next(),
+        KeyCode::BackTab | KeyCode::Left => state.scheme = state.scheme.previous(),
+        _ => {}
+    }
+    app.active_overlay = ActiveOverlay::MetadataAutoNumber(state.clone());
+}
+
+fn handle_metadata_autonumber_mouse(app: &mut AppState, mouse: MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let button = app.button_map.find_button_at(mouse.column, mouse.row);
+    let ActiveOverlay::MetadataAutoNumber(mut state) = std::mem::replace(
+        &mut app.active_overlay,
+        ActiveOverlay::None,
+    ) else {
+        return;
+    };
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp if state.prefix_input.is_none() => state.move_cursor(-1, false),
+        MouseEventKind::ScrollDown if state.prefix_input.is_none() => state.move_cursor(1, false),
+        MouseEventKind::Down(MouseButton::Right) => {
+            app.active_overlay = ActiveOverlay::MetadataAutoNumber(state);
+            return;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if matches!(button, Some(TuiButton::MetadataAutoNumberCancel)) {
+                // A pointer click on the visible Cancel control cancels the
+                // whole child overlay, including any uncommitted prefix edit.
+                close_metadata_autonumber_restoring_editor(app);
+                return;
+            }
+            let was_editing_prefix = state.prefix_input.is_some();
+            // Changing focus commits the prefix edit first, matching the
+            // metadata editor's commit-on-focus-change behavior. Invalid
+            // input remains active and cannot be applied accidentally.
+            if was_editing_prefix
+                && !matches!(button, Some(TuiButton::MetadataAutoNumberPrefix))
+            {
+                if let Err(error) = state.commit_prefix_edit() {
+                    app.set_status(format!("Auto-number: {error}"));
+                    app.active_overlay = ActiveOverlay::MetadataAutoNumber(state);
+                    return;
+                }
+            }
+            match button {
+                Some(TuiButton::MetadataAutoNumberScheme(idx)) => {
+                    if let Some(scheme) =
+                        super::metadata_autonumber::NumberingScheme::ALL.get(idx)
+                    {
+                        state.scheme = *scheme;
+                    }
+                }
+                Some(TuiButton::MetadataAutoNumberPrefix) => {
+                    if state.prefix_input.is_none() {
+                        state.begin_prefix_edit();
+                    }
+                }
+                Some(TuiButton::MetadataAutoNumberRow(slot)) if slot < state.len() => {
+                    state.cursor = slot;
+                    state.toggle_current_selection();
+                }
+                Some(TuiButton::MetadataAutoNumberApply) => {
+                    // A valid in-flight prefix edit commits and applies in the
+                    // same click. Requiring a second Apply click would make the
+                    // mouse lifecycle differ from Enter and invite stale-preview
+                    // mistakes.
+                    apply_metadata_autonumber_overlay(app, &state);
+                    return;
+                }
+                Some(TuiButton::MetadataAutoNumberCancel) => {
+                    close_metadata_autonumber_restoring_editor(app);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    app.active_overlay = ActiveOverlay::MetadataAutoNumber(state);
+}
+
 ///
 /// Called from every ContextMenu close path (Esc / Left / outside-click /
 /// post-action) so right-click → context menu → Esc round-trips back to
@@ -6116,7 +6280,11 @@ fn run_context_action_restoring_parked(
         let preserve_gnudb_editor = app
             .active_gnudb_operation
             .is_some_and(|active| active.editor_session.is_some());
-        if !preserve_mb_editor && !preserve_gnudb_editor {
+        let preserve_autonumber_editor = matches!(
+            app.active_overlay,
+            ActiveOverlay::MetadataAutoNumber(_)
+        );
+        if !preserve_mb_editor && !preserve_gnudb_editor && !preserve_autonumber_editor {
             app.pending_metadata_editor = None;
         }
         app.pending_cue_preview = None;
@@ -6222,8 +6390,8 @@ fn handle_context_menu_key(
             }
         }
         _ => {
-            app.active_overlay = ActiveOverlay::None;
-            return;
+            // Unhandled keys are inert. A context menu is modal; silently
+            // dismissing it would also strand any parked owning overlay.
         }
     }
 
@@ -6271,7 +6439,7 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
     let mut levels = vec![super::context_menu::MenuLevel::new(entries)];
     // If the root's first entry is a Submenu, auto-push it so users
     // see the cascade preview without first arrowing down.
-    if let Some(super::context_menu::ContextMenuEntry::Submenu { children, .. }) =
+    if let Some(crate::tui::context_menu::ContextMenuEntry::Submenu { children, .. }) =
         levels[0].entries.first()
     {
         if levels.len() < super::context_menu::MAX_CONTEXT_MENU_DEPTH {
@@ -19694,6 +19862,65 @@ fn handle_generic_overlay_mouse_in_area(
 /// Handle mouse events inside the metadata editor overlay.
 /// Build the row-level context menu for the MetadataEditor based on the
 /// clicked row's pill state (Revert / UseMb / None) and deletion mark.
+fn build_metadata_autonumber_submenu(
+    state: &super::app::MetadataEditorState,
+    target: super::metadata_autonumber::NumberingTarget,
+) -> Option<super::context_menu::ContextMenuEntry> {
+    use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
+
+    let eligibility =
+        super::metadata_autonumber::numbering_menu_eligibility(state, target).ok()?;
+    let mut children = eligibility
+        .immediate
+        .into_iter()
+        .map(|scheme| {
+            ContextMenuEntry::Item(ContextMenuItem {
+                label: scheme.label().to_string(),
+                action: ContextAction::MetadataAutoNumber(target, scheme),
+                shortcut: None,
+                enabled: true,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if eligibility.custom {
+        if !children.is_empty() {
+            children.push(ContextMenuEntry::Separator);
+        }
+        children.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Custom…".to_string(),
+            action: ContextAction::MetadataOpenAutoNumber(target),
+            shortcut: None,
+            enabled: true,
+        }));
+    }
+
+    (!children.is_empty()).then_some(ContextMenuEntry::Submenu {
+        label: "Auto number".to_string(),
+        children,
+    })
+}
+
+fn metadata_auto_populate_menu_item(
+    state: &super::app::MetadataEditorState,
+    target: super::metadata_autonumber::AutoPopulateTarget,
+    shortcut: &str,
+) -> Option<super::context_menu::ContextMenuEntry> {
+    use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
+
+    super::metadata_autonumber::auto_populate_has_useful_effect(state, target)
+        .ok()
+        .filter(|useful| *useful)
+        .map(|_| {
+            ContextMenuEntry::Item(ContextMenuItem {
+                label: "Auto populate".to_string(),
+                action: ContextAction::MetadataAutoPopulate(target),
+                shortcut: Some(shortcut.to_string()),
+                enabled: true,
+            })
+        })
+}
+
 pub(super) fn build_metadata_row_context_menu(
     state: &super::app::MetadataEditorState,
     row: usize,
@@ -19773,6 +20000,62 @@ pub(super) fn build_metadata_row_context_menu(
             shortcut: None,
             enabled: true,
         }));
+    }
+
+    let canonical_key = state
+        .active_surface()
+        .entries
+        .get(row)
+        .map(|entry| super::probe::canonical_metadata_display_key(&entry.display_key))
+        .unwrap_or_default();
+    let mut automatic_actions = Vec::new();
+    match canonical_key.as_str() {
+        "TRACKNUMBER" => {
+            if let Some(submenu) = build_metadata_autonumber_submenu(
+                state,
+                super::metadata_autonumber::NumberingTarget::Track,
+            ) {
+                automatic_actions.push(submenu);
+            }
+        }
+        "DISCNUMBER" => {
+            if let Some(submenu) = build_metadata_autonumber_submenu(
+                state,
+                super::metadata_autonumber::NumberingTarget::Disc,
+            ) {
+                automatic_actions.push(submenu);
+            }
+            if let Some(item) = metadata_auto_populate_menu_item(
+                state,
+                super::metadata_autonumber::AutoPopulateTarget::DiscNumber,
+                ":autopopulate discnumber",
+            ) {
+                automatic_actions.push(item);
+            }
+        }
+        "TRACKTOTAL" => {
+            if let Some(item) = metadata_auto_populate_menu_item(
+                state,
+                super::metadata_autonumber::AutoPopulateTarget::TrackTotal,
+                ":autopopulate totaltracks",
+            ) {
+                automatic_actions.push(item);
+            }
+        }
+        "DISCTOTAL" => {
+            if let Some(item) = metadata_auto_populate_menu_item(
+                state,
+                super::metadata_autonumber::AutoPopulateTarget::DiscTotal,
+                ":autopopulate totaldiscs",
+            ) {
+                automatic_actions.push(item);
+            }
+        }
+        _ => {}
+    }
+    if !automatic_actions.is_empty() {
+        entries.push(ContextMenuEntry::Separator);
+        entries.extend(automatic_actions);
     }
     entries.push(ContextMenuEntry::Separator);
     entries.push(ContextMenuEntry::Item(ContextMenuItem {
@@ -21709,18 +21992,29 @@ fn handle_metadata_editor_mouse_in_area(
                         if state.detail_edit.is_some() {
                             state.detail_edit = None;
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                        } else if in_popup {
-                            let entries = build_metadata_detail_context_menu(&state);
-                            app.pending_metadata_editor = Some(state);
-                            app.active_overlay = ActiveOverlay::ContextMenu {
-                                levels: vec![super::context_menu::MenuLevel::new(entries)],
-                                origin: (mx, my),
-                            };
                         } else {
-                            // Right-click outside popup: back out.
-                            state.detail_edit = None;
-                            state.phase = MetadataEditorPhase::Editing;
-                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                            let detail_slot = in_content
+                                .then(|| (my - content_y) as usize + state.detail_scroll)
+                                .and_then(|row| row.checked_sub(2));
+                            let detail_len = state
+                                .active_surface()
+                                .entries
+                                .get(state.detail_field_idx)
+                                .map(|entry| entry.per_file_values.len())
+                                .unwrap_or(state.active_surface().paths.len());
+                            if let Some(slot) = detail_slot.filter(|slot| *slot < detail_len) {
+                                state.detail_cursor = slot;
+                                let entries = build_metadata_detail_context_menu(&state);
+                                app.pending_metadata_editor = Some(state);
+                                app.active_overlay = ActiveOverlay::ContextMenu {
+                                    levels: vec![super::context_menu::MenuLevel::new(entries)],
+                                    origin: (mx, my),
+                                };
+                            } else {
+                                // Outside the actionable detail rows,
+                                // right-click is intentionally inert.
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                            }
                         }
                     }
                     MetadataEditorPhase::Editing
@@ -21736,15 +22030,15 @@ fn handle_metadata_editor_mouse_in_area(
                                 levels: vec![super::context_menu::MenuLevel::new(entries)],
                                 origin: (mx, my),
                             };
-                        } else {
-                            // Right-click on the "+ Add field..." line or
-                            // empty space → simple add-field menu.
-                            let entries = vec![super::context_menu::ContextMenuEntry::Item(
+                        } else if row == state.active_surface().entries.len() {
+                            // Only the rendered "+ Add field..." row is
+                            // actionable. Empty content below it is a no-op.
+                            let entries = vec![crate::tui::context_menu::ContextMenuEntry::Item(
                                 super::context_menu::ContextMenuItem {
                                     label: "Add new field".to_string(),
                                     action: super::context_menu::ContextAction::MetadataAddField,
                                     shortcut: None,
-                                    enabled: true,
+                                    enabled: !state.read_only,
                                 },
                             )];
                             app.pending_metadata_editor = Some(state);
@@ -21752,13 +22046,14 @@ fn handle_metadata_editor_mouse_in_area(
                                 levels: vec![super::context_menu::MenuLevel::new(entries)],
                                 origin: (mx, my),
                             };
+                        } else {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         }
                     }
                     _ => {
-                        // Right-click outside content area uses the
-                        // same close gate as Esc/footer/outside-click so
-                        // dirty edits cannot be discarded silently.
-                        request_metadata_editor_close(app, &mut state, tx);
+                        // Right-click is never a close gesture in the metadata
+                        // editor. Outside actionable rows it is a harmless no-op.
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     }
                 }
             }
@@ -22560,7 +22855,7 @@ fn metadata_editor_apply_inline_value_to_writable_slots(
     updated
 }
 
-fn metadata_editor_recompute_entry_display(entry: &mut super::probe::TagEntry) {
+pub(super) fn metadata_editor_recompute_entry_display(entry: &mut super::probe::TagEntry) {
     let all_same = entry.per_file_values.windows(2).all(|w| w[0] == w[1]);
     entry.is_mixed = !all_same && entry.per_file_values.len() > 1;
     entry.value = if entry.is_mixed {
@@ -22753,7 +23048,7 @@ fn metadata_editor_entry_edit_block_reason(
     (0..entry.per_file_values.len()).find_map(|idx| metadata_editor_slot_edit_block_reason(state, idx))
 }
 
-fn metadata_editor_slot_is_writable(
+pub(super) fn metadata_editor_slot_is_writable(
     state: &super::app::MetadataEditorState,
     slot_index: usize,
 ) -> bool {
@@ -29411,6 +29706,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         handle_theme_builder_mouse(app, mouse);
         return;
     }
+    if matches!(app.active_overlay, ActiveOverlay::MetadataAutoNumber(_)) {
+        handle_metadata_autonumber_mouse(app, mouse);
+        return;
+    }
     // MbSelect picker: dedicated handler (clickable rows, footer pills,
     // right-click context menu, double-click-to-accept).
     if matches!(app.active_overlay, ActiveOverlay::MbSelect(_)) {
@@ -29634,10 +29933,36 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
         if matches!(mouse.kind, MouseEventKind::Down(_)) {
             clear_convert_double_click_state_for_button(app, None);
+            let mb_owned_menu = app.pending_mb_select.is_some();
+            let cue_owned_menu = !mb_owned_menu && app.pending_cue_preview.is_some();
+            let metadata_owned_menu = !mb_owned_menu
+                && !cue_owned_menu
+                && app.pending_metadata_editor.is_some();
+            let overlay_owned_menu =
+                mb_owned_menu || cue_owned_menu || metadata_owned_menu;
             if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
-                // Right-click: close old menu (the user is going to open
-                // a new one). Drop any parked overlay state since the
-                // user is shifting context. Fall through to open new.
+                if mb_owned_menu {
+                    close_context_menu_restoring_parked(app);
+                    handle_mb_select_mouse(app, mouse, tx);
+                    return;
+                }
+                if cue_owned_menu {
+                    close_context_menu_restoring_parked(app);
+                    handle_cue_preview_mouse(app, mouse, tx);
+                    return;
+                }
+                // A metadata-originated menu is still inside the editor's
+                // interaction context. Restore that editor and route the new
+                // right-click through its own hit testing instead of dropping
+                // the parked state and revealing Browse.
+                if metadata_owned_menu {
+                    close_context_menu_restoring_parked(app);
+                    handle_metadata_editor_mouse(app, mouse, tx);
+                    return;
+                }
+
+                // Other origins preserve the existing desktop behavior: close
+                // the old menu and let the underlying screen open a new one.
                 app.active_overlay = ActiveOverlay::None;
                 app.pending_metadata_editor = None;
                 app.pending_cue_preview = None;
@@ -29649,6 +29974,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     // parked overlay) and select the clicked browse/queue
                     // item if applicable.
                     close_context_menu_restoring_parked(app);
+                    if overlay_owned_menu {
+                        // Parked overlays are modal. Closing a child menu
+                        // consumes the click; never leak it into Browse/Queue
+                        // controls that happen to be geometrically behind it.
+                        return;
+                    }
                     let x = mouse.column;
                     let y = mouse.row;
                     match app.current_screen {
@@ -30873,6 +31204,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataArtworkAdd(_)
             | TuiButton::MetadataArtworkReplace(_)
             | TuiButton::MetadataArtworkRemove(_)
+            | TuiButton::MetadataAutoNumberScheme(_)
+            | TuiButton::MetadataAutoNumberPrefix
+            | TuiButton::MetadataAutoNumberRow(_)
+            | TuiButton::MetadataAutoNumberApply
+            | TuiButton::MetadataAutoNumberCancel
             => {
                 // Handled in dedicated mouse/overlay handlers; no-op here.
             }
@@ -31677,6 +32013,217 @@ mod phase4_tests {
             Some("typed"),
             "the in-flight edit buffer must survive"
         );
+    }
+
+    #[test]
+    fn wheel_scroll_never_retargets_an_inflight_autonumber_prefix_edit() {
+        let editor = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![entry(
+                "TRACKNUMBER",
+                ItemKey::TrackNumber,
+                &["1", "1"],
+                &["1", "1"],
+            )],
+            vec!["a".to_string(), "b".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let mut overlay =
+            super::super::metadata_autonumber::AutoNumberOverlayState::new(
+                &editor,
+                super::super::metadata_autonumber::NumberingTarget::Track,
+            )
+            .unwrap();
+        overlay.cursor = 1;
+        overlay.begin_prefix_edit();
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(editor));
+        app.active_overlay = ActiveOverlay::MetadataAutoNumber(Box::new(overlay));
+
+        handle_metadata_autonumber_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        let ActiveOverlay::MetadataAutoNumber(overlay) = &app.active_overlay else {
+            panic!("auto-number overlay must remain open");
+        };
+        assert_eq!(
+            overlay.cursor, 1,
+            "a wheel notch must not retarget an in-flight prefix assignment"
+        );
+        assert!(
+            overlay.prefix_input.is_some(),
+            "the in-flight prefix buffer must survive"
+        );
+    }
+
+    fn autonumber_overlay_app() -> AppState {
+        let editor = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            vec![entry(
+                "TRACKNUMBER",
+                ItemKey::TrackNumber,
+                &["1", "1"],
+                &["1", "1"],
+            )],
+            vec!["one".to_string(), "two".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let overlay = super::super::metadata_autonumber::AutoNumberOverlayState::new(
+            &editor,
+            super::super::metadata_autonumber::NumberingTarget::Track,
+        )
+        .expect("auto-number overlay");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(editor));
+        app.active_overlay = ActiveOverlay::MetadataAutoNumber(Box::new(overlay));
+        app
+    }
+
+    #[test]
+    fn autonumber_keyboard_lifecycle_selects_prefixes_applies_and_cancels() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = autonumber_overlay_app();
+
+        for key in [
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            handle_overlay_key(&mut app, key, &tx);
+        }
+
+        let ActiveOverlay::MetadataEditor(editor) = &app.active_overlay else {
+            panic!("Enter apply must restore the editor");
+        };
+        assert_eq!(
+            editor.active_surface().entries[0].per_file_values,
+            ["B01", "B02"]
+        );
+        assert!(editor.active_surface().dirty);
+        assert!(app.pending_metadata_editor.is_none());
+
+        let mut cancel_app = autonumber_overlay_app();
+        handle_overlay_key(
+            &mut cancel_app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+        let ActiveOverlay::MetadataEditor(editor) = &cancel_app.active_overlay else {
+            panic!("Esc cancel must restore the editor");
+        };
+        assert_eq!(editor.active_surface().entries[0].per_file_values, ["1", "1"]);
+        assert!(!editor.active_surface().dirty);
+        assert!(cancel_app.pending_metadata_editor.is_none());
+    }
+
+    #[test]
+    fn autonumber_mouse_lifecycle_commits_prefix_and_applies_in_one_click() {
+        let mut app = autonumber_overlay_app();
+        app.button_map.record_button(
+            TuiButton::MetadataAutoNumberPrefix,
+            Rect::new(4, 4, 4, 1),
+        );
+        app.button_map.record_button(
+            TuiButton::MetadataAutoNumberApply,
+            Rect::new(4, 6, 4, 1),
+        );
+        let (tx, _rx) = mpsc::channel(8);
+
+        handle_metadata_autonumber_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE),
+            &tx,
+        );
+        handle_metadata_autonumber_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        let ActiveOverlay::MetadataEditor(editor) = &app.active_overlay else {
+            panic!("mouse Apply must commit and restore the editor");
+        };
+        assert_eq!(
+            editor.active_surface().entries[0].per_file_values,
+            ["B01", "A01"]
+        );
+        assert!(editor.active_surface().dirty);
+        assert!(app.pending_metadata_editor.is_none());
+    }
+
+    #[test]
+    fn autonumber_mouse_cancel_discards_inflight_prefix_and_restores_editor() {
+        let mut app = autonumber_overlay_app();
+        app.button_map.record_button(
+            TuiButton::MetadataAutoNumberPrefix,
+            Rect::new(4, 4, 4, 1),
+        );
+        app.button_map.record_button(
+            TuiButton::MetadataAutoNumberCancel,
+            Rect::new(4, 6, 4, 1),
+        );
+        let (tx, _rx) = mpsc::channel(8);
+
+        handle_metadata_autonumber_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE),
+            &tx,
+        );
+        handle_metadata_autonumber_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        let ActiveOverlay::MetadataEditor(editor) = &app.active_overlay else {
+            panic!("mouse Cancel must restore the editor");
+        };
+        assert_eq!(editor.active_surface().entries[0].per_file_values, ["1", "1"]);
+        assert!(!editor.active_surface().dirty);
+        assert!(app.pending_metadata_editor.is_none());
     }
 
     #[test]
@@ -32554,16 +33101,480 @@ mod phase4_tests {
     }
 
     #[test]
-    fn metadata_editor_right_click_outside_content_dirty_popup_prompts_before_closing() {
+    fn metadata_editor_right_click_outside_content_is_inert_even_when_dirty() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
         ])));
         let (tx, _rx) = mpsc::channel(1);
 
-        handle_mouse(&mut app, right_click_inside_popup_outside_content(), &tx);
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            right_click_inside_popup_outside_content(),
+            &tx,
+            Rect::new(0, 0, 100, 40),
+        );
 
-        assert_discard_confirmation(&app);
+        match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => {
+                assert!(state.active_surface().dirty);
+                assert_eq!(state.active_surface().entries[0].value, "New");
+            }
+            other => panic!("expected metadata editor to remain open, got {other:?}"),
+        }
+        assert!(app.pending_metadata_editor.is_none());
+    }
+
+    fn parked_metadata_context_menu() -> AppState {
+        use crate::tui::context_menu::{
+            ContextAction, ContextMenuEntry, ContextMenuItem, MenuLevel,
+        };
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(single_image_state(vec![entry(
+            "TRACKNUMBER",
+            ItemKey::TrackNumber,
+            &["01"],
+            &["01"],
+        )])));
+        app.active_overlay = ActiveOverlay::ContextMenu {
+            levels: vec![MenuLevel::new(vec![ContextMenuEntry::Item(
+                ContextMenuItem {
+                    label: "Edit value".to_string(),
+                    action: ContextAction::MetadataEditValue,
+                    shortcut: None,
+                    enabled: true,
+                },
+            )])],
+            origin: (2, 2),
+        };
+        app
+    }
+
+    fn assert_parked_metadata_menu(app: &AppState) {
+        assert!(matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }));
+        assert!(app.pending_metadata_editor.is_some());
+    }
+
+    fn assert_restored_metadata_editor(app: &AppState) {
+        assert!(matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)));
+        assert!(app.pending_metadata_editor.is_none());
+    }
+
+    #[test]
+    fn metadata_context_menu_unknown_keys_are_modal_noops() {
+        let (tx, _rx) = mpsc::channel(4);
+        for code in [KeyCode::Char('x'), KeyCode::Home, KeyCode::PageDown] {
+            let mut app = parked_metadata_context_menu();
+
+            handle_overlay_key(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &tx,
+            );
+
+            assert_parked_metadata_menu(&app);
+        }
+    }
+
+    #[test]
+    fn metadata_context_menu_all_keyboard_close_paths_restore_or_transition() {
+        let (tx, _rx) = mpsc::channel(8);
+        for code in [KeyCode::Esc, KeyCode::Left] {
+            let mut app = parked_metadata_context_menu();
+
+            handle_overlay_key(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &tx,
+            );
+
+            assert_restored_metadata_editor(&app);
+        }
+
+        for code in [KeyCode::Enter, KeyCode::Char('q')] {
+            let mut app = parked_metadata_context_menu();
+
+            handle_overlay_key(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &tx,
+            );
+
+            let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+                panic!("item action must transition back into the editor");
+            };
+            assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
+            assert!(app.pending_metadata_editor.is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_context_menu_all_mouse_close_paths_preserve_the_editor() {
+        let (tx, _rx) = mpsc::channel(16);
+        let area = crossterm::terminal::size().unwrap_or((80, 24));
+
+        // Every non-right activation button follows the same action-dispatch
+        // close path. The enabled item consumes the parked editor and opens
+        // its inline edit phase.
+        for button in [MouseButton::Left, MouseButton::Middle] {
+            let mut app = parked_metadata_context_menu();
+            let (levels, origin) = match &app.active_overlay {
+                ActiveOverlay::ContextMenu { levels, origin } => (levels.clone(), *origin),
+                _ => unreachable!(),
+            };
+            let (rects, _) = context_menu_stack_rects(&levels, origin, area.0, area.1);
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(button),
+                    column: rects[0].x.saturating_add(1),
+                    row: rects[0].y.saturating_add(1),
+                    modifiers: KeyModifiers::NONE,
+                },
+                &tx,
+            );
+            let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+                panic!("menu item click must return to metadata editor");
+            };
+            assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
+            assert!(app.pending_metadata_editor.is_none());
+        }
+
+        // Every non-right outside-click path closes only the child menu and
+        // consumes the click, restoring the exact owning editor.
+        for button in [MouseButton::Left, MouseButton::Middle] {
+            let mut app = parked_metadata_context_menu();
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(button),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &tx,
+            );
+            assert_restored_metadata_editor(&app);
+        }
+
+        // Right-click has its own close-and-reroute path. A non-actionable
+        // editor location must remain an inert click, never fall through to
+        // Browse after the old menu is closed.
+        let mut app = parked_metadata_context_menu();
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+        assert_restored_metadata_editor(&app);
+    }
+
+    #[test]
+    fn track_number_context_menu_exposes_all_immediate_schemes_and_custom() {
+        let state = single_image_state(vec![entry(
+            "TRACKNUMBER",
+            ItemKey::TrackNumber,
+            &["99"],
+            &["99"],
+        )]);
+        let entries = build_metadata_row_context_menu(&state, 0);
+        let children = entries
+            .iter()
+            .find_map(|entry| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Submenu { label, children }
+                    if label == "Auto number" => Some(children),
+                _ => None,
+            })
+            .expect("TRACKNUMBER auto-number submenu");
+        let labels = children
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Item(item) => Some(item.label.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, ["N", "NN", "N/NN", "NN/NN", "Custom…"]);
+    }
+
+    #[test]
+    fn numeric_carrier_menu_exposes_only_round_trip_safe_numbering() {
+        let state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/album.dsf")],
+            vec![entry(
+                "TRACKNUMBER",
+                ItemKey::TrackNumber,
+                &["9"],
+                &["9"],
+            )],
+            vec!["01".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let entries = build_metadata_row_context_menu(&state, 0);
+        let children = entries
+            .iter()
+            .find_map(|entry| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Submenu { label, children }
+                    if label == "Auto number" => Some(children),
+                _ => None,
+            })
+            .expect("TRACKNUMBER auto-number submenu");
+        let items = children
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Item(item) => {
+                    Some((item.label.as_str(), item.enabled))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(items, [("N", true)]);
+    }
+
+    #[test]
+    fn auto_number_parent_is_omitted_when_no_child_can_do_useful_work() {
+        let state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/album.dsf")],
+            vec![entry(
+                "TRACKNUMBER",
+                ItemKey::TrackNumber,
+                &["1"],
+                &["1"],
+            )],
+            vec!["01".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let entries = build_metadata_row_context_menu(&state, 0);
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Submenu { label, .. }
+                if label == "Auto number"
+        )));
+    }
+
+    #[test]
+    fn read_only_or_unpersistable_rows_never_expose_empty_auto_actions() {
+        let mut state = single_image_state(vec![entry(
+            "TRACKNUMBER",
+            ItemKey::TrackNumber,
+            &["9"],
+            &["9"],
+        )]);
+        state.read_only = true;
+        let entries = build_metadata_row_context_menu(&state, 0);
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Submenu { label, .. }
+                if label == "Auto number"
+        )));
+    }
+
+    #[test]
+    fn no_writable_slots_omit_numbering_and_auto_population_actions() {
+        let path = std::path::PathBuf::from("/tmp/album.flac");
+        let mut details = crate::tui::app::MetadataTechnicalDetails::default();
+        let mut file = crate::tui::app::MetadataFileDetails::default();
+        file.file_facts.path = path.clone();
+        file.file_facts.write_eligibility =
+            crate::tui::app::FileWriteEligibility::Blocked {
+                reason: "read-only fixture".to_string(),
+            };
+        details.files = vec![file];
+
+        for (display_key, item_key) in [
+            ("TRACKNUMBER", ItemKey::TrackNumber),
+            ("DISCNUMBER", ItemKey::DiscNumber),
+            ("TRACKTOTAL", ItemKey::TrackTotal),
+            ("DISCTOTAL", ItemKey::DiscTotal),
+        ] {
+            let state = MetadataEditorState::for_files(
+                vec![path.clone()],
+                vec![entry(display_key, item_key.clone(), &["9"], &["9"])],
+                vec!["01".to_string()],
+                details.clone(),
+            );
+            let entries = build_metadata_row_context_menu(&state, 0);
+            assert!(!entries.iter().any(|entry| matches!(
+                entry,
+                crate::tui::context_menu::ContextMenuEntry::Submenu { label, .. }
+                    if label == "Auto number"
+            )));
+            assert!(!entries.iter().any(|entry| matches!(
+                entry,
+                crate::tui::context_menu::ContextMenuEntry::Item(item)
+                    if matches!(
+                        &item.action,
+                        crate::tui::context_menu::ContextAction::MetadataAutoPopulate(_)
+                    )
+            )));
+        }
+    }
+
+    fn menu_has_auto_populate(
+        entries: &[crate::tui::context_menu::ContextMenuEntry],
+        target: crate::tui::metadata_autonumber::AutoPopulateTarget,
+    ) -> bool {
+        entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if item.enabled
+                    && matches!(
+                        &item.action,
+                        crate::tui::context_menu::ContextAction::MetadataAutoPopulate(actual)
+                            if *actual == target
+                    )
+        ))
+    }
+
+    #[test]
+    fn auto_populate_is_omitted_without_eligible_values_and_shown_with_work() {
+        let no_evidence = single_image_state(vec![entry(
+            "DISCNUMBER",
+            ItemKey::DiscNumber,
+            &[""],
+            &[""],
+        )]);
+        let no_evidence_menu = build_metadata_row_context_menu(&no_evidence, 0);
+        assert!(!menu_has_auto_populate(
+            &no_evidence_menu,
+            crate::tui::metadata_autonumber::AutoPopulateTarget::DiscNumber,
+        ));
+
+        let track_total = single_image_state(vec![entry(
+            "TRACKTOTAL",
+            ItemKey::TrackTotal,
+            &[""],
+            &[""],
+        )]);
+        assert!(menu_has_auto_populate(
+            &build_metadata_row_context_menu(&track_total, 0),
+            crate::tui::metadata_autonumber::AutoPopulateTarget::TrackTotal,
+        ));
+
+        let already_populated = single_image_state(vec![entry(
+            "TRACKTOTAL",
+            ItemKey::TrackTotal,
+            &["1"],
+            &["1"],
+        )]);
+        assert!(!menu_has_auto_populate(
+            &build_metadata_row_context_menu(&already_populated, 0),
+            crate::tui::metadata_autonumber::AutoPopulateTarget::TrackTotal,
+        ));
+
+        let disc_number = single_image_state(vec![entry(
+            "DISCNUMBER",
+            ItemKey::DiscNumber,
+            &[""],
+            &["2"],
+        )]);
+        assert!(menu_has_auto_populate(
+            &build_metadata_row_context_menu(&disc_number, 0),
+            crate::tui::metadata_autonumber::AutoPopulateTarget::DiscNumber,
+        ));
+
+        let disc_total = single_image_state(vec![
+            entry("DISCNUMBER", ItemKey::DiscNumber, &["2"], &["2"]),
+            entry("DISCTOTAL", ItemKey::DiscTotal, &[""], &[""]),
+        ]);
+        assert!(menu_has_auto_populate(
+            &build_metadata_row_context_menu(&disc_total, 1),
+            crate::tui::metadata_autonumber::AutoPopulateTarget::DiscTotal,
+        ));
+    }
+
+    #[test]
+    fn mixed_writable_read_only_menu_uses_writable_carrier_intersection() {
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/one.flac"),
+            std::path::PathBuf::from("/tmp/two.dsf"),
+        ];
+        let mut details = crate::tui::app::MetadataTechnicalDetails::default();
+        details.files = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut file = crate::tui::app::MetadataFileDetails::default();
+                file.file_facts.path = path.clone();
+                if index == 1 {
+                    file.file_facts.write_eligibility =
+                        crate::tui::app::FileWriteEligibility::Blocked {
+                            reason: "read-only fixture".to_string(),
+                        };
+                }
+                file
+            })
+            .collect();
+        let state = MetadataEditorState::for_files(
+            paths,
+            vec![entry(
+                "TRACKNUMBER",
+                ItemKey::TrackNumber,
+                &["9", "1"],
+                &["9", "1"],
+            )],
+            vec!["one".to_string(), "two".to_string()],
+            details,
+        );
+        let entries = build_metadata_row_context_menu(&state, 0);
+        let children = entries
+            .iter()
+            .find_map(|entry| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Submenu { label, children }
+                    if label == "Auto number" => Some(children),
+                _ => None,
+            })
+            .expect("writable FLAC slot keeps text-safe submenu available");
+        assert!(children.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if item.label == "Custom…" && item.enabled
+        )));
+    }
+
+    #[test]
+    fn auto_number_submenu_never_contains_only_separators() {
+        for state in [
+            MetadataEditorState::for_files(
+                vec![std::path::PathBuf::from("/tmp/unknown.bin")],
+                vec![entry(
+                    "TRACKNUMBER",
+                    ItemKey::TrackNumber,
+                    &["9"],
+                    &["9"],
+                )],
+                vec!["01".to_string()],
+                crate::tui::app::MetadataTechnicalDetails::default(),
+            ),
+            MetadataEditorState::for_files(
+                vec![std::path::PathBuf::from("/tmp/album.dsf")],
+                vec![entry(
+                    "TRACKNUMBER",
+                    ItemKey::TrackNumber,
+                    &["1"],
+                    &["1"],
+                )],
+                vec!["01".to_string()],
+                crate::tui::app::MetadataTechnicalDetails::default(),
+            ),
+        ] {
+            let entries = build_metadata_row_context_menu(&state, 0);
+            for entry in entries {
+                if let crate::tui::context_menu::ContextMenuEntry::Submenu { children, .. } = entry {
+                    assert!(children.iter().any(|child| matches!(
+                        child,
+                        crate::tui::context_menu::ContextMenuEntry::Item(item) if item.enabled
+                    )));
+                }
+            }
+        }
     }
 
     #[test]

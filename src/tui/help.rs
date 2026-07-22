@@ -58,6 +58,14 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     ("Esc", "Exit type-ahead / visual mode / clear selection"),
                     ("Ctrl+E", "Edit metadata for selected file(s)"),
                     (":D / :detail", "Per-file detail view (in metadata editor)"),
+                    (
+                        ":autonumber …",
+                        "Auto-number track or disc fields in metadata editor",
+                    ),
+                    (
+                        ":autopopulate …",
+                        "Populate totals or explicit disc numbers in metadata editor",
+                    ),
                 ],
             },
             HelpSection {
@@ -302,6 +310,17 @@ mod tests {
             .into_iter()
             .flat_map(|section| section.entries.into_iter())
             .collect()
+    }
+
+    #[test]
+    fn metadata_help_renders_auto_numbering_commands() {
+        let entries = rendered_help_pairs(AppScreen::Browse);
+        for command in [":autonumber …", ":autopopulate …"] {
+            assert!(
+                entries.iter().any(|(key, _)| *key == command),
+                "Browse help must render {command}"
+            );
+        }
     }
 
     #[test]

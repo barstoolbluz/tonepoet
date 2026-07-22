@@ -4,6 +4,7 @@ pub mod ctdb_rs;
 pub mod db;
 pub mod disc;
 pub mod dsf_tags;
+pub mod metadata_persistence;
 pub mod secret_store;
 pub mod tui;
 

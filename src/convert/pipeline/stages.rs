@@ -4444,6 +4444,10 @@ fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> V
     }
     if let Some(n) = meta.track_number {
         push_tag_value(&mut tags, "TRACKNUMBER", &n.to_string());
+    } else if let Some((_, sequence)) = source_side_prefixed_track_number(meta) {
+        // Side-prefixed source values remain raw for filename rendering, while
+        // format-specific metadata writers receive a valid numeric atom.
+        push_tag_value(&mut tags, "TRACKNUMBER", &sequence.to_string());
     }
     if let Some(n) = meta.disc_number.or(album.disc_number) {
         push_tag_value(&mut tags, "DISCNUMBER", &n.to_string());
@@ -33239,10 +33243,16 @@ fn render_track_template<T: TemplateRenderTarget + ?Sized>(
         .unwrap_or_default();
 
     let mut tokens = BTreeMap::new();
-    let nn = format!("{n:02}");
+    let raw_track_number = source_side_prefixed_track_number(&track.metadata)
+        .map(|(raw, _)| raw);
+    let nn = raw_track_number
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{n:02}"));
     tokens.insert("NN".to_string(), nn.clone());
     tokens.insert("TRACKNN".to_string(), nn);
-    let n_str = n.to_string();
+    let n_str = raw_track_number
+        .map(str::to_string)
+        .unwrap_or_else(|| n.to_string());
     tokens.insert("N".to_string(), n_str.clone());
     tokens.insert("TRACKN".to_string(), n_str.clone());
     tokens.insert("TRACK".to_string(), n_str);
@@ -34422,6 +34432,87 @@ fn template_disc_number(source: &PreparedSource, track: &PreparedTrack) -> u32 {
     track_disc_number_hint(source, track)
         .filter(|disc| *disc > 0)
         .unwrap_or(1)
+}
+
+fn source_side_prefixed_track_number(meta: &TrackMetadata) -> Option<(&str, u32)> {
+    meta.extra.iter().find_map(|(marker_key, marker_value)| {
+        let source_key = source_text_tag_key_from_extra(&meta.extra, marker_key, marker_value)?;
+        if normalize_metadata_key(source_key) != "TRACKNUMBER" {
+            return None;
+        }
+        strict_side_prefixed_track_number(marker_value)
+    })
+}
+
+fn strict_side_prefixed_track_number(value: &str) -> Option<(&str, u32)> {
+    let value = value.trim();
+    let mut saw_prefix = false;
+    let mut saw_digit = false;
+    let mut prefix_len = 0usize;
+    let mut sequence = String::new();
+    for character in value.chars() {
+        if !saw_digit && character.is_ascii_alphabetic() {
+            saw_prefix = true;
+            prefix_len += 1;
+            if prefix_len > 8 {
+                return None;
+            }
+            continue;
+        }
+        if saw_prefix && character.is_ascii_digit() {
+            saw_digit = true;
+            sequence.push(character);
+            continue;
+        }
+        return None;
+    }
+    if !saw_prefix || !saw_digit {
+        return None;
+    }
+    let sequence = sequence.parse::<u32>().ok().filter(|number| *number > 0)?;
+    Some((value, sequence))
+}
+
+#[cfg(test)]
+mod side_prefixed_track_number_tests {
+    use super::*;
+
+    #[test]
+    fn source_provenance_is_required_for_raw_side_numbering() {
+        let mut meta = TrackMetadata::default();
+        meta.extra.insert("tracknumber".to_string(), "A01".to_string());
+        assert_eq!(source_side_prefixed_track_number(&meta), None);
+
+        insert_source_text_tag(&mut meta.extra, "TRACKNUMBER", "A01");
+        assert_eq!(source_side_prefixed_track_number(&meta), Some(("A01", 1)));
+    }
+
+    #[test]
+    fn raw_track_number_acceptance_is_strict_and_path_safe() {
+        for rejected in ["01", "A0", "A01/17", "A01 - title", "../A01", "A 01"] {
+            assert_eq!(strict_side_prefixed_track_number(rejected), None, "{rejected}");
+        }
+        assert_eq!(strict_side_prefixed_track_number("A01"), Some(("A01", 1)));
+        assert_eq!(
+            strict_side_prefixed_track_number("SIDEB11"),
+            Some(("SIDEB11", 11))
+        );
+    }
+
+    #[test]
+    fn side_prefixed_source_number_keeps_output_metadata_numeric() {
+        let mut meta = TrackMetadata::default();
+        insert_source_text_tag(&mut meta.extra, "TRACKNUMBER", "B11");
+
+        let tags = authoritative_metadata_tags(&meta, &AlbumMetadata::default());
+
+        assert!(tags.iter().any(|(key, value)| {
+            key == "TRACKNUMBER" && value == "11"
+        }));
+        assert!(!tags.iter().any(|(key, value)| {
+            key == "TRACKNUMBER" && value == "B11"
+        }));
+    }
 }
 
 fn template_track_number(source: &PreparedSource, track: &PreparedTrack) -> u32 {
@@ -40167,6 +40258,75 @@ mod naming_template_tests {
             path,
             PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT 999 -")
         );
+    }
+
+    #[test]
+    fn render_track_template_preserves_provenance_backed_side_numbering() {
+        let mut source = template_source();
+        insert_source_text_tag(
+            &mut source.tracks[0].metadata.extra,
+            "TRACKNUMBER",
+            "A01",
+        );
+
+        let path = render_track_template(
+            "%NN% - %N% - %TRACKNN% - %TRACKN% - %TRACK% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            &tonepoet_pipeline::AudioFormat::Flac,
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("A01 - A01 - A01 - A01 - A01 - Right Off")
+        );
+    }
+
+    #[test]
+    fn saved_side_prefixed_flac_reopens_materializes_and_renders_exact_output_path() {
+        use lofty::tag::ItemKey;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("Come Together.flac");
+        std::fs::write(&path, include_bytes!("../../../tests/fixtures/silence.flac"))
+            .expect("write FLAC fixture");
+
+        crate::tui::probe::write_all_tags(
+            &path,
+            &[
+                (ItemKey::TrackNumber, Some("A01".to_string())),
+                (ItemKey::TrackTitle, Some("Come Together".to_string())),
+            ],
+        )
+        .expect("save side-prefixed metadata through the editor writer");
+
+        let reopened = crate::tui::probe::read_all_tags(&path)
+            .expect("reopen metadata through the editor reader");
+        let track_number = reopened
+            .iter()
+            .find(|entry| normalize_metadata_key(&entry.display_key) == "TRACKNUMBER")
+            .expect("reopened TRACKNUMBER");
+        assert_eq!(track_number.per_file_values, ["A01"]);
+
+        let metadata = super::super::materializer_single::read_track_metadata(&path)
+            .expect("materialize saved FLAC metadata");
+        assert_eq!(metadata.track_number, None);
+        assert_eq!(source_side_prefixed_track_number(&metadata), Some(("A01", 1)));
+
+        let mut source = template_source();
+        source.container = path.clone();
+        source.tracks[0].source_ref = TrackSourceRef::StagedFile(path);
+        source.tracks[0].metadata = metadata;
+
+        let rendered = render_track_template(
+            "%NN% - %TITLE%",
+            &source,
+            &source.tracks[0],
+            &tonepoet_pipeline::AudioFormat::Flac,
+        )
+        .expect("render saved source metadata");
+        assert_eq!(rendered, PathBuf::from("A01 - Come Together"));
     }
 
     #[test]

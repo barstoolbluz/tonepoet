@@ -159,6 +159,15 @@ pub enum ContextAction {
     MetadataRestoreEntry,
     /// MetadataEditor: open the "add new field" input.
     MetadataAddField,
+    /// MetadataEditor: immediately apply one numbering scheme.
+    MetadataAutoNumber(
+        crate::tui::metadata_autonumber::NumberingTarget,
+        crate::tui::metadata_autonumber::NumberingScheme,
+    ),
+    /// MetadataEditor: open the custom side-prefix/preview overlay.
+    MetadataOpenAutoNumber(crate::tui::metadata_autonumber::NumberingTarget),
+    /// MetadataEditor: derive and populate one count/number field.
+    MetadataAutoPopulate(crate::tui::metadata_autonumber::AutoPopulateTarget),
     /// MetadataEditor: open a read-only CuePreview seeded with the
     /// cursor row's value (synthetic-preview rows like CUESHEET).
     MetadataCueView,
@@ -1331,6 +1340,55 @@ pub fn execute_context_action(
                 state.phase = super::app::MetadataEditorPhase::AddingKey;
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
+        }
+        ContextAction::MetadataAutoNumber(target, scheme) => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status("Auto-number: owning metadata editor is no longer available");
+                return;
+            };
+            match super::metadata_autonumber::apply_numbering(
+                &mut state,
+                target,
+                scheme,
+                None,
+            ) {
+                Ok(report) => app.set_status(report.status("Auto-numbered")),
+                Err(error) => app.set_status(format!("Auto-number: {error}")),
+            }
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+        }
+        ContextAction::MetadataOpenAutoNumber(target) => {
+            let result = app
+                .pending_metadata_editor
+                .as_ref()
+                .ok_or_else(|| "owning metadata editor is no longer available".to_string())
+                .and_then(|state| {
+                    super::metadata_autonumber::AutoNumberOverlayState::new(state, target)
+                });
+            match result {
+                Ok(overlay) => {
+                    app.active_overlay = super::app::ActiveOverlay::MetadataAutoNumber(Box::new(
+                        overlay,
+                    ));
+                }
+                Err(error) => {
+                    app.set_status(format!("Auto-number: {error}"));
+                    if let Some(state) = app.pending_metadata_editor.take() {
+                        app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                    }
+                }
+            }
+        }
+        ContextAction::MetadataAutoPopulate(target) => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status("Auto populate: owning metadata editor is no longer available");
+                return;
+            };
+            match super::metadata_autonumber::auto_populate(&mut state, target) {
+                Ok(report) => app.set_status(report.status("Auto-populated")),
+                Err(error) => app.set_status(format!("Auto populate: {error}")),
+            }
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
         ContextAction::MetadataCueView => {
             // Open a read-only CuePreview seeded with the row's full CUE

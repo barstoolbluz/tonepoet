@@ -1122,18 +1122,10 @@ mod flac_metadata_writer {
     }
 
     pub(super) fn is_probably_flac(path: &Path) -> bool {
-        if path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("flac"))
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        let mut magic = [0u8; 4];
-        std::fs::File::open(path)
-            .and_then(|mut file| file.read_exact(&mut magic))
-            .map(|()| &magic == FLAC_MAGIC)
-            .unwrap_or(false)
+        matches!(
+            crate::metadata_persistence::metadata_persistence_route_for_path(path),
+            crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
+        )
     }
 
     pub(super) fn write_vorbis_comment_changes(
@@ -7588,62 +7580,76 @@ fn write_all_tags_with_cancel_report(
 
     check_metadata_write_cancel(cancel, "before starting file")?;
 
-    if crate::dsf_tags::is_dsf(path) {
-        let dsf_changes = changes
-            .iter()
-            .map(|(key, value)| {
-                let canonical_key = match key {
-                    lofty::tag::ItemKey::Unknown(value) => Some(value.as_str()),
-                    _ => key.map_key(lofty::tag::TagType::VorbisComments, true),
-                }
-                .ok_or_else(|| format!("cannot map {:?} to the DSF editor tag canon", key))?;
-                Ok(crate::dsf_tags::DsfTagChange {
-                    canonical_key: canonical_metadata_display_key(canonical_key),
-                    value: value.clone(),
+    let route = crate::metadata_persistence::metadata_persistence_route_for_path(path);
+    match route {
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3 => {
+            let dsf_changes = changes
+                .iter()
+                .map(|(key, value)| {
+                    let canonical_key = match key {
+                        lofty::tag::ItemKey::Unknown(value) => Some(value.as_str()),
+                        _ => key.map_key(lofty::tag::TagType::VorbisComments, true),
+                    }
+                    .ok_or_else(|| format!("cannot map {:?} to the DSF editor tag canon", key))?;
+                    Ok(crate::dsf_tags::DsfTagChange {
+                        canonical_key: canonical_metadata_display_key(canonical_key),
+                        value: value.clone(),
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let is_cancelled = || {
-            cancel.is_some_and(|flag| {
-                let cancelled = flag.is_cancelled();
-                if cancelled {
-                    flag.record_observation();
+                .collect::<Result<Vec<_>, String>>()?;
+            let is_cancelled = || {
+                cancel.is_some_and(|flag| {
+                    let cancelled = flag.is_cancelled();
+                    if cancelled {
+                        flag.record_observation();
+                    }
+                    cancelled
+                })
+            };
+            let report_progress = |update| {
+                if let Some(progress) = byte_progress {
+                    progress(path, update);
                 }
-                cancelled
-            })
-        };
-        let report_progress = |update| {
-            if let Some(progress) = byte_progress {
-                progress(path, update);
-            }
-        };
-        let warning = crate::dsf_tags::write_with_control(
-            path,
-            &dsf_changes,
-            &is_cancelled,
-            &report_progress,
-        )?;
-        return Ok(MetadataWriteCommitReport::from_warnings(warning.into_iter().collect()));
-    }
-
-    if flac_metadata_writer::is_probably_flac(path) {
-        let observation_before = cancel.map_or(0, MetadataWriteCancelFlag::observation_count);
-        match flac_metadata_writer::write_vorbis_comment_changes(path, changes, cancel) {
-            Ok(report) => {
-                return Ok(MetadataWriteCommitReport::from_warnings(report.durability_warnings));
-            }
-            Err(native_err)
-                if cancel.is_some_and(|flag| flag.observation_count() > observation_before) =>
-            {
-                return Err(native_err);
-            }
-            Err(native_err) => {
-                return Err(native_flac_write_refused_error(path, "tag write", &native_err));
+            };
+            let warning = crate::dsf_tags::write_with_control(
+                path,
+                &dsf_changes,
+                &is_cancelled,
+                &report_progress,
+            )?;
+            return Ok(MetadataWriteCommitReport::from_warnings(
+                warning.into_iter().collect(),
+            ));
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => {
+            let observation_before =
+                cancel.map_or(0, MetadataWriteCancelFlag::observation_count);
+            match flac_metadata_writer::write_vorbis_comment_changes(path, changes, cancel) {
+                Ok(report) => {
+                    return Ok(MetadataWriteCommitReport::from_warnings(
+                        report.durability_warnings,
+                    ));
+                }
+                Err(native_err)
+                    if cancel
+                        .is_some_and(|flag| flag.observation_count() > observation_before) =>
+                {
+                    return Err(native_err);
+                }
+                Err(native_err) => {
+                    return Err(native_flac_write_refused_error(
+                        path,
+                        "tag write",
+                        &native_err,
+                    ));
+                }
             }
         }
+        crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {
+            reject_unsupported_dff_metadata_write(path, "writing")?;
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {}
     }
-
-    reject_unsupported_dff_metadata_write(path, "writing")?;
     check_metadata_write_cancel(cancel, "before starting full-file fallback rewrite")?;
     let cleanup_warning = write_all_tags_lofty_with_backup(path, changes)?;
     Ok(MetadataWriteCommitReport::from_warnings(cleanup_warning.into_iter().collect()))
@@ -7657,21 +7663,24 @@ fn write_all_tags_without_full_file_backup(
         return Ok(());
     }
 
-    if crate::dsf_tags::is_dsf(path) {
-        return Err(format!(
-            "internal transaction error: DSF path '{}' reached the legacy full-file transaction even though DSF owns a native recovery journal",
-            path.display()
-        ));
+    match crate::metadata_persistence::metadata_persistence_route_for_path(path) {
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3 => {
+            return Err(format!(
+                "internal transaction error: DSF path '{}' reached the legacy full-file transaction even though DSF owns a native recovery journal",
+                path.display()
+            ));
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => {
+            return Err(format!(
+                "internal transaction error: native FLAC path '{}' reached the full-file writer",
+                path.display()
+            ));
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {
+            reject_unsupported_dff_metadata_write(path, "writing")?;
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {}
     }
-
-    if flac_metadata_writer::is_probably_flac(path) {
-        return Err(format!(
-            "internal transaction error: native FLAC path '{}' reached the full-file writer",
-            path.display()
-        ));
-    }
-
-    reject_unsupported_dff_metadata_write(path, "writing")?;
     write_all_tags_lofty_in_place(path, changes)
 }
 
@@ -7827,21 +7836,35 @@ fn write_all_tags_lofty_in_place(
         .primary_tag_mut()
         .ok_or_else(|| "failed to create primary tag".to_string())?;
 
-    if tag.tag_type() == lofty::tag::TagType::VorbisComments {
+    let backend = crate::metadata_persistence::metadata_backend_for_lofty_tag_type(
+        tag.tag_type(),
+    );
+    if backend
+        == crate::metadata_persistence::MetadataPersistenceBackend::LoftyVorbisComments
+    {
         apply_vorbis_lofty_changes(tag, changes)?;
     } else {
         for (key, new_value) in changes {
+            let persistence_key =
+                crate::metadata_persistence::normalize_numbering_item_key_for_backend(
+                    backend, key,
+                );
+            // Remove both spellings. Core editor rows can originate as logical
+            // `Unknown` keys before a carrier stores the field, while older
+            // writes may already have created that free-form spelling. The
+            // backend-owned typed key is the only representation reinserted.
+            tag.remove_key(key);
+            if persistence_key != *key {
+                tag.remove_key(&persistence_key);
+            }
             match new_value {
                 Some(value) if !value.trim().is_empty() => {
-                    tag.remove_key(key);
                     tag.insert_unchecked(TagItem::new(
-                        key.clone(),
+                        persistence_key,
                         ItemValue::Text(value.trim().to_string()),
                     ));
                 }
-                _ => {
-                    tag.remove_key(key);
-                }
+                _ => {}
             }
         }
     }
@@ -8553,6 +8576,281 @@ pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lofty::file::TaggedFileExt;
+
+    const VORBIS_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata_persistence/vorbis.ogg"
+    ));
+    const ID3V2_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata_persistence/id3v2.mp3"
+    ));
+    const APE_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata_persistence/ape.wv"
+    ));
+    const MP4_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata_persistence/mp4.m4a"
+    ));
+
+    fn copy_numbering_fixture(
+        file_name: &str,
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().expect("metadata persistence tempdir");
+        let path = temp.path().join(file_name);
+        std::fs::write(&path, bytes).expect("copy metadata persistence fixture");
+        (temp, path)
+    }
+
+    fn editor_numbering_value(path: &std::path::Path, display_key: &str) -> String {
+        let merged = read_all_tags_merged_with_metadata(&[path.to_path_buf()])
+            .expect("reopen metadata through production editor reader");
+        merged
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == display_key)
+            .and_then(|entry| entry.per_file_values.first())
+            .cloned()
+            .unwrap_or_else(|| panic!("missing {display_key} after persistence round trip"))
+    }
+
+    fn assert_textual_numbering_backend_round_trip(
+        file_name: &str,
+        fixture: &[u8],
+        expected_backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    ) {
+        let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+        let capability =
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path)
+                .expect("classify real metadata fixture");
+        assert_eq!(capability.backend, expected_backend);
+        assert_eq!(
+            capability.capabilities,
+            crate::metadata_persistence::MetadataNumberingCapabilities::TEXTUAL
+        );
+
+        for expected in ["A01", "7", "01/17"] {
+            write_all_tags(
+                &path,
+                &[(
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some(expected.to_string()),
+                )],
+            )
+            .expect("persist numbering value through production writer");
+            assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), expected);
+
+            let tagged = lofty::read_from_path(&path).expect("reopen persisted carrier");
+            let tag = tagged.primary_tag().expect("primary tag after write");
+            assert!(
+                tag.items()
+                    .any(|item| item.key() == &lofty::tag::ItemKey::TrackNumber),
+                "{expected_backend:?} must serialize the logical editor key as its standard track-number item"
+            );
+            assert!(
+                !tag.items().any(|item| matches!(
+                    item.key(),
+                    lofty::tag::ItemKey::Unknown(name)
+                        if name.eq_ignore_ascii_case("TRACKNUMBER")
+                )),
+                "{expected_backend:?} must not substitute a free-form TRACKNUMBER item"
+            );
+        }
+    }
+
+    #[test]
+    fn lofty_vorbis_numbering_capability_matches_production_round_trip() {
+        assert_textual_numbering_backend_round_trip(
+            "numbering.ogg",
+            VORBIS_NUMBERING_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyVorbisComments,
+        );
+    }
+
+    #[test]
+    fn id3v2_numbering_capability_matches_production_round_trip() {
+        assert_textual_numbering_backend_round_trip(
+            "numbering.mp3",
+            ID3V2_NUMBERING_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2,
+        );
+    }
+
+    #[test]
+    fn ape_numbering_capability_matches_production_round_trip() {
+        assert_textual_numbering_backend_round_trip(
+            "numbering.wv",
+            APE_NUMBERING_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe,
+        );
+    }
+
+    #[test]
+    fn mp4_numbering_pairs_round_trip_without_free_form_atoms() {
+        use lofty::tag::Accessor;
+
+        let (_temp, path) = copy_numbering_fixture("numbering.m4a", MP4_NUMBERING_FIXTURE);
+        let capability =
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path)
+                .expect("classify real MP4 fixture");
+        assert_eq!(
+            capability.backend,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+        );
+        assert_eq!(
+            capability.capabilities,
+            crate::metadata_persistence::MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY
+        );
+
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("17".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                    Some("3".to_string()),
+                ),
+            ],
+        )
+        .expect("persist MP4 numbering pairs through production writer");
+
+        let tagged = lofty::read_from_path(&path).expect("reopen persisted MP4");
+        let tag = tagged.primary_tag().expect("MP4 primary ilst tag");
+        assert_eq!(tag.track(), Some(7));
+        assert_eq!(tag.track_total(), Some(17));
+        assert_eq!(tag.disk(), Some(2));
+        assert_eq!(tag.disk_total(), Some(3));
+
+        let persisted_bytes = std::fs::read(&path).expect("read persisted MP4 bytes");
+        for forbidden in ["TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+            assert!(
+                !tag.items().any(|item| matches!(
+                    item.key(),
+                    lofty::tag::ItemKey::Unknown(name)
+                        if name.eq_ignore_ascii_case(forbidden)
+                )),
+                "MP4 writer must not substitute free-form {forbidden} metadata for trkn/disk pairs"
+            );
+            assert!(
+                !persisted_bytes
+                    .windows(forbidden.len())
+                    .any(|window| window.eq_ignore_ascii_case(forbidden.as_bytes())),
+                "MP4 carrier must not contain a free-form {forbidden} atom identifier"
+            );
+        }
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        assert_eq!(editor_numbering_value(&path, "TRACKTOTAL"), "17");
+        assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "2");
+        assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "3");
+    }
+
+    #[test]
+    fn dsf_numeric_numbering_round_trips_and_lexical_write_is_atomic() {
+        let temp = tempfile::tempdir().expect("DSF metadata persistence tempdir");
+        let path = temp.path().join("numbering.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("write DSF fixture");
+        let capability =
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path)
+                .expect("classify real DSF fixture");
+        assert_eq!(
+            capability.backend,
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeDsfId3
+        );
+        assert_eq!(
+            capability.capabilities,
+            crate::metadata_persistence::MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY
+        );
+
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("17".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                    Some("3".to_string()),
+                ),
+            ],
+        )
+        .expect("persist numeric DSF numbering values");
+        let snapshot = crate::dsf_tags::read(&path).expect("reopen numeric DSF metadata");
+        assert_eq!(snapshot.first("TRACKNUMBER"), Some("7"));
+        assert_eq!(snapshot.first("TRACKTOTAL"), Some("17"));
+        assert_eq!(snapshot.first("DISCNUMBER"), Some("2"));
+        assert_eq!(snapshot.first("DISCTOTAL"), Some("3"));
+
+        let before = std::fs::read(&path).expect("snapshot DSF before rejected write");
+        let error = write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some("A01".to_string()),
+            )],
+        )
+        .expect_err("DSF must reject lexical track numbers");
+        assert!(
+            error.contains("TRACKNUMBER") && error.contains("unsigned"),
+            "unexpected DSF lexical rejection: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read DSF after rejected write"),
+            before,
+            "rejected DSF lexical metadata must not mutate the carrier"
+        );
+    }
+
+    #[test]
+    fn unknown_carrier_capability_and_production_write_fail_closed() {
+        let temp = tempfile::tempdir().expect("unknown metadata carrier tempdir");
+        let path = temp.path().join("unknown.bin");
+        let original = b"not an audio carrier";
+        std::fs::write(&path, original).expect("write unknown carrier fixture");
+
+        assert!(
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path).is_err(),
+            "unknown carriers must not acquire numbering capabilities"
+        );
+        assert!(
+            write_all_tags(
+                &path,
+                &[(
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("1".to_string()),
+                )],
+            )
+            .is_err(),
+            "the production writer must reject an unknown carrier"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read unknown carrier after rejection"),
+            original.to_vec(),
+            "failed unknown-carrier writes must roll back byte-exactly"
+        );
+    }
 
     #[test]
     fn metadata_write_worker_policy_parallelizes_distinct_dsf_targets() {

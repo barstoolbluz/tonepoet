@@ -45,6 +45,7 @@ pub mod keybindings;
 pub mod keychain;
 pub mod message;
 pub mod metadata_editor_actions;
+pub mod metadata_autonumber;
 pub mod metadata_view_models;
 pub mod musicbrainz;
 pub mod pill;

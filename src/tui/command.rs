@@ -2024,6 +2024,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "tags-mb",
     "mb-tags",
     "musicbrainz-tags",
+    "autonumber",
+    "autopopulate",
     "revert",
     "restore",
     "g",
@@ -2351,6 +2353,14 @@ pub enum Command {
     /// Metadata editor: force-open the per-file detail overlay (even
     /// for non-mixed entries with multi-track dim). Colon-form of `D`.
     MetaDetail,
+    /// Metadata editor: apply deterministic track/disc numbering.
+    MetaAutoNumber {
+        target: super::metadata_autonumber::NumberingTarget,
+        scheme: super::metadata_autonumber::NumberingScheme,
+        prefix: Option<String>,
+    },
+    /// Metadata editor: populate totals or explicit disc numbers.
+    MetaAutoPopulate(super::metadata_autonumber::AutoPopulateTarget),
     /// Metadata editor: re-load per-track TITLE / ARTIST / ISRC from
     /// the sidecar `.cue` file alongside the audio. Useful when the
     /// user has edited the sidecar externally OR when the file has
@@ -2528,6 +2538,15 @@ impl std::fmt::Debug for Command {
             Command::MetaDelete => f.write_str("MetaDelete"),
             Command::MetaUndelete => f.write_str("MetaUndelete"),
             Command::MetaDetail => f.write_str("MetaDetail"),
+            Command::MetaAutoNumber { target, scheme, prefix } => f
+                .debug_struct("MetaAutoNumber")
+                .field("target", target)
+                .field("scheme", scheme)
+                .field("prefix", prefix)
+                .finish(),
+            Command::MetaAutoPopulate(target) => {
+                f.debug_tuple("MetaAutoPopulate").field(target).finish()
+            }
             Command::TagsCueSidecar => f.write_str("TagsCueSidecar"),
             Command::CueSheetDelete => f.write_str("CueSheetDelete"),
             Command::CueSheetEdit => f.write_str("CueSheetEdit"),
@@ -2606,6 +2625,48 @@ pub fn parse_command(input: &str) -> Command {
         "d" => Command::MetaDelete,
         "u" | "undelete" => Command::MetaUndelete,
         "D" | "detail" => Command::MetaDetail,
+        "autonumber" => {
+            let mut tokens = args.split_whitespace();
+            let first = tokens.next().unwrap_or("");
+            let (target, scheme_token) = if first.eq_ignore_ascii_case("disc") {
+                (
+                    super::metadata_autonumber::NumberingTarget::Disc,
+                    tokens.next().unwrap_or(""),
+                )
+            } else {
+                (super::metadata_autonumber::NumberingTarget::Track, first)
+            };
+            let Some(scheme) = super::metadata_autonumber::NumberingScheme::parse(scheme_token) else {
+                return Command::Unknown(
+                    "usage: :autonumber [disc] N|NN|N/NN|NN/NN|SN|SNN [PREFIX]"
+                        .to_string(),
+                );
+            };
+            let remainder = tokens.collect::<Vec<_>>();
+            if !scheme.is_side() && !remainder.is_empty() {
+                return Command::Unknown(
+                    "usage: prefixes are valid only with :autonumber SN or SNN".to_string(),
+                );
+            }
+            if remainder.len() > 1 {
+                return Command::Unknown(
+                    "usage: :autonumber [disc] SN|SNN [PREFIX]".to_string(),
+                );
+            }
+            Command::MetaAutoNumber {
+                target,
+                scheme,
+                prefix: remainder.first().map(|value| (*value).to_string()),
+            }
+        }
+        "autopopulate" => {
+            let Some(target) = super::metadata_autonumber::AutoPopulateTarget::parse(args) else {
+                return Command::Unknown(
+                    "usage: :autopopulate totaltracks|totaldiscs|discnumber".to_string(),
+                );
+            };
+            Command::MetaAutoPopulate(target)
+        }
         "tags-cue-sidecar" | "tags-cue" => Command::TagsCueSidecar,
         "cuesheet-delete" | "cue-delete" => Command::CueSheetDelete,
         "cuesheet-edit" | "cue-edit" => Command::CueSheetEdit,
@@ -4308,6 +4369,31 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
         }
         Command::MetaDetail => {
             with_editor_state(app, |state| super::keybindings::metadata_editor_open_detail(state));
+        }
+        Command::MetaAutoNumber {
+            target,
+            scheme,
+            ref prefix,
+        } => {
+            with_editor_state(app, |state| {
+                match super::metadata_autonumber::apply_numbering(
+                    state,
+                    target,
+                    scheme,
+                    prefix.as_deref(),
+                ) {
+                    Ok(report) => Some(report.status(":autonumber")),
+                    Err(error) => Some(format!(":autonumber: {error}")),
+                }
+            });
+        }
+        Command::MetaAutoPopulate(target) => {
+            with_editor_state(app, |state| {
+                match super::metadata_autonumber::auto_populate(state, target) {
+                    Ok(report) => Some(report.status(":autopopulate")),
+                    Err(error) => Some(format!(":autopopulate: {error}")),
+                }
+            });
         }
         Command::MbBack => {
             if app.active_tags_mb_operation.is_some() {
@@ -18121,7 +18207,9 @@ mod split_cue_source_coverage_tests {
 mod in_editor_tags_mb_reducer_safety_tests {
     use super::*;
     use crate::config::TonepoetConfig;
-    use crate::tui::app::{ActiveOverlay, AppState, MetadataEditorState, MetadataTechnicalDetails};
+    use crate::tui::app::{
+        ActiveOverlay, AppState, MetadataEditorState, MetadataTechnicalDetails,
+    };
     use tokio::sync::mpsc;
 
     fn tx() -> mpsc::Sender<AppMessage> {
@@ -18537,5 +18625,129 @@ mod mb_cardinality_command_tests {
             .unwrap_or("");
         assert!(status.contains(":restore: ARTIST (snapped to MB values)"));
         assert!(status.contains("warning: 1 carrier"));
+    }
+}
+
+#[cfg(test)]
+mod metadata_autonumber_command_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{
+        ActiveOverlay, AppState, MetadataEditorState, MetadataTechnicalDetails,
+    };
+    use crate::tui::metadata_autonumber::{
+        numbering_menu_eligibility, AutoPopulateTarget, NumberingScheme, NumberingTarget,
+    };
+    use crate::tui::probe::{RowScope, TagEntry};
+    use lofty::tag::ItemKey;
+    use tokio::sync::mpsc;
+
+    fn track_number_entry(values: &[&str]) -> TagEntry {
+        let values = values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let value = values.first().cloned().unwrap_or_default();
+        TagEntry {
+            display_key: "TRACKNUMBER".to_string(),
+            item_key: ItemKey::TrackNumber,
+            value: value.clone(),
+            original: value,
+            is_binary: false,
+            is_mixed: values
+                .windows(2)
+                .any(|pair| pair[0].as_str() != pair[1].as_str()),
+            has_multiple_stored_values: false,
+            row_scope: RowScope::File,
+            per_file_stored_value_counts: vec![1; values.len()],
+            per_file_values: values.clone(),
+            per_file_originals: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn parses_track_and_disc_numbering_commands() {
+        assert!(matches!(
+            parse_command("autonumber NN"),
+            Command::MetaAutoNumber {
+                target: NumberingTarget::Track,
+                scheme: NumberingScheme::NN,
+                prefix: None,
+            }
+        ));
+        assert!(matches!(
+            parse_command("autonumber disc SNN B"),
+            Command::MetaAutoNumber {
+                target: NumberingTarget::Disc,
+                scheme: NumberingScheme::SNN,
+                prefix: Some(prefix),
+            } if prefix == "B"
+        ));
+    }
+
+    #[test]
+    fn rejects_prefixes_for_non_side_schemes() {
+        assert!(matches!(
+            parse_command("autonumber NN B"),
+            Command::Unknown(message) if message.contains("prefixes")
+        ));
+    }
+
+    #[test]
+    fn command_rejects_side_numbering_on_numeric_carriers_without_mutation() {
+        let editor = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/track.dsf")],
+            vec![track_number_entry(&["1"])],
+            vec!["track".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        let eligibility = numbering_menu_eligibility(&editor, NumberingTarget::Track)
+            .expect("DSF target should have a proven numeric capability");
+        assert_eq!(eligibility.immediate, vec![NumberingScheme::N]);
+        assert!(!eligibility.custom);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(editor));
+        let (tx, _rx) = mpsc::channel(4);
+
+        execute_command(
+            &mut app,
+            Command::MetaAutoNumber {
+                target: NumberingTarget::Track,
+                scheme: NumberingScheme::SNN,
+                prefix: Some("A".to_string()),
+            },
+            &tx,
+        );
+
+        let ActiveOverlay::MetadataEditor(editor) = &app.active_overlay else {
+            panic!("rejected command must preserve the metadata editor");
+        };
+        assert_eq!(editor.active_surface().entries[0].per_file_values, ["1"]);
+        assert!(!editor.active_surface().dirty);
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("requires lexical numbering values"));
+    }
+
+    #[test]
+    fn parses_auto_population_targets() {
+        assert!(matches!(
+            parse_command("autopopulate totaltracks"),
+            Command::MetaAutoPopulate(AutoPopulateTarget::TrackTotal)
+        ));
+        assert!(matches!(
+            parse_command("autopopulate totaldiscs"),
+            Command::MetaAutoPopulate(AutoPopulateTarget::DiscTotal)
+        ));
+        assert!(matches!(
+            parse_command("autopopulate discnumber"),
+            Command::MetaAutoPopulate(AutoPopulateTarget::DiscNumber)
+        ));
     }
 }

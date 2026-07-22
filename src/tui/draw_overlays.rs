@@ -327,6 +327,11 @@ pub(crate) fn move_multiline_cursor_vertical(
 
 /// Draw any active overlay on top of the main content
 pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
+    let parked_metadata_dirty = app
+        .pending_metadata_editor
+        .as_ref()
+        .is_some_and(|state| state.any_presentation_dirty());
+
     if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
         let image_picker_generation = app.image_picker_generation;
         let image_repaint_generation = app.image_repaint_generation;
@@ -336,8 +341,45 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             &mut app.button_map,
             &mut app.image_picker,
             image_picker_generation,
-            image_repaint_generation, theme);
+            image_repaint_generation,
+            theme,
+        );
         return;
+    }
+
+    // Editor-owned child overlays must preserve visual context.  Draw the
+    // parked editor first, then dim its cells before rendering the foreground
+    // menu/preview.  Taking and restoring the Box avoids overlapping mutable
+    // borrows of AppState's renderer-owned fields.
+    let context_menu_active = matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. });
+    if context_menu_active && app.pending_mb_select.is_some() {
+        if let Some(parked) = app.pending_mb_select.take() {
+            draw_mb_select(f, &parked, &mut app.button_map, theme);
+            app.pending_mb_select = Some(parked);
+        }
+    } else if context_menu_active && app.pending_cue_preview.is_some() {
+        if let Some(parked) = app.pending_cue_preview.take() {
+            draw_cue_preview(f, &parked, &mut app.button_map, theme);
+            app.pending_cue_preview = Some(parked);
+        }
+    } else if (context_menu_active && app.pending_metadata_editor.is_some())
+        || matches!(app.active_overlay, ActiveOverlay::MetadataAutoNumber(_))
+    {
+        if let Some(mut parked) = app.pending_metadata_editor.take() {
+            let image_picker_generation = app.image_picker_generation;
+            let image_repaint_generation = app.image_repaint_generation;
+            draw_metadata_editor(
+                f,
+                &mut parked,
+                &mut app.button_map,
+                &mut app.image_picker,
+                image_picker_generation,
+                image_repaint_generation,
+                theme,
+            );
+            dim_metadata_editor_backdrop(f, theme);
+            app.pending_metadata_editor = Some(parked);
+        }
     }
 
     if let ActiveOverlay::FilePicker(session) = &mut app.active_overlay {
@@ -364,6 +406,17 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
 
     if let ActiveOverlay::ThemeBuilder(state) = &mut app.active_overlay {
         super::theme_builder::draw_theme_builder(f, state.as_ref(), &mut app.button_map, theme);
+        return;
+    }
+
+    if let ActiveOverlay::MetadataAutoNumber(state) = &mut app.active_overlay {
+        draw_metadata_autonumber(
+            f,
+            state,
+            parked_metadata_dirty,
+            &mut app.button_map,
+            theme,
+        );
         return;
     }
 
@@ -433,6 +486,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         ActiveOverlay::FilePicker(_) => {}
         ActiveOverlay::FileTaskProgress(_) => {}
         ActiveOverlay::MetadataEditor(_) => {}
+        ActiveOverlay::MetadataAutoNumber(_) => {}
         ActiveOverlay::CuePreview(ref state) => {
             draw_cue_preview(f, state, &mut app.button_map, theme);
         }
@@ -698,6 +752,310 @@ fn render_menu_panel_at(
     f.render_widget(Paragraph::new(lines), inner);
 
     popup
+}
+
+fn dim_metadata_editor_backdrop(f: &mut Frame, theme: super::theme::Theme) {
+    let area = metadata_editor_layout_for_area(f.size()).popup;
+    let buffer = f.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            buffer.get_mut(x, y).set_fg(theme.text_dim);
+        }
+    }
+}
+
+fn metadata_autonumber_border_color(
+    owner_dirty: bool,
+    theme: super::theme::Theme,
+) -> ratatui::style::Color {
+    if owner_dirty {
+        theme.amber
+    } else {
+        theme.cyan
+    }
+}
+
+fn draw_metadata_autonumber(
+    f: &mut Frame,
+    state: &mut super::metadata_autonumber::AutoNumberOverlayState,
+    owner_dirty: bool,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
+    use super::metadata_autonumber::NumberingScheme;
+
+    let parent = f.size();
+    let editor_popup = metadata_editor_layout_for_area(parent).popup;
+    let inset_popup = editor_popup.inner(&ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let popup = if inset_popup.width >= 50 && inset_popup.height >= 14 {
+        inset_popup
+    } else {
+        editor_popup
+    };
+    f.render_widget(Clear, popup);
+    let border_color = metadata_autonumber_border_color(owner_dirty, theme);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            format!(" Auto-number: {} ", state.target.title()),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(block, popup);
+    let inner = popup.inner(&ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.width < 42 || inner.height < 11 {
+        f.render_widget(
+            Paragraph::new("Terminal is too small for the auto-number preview")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.text_dim)),
+            inner,
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    // Scheme selector. Keep all six choices actionable on narrow terminals by
+    // switching to a compact form and wrapping into the second reserved row.
+    let compact_schemes = rows[0].width < 48;
+    let heading = if rows[0].width < 24 { "S: " } else { "Scheme:  " };
+    let heading_width = super::display_width::width(heading) as u16;
+    let mut scheme_lines = vec![vec![Span::styled(
+        heading,
+        Style::default().fg(theme.text_bright),
+    )]];
+    let mut scheme_line = 0usize;
+    let mut scheme_x = heading_width;
+    for (idx, scheme) in NumberingScheme::ALL.iter().copied().enumerate() {
+        let selected = scheme == state.scheme;
+        let label = if compact_schemes {
+            if selected {
+                format!("[{}]", scheme.label())
+            } else {
+                format!(" {} ", scheme.label())
+            }
+        } else {
+            format!("({}) {} ", if selected { "•" } else { " " }, scheme.label())
+        };
+        let width = super::display_width::width(&label) as u16;
+        if scheme_x.saturating_add(width) > rows[0].width && scheme_line == 0 {
+            scheme_lines.push(Vec::new());
+            scheme_line = 1;
+            scheme_x = 0;
+        }
+        button_map.record_button(
+            TuiButton::MetadataAutoNumberScheme(idx),
+            Rect::new(
+                rows[0].x.saturating_add(scheme_x),
+                rows[0].y.saturating_add(scheme_line as u16),
+                width.min(rows[0].width.saturating_sub(scheme_x)),
+                1,
+            ),
+        );
+        scheme_x = scheme_x.saturating_add(width);
+        scheme_lines[scheme_line].push(Span::styled(
+            label,
+            if selected {
+                Style::default()
+                    .fg(theme.amber)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            },
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(
+            scheme_lines
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        ),
+        rows[0],
+    );
+
+    const PREFIX_FIELD_WIDTH: usize = 8;
+    let prefix_lead = "Side prefix for selection:  [ ";
+    let mut prefix_spans = vec![Span::styled(
+        prefix_lead,
+        Style::default().fg(theme.text_bright),
+    )];
+    if let Some(input) = state.prefix_input.as_ref() {
+        prefix_spans.extend(super::inline_edit::render_inline_value_with_embedded_cursor(
+            input,
+            PREFIX_FIELD_WIDTH,
+            theme,
+        ));
+    } else {
+        prefix_spans.push(Span::styled(
+            super::display_width::pad_or_truncate(
+                &state.selected_prefix_display(),
+                PREFIX_FIELD_WIDTH,
+                false,
+            ),
+            Style::default().fg(theme.text_bright),
+        ));
+    }
+    prefix_spans.push(Span::styled(
+        format!(" ]     Sides from: {}", state.source_summary()),
+        Style::default().fg(theme.text_dim),
+    ));
+    f.render_widget(Paragraph::new(Line::from(prefix_spans)), rows[1]);
+
+    let prefix_x_offset = (super::display_width::width(prefix_lead) as u16)
+        .min(rows[1].width.saturating_sub(1));
+    button_map.record_button(
+        TuiButton::MetadataAutoNumberPrefix,
+        Rect::new(
+            rows[1].x.saturating_add(prefix_x_offset),
+            rows[1].y,
+            (PREFIX_FIELD_WIDTH as u16)
+                .min(rows[1].width.saturating_sub(prefix_x_offset)),
+            1,
+        ),
+    );
+
+    let preview = state
+        .preview_values()
+        .unwrap_or_else(|_| vec!["?".to_string(); state.len()]);
+    let label_width = state
+        .labels
+        .iter()
+        .map(|label| super::display_width::width(label))
+        .max()
+        .unwrap_or(12)
+        .min((inner.width as usize).saturating_sub(22))
+        .max(12);
+    let header = format!(
+        "  {}  {}  →  {}",
+        super::display_width::pad_or_truncate("track (file)", label_width, false),
+        super::display_width::pad_or_truncate("now", 8, true),
+        super::display_width::pad_or_truncate("new", 12, false),
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            header,
+            Style::default()
+                .fg(theme.cyan)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        rows[2],
+    );
+
+    let visible_rows = rows[3].height as usize;
+    state.ensure_cursor_visible(visible_rows);
+    let end = state.scroll.saturating_add(visible_rows).min(state.len());
+    let mut lines = Vec::new();
+    for slot in state.scroll..end {
+        let cursor = slot == state.cursor;
+        let selected = state.selected.contains(&slot);
+        let marker = match (cursor, selected) {
+            (true, true) => "▸‣",
+            (true, false) => "▸ ",
+            (false, true) => " ‣",
+            (false, false) => "  ",
+        };
+        let label = super::display_width::pad_or_truncate(
+            &state.labels[slot],
+            label_width,
+            false,
+        );
+        let current = super::display_width::pad_or_truncate(
+            state.current_values.get(slot).map(String::as_str).unwrap_or(""),
+            8,
+            true,
+        );
+        let new_value = super::display_width::pad_or_truncate(
+            preview.get(slot).map(String::as_str).unwrap_or(""),
+            12,
+            false,
+        );
+        let label_style = if cursor {
+            Style::default()
+                .fg(theme.amber)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default().fg(theme.text_bright)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", marker), label_style),
+            Span::styled(label, label_style),
+            Span::raw("  "),
+            Span::styled(current, Style::default().fg(theme.text_bright)),
+            Span::styled("  →  ", Style::default().fg(theme.text_dim)),
+            Span::styled(new_value, Style::default().fg(theme.green)),
+        ]));
+        button_map.record_button(
+            TuiButton::MetadataAutoNumberRow(slot),
+            Rect::new(
+                rows[3].x,
+                rows[3].y + (slot - state.scroll) as u16,
+                rows[3].width,
+                1,
+            ),
+        );
+    }
+    f.render_widget(Paragraph::new(lines), rows[3]);
+
+    let editing_prefix = state.prefix_input.is_some();
+    let help = Line::from(vec![Span::styled(
+        if editing_prefix {
+            "Type a 1-8 letter prefix"
+        } else {
+            "↑↓ move · Shift+↑↓ select · Space toggle · p set prefix · Tab scheme"
+        },
+        Style::default().fg(theme.text_dim),
+    )]);
+    let (apply_label, cancel_label) = if editing_prefix {
+        ("Enter confirm", "Esc cancel")
+    } else {
+        ("Enter apply", "Esc cancel")
+    };
+    let actions = Line::from(vec![
+        footer_pill(apply_label, theme.green, theme),
+        pill_gap(),
+        footer_pill(cancel_label, theme.purple, theme),
+    ]);
+    let footer_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(rows[4]);
+    f.render_widget(Paragraph::new(help).alignment(Alignment::Center), footer_split[0]);
+    f.render_widget(
+        Paragraph::new(actions).alignment(Alignment::Center),
+        footer_split[1],
+    );
+    let apply_width = if editing_prefix { 15u16 } else { 13u16 };
+    let cancel_width = 12u16;
+    let total = apply_width + 1 + cancel_width;
+    let start_x = footer_split[1].x + footer_split[1].width.saturating_sub(total) / 2;
+    button_map.record_button(
+        TuiButton::MetadataAutoNumberApply,
+        Rect::new(start_x, footer_split[1].y, apply_width, 1),
+    );
+    button_map.record_button(
+        TuiButton::MetadataAutoNumberCancel,
+        Rect::new(start_x + apply_width + 1, footer_split[1].y, cancel_width, 1),
+    );
 }
 
 /// Center a rect within a parent area
@@ -7747,6 +8105,16 @@ mod tests {
         input.selection_anchor = Some(1);
         input.cursor = 4;
         input
+    }
+
+    #[test]
+    fn metadata_autonumber_border_tracks_owner_dirty_state() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+
+        assert_eq!(metadata_autonumber_border_color(false, theme), theme.cyan);
+        assert_eq!(metadata_autonumber_border_color(true, theme), theme.amber);
     }
 
     #[test]

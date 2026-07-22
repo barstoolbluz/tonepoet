@@ -180,7 +180,15 @@ pub enum TuiButton {
     MetadataArtworkReplace(usize),
     /// MetadataEditor Artwork tab remove button for an existing artwork type.
     MetadataArtworkRemove(usize),
-
+    /// Metadata auto-number overlay scheme pill.
+    MetadataAutoNumberScheme(usize),
+    /// Metadata auto-number overlay prefix input.
+    MetadataAutoNumberPrefix,
+    /// Metadata auto-number overlay row.
+    MetadataAutoNumberRow(usize),
+    /// Metadata auto-number overlay footer actions.
+    MetadataAutoNumberApply,
+    MetadataAutoNumberCancel,
 
     /// MbSelect overlay: clickable row (0-based index into `releases`).
     MbSelectRow(usize),
@@ -368,6 +376,11 @@ impl TuiButton {
             | Self::MetadataArtworkAdd(_)
             | Self::MetadataArtworkReplace(_)
             | Self::MetadataArtworkRemove(_)
+            | Self::MetadataAutoNumberScheme(_)
+            | Self::MetadataAutoNumberPrefix
+            | Self::MetadataAutoNumberRow(_)
+            | Self::MetadataAutoNumberApply
+            | Self::MetadataAutoNumberCancel
             | Self::MbSelectRow(_)
             | Self::MbSelectAccept
             | Self::MbSelectCancel
