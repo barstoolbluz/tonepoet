@@ -10,11 +10,11 @@ from pathlib import Path
 
 
 FROZEN_V15 = {
-    "derive_dsd_reference_v15_hardening.py": "f1b503025c5326ece03ec253f1db85e0a6ca1a00b2b9410d3ef700a8a7d63468",
-    "dsd_reference_sox_ng_14_8_0_1_v15.json": "45be292a81c75f47874b26e371936a67b6d9a7673e31eef6ccafbd92167c8528",
-    "dsd_reference_sox_ng_14_8_0_1_v15_candidate.json": "45be292a81c75f47874b26e371936a67b6d9a7673e31eef6ccafbd92167c8528",
+    "derive_dsd_reference_v15_hardening.py": "ddc8c52afdffe384217fc8ba98524e92328c019cd882f404da23d10a9c5c8322",
+    "dsd_reference_sox_ng_14_8_0_1_v15.json": "b6e757fa364df216b0045d56538705bec7f94505701f53d04c02bc0c3df64189",
+    "dsd_reference_sox_ng_14_8_0_1_v15_candidate.json": "b6e757fa364df216b0045d56538705bec7f94505701f53d04c02bc0c3df64189",
     "dsd_reference_sox_ng_14_8_0_1_v15_certification.json": "39a895648e43e17fc55dd30069def2040b15f96b029c19dbbb89b33b883b4c3a",
-    "dsd_reference_sox_ng_14_8_0_1_v15_report.md": "897c660c75f3d5f99903973ce2ccb8bae8107accfc8179905be8e6fa85f13202",
+    "dsd_reference_sox_ng_14_8_0_1_v15_report.md": "ffd8dd7630f6f39120c04556cb959d0dcb355649792980bf6809914b7890070e",
 }
 
 
@@ -53,10 +53,19 @@ def main() -> None:
     if manifest.get("status") != "qualification_candidate":
         raise AssertionError("v16 must remain an unpromoted qualification candidate")
     if manifest["qualification_report"] != {
+        "schema": "tonepoet-dsd-reference-policy-qualification-report/v1",
         "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_report.md",
         "sha256": digest(report_path),
+        "guidance_sha256": "a5a5556c70b93c56d216c0d142ab5213920fa9f696caa48ea4110f382bf2e36f",
+        "decimation_report_sha256": "af6e6880003f2b3673d804b992a093700cd8141465ee0277f8689d48209055c7",
+        "commission_sha256": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",
+        "amendment_sha256": "fe283db73d357d4cc22c19dc6d364fd552b5ce80ebf9b211eff44b4e516abac8",
+        "analyzer_corrective_brief_sha256": "ed9b4bae68aa57da1b268c44c4b56733905c0a9900324b0aafee12f5103be0f8",
+        "runtime_defaults_corrective_brief_sha256": "839cd1fccf591301aa87d86ebe33bfe17b51eb79c8de0155638bb79cc7da4ebf",
+        "expanded_supported_cell_count": 13248,
+        "expanded_supported_cell_digest": "8655f32296e3ac0012357c321cae026eb0effbcb3e128d5a1fad673fe12927a3",
     }:
-        raise AssertionError("v16 report descriptor does not bind the report bytes")
+        raise AssertionError("v16 report descriptor does not bind the report and inherited evidence bytes")
     if manifest["release_certification"] != {
         "schema": "tonepoet-dsd-reference-release-certification/v1",
         "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_certification.json",
@@ -158,6 +167,10 @@ def main() -> None:
         "same_path_qpcm_package_hash_counted_as_independent_packaging",
         "dsd_reference_sox_ng_14_8_0_1_v16.json",
         "manifest.schema_version != 16",
+        "parse_embedded_reference_qualification_wire",
+        "HistoricalEmbeddedReferenceQualification",
+        "strict v16 activation",
+        "every_checked_in_reference_qualification_manifest_parses_through_current_wire_dispatch",
     ]:
         require(executor, marker, "executor")
     for marker in [
@@ -177,6 +190,10 @@ def main() -> None:
         '"w64_same_path_hash_counted_as_independent_packaging": false',
         "assert_exact_w64_package_probe",
         "validate_exact_w64_pcm",
+        "exact_parser_rejected_silence",
+        "exact_parser_diagnostic_code",
+        "qualification all-zero Wave64 witness",
+        "root declares 136 bytes",
     ]:
         require(qualification, marker, "qualification")
     require(settings, "SoxNg14801V16", "settings")

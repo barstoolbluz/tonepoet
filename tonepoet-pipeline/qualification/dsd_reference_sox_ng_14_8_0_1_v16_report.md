@@ -17,3 +17,9 @@ Policy v16 is an append-only successor to v15. It preserves the commissioned DSP
 
 `not_run`. Promotion remains fail-closed until the complete workspace, formatting, lint, pinned-tool, live-smoke, throughput, qualification, and certification gates pass in the exact declared closure.
 - The required 60-cell W64 matrix includes a 96-exponent scan and a 256-point boundary-neighborhood bracket at `2^e / 510` resolution for each enabled rate/channel/depth cell.
+
+## F11 terminal corrections
+
+- Qualification manifests are parsed by generation: historical schemas v1-v15 retain their immutable wire shapes, while runtime activation continues to require the strict v16 schema. A permanent census parses every checked-in promoted/candidate qualification manifest.
+- The pinned all-zero Float64-W64 witness is not subjected to a universal exact-header success assertion. The independent parser must reject it, the rejection must identify the false 136-byte root extent against the 70,696-byte physical file, and the surfaced diagnostic must be `DSD-REF-P0-026`.
+- The pre-F10 v15 manifest, candidate, report, and checker bytes are restored and frozen by digest. F10/F11 evidence exists only in v16; historical checker compatibility is preserved without editing the historical checker.

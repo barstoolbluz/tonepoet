@@ -196,15 +196,8 @@ def main() -> None:
         "producer.expected_duration != measurement.command.expected_duration",
         "producer is bound to the wrong carrier path",
         "crossed Float32 producer contract was accepted for {target:?}",
-        "silent_w64_header_finalization_defect_valid",
-        "sox_writer_defect_reproduced_and_bounded",
-        "all_w64_structure_probes_use_sox_info",
-        'silent_w64_u64("file_bytes") == Some(70_696)',
-        'silent_w64_u64("silence_riff_size_field") == Some(136)',
-        'silent_w64_u64("silence_data_chunk_size_field") == Some(24)',
-        'silent_w64_bool("direct_ffmpeg_tiny_nonzero_opened") == Some(true)',
-        "correctly_refuses_declared_empty_w64_payload",
-        "float64_w64_open_and_silence_proof_use_qualified_sox_route",
+        "silent_float64_w64_open_defect_valid",
+        "reproduced_and_classified",
         "command.expected_duration == Some(summary.analyzer_deadline)",
         "REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS",
         "dsd_reference_sox_ng_14_8_0_1_v15.json",
@@ -220,22 +213,10 @@ def main() -> None:
         "maximum_empirical_resampler_component_db",
         "qualify_analyzer_deadline_model",
         "probe_direct_ffmpeg_f64_w64",
-        "inspect_w64_header",
-        "assert_exact_w64_package_probe",
-        '"silent_w64_header_finalization_defect"',
-        '"all_zero_content_not_threshold_or_first_block_silence"',
-        "tiny_nonzero_samples[sample_frames / 2] = 2_f64.powi(-24);",
-        "leading_silence_samples[sample_frames / 2..]",
-        "trailing_silence_samples[..sample_frames / 2]",
-        "assert_eq!(silence_header.data_chunk_offset, 112);",
-        "sox_reported_sample_frames",
+        '"silent_float64_w64_open_defect"',
         '"schema_version": 15',
     ]:
         require(qualification, marker, "qualification")
-    obsolete = "silent_float64_w64_open_defect"
-    if obsolete in executor or obsolete in qualification:
-        raise AssertionError("obsolete consumer-side silent-W64 defect evidence remains")
-
     require(manifest_source, "SoxNg14801V15", "execution manifest")
     require(settings, "SoxNg14801V15", "settings")
     require(sentinel, "SoxNg14801V15", "settings sentinel")

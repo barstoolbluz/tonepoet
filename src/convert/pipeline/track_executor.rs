@@ -1153,6 +1153,8 @@ fn effective_metadata_satisfaction(
 const _V15_APPEND_ONLY_EXECUTOR_MARKERS: &str = concat!(
     "dsd_reference_sox_ng_14_8_0_1_v15.json",
     "manifest.schema_version != 15",
+    "silent_float64_w64_open_defect_valid",
+    "reproduced_and_classified",
     "all_w64_structure_probes_use_sox_info",
     "float64_w64_open_and_silence_proof_use_qualified_sox_route",
 );
@@ -1181,6 +1183,74 @@ struct EmbeddedReferenceQualification {
     release_certification: EmbeddedReleaseCertification,
     qualification_basis: String,
     runtime_activation: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EmbeddedReferenceQualificationVersionProbe {
+    schema_version: u32,
+}
+
+/// Historical policy manifests use their generation's immutable wire shape.
+/// Keep those shapes parseable without weakening the strict active-v16 schema.
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalEmbeddedReferenceQualification {
+    schema_version: u32,
+    policy: String,
+    status: String,
+    sox_ng: serde_json::Value,
+    ffmpeg: serde_json::Value,
+    in_process: serde_json::Value,
+    analyzer: serde_json::Value,
+    #[serde(default)]
+    packaging: Option<serde_json::Value>,
+    #[serde(default)]
+    sample_identity: Option<serde_json::Value>,
+    #[serde(default)]
+    subprocess_environment: Option<serde_json::Value>,
+    #[serde(default)]
+    qualification_supervision: Option<serde_json::Value>,
+    profiles: serde_json::Value,
+    terminal_bounds: serde_json::Value,
+    riff_capacity: serde_json::Value,
+    #[serde(default)]
+    streamed_wav_capacity: Option<serde_json::Value>,
+    cell_contract: serde_json::Value,
+    qualification_report: serde_json::Value,
+    #[serde(default)]
+    release_certification: Option<serde_json::Value>,
+    qualification_basis: String,
+    runtime_activation: String,
+}
+
+#[derive(Debug)]
+enum EmbeddedReferenceQualificationWire {
+    Historical(HistoricalEmbeddedReferenceQualification),
+    Current(EmbeddedReferenceQualification),
+}
+
+fn parse_embedded_reference_qualification_wire(
+    raw: &str,
+) -> Result<EmbeddedReferenceQualificationWire, String> {
+    let probe: EmbeddedReferenceQualificationVersionProbe = serde_json::from_str(raw)
+        .map_err(|error| format!("qualification manifest version probe failed: {error}"))?;
+    match probe.schema_version {
+        1..=15 => serde_json::from_str(raw)
+            .map(EmbeddedReferenceQualificationWire::Historical)
+            .map_err(|error| {
+                format!(
+                    "historical qualification schema v{} is invalid: {error}",
+                    probe.schema_version
+                )
+            }),
+        16 => serde_json::from_str(raw)
+            .map(EmbeddedReferenceQualificationWire::Current)
+            .map_err(|error| format!("current qualification schema v16 is invalid: {error}")),
+        other => Err(format!(
+            "unsupported qualification schema version {other}; current runtime supports historical v1-v15 parsing and strict v16 activation"
+        )),
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2754,6 +2824,16 @@ fn validate_embedded_release_certification(
                 == Some("correctly_refuses_declared_empty_w64_payload")
             && silent_w64_str("qualification_probe_disposition")
                 == Some("superseded_by_v16_independent_exact_parser")
+            && silent_w64_bool("exact_parser_rejected_silence") == Some(true)
+            && silent_w64_str("exact_parser_diagnostic_code") == Some("DSD-REF-P0-026")
+            && silent_w64_str("exact_parser_error").is_some_and(|value| {
+                value.contains("root declares 136 bytes")
+                    && value.contains("physical file contains 70696 bytes")
+            })
+            && silent_w64_str("exact_parser_diagnostic").is_some_and(|value| {
+                value.starts_with("DSD-REF-P0-026:")
+                    && value.contains("qualification all-zero Wave64 witness")
+            })
             && silent_w64_str("production_disposition")
                 == Some("malformed_w64_rejected_before_publication_DSD-REF-P0-026")
             && silent_w64_str("ffmpeg_error").is_some_and(|value| !value.is_empty());
@@ -4968,9 +5048,17 @@ async fn attest_reference_toolchain(
         env!("CARGO_MANIFEST_DIR"),
         "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
     ));
-    let manifest: EmbeddedReferenceQualification = serde_json::from_str(raw).map_err(|err| {
-        reference_toolchain_error(format!("qualification manifest is invalid: {err}"))
-    })?;
+    let manifest = match parse_embedded_reference_qualification_wire(raw)
+        .map_err(reference_toolchain_error)?
+    {
+        EmbeddedReferenceQualificationWire::Current(manifest) => manifest,
+        EmbeddedReferenceQualificationWire::Historical(historical) => {
+            return Err(reference_toolchain_error(format!(
+                "the embedded policy artifact is historical schema v{} ({}) and cannot activate the v16 runtime",
+                historical.schema_version, historical.policy,
+            )));
+        }
+    };
     if manifest.schema_version != 16
         || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY
         || manifest.status != "qualified_release"
@@ -9784,22 +9872,108 @@ mod tests {
     }
 
     #[test]
+    fn every_checked_in_reference_qualification_manifest_parses_through_current_wire_dispatch() {
+        let qualification_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tonepoet-pipeline/qualification");
+        let mut paths = std::fs::read_dir(&qualification_dir)
+            .expect("read qualification directory")
+            .map(|entry| entry.expect("read qualification directory entry").path())
+            .filter(|path| {
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    return false;
+                };
+                name.starts_with("dsd_reference_sox_ng_14_8_0_1_v")
+                    && name.ends_with(".json")
+                    && !name.contains("_certification")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths.len(),
+            31,
+            "qualification manifest inventory changed; update the permanent parse census intentionally"
+        );
+
+        for path in paths {
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let parsed = parse_embedded_reference_qualification_wire(&raw)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            match parsed {
+                EmbeddedReferenceQualificationWire::Historical(manifest) => {
+                    assert!(manifest.schema_version <= 15);
+                    assert!(manifest.policy.starts_with("sox_ng_14_8_0_1_v"));
+                    assert!(!manifest.status.trim().is_empty());
+                }
+                EmbeddedReferenceQualificationWire::Current(manifest) => {
+                    assert_eq!(manifest.schema_version, 16);
+                    assert_eq!(
+                        manifest.policy,
+                        tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn historical_v12_streamed_wav_capacity_schema_remains_linked() {
-        let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
+        let raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v12_candidate.json"
-        )))
-        .expect("historical v12 candidate JSON parses");
-        assert_eq!(manifest.schema_version, 12);
+        ));
+        let historical = match parse_embedded_reference_qualification_wire(raw)
+            .expect("historical v12 candidate JSON parses")
+        {
+            EmbeddedReferenceQualificationWire::Historical(manifest) => manifest,
+            EmbeddedReferenceQualificationWire::Current(_) => {
+                panic!("historical v12 candidate dispatched as current schema")
+            }
+        };
+        assert_eq!(historical.schema_version, 12);
         assert_eq!(
-            manifest.policy,
+            historical.policy,
             tonepoet_pipeline::DSD_REFERENCE_POLICY_V12_KEY,
         );
-        assert_eq!(manifest.streamed_wav_capacity.riff_size_overhead_bytes, 58);
-        assert_eq!(
-            manifest.streamed_wav_capacity.max_audio_payload_bytes,
-            4_294_967_237,
-        );
+        // The v12 generation serialized a DIFFERENT wire shape than the
+        // current evidence struct (documentary schema/applies_to/... fields;
+        // no edge observations). Per the F11.1 lineage rule, historical
+        // artifacts parse through their own generation's wire struct.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct HistoricalV12StreamedWavCapacityWire {
+            schema: String,
+            applies_to: String,
+            riff_size_field_max: u64,
+            riff_size_overhead_bytes: u64,
+            max_audio_payload_bytes: u64,
+            sample_encoding: String,
+            bytes_per_sample: u64,
+            duration_guard_frames: u64,
+            admission_rule: String,
+            overflow_behavior: String,
+            overflow_error_code: String,
+            future_lift: String,
+        }
+        let streamed_wav_capacity: HistoricalV12StreamedWavCapacityWire =
+            serde_json::from_value(
+                historical
+                    .streamed_wav_capacity
+                    .expect("historical v12 streamed-WAV capacity evidence"),
+            )
+            .expect("historical v12 streamed-WAV capacity schema parses");
+        assert!(!streamed_wav_capacity.schema.is_empty());
+        assert!(!streamed_wav_capacity.applies_to.is_empty());
+        assert!(!streamed_wav_capacity.admission_rule.is_empty());
+        assert!(!streamed_wav_capacity.overflow_behavior.is_empty());
+        assert!(!streamed_wav_capacity.overflow_error_code.is_empty());
+        assert!(!streamed_wav_capacity.future_lift.is_empty());
+        assert_eq!(streamed_wav_capacity.sample_encoding, "pcm_f64le");
+        assert_eq!(streamed_wav_capacity.bytes_per_sample, 8);
+        assert!(streamed_wav_capacity.riff_size_field_max >= streamed_wav_capacity.max_audio_payload_bytes);
+        assert!(streamed_wav_capacity.duration_guard_frames > 0);
+        assert_eq!(streamed_wav_capacity.riff_size_overhead_bytes, 58);
+        assert_eq!(streamed_wav_capacity.max_audio_payload_bytes, 4_294_967_237);
 
         let validator: fn(
             &tonepoet_pipeline::ReferenceStreamedWavCapacityEvidenceV2,

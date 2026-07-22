@@ -1136,8 +1136,17 @@
     ]
   },
   "qualification_report": {
+    "schema": "tonepoet-dsd-reference-policy-qualification-report/v1",
     "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_report.md",
-    "sha256": "7f7a03f99d949a7d404e8819b81f4e9fa168fffc5b6170daef3cd1e5d664f2d9"
+    "sha256": "06f8eefe57db1de53cab4f0ea841f8e6bb4ff69414b656e0e949d3e517bbf587",
+    "guidance_sha256": "a5a5556c70b93c56d216c0d142ab5213920fa9f696caa48ea4110f382bf2e36f",
+    "decimation_report_sha256": "af6e6880003f2b3673d804b992a093700cd8141465ee0277f8689d48209055c7",
+    "commission_sha256": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",
+    "amendment_sha256": "fe283db73d357d4cc22c19dc6d364fd552b5ce80ebf9b211eff44b4e516abac8",
+    "analyzer_corrective_brief_sha256": "ed9b4bae68aa57da1b268c44c4b56733905c0a9900324b0aafee12f5103be0f8",
+    "runtime_defaults_corrective_brief_sha256": "839cd1fccf591301aa87d86ebe33bfe17b51eb79c8de0155638bb79cc7da4ebf",
+    "expanded_supported_cell_count": 13248,
+    "expanded_supported_cell_digest": "8655f32296e3ac0012357c321cae026eb0effbcb3e128d5a1fad673fe12927a3"
   },
   "release_certification": {
     "schema": "tonepoet-dsd-reference-release-certification/v1",

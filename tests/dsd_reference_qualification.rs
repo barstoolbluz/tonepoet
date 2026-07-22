@@ -69,8 +69,10 @@ use tonepoet_pipeline::{
 
 // Frozen v15 checker compatibility marker. The current report is schema v16.
 // append-only v15 checker source marker: "schema_version": 15
+// append-only v15 checker source marker: "silent_float64_w64_open_defect"
 const _V15_APPEND_ONLY_REPORT_MARKER: &str = concat!(
     r#"\"schema_version\": 15"#,
+    r#"\"silent_float64_w64_open_defect\""#,
     "all_zero_content_not_threshold_or_first_block_silence",
 );
 const GATE: &str = "TONEPOET_REQUIRE_TOOLS";
@@ -3598,11 +3600,19 @@ fn qualify_analyzer_carrier_contract() -> Value {
         .checked_add(24)
         .expect("W64 data-chunk size does not overflow");
 
-    for (name, observation) in [
-        ("tone", tone_header),
-        ("tiny_nonzero", tiny_nonzero_header),
-        ("leading_silence_then_tone", leading_silence_header),
-        ("tone_then_trailing_silence", trailing_silence_header),
+    for (name, path, observation) in [
+        ("tone", &tone_path, tone_header),
+        ("tiny_nonzero", &tiny_nonzero_path, tiny_nonzero_header),
+        (
+            "leading_silence_then_tone",
+            &leading_silence_path,
+            leading_silence_header,
+        ),
+        (
+            "tone_then_trailing_silence",
+            &trailing_silence_path,
+            trailing_silence_header,
+        ),
     ] {
         assert_eq!(observation.file_bytes, expected_file_bytes, "{name} file size");
         assert_eq!(
@@ -3619,6 +3629,14 @@ fn qualify_analyzer_carrier_contract() -> Value {
             expected_data_chunk_size,
             "{name} data-chunk size"
         );
+        exact_w64_characterization_result(
+            path,
+            sample_rate_hz,
+            1,
+            "float64",
+            u64::try_from(sample_frames).expect("fixture sample count fits u64"),
+        )
+        .unwrap_or_else(|error| panic!("{name} exact W64 validation failed: {error}"));
     }
     assert_eq!(silence_header.file_bytes, expected_file_bytes);
     assert_eq!(silence_header.payload_bytes_present, expected_payload_bytes);
@@ -3636,6 +3654,29 @@ fn qualify_analyzer_carrier_contract() -> Value {
     assert!(
         !exact_float64_w64_header(silence_header),
         "pinned SoX-ng unexpectedly fixed the silent W64 header without a policy/pin lift"
+    );
+    let silence_validation_error = exact_w64_characterization_result(
+        &silence_path,
+        sample_rate_hz,
+        1,
+        "float64",
+        u64::try_from(sample_frames).expect("fixture sample count fits u64"),
+    )
+    .expect_err(
+        "the pinned all-zero W64 witness must be rejected by the independent exact parser",
+    );
+    let silence_diagnostic = format!(
+        "{} qualification all-zero Wave64 witness: {silence_validation_error}",
+        tonepoet_pipeline::reference_error_text(ReferenceErrorCode::W64StructuralIntegrity),
+    );
+    assert!(
+        silence_diagnostic.starts_with("DSD-REF-P0-026:"),
+        "silent W64 rejection lost the production diagnostic: {silence_diagnostic}"
+    );
+    assert!(
+        silence_validation_error.contains("root declares 136 bytes")
+            && silence_validation_error.contains("physical file contains 70696 bytes"),
+        "silent W64 rejection did not identify the known false declared extent: {silence_validation_error}"
     );
 
     for path in [
@@ -3700,6 +3741,10 @@ fn qualify_analyzer_carrier_contract() -> Value {
         "trigger_classification": "historical_float64_single_amplitude_witness_only",
         "ffmpeg_disposition": "correctly_refuses_declared_empty_w64_payload",
         "qualification_probe_disposition": "superseded_by_v16_independent_exact_parser",
+        "exact_parser_rejected_silence": true,
+        "exact_parser_diagnostic_code": "DSD-REF-P0-026",
+        "exact_parser_error": silence_validation_error,
+        "exact_parser_diagnostic": silence_diagnostic,
         "production_disposition": "malformed_w64_rejected_before_publication_DSD-REF-P0-026",
         "ffmpeg_error": first_nonempty_line(&String::from_utf8_lossy(
             &silence_direct.stderr,

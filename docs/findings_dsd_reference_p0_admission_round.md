@@ -1007,3 +1007,32 @@ Terminal rules restated: every historical artifact parses and its
 checker passes unmodified; the silence case is verified through the
 diagnostic path; no cell predicted-failing; static assembly checks
 re-run before returning.
+
+### F11 resolution (v16 terminal corrective return)
+
+1. **Versioned wire parsing without weakening v16.** Historical qualification manifests dispatch to a historical root wire schema; v16 dispatches to the existing strict, fully typed schema. Runtime activation accepts only the strict v16 variant. A permanent filesystem census parses every checked-in promoted/candidate qualification JSON and separately retains the typed v12 streamed-WAV capacity assertion.
+2. **Silence is verified by rejection, not exempted.** The four nonzero controls must pass the independent exact Wave64 parser. The all-zero witness must reproduce the pinned false extent, fail exact validation, surface `DSD-REF-P0-026`, and identify the 136-byte declared root against the 70,696-byte physical file. FFmpeg refusal and SoX EOF-reading behavior remain corroborating evidence only.
+3. **v15 lineage restored byte-for-byte.** The pre-F10 v15 manifest, candidate, report, and derivation checker are restored from the last F9 handoff. The v16 checker freezes those original digests. Current sources retain narrow append-only marker shims so the restored historical checker passes unchanged; no F10/F11 claim is backported into v15.
+
+The historical checker chain, v16 checker, JSON census, static source-marker checks, archive safety checks, and regenerated complete-file manifest are required before delivery. Policy v16 remains fail-closed and unpromoted pending the pinned real-tool qualification and release-certification gates.
+
+
+## FINAL DISPOSITION (2026-07-21, product owner decision) — model rounds CLOSED
+
+- F11.1 resolved locally: the v12 generation serialized a different
+  streamed-WAV-capacity wire shape; the historical-link test now parses
+  it through a dedicated v12-era wire struct (versioned dispatch per
+  the F11.1 rule), with value asserts mirroring the artifact. The
+  current evidence struct remains strict and unmodified.
+- F11.2 ACCEPTED-AS-DOCUMENTED: `complete_p0_reference_qualification_report`
+  remains 4/5 — the exact-W64-header assert fires on silence-class
+  carriers, where the pinned sox_ng writes bogus size fields (F10).
+  This is a qualification-harness semantics issue (assert the detection,
+  not exact fields), not an audio-path or runtime defect; the policy
+  ships as an unpromoted `qualification_candidate` with runtime
+  fail-closed regardless. To be resolved in a future round if/when
+  promotion is pursued — ideally after the fork-side sox_ng fixes
+  (upstream ledger) make silence carriers well-formed.
+- F11.3 stands as written for any future round.
+- Ship state: workspace suite fully green, 12/12 checkers, live smoke
+  green, zero cold warnings, qualification 4/5 with the above ledger.
