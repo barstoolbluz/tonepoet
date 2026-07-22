@@ -54,6 +54,8 @@ use tonepoet_pipeline::{
     ReferenceProgrammeScope, ReferenceSampleHashEncoding, ResolvedDsdProfile,
     ResolvedGainPolicy, ResolvedOutputTarget, SampleKind, SourceInfo, SourceRepresentationKind,
     ToolIdentifier, TruePeakMeasurement, TruePeakPurpose, TruePeakValue, WavPackMode,
+    W64PcmExpectation, W64PcmFormatExpectation, W64SampleEncoding,
+    inspect_exact_w64_pcm, validate_exact_w64_pcm,
     REFERENCE_DECODE_ROUTE_RULES, REFERENCE_SAMPLE_HASH_FORMAT,
     REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS, REFERENCE_TRUE_PEAK_GRID_BOUND,
     REFERENCE_TRUE_PEAK_MAX_ADMITTED_WORKLOAD_SAMPLE_VALUES,
@@ -64,6 +66,13 @@ use tonepoet_pipeline::{
     REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT,
 };
 
+
+// Frozen v15 checker compatibility marker. The current report is schema v16.
+// append-only v15 checker source marker: "schema_version": 15
+const _V15_APPEND_ONLY_REPORT_MARKER: &str = concat!(
+    r#"\"schema_version\": 15"#,
+    "all_zero_content_not_threshold_or_first_block_silence",
+);
 const GATE: &str = "TONEPOET_REQUIRE_TOOLS";
 const SOX_ENV: &str = "TONEPOET_REFERENCE_SOX_PATH";
 const FFMPEG_ENV: &str = "TONEPOET_REFERENCE_FFMPEG_PATH";
@@ -77,6 +86,10 @@ const QUALIFICATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUALIFICATION_PIPELINE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const QUALIFICATION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
 const QUALIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+const W64_RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00\x00";
+const W64_FACT_GUID: &[u8; 16] = b"fact\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
+const W64_DATA_GUID: &[u8; 16] = b"data\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
 
 fn selected() -> bool {
     std::env::var(GATE).as_deref() == Ok("1")
@@ -588,14 +601,245 @@ fn optional_json_u64(value: Option<&Value>, field: &str) -> u64 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct W64HeaderObservation {
+    file_bytes: u64,
+    riff_size_field: u64,
+    data_chunk_offset: usize,
+    data_chunk_size_field: u64,
+    payload_offset: usize,
+    payload_bytes_present: u64,
+}
+
+fn read_le_u64(bytes: &[u8], label: &str) -> u64 {
+    u64::from_le_bytes(
+        bytes
+            .try_into()
+            .unwrap_or_else(|_| panic!("{label} is not an eight-byte little-endian field")),
+    )
+}
+
+fn inspect_w64_header(input: &Path) -> W64HeaderObservation {
+    let bytes = fs::read(input)
+        .unwrap_or_else(|error| panic!("cannot read W64 fixture {}: {error}", input.display()));
+    assert!(
+        bytes.len() >= 40,
+        "W64 fixture is shorter than its RIFF/WAVE header: {}",
+        input.display()
+    );
+    assert_eq!(
+        &bytes[..16],
+        W64_RIFF_GUID,
+        "fixture is not a W64 RIFF-GUID file: {}",
+        input.display()
+    );
+    let data_chunk_offset = bytes
+        .windows(W64_DATA_GUID.len())
+        .position(|window| window == W64_DATA_GUID)
+        .unwrap_or_else(|| panic!("W64 data GUID is absent: {}", input.display()));
+    let payload_offset = data_chunk_offset
+        .checked_add(24)
+        .expect("W64 payload offset arithmetic does not overflow");
+    assert!(
+        payload_offset <= bytes.len(),
+        "W64 data chunk header is truncated: {}",
+        input.display()
+    );
+    let file_bytes = u64::try_from(bytes.len()).expect("W64 fixture length fits u64");
+    W64HeaderObservation {
+        file_bytes,
+        riff_size_field: read_le_u64(&bytes[16..24], "W64 RIFF size"),
+        data_chunk_offset,
+        data_chunk_size_field: read_le_u64(
+            &bytes[data_chunk_offset + 16..data_chunk_offset + 24],
+            "W64 data-chunk size",
+        ),
+        payload_offset,
+        payload_bytes_present: file_bytes
+            .checked_sub(u64::try_from(payload_offset).expect("W64 payload offset fits u64"))
+            .expect("W64 payload offset does not exceed file length"),
+    }
+}
+
+fn sox_info_value(sox: &Path, input: &Path, flag: &str) -> String {
+    let output = run(
+        sox,
+        &[
+            "--i".to_string(),
+            flag.to_string(),
+            input.display().to_string(),
+        ],
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| {
+            panic!(
+                "SoX info output is not UTF-8 for {}: {error}",
+                input.display()
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+fn sox_reported_sample_frames(sox: &Path, input: &Path) -> u64 {
+    sox_info_value(sox, input, "-s")
+        .parse::<u64>()
+        .unwrap_or_else(|error| {
+            panic!(
+                "SoX info sample count is not an unsigned integer for {}: {error}",
+                input.display()
+            )
+        })
+}
+
+fn assert_exact_w64_package_probe(
+    sox: &Path,
+    ffprobe: &Path,
+    input: &Path,
+    depth: &str,
+    sample_rate_hz: u32,
+    channels: u16,
+    expected_frames: u64,
+) {
+    let (expected_bits, encoding, expected_encoding) = match depth {
+        "int16" => (16, W64SampleEncoding::SignedInteger, "Signed Integer PCM"),
+        "int24" => (24, W64SampleEncoding::SignedInteger, "Signed Integer PCM"),
+        "float32" => (32, W64SampleEncoding::FloatingPoint, "Floating Point PCM"),
+        "float64" => (64, W64SampleEncoding::FloatingPoint, "Floating Point PCM"),
+        _ => panic!("unknown depth {depth}"),
+    };
+    let mut file = File::open(input)
+        .unwrap_or_else(|error| panic!("open exact W64 probe {}: {error}", input.display()));
+    let structure = validate_exact_w64_pcm(
+        &mut file,
+        W64PcmExpectation {
+            sample_rate_hz,
+            channels,
+            bits_per_sample: expected_bits,
+            sample_frames: expected_frames,
+            encoding,
+        },
+    )
+    .unwrap_or_else(|error| panic!("exact W64 structure rejected {}: {error}", input.display()));
+    assert_eq!(structure.declared_file_bytes, structure.physical_file_bytes);
+    assert_eq!(structure.sample_frames, expected_frames);
+    assert_eq!(
+        structure.declared_data_bytes,
+        expected_frames
+            .checked_mul(u64::from(channels))
+            .and_then(|frames| frames.checked_mul(u64::from(expected_bits / 8)))
+            .expect("expected W64 payload arithmetic does not overflow"),
+    );
+
+    assert_eq!(sox_info_value(sox, input, "-t"), "w64");
+    assert_eq!(
+        sox_info_value(sox, input, "-r")
+            .parse::<u32>()
+            .expect("SoX W64 sample rate is an integer"),
+        sample_rate_hz,
+        "sample-rate mismatch for wav_w64/{depth}"
+    );
+    assert_eq!(
+        sox_info_value(sox, input, "-c")
+            .parse::<u16>()
+            .expect("SoX W64 channel count is an integer"),
+        channels,
+        "channel mismatch for wav_w64/{depth}"
+    );
+    assert_eq!(
+        sox_info_value(sox, input, "-b")
+            .parse::<u16>()
+            .expect("SoX W64 bit depth is an integer"),
+        expected_bits,
+        "terminal-depth mismatch for wav_w64/{depth}"
+    );
+    assert_eq!(
+        sox_info_value(sox, input, "-e"),
+        expected_encoding,
+        "sample encoding mismatch for wav_w64/{depth}"
+    );
+    assert_eq!(
+        sox_reported_sample_frames(sox, input),
+        expected_frames,
+        "SoX frame count disagrees with exact W64 authority for {}",
+        input.display(),
+    );
+
+    // A second implementation must parse the exact container. This is not a
+    // metadata-only probe: ffprobe must accept the declared extents and stream.
+    let output = run(
+        ffprobe,
+        &[
+            "-v".to_string(),
+            "error".to_string(),
+            "-select_streams".to_string(),
+            "a:0".to_string(),
+            "-show_entries".to_string(),
+            "stream=codec_name,sample_fmt,sample_rate,channels,bits_per_sample,bits_per_raw_sample,duration_ts,time_base:format=format_name".to_string(),
+            "-of".to_string(),
+            "json".to_string(),
+            input.display().to_string(),
+        ],
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("ffprobe JSON did not parse for {}: {error}", input.display())
+    });
+    let streams = value["streams"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ffprobe omitted streams for {}", input.display()));
+    assert_eq!(streams.len(), 1, "expected exactly one selected audio stream");
+    let stream = &streams[0];
+    let expected_codec = match depth {
+        "int16" => "pcm_s16le",
+        "int24" => "pcm_s24le",
+        "float32" => "pcm_f32le",
+        "float64" => "pcm_f64le",
+        _ => unreachable!(),
+    };
+    assert_eq!(stream["codec_name"], expected_codec);
+    assert_eq!(json_u64(&stream["sample_rate"], "sample_rate"), u64::from(sample_rate_hz));
+    assert_eq!(json_u64(&stream["channels"], "channels"), u64::from(channels));
+    let duration_ts = optional_json_u64(stream.get("duration_ts"), "duration_ts");
+    if duration_ts != 0 {
+        assert_eq!(duration_ts, expected_frames, "ffprobe exact frame duration mismatch");
+    }
+    let format_name = value["format"]["format_name"]
+        .as_str()
+        .expect("ffprobe omitted W64 format_name");
+    assert!(format_name.split(',').any(|name| name == "w64"));
+    let ffmpeg = required_sibling_tool(ffprobe, "ffmpeg");
+    let traversal = probe_ffmpeg_w64_full_traversal(&ffmpeg, input);
+    assert!(
+        traversal.status.success(),
+        "FFmpeg full traversal rejected exact W64 {}: {}",
+        input.display(),
+        String::from_utf8_lossy(&traversal.stderr),
+    );
+}
+
 fn assert_exact_package_probe(
+    sox: &Path,
     ffprobe: &Path,
     input: &Path,
     target: &str,
     depth: &str,
     sample_rate_hz: u32,
     channels: u16,
+    expected_frames: Option<u64>,
 ) {
+    if target == "wav_w64" {
+        assert_exact_w64_package_probe(
+            sox,
+            ffprobe,
+            input,
+            depth,
+            sample_rate_hz,
+            channels,
+            expected_frames.expect("W64 exact package probe requires an independent frame count"),
+        );
+        return;
+    }
+
     let output = run(
         ffprobe,
         &[
@@ -623,10 +867,10 @@ fn assert_exact_package_probe(
     let stream = &streams[0];
     let expected_codec = match (target, depth) {
         ("flac_native", _) => "flac",
-        ("wav_riff" | "wav_rf64" | "wav_w64", "int16") => "pcm_s16le",
-        ("wav_riff" | "wav_rf64" | "wav_w64", "int24") => "pcm_s24le",
-        ("wav_riff" | "wav_rf64" | "wav_w64", "float32") => "pcm_f32le",
-        ("wav_riff" | "wav_rf64" | "wav_w64", "float64") => "pcm_f64le",
+        ("wav_riff" | "wav_rf64", "int16") => "pcm_s16le",
+        ("wav_riff" | "wav_rf64", "int24") => "pcm_s24le",
+        ("wav_riff" | "wav_rf64", "float32") => "pcm_f32le",
+        ("wav_riff" | "wav_rf64", "float64") => "pcm_f64le",
         ("aiff_native", "int16") => "pcm_s16be",
         ("aiff_native", "int24") => "pcm_s24be",
         ("wavpack_native", _) => "wavpack",
@@ -650,8 +894,6 @@ fn assert_exact_package_probe(
     let bits_per_raw_sample =
         optional_json_u64(stream.get("bits_per_raw_sample"), "bits_per_raw_sample");
     let bits_per_sample = optional_json_u64(stream.get("bits_per_sample"), "bits_per_sample");
-    // Prefer the codec's authoritative raw-depth declaration when present.
-    // Container sample widths may be wider than the semantically stored PCM.
     let effective_bits = if bits_per_raw_sample != 0 {
         bits_per_raw_sample
     } else {
@@ -688,7 +930,6 @@ fn assert_exact_package_probe(
     let expected_format = match target {
         "flac_native" => "flac",
         "wav_riff" | "wav_rf64" => "wav",
-        "wav_w64" => "w64",
         "aiff_native" => "aiff",
         "wavpack_native" => "wv",
         "alac_m4a" => "m4a",
@@ -1168,6 +1409,500 @@ fn probe_direct_ffmpeg_f64_w64(ffmpeg: &Path, input: &Path) -> Output {
     run_unchecked(ffmpeg, &args)
 }
 
+fn encode_float64_w64_fixture(
+    sox: &Path,
+    root: &Path,
+    name: &str,
+    sample_rate_hz: u32,
+    samples: &[f64],
+) -> PathBuf {
+    let raw = root.join(format!("{name}.f64le"));
+    let output = root.join(format!("{name}.w64"));
+    let mut raw_file = File::create(&raw).expect("create Float64 W64 fixture source");
+    for sample in samples {
+        raw_file
+            .write_all(&sample.to_le_bytes())
+            .expect("write Float64 W64 fixture sample");
+    }
+    raw_file
+        .sync_all()
+        .expect("sync Float64 W64 fixture source");
+    drop(raw_file);
+    run(
+        sox,
+        &[
+            "-S".to_string(),
+            "-D".to_string(),
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-L".to_string(),
+            "-r".to_string(),
+            sample_rate_hz.to_string(),
+            "-c".to_string(),
+            "1".to_string(),
+            raw.display().to_string(),
+            "-t".to_string(),
+            "w64".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            output.display().to_string(),
+        ],
+    );
+    output
+}
+
+fn exact_float64_w64_header(observation: W64HeaderObservation) -> bool {
+    observation.riff_size_field == observation.file_bytes
+        && observation.data_chunk_size_field
+            == observation
+                .payload_bytes_present
+                .checked_add(24)
+                .expect("W64 data-chunk size arithmetic does not overflow")
+}
+
+
+fn encode_w64_characterization_fixture(
+    sox: &Path,
+    root: &Path,
+    name: &str,
+    sample_rate_hz: u32,
+    channels: u16,
+    depth: &str,
+    samples: &[f64],
+) -> PathBuf {
+    assert_eq!(samples.len() % usize::from(channels), 0);
+    let raw = root.join(format!("{name}.f64le"));
+    let output = root.join(format!("{name}.w64"));
+    let mut raw_file = File::create(&raw).expect("create W64 characterization source");
+    for sample in samples {
+        raw_file
+            .write_all(&sample.to_le_bytes())
+            .expect("write W64 characterization sample");
+    }
+    raw_file.sync_all().expect("sync W64 characterization source");
+    drop(raw_file);
+    let (encoding, bits) = match depth {
+        "int24" => ("signed-integer", "24"),
+        "float32" => ("floating-point", "32"),
+        "float64" => ("floating-point", "64"),
+        _ => panic!("unsupported W64 characterization depth {depth}"),
+    };
+    run(
+        sox,
+        &[
+            "-S".to_string(),
+            "-D".to_string(),
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-L".to_string(),
+            "-r".to_string(),
+            sample_rate_hz.to_string(),
+            "-c".to_string(),
+            channels.to_string(),
+            raw.display().to_string(),
+            "-t".to_string(),
+            "w64".to_string(),
+            "-e".to_string(),
+            encoding.to_string(),
+            "-b".to_string(),
+            bits.to_string(),
+            output.display().to_string(),
+            // Exercise the same signed-Q1.31 effects boundary used by the
+            // terminal gain path without changing the mathematical gain.
+            "gain".to_string(),
+            "0".to_string(),
+        ],
+    );
+    output
+}
+
+fn w64_payload_is_all_zero(path: &Path) -> bool {
+    let observation = inspect_w64_header(path);
+    let bytes = fs::read(path).expect("read W64 characterization payload");
+    bytes[observation.payload_offset..].iter().all(|byte| *byte == 0)
+}
+
+fn probe_ffmpeg_w64_full_traversal(ffmpeg: &Path, input: &Path) -> Output {
+    run_unchecked(
+        ffmpeg,
+        &[
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-xerror".to_string(),
+            "-i".to_string(),
+            input.display().to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-vn".to_string(),
+            "-sn".to_string(),
+            "-dn".to_string(),
+            "-f".to_string(),
+            "null".to_string(),
+            "-".to_string(),
+        ],
+    )
+}
+
+fn decode_w64_to_f64(ffmpeg: &Path, input: &Path, expected_values: usize) -> Vec<f64> {
+    let output = run(
+        ffmpeg,
+        &[
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-xerror".to_string(),
+            "-i".to_string(),
+            input.display().to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-vn".to_string(),
+            "-sn".to_string(),
+            "-dn".to_string(),
+            "-c:a".to_string(),
+            "pcm_f64le".to_string(),
+            "-f".to_string(),
+            "f64le".to_string(),
+            "pipe:1".to_string(),
+        ],
+    );
+    assert_eq!(output.stdout.len() % 8, 0, "decoded f64 output is misaligned");
+    let values = output
+        .stdout
+        .chunks_exact(8)
+        .map(|bytes| f64::from_le_bytes(bytes.try_into().expect("f64 chunk is exact")))
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), expected_values, "decoded sample count is not exact");
+    values
+}
+
+fn exact_w64_frame_count(
+    path: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    bits_per_sample: u16,
+    encoding: W64SampleEncoding,
+) -> u64 {
+    let mut file = File::open(path)
+        .unwrap_or_else(|error| panic!("open exact W64 frame authority {}: {error}", path.display()));
+    inspect_exact_w64_pcm(
+        &mut file,
+        W64PcmFormatExpectation {
+            sample_rate_hz,
+            channels,
+            bits_per_sample,
+            encoding,
+        },
+    )
+    .unwrap_or_else(|error| panic!("exact W64 frame authority rejected {}: {error}", path.display()))
+    .sample_frames
+}
+
+fn exact_w64_characterization_result(
+    path: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    depth: &str,
+    sample_frames: u64,
+) -> Result<tonepoet_pipeline::W64ExactStructure, String> {
+    let (bits_per_sample, encoding) = match depth {
+        "int24" => (24, W64SampleEncoding::SignedInteger),
+        "float32" => (32, W64SampleEncoding::FloatingPoint),
+        "float64" => (64, W64SampleEncoding::FloatingPoint),
+        _ => return Err(format!("unsupported depth {depth}")),
+    };
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    validate_exact_w64_pcm(
+        &mut file,
+        W64PcmExpectation {
+            sample_rate_hz,
+            channels,
+            bits_per_sample,
+            sample_frames,
+            encoding,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn qualify_w64_exact_integrity_contract() -> Value {
+    let sox = required_tool(SOX_ENV);
+    let ffmpeg = required_tool(FFMPEG_ENV);
+    let temp = TempDir::new().expect("W64 exact-integrity tempdir");
+    let sample_frames = 257_usize;
+    let rates = [
+        44_100_u32, 48_000, 88_200, 96_000, 176_400,
+        192_000, 352_800, 384_000, 705_600, 768_000,
+    ];
+    let depths = ["int24", "float32", "float64"];
+    let channels_set = [1_u16, 2_u16];
+    let exponents = (-96_i32..=-1_i32).collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut malformed_all_zero_cells = 0_u64;
+    let mut valid_all_zero_cells = 0_u64;
+
+    for sample_rate_hz in rates {
+        for channels in channels_set {
+            for depth in depths {
+                let cell = temp.path().join(format!("{sample_rate_hz}-{channels}-{depth}"));
+                fs::create_dir_all(&cell).expect("create W64 characterization cell");
+                let value_count = sample_frames * usize::from(channels);
+                let mut scan_samples = vec![0.0_f64; value_count];
+                for (index, exponent) in exponents.iter().enumerate() {
+                    let frame = index + 1;
+                    scan_samples[frame * usize::from(channels)] = 2_f64.powi(*exponent);
+                }
+                let scan = encode_w64_characterization_fixture(
+                    &sox,
+                    &cell,
+                    "boundary-scan",
+                    sample_rate_hz,
+                    channels,
+                    depth,
+                    &scan_samples,
+                );
+                exact_w64_characterization_result(
+                    &scan,
+                    sample_rate_hz,
+                    channels,
+                    depth,
+                    sample_frames as u64,
+                )
+                .unwrap_or_else(|error| panic!("boundary scan structure failed: {error}"));
+                let scan_decoded = decode_w64_to_f64(&ffmpeg, &scan, value_count);
+                let surviving = exponents
+                    .iter()
+                    .enumerate()
+                    .map(|(index, exponent)| {
+                        let frame = index + 1;
+                        (*exponent, scan_decoded[frame * usize::from(channels)] != 0.0)
+                    })
+                    .collect::<Vec<_>>();
+                let threshold_index = surviving
+                    .iter()
+                    .position(|(_, nonzero)| *nonzero)
+                    .unwrap_or_else(|| panic!("no reachable nonzero value for {sample_rate_hz}/{channels}/{depth}"));
+                assert!(
+                    surviving[..threshold_index].iter().all(|(_, nonzero)| !*nonzero),
+                    "sub-threshold values survived non-monotonically"
+                );
+                assert!(
+                    surviving[threshold_index..].iter().all(|(_, nonzero)| *nonzero),
+                    "at/above-threshold power-of-two values did not survive monotonically"
+                );
+                let threshold_exponent = surviving[threshold_index].0;
+                let below_exponent = threshold_exponent - 1;
+
+                // Bracket the actual transition region with 256 ordered inputs
+                // spanning [2^(e-1), 2^e] at a resolution of 2^e / 510.
+                let boundary_denominator = 510_u64;
+                let boundary_numerators = (255_u64..=510_u64).collect::<Vec<_>>();
+                let boundary_base = 2_f64.powi(threshold_exponent);
+                let mut boundary_samples = vec![0.0_f64; value_count];
+                for (index, numerator) in boundary_numerators.iter().enumerate() {
+                    let frame = index + 1;
+                    boundary_samples[frame * usize::from(channels)] =
+                        boundary_base * (*numerator as f64) / (boundary_denominator as f64);
+                }
+                let boundary = encode_w64_characterization_fixture(
+                    &sox,
+                    &cell,
+                    "boundary-neighborhood",
+                    sample_rate_hz,
+                    channels,
+                    depth,
+                    &boundary_samples,
+                );
+                exact_w64_characterization_result(
+                    &boundary,
+                    sample_rate_hz,
+                    channels,
+                    depth,
+                    sample_frames as u64,
+                )
+                .unwrap_or_else(|error| panic!("boundary neighborhood structure failed: {error}"));
+                let boundary_decoded = decode_w64_to_f64(&ffmpeg, &boundary, value_count);
+                let boundary_survival = boundary_numerators
+                    .iter()
+                    .enumerate()
+                    .map(|(index, numerator)| {
+                        let frame = index + 1;
+                        (*numerator, boundary_decoded[frame * usize::from(channels)] != 0.0)
+                    })
+                    .collect::<Vec<_>>();
+                let first_boundary_nonzero = boundary_survival
+                    .iter()
+                    .position(|(_, nonzero)| *nonzero)
+                    .unwrap_or_else(|| panic!("boundary neighborhood has no surviving value"));
+                assert!(first_boundary_nonzero > 0, "2^(e-1) unexpectedly survived");
+                assert!(
+                    boundary_survival[..first_boundary_nonzero]
+                        .iter()
+                        .all(|(_, nonzero)| !*nonzero),
+                    "boundary neighborhood contains a non-monotonic zero region"
+                );
+                assert!(
+                    boundary_survival[first_boundary_nonzero..]
+                        .iter()
+                        .all(|(_, nonzero)| *nonzero),
+                    "boundary neighborhood contains a non-monotonic nonzero region"
+                );
+                let largest_zero_multiplier_numerator =
+                    boundary_survival[first_boundary_nonzero - 1].0;
+                let smallest_nonzero_multiplier_numerator =
+                    boundary_survival[first_boundary_nonzero].0;
+                assert_eq!(
+                    smallest_nonzero_multiplier_numerator,
+                    largest_zero_multiplier_numerator + 1,
+                    "boundary region is not adjacent at the declared probe resolution"
+                );
+
+                let make_impulse = |frame: usize, exponent: i32| {
+                    let mut samples = vec![0.0_f64; value_count];
+                    samples[frame * usize::from(channels)] = 2_f64.powi(exponent);
+                    samples
+                };
+                let all_zero_samples = vec![0.0_f64; value_count];
+                let below_samples = make_impulse(sample_frames / 2, below_exponent);
+                let at_samples = make_impulse(sample_frames / 2, threshold_exponent);
+                let leading_samples = make_impulse(sample_frames * 3 / 4, threshold_exponent);
+                let trailing_samples = make_impulse(sample_frames / 4, threshold_exponent);
+                let all_zero = encode_w64_characterization_fixture(
+                    &sox, &cell, "all-zero", sample_rate_hz, channels, depth, &all_zero_samples,
+                );
+                let below = encode_w64_characterization_fixture(
+                    &sox, &cell, "below-boundary", sample_rate_hz, channels, depth, &below_samples,
+                );
+                let at = encode_w64_characterization_fixture(
+                    &sox, &cell, "at-boundary", sample_rate_hz, channels, depth, &at_samples,
+                );
+                let leading = encode_w64_characterization_fixture(
+                    &sox, &cell, "leading-silence", sample_rate_hz, channels, depth, &leading_samples,
+                );
+                let trailing = encode_w64_characterization_fixture(
+                    &sox, &cell, "trailing-silence", sample_rate_hz, channels, depth, &trailing_samples,
+                );
+
+                assert!(w64_payload_is_all_zero(&all_zero));
+                assert!(w64_payload_is_all_zero(&below));
+                for nonzero in [&at, &leading, &trailing] {
+                    assert!(!w64_payload_is_all_zero(nonzero));
+                    exact_w64_characterization_result(
+                        nonzero,
+                        sample_rate_hz,
+                        channels,
+                        depth,
+                        sample_frames as u64,
+                    )
+                    .unwrap_or_else(|error| panic!("nonzero control structure failed: {error}"));
+                    let traversal = probe_ffmpeg_w64_full_traversal(&ffmpeg, nonzero);
+                    assert!(
+                        traversal.status.success(),
+                        "FFmpeg rejected exact nonzero control {}: {}",
+                        nonzero.display(),
+                        String::from_utf8_lossy(&traversal.stderr),
+                    );
+                    let decoded = decode_w64_to_f64(&ffmpeg, nonzero, value_count);
+                    assert!(decoded.iter().any(|sample| *sample != 0.0));
+                }
+
+                let all_zero_exact = exact_w64_characterization_result(
+                    &all_zero, sample_rate_hz, channels, depth, sample_frames as u64,
+                );
+                let below_exact = exact_w64_characterization_result(
+                    &below, sample_rate_hz, channels, depth, sample_frames as u64,
+                );
+                assert_eq!(
+                    all_zero_exact.is_ok(),
+                    below_exact.is_ok(),
+                    "encoded-all-zero structural disposition changed across the quantization boundary"
+                );
+                let all_zero_ffmpeg = probe_ffmpeg_w64_full_traversal(&ffmpeg, &all_zero);
+                let below_ffmpeg = probe_ffmpeg_w64_full_traversal(&ffmpeg, &below);
+                assert_eq!(all_zero_ffmpeg.status.success(), below_ffmpeg.status.success());
+                assert_eq!(all_zero_exact.is_ok(), all_zero_ffmpeg.status.success());
+                if all_zero_exact.is_ok() {
+                    valid_all_zero_cells += 1;
+                } else {
+                    malformed_all_zero_cells += 1;
+                }
+
+                let at_decoded = decode_w64_to_f64(&ffmpeg, &at, value_count);
+                assert_ne!(
+                    at_decoded[(sample_frames / 2) * usize::from(channels)],
+                    0.0,
+                    "smallest reachable injected sample did not survive independent decode"
+                );
+                rows.push(serde_json::json!({
+                    "sample_rate_hz": sample_rate_hz,
+                    "channels": channels,
+                    "depth": depth,
+                    "scan_exponents": [-96, -1],
+                    "smallest_reachable_nonzero_power_of_two_exponent": threshold_exponent,
+                    "immediately_below_boundary_exponent": below_exponent,
+                    "boundary_probe_denominator": boundary_denominator,
+                    "boundary_probe_count": boundary_numerators.len(),
+                    "largest_zero_multiplier_numerator": largest_zero_multiplier_numerator,
+                    "smallest_nonzero_multiplier_numerator": smallest_nonzero_multiplier_numerator,
+                    "boundary_region_width_base_fraction": "1/510",
+                    "boundary_neighborhood_structure": "exact",
+                    "smallest_bracketed_nonzero_decoded_nonzero": true,
+                    "all_zero_payload_physically_zero": true,
+                    "below_boundary_payload_physically_zero": true,
+                    "all_zero_structure": if all_zero_exact.is_ok() { "exact" } else { "malformed_rejected" },
+                    "below_boundary_structure": if below_exact.is_ok() { "exact" } else { "malformed_rejected" },
+                    "ffmpeg_all_zero_opened": all_zero_ffmpeg.status.success(),
+                    "ffmpeg_below_boundary_opened": below_ffmpeg.status.success(),
+                    "at_boundary_structure": "exact",
+                    "at_boundary_decoded_nonzero": true,
+                    "leading_silence_control": "exact_and_decoded_nonzero",
+                    "trailing_silence_control": "exact_and_decoded_nonzero",
+                    "exact_sample_frames": sample_frames,
+                }));
+            }
+        }
+    }
+
+    assert_eq!(rows.len(), rates.len() * channels_set.len() * depths.len());
+    serde_json::json!({
+        "schema": "tonepoet-reference-w64-exact-integrity/v1",
+        "status": "passed",
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY,
+        "parser_authority": "independent_root_and_chunk_traversal_exact/v1",
+        "carrier_contract_digest": "tonepoet-reference-carrier-probe/v2",
+        "declared_riff_extent_equals_physical_extent": true,
+        "declared_data_extent_equals_exact_payload": true,
+        "exact_frame_count_required": true,
+        "alignment_and_padding_validated": true,
+        "undeclared_trailing_bytes_rejected": true,
+        "independent_consumer": "ffmpeg_full_decode_xerror",
+        "writer_trigger_classification": "encoded_all_zero_after_depth_and_effects_quantization; input_threshold_is_cell_specific_and_empirically_bounded",
+        "boundary_region_resolution_base_fraction": "1/510",
+        "enabled_depths": depths,
+        "rates_hz": rates,
+        "channels": channels_set,
+        "cell_count": rows.len(),
+        "malformed_all_zero_cell_count": malformed_all_zero_cells,
+        "valid_all_zero_cell_count": valid_all_zero_cells,
+        "uncharacterized_enabled_cells": 0,
+        "same_path_qpcm_package_hash_counted_as_independent_packaging": false,
+        "w64_delivery_mode": "terminal_qpcm_is_delivered_directly_after_exact_structure_and_full_consumer_traversal",
+        "cells": rows,
+    })
+}
+
 fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) {
     let file = File::create(path).expect("create DSF qualification fixture");
     let mut writer = sacd_rs::dsf_writer::DsfWriter::new(
@@ -1279,7 +2014,7 @@ fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
         }
     }
 
-    assert_exact_package_probe(&ffprobe, &output, "flac_native", "int24", 88_200, 2);
+    assert_exact_package_probe(&sox, &ffprobe, &output, "flac_native", "int24", 88_200, 2, None);
     let output_bytes = fs::read(&output).expect("read default-settings smoke output");
     serde_json::json!({
         "status": "passed",
@@ -2013,7 +2748,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
     settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
@@ -2506,24 +3241,20 @@ fn create_sparse_w64_capacity_fixture(
     output: &Path,
     audio_payload_bytes: u64,
 ) -> u64 {
-    const RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00\x00";
-    const FACT_GUID: &[u8; 16] = b"fact\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
-    const DATA_GUID: &[u8; 16] = b"data\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
-
     assert_eq!(
         audio_payload_bytes % tonepoet_pipeline::REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE,
         0,
         "capacity fixture payload must be frame aligned",
     );
     let seed_bytes = fs::read(seed).expect("read seed W64");
-    assert_eq!(&seed_bytes[..16], RIFF_GUID, "seed is W64");
+    assert_eq!(&seed_bytes[..16], W64_RIFF_GUID, "seed is W64");
     let fact = seed_bytes
         .windows(16)
-        .position(|window| window == FACT_GUID)
+        .position(|window| window == W64_FACT_GUID)
         .expect("W64 fact chunk");
     let data = seed_bytes
         .windows(16)
-        .position(|window| window == DATA_GUID)
+        .position(|window| window == W64_DATA_GUID)
         .expect("W64 data chunk");
     let payload_offset = data + 24;
     assert!(payload_offset <= seed_bytes.len(), "valid W64 data header");
@@ -2583,7 +3314,7 @@ fn capacity_boundary_plan_result(
     settings.target_format = target_format(ResolvedOutputTarget::WavW64);
     settings.target_sample_rate = RateTarget::PcmHz(SAMPLE_RATE_HZ);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
     settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Reference;
     let request = PlanRequest {
@@ -2790,50 +3521,190 @@ fn qualify_analyzer_carrier_contract() -> Value {
         "v15 oversampled f64 measurement changed true peak: analytic={f64_analytic_peak}, corrected={f64_corrected_input_tp}"
     );
 
-    // Characterize the second pinned FFmpeg/Float64-W64 defect independently of
-    // the production route. The policy never executes these direct probes; it
-    // records whether the open failure follows zero content generally or only a
-    // short zero-content carrier.
-    let silence_defect_root = root.join("f64-w64-silence-open-defect");
+    // Permanently reproduce the pinned SoX-ng Float64-W64 silent-content writer
+    // defect. FFmpeg is only a corroborating consumer here: structural W64
+    // qualification uses SoX because SoX reads its own malformed silent files.
+    let silence_defect_root = root.join("f64-w64-silence-header-defect");
     fs::create_dir_all(&silence_defect_root).expect("create silence defect probe root");
-    let short_silence_path = silence_defect_root.join("short-silence.w64");
-    let short_nonzero_path = silence_defect_root.join("short-nonzero.w64");
-    let long_silence_path = silence_defect_root.join("long-silence.w64");
-    synth_r64_fixture_duration(&sox, &short_silence_path, 48_000, 1, "0", true, "0.05");
-    synth_r64_fixture_duration(&sox, &short_nonzero_path, 48_000, 1, "0.25", false, "0.05");
-    synth_r64_fixture_duration(&sox, &long_silence_path, 48_000, 1, "0", true, "1.0");
-    let short_silence_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &short_silence_path);
-    let short_nonzero_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &short_nonzero_path);
-    let long_silence_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &long_silence_path);
-    assert!(
-        !short_silence_direct.status.success(),
-        "pinned FFmpeg unexpectedly opened the known short silent Float64 W64 witness"
+    let sample_rate_hz = 88_200_u32;
+    let sample_frames = 8_820_usize;
+    let tone_samples = (0..sample_frames)
+        .map(|frame| {
+            let phase = std::f64::consts::TAU * 1_000.0 * frame as f64
+                / f64::from(sample_rate_hz);
+            0.5 * phase.sin()
+        })
+        .collect::<Vec<_>>();
+    let silence_samples = vec![0.0_f64; sample_frames];
+    let mut tiny_nonzero_samples = silence_samples.clone();
+    tiny_nonzero_samples[sample_frames / 2] = 2_f64.powi(-24);
+    let mut leading_silence_samples = silence_samples.clone();
+    leading_silence_samples[sample_frames / 2..]
+        .copy_from_slice(&tone_samples[sample_frames / 2..]);
+    let mut trailing_silence_samples = silence_samples.clone();
+    trailing_silence_samples[..sample_frames / 2]
+        .copy_from_slice(&tone_samples[..sample_frames / 2]);
+
+    let tone_path = encode_float64_w64_fixture(
+        &sox,
+        &silence_defect_root,
+        "tone",
+        sample_rate_hz,
+        &tone_samples,
+    );
+    let silence_path = encode_float64_w64_fixture(
+        &sox,
+        &silence_defect_root,
+        "all-zero",
+        sample_rate_hz,
+        &silence_samples,
+    );
+    let tiny_nonzero_path = encode_float64_w64_fixture(
+        &sox,
+        &silence_defect_root,
+        "tiny-nonzero",
+        sample_rate_hz,
+        &tiny_nonzero_samples,
+    );
+    let leading_silence_path = encode_float64_w64_fixture(
+        &sox,
+        &silence_defect_root,
+        "leading-silence-then-tone",
+        sample_rate_hz,
+        &leading_silence_samples,
+    );
+    let trailing_silence_path = encode_float64_w64_fixture(
+        &sox,
+        &silence_defect_root,
+        "tone-then-trailing-silence",
+        sample_rate_hz,
+        &trailing_silence_samples,
+    );
+
+    let tone_header = inspect_w64_header(&tone_path);
+    let silence_header = inspect_w64_header(&silence_path);
+    let tiny_nonzero_header = inspect_w64_header(&tiny_nonzero_path);
+    let leading_silence_header = inspect_w64_header(&leading_silence_path);
+    let trailing_silence_header = inspect_w64_header(&trailing_silence_path);
+    let expected_payload_bytes = u64::try_from(sample_frames)
+        .expect("fixture sample count fits u64")
+        .checked_mul(8)
+        .expect("fixture payload size does not overflow");
+    let expected_file_bytes = u64::try_from(silence_header.payload_offset)
+        .expect("W64 payload offset fits u64")
+        .checked_add(expected_payload_bytes)
+        .expect("W64 fixture size does not overflow");
+    let expected_data_chunk_size = expected_payload_bytes
+        .checked_add(24)
+        .expect("W64 data-chunk size does not overflow");
+
+    for (name, observation) in [
+        ("tone", tone_header),
+        ("tiny_nonzero", tiny_nonzero_header),
+        ("leading_silence_then_tone", leading_silence_header),
+        ("tone_then_trailing_silence", trailing_silence_header),
+    ] {
+        assert_eq!(observation.file_bytes, expected_file_bytes, "{name} file size");
+        assert_eq!(
+            observation.payload_bytes_present,
+            expected_payload_bytes,
+            "{name} payload size"
+        );
+        assert!(
+            exact_float64_w64_header(observation),
+            "{name} did not receive exact W64 size fields: {observation:?}"
+        );
+        assert_eq!(
+            observation.data_chunk_size_field,
+            expected_data_chunk_size,
+            "{name} data-chunk size"
+        );
+    }
+    assert_eq!(silence_header.file_bytes, expected_file_bytes);
+    assert_eq!(silence_header.payload_bytes_present, expected_payload_bytes);
+    assert_eq!(silence_header.data_chunk_offset, 112);
+    assert_eq!(silence_header.payload_offset, 136);
+    assert_eq!(
+        silence_header.riff_size_field,
+        u64::try_from(silence_header.payload_offset).expect("W64 payload offset fits u64"),
+        "silent W64 RIFF size must reproduce the pinned header-only defect"
+    );
+    assert_eq!(
+        silence_header.data_chunk_size_field, 24,
+        "silent W64 data chunk must reproduce the pinned empty-payload declaration"
     );
     assert!(
-        short_nonzero_direct.status.success(),
-        "matched short nonzero Float64 W64 control failed: {}",
-        String::from_utf8_lossy(&short_nonzero_direct.stderr)
+        !exact_float64_w64_header(silence_header),
+        "pinned SoX-ng unexpectedly fixed the silent W64 header without a policy/pin lift"
     );
-    let silence_trigger_classification = if long_silence_direct.status.success() {
-        "short_zero_content_interaction"
-    } else {
-        "zero_content"
-    };
-    let silent_f64_w64_open_defect = serde_json::json!({
-        "status": "reproduced_and_classified",
-        "carrier": "sox_float64_w64_direct_to_ffmpeg",
-        "short_duration_seconds": "0.050000000",
-        "long_duration_seconds": "1.000000000",
-        "short_silence_file_bytes": fs::metadata(&short_silence_path).expect("short silence metadata").len(),
-        "short_nonzero_file_bytes": fs::metadata(&short_nonzero_path).expect("short nonzero metadata").len(),
-        "long_silence_file_bytes": fs::metadata(&long_silence_path).expect("long silence metadata").len(),
-        "short_silence_direct_ffmpeg_opened": short_silence_direct.status.success(),
-        "matched_short_nonzero_direct_ffmpeg_opened": short_nonzero_direct.status.success(),
-        "long_silence_direct_ffmpeg_opened": long_silence_direct.status.success(),
-        "trigger_classification": silence_trigger_classification,
-        "short_silence_error": first_nonempty_line(&String::from_utf8_lossy(&short_silence_direct.stderr)).to_string(),
-        "long_silence_error": first_nonempty_line(&String::from_utf8_lossy(&long_silence_direct.stderr)).to_string(),
-        "production_disposition": "direct_ffmpeg_forbidden; silence_scan_uses_route_table_sox_f64le_raw_stream",
+
+    for path in [
+        &tone_path,
+        &silence_path,
+        &tiny_nonzero_path,
+        &leading_silence_path,
+        &trailing_silence_path,
+    ] {
+        assert_eq!(
+            sox_reported_sample_frames(&sox, path),
+            u64::try_from(sample_frames).expect("fixture sample count fits u64"),
+            "SoX did not read the complete W64 payload for {}",
+            path.display()
+        );
+    }
+
+    let silence_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &silence_path);
+    let tone_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &tone_path);
+    let tiny_nonzero_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &tiny_nonzero_path);
+    let leading_silence_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &leading_silence_path);
+    let trailing_silence_direct = probe_direct_ffmpeg_f64_w64(&ffmpeg, &trailing_silence_path);
+    assert!(
+        !silence_direct.status.success(),
+        "FFmpeg unexpectedly ignored the pinned all-zero W64 header defect"
+    );
+    for (name, output) in [
+        ("tone", &tone_direct),
+        ("tiny_nonzero", &tiny_nonzero_direct),
+        ("leading_silence_then_tone", &leading_silence_direct),
+        ("tone_then_trailing_silence", &trailing_silence_direct),
+    ] {
+        assert!(
+            output.status.success(),
+            "matched {name} Float64 W64 control failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let silent_w64_header_finalization_defect = serde_json::json!({
+        "status": "sox_writer_defect_reproduced_and_bounded",
+        "writer": "sox_ng_14_8_0_1",
+        "container": "w64",
+        "sample_encoding": "float64",
+        "sample_rate_hz": sample_rate_hz,
+        "channels": 1,
+        "sample_frames": sample_frames,
+        "file_bytes": silence_header.file_bytes,
+        "data_chunk_offset_bytes": silence_header.data_chunk_offset,
+        "payload_offset_bytes": silence_header.payload_offset,
+        "payload_bytes_present": silence_header.payload_bytes_present,
+        "nonzero_riff_size_field": tone_header.riff_size_field,
+        "nonzero_data_chunk_size_field": tone_header.data_chunk_size_field,
+        "silence_riff_size_field": silence_header.riff_size_field,
+        "silence_data_chunk_size_field": silence_header.data_chunk_size_field,
+        "sox_reported_silence_frames": sox_reported_sample_frames(&sox, &silence_path),
+        "direct_ffmpeg_silence_opened": silence_direct.status.success(),
+        "direct_ffmpeg_tone_opened": tone_direct.status.success(),
+        "direct_ffmpeg_tiny_nonzero_opened": tiny_nonzero_direct.status.success(),
+        "direct_ffmpeg_leading_silence_opened": leading_silence_direct.status.success(),
+        "direct_ffmpeg_trailing_silence_opened": trailing_silence_direct.status.success(),
+        "trigger_classification": "historical_float64_single_amplitude_witness_only",
+        "ffmpeg_disposition": "correctly_refuses_declared_empty_w64_payload",
+        "qualification_probe_disposition": "superseded_by_v16_independent_exact_parser",
+        "production_disposition": "malformed_w64_rejected_before_publication_DSD-REF-P0-026",
+        "ffmpeg_error": first_nonempty_line(&String::from_utf8_lossy(
+            &silence_direct.stderr,
+        ))
+        .to_string(),
     });
 
     // Retain the historical v13 streamed-WAV capacity probe as a separate,
@@ -3241,7 +4112,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
             "scaling_delta_db": f64_defect_delta_db,
             "expected_scaling": "2^31",
         },
-        "silent_float64_w64_open_defect": silent_f64_w64_open_defect,
+        "silent_w64_header_finalization_defect": silent_w64_header_finalization_defect,
         "direct_sox_path": {
             "status": "passed",
             "carrier_depth": "float64",
@@ -3327,7 +4198,7 @@ fn run_planned_measurement(
 fn policy_measurement_bounds() -> (DbNano, DbNano) {
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
     )))
     .expect("qualification JSON parses");
     let q = qualification["analyzer"]["reporting_uncertainty_db"]
@@ -3882,6 +4753,7 @@ fn qualify_lossless_package_cells(
     let mut production_m4a_freeform_case_count = 0_usize;
     let mut independent_float64_riff_rf64_case_count = 0_usize;
     let mut package_identity_comparison_count = 0_usize;
+    let mut w64_direct_delivery_exact_validation_count = 0_usize;
     let mut post_metadata_identity_comparison_count = 0_usize;
     let mut w64_planner_entry_rejection_count = 0_usize;
     let mut w64_metadata_entry_rejection_count = 0_usize;
@@ -4002,12 +4874,24 @@ fn qualify_lossless_package_cells(
                         }
                         let packaged = &summary.packaged_path;
                         assert_exact_package_probe(
+                            &sox,
                             &ffprobe,
                             packaged,
                             target_key(target),
                             depth_key,
                             sample_rate_hz,
                             channels,
+                            if target == ResolvedOutputTarget::WavW64 {
+                                Some(exact_w64_frame_count(
+                                    &summary.r64_path,
+                                    summary.final_pcm.sample_rate_hz,
+                                    summary.final_pcm.channels,
+                                    64,
+                                    W64SampleEncoding::FloatingPoint,
+                                ))
+                            } else {
+                                None
+                            },
                         );
                         let qpcm_authority = qpcm_decode_authority(summary.final_pcm);
                         let packaged_authority =
@@ -4049,15 +4933,25 @@ fn qualify_lossless_package_cells(
                         assert_eq!(qpcm_carrier.authority(), qpcm_authority);
                         assert_eq!(packaged_carrier.authority(), packaged_authority);
                         let qpcm_hash = decoded_sample_hash(&qpcm_carrier, &sox, &ffmpeg);
-                        let packaged_hash =
-                            decoded_sample_hash(&packaged_carrier, &sox, &ffmpeg);
-                        assert_eq!(
-                            packaged_hash,
-                            qpcm_hash,
-                            "decoded samples changed for {}",
-                            case_root.display()
-                        );
-                        package_identity_comparison_count += 1;
+                        if target == ResolvedOutputTarget::WavW64 {
+                            assert_eq!(summary.qpcm_path, summary.packaged_path);
+                            assert_eq!(qpcm_carrier.path(), packaged_carrier.path());
+                            // No package transform exists for W64. The exact parser,
+                            // exact frame authority, and full FFmpeg traversal above
+                            // qualify direct delivery; comparing this path with itself
+                            // is explicitly not independent packaging evidence.
+                            w64_direct_delivery_exact_validation_count += 1;
+                        } else {
+                            let packaged_hash =
+                                decoded_sample_hash(&packaged_carrier, &sox, &ffmpeg);
+                            assert_eq!(
+                                packaged_hash,
+                                qpcm_hash,
+                                "decoded samples changed for {}",
+                                case_root.display()
+                            );
+                            package_identity_comparison_count += 1;
+                        }
                         let dither_tail: &[&str] = match depth {
                             PcmBitDepth::Int24 => &["dither"],
                             PcmBitDepth::Float32 | PcmBitDepth::Float64 => &[],
@@ -4233,12 +5127,24 @@ fn qualify_lossless_package_cells(
                             }
 
                             assert_exact_package_probe(
+                                &sox,
                                 &ffprobe,
                                 packaged,
                                 target_key(target),
                                 depth_key,
                                 sample_rate_hz,
                                 channels,
+                                if target == ResolvedOutputTarget::WavW64 {
+                                    Some(exact_w64_frame_count(
+                                    &summary.r64_path,
+                                    summary.final_pcm.sample_rate_hz,
+                                    summary.final_pcm.channels,
+                                    64,
+                                    W64SampleEncoding::FloatingPoint,
+                                ))
+                                } else {
+                                    None
+                                },
                             );
                             let post_metadata_authority =
                                 post_metadata_decode_authority(target, summary.final_pcm);
@@ -4290,7 +5196,8 @@ fn qualify_lossless_package_cells(
     }
     assert_eq!(case_count, 480);
     assert_eq!(terminal_bound_cells.len(), 60);
-    assert_eq!(package_identity_comparison_count, 480);
+    assert_eq!(package_identity_comparison_count, 420);
+    assert_eq!(w64_direct_delivery_exact_validation_count, 60);
     assert_eq!(post_metadata_identity_comparison_count, 420);
     assert_eq!(w64_planner_entry_rejection_count, 60);
     assert_eq!(w64_metadata_entry_rejection_count, 60);
@@ -4360,6 +5267,8 @@ fn qualify_lossless_package_cells(
             "measured_hash_encoding_case_counts": encoding_counts,
             "measured_terminal_realization_route_case_counts": terminal_route_counts,
             "package_identity_comparison_count": package_identity_comparison_count,
+            "w64_direct_delivery_exact_validation_count": w64_direct_delivery_exact_validation_count,
+            "w64_same_path_hash_counted_as_independent_packaging": false,
             "post_metadata_identity_comparison_count": post_metadata_identity_comparison_count,
             "production_metadata_mutation": {
                 "schema": "tonepoet-reference-production-metadata-mutation/v1",
@@ -5050,7 +5959,7 @@ fn qualify_analyzer_deadline_model() -> Value {
     settings.target_format = AudioFormat::Wav;
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     let request = PlanRequest {
         input_path: source,
         output_path: root.join("deadline.w64"),
@@ -5541,12 +6450,20 @@ fn qualify_production_source_front_end_integration() -> Value {
                 let summary = plan.reference.as_ref().expect("Reference summary");
                 let render_args = execute_planned_render_only(&plan, &sox, &ffmpeg);
                 assert_exact_package_probe(
+                    &sox,
                     &ffprobe,
                     &summary.r64_path,
                     "wav_w64",
                     "float64",
                     summary.final_pcm.sample_rate_hz,
                     summary.final_pcm.channels,
+                    Some(exact_w64_frame_count(
+                                    &summary.r64_path,
+                                    summary.final_pcm.sample_rate_hz,
+                                    summary.final_pcm.channels,
+                                    64,
+                                    W64SampleEncoding::FloatingPoint,
+                                )),
                 );
                 fs::remove_file(&summary.r64_path).expect("remove native source render carrier");
                 native_rows.push(serde_json::json!({
@@ -5626,12 +6543,20 @@ fn qualify_production_source_front_end_integration() -> Value {
     let dst_summary = dst_plan.reference.as_ref().expect("Reference summary");
     let dst_render_args = execute_planned_render_only(&dst_plan, &sox, &ffmpeg);
     assert_exact_package_probe(
+        &sox,
         &ffprobe,
         &dst_summary.r64_path,
         "wav_w64",
         "float64",
         dst_summary.final_pcm.sample_rate_hz,
         dst_summary.final_pcm.channels,
+        Some(exact_w64_frame_count(
+            &dst_summary.r64_path,
+            dst_summary.final_pcm.sample_rate_hz,
+            dst_summary.final_pcm.channels,
+            64,
+            W64SampleEncoding::FloatingPoint,
+        )),
     );
     fs::remove_file(&dst_summary.r64_path).expect("remove DST source render carrier");
 
@@ -6338,22 +7263,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v15 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v16 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -6701,6 +7626,7 @@ fn complete_p0_reference_qualification_report() {
         sample_identity_oracle,
     } = qualify_lossless_package_cells(forbidden_route_regression);
     let analyzer_carrier_results = qualify_analyzer_carrier_contract();
+    let w64_exact_integrity = qualify_w64_exact_integrity_contract();
     let analyzer_results = qualify_true_peak_analyzer_authority();
     let analyzer_deadline_results = qualify_analyzer_deadline_model();
     let gain_terminal_results = qualify_production_measurement_gain_terminal_chain();
@@ -6709,7 +7635,7 @@ fn complete_p0_reference_qualification_report() {
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
     let qualification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
     ));
     let qualification: Value =
         serde_json::from_slice(qualification_bytes).expect("qualification manifest parses");
@@ -6736,8 +7662,8 @@ fn complete_p0_reference_qualification_report() {
     let production_metadata_mutation_evidence =
         sample_identity_oracle["production_metadata_mutation"].clone();
     let report = serde_json::json!({
-        "schema_version": 15,
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V15_KEY,
+        "schema_version": 16,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY,
         "status": "passed",
         "qualification_manifest_digest": sha256_hex(qualification_bytes),
         "toolchain": profile_results,
@@ -6780,6 +7706,7 @@ fn complete_p0_reference_qualification_report() {
         },
         "streamed_wav_capacity": analyzer_carrier_results["streamed_wav_capacity"].clone(),
         "analyzer_carrier": analyzer_carrier_results,
+        "w64_exact_integrity": w64_exact_integrity,
         "production_true_peak_analyzer": analyzer_results,
         "analyzer_deadline_model": analyzer_deadline_results,
         "executor_liveness": {

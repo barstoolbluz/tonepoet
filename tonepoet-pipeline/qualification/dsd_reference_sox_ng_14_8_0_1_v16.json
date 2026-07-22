@@ -1,6 +1,6 @@
 {
-  "schema_version": 15,
-  "policy": "sox_ng_14_8_0_1_v15",
+  "schema_version": 16,
+  "policy": "sox_ng_14_8_0_1_v16",
   "status": "qualification_candidate",
   "sox_ng": {
     "version": "14.8.0.1",
@@ -343,8 +343,8 @@
     "post_final_acceptance_reserve_db": "0.010000000",
     "post_final_acceptance_reserve_basis": "one_analyzer_reporting_quantum"
   },
-  "qualification_basis": "Append-only policy v15 preserves the v14 16x measurement-only architecture while adding globally ordered composite tool permits, explicit ideal-grid versus empirically qualified pinned-resampler versus reporting-quantization authority, 200 adversarial 64x-oracle cases, and workload-derived analyzer deadlines. The unchanged analyzer residual is 0.100000000 dB and the unchanged reporting uncertainty is 0.010000000 dB.",
-  "runtime_activation": "Fail closed until a passing schema-v15 pinned real-tool, executor-liveness, and workload-throughput certification report is bound by digest to the byte-identical v15 candidate manifest.",
+  "qualification_basis": "Policy v16 preserves the v15 DSP/analyzer contract and adds independent exact Wave64 root/chunk validation, exact frame-count authority, full FFmpeg traversal, and all-enabled-depth/rate/channel trigger characterization. Promotion requires the complete pinned real-tool release gate.",
+  "runtime_activation": "Fail closed unless the embedded v16 candidate is promoted by a passed release certification that binds the exact candidate bytes and the complete W64 integrity evidence.",
   "cell_contract": {
     "schema": "tonepoet-dsd-reference-qualified-cells/v3",
     "source_kinds": [
@@ -1136,22 +1136,13 @@
     ]
   },
   "qualification_report": {
-    "schema": "tonepoet-dsd-reference-policy-qualification-report/v1",
-    "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15_report.md",
-    "sha256": "897c660c75f3d5f99903973ce2ccb8bae8107accfc8179905be8e6fa85f13202",
-    "guidance_sha256": "a5a5556c70b93c56d216c0d142ab5213920fa9f696caa48ea4110f382bf2e36f",
-    "decimation_report_sha256": "af6e6880003f2b3673d804b992a093700cd8141465ee0277f8689d48209055c7",
-    "commission_sha256": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",
-    "amendment_sha256": "fe283db73d357d4cc22c19dc6d364fd552b5ce80ebf9b211eff44b4e516abac8",
-    "expanded_supported_cell_count": 13248,
-    "expanded_supported_cell_digest": "8655f32296e3ac0012357c321cae026eb0effbcb3e128d5a1fad673fe12927a3",
-    "analyzer_corrective_brief_sha256": "ed9b4bae68aa57da1b268c44c4b56733905c0a9900324b0aafee12f5103be0f8",
-    "runtime_defaults_corrective_brief_sha256": "839cd1fccf591301aa87d86ebe33bfe17b51eb79c8de0155638bb79cc7da4ebf"
+    "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_report.md",
+    "sha256": "7f7a03f99d949a7d404e8819b81f4e9fa168fffc5b6170daef3cd1e5d664f2d9"
   },
   "release_certification": {
     "schema": "tonepoet-dsd-reference-release-certification/v1",
-    "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15_certification.json",
-    "candidate_manifest_path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15_candidate.json",
+    "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_certification.json",
+    "candidate_manifest_path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_candidate.json",
     "report_sha256": null,
     "candidate_manifest_sha256": null
   },
@@ -1222,7 +1213,9 @@
     },
     "forbidden_route": "ffmpeg_direct_decode_of_float64_qpcm_w64",
     "stream_framing": "headerless_raw_pcm",
-    "endianness": "little"
+    "endianness": "little",
+    "w64_delivery_mode": "terminal_qpcm_direct_delivery_after_exact_structure_and_independent_consumer_traversal",
+    "w64_same_path_hash_disposition": "identity continuity only; not independent packaging evidence"
   },
   "sample_identity": {
     "schema": "tonepoet-reference-sample-identity/v7",
@@ -1308,5 +1301,45 @@
     "overflow_behavior": "sox_ng_unseekable_wav_overflow_riff_size_58_data_size_modulo_2^32",
     "overflow_error_code": "DSD-REF-P0-025",
     "future_lift": "append_only_policy_with_corrected_sox_ng_pin_or_independently_qualified_transport"
+  },
+  "w64_integrity": {
+    "schema": "tonepoet-reference-w64-exact-integrity/v1",
+    "parser": "independent_root_and_chunk_traversal_exact/v1",
+    "production_disposition": "reject_before_publication_with_DSD-REF-P0-026",
+    "required_invariants": [
+      "declared_riff_extent_equals_physical_file_extent",
+      "declared_data_extent_equals_exact_pcm_payload",
+      "complete_alignment_valid_chunk_traversal",
+      "exact_upstream_r64_frame_authority_for_terminal_qpcm",
+      "no_undeclared_trailing_bytes",
+      "cell_specific_boundary_region_bracketed_at_1_over_510_base",
+      "independent_ffmpeg_full_decode_xerror"
+    ],
+    "enabled_depths": [
+      "int24",
+      "float32",
+      "float64"
+    ],
+    "rates_hz": [
+      44100,
+      48000,
+      88200,
+      96000,
+      176400,
+      192000,
+      352800,
+      384000,
+      705600,
+      768000
+    ],
+    "channels": [
+      1,
+      2
+    ],
+    "required_characterization_cell_count": 60,
+    "trigger_claim": "encoded_all_zero_after_depth_and_effects_quantization; input threshold is measured per cell and is not assumed",
+    "same_path_qpcm_package_hash_is_independent_packaging_evidence": false,
+    "boundary_region_resolution_base_fraction": "1/510",
+    "carrier_contract_digest": "tonepoet-reference-carrier-probe/v2"
   }
 }

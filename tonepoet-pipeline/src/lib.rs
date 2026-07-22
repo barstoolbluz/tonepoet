@@ -15,6 +15,7 @@ pub mod qualification_schema;
 pub mod settings;
 pub mod source;
 pub mod tools;
+pub mod w64;
 pub mod fingerprint;
 
 pub use dsd_reference::*;
@@ -35,6 +36,7 @@ pub use plugins::{
 pub use settings::*;
 pub use source::{SourceInfo, SourceRepresentationKind};
 pub use tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolRegistry, ToolSupport};
+pub use w64::*;
 pub use fingerprint::{
     settings_fingerprint, SettingsFingerprint, SETTINGS_FINGERPRINT_FIELD_COUNT,
     SETTINGS_FINGERPRINT_FIELD_PATHS, SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT,

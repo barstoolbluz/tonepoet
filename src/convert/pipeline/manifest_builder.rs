@@ -18,7 +18,7 @@ use super::manifest::{
 };
 use super::track_executor::{
     reference_execution_identity_input, reference_materialization_identity_digest,
-    ReferenceExecutionEvidence,
+    ReferenceExecutionEvidence, ReferencePackagedSampleIdentityMode,
 };
 
 pub struct ManifestBuildInput {
@@ -222,6 +222,7 @@ fn build_reference_manifest_track(
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V13
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V14
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V15
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
         ) {
             reference_executed_evidence_digest_v3(&evidence)?
         } else {
@@ -258,10 +259,37 @@ fn build_reference_manifest_track(
     )
 }
 
+fn validate_reference_packaged_sample_identity_mode(
+    policy: tonepoet_pipeline::DsdReferencePolicyVersion,
+    target: tonepoet_pipeline::ResolvedOutputTarget,
+    actual: ReferencePackagedSampleIdentityMode,
+) -> Result<(), ManifestError> {
+    if policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16 {
+        return Ok(());
+    }
+    let required = if target == tonepoet_pipeline::ResolvedOutputTarget::WavW64 {
+        ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery
+    } else {
+        ReferencePackagedSampleIdentityMode::IndependentDecodeComparison
+    };
+    if actual != required {
+        return Err(ManifestError::InvalidAuthority(format!(
+            "Reference v16 package identity mode {:?} disagrees with required {:?} for {:?}",
+            actual, required, target,
+        )));
+    }
+    Ok(())
+}
+
 fn reference_executed_evidence_digest_v1(
     evidence: &ReferenceExecutionEvidence,
 ) -> Result<Sha256Digest, ManifestError> {
     let verification = &evidence.pcm_verification;
+    validate_reference_packaged_sample_identity_mode(
+        evidence.plan.policy,
+        evidence.plan.target,
+        verification.packaged_sample_identity_mode,
+    )?;
     let post_metadata = verification.post_metadata_sample_sha256.ok_or_else(|| {
         ManifestError::InvalidAuthority(
             "Reference manifest requires post-metadata decoded-sample verification".to_string(),
@@ -271,7 +299,7 @@ fn reference_executed_evidence_digest_v1(
         || verification.qpcm_sample_sha256 != post_metadata
     {
         return Err(ManifestError::InvalidAuthority(
-            "Reference decoded-sample verification identities do not match".to_string(),
+            "Reference decoded-sample identity continuity does not match across QPCM, delivery, and post-metadata verification".to_string(),
         ));
     }
     // Preserve the frozen v1 authority exactly. For v7 streamed verification,
@@ -410,6 +438,36 @@ mod manifest_merge_gap_tests {
             std::fs::create_dir_all(parent).expect("parent dir");
         }
         std::fs::write(path, bytes).expect("write file");
+    }
+
+    #[test]
+    fn v16_package_identity_mode_distinguishes_direct_w64_from_independent_packaging() {
+        use tonepoet_pipeline::{DsdReferencePolicyVersion, ResolvedOutputTarget};
+
+        assert!(validate_reference_packaged_sample_identity_mode(
+            DsdReferencePolicyVersion::SoxNg14801V16,
+            ResolvedOutputTarget::WavW64,
+            ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery,
+        )
+        .is_ok());
+        assert!(validate_reference_packaged_sample_identity_mode(
+            DsdReferencePolicyVersion::SoxNg14801V16,
+            ResolvedOutputTarget::WavW64,
+            ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
+        )
+        .is_err());
+        assert!(validate_reference_packaged_sample_identity_mode(
+            DsdReferencePolicyVersion::SoxNg14801V16,
+            ResolvedOutputTarget::WavRiff,
+            ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
+        )
+        .is_ok());
+        assert!(validate_reference_packaged_sample_identity_mode(
+            DsdReferencePolicyVersion::SoxNg14801V16,
+            ResolvedOutputTarget::WavRiff,
+            ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery,
+        )
+        .is_err());
     }
 
     fn v7_verification_record(

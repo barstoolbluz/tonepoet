@@ -1,7 +1,7 @@
 # Current DSD Reference P0 Handoff
 
-**Date:** 2026-07-21
-**Current candidate policy:** `sox_ng_14_8_0_1_v15`
+**Date:** 2026-07-22
+**Current candidate policy:** `sox_ng_14_8_0_1_v16`
 **Runtime exposure:** fail-closed until promotion; ordinary defaults remain exact legacy behavior
 **Supersedes:** all earlier `handoff_dsd_reference_p0_*` snapshots for current-state claims
 
@@ -14,6 +14,50 @@
 3. a non-DSD target.
 
 Native-v2 DSD-to-DSD requests remain on the ordinary DSD topology. Pre-promotion defaults remain the exact legacy flat settings origin and do not enter the Reference planner.
+
+## F10 corrective re-resolution (policy v16)
+
+Policy v16 supersedes the rejected v15 F10 response. It does not treat SoX
+metadata probing as structural authority and never publishes a W64 carrier whose
+declared extents disagree with its physical bytes.
+
+Before any W64 terminal QPCM can reach metadata work or the final atomic rename,
+production invokes the independent `validate_exact_w64_pcm()` parser. The parser
+requires the root-declared extent to equal the physical file extent, traverses
+every chunk to the exact end of file, validates 8-byte alignment and zero padding,
+rejects duplicate or missing required chunks, requires canonical format/fact
+payloads, checks rate/channels/depth/encoding/block alignment/byte rate, derives
+the exact frame count from the structurally valid R64 data extent and requires
+terminal QPCM to match it, and rejects undeclared
+trailing bytes. Failure is fail-closed with stable diagnostic
+`DSD-REF-P0-026` before publication. A structurally accepted carrier must then
+complete an independent FFmpeg `-xerror` decode traversal. SoX `--i` is
+supplemental metadata evidence only.
+
+The release gate defines a 60-cell W64 characterization matrix covering Int24,
+Float32, and Float64 at every enabled rate and mono/stereo. Each cell scans the
+`2^-96` through `2^-1` power-of-two region, then brackets the observed transition
+with 256 ordered amplitudes at `2^e / 510` resolution. It then tests all-zero,
+immediately-below-power-boundary, at-boundary, leading-silence, and
+trailing-silence fixtures. The gate inspects payload bytes,
+requires exact declared extents and exact frame counts, and independently decodes
+controls to prove that each intended nonzero sample remains nonzero. The policy
+therefore makes the narrower claim that the defect is associated with an encoded
+all-zero result after depth/effects quantization; any input-level threshold is
+measured per cell rather than assumed.
+
+For direct W64 delivery, QPCM and packaged output are intentionally the same
+path. Their equal sample hashes are recorded only as identity continuity. The
+execution evidence uses `direct_w64_qpcm_exact_delivery`, and manifest authority
+rejects any v16 W64 evidence that claims an independent package decode
+comparison. Non-W64 targets continue to require independent decoded-package
+comparison.
+
+Policy v15 remains byte-frozen as a rejected historical candidate. Policy v16
+is the append-only successor and remains `not_run`, fail-closed, and unpromoted
+until compilation, formatting, warning-denied lint, the complete workspace
+suite, the exact pinned tool closure, live smoke, throughput qualification, the
+60-cell W64 matrix, and release-report binding all pass.
 
 ## F9 corrective return
 
@@ -35,9 +79,10 @@ short-silence/short-nonzero probe plus a long-silence probe, classifies the
 pinned FFmpeg open defect, and runtime certification validation requires the
 canonical evidence and production disposition.
 
-Static assembly and all historical derivation checkers were rerun. The assembly
-container lacks the Rust toolchain and pinned real-tool closure, so v15 remains
-a fail-closed, unpromoted candidate pending commissioned qualification.
+Static assembly and all historical derivation checkers were rerun. That F9
+return left v15 fail-closed and unpromoted; v15 is now a frozen rejected
+historical candidate and current v16 remains fail-closed pending commissioned
+qualification.
 
 ## V15/F8 operational hardening
 
@@ -144,7 +189,7 @@ SoX:    -S -D <qpcm.w64> -t raw -e floating-point -b 64 -L -
 FFmpeg: -f f64le -ar <rate> -ac <channels> -i pipe:0 ... -c:a pcm_f64le -f wav [ -rf64 always ] <output>
 ```
 
-The packaging transport is headerless little-endian Float64 PCM over a direct stdout-to-stdin pipe. It introduces no disk-backed RIFF intermediate and does not itself impose RIFF's 4 GiB ceiling on RF64 or W64 delivery. Current policy v15 conservatively retains v13's corrected streamed-WAV capacity guard for every Reference plan, although the v15 analyzer itself no longer uses that carrier. Ordinary RIFF output also retains its final-container capacity admission.
+The packaging transport is headerless little-endian Float64 PCM over a direct stdout-to-stdin pipe. It introduces no disk-backed RIFF intermediate and does not itself impose RIFF's 4 GiB ceiling on RF64 or W64 delivery. Current policy v16 conservatively retains v13's corrected streamed-WAV capacity guard for every Reference plan, although the v15 analyzer itself no longer uses that carrier. Ordinary RIFF output also retains its final-container capacity admission.
 
 The planner refuses to construct a one-process FFmpeg package command for Float64. The executor independently revalidates the exact producer and consumer tools, argv, typed endpoints, rate, channel count, target-specific RF64 flags, and environment before spawning the pipeline.
 
@@ -388,13 +433,13 @@ Reference pathway/profile, Reference gain, NativeLevel, and native NormalizePeak
 
 ## Required verification commands
 
-The v15 derivation checker freezes the complete v14 checker/artifact set and
-validates inherited manifest fields before checking the hardening source and
-evidence bindings. Historical checkers are not rerun against the newer active
-policy identity.
+The v16 derivation checker freezes the complete v15 checker/artifact set and
+validates inherited manifest fields before checking the exact W64 integrity
+source and evidence bindings. Every historical checker is also run against its
+own immutable artifacts so the append-only lineage remains green.
 
 ```text
-python3 tonepoet-pipeline/qualification/derive_dsd_reference_v15_hardening.py
+python3 tonepoet-pipeline/qualification/derive_dsd_reference_v16_w64_integrity.py --check
 cargo fmt -p tonepoet -p tonepoet-pipeline -p sacd-rs -- --check
 cargo test -p tonepoet-pipeline
 cargo test -p sacd-rs
@@ -403,7 +448,7 @@ cargo test --workspace
 cargo clippy -p tonepoet -p tonepoet-pipeline -p sacd-rs \
   --all-targets --all-features -- -D warnings
 TONEPOET_REQUIRE_TOOLS=1 \
-TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v15_certification.json" \
+TONEPOET_DSD_REFERENCE_REPORT_PATH="$PWD/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_certification.json" \
   cargo test -p tonepoet --test dsd_reference_qualification -- --nocapture
 ```
 
@@ -420,7 +465,7 @@ produce matching source/delivered identities while direct FFmpeg decode of the W
 The environment does not provide Cargo, rustc, rustfmt, Clippy, Nix, Flox, or
 the pinned SoX-ng 14.8.0.1 closure. Therefore Rust compilation, formatting, workspace tests, Clippy, pinned-tool
 qualification, live smoke, and release certification could not be executed here.
-V15 remains fail-closed and unpromoted.
+V16 remains fail-closed and unpromoted.
 
 ## V11/F5 runtime completion: certified mutator identity is executed
 
@@ -508,3 +553,5 @@ byte-identical. Its v2 evidence type retains the historical 66-byte header and
 58-byte RIFF contribution. V13 uses a separate v3 evidence type and current
 runtime binding. No route, tool, metadata, analyzer, terminal, admission-scope,
 or enabled-cell behavior changed.
+
+- v16 threshold characterization brackets each enabled W64 cell with a 96-exponent scan and a 256-point boundary-neighborhood at `2^e / 510` resolution; the first bracketed nonzero must remain nonzero after FFmpeg decoding.

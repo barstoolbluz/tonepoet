@@ -1,0 +1,28 @@
+{
+  "schema": "tonepoet-dsd-reference-release-certification/v1",
+  "schema_version": 16,
+  "policy": "sox_ng_14_8_0_1_v16",
+  "status": "not_run",
+  "outcome": "not_run",
+  "qualification_manifest_digest": null,
+  "reason": "The exact pinned v16 release qualification has not been executed in this environment.",
+  "required_gates": [
+    "cargo_test_workspace",
+    "cargo_fmt_check",
+    "cargo_clippy_all_targets_all_features_deny_warnings",
+    "pinned_sox_ng_14_8_0_1_and_declared_tool_closure",
+    "default_settings_live_smoke",
+    "throughput_and_deadline_qualification",
+    "complete_real_tool_reference_qualification",
+    "w64_exact_integrity_60_cell_matrix",
+    "release_report_binding"
+  ],
+  "w64_exact_integrity": {
+    "status": "not_run",
+    "required_cell_count": 60,
+    "uncharacterized_enabled_cells": 60,
+    "malformed_w64_publication_allowed": false,
+    "same_path_hash_counted_as_independent_packaging": false,
+    "boundary_region_resolution_base_fraction": "1/510"
+  }
+}

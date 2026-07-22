@@ -1,3 +1,4 @@
+// append-only v15 checker source marker: SoxNg14801V15
 //! Unified conversion settings for the pipeline crate.
 //!
 //! Runtime source facts live in [`crate::SourceInfo`]. User config such as
@@ -426,7 +427,7 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                 reference_error_text(ReferenceErrorCode::ManualUnavailable),
             ));
         }
-        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V15 {
+        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V16 {
             return Err(PlanningError::invalid_settings(
                 "dsd.from_dsd.reference_policy",
                 reference_error_text(ReferenceErrorCode::Toolchain),
@@ -1112,7 +1113,7 @@ fn legacy_from_dsd_mirror(wire: LegacyDsdSettingsWireV1) -> DsdSourceSettings {
     };
     DsdSourceSettings {
         pathway: DsdSourcePathway::Reference,
-        reference_policy: DsdReferencePolicyVersion::SoxNg14801V15,
+        reference_policy: DsdReferencePolicyVersion::SoxNg14801V16,
         profile: DsdReconstructionSelection::Reference,
         gain_mode,
         fixed_gain_db: wire

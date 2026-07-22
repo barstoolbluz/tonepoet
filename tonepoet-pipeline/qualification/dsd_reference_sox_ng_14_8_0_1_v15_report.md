@@ -36,6 +36,26 @@ Neither the direct SoX route nor the Float32 FFmpeg-to-SoX route may inherit the
 
 The streamed-WAV capacity gate limits the maximum admitted analyzer workload to 8,589,934,480 oversampled sample values, which yields a maximum derived deadline of 8,710 seconds. The exact deadline is stored in the plan summary, serialized into the v15 semantic-plan identity, and required to match every analyzer command at runtime. Qualification must demonstrate at least 1,000,000 oversampled sample values per second for the pinned toolchain and include a maximum-admission arithmetic check. This deadline is a conservative failure bound, not an expected completion time.
 
+## Silent-content W64 writer defect
+
+The pinned SoX-ng 14.8.0.1 W64 writer has a separate silent-content
+finalization defect. For an 88.2 kHz mono Float64 carrier containing 8,820
+all-zero frames, the file remains 70,696 bytes and contains 70,560 payload bytes,
+but the RIFF-GUID size is finalized as 136 and the data-chunk size as 24. SoX
+reads all 8,820 frames by continuing to EOF; FFmpeg correctly refuses the file
+because the declared data extent is empty.
+
+Qualification therefore uses SoX `--i` for every W64 structural package probe
+and FFprobe only for non-W64 targets. A permanent five-fixture control set binds
+ordinary tone, a tiny nonzero sample, leading silence followed by tone, trailing
+silence after tone, and all-zero content. Only the all-zero witness may carry
+the malformed header and be refused by FFmpeg; all controls must have exact W64
+size fields and open successfully. Runtime certification requires the exact
+header values, file/payload sizes, SoX frame count, trigger classification, and
+probe-route disposition. This does not change production render, terminal,
+packaging, metadata, or delivered-audio behavior; the existing qualified SoX
+route remains authoritative for Float64-W64 opening and silence proof.
+
 ## Required promotion gates
 
 Promotion requires byte-identical current and candidate v15 manifests, the v15 deterministic derivation check, formatting, compilation, the full workspace suite, Clippy with warnings denied, zero cold-build warnings, the complete pinned-tool qualification matrix, the liveness regression, the workload-throughput gate, live smoke coverage, and atomic binding of the passing certification report and candidate manifest hashes. Until then, v15 remains a source-controlled candidate and Reference activation fails closed.

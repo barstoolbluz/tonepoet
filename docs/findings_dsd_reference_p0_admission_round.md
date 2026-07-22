@@ -866,3 +866,144 @@ Resolution shapes under the terminal rules:
 Product owner note (outside your scope): this is the second sox_ng
 writer defect for the upstream ledger — one-line-class fix expected in
 the fork's W64 size finalization, then pin bump + policy lift.
+
+### F10 resolution (v15 corrective return)
+
+The pinned-tool failure was a qualification-probe route error plus a misattributed
+defect, not an FFmpeg demuxer defect. The correction keeps the production
+Float64-W64 decode authority unchanged and does not alter render, terminal,
+packaging, metadata, or delivered-audio behavior.
+
+1. **W64 structural probes use SoX-ng.** The shared exact-package probe now
+   dispatches every W64 carrier through pinned SoX `--i` for container, rate,
+   channel count, depth, encoding, and nonempty sample-count validation. FFprobe
+   remains the structural authority for non-W64 targets only. Therefore an
+   all-zero SoX-written W64 is no longer sent to a consumer that correctly trusts
+   the malformed declared extent.
+2. **Permanent all-zero writer-defect fixture.** The gate writes five matched
+   88.2 kHz mono Float64 W64 carriers of 8,820 frames: ordinary tone, all-zero,
+   one tiny nonzero sample, leading silence followed by tone, and tone followed
+   by trailing silence. It parses the W64 GUID sizes directly. The four nonzero
+   controls must declare the exact 70,696-byte RIFF extent and 70,584-byte data
+   chunk; the all-zero witness must reproduce RIFF size 136 and data size 24 while
+   retaining 70,560 payload bytes on disk. SoX must report all 8,820 frames for
+   every fixture. FFmpeg must reject only the all-zero malformed witness. This
+   binds the trigger as all-zero content, not a low-level threshold or
+   first-block-silence condition.
+3. **Certification binds the corrected attribution.** Runtime release
+   certification now requires the exact header fields, payload/file sizes, SoX
+   frame count, control outcomes, trigger classification, SoX-only W64 probe
+   disposition, and nonempty FFmpeg refusal diagnostic. The former
+   `silent_float64_w64_open_defect` evidence is removed; the report names the
+   pinned SoX-ng writer defect and records FFmpeg as the correct refusing
+   consumer.
+
+The complete v5-v15 checker chain and static source-marker checks are rerun in
+the returned tree. The assembly environment still lacks the Rust toolchain and
+the pinned SoX-ng/FFmpeg closure, so no compiled or commissioned real-tool pass
+is claimed. Policy v15 remains fail-closed and unpromoted.
+
+### F10 corrective re-resolution (v16 append-only return)
+
+The prior v15 response is rejected because it routed structural authority through
+the permissive SoX reader and retained the malformed W64 as deliverable output.
+Policy v16 is an append-only successor; the frozen v15 artifacts remain unchanged.
+
+1. **Malformed W64 cannot be published.** Production independently parses every
+   W64 R64/QPCM carrier. Root extent must equal physical file length; the unique
+   data extent must equal the exact payload implied by the independently parsed
+   R64 frame authority; complete chunk traversal, canonical format/fact metadata,
+   8-byte alignment, zero padding, exact frame count, and absence of trailing
+   bytes are mandatory. A mismatch
+   returns `DSD-REF-P0-026` before metadata work or atomic publication. A carrier
+   that passes structure must also complete an FFmpeg `-xerror` traversal. No
+   repair is attempted in this policy.
+2. **Characterization is depth/rate/channel complete and threshold-honest.** The
+   pinned qualification defines 60 enabled W64 cells: Int24, Float32, and Float64
+   across all ten admitted rates and mono/stereo. Each cell scans powers `2^-96`
+   through `2^-1`, identifies the first surviving power-of-two, then brackets the
+   transition with 256 ordered amplitudes between the preceding and surviving
+   powers at `2^e / 510` resolution. It also tests zero,
+   immediately-below-power-boundary, at-boundary, leading-silence, and
+   trailing-silence fixtures. At-boundary and both silence
+   controls must remain nonzero after independent decoded-sample inspection. The
+   evidence claims only `encoded_all_zero_after_depth_and_effects_quantization`;
+   it records the cell-specific input boundary instead of asserting that no lower
+   threshold exists.
+3. **The W64 probe is exact.** `validate_exact_w64_pcm()` is independent of both
+   SoX and FFmpeg. It requires declared RIFF extent == physical extent, declared
+   data payload == exact expected payload, derived frames == exact expected
+   frames, exact alignment-valid traversal, and no undeclared bytes. SoX metadata
+   supplements this proof but cannot replace it.
+4. **Same-path evidence is not called packaging evidence.** W64 directly delivers
+   terminal QPCM after exact structural and consumer validation. Equal QPCM and
+   packaged hashes are identity continuity only. The execution-evidence mode is
+   explicit, and v16 manifest construction rejects the wrong mode. Non-W64
+   package targets retain an independent decoded-package comparison.
+5. **Release remains fail-closed.** The v16 certification is `not_run`; all 60
+   W64 cells remain uncharacterized until commissioned in the exact pinned
+   closure. No production hand-off is claimed without workspace compilation and
+   tests, rustfmt, warning-denied Clippy, pinned-tool qualification, smoke,
+   throughput, and report/candidate binding.
+
+The handoff manifest continues to hash every regular file. A separate hashed
+symlink ledger binds the only symlink and its exact in-tree target.
+
+
+- v16 threshold characterization brackets each enabled W64 cell with a 96-exponent scan and a 256-point boundary-neighborhood at `2^e / 510` resolution; the first bracketed nonzero must remain nonzero after FFmpeg decoding.
+
+
+## F11 (v16 round) — schema evolution breaks historical artifacts; exact-header assert collides with the known silence defect; v15 edited in place
+
+Applied state: 12/12 checkers green, suite 4,643 passed, smoke green,
+zero cold warnings, qualification 4/5 (773 s). Three items:
+
+### F11.1 — new required schema fields break historical JSON parsing
+
+Your own integrity tests fail:
+
+```text
+track_executor.rs:9816: embedded Reference qualification JSON parses:
+  Error("missing field `schema`", line 1141, column 3)
+track_executor.rs:9792: historical v12 candidate JSON parses:
+  Error("missing field `w64_delivery_mode`", line 1141, column 3)
+```
+
+v16 added required fields to the qualification schema structs; the
+historical artifacts (v12's JSON is untouched since its round) no
+longer deserialize. Rule to encode: schema evolution must keep every
+historical artifact parseable — new fields are `Option`/defaulted for
+pre-existing generations, or versioned wire structs dispatch by
+generation. Add a permanent test that parses EVERY checked-in
+qualification JSON through the current schema.
+
+### F11.2 — exact-W64-header assert (qual :3613) must route the known
+silence defect through the diagnostic path, not a harness panic
+
+`exact_float64_w64_header(observation)` fails for at least one case.
+Given F10 (sox finalizes silent-content W64 with header-only size
+fields), a silence-class carrier CANNOT present exact size fields on
+this toolchain — your independent parser exists precisely to detect
+that and surface the named diagnostic. The gate must assert the
+DETECTION (bogus-field case yields the F10 diagnostic and the qualified
+fallback/refusal you designed), not assert exact fields universally.
+Reproduce with your own all-zero fixture; do not exempt silence from
+verification — verify the correct behavior for it.
+
+### F11.3 — v15 artifacts were edited in place (governance)
+
+The v16 bundle modified `dsd_reference_sox_ng_14_8_0_1_v15.json` and
+`v15_candidate.json` AND their checker together — which keeps the
+checker quiet while rewriting a serialized generation. Your own
+precedent (v10 minted a new ID rather than editing v9's overstated
+phrase) and the F9.1 lineage contract say historical generations are
+immutable once serialized, promoted or not. Either revert the v15
+artifacts and carry the correction in v16, or state an explicit,
+narrow amendment rule for unpromoted candidates — silently co-editing
+artifact+checker is the one shape that must never happen, because it
+defeats the guard.
+
+Terminal rules restated: every historical artifact parses and its
+checker passes unmodified; the silence case is verified through the
+diagnostic path; no cell predicted-failing; static assembly checks
+re-run before returning.
