@@ -1,6 +1,6 @@
 # Upstream Issue Drafts — toolchain defects found by the DSD Reference qualification gate
 
-Status: DRAFTS, not yet filed. Four real toolchain defects were isolated
+Status: DRAFTS, not yet filed. Five real toolchain defects were isolated
 with minimal reproductions during the DSD Reference P0 qualification
 rounds (2026-07-19..21). File when convenient; none block tonepoet (all
 are routed around or rejected fail-closed by policy), but upstream fixes
@@ -64,7 +64,64 @@ cap as a new append-only policy ID.
 
 ---
 
-## 2. ffmpeg (trac.ffmpeg.org) — W64 demuxer mis-scales plain-IEEE_FLOAT f64 by 2^31
+## 2. sox_ng (file at codeberg.org/sox_ng/sox_ng; also applies to barstoolbluz/sox_ng fork)
+
+**Title:** W64 writer finalizes header-only/empty size fields for
+all-zero (digital-silence) content, while the full payload is present on
+disk
+
+**Version:** sox_ng 14.8.0.1
+
+**Summary:** When SoX-ng writes an **all-zero** payload to W64, both the
+RIFF-GUID size field (finalized to the header length) and the `data`
+chunk size field (finalized to empty) declare a header-only/empty file,
+even though the complete zero-sample payload IS written to disk. A reader that honors the declared sizes (FFmpeg)
+correctly refuses the file; SoX round-trips its own broken output because
+its reader reads to EOF and ignores the size fields. This is a sibling of
+defect #1 (the streamed-WAV >4 GiB size wrap): SoX-ng's WAV/W64 size
+accounting has more than one finalization bug.
+
+**Reproduction (Linux; two mono 88.2 kHz Float64 W64 files, 8,820
+frames each, both 70,696 bytes on disk):**
+
+```console
+$ sox -D -r 88200 -n -e floating-point -b 64 -c 1 tone.w64  synth 0.1 sine 1000 gain -6
+$ sox -D -r 88200 -n -e floating-point -b 64 -c 1 zeros.w64 synth 0.1 sine 1000 vol 0
+
+$ sox --info tone.w64 && sox --info zeros.w64   # SoX reads BOTH: 8,820 samples
+
+# RIFF-GUID size field (bytes 16..24, little-endian u64):
+#   tone.w64  -> 0x00011428 = 70,696   (correct: whole file)
+#   zeros.w64 -> 0x00000088 = 136       (HEADER-ONLY — bogus)
+# data-chunk size field:
+#   zeros.w64 -> 0x18 = 24              (declares EMPTY payload; correct
+#                value = 0x113b8 = 70,584, i.e. 70,560 payload bytes +
+#                24-byte W64 chunk header — the payload IS on disk)
+
+$ ffprobe tone.w64    # opens fine
+$ ffprobe zeros.w64   # "Invalid data" — correctly honoring the bogus size
+$ ffprobe -f w64 zeros.w64   # forcing the demuxer does NOT bypass
+```
+
+**Impact:** any all-zero (or effects-quantized-to-zero) W64 SoX-ng
+writes is unreadable by size-honoring consumers (FFmpeg, and any strict
+W64 parser), while SoX itself masks the corruption by ignoring its own
+size fields. Digital-silence carriers and silent lead-in/-out fixtures
+are the natural triggers.
+
+**Candidate fix:** one-line-class — in the W64 size finalization path,
+compute the final RIFF and `data` sizes from the actual bytes written,
+not from a running counter/flag that stays at its initial (empty) state
+for all-zero content. Verify the byte-count update fires on all-zero
+blocks identically to nonzero ones. Suggested to characterize the exact
+trigger (all-zero-whole-file vs first-block-silence vs a threshold) with
+leading-/trailing-silence controls while in the code. After the fix:
+bump the tonepoet flake pin, re-attest, and lift the all-zero W64
+refusal accommodation as a new append-only policy ID.
+
+---
+
+## 3. ffmpeg (trac.ffmpeg.org) — W64 demuxer mis-scales plain-IEEE_FLOAT f64 by 2^31
 
 **Version:** ffmpeg 7.1
 
@@ -79,7 +136,7 @@ floating-point -b 64 t.w64 synth 1 sine 1000 gain -20` then
 f32-in-W64 with the same plain tag decodes correctly; f64 WAV (RIFF)
 decodes correctly.
 
-## 3. ffmpeg (trac.ffmpeg.org) — W64 muxer folds alignment padding into the data chunk
+## 4. ffmpeg (trac.ffmpeg.org) — W64 muxer folds alignment padding into the data chunk
 
 **Version:** ffmpeg 7.1
 
@@ -90,7 +147,7 @@ decodes to one extra phantom sample (8,821): the muxer includes the
 alignment padding in the declared data extent. Identical prefix,
 zero-valued trailing sample. Aligned sizes round-trip cleanly.
 
-## 4. ffmpeg (trac.ffmpeg.org) — f32 W64 mis-measured via streamed f64 WAV re-container
+## 5. ffmpeg (trac.ffmpeg.org) — f32 W64 mis-measured via streamed f64 WAV re-container
 
 **Version:** ffmpeg 7.1 (interaction with SoX-ng 14.8.0.1 producer)
 
@@ -105,8 +162,9 @@ empirical route matrix is recorded in tonepoet's
 
 ---
 
-Provenance: all four were surfaced by tonepoet's DSD Reference
-qualification gate (policy lineage `sox_ng_14_8_0_1_v4..v11`) and
+Provenance: all five were surfaced by tonepoet's DSD Reference
+qualification gate (policy lineage `sox_ng_14_8_0_1_v4..v16`) and
 isolated with the minimal fixtures described in
-`docs/findings_dsd_reference_p0_admission_round.md` (F1/F5/F6) and the
-policy handoff docs.
+`docs/findings_dsd_reference_p0_admission_round.md` (F1/F5/F6 §373,
+F10 §812) and the policy handoff docs. The two sox_ng writer defects
+(#1, #2) are the fork-fix track; see `docs/handoff_sox_ng_fork_fixes.md`.
