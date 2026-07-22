@@ -809,38 +809,60 @@ closure, so no compiled or pinned-real-tool execution is claimed here. Policy
 v15 remains fail-closed and unpromoted pending its commissioned qualification.
 
 
-## F10 (F9-resolution round) — ffmpeg refuses to OPEN sox-written W64 files whose content is silence (fifth W64 defect)
+## F10 (F9-resolution round) — sox_ng writes a bogus header-only W64 size field for silent content; ffmpeg correctly refuses the file
 
 Your F9 resolution lands fully: all 11 historical checkers green under
 the new lineage contract, the crossed-carrier negative test passes,
 suite 4,633/0, smoke green, zero cold warnings after an import cleanup
-on our side (the loudnorm-parser imports your v15 removed from
-production use are now test-scoped). The single remaining qualification
-failure is a NEW toolchain defect, minimally isolated:
+on our side (the loudnorm-parser imports v15 removed from production
+use are now test-scoped). The single remaining qualification failure
+(`tests/dsd_reference_qualification.rs:462`, ffprobe refusing the
+`dsf_uncompressed-2822400-1ch` QPCM) is a NEW toolchain defect —
+initially misattributed to ffmpeg, then fully isolated:
 
 ```text
-sox -D -r 88200 -n -e floating-point -b 64 -c 1 tone.w64 synth 0.1 sine 1000 gain -6
-ffprobe tone.w64                  -> opens fine
-
+sox -D -r 88200 -n -e floating-point -b 64 -c 1 tone.w64  synth 0.1 sine 1000 gain -6
 sox -D -r 88200 -n -e floating-point -b 64 -c 1 zeros.w64 synth 0.1 sine 1000 vol 0
-sox --info zeros.w64              -> 8,820 samples, valid (sox reads it)
-ffprobe zeros.w64                 -> "Invalid data found when processing input"
+
+both files: 70,696 bytes; sox reads both correctly (8,820 samples)
+
+tone.w64  RIFF-GUID size field: 0x00011428 = 70,696  (correct)
+zeros.w64 RIFF-GUID size field: 0x00000088 = 136     (HEADER-ONLY — bogus)
+zeros.w64 data-chunk size field: 0x18 = 24           (EMPTY payload declared;
+                                  correct field value would be 0x113b8 =
+                                  70,584 (W64 sizes include the 24-byte
+                                  chunk header); 70,560 bytes of zero
+                                  samples are present on disk)
+
+ffprobe tone.w64   -> opens fine
+ffprobe zeros.w64  -> "Invalid data" (correctly honoring a size field
+                       that excludes the entire data payload)
+ffprobe -f w64 …   -> forcing the demuxer does NOT bypass (verified)
 ```
 
-Identical command shape; the only difference is the sample content
-(all zero-valued). The pinned FFmpeg's W64 open path evidently scores
-stream content during probing and rejects silence-bearing files. This
-is what your gate hit twice: the verified_silence QPCM (F9.3(b)) and
-now `dsf_uncompressed-2822400-1ch`'s quiet QPCM at the ffprobe step
-(`tests/dsd_reference_qualification.rs:462`, captured argv in the
-apply log).
+So: **sox_ng 14.8.0.1's W64 writer finalizes BOTH size fields as an
+empty file when the written content is all-zero** (as if header
+patch-up never ran), while the full zero-sample payload is present on
+disk — a sibling of the F6 streamed-WAV size-wrap defect (its W64/WAV
+size accounting has multiple bugs). FFmpeg is exonerated for this
+failure class: it honors the declared sizes. sox reports the full
+8,820 samples despite both fields declaring empty, so its reader
+evidently reads to EOF rather than trusting the size fields — which is
+why sox round-trips its own broken files while FFmpeg refuses them. This explains both gate hits:
+the verified_silence QPCM (F9.3(b)) and any fixture whose QPCM renders
+all-zero.
 
-Resolution shapes under the terminal rules: route every probe/open of
-f64/quiet W64 carriers through the qualified SoX mechanism (ffprobe of
-a W64 carrier is now demonstrably unreliable for valid content); or
-force the demuxer (`-f w64`) IF you can qualify that forcing bypasses
-the content-scoring rejection (verify empirically — we did not); and
-add a permanent all-zero-content W64 fixture to the gate. Record this
-alongside the other four FFmpeg W64 defects for the upstream ledger.
-Do not special-case silence in assertions; fix the transport/probe
-route.
+Resolution shapes under the terminal rules:
+
+1. Route every open/probe of possibly-silent W64 carriers through the
+   qualified SoX mechanism (SoX reads its own files correctly), and add
+   a permanent all-zero-content W64 fixture to the gate;
+2. and/or have the harness/production detect-and-refuse the bogus size
+   field explicitly (a 0x88 header-only size on a larger file is
+   mechanically detectable) with a diagnostic naming this defect;
+3. characterize the exact trigger (all-zero vs threshold vs first-block
+   silence) with fixtures while you are in there.
+
+Product owner note (outside your scope): this is the second sox_ng
+writer defect for the upstream ledger — one-line-class fix expected in
+the fork's W64 size finalization, then pin bump + policy lift.
