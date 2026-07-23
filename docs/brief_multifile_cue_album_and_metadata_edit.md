@@ -1,8 +1,8 @@
 # Brief: native multi-FILE cue albums (front-end) + cue-album metadata-edit fix
 
-Date: 2026-07-23. For a fresh reasoning-model session. Baseline: branch
-`working` at (see handoff — post-0.4.2), full workspace suite green
-(`cargo test --workspace --no-fail-fast`, ~4740 tests, 0 failed). The sandbox
+Date: 2026-07-23. For a fresh reasoning-model session. Baseline: `working` ==
+`main` == `origin` at `fc489b9` (tonepoet 0.4.3), full workspace suite green
+(`cargo test --workspace --no-fail-fast`, 4742 tests, 0 failed). The sandbox
 cannot compile; the applier (Claude Code) compiles, runs the full gate, and
 validates on the real trees below. **Complete-file delivery contract**: return
 every file you change in full, plus the manifests in the bundle.
@@ -46,9 +46,11 @@ multi-day cycle. That must not recur. This brief is deliberately narrow.
    **already** materializes native multi-FILE cues correctly as one album (it is
    REFERENCE-ONLY here; see §3.1). Do not modify it. If Deliverable 3 seems to
    require an engine change, see the note there — it does not.
-2. `sanitize_component` / the folder-name whitespace/slash sanitizer
-   (`src/convert/pipeline/stages.rs`). A separate QoL fix already landed on
-   `working`. Leave it entirely alone.
+2. The folder-name sanitizers in `src/convert/pipeline/stages.rs` —
+   `sanitize_component` (single-space) and `sanitize_title_extra_component` (the
+   `%TITLE_EXTRA%`-only two-space slash rendering). A separate QoL fix already
+   shipped (0.4.3); both are done and correct. Leave them entirely alone — do
+   not "unify", re-scope, or extend the slash behavior to other tokens.
 3. **Duplicate format-copy dedup** (a folder holding the same album as both a
    FLAC copy and a WavPack copy, each with its own cue — the "Foxy" two-cue
    enqueue). This is deferred to its own round. Do not attempt to detect or
