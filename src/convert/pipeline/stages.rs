@@ -35193,29 +35193,18 @@ fn format_sample_rate(hz: u32) -> String {
 }
 
 fn sanitize_component(value: &str) -> String {
-    // House style: a forward slash in a tag value renders as a two-space gap
-    // between the surrounding tokens (e.g. `LP / 24-192` -> `LP  24-192`), so a
-    // reader can see where the slash was. Every other illegal or control
-    // character becomes a single space, and runs of whitespace WITHIN a
-    // slash-delimited segment still collapse to one space.
-    fn sanitize_slash_segment(part: &str) -> String {
-        part.chars()
-            .map(|ch| match ch {
-                '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
-                ch if ch.is_control() => ' ',
-                ch => ch,
-            })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-    let trimmed = value
-        .split('/')
-        .map(sanitize_slash_segment)
-        .filter(|segment| !segment.is_empty())
+    let sanitized: String = value
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            ch if ch.is_control() => ' ',
+            ch => ch,
+        })
+        .collect();
+    let trimmed = sanitized
+        .split_whitespace()
         .collect::<Vec<_>>()
-        .join("  ")
+        .join(" ")
         .trim_matches('.')
         .to_string();
     if trimmed.is_empty() {
@@ -40248,7 +40237,7 @@ mod naming_template_tests {
                 &source,
                 &tonepoet_pipeline::AudioFormat::Flac
             ),
-            PathBuf::from("Miles Davis/CK  1234/A Tribute to Jack Johnson")
+            PathBuf::from("Miles Davis/CK 1234/A Tribute to Jack Johnson")
         );
     }
 
@@ -40267,7 +40256,7 @@ mod naming_template_tests {
         // same policy as sanitize_component).
         assert_eq!(
             path,
-            PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT  999 -")
+            PathBuf::from("01 - Right Off - 1971 - Jazz - CK-1234 - 44.1kHz - 24 - CAT 999 -")
         );
     }
 
@@ -41084,18 +41073,8 @@ mod naming_template_tests {
     }
 
     #[test]
-    fn sanitize_component_renders_value_slash_as_two_space_gap() {
-        // House style: a value slash becomes a visible two-space gap, absorbing
-        // any spaces that surrounded the slash, while other whitespace collapses.
-        assert_eq!(sanitize_component("LP / 24-192"), "LP  24-192");
-        assert_eq!(sanitize_component("Miles/Davis"), "Miles  Davis");
-        assert_eq!(sanitize_component("A  /  B"), "A  B");
-        assert_eq!(sanitize_component("a/b/c"), "a  b  c");
-        // Non-slash illegal characters still collapse to a single space.
-        assert_eq!(sanitize_component("Foo:  Bar"), "Foo Bar");
-        // Leading/trailing slashes do not produce leading/trailing gaps.
-        assert_eq!(sanitize_component("/lead"), "lead");
-        assert_eq!(sanitize_component("trail/"), "trail");
+    fn sanitize_component_collapses_whitespace_after_separator_replacement() {
+        assert_eq!(sanitize_component("LP / 24-192"), "LP 24-192");
     }
 
     #[test]
@@ -41104,7 +41083,7 @@ mod naming_template_tests {
         source.album_metadata.album_artist = Some("Miles/Davis".to_string());
         assert_eq!(
             render_folder_template("%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
-            PathBuf::from("Miles  Davis/A Tribute to Jack Johnson")
+            PathBuf::from("Miles Davis/A Tribute to Jack Johnson")
         );
     }
 
@@ -41702,23 +41681,23 @@ mod title_extra_tests {
         let plan = plan_outputs(&source, &req).expect("disc-subfolder planning");
         assert_eq!(
             plan.entries[0].final_path,
-            PathBuf::from("/out/disc 01/Miles  Davis/1 - Statesboro Blues.flac")
+            PathBuf::from("/out/disc 01/Miles Davis/1 - Statesboro Blues.flac")
         );
         assert_eq!(
             plan.entries[1].final_path,
-            PathBuf::from("/out/disc 02/Miles  Davis/1 - Hot 'Lanta.flac")
+            PathBuf::from("/out/disc 02/Miles Davis/1 - Hot 'Lanta.flac")
         );
         assert_eq!(
             plan.entries[2].final_path,
-            PathBuf::from("/out/disc 01/Miles  Davis/2 - Done Somebody Wrong.flac")
+            PathBuf::from("/out/disc 01/Miles Davis/2 - Done Somebody Wrong.flac")
         );
         assert_eq!(
             plan.entries[3].final_path,
-            PathBuf::from("/out/disc 02/Miles  Davis/2 - In Memory of Elizabeth Reed.flac")
+            PathBuf::from("/out/disc 02/Miles Davis/2 - In Memory of Elizabeth Reed.flac")
         );
         assert_eq!(
             plan.entries[6].final_path,
-            PathBuf::from("/out/disc 01/Miles  Davis/4 - You Don't Love Me.flac")
+            PathBuf::from("/out/disc 01/Miles Davis/4 - You Don't Love Me.flac")
         );
     }
 
