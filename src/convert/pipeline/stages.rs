@@ -34323,7 +34323,10 @@ fn album_and_title_extra_for_template(
         Some((clean, extra)) => {
             let strip_resolution = template.contains("%BITDEPTH%") || template.contains("%SAMPLERATE%");
             let normalized = normalize_title_extra_for_template(&extra, source, strip_resolution);
-            (sanitize_component(&clean), sanitize_component(&normalized))
+            // TITLE_EXTRA only: a forward slash renders as a two-space gap
+            // (house style, e.g. `LP / 24-192` -> `LP  24-192`). The album
+            // (`clean`) and all other tokens keep the single-space sanitizer.
+            (sanitize_component(&clean), sanitize_title_extra_component(&normalized))
         }
         None => (sanitize_component(raw_album), String::new()),
     }
@@ -35205,6 +35208,42 @@ fn sanitize_component(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+        .trim_matches('.')
+        .to_string();
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Like `sanitize_component`, but renders a forward slash as a two-space gap
+/// between the surrounding tokens (house style for the `%TITLE_EXTRA%`
+/// pressing/edition designator, e.g. `LP / 24-192` -> `LP  24-192`, so a reader
+/// can see where the slash was). This is scoped to the `%TITLE_EXTRA%` value
+/// ONLY; every other token (artist, album, catalog, ...) uses the single-space
+/// `sanitize_component`, so e.g. an `AC/DC` artist stays `AC DC`. Every other
+/// illegal/control character still becomes a single space, and whitespace
+/// within a slash-delimited segment still collapses.
+fn sanitize_title_extra_component(value: &str) -> String {
+    fn sanitize_slash_segment(part: &str) -> String {
+        part.chars()
+            .map(|ch| match ch {
+                '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+                ch if ch.is_control() => ' ',
+                ch => ch,
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let trimmed = value
+        .split('/')
+        .map(sanitize_slash_segment)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ")
         .trim_matches('.')
         .to_string();
     if trimmed.is_empty() {
@@ -41084,6 +41123,36 @@ mod naming_template_tests {
         assert_eq!(
             render_folder_template("%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Miles Davis/A Tribute to Jack Johnson")
+        );
+    }
+
+    #[test]
+    fn title_extra_renders_slash_as_two_space_gap_scoped_to_title_extra() {
+        // The TITLE_EXTRA-only helper renders a forward slash as a two-space gap.
+        assert_eq!(
+            sanitize_title_extra_component("Blue Note Classic Reissue LP / 24-192"),
+            "Blue Note Classic Reissue LP  24-192"
+        );
+        // Every other token's sanitizer still collapses a slash to ONE space.
+        assert_eq!(
+            sanitize_component("Blue Note Classic Reissue LP / 24-192"),
+            "Blue Note Classic Reissue LP 24-192"
+        );
+
+        let mut source = template_source();
+        source.album_metadata.album =
+            Some("Dark Side of the Moon (MFSL LP / 24-96)".to_string());
+        source.album_metadata.album_artist = Some("AC/DC".to_string());
+        // The designator reaches %TITLE_EXTRA% with a two-space gap (template
+        // has no %BITDEPTH%/%SAMPLERATE%, so the resolution stays in place).
+        assert_eq!(
+            render_folder_template("%TITLE_EXTRA%", &source, &tonepoet_pipeline::AudioFormat::Flac),
+            PathBuf::from("MFSL LP  24-96")
+        );
+        // A slashed %ARTIST% is NOT affected — it stays single-space.
+        assert_eq!(
+            render_folder_template("%ARTIST%", &source, &tonepoet_pipeline::AudioFormat::Flac),
+            PathBuf::from("AC DC")
         );
     }
 
