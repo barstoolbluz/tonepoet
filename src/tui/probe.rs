@@ -6241,6 +6241,116 @@ fn append_distinct_editor_value(current: &mut String, next: &str) {
     current.push_str(next);
 }
 
+/// Format-independent canonical editor key for a Lofty tag item.
+///
+/// Numbering fields resolve through the shared numbering classifier. Every other
+/// key maps through its Vorbis-comment spelling first, so ID3v2 frame IDs
+/// (`TIT2`, `TPE1`, `TSSE`, …) and other format-native names collapse onto the
+/// same canonical editor rows that Vorbis/FLAC already use instead of surfacing
+/// raw frame identifiers. Genuinely custom keys fall back to their raw name.
+fn canonical_editor_display_key(
+    key: &lofty::tag::ItemKey,
+    tag_type: lofty::tag::TagType,
+) -> String {
+    if let Some(canonical) =
+        crate::metadata_persistence::canonical_numbering_display_key_for_tag_item(key, tag_type)
+    {
+        return canonical.to_string();
+    }
+    if let Some(vorbis) = lofty_vorbis_comment_key(key) {
+        return canonical_metadata_display_key(&vorbis);
+    }
+    canonical_metadata_display_key(&item_key_display(key, tag_type))
+}
+
+/// Split an APE `Disk`=`N/M` combined disc item into its `(number, total?)`
+/// string parts.
+///
+/// Lofty serializes APE disc numbering into a single `Disk` item and then reads
+/// it back only as `Unknown("Disk")` — its typed disc accessors return None.
+/// Returns None unless this is an APE disc carrier whose leading part is an
+/// unsigned integer, so a custom or non-numbering `Disk`-like field (or the
+/// unrelated `Media` media-type field) is left on its normal per-item path.
+fn ape_combined_disc_parts(
+    key: &lofty::tag::ItemKey,
+    tag_type: lofty::tag::TagType,
+    value: &str,
+) -> Option<(String, Option<String>)> {
+    if tag_type != lofty::tag::TagType::Ape {
+        return None;
+    }
+    let lofty::tag::ItemKey::Unknown(name) = key else {
+        return None;
+    };
+    if !matches!(name.trim().to_ascii_uppercase().as_str(), "DISK" | "DISC") {
+        return None;
+    }
+    let mut parts = value.split('/');
+    let disc = parts.next().unwrap_or("").trim();
+    if disc.parse::<u32>().is_err() {
+        return None;
+    }
+    let total = parts
+        .next()
+        .map(str::trim)
+        .filter(|total| !total.is_empty())
+        .map(str::to_string);
+    Some((disc.to_string(), total))
+}
+
+/// Canonical DISCNUMBER/DISCTOTAL editor rows recovered from an APE `Disk` item.
+fn ape_combined_disc_editor_rows(
+    key: &lofty::tag::ItemKey,
+    tag_type: lofty::tag::TagType,
+    value: &str,
+) -> Option<Vec<(String, lofty::tag::ItemKey, String)>> {
+    let (disc, total) = ape_combined_disc_parts(key, tag_type, value)?;
+    let mut rows = vec![(
+        "DISCNUMBER".to_string(),
+        lofty::tag::ItemKey::DiscNumber,
+        disc,
+    )];
+    if let Some(total) = total {
+        rows.push((
+            "DISCTOTAL".to_string(),
+            lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+            total,
+        ));
+    }
+    Some(rows)
+}
+
+/// Insert or merge one editor row, collapsing duplicate canonical keys the same
+/// way multiple stored carriers for one logical field are collapsed elsewhere.
+fn merge_editor_field(
+    fields: &mut Vec<CanonicalEditorTagField>,
+    indexes: &mut std::collections::HashMap<String, usize>,
+    display_key: String,
+    item_key: lofty::tag::ItemKey,
+    value: String,
+    is_binary: bool,
+) {
+    if let Some(index) = indexes.get(&display_key).copied() {
+        let field: &mut CanonicalEditorTagField = &mut fields[index];
+        // A second stored carrier is cardinality information even when
+        // its text duplicates the first value. Keep display de-duplicated,
+        // but retain the fact that an explicit scalar edit will collapse
+        // more than one stored item.
+        field.stored_value_count += 1;
+        append_distinct_editor_value(&mut field.value, &value);
+        field.is_binary |= is_binary;
+        return;
+    }
+    indexes.insert(display_key.clone(), fields.len());
+    fields.push(CanonicalEditorTagField {
+        item_key,
+        display_key,
+        value,
+        is_binary,
+        stored_value_count: 1,
+    });
+}
+
 /// Collect one logical row per canonical editor key. Vorbis/ID3 aliases are
 /// collapsed before placeholder synthesis, so COMMENT/DESCRIPTION and total
 /// spellings cannot produce competing rows or order-dependent writes.
@@ -6257,38 +6367,36 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
     let mut fields = Vec::new();
     let mut indexes = HashMap::<String, usize>::new();
     for item in tag.items() {
-        let display_key = crate::metadata_persistence::canonical_numbering_display_key_for_tag_item(
-            item.key(),
-            tag.tag_type(),
-        )
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            canonical_metadata_display_key(&item_key_display(item.key(), tag.tag_type()))
-        });
         let (value, is_binary) = match item.value() {
             ItemValue::Text(value) => (value.clone(), false),
             ItemValue::Locator(value) => (value.clone(), false),
             ItemValue::Binary(value) => (format!("<binary, {} bytes>", value.len()), true),
         };
-        if let Some(index) = indexes.get(&display_key).copied() {
-            let field: &mut CanonicalEditorTagField = &mut fields[index];
-            // A second stored carrier is cardinality information even when
-            // its text duplicates the first value. Keep display de-duplicated,
-            // but retain the fact that an explicit scalar edit will collapse
-            // more than one stored item.
-            field.stored_value_count += 1;
-            append_distinct_editor_value(&mut field.value, &value);
-            field.is_binary |= is_binary;
-            continue;
+
+        // APE stores disc numbering as a single combined `Disk`=`N/M` item that
+        // Lofty writes but cannot read back through its typed accessors
+        // (`tag.disk()`/`tag.disk_total()` both return None). Split it into the
+        // canonical DISCNUMBER/DISCTOTAL editor rows so APE matches every other
+        // carrier and the value is not stranded under a raw `DISK` row.
+        if !is_binary {
+            if let Some(rows) = ape_combined_disc_editor_rows(item.key(), tag.tag_type(), &value) {
+                for (display_key, item_key, row_value) in rows {
+                    merge_editor_field(
+                        &mut fields,
+                        &mut indexes,
+                        display_key,
+                        item_key,
+                        row_value,
+                        false,
+                    );
+                }
+                continue;
+            }
         }
-        indexes.insert(display_key.clone(), fields.len());
-        fields.push(CanonicalEditorTagField {
-            item_key: canonical_editor_item_key(&display_key, item.key()),
-            display_key,
-            value,
-            is_binary,
-            stored_value_count: 1,
-        });
+
+        let display_key = canonical_editor_display_key(item.key(), tag.tag_type());
+        let item_key = canonical_editor_item_key(&display_key, item.key());
+        merge_editor_field(&mut fields, &mut indexes, display_key, item_key, value, is_binary);
     }
 
     // Structured carriers such as MP4 may expose `trkn`/`disk` only through
@@ -8130,6 +8238,41 @@ fn apply_typed_lofty_changes(
     changed
 }
 
+/// Rewrite the APE combined `Disk`=`N/M` item into typed DiscNumber/DiscTotal
+/// items before the idempotency preflight runs.
+///
+/// The preflight compares desired disc numbering against Lofty's typed disc
+/// accessors, but Lofty exposes APE disc only as `Unknown("Disk")` (its typed
+/// accessors return None), so a repeat write of the same disc value would
+/// otherwise look like a change and enter the full-file fallback transaction.
+/// Lofty re-serializes the typed items back into the identical combined `Disk`
+/// item, so this normalization never alters the persisted bytes on its own.
+fn normalize_ape_combined_disc(tag: &mut lofty::tag::Tag) {
+    use lofty::tag::{ItemValue, TagItem};
+
+    let combined = tag.items().find_map(|item| {
+        let ItemValue::Text(value) = item.value() else {
+            return None;
+        };
+        ape_combined_disc_parts(item.key(), tag.tag_type(), value)
+            .map(|parts| (item.key().clone(), parts))
+    });
+    let Some((key, (disc, total))) = combined else {
+        return;
+    };
+    tag.remove_key(&key);
+    tag.insert_unchecked(TagItem::new(
+        lofty::tag::ItemKey::DiscNumber,
+        ItemValue::Text(disc),
+    ));
+    if let Some(total) = total {
+        tag.insert_unchecked(TagItem::new(
+            lofty::tag::ItemKey::DiscTotal,
+            ItemValue::Text(total),
+        ));
+    }
+}
+
 fn prepare_all_tags_lofty(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
@@ -8150,6 +8293,9 @@ fn prepare_all_tags_lofty(
     let backend = crate::metadata_persistence::metadata_backend_for_lofty_tag_type(
         tag.tag_type(),
     );
+    if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe {
+        normalize_ape_combined_disc(tag);
+    }
     let normalized_typed_changes = matches!(
         backend,
         crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
@@ -9453,8 +9599,15 @@ mod tests {
         let tag = tagged.primary_tag().expect("primary tag after write");
         assert_eq!(tag.track(), Some(7));
         assert_eq!(tag.track_total(), Some(17));
-        assert_eq!(tag.disk(), Some(2));
-        assert_eq!(tag.disk_total(), Some(3));
+        // Lofty serializes APE disc numbering into a single combined `Disk`=`N/M`
+        // item that it reads back only as `Unknown("Disk")`, so its typed disc
+        // accessors return None for APE regardless of what was written. The
+        // editor-level round trip below (through the production reader, which
+        // recovers the combined item) is the meaningful guarantee for APE.
+        if expected_backend != crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe {
+            assert_eq!(tag.disk(), Some(2));
+            assert_eq!(tag.disk_total(), Some(3));
+        }
         for (display_key, expected) in [
             ("TRACKNUMBER", "7"),
             ("TRACKTOTAL", "17"),
