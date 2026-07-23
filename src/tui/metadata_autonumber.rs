@@ -262,9 +262,10 @@ fn existing_tag_side_number(
     parse_side_number(value)
 }
 
-/// Strictly recognize a leading ASCII side label followed immediately by a
-/// positive decimal sequence.  The remainder may be empty, a total (`/17`),
-/// or a filename separator; arbitrary embedded letters are rejected.
+/// Recognize an explicit ASCII side label followed immediately by a positive
+/// decimal sequence. The label may contain one to eight letters for custom or
+/// existing-tag values. Filename inference applies the narrower one-letter
+/// anchoring policy in [`side_number_from_filename`].
 pub fn parse_side_number(input: &str) -> Option<DerivedSideNumber> {
     let trimmed = input.trim();
     let mut chars = trimmed.char_indices().peekable();
@@ -328,10 +329,22 @@ pub fn parse_side_number(input: &str) -> Option<DerivedSideNumber> {
 
 pub fn side_number_from_filename(path: &Path) -> Option<DerivedSideNumber> {
     let stem = path.file_stem()?.to_str()?;
-    parse_side_number(stem).map(|mut derived| {
-        derived.source = SideDerivationSource::Filename;
-        derived
-    })
+    let mut chars = stem.chars();
+    let side = chars.next()?;
+    let first_digit = chars.next()?;
+    if !side.is_ascii_alphabetic() || !first_digit.is_ascii_digit() {
+        return None;
+    }
+
+    let mut derived = parse_side_number(stem)?;
+    // Filename inference is intentionally narrower than explicit/custom side
+    // labels: one leading side letter avoids treating stems such as
+    // `trackA01` as side-number evidence.
+    if derived.prefix.len() != 1 {
+        return None;
+    }
+    derived.source = SideDerivationSource::Filename;
+    Some(derived)
 }
 
 fn decimal_width(total: usize) -> usize {
@@ -1343,6 +1356,29 @@ mod tests {
         assert!(side_number_from_filename(&PathBuf::from("01 - Come Together.flac")).is_none());
         assert!(parse_side_number("A01/not-a-total").is_none());
         assert_eq!(parse_side_number("A01/17").unwrap().sequence, 1);
+        assert_eq!(parse_side_number("SIDE01").unwrap().prefix, "SIDE");
+        assert!(side_number_from_filename(&PathBuf::from("SIDE01.flac")).is_none());
+    }
+
+    #[test]
+    fn numeric_only_menu_exposes_plain_numbering_only_when_it_changes_values() {
+        let changing = state(
+            &["track.dsf"],
+            vec![entry("TRACKNUMBER", ItemKey::TrackNumber, &["9"])],
+        );
+        let eligibility = numbering_menu_eligibility(&changing, NumberingTarget::Track)
+            .expect("DSF should expose its proven plain-unsigned capability");
+        assert_eq!(eligibility.immediate, vec![NumberingScheme::N]);
+        assert!(!eligibility.custom);
+
+        let already_numbered = state(
+            &["track.dsf"],
+            vec![entry("TRACKNUMBER", ItemKey::TrackNumber, &["1"])],
+        );
+        let eligibility = numbering_menu_eligibility(&already_numbered, NumberingTarget::Track)
+            .expect("idempotent DSF eligibility should remain valid");
+        assert!(eligibility.immediate.is_empty());
+        assert!(!eligibility.custom);
     }
 
     #[test]

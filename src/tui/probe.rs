@@ -1142,7 +1142,15 @@ mod flac_metadata_writer {
         recover_artwork_rollback_journal_before_native_write(path, "tag write")?;
         reject_hardlinked_native_write(path, "tag write")?;
         let metadata = read_flac_metadata(path)?;
-        let replacement = build_vorbis_comment_replacement(&metadata, changes)?;
+        let Some(replacement) = build_vorbis_comment_replacement(&metadata, changes)? else {
+            let mut report = FlacWriteReport::clean();
+            if let Some(warning) = write_claim.release_with_warning(
+                "FLAC common write lock removal after no-op tag write",
+            ) {
+                report.durability_warnings.push(warning);
+            }
+            return Ok(report);
+        };
         let mut report = write_replacement_blocks(path, &metadata, replacement, cancel)?;
         if let Some(warning) = write_claim.release_with_warning("FLAC common write lock removal after tag write") {
             report.durability_warnings.push(warning);
@@ -1451,7 +1459,7 @@ mod flac_metadata_writer {
     fn build_vorbis_comment_replacement(
         metadata: &FlacMetadata,
         changes: &[(lofty::tag::ItemKey, Option<String>)],
-    ) -> Result<Vec<FlacBlock>, String> {
+    ) -> Result<Option<Vec<FlacBlock>>, String> {
         let old_vorbis = metadata
             .blocks
             .iter()
@@ -1463,7 +1471,9 @@ mod flac_metadata_writer {
                 comments: Vec::new(),
             });
         let mut vorbis = old_vorbis;
-        apply_comment_changes(&mut vorbis, changes)?;
+        if !apply_comment_changes(&mut vorbis, changes)? {
+            return Ok(None);
+        }
         let maybe_vorbis_block = if vorbis.comments.is_empty() {
             None
         } else {
@@ -1502,7 +1512,7 @@ mod flac_metadata_writer {
             }
         }
 
-        Ok(replacement)
+        Ok(Some(replacement))
     }
 
     fn build_picture_replacement(
@@ -1626,14 +1636,16 @@ mod flac_metadata_writer {
         Err("saved FLAC metadata region did not terminate".to_string())
     }
 
-    /// Alias groups whose spellings all refer to the SAME logical field.
-    /// Editing any of them must remove every alias, or the write leaves a
-    /// stale duplicate under the other spelling (a FLAC tagged TOTALTRACKS
-    /// reads as TrackTotal, and the edit would write TRACKTOTAL alongside).
+    /// Alias groups whose spellings all refer to the same logical field.
+    /// Editing any member must remove the complete group; otherwise a legacy
+    /// total or DISK spelling can survive beside the canonical field.
     fn vorbis_key_aliases(comment_key: &str) -> &'static [&'static str] {
+        if let Some((_, aliases)) =
+            crate::metadata_persistence::logical_numbering_alias_group(comment_key)
+        {
+            return aliases;
+        }
         match comment_key {
-            "TRACKTOTAL" | "TOTALTRACKS" => &["TRACKTOTAL", "TOTALTRACKS"],
-            "DISCTOTAL" | "TOTALDISCS" => &["DISCTOTAL", "TOTALDISCS"],
             "COMMENT" | "DESCRIPTION" => &["COMMENT", "DESCRIPTION"],
             _ => &[],
         }
@@ -1642,7 +1654,7 @@ mod flac_metadata_writer {
     fn apply_comment_changes(
         vorbis: &mut VorbisComments,
         changes: &[(lofty::tag::ItemKey, Option<String>)],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         use std::collections::BTreeMap;
 
         // Resolve logical alias groups before mutating the comment list. The
@@ -1670,8 +1682,39 @@ mod flac_metadata_writer {
             resolved.insert(comment_key, normalized_value);
         }
 
+        let mut changed = false;
         for (comment_key, new_value) in resolved {
             let aliases = vorbis_key_aliases(&comment_key);
+            let mut matching_count = 0usize;
+            let mut matching_value = None;
+            let mut matching_key_is_canonical = false;
+            for comment in &vorbis.comments {
+                let VorbisComment::Parsed { name, value } = comment else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case(&comment_key)
+                    || aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias))
+                {
+                    matching_count += 1;
+                    if matching_count == 1 {
+                        matching_value = Some(value.as_str());
+                        matching_key_is_canonical = name.eq_ignore_ascii_case(&comment_key);
+                    }
+                }
+            }
+            let already_satisfied = match new_value.as_deref() {
+                Some(expected) => {
+                    matching_count == 1
+                        && matching_key_is_canonical
+                        && matching_value == Some(expected)
+                }
+                None => matching_count == 0,
+            };
+            if already_satisfied {
+                continue;
+            }
+
+            changed = true;
             vorbis.comments.retain(|comment| match comment {
                 VorbisComment::Parsed { name, .. } => {
                     !name.eq_ignore_ascii_case(&comment_key)
@@ -1687,7 +1730,7 @@ mod flac_metadata_writer {
                 });
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn vorbis_comment_key(key: &lofty::tag::ItemKey) -> Result<String, String> {
@@ -4795,7 +4838,8 @@ mod flac_metadata_writer {
         recover_metadata_journal(path)?;
         recover_artwork_rollback_journal(path)?;
         let metadata = read_flac_metadata(path)?;
-        let replacement = build_vorbis_comment_replacement(&metadata, changes)?;
+        let replacement = build_vorbis_comment_replacement(&metadata, changes)?
+            .ok_or_else(|| "test kill-point change set was already satisfied".to_string())?;
         let mut padded_replacement = replacement;
         let old_metadata_len = metadata.raw_metadata_region.len();
         let new_len_without_padding = encoded_blocks_len(&padded_replacement)?;
@@ -4844,7 +4888,8 @@ mod flac_metadata_writer {
     ) -> Result<(), String> {
         recover_metadata_journal(path)?;
         let metadata = read_flac_metadata(path)?;
-        let mut replacement = build_vorbis_comment_replacement(&metadata, changes)?;
+        let mut replacement = build_vorbis_comment_replacement(&metadata, changes)?
+            .ok_or_else(|| "test wrong-offset change set was already satisfied".to_string())?;
         let old_metadata_len = metadata.raw_metadata_region.len();
         let new_len_without_padding = encoded_blocks_len(&replacement)?;
         if new_len_without_padding > old_metadata_len {
@@ -4911,7 +4956,8 @@ mod flac_metadata_writer {
     ) -> Result<(), String> {
         recover_metadata_journal(path)?;
         let metadata = read_flac_metadata(path)?;
-        let mut replacement = build_vorbis_comment_replacement(&metadata, changes)?;
+        let mut replacement = build_vorbis_comment_replacement(&metadata, changes)?
+            .ok_or_else(|| "test forced-rewrite change set was already satisfied".to_string())?;
         append_padding(&mut replacement, REWRITE_PADDING_BYTES)?;
         stream_rewrite(path, metadata.audio_start, &replacement, None).map(|_| ())
     }
@@ -4945,6 +4991,60 @@ mod flac_metadata_writer {
                 _ => None,
             })
             .collect())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_replace_vorbis_comments(
+        path: &Path,
+        comments: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let metadata = read_flac_metadata(path)?;
+        let vendor = metadata
+            .blocks
+            .iter()
+            .find(|block| block.block_type == BLOCK_VORBIS_COMMENT)
+            .map(|block| parse_vorbis_comments(&block.data))
+            .transpose()?
+            .map(|comments| comments.vendor)
+            .unwrap_or_else(|| "tonepoet-test".to_string());
+        let replacement_comment = FlacBlock {
+            block_type: BLOCK_VORBIS_COMMENT,
+            data: serialize_vorbis_comments(&VorbisComments {
+                vendor,
+                comments: comments
+                    .iter()
+                    .map(|(name, value)| VorbisComment::Parsed {
+                        name: (*name).to_string(),
+                        value: (*value).to_string(),
+                    })
+                    .collect(),
+            })?,
+        };
+
+        let mut replacement = Vec::with_capacity(metadata.blocks.len() + 1);
+        replacement.push(
+            metadata
+                .blocks
+                .first()
+                .ok_or_else(|| "FLAC metadata is empty".to_string())?
+                .clone(),
+        );
+        let mut inserted = false;
+        for block in metadata.blocks.iter().skip(1) {
+            match block.block_type {
+                BLOCK_VORBIS_COMMENT if !inserted => {
+                    replacement.push(replacement_comment.clone());
+                    inserted = true;
+                }
+                BLOCK_VORBIS_COMMENT | BLOCK_PADDING => {}
+                _ => replacement.push(block.clone()),
+            }
+        }
+        if !inserted {
+            replacement.insert(1, replacement_comment);
+        }
+        append_padding(&mut replacement, REWRITE_PADDING_BYTES)?;
+        stream_rewrite(path, metadata.audio_start, &replacement, None).map(|_| ())
     }
 
     #[cfg(test)]
@@ -6117,7 +6217,9 @@ fn canonical_editor_item_key(
     fallback: &lofty::tag::ItemKey,
 ) -> lofty::tag::ItemKey {
     match canonical_display_key {
+        "TRACKNUMBER" => lofty::tag::ItemKey::TrackNumber,
         "TRACKTOTAL" => lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+        "DISCNUMBER" => lofty::tag::ItemKey::DiscNumber,
         "DISCTOTAL" => lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
         "COMMENT" => lofty::tag::ItemKey::Comment,
         _ => fallback.clone(),
@@ -6155,8 +6257,14 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
     let mut fields = Vec::new();
     let mut indexes = HashMap::<String, usize>::new();
     for item in tag.items() {
-        let raw_display = item_key_display(item.key(), tag.tag_type());
-        let display_key = canonical_metadata_display_key(&raw_display);
+        let display_key = crate::metadata_persistence::canonical_numbering_display_key_for_tag_item(
+            item.key(),
+            tag.tag_type(),
+        )
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            canonical_metadata_display_key(&item_key_display(item.key(), tag.tag_type()))
+        });
         let (value, is_binary) = match item.value() {
             ItemValue::Text(value) => (value.clone(), false),
             ItemValue::Locator(value) => (value.clone(), false),
@@ -6179,6 +6287,32 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
             display_key,
             value,
             is_binary,
+            stored_value_count: 1,
+        });
+    }
+
+    // Structured carriers such as MP4 may expose `trkn`/`disk` only through
+    // Lofty's numeric accessors. Supplement absent editor rows without
+    // replacing an exact textual value already recovered from a tag item.
+    use lofty::tag::Accessor;
+    for (display_key, item_key, value) in [
+        ("TRACKNUMBER", lofty::tag::ItemKey::TrackNumber, tag.track()),
+        ("TRACKTOTAL", lofty::tag::ItemKey::TrackTotal, tag.track_total()),
+        ("DISCNUMBER", lofty::tag::ItemKey::DiscNumber, tag.disk()),
+        ("DISCTOTAL", lofty::tag::ItemKey::DiscTotal, tag.disk_total()),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        if indexes.contains_key(display_key) {
+            continue;
+        }
+        indexes.insert(display_key.to_string(), fields.len());
+        fields.push(CanonicalEditorTagField {
+            item_key,
+            display_key: display_key.to_string(),
+            value: value.to_string(),
+            is_binary: false,
             stored_value_count: 1,
         });
     }
@@ -7582,17 +7716,44 @@ fn write_all_tags_with_cancel_report(
 
     let route = crate::metadata_persistence::metadata_persistence_route_for_path(path);
     match route {
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => {
+            normalized_vorbis_lofty_changes(changes)?;
+            crate::metadata_persistence::validate_numbering_changes_for_backend(
+                crate::metadata_persistence::MetadataPersistenceBackend::NativeFlacVorbis,
+                changes,
+            )?;
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3 => {
+            crate::metadata_persistence::validate_numbering_changes_for_backend(
+                crate::metadata_persistence::MetadataPersistenceBackend::NativeDsfId3,
+                changes,
+            )?;
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty
+        | crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {}
+    }
+    match route {
         crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3 => {
             let dsf_changes = changes
                 .iter()
                 .map(|(key, value)| {
-                    let canonical_key = match key {
-                        lofty::tag::ItemKey::Unknown(value) => Some(value.as_str()),
-                        _ => key.map_key(lofty::tag::TagType::VorbisComments, true),
-                    }
-                    .ok_or_else(|| format!("cannot map {:?} to the DSF editor tag canon", key))?;
+                    let canonical_key =
+                        crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+                            crate::metadata_persistence::MetadataPersistenceBackend::NativeDsfId3,
+                            key,
+                        )
+                        .map(str::to_string)
+                        .or_else(|| match key {
+                            lofty::tag::ItemKey::Unknown(value) => Some(value.clone()),
+                            _ => key
+                                .map_key(lofty::tag::TagType::VorbisComments, true)
+                                .map(str::to_string),
+                        })
+                        .ok_or_else(|| {
+                            format!("cannot map {:?} to the DSF editor tag canon", key)
+                        })?;
                     Ok(crate::dsf_tags::DsfTagChange {
-                        canonical_key: canonical_metadata_display_key(canonical_key),
+                        canonical_key: canonical_metadata_display_key(&canonical_key),
                         value: value.clone(),
                     })
                 })
@@ -7681,7 +7842,7 @@ fn write_all_tags_without_full_file_backup(
         }
         crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {}
     }
-    write_all_tags_lofty_in_place(path, changes)
+    write_all_tags_lofty_in_place(path, changes).map(|_| ())
 }
 
 fn native_flac_write_refused_error(path: &std::path::Path, operation: &str, native_err: &str) -> String {
@@ -7725,9 +7886,12 @@ fn lofty_vorbis_comment_key(key: &lofty::tag::ItemKey) -> Option<String> {
 fn canonical_vorbis_alias_group<'a>(
     key: &'a str,
 ) -> (&'a str, &'static [&'static str]) {
+    if let Some((canonical, aliases)) =
+        crate::metadata_persistence::logical_numbering_alias_group(key)
+    {
+        return (canonical, aliases);
+    }
     match key {
-        "TRACKTOTAL" | "TOTALTRACKS" => ("TRACKTOTAL", &["TRACKTOTAL", "TOTALTRACKS"]),
-        "DISCTOTAL" | "TOTALDISCS" => ("DISCTOTAL", &["DISCTOTAL", "TOTALDISCS"]),
         "COMMENT" | "DESCRIPTION" => ("COMMENT", &["COMMENT", "DESCRIPTION"]),
         _ => (key, &[]),
     }
@@ -7788,9 +7952,10 @@ fn normalized_vorbis_lofty_changes(
 fn apply_vorbis_lofty_changes(
     tag: &mut lofty::tag::Tag,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     use lofty::tag::{ItemValue, TagItem};
 
+    let mut changed = false;
     for (canonical, insert_key, new_value, removal_keys) in
         normalized_vorbis_lofty_changes(changes)?
     {
@@ -7798,14 +7963,40 @@ fn apply_vorbis_lofty_changes(
         // Unknown aliases. Some Vorbis spellings map to typed ItemKey variants,
         // while others remain Unknown; canonicalizing each existing item before
         // collecting its key covers both.
+        let mut matching_count = 0usize;
+        let mut matching_text = None;
+        let mut matching_key_is_canonical = false;
         let parsed_alias_keys = tag
             .items()
             .filter_map(|item| {
                 let raw = lofty_vorbis_comment_key(item.key())?;
                 let (existing_canonical, _) = canonical_vorbis_alias_group(&raw);
-                (existing_canonical == canonical).then(|| item.key().clone())
+                if existing_canonical != canonical {
+                    return None;
+                }
+                matching_count += 1;
+                if matching_count == 1 {
+                    matching_text = match item.value() {
+                        ItemValue::Text(value) => Some(value.clone()),
+                        _ => None,
+                    };
+                    matching_key_is_canonical = raw.eq_ignore_ascii_case(&canonical);
+                }
+                Some(item.key().clone())
             })
             .collect::<Vec<_>>();
+        let already_satisfied = match new_value.as_deref() {
+            Some(expected) => {
+                matching_count == 1
+                    && matching_key_is_canonical
+                    && matching_text.as_deref() == Some(expected)
+            }
+            None => matching_count == 0,
+        };
+        if already_satisfied {
+            continue;
+        }
+        changed = true;
         for removal_key in parsed_alias_keys.iter().chain(removal_keys.iter()) {
             tag.remove_key(removal_key);
         }
@@ -7814,16 +8005,136 @@ fn apply_vorbis_lofty_changes(
             tag.insert_unchecked(TagItem::new(insert_key, ItemValue::Text(value)));
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
-fn write_all_tags_lofty_in_place(
+fn typed_numbering_accessor_value(
+    tag: &lofty::tag::Tag,
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    key: &lofty::tag::ItemKey,
+) -> Option<String> {
+    use lofty::tag::Accessor;
+
+    match crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+        backend, key,
+    )? {
+        "TRACKNUMBER" => tag.track().map(|value| value.to_string()),
+        "TRACKTOTAL" => tag.track_total().map(|value| value.to_string()),
+        "DISCNUMBER" => tag.disk().map(|value| value.to_string()),
+        "DISCTOTAL" => tag.disk_total().map(|value| value.to_string()),
+        _ => None,
+    }
+}
+
+fn typed_lofty_change_already_satisfied(
+    tag: &lofty::tag::Tag,
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    change: &crate::metadata_persistence::NormalizedTypedLoftyChange,
+) -> bool {
+    use lofty::tag::ItemValue;
+
+    if let Some(target) =
+        crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+            backend,
+            &change.persistence_key,
+        )
+    {
+        let matching_count = tag
+            .items()
+            .filter(|item| {
+                crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+                    backend,
+                    item.key(),
+                ) == Some(target)
+            })
+            .count();
+        if matching_count > 1 {
+            return false;
+        }
+        let current = typed_numbering_accessor_value(tag, backend, &change.persistence_key);
+        return match change.value.as_deref() {
+            Some(expected) => current.as_deref() == Some(expected),
+            None => current.is_none() && matching_count == 0,
+        };
+    }
+
+    let mut matching_count = 0usize;
+    let mut matching_text = None;
+    for item in tag.items() {
+        if !change
+            .removal_keys
+            .iter()
+            .any(|candidate| item.key() == candidate)
+        {
+            continue;
+        }
+        matching_count += 1;
+        if matching_count == 1 {
+            matching_text = match item.value() {
+                ItemValue::Text(value) => Some(value.clone()),
+                _ => None,
+            };
+        }
+    }
+    match change.value.as_deref() {
+        Some(expected) => matching_count == 1 && matching_text.as_deref() == Some(expected),
+        None => matching_count == 0,
+    }
+}
+
+fn apply_typed_lofty_changes(
+    tag: &mut lofty::tag::Tag,
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    normalized: Vec<crate::metadata_persistence::NormalizedTypedLoftyChange>,
+) -> bool {
+    use lofty::tag::{ItemValue, TagItem};
+
+    let mut changed = false;
+    for change in normalized {
+        if typed_lofty_change_already_satisfied(tag, backend, &change) {
+            continue;
+        }
+        changed = true;
+
+        let numbering_target =
+            crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+                backend,
+                &change.persistence_key,
+            );
+        let parsed_removal_keys = tag
+            .items()
+            .filter(|item| {
+                numbering_target.is_some_and(|target| {
+                    crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+                        backend,
+                        item.key(),
+                    ) == Some(target)
+                }) || change
+                    .removal_keys
+                    .iter()
+                    .any(|candidate| item.key() == candidate)
+            })
+            .map(|item| item.key().clone())
+            .collect::<Vec<_>>();
+        for removal_key in parsed_removal_keys.iter().chain(change.removal_keys.iter()) {
+            tag.remove_key(removal_key);
+        }
+        tag.remove_key(&change.persistence_key);
+        if let Some(value) = change.value {
+            tag.insert_unchecked(TagItem::new(
+                change.persistence_key,
+                ItemValue::Text(value),
+            ));
+        }
+    }
+    changed
+}
+
+fn prepare_all_tags_lofty(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
-) -> Result<(), String> {
-    use lofty::config::WriteOptions;
-    use lofty::file::{AudioFile, TaggedFileExt};
-    use lofty::tag::{ItemValue, TagItem};
+) -> Result<Option<lofty::file::TaggedFile>, String> {
+    use lofty::file::TaggedFileExt;
 
     let mut tagged = lofty::read_from_path(path)
         .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
@@ -7839,39 +8150,95 @@ fn write_all_tags_lofty_in_place(
     let backend = crate::metadata_persistence::metadata_backend_for_lofty_tag_type(
         tag.tag_type(),
     );
-    if backend
+    let normalized_typed_changes = matches!(
+        backend,
+        crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+            | crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe
+            | crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+    )
+    .then(|| crate::metadata_persistence::normalized_typed_lofty_changes(backend, changes))
+    .transpose()?;
+    crate::metadata_persistence::validate_numbering_changes_for_backend(backend, changes)?;
+    let changed = if backend
         == crate::metadata_persistence::MetadataPersistenceBackend::LoftyVorbisComments
     {
-        apply_vorbis_lofty_changes(tag, changes)?;
+        apply_vorbis_lofty_changes(tag, changes)?
+    } else if matches!(
+        backend,
+        crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+            | crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe
+            | crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+    ) {
+        apply_typed_lofty_changes(
+            tag,
+            backend,
+            normalized_typed_changes.unwrap_or_default(),
+        )
     } else {
+        use lofty::tag::{ItemValue, TagItem};
+
+        let mut changed = false;
         for (key, new_value) in changes {
-            let persistence_key =
-                crate::metadata_persistence::normalize_numbering_item_key_for_backend(
-                    backend, key,
-                );
-            // Remove both spellings. Core editor rows can originate as logical
-            // `Unknown` keys before a carrier stores the field, while older
-            // writes may already have created that free-form spelling. The
-            // backend-owned typed key is the only representation reinserted.
-            tag.remove_key(key);
-            if persistence_key != *key {
-                tag.remove_key(&persistence_key);
-            }
-            match new_value {
-                Some(value) if !value.trim().is_empty() => {
-                    tag.insert_unchecked(TagItem::new(
-                        persistence_key,
-                        ItemValue::Text(value.trim().to_string()),
-                    ));
+            let normalized_value = new_value
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let mut matching_count = 0usize;
+            let mut matching_text = None;
+            for item in tag.items() {
+                if item.key() != key {
+                    continue;
                 }
-                _ => {}
+                matching_count += 1;
+                if matching_count == 1 {
+                    matching_text = match item.value() {
+                        ItemValue::Text(value) => Some(value.clone()),
+                        _ => None,
+                    };
+                }
+            }
+            let already_satisfied = match normalized_value.as_deref() {
+                Some(expected) => {
+                    matching_count == 1 && matching_text.as_deref() == Some(expected)
+                }
+                None => matching_count == 0,
+            };
+            if already_satisfied {
+                continue;
+            }
+            changed = true;
+            tag.remove_key(key);
+            if let Some(value) = normalized_value {
+                tag.insert_unchecked(TagItem::new(key.clone(), ItemValue::Text(value)));
             }
         }
-    }
+        changed
+    };
+
+    Ok(changed.then_some(tagged))
+}
+
+fn save_prepared_lofty_tags(
+    path: &std::path::Path,
+    tagged: &lofty::file::TaggedFile,
+) -> Result<(), String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::AudioFile;
 
     tagged
         .save_to_path(path, WriteOptions::default())
         .map_err(|error| format!("failed to save '{}': {error}", path.display()))
+}
+
+fn write_all_tags_lofty_in_place(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<bool, String> {
+    let Some(tagged) = prepare_all_tags_lofty(path, changes)? else {
+        return Ok(false);
+    };
+    save_prepared_lofty_tags(path, &tagged)?;
+    Ok(true)
 }
 
 fn write_all_tags_lofty_with_backup(
@@ -7883,14 +8250,26 @@ fn write_all_tags_lofty_with_backup(
     // receive native metadata-region writers. FLACs must not silently enter
     // this path: a native FLAC refusal is returned to the caller as an
     // explicit, user-visible error instead of creating a full-file backup.
+    // Resolve and apply the complete change set in memory before entering the
+    // fallback transaction. A semantically satisfied request therefore
+    // performs no carrier write, invokes no fallback hook, and creates no
+    // transient or residual backup artifact.
+    if prepare_all_tags_lofty(path, changes)?.is_none() {
+        return Ok(None);
+    }
+
     #[cfg(test)]
     run_test_lofty_fallback_hook(path);
+
     let backup = crate::db::Database::backup_path_for(path);
     crate::db::Database::create_backup_for(path, &backup)
         .map_err(|error| format!("backup failed for '{}': {error}", path.display()))?;
 
+    // Re-read after the rollback copy is armed. The initial preparation is a
+    // no-op preflight only; never serialize a stale in-memory view if another
+    // actor changed the carrier before the transaction began.
     match write_all_tags_lofty_in_place(path, changes) {
-        Ok(()) => match std::fs::remove_file(&backup) {
+        Ok(_) => match std::fs::remove_file(&backup) {
             Ok(()) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
                 "metadata write for '{}' committed, but full-file rollback marker '{}' was already absent during cleanup",
@@ -8582,6 +8961,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/metadata_persistence/vorbis.ogg"
     ));
+    const NATIVE_FLAC_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/silence.flac"
+    ));
     const ID3V2_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/metadata_persistence/id3v2.mp3"
@@ -8617,6 +9000,38 @@ mod tests {
             .unwrap_or_else(|| panic!("missing {display_key} after persistence round trip"))
     }
 
+    fn assert_lofty_repetition_skips_transaction(
+        path: &std::path::Path,
+        changes: &[(lofty::tag::ItemKey, Option<String>)],
+        context: &str,
+    ) {
+        let first_commit = std::fs::read(path).expect("snapshot first accepted Lofty write");
+        let fallback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_hook = std::sync::Arc::clone(&fallback_calls);
+        with_lofty_fallback_hook(
+            path.parent().expect("Lofty fixture parent"),
+            move |_| {
+                calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            || write_all_tags(path, changes),
+        )
+        .unwrap_or_else(|error| panic!("repeat already-satisfied {context}: {error}"));
+        assert_eq!(
+            fallback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "repeating {context} must not enter the full-file fallback transaction"
+        );
+        assert_eq!(
+            std::fs::read(path).expect("read repeated accepted Lofty write"),
+            first_commit,
+            "repeating {context} must be byte-identical"
+        );
+        assert!(
+            !crate::db::Database::backup_path_for(path).exists(),
+            "repeating {context} must not create a rollback marker"
+        );
+    }
+
     fn assert_textual_numbering_backend_round_trip(
         file_name: &str,
         fixture: &[u8],
@@ -8633,15 +9048,19 @@ mod tests {
         );
 
         for expected in ["A01", "7", "01/17"] {
-            write_all_tags(
-                &path,
-                &[(
-                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
-                    Some(expected.to_string()),
-                )],
-            )
-            .expect("persist numbering value through production writer");
+            let change = [(
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some(expected.to_string()),
+            )];
+            write_all_tags(&path, &change)
+                .expect("persist numbering value through production writer");
             assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), expected);
+
+            assert_lofty_repetition_skips_transaction(
+                &path,
+                &change,
+                &format!("{expected_backend:?} TRACKNUMBER={expected:?}"),
+            );
 
             let tagged = lofty::read_from_path(&path).expect("reopen persisted carrier");
             let tag = tagged.primary_tag().expect("primary tag after write");
@@ -8661,6 +9080,437 @@ mod tests {
         }
     }
 
+    fn editor_value(path: &std::path::Path, display_key: &str) -> Option<String> {
+        let merged = read_all_tags_merged_with_metadata(&[path.to_path_buf()])
+            .expect("reopen metadata through production editor reader");
+        merged
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == display_key)
+            .and_then(|entry| entry.per_file_values.first())
+            .cloned()
+    }
+
+    fn seed_lofty_vorbis_comments(
+        path: &std::path::Path,
+        comments: &[(&str, &str)],
+    ) {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+        let mut tagged = lofty::read_from_path(path).expect("read Vorbis fixture for raw seeding");
+        if tagged.primary_tag().is_none() {
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+        }
+        let tag = tagged.primary_tag_mut().expect("Vorbis primary tag");
+        for (name, value) in comments {
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::Unknown((*name).to_string()),
+                ItemValue::Text((*value).to_string()),
+            ));
+        }
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .expect("save raw Vorbis alias fixture");
+    }
+
+    fn lofty_vorbis_physical_values(
+        path: &std::path::Path,
+        expected_key: &str,
+    ) -> Vec<String> {
+        use lofty::tag::ItemValue;
+
+        let tagged = lofty::read_from_path(path).expect("reopen Vorbis carrier");
+        let tag = tagged.primary_tag().expect("Vorbis primary tag after write");
+        tag.items()
+            .filter_map(|item| {
+                let key = lofty_vorbis_comment_key(item.key())?;
+                if !key.eq_ignore_ascii_case(expected_key) {
+                    return None;
+                }
+                match item.value() {
+                    ItemValue::Text(value) | ItemValue::Locator(value) => Some(value.clone()),
+                    ItemValue::Binary(_) => None,
+                }
+            })
+            .collect()
+    }
+
+    fn file_contains_ascii_case_insensitive(
+        path: &std::path::Path,
+        needle: &str,
+    ) -> bool {
+        let bytes = std::fs::read(path).expect("read real carrier for physical-field assertion");
+        let needle = needle.as_bytes();
+        if needle.is_empty() {
+            return true;
+        }
+        bytes.windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        })
+    }
+
+    fn assert_lofty_custom_text_item(
+        path: &std::path::Path,
+        expected_key: &str,
+        expected_value: &str,
+    ) {
+        use lofty::tag::ItemValue;
+
+        let tagged = lofty::read_from_path(path).expect("reopen carrier with custom field");
+        let tag = tagged.primary_tag().expect("primary tag with custom field");
+        let item = tag
+            .items()
+            .find(|item| matches!(
+                item.key(),
+                lofty::tag::ItemKey::Unknown(name)
+                    if name.eq_ignore_ascii_case(expected_key)
+            ))
+            .unwrap_or_else(|| panic!("missing independent custom field {expected_key:?}"));
+        match item.value() {
+            ItemValue::Text(value) | ItemValue::Locator(value) => {
+                assert_eq!(value, expected_value);
+            }
+            ItemValue::Binary(_) => panic!("custom field {expected_key:?} became binary"),
+        }
+    }
+
+    fn assert_typed_numbering_conflicts_fail_closed(
+        file_name: &str,
+        fixture: &[u8],
+        expected_backend: crate::metadata_persistence::MetadataPersistenceBackend,
+        native_track_alias: &str,
+        native_disc_alias: &str,
+    ) {
+        let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+        let capability =
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path)
+                .expect("classify typed numbering fixture");
+        assert_eq!(capability.backend, expected_backend);
+
+        let mut conflict_errors = Vec::new();
+        for changes in [
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
+                    Some("8".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
+                    Some("8".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(native_disc_alias.to_string()),
+                    Some("3".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown(native_disc_alias.to_string()),
+                    Some("3".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
+                    None,
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
+                    None,
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(native_disc_alias.to_string()),
+                    None,
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown(native_disc_alias.to_string()),
+                    None,
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("17".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TOTALTRACKS".to_string()),
+                    None,
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("TOTALTRACKS".to_string()),
+                    None,
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("17".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("A01".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
+                    Some("B01".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
+                    Some("B01".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("A01".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                    Some("3".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TOTALDISCS".to_string()),
+                    None,
+                ),
+            ],
+            vec![
+                (
+                    lofty::tag::ItemKey::Unknown("TOTALDISCS".to_string()),
+                    None,
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                    Some("3".to_string()),
+                ),
+            ],
+        ] {
+            let before = std::fs::read(&path).expect("snapshot before conflicting aliases");
+            let error = write_all_tags(&path, &changes)
+                .expect_err("conflicting aliases must fail before carrier mutation");
+            assert!(
+                error.contains("conflicting metadata changes"),
+                "unexpected alias-conflict error for {expected_backend:?}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read carrier after alias conflict"),
+                before,
+                "{expected_backend:?} alias conflict mutated the carrier"
+            );
+            assert!(
+                !crate::db::Database::backup_path_for(&path).exists(),
+                "{expected_backend:?} alias conflict allocated a rollback backup"
+            );
+            conflict_errors.push(error);
+        }
+        for pair in conflict_errors.chunks_exact(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "{expected_backend:?} alias-conflict reporting must not depend on input order"
+            );
+        }
+
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(native_disc_alias.to_string()),
+                    Some("2".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("17".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TOTALTRACKS".to_string()),
+                    Some("17".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                    Some("3".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TOTALDISCS".to_string()),
+                    Some("3".to_string()),
+                ),
+            ],
+        )
+        .expect("identical aliases must coalesce deterministically");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        assert_eq!(editor_numbering_value(&path, "TRACKTOTAL"), "17");
+        assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "2");
+        assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "3");
+    }
+
+    fn assert_plain_unsigned_numbering_backend_round_trip(
+        file_name: &str,
+        fixture: &[u8],
+        expected_backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    ) {
+        use lofty::tag::Accessor;
+
+        let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+        let capability =
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path)
+                .expect("classify real metadata fixture");
+        assert_eq!(capability.backend, expected_backend);
+        assert_eq!(
+            capability.capabilities,
+            crate::metadata_persistence::MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY
+        );
+
+        let accepted = vec![
+            (
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some("7".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                Some("17".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                Some("2".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                Some("3".to_string()),
+            ),
+        ];
+        write_all_tags(&path, &accepted)
+            .expect("persist all plain unsigned numbering fields through production writer");
+
+        assert_lofty_repetition_skips_transaction(
+            &path,
+            &accepted,
+            &format!("accepted {expected_backend:?} numbering write"),
+        );
+
+        let tagged = lofty::read_from_path(&path).expect("reopen persisted carrier");
+        let tag = tagged.primary_tag().expect("primary tag after write");
+        assert_eq!(tag.track(), Some(7));
+        assert_eq!(tag.track_total(), Some(17));
+        assert_eq!(tag.disk(), Some(2));
+        assert_eq!(tag.disk_total(), Some(3));
+        for (display_key, expected) in [
+            ("TRACKNUMBER", "7"),
+            ("TRACKTOTAL", "17"),
+            ("DISCNUMBER", "2"),
+            ("DISCTOTAL", "3"),
+        ] {
+            assert_eq!(editor_numbering_value(&path, display_key), expected);
+        }
+        assert!(
+            !tag.items().any(|item| {
+                matches!(item.key(), lofty::tag::ItemKey::Unknown(_))
+                    && crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+                        expected_backend,
+                        item.key(),
+                    )
+                    .is_some()
+            }),
+            "{expected_backend:?} must not retain logical or backend-native numbering aliases as free-form fields"
+        );
+
+        for (display_key, stable_value) in [
+            ("TRACKNUMBER", "7"),
+            ("TRACKTOTAL", "17"),
+            ("DISCNUMBER", "2"),
+            ("DISCTOTAL", "3"),
+        ] {
+            for unsupported in ["A01", "01", "7/17", "01/17"] {
+                let before =
+                    std::fs::read(&path).expect("snapshot before rejected numbering write");
+                let error = write_all_tags(
+                    &path,
+                    &[(
+                        lofty::tag::ItemKey::Unknown(display_key.to_string()),
+                        Some(unsupported.to_string()),
+                    )],
+                )
+                .expect_err("unsupported numbering representation must fail closed");
+                assert!(
+                    error.contains(display_key) && error.contains("unsigned"),
+                    "unexpected {expected_backend:?} rejection for {display_key}={unsupported:?}: {error}"
+                );
+                assert_eq!(
+                    std::fs::read(&path)
+                        .expect("read carrier after rejected numbering write"),
+                    before,
+                    "rejected {expected_backend:?} {display_key} value {unsupported:?} mutated the carrier"
+                );
+                assert!(
+                    !crate::db::Database::backup_path_for(&path).exists(),
+                    "rejected {expected_backend:?} numbering must not allocate a rollback backup"
+                );
+                assert_eq!(editor_numbering_value(&path, display_key), stable_value);
+            }
+        }
+    }
+
     #[test]
     fn lofty_vorbis_numbering_capability_matches_production_round_trip() {
         assert_textual_numbering_backend_round_trip(
@@ -8671,8 +9521,400 @@ mod tests {
     }
 
     #[test]
+    fn native_flac_numbering_repetition_is_byte_identical() {
+        let temp = tempfile::tempdir().expect("native FLAC numbering tempdir");
+        let path = temp.path().join("numbering.flac");
+        let blocks = vec![
+            (0, vec![0u8; 34]),
+            (
+                4,
+                vorbis_block_body(
+                    "tonepoet-test",
+                    &[("TRACKNUMBER", "7"), ("ARTIST", "No-op sentinel")],
+                ),
+            ),
+            (1, vec![0u8; 4096]),
+        ];
+        write_synthetic_flac_with_blocks(&path, &blocks, 16 * 1024);
+        let capability =
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path)
+                .expect("classify native FLAC fixture");
+        assert_eq!(
+            capability.backend,
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeFlacVorbis
+        );
+        assert_eq!(
+            capability.capabilities,
+            crate::metadata_persistence::MetadataNumberingCapabilities::TEXTUAL
+        );
+
+        let already_satisfied = [(
+            lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+            Some("7".to_string()),
+        )];
+        let initial = std::fs::read(&path).expect("snapshot satisfied native FLAC fixture");
+        write_all_tags(&path, &already_satisfied)
+            .expect("submit already-satisfied native FLAC numbering");
+        assert_eq!(
+            std::fs::read(&path).expect("read satisfied native FLAC fixture"),
+            initial,
+            "an already-satisfied native FLAC field must not be reordered or rewritten"
+        );
+
+        let changed = [(
+            lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+            Some("8".to_string()),
+        )];
+        write_all_tags(&path, &changed).expect("persist changed native FLAC numbering");
+        let first_commit = std::fs::read(&path).expect("snapshot native FLAC write");
+        write_all_tags(&path, &changed).expect("repeat native FLAC numbering");
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated native FLAC write"),
+            first_commit,
+            "repeating accepted native FLAC numbering must be byte-identical"
+        );
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(!flac_metadata_writer::test_journal_path(&path).exists());
+        assert!(!flac_metadata_writer::test_write_lock_path(&path).exists());
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "8");
+    }
+
+    #[test]
+    fn native_flac_disk_aliases_canonicalize_conflict_close_and_repeat_as_noop() {
+        let (_temp, path) =
+            copy_numbering_fixture("disk-aliases.flac", NATIVE_FLAC_NUMBERING_FIXTURE);
+        flac_metadata_writer::test_replace_vorbis_comments(
+            &path,
+            &[
+                ("DISKNUMBER", "2"),
+                ("DISKTOTAL", "3"),
+                ("TOTALDISCS", "3"),
+                ("DISK-NUMBER", "independent-custom-value"),
+                ("ARTIST", "Alias fixture sentinel"),
+            ],
+        )
+        .expect("seed exact legacy DISK aliases on a real FLAC carrier");
+
+        assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "2");
+        assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "3");
+        assert_eq!(
+            editor_value(&path, "DISK-NUMBER").as_deref(),
+            Some("independent-custom-value")
+        );
+
+        for (canonical, legacy) in [
+            ("DISCNUMBER", "DISKNUMBER"),
+            ("DISCTOTAL", "DISKTOTAL"),
+            ("DISCTOTAL", "TOTALDISCS"),
+        ] {
+            let conflicting = [
+                (
+                    lofty::tag::ItemKey::Unknown(canonical.to_string()),
+                    Some("8".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(legacy.to_string()),
+                    Some("9".to_string()),
+                ),
+            ];
+            let before_conflict =
+                std::fs::read(&path).expect("snapshot FLAC before alias conflict");
+            let error = write_all_tags(&path, &conflicting)
+                .expect_err("conflicting FLAC disc aliases must fail closed");
+            assert!(error.contains("conflicting metadata changes"));
+            assert_eq!(
+                std::fs::read(&path).expect("read FLAC after rejected alias conflict"),
+                before_conflict,
+                "FLAC conflict {canonical}/{legacy} mutated the carrier"
+            );
+            assert!(!crate::db::Database::backup_path_for(&path).exists());
+            assert!(!flac_metadata_writer::test_journal_path(&path).exists());
+            assert!(!flac_metadata_writer::test_write_lock_path(&path).exists());
+        }
+
+        let accepted = [
+            (
+                lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                Some("3".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                Some("4".to_string()),
+            ),
+        ];
+        write_all_tags(&path, &accepted).expect("replace legacy FLAC DISK aliases");
+        assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "3");
+        assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "4");
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&path, "DISCNUMBER")
+                .expect("read canonical FLAC disc number"),
+            vec!["3".to_string()]
+        );
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&path, "DISCTOTAL")
+                .expect("read canonical FLAC disc total"),
+            vec!["4".to_string()]
+        );
+        for removed in ["DISKNUMBER", "DISKTOTAL", "TOTALDISCS"] {
+            assert!(
+                flac_metadata_writer::test_vorbis_field_values(&path, removed)
+                    .expect("inspect removed FLAC alias")
+                    .is_empty(),
+                "legacy FLAC alias {removed} survived canonical replacement"
+            );
+        }
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&path, "DISK-NUMBER")
+                .expect("read punctuation-bearing FLAC custom field"),
+            vec!["independent-custom-value".to_string()]
+        );
+
+        let first_commit = std::fs::read(&path).expect("snapshot accepted FLAC alias edit");
+        write_all_tags(&path, &accepted).expect("repeat accepted FLAC alias edit");
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated FLAC alias edit"),
+            first_commit,
+            "repeating the accepted FLAC alias edit must be byte-identical"
+        );
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(!flac_metadata_writer::test_journal_path(&path).exists());
+        assert!(!flac_metadata_writer::test_write_lock_path(&path).exists());
+
+        let deletion = [
+            (
+                lofty::tag::ItemKey::Unknown("DISKNUMBER".to_string()),
+                None,
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISKTOTAL".to_string()),
+                None,
+            ),
+        ];
+        write_all_tags(&path, &deletion).expect("delete FLAC disc aliases as one logical pair");
+        for removed in [
+            "DISCNUMBER",
+            "DISKNUMBER",
+            "DISCTOTAL",
+            "DISKTOTAL",
+            "TOTALDISCS",
+        ] {
+            assert!(
+                flac_metadata_writer::test_vorbis_field_values(&path, removed)
+                    .expect("inspect deleted FLAC alias group")
+                    .is_empty(),
+                "FLAC alias {removed} survived logical deletion"
+            );
+        }
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&path, "DISK-NUMBER")
+                .expect("read FLAC custom field after deletion"),
+            vec!["independent-custom-value".to_string()]
+        );
+        let deletion_commit = std::fs::read(&path).expect("snapshot FLAC alias deletion");
+        write_all_tags(&path, &deletion).expect("repeat FLAC alias deletion");
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated FLAC alias deletion"),
+            deletion_commit,
+            "repeating FLAC alias deletion must be byte-identical"
+        );
+        assert!(!flac_metadata_writer::test_journal_path(&path).exists());
+        assert!(!flac_metadata_writer::test_write_lock_path(&path).exists());
+    }
+
+    #[test]
+    fn lofty_vorbis_disk_aliases_canonicalize_conflict_close_and_repeat_as_noop() {
+        let (_temp, path) = copy_numbering_fixture("disk-aliases.ogg", VORBIS_NUMBERING_FIXTURE);
+        seed_lofty_vorbis_comments(
+            &path,
+            &[
+                ("DISKNUMBER", "2"),
+                ("DISKTOTAL", "3"),
+                ("TOTALDISCS", "3"),
+                ("DISK-NUMBER", "independent-custom-value"),
+            ],
+        );
+        for seeded in [
+            "DISKNUMBER=2",
+            "DISKTOTAL=3",
+            "TOTALDISCS=3",
+            "DISK-NUMBER=independent-custom-value",
+        ] {
+            assert!(
+                file_contains_ascii_case_insensitive(&path, seeded),
+                "real Ogg fixture did not contain seeded physical comment {seeded:?}"
+            );
+        }
+
+        assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "2");
+        assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "3");
+        assert_eq!(
+            editor_value(&path, "DISK-NUMBER").as_deref(),
+            Some("independent-custom-value")
+        );
+
+        for (canonical, legacy) in [
+            ("DISCNUMBER", "DISKNUMBER"),
+            ("DISCTOTAL", "DISKTOTAL"),
+            ("DISCTOTAL", "TOTALDISCS"),
+        ] {
+            let conflicting = [
+                (
+                    lofty::tag::ItemKey::Unknown(canonical.to_string()),
+                    Some("8".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown(legacy.to_string()),
+                    Some("9".to_string()),
+                ),
+            ];
+            let before_conflict =
+                std::fs::read(&path).expect("snapshot Ogg before alias conflict");
+            let error = write_all_tags(&path, &conflicting)
+                .expect_err("conflicting Vorbis disc aliases must fail closed");
+            assert!(error.contains("conflicting metadata changes"));
+            assert_eq!(
+                std::fs::read(&path).expect("read Ogg after rejected alias conflict"),
+                before_conflict,
+                "Ogg conflict {canonical}/{legacy} mutated the carrier"
+            );
+            assert!(!crate::db::Database::backup_path_for(&path).exists());
+        }
+
+        let accepted = [
+            (
+                lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                Some("3".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                Some("4".to_string()),
+            ),
+        ];
+        write_all_tags(&path, &accepted).expect("replace legacy Ogg Vorbis DISK aliases");
+        assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "3");
+        assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "4");
+        assert_eq!(
+            lofty_vorbis_physical_values(&path, "DISCNUMBER"),
+            vec!["3".to_string()]
+        );
+        assert_eq!(
+            lofty_vorbis_physical_values(&path, "DISCTOTAL"),
+            vec!["4".to_string()]
+        );
+        for removed in ["DISKNUMBER", "DISKTOTAL", "TOTALDISCS"] {
+            assert!(
+                lofty_vorbis_physical_values(&path, removed).is_empty(),
+                "legacy Ogg Vorbis alias {removed} survived canonical replacement"
+            );
+        }
+        assert_eq!(
+            lofty_vorbis_physical_values(&path, "DISK-NUMBER"),
+            vec!["independent-custom-value".to_string()]
+        );
+        for canonical in ["DISCNUMBER=3", "DISCTOTAL=4"] {
+            assert!(
+                file_contains_ascii_case_insensitive(&path, canonical),
+                "canonical physical Ogg comment {canonical:?} was not written"
+            );
+        }
+        for removed in ["DISKNUMBER=", "DISKTOTAL=", "TOTALDISCS="] {
+            assert!(
+                !file_contains_ascii_case_insensitive(&path, removed),
+                "legacy physical Ogg alias {removed:?} survived canonical replacement"
+            );
+        }
+        assert!(file_contains_ascii_case_insensitive(
+            &path,
+            "DISK-NUMBER=independent-custom-value"
+        ));
+        assert_lofty_repetition_skips_transaction(
+            &path,
+            &accepted,
+            "accepted Ogg Vorbis DISK-alias edit",
+        );
+
+        let deletion = [
+            (
+                lofty::tag::ItemKey::Unknown("DISKNUMBER".to_string()),
+                None,
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISKTOTAL".to_string()),
+                None,
+            ),
+        ];
+        write_all_tags(&path, &deletion).expect("delete Ogg Vorbis disc aliases");
+        for removed in [
+            "DISCNUMBER",
+            "DISKNUMBER",
+            "DISCTOTAL",
+            "DISKTOTAL",
+            "TOTALDISCS",
+        ] {
+            assert!(
+                lofty_vorbis_physical_values(&path, removed).is_empty(),
+                "Ogg Vorbis alias {removed} survived logical deletion"
+            );
+        }
+        assert_eq!(
+            lofty_vorbis_physical_values(&path, "DISK-NUMBER"),
+            vec!["independent-custom-value".to_string()]
+        );
+        assert!(file_contains_ascii_case_insensitive(
+            &path,
+            "DISK-NUMBER=independent-custom-value"
+        ));
+        assert_lofty_repetition_skips_transaction(
+            &path,
+            &deletion,
+            "accepted Ogg Vorbis DISK-alias deletion",
+        );
+    }
+
+    #[test]
+    fn dsf_disk_aliases_surface_as_canonical_editor_rows() {
+        use id3::frame::ExtendedText;
+        use id3::TagLike as _;
+
+        let temp = tempfile::tempdir().expect("DSF editor alias tempdir");
+        let path = temp.path().join("disk-aliases.dsf");
+        let mut tag = id3::Tag::new();
+        tag.add_frame(ExtendedText {
+            description: "DISKNUMBER".to_string(),
+            value: "2".to_string(),
+        });
+        tag.add_frame(ExtendedText {
+            description: "DISKTOTAL".to_string(),
+            value: "3".to_string(),
+        });
+        tag.add_frame(ExtendedText {
+            description: "TOTALDISCS".to_string(),
+            value: "3".to_string(),
+        });
+        tag.add_frame(ExtendedText {
+            description: "DISK-NUMBER".to_string(),
+            value: "independent-custom-value".to_string(),
+        });
+        let mut metadata = Vec::new();
+        tag.write_to(&mut metadata, id3::Version::Id3v24)
+            .expect("serialize DSF editor alias fixture");
+        crate::dsf_tags::write_test_dsf_fixture(&path, Some(&metadata))
+            .expect("write DSF editor alias fixture");
+
+        assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "2");
+        assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "3");
+        assert_eq!(
+            editor_value(&path, "DISK-NUMBER").as_deref(),
+            Some("independent-custom-value")
+        );
+        assert_eq!(editor_value(&path, "DISKNUMBER"), None);
+        assert_eq!(editor_value(&path, "DISKTOTAL"), None);
+        assert_eq!(editor_value(&path, "TOTALDISCS"), None);
+    }
+
+    #[test]
     fn id3v2_numbering_capability_matches_production_round_trip() {
-        assert_textual_numbering_backend_round_trip(
+        assert_plain_unsigned_numbering_backend_round_trip(
             "numbering.mp3",
             ID3V2_NUMBERING_FIXTURE,
             crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2,
@@ -8681,10 +9923,213 @@ mod tests {
 
     #[test]
     fn ape_numbering_capability_matches_production_round_trip() {
-        assert_textual_numbering_backend_round_trip(
+        assert_plain_unsigned_numbering_backend_round_trip(
             "numbering.wv",
             APE_NUMBERING_FIXTURE,
             crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe,
+        );
+    }
+
+    #[test]
+    fn id3_punctuation_custom_fields_remain_independent_on_real_carrier() {
+        let (_temp, path) = copy_numbering_fixture("custom.mp3", ID3V2_NUMBERING_FIXTURE);
+        let custom_changes = [
+            (
+                lofty::tag::ItemKey::Unknown("T-R-C-K".to_string()),
+                Some("custom-id3-native-like".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("TRACK-NUMBER".to_string()),
+                Some("custom-id3-logical-like".to_string()),
+            ),
+        ];
+        write_all_tags(&path, &custom_changes)
+            .expect("persist punctuation-bearing ID3 custom fields through production writer");
+
+        for (display_key, value) in [
+            ("T-R-C-K", "custom-id3-native-like"),
+            ("TRACK-NUMBER", "custom-id3-logical-like"),
+        ] {
+            assert_eq!(editor_value(&path, display_key).as_deref(), Some(value));
+        }
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some("7".to_string()),
+            )],
+        )
+        .expect("write ID3 numbering beside punctuation-bearing custom fields");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        for (display_key, value) in [
+            ("T-R-C-K", "custom-id3-native-like"),
+            ("TRACK-NUMBER", "custom-id3-logical-like"),
+        ] {
+            assert_eq!(editor_value(&path, display_key).as_deref(), Some(value));
+            assert_lofty_custom_text_item(&path, display_key, value);
+        }
+    }
+
+    #[test]
+    fn ape_punctuation_custom_fields_remain_independent_on_real_carrier() {
+        let (_temp, path) = copy_numbering_fixture("custom.wv", APE_NUMBERING_FIXTURE);
+        let custom_changes = [
+            (
+                lofty::tag::ItemKey::Unknown("T-R-A-C-K".to_string()),
+                Some("custom-ape-native-like".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("TRACK-NUMBER".to_string()),
+                Some("custom-ape-logical-like".to_string()),
+            ),
+        ];
+        write_all_tags(&path, &custom_changes)
+            .expect("seed punctuation-bearing APE fields");
+
+        for (display_key, value) in [
+            ("T-R-A-C-K", "custom-ape-native-like"),
+            ("TRACK-NUMBER", "custom-ape-logical-like"),
+        ] {
+            assert_eq!(editor_value(&path, display_key).as_deref(), Some(value));
+        }
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some("7".to_string()),
+            )],
+        )
+        .expect("write APE numbering beside punctuation-bearing custom fields");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        for (display_key, value) in [
+            ("T-R-A-C-K", "custom-ape-native-like"),
+            ("TRACK-NUMBER", "custom-ape-logical-like"),
+        ] {
+            assert_eq!(editor_value(&path, display_key).as_deref(), Some(value));
+            assert_lofty_custom_text_item(&path, display_key, value);
+        }
+    }
+
+    #[test]
+    fn mp4_punctuation_custom_fields_remain_independent_on_real_carrier() {
+        const NATIVE_LIKE_KEY: &str = "----:com.tonepoet:T-R-K-N";
+        const LOGICAL_LIKE_KEY: &str = "----:com.tonepoet:TRACK-NUMBER";
+
+        let (_temp, path) = copy_numbering_fixture("custom.m4a", MP4_NUMBERING_FIXTURE);
+        let custom_changes = [
+            (
+                lofty::tag::ItemKey::Unknown(NATIVE_LIKE_KEY.to_string()),
+                Some("custom-mp4-native-like".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown(LOGICAL_LIKE_KEY.to_string()),
+                Some("custom-mp4-logical-like".to_string()),
+            ),
+        ];
+        write_all_tags(&path, &custom_changes)
+            .expect("seed punctuation-bearing MP4 freeform fields");
+
+        for (key, value) in [
+            (NATIVE_LIKE_KEY, "custom-mp4-native-like"),
+            (LOGICAL_LIKE_KEY, "custom-mp4-logical-like"),
+        ] {
+            assert_eq!(
+                editor_value(&path, &key.to_ascii_uppercase()).as_deref(),
+                Some(value)
+            );
+        }
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some("7".to_string()),
+            )],
+        )
+        .expect("write MP4 numbering beside punctuation-bearing custom fields");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        for (key, value) in [
+            (NATIVE_LIKE_KEY, "custom-mp4-native-like"),
+            (LOGICAL_LIKE_KEY, "custom-mp4-logical-like"),
+        ] {
+            assert_eq!(
+                editor_value(&path, &key.to_ascii_uppercase()).as_deref(),
+                Some(value)
+            );
+            assert_lofty_custom_text_item(&path, key, value);
+        }
+    }
+
+    #[test]
+    fn lofty_noop_preflight_never_serializes_a_stale_carrier_snapshot() {
+        let (temp, path) = copy_numbering_fixture("preflight-race.mp3", ID3V2_NUMBERING_FIXTURE);
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::TrackTitle,
+                Some("before hook".to_string()),
+            )],
+        )
+        .expect("seed preflight race fixture");
+
+        with_lofty_fallback_hook(
+            temp.path(),
+            |hook_path| {
+                write_all_tags_without_full_file_backup(
+                    hook_path,
+                    &[(
+                        lofty::tag::ItemKey::TrackTitle,
+                        Some("hook update".to_string()),
+                    )],
+                )
+                .expect("apply concurrent hook update without recursive fallback");
+            },
+            || {
+                write_all_tags(
+                    &path,
+                    &[(
+                        lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                        Some("7".to_string()),
+                    )],
+                )
+            },
+        )
+        .expect("persist numbering after fallback hook update");
+
+        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some("hook update"));
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+    }
+
+    #[test]
+    fn id3_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        assert_typed_numbering_conflicts_fail_closed(
+            "aliases.mp3",
+            ID3V2_NUMBERING_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2,
+            "TRCK",
+            "TPOS",
+        );
+    }
+
+    #[test]
+    fn ape_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        assert_typed_numbering_conflicts_fail_closed(
+            "aliases.wv",
+            APE_NUMBERING_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe,
+            "Track",
+            "Disc",
+        );
+    }
+
+    #[test]
+    fn mp4_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        assert_typed_numbering_conflicts_fail_closed(
+            "aliases.m4a",
+            MP4_NUMBERING_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst,
+            "trkn",
+            "disk",
         );
     }
 
@@ -8705,28 +10150,31 @@ mod tests {
             crate::metadata_persistence::MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY
         );
 
-        write_all_tags(
+        let accepted = [
+            (
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some("7".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                Some("17".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                Some("2".to_string()),
+            ),
+            (
+                lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                Some("3".to_string()),
+            ),
+        ];
+        write_all_tags(&path, &accepted)
+            .expect("persist MP4 numbering pairs through production writer");
+        assert_lofty_repetition_skips_transaction(
             &path,
-            &[
-                (
-                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
-                    Some("7".to_string()),
-                ),
-                (
-                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
-                    Some("17".to_string()),
-                ),
-                (
-                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
-                    Some("2".to_string()),
-                ),
-                (
-                    lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
-                    Some("3".to_string()),
-                ),
-            ],
-        )
-        .expect("persist MP4 numbering pairs through production writer");
+            &accepted,
+            "accepted MP4 numbering pairs",
+        );
 
         let tagged = lofty::read_from_path(&path).expect("reopen persisted MP4");
         let tag = tagged.primary_tag().expect("MP4 primary ilst tag");
@@ -8756,6 +10204,28 @@ mod tests {
         assert_eq!(editor_numbering_value(&path, "TRACKTOTAL"), "17");
         assert_eq!(editor_numbering_value(&path, "DISCNUMBER"), "2");
         assert_eq!(editor_numbering_value(&path, "DISCTOTAL"), "3");
+
+        for unsupported in ["A01", "01", "7/17", "01/17"] {
+            let before = std::fs::read(&path).expect("snapshot MP4 before rejected write");
+            let error = write_all_tags(
+                &path,
+                &[(
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some(unsupported.to_string()),
+                )],
+            )
+            .expect_err("MP4 must reject non-plain numbering");
+            assert!(error.contains("TRACKNUMBER") && error.contains("unsigned"));
+            assert_eq!(
+                std::fs::read(&path).expect("read MP4 after rejected write"),
+                before,
+                "rejected MP4 numbering value {unsupported:?} mutated the carrier"
+            );
+            assert!(
+                !crate::db::Database::backup_path_for(&path).exists(),
+                "rejected MP4 numbering must not allocate a rollback backup"
+            );
+        }
     }
 
     #[test]
@@ -8802,6 +10272,42 @@ mod tests {
         assert_eq!(snapshot.first("TRACKTOTAL"), Some("17"));
         assert_eq!(snapshot.first("DISCNUMBER"), Some("2"));
         assert_eq!(snapshot.first("DISCTOTAL"), Some("3"));
+
+        let first_commit = std::fs::read(&path).expect("snapshot first DSF numbering write");
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("17".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                    Some("2".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("DISCTOTAL".to_string()),
+                    Some("3".to_string()),
+                ),
+            ],
+        )
+        .expect("repeat already-satisfied DSF numbering values");
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated DSF numbering write"),
+            first_commit,
+            "repeating accepted DSF numbering values must be byte-identical"
+        );
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(
+            crate::dsf_tags::inspect_tail_journal(&path)
+                .expect("inspect DSF journal after no-op numbering write")
+                .is_none(),
+            "repeating accepted DSF numbering must not publish a recovery journal"
+        );
 
         let before = std::fs::read(&path).expect("snapshot DSF before rejected write");
         let error = write_all_tags(
@@ -9269,8 +10775,34 @@ mod tests {
     fn canonical_metadata_display_key_collapses_editor_aliases() {
         assert_eq!(canonical_metadata_display_key("Year"), "DATE");
         assert_eq!(canonical_metadata_display_key("Album Artist"), "ALBUMARTIST");
+        assert_eq!(canonical_metadata_display_key("TOTALTRACKS"), "TRACKTOTAL");
+        assert_eq!(canonical_metadata_display_key("DISKNUMBER"), "DISCNUMBER");
+        assert_eq!(canonical_metadata_display_key("DISKTOTAL"), "DISCTOTAL");
+        assert_eq!(canonical_metadata_display_key("TOTALDISCS"), "DISCTOTAL");
+        assert_eq!(canonical_metadata_display_key("TOTAL-TRACKS"), "TOTAL-TRACKS");
+        assert_eq!(canonical_metadata_display_key("DISK-NUMBER"), "DISK-NUMBER");
+        assert_eq!(canonical_metadata_display_key("DISK-TOTAL"), "DISK-TOTAL");
+        assert_eq!(canonical_metadata_display_key("TOTAL-DISCS"), "TOTAL-DISCS");
         assert_eq!(canonical_metadata_display_key("MUSICBRAINZ_ALBUMID"), "MUSICBRAINZ_ALBUMID");
         assert_eq!(canonical_metadata_display_key("MusicBrainz Release Track Id"), "MUSICBRAINZ_RELEASETRACKID");
+    }
+
+    #[test]
+    fn canonical_editor_reader_converts_native_numbering_aliases_to_semantic_keys() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("TRCK".to_string()),
+            ItemValue::Text("7".to_string()),
+        ));
+
+        let field = canonical_editor_fields_from_tag(&tag)
+            .into_iter()
+            .find(|field| field.display_key == "TRACKNUMBER")
+            .expect("canonical track-number field");
+        assert_eq!(field.item_key, ItemKey::TrackNumber);
+        assert_eq!(field.value, "7");
     }
 
     #[test]
@@ -9415,6 +10947,45 @@ mod tests {
             .find(|entry| entry.display_key == "COMMENT")
             .expect("album COMMENT row");
         assert_eq!(album_comment.per_file_stored_value_counts, vec![3, 1]);
+    }
+
+    #[test]
+    fn typed_alias_cleanup_is_case_insensitive_without_touching_punctuation() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("tRcK".to_string()),
+            ItemValue::Text("6".to_string()),
+        ));
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("T-R-C-K".to_string()),
+            ItemValue::Text("independent".to_string()),
+        ));
+        let normalized = crate::metadata_persistence::normalized_typed_lofty_changes(
+            backend,
+            &[(
+                ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some("7".to_string()),
+            )],
+        )
+        .expect("normalize exact ID3 numbering alias");
+
+        assert!(apply_typed_lofty_changes(&mut tag, backend, normalized));
+        assert!(tag.items().any(|item| {
+            item.key() == &ItemKey::TrackNumber
+                && matches!(item.value(), ItemValue::Text(value) if value == "7")
+        }));
+        assert!(!tag.items().any(|item| matches!(
+            item.key(),
+            ItemKey::Unknown(name) if name.eq_ignore_ascii_case("TRCK")
+        )));
+        assert!(tag.items().any(|item| matches!(
+            (item.key(), item.value()),
+            (ItemKey::Unknown(name), ItemValue::Text(value))
+                if name == "T-R-C-K" && value == "independent"
+        )));
     }
 
     #[test]

@@ -18699,7 +18699,7 @@ mod metadata_autonumber_command_tests {
     fn command_rejects_side_numbering_on_numeric_carriers_without_mutation() {
         let editor = MetadataEditorState::for_files(
             vec![std::path::PathBuf::from("/tmp/track.dsf")],
-            vec![track_number_entry(&["1"])],
+            vec![track_number_entry(&["9"])],
             vec!["track".to_string()],
             MetadataTechnicalDetails::default(),
         );
@@ -18725,7 +18725,7 @@ mod metadata_autonumber_command_tests {
         let ActiveOverlay::MetadataEditor(editor) = &app.active_overlay else {
             panic!("rejected command must preserve the metadata editor");
         };
-        assert_eq!(editor.active_surface().entries[0].per_file_values, ["1"]);
+        assert_eq!(editor.active_surface().entries[0].per_file_values, ["9"]);
         assert!(!editor.active_surface().dirty);
         let status = app
             .status_message

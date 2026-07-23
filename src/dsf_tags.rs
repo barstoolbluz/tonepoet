@@ -706,6 +706,9 @@ pub fn write_with_control(
     let resolved = validate_and_resolve_write(path, changes)?;
     let (location, encoded) = backend::prepare(path, &resolved)
         .map_err(|error| format!("failed to save DSF ID3 tags to '{}': {error}", path.display()))?;
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
     write_prepared(path, location, &encoded, is_cancelled, progress)
 }
 
@@ -3029,16 +3032,23 @@ pub fn recover_stale_writes_in_directory(dir: &Path) -> Vec<String> {
 /// snapshot; editor consumers must use the snapshot keys as-is rather than
 /// canonicalizing them a second time.
 pub(crate) fn canonical_metadata_key(key: &str) -> String {
-    let squashed = key
+    let normalized = key.trim().to_ascii_uppercase();
+    // Numbering aliases are intentionally exact after surrounding-whitespace
+    // removal. Punctuation-bearing custom fields such as `DISK-NUMBER` must
+    // not acquire numbering semantics merely because punctuation disappears.
+    if let Some((canonical, _)) =
+        crate::metadata_persistence::logical_numbering_alias_group(&normalized)
+    {
+        return canonical.to_string();
+    }
+
+    let squashed = normalized
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
-        .map(|character| character.to_ascii_uppercase())
         .collect::<String>();
     match squashed.as_str() {
         "YEAR" => "DATE".to_string(),
         "ALBUMARTIST" | "ALBUMARTISTS" | "ALBUMARTISTCREDIT" => "ALBUMARTIST".to_string(),
-        "TOTALTRACKS" => "TRACKTOTAL".to_string(),
-        "TOTALDISCS" => "DISCTOTAL".to_string(),
         "DESCRIPTION" => "COMMENT".to_string(),
         "MUSICBRAINZALBUMID" => "MUSICBRAINZ_ALBUMID".to_string(),
         "MUSICBRAINZALBUMARTISTID" => "MUSICBRAINZ_ALBUMARTISTID".to_string(),
@@ -3048,7 +3058,7 @@ pub(crate) fn canonical_metadata_key(key: &str) -> String {
         }
         "MUSICBRAINZRELEASETRACKID" => "MUSICBRAINZ_RELEASETRACKID".to_string(),
         "MUSICBRAINZARTISTID" => "MUSICBRAINZ_ARTISTID".to_string(),
-        _ => key.trim().to_ascii_uppercase(),
+        _ => normalized,
     }
 }
 
@@ -3163,10 +3173,14 @@ mod backend {
     pub(super) fn prepare(
         path: &Path,
         changes: &[DsfTagChange],
-    ) -> Result<(DsfMetadataLocation, Vec<u8>), String> {
+    ) -> Result<(DsfMetadataLocation, Option<Vec<u8>>), String> {
         let location = super::inspect_dsf_metadata_location(path)?;
         let mut tag = read_tag(path, location)?;
+        let before = snapshot_from_tag(&tag);
         apply_changes_to_tag(&mut tag, changes);
+        if snapshot_from_tag(&tag) == before {
+            return Ok((location, None));
+        }
 
         let mut encoded = Vec::new();
         tag.write_to(&mut encoded, Version::Id3v24)
@@ -3174,7 +3188,7 @@ mod backend {
         if !encoded.starts_with(b"ID3") {
             return Err("ID3 backend produced bytes without an ID3 marker".to_string());
         }
-        Ok((location, encoded))
+        Ok((location, Some(encoded)))
     }
 
     pub(super) fn prepare_artwork_replace(
@@ -3363,6 +3377,18 @@ mod backend {
         for change in changes {
             apply_one(tag, change);
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_extended_text_values(
+        path: &Path,
+    ) -> Result<Vec<(String, String)>, String> {
+        let location = super::inspect_dsf_metadata_location(path)?;
+        let tag = read_tag(path, location)?;
+        Ok(tag
+            .extended_texts()
+            .map(|text| (text.description.clone(), text.value.clone()))
+            .collect())
     }
 
     #[cfg(test)]
@@ -3597,6 +3623,156 @@ mod tests {
         assert_eq!(snapshot.first("DISCTOTAL"), Some("3"));
         assert_eq!(snapshot.first("COMMENT"), Some("Updated comment"));
         assert_eq!(snapshot.first("CATALOGNUMBER"), Some("ABC-123"));
+    }
+
+    #[test]
+    fn dsf_disk_aliases_canonicalize_conflict_close_and_repeat_as_noop() {
+        use id3::frame::ExtendedText;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("disk-aliases.dsf");
+        let mut tag = id3::Tag::new();
+        tag.add_frame(ExtendedText {
+            description: "DISKNUMBER".to_string(),
+            value: "2".to_string(),
+        });
+        tag.add_frame(ExtendedText {
+            description: "DISKTOTAL".to_string(),
+            value: "3".to_string(),
+        });
+        tag.add_frame(ExtendedText {
+            description: "TOTALDISCS".to_string(),
+            value: "3".to_string(),
+        });
+        tag.add_frame(ExtendedText {
+            description: "DISK-NUMBER".to_string(),
+            value: "independent-custom-value".to_string(),
+        });
+        let mut metadata = Vec::new();
+        tag.write_to(&mut metadata, id3::Version::Id3v24)
+            .expect("serialize legacy DSF DISK aliases");
+        write_test_dsf_fixture(&path, Some(&metadata)).expect("write DSF alias fixture");
+
+        let initial = read(&path).expect("read canonicalized DSF aliases");
+        assert_eq!(initial.first("DISCNUMBER"), Some("2"));
+        assert_eq!(initial.first("DISCTOTAL"), Some("3"));
+        assert_eq!(
+            initial.first("DISK-NUMBER"),
+            Some("independent-custom-value")
+        );
+
+        for (canonical, legacy) in [
+            ("DISCNUMBER", "DISKNUMBER"),
+            ("DISCTOTAL", "DISKTOTAL"),
+            ("DISCTOTAL", "TOTALDISCS"),
+        ] {
+            let before_conflict =
+                std::fs::read(&path).expect("snapshot DSF before alias conflict");
+            let error = write_with_backup(
+                &path,
+                &[
+                    DsfTagChange {
+                        canonical_key: canonical.into(),
+                        value: Some("8".into()),
+                    },
+                    DsfTagChange {
+                        canonical_key: legacy.into(),
+                        value: Some("9".into()),
+                    },
+                ],
+            )
+            .expect_err("conflicting DSF disc aliases must fail closed");
+            assert!(error.contains(&format!("canonical key {canonical}")));
+            assert_eq!(
+                std::fs::read(&path).expect("read DSF after rejected alias conflict"),
+                before_conflict,
+                "DSF conflict {canonical}/{legacy} mutated the carrier"
+            );
+            assert!(!tail_journal_path(&path).exists());
+            assert!(!crate::db::Database::backup_path_for(&path).exists());
+        }
+
+        let accepted = [
+            DsfTagChange {
+                canonical_key: "DISCNUMBER".into(),
+                value: Some("3".into()),
+            },
+            DsfTagChange {
+                canonical_key: "DISCTOTAL".into(),
+                value: Some("4".into()),
+            },
+        ];
+        write_with_backup(&path, &accepted).expect("replace legacy DSF DISK aliases");
+        let committed = read(&path).expect("read replaced DSF aliases");
+        assert_eq!(committed.first("DISCNUMBER"), Some("3"));
+        assert_eq!(committed.first("DISCTOTAL"), Some("4"));
+        assert_eq!(committed.stored_value_count("DISCNUMBER"), 1);
+        assert_eq!(committed.stored_value_count("DISCTOTAL"), 1);
+        assert_eq!(
+            committed.first("DISK-NUMBER"),
+            Some("independent-custom-value")
+        );
+        let extended = backend::test_extended_text_values(&path)
+            .expect("inspect DSF extended text after canonical replacement");
+        assert!(
+            extended.iter().all(|(description, _)| {
+                !description.eq_ignore_ascii_case("DISKNUMBER")
+                    && !description.eq_ignore_ascii_case("DISKTOTAL")
+                    && !description.eq_ignore_ascii_case("TOTALDISCS")
+            }),
+            "legacy DSF DISK aliases survived canonical replacement: {extended:?}"
+        );
+        assert!(extended.iter().any(|(description, value)| {
+            description == "DISK-NUMBER" && value == "independent-custom-value"
+        }));
+
+        let first_commit = std::fs::read(&path).expect("snapshot accepted DSF alias edit");
+        write_with_backup(&path, &accepted).expect("repeat accepted DSF alias edit");
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated DSF alias edit"),
+            first_commit,
+            "repeating the accepted DSF alias edit must be byte-identical"
+        );
+        assert!(!tail_journal_path(&path).exists());
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+
+        let deletion = [
+            DsfTagChange {
+                canonical_key: "DISKNUMBER".into(),
+                value: None,
+            },
+            DsfTagChange {
+                canonical_key: "DISKTOTAL".into(),
+                value: None,
+            },
+        ];
+        write_with_backup(&path, &deletion).expect("delete DSF disc alias groups");
+        let deleted = read(&path).expect("read DSF after alias deletion");
+        assert_eq!(deleted.first("DISCNUMBER"), None);
+        assert_eq!(deleted.first("DISCTOTAL"), None);
+        assert_eq!(
+            deleted.first("DISK-NUMBER"),
+            Some("independent-custom-value")
+        );
+        let extended = backend::test_extended_text_values(&path)
+            .expect("inspect DSF extended text after alias deletion");
+        assert!(extended.iter().all(|(description, _)| {
+            !description.eq_ignore_ascii_case("DISKNUMBER")
+                && !description.eq_ignore_ascii_case("DISKTOTAL")
+                && !description.eq_ignore_ascii_case("TOTALDISCS")
+        }));
+        assert!(extended.iter().any(|(description, value)| {
+            description == "DISK-NUMBER" && value == "independent-custom-value"
+        }));
+        let deletion_commit = std::fs::read(&path).expect("snapshot DSF alias deletion");
+        write_with_backup(&path, &deletion).expect("repeat DSF alias deletion");
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated DSF alias deletion"),
+            deletion_commit,
+            "repeating DSF alias deletion must be byte-identical"
+        );
+        assert!(!tail_journal_path(&path).exists());
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
     }
 
     #[test]
