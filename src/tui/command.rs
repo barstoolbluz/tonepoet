@@ -12,8 +12,8 @@ use super::app::*;
 use super::message::AppMessage;
 use crate::convert::formats::AudioFormat;
 use crate::convert::queue_expansion::{
-    queue_path_key, split_cue_album_grouping_key_for_queue, QueueExpansionResult,
-    QueueSplitCueAlbumGroupingDecisions,
+    queue_path_key, split_cue_album_grouping_key_for_queue, QueueCueSelectionOverrides,
+    QueueExpansionResult, QueueSplitCueAlbumGroupingDecisions,
 };
 use crate::convert::simple_wizard::DitherType;
 
@@ -137,6 +137,9 @@ pub struct BrowseConvertExpansionRequest {
     /// travels with the request to preserve stale-mark observability after the
     /// final queue/convert status is written.
     pub dropped_stale_selection_count: usize,
+    /// Folder-local CUE choices made in this operation. They are deliberately
+    /// not persisted beyond this edit/convert action.
+    pub cue_selection_overrides: QueueCueSelectionOverrides,
 }
 
 #[derive(Debug, Clone)]
@@ -408,11 +411,28 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking(
     )
 }
 
+#[cfg(test)] // superseded in production by the _and_cue_selections variant; reached only from the test-only wrapper above
 pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions(
     browse_in_archive: bool,
     paths: Vec<PathBuf>,
     cancel: tokio_util::sync::CancellationToken,
+    grouping_decisions: QueueSplitCueAlbumGroupingDecisions,
+) -> BrowseConvertExpansion {
+    expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions_and_cue_selections(
+        browse_in_archive,
+        paths,
+        cancel,
+        grouping_decisions,
+        QueueCueSelectionOverrides::new(),
+    )
+}
+
+pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions_and_cue_selections(
+    browse_in_archive: bool,
+    paths: Vec<PathBuf>,
+    cancel: tokio_util::sync::CancellationToken,
     mut grouping_decisions: QueueSplitCueAlbumGroupingDecisions,
+    cue_selection_overrides: QueueCueSelectionOverrides,
 ) -> BrowseConvertExpansion {
     let selection = normalized_path_snapshot(paths);
     let mut regular_folders = Vec::new();
@@ -439,6 +459,7 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
                 cue_artifact_audio: std::collections::HashSet::new(),
                 synthetic_cue_artifacts: std::collections::HashSet::new(),
                 expansion_errors: Vec::new(),
+                cue_selection_prompt: None,
             },
             expanded_folder_count: 0,
             empty_audio_folders: Vec::new(),
@@ -457,12 +478,13 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
         return BrowseConvertExpansion::cancelled(0);
     }
 
-    match crate::convert::queue_expansion::expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions(
+    match crate::convert::queue_expansion::expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions_and_cue_selections(
         &selection,
         &preserved_roots,
         BROWSE_CONVERT_FOLDER_EXPANSION_MAX_VISITED,
         || cancel.is_cancelled(),
         &grouping_decisions,
+        &cue_selection_overrides,
     ) {
         Ok((queue, visited)) => {
             let empty_audio_folders = regular_folders
@@ -529,7 +551,16 @@ pub(crate) fn start_browse_convert_folder_expansion(
         selection_snapshot,
         browse_in_archive: app.browse.is_in_archive(),
         dropped_stale_selection_count,
+        cue_selection_overrides: QueueCueSelectionOverrides::new(),
     };
+    start_browse_convert_folder_expansion_request(app, tx, request);
+}
+
+pub(crate) fn start_browse_convert_folder_expansion_request(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    request: BrowseConvertExpansionRequest,
+) {
     let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
 
     let folder_count = request
@@ -546,7 +577,7 @@ pub(crate) fn start_browse_convert_folder_expansion(
         "Expanding folder…".to_string()
     };
     app.set_status(status_with_stale_selection_notice(
-        dropped_stale_selection_count,
+        request.dropped_stale_selection_count,
         status,
     ));
 
@@ -559,13 +590,15 @@ pub(crate) fn start_browse_convert_folder_expansion(
     tokio::spawn(async move {
         let paths_for_worker = request_for_worker.selection_snapshot.clone();
         let browse_in_archive = request_for_worker.browse_in_archive;
+        let cue_selection_overrides = request_for_worker.cue_selection_overrides.clone();
         let cancel_for_worker = cancel.clone();
         let worker_result = task::spawn_blocking(move || {
-            expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions(
+            expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions_and_cue_selections(
                 browse_in_archive,
                 paths_for_worker,
                 cancel_for_worker,
                 grouping_decisions,
+                cue_selection_overrides,
             )
         })
         .await
@@ -581,7 +614,7 @@ pub(crate) fn start_browse_convert_folder_expansion(
     });
 }
 
-fn browse_convert_expansion_selection_still_current(
+pub(crate) fn browse_convert_expansion_selection_still_current(
     app: &AppState,
     request: &BrowseConvertExpansionRequest,
 ) -> bool {
@@ -631,6 +664,19 @@ pub(crate) fn handle_browse_convert_expansion_complete(
         return;
     }
     let _ = app.complete_browse_convert_expansion(generation, &request);
+
+    if let Some(prompt) = expansion.queue.cue_selection_prompt.clone() {
+        cleanup_discarded_browse_convert_expansion(&expansion);
+        app.active_overlay = ActiveOverlay::CueSelect(Box::new(CueSelectState {
+            parent: prompt.parent,
+            candidates: prompt.candidates,
+            selected: 0,
+            scroll: 0,
+            operation: CueSelectOperation::BrowseConvert { request },
+        }));
+        app.set_status("Choose the CUE file to use for this conversion operation");
+        return;
+    }
 
     if expansion.cancelled {
         app.set_status(status_with_stale_selection_notice(
@@ -1819,6 +1865,10 @@ pub(crate) fn spawn_split_cue_album_grouping_ladder_for_metadata_editor(
     tx: &mpsc::Sender<AppMessage>,
     infos: Vec<super::cue_parser::SingleImageInfo>,
     active_cue_path: Option<PathBuf>,
+    ordinary_paths: Vec<PathBuf>,
+    metadata_sidecar_cue_paths: Vec<PathBuf>,
+    cue_admission_warnings: Vec<String>,
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
 ) -> bool {
     if !same_folder_split_cue_infos(&infos) {
         return false;
@@ -1860,6 +1910,10 @@ pub(crate) fn spawn_split_cue_album_grouping_ladder_for_metadata_editor(
                 operation_id,
                 infos,
                 active_cue_path,
+                ordinary_paths,
+                metadata_sidecar_cue_paths,
+                cue_admission_warnings,
+                cue_policy,
                 result,
             })
             .await;
@@ -7414,7 +7468,13 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
     let mut errors = 0usize;
     let mut first_error: Option<String> = None;
     let mut first_warning: Option<String> = None;
-    let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    let QueueExpansionResult {
+        paths,
+        cue_artifact_audio,
+        synthetic_cue_artifacts,
+        expansion_errors,
+        ..
+    } = queue;
     let expansion_warning = if let Some(err) = expansion_errors.first() {
         if paths.is_empty() {
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
@@ -7544,7 +7604,13 @@ pub(crate) fn install_browse_convert_source_paths(
     from_folder_expansion: bool,
 ) {
     app.cancel_browse_convert_expansion();
-    let QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    let QueueExpansionResult {
+        paths,
+        cue_artifact_audio,
+        synthetic_cue_artifacts,
+        expansion_errors,
+        ..
+    } = queue;
     // A set_status here would be overwritten by the final review-settings
     // status in the same reducer pass; capture the warning and fold it into
     // that status instead (and keep a durable log record).
@@ -7692,7 +7758,13 @@ fn finish_browse_queue_review_after_expansion(
     queue: QueueExpansionResult,
     expanded_folder_count: usize,
 ) -> bool {
-    let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;
+    let QueueExpansionResult {
+        paths,
+        mut cue_artifact_audio,
+        synthetic_cue_artifacts,
+        expansion_errors,
+        ..
+    } = queue;
     if let Some(err) = expansion_errors.first() {
         if paths.is_empty() {
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
@@ -7736,7 +7808,13 @@ fn finish_browse_queue_review_after_expansion(
     install_browse_convert_source_paths(
         app,
         tx,
-        QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors },
+        QueueExpansionResult {
+            paths,
+            cue_artifact_audio,
+            synthetic_cue_artifacts,
+            expansion_errors,
+            cue_selection_prompt: None,
+        },
         expanded_folder_count,
         expanded_folder_count > 0,
     );
@@ -17333,7 +17411,9 @@ mod execute_queue_state_consistency_tests {
             "fresh async completions must not recompute queue semantics through Browse"
         );
         let destructure = finish_body
-            .find("let QueueExpansionResult { paths, mut cue_artifact_audio, synthetic_cue_artifacts, expansion_errors } = queue;")
+            .find(
+                "let QueueExpansionResult {\n        paths,\n        mut cue_artifact_audio,\n        synthetic_cue_artifacts,\n        expansion_errors,\n        ..\n    } = queue;",
+            )
             .expect("CUE metadata should come from the expansion result");
         let retain = finish_body
             .find("cue_artifact_audio.retain")
@@ -17341,7 +17421,7 @@ mod execute_queue_state_consistency_tests {
         // Warnings pass through to install_browse_convert_source_paths so
         // they fold into the final status instead of being overwritten.
         let publish = finish_body
-            .find("QueueExpansionResult { paths, cue_artifact_audio, synthetic_cue_artifacts, expansion_errors }")
+            .find("cue_selection_prompt: None,")
             .expect("CUE metadata should be published with source paths");
 
         assert!(destructure < retain);
@@ -17561,6 +17641,7 @@ FILE "{stem}.flac" WAVE
             selection_snapshot: vec![album],
             browse_in_archive: false,
             dropped_stale_selection_count: 2,
+            cue_selection_overrides: QueueCueSelectionOverrides::new(),
         };
         let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
 
@@ -17575,6 +17656,7 @@ FILE "{stem}.flac" WAVE
                     cue_artifact_audio: std::collections::HashSet::new(),
                     synthetic_cue_artifacts: std::collections::HashSet::new(),
                     expansion_errors: Vec::new(),
+                    cue_selection_prompt: None,
                 },
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -17595,6 +17677,76 @@ FILE "{stem}.flac" WAVE
         // decodability, so pin the shared suffix instead of one branch).
         assert!(status.starts_with("Ignored 2 stale selection marks outside the current directory; "));
         assert!(status.contains("review settings, then :commit or :Commit"));
+    }
+
+    #[test]
+    fn browse_convert_completion_opens_operation_scoped_cue_picker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let cue_a = album.join("side-a.cue");
+        let cue_b = album.join("side-b.cue");
+        std::fs::write(&cue_a, b"fixture").expect("cue A");
+        std::fs::write(&cue_b, b"fixture").expect("cue B");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        let request = BrowseConvertExpansionRequest {
+            target: BrowseConvertExpansionTarget::ConvertReview {
+                preset: None,
+                post_load: BrowseConvertPostLoad::ReviewOnly,
+            },
+            selection_snapshot: vec![album.clone()],
+            browse_in_archive: false,
+            dropped_stale_selection_count: 0,
+            cue_selection_overrides: QueueCueSelectionOverrides::new(),
+        };
+        let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request.clone(),
+            BrowseConvertExpansion {
+                queue: QueueExpansionResult {
+                    cue_selection_prompt: Some(
+                        crate::convert::queue_expansion::QueueCueSelectionPrompt {
+                            parent: album.clone(),
+                            candidates: vec![cue_a.clone(), cue_b.clone()],
+                        },
+                    ),
+                    ..QueueExpansionResult::default()
+                },
+                expanded_folder_count: 1,
+                empty_audio_folders: Vec::new(),
+                expansion_errors: Vec::new(),
+                visited: 2,
+                cancelled: false,
+            },
+        );
+
+        assert!(app.pending_browse_convert_expansion.is_none());
+        let ActiveOverlay::CueSelect(state) = &app.active_overlay else {
+            panic!("ambiguous conversion expansion must open the CUE picker");
+        };
+        assert_eq!(state.parent, album);
+        assert_eq!(state.candidates, vec![cue_a, cue_b]);
+        assert!(matches!(
+            &state.operation,
+            CueSelectOperation::BrowseConvert { request: stored } if stored == &request
+        ));
     }
 
     #[test]
@@ -17639,6 +17791,7 @@ FILE "{stem}.flac" WAVE
             selection_snapshot: vec![album_a],
             browse_in_archive: false,
             dropped_stale_selection_count: 0,
+            cue_selection_overrides: QueueCueSelectionOverrides::new(),
         };
         let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
 

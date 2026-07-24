@@ -242,6 +242,10 @@ pub struct SplitCueAdmissionMember {
     pub referenced_audio: Vec<PathBuf>,
     pub track_audio_paths: Vec<PathBuf>,
     pub role: SplitCueMemberRole,
+    /// True only when every FILE token resolved to the literal path named by
+    /// the CUE (including its extension). Case-insensitive filename recovery
+    /// and same-stem/other-extension recovery are deliberately lower-ranked.
+    pub all_file_references_exact: bool,
 }
 
 impl SplitCueAdmissionMember {
@@ -328,6 +332,219 @@ pub enum SplitCueReferenceResolution {
     /// "was not found", and so an existing-but-unsupported direct target is
     /// never silently rebound to a same-stem audio sibling.
     UnsupportedTarget(PathBuf),
+}
+
+/// Folder-local cue selection outcome shared by metadata editing and queue
+/// expansion. Selection happens before the split-album grouping ladder so
+/// alternative descriptions of the same image can never be merged into a
+/// synthetic multi-part album.
+#[derive(Debug, Clone)]
+pub enum SplitCueFolderSelection {
+    /// One unambiguous cue, or an all-exact pairwise-disjoint cue set that may
+    /// continue through the existing album grouping ladder.
+    Selected {
+        members: Vec<SplitCueAdmissionMember>,
+        /// Resolved audio claimed only by excluded alternatives (including
+        /// partially-resolvable rejected CUEs). Queue expansion suppresses
+        /// these paths so a selection cannot leak alternatives back as raw jobs.
+        excluded_audio: Vec<PathBuf>,
+        rejected: Vec<(PathBuf, String)>,
+    },
+    /// More than one viable alternative remains after exact-match ranking.
+    /// The caller must ask the user to choose exactly one.
+    NeedsChoice {
+        candidates: Vec<SplitCueAdmissionMember>,
+        rejected: Vec<(PathBuf, String)>,
+    },
+    /// No candidate resolves safely to local audio. Callers must fall back to
+    /// their ordinary file/TOC path and surface the rejection visibly.
+    NoViable {
+        rejected: Vec<(PathBuf, String)>,
+    },
+}
+
+/// Select viable CUE descriptions for one folder.
+///
+/// Precedence is intentionally narrow and deterministic:
+/// 1. the sole viable CUE, regardless of its downstream role;
+/// 2. the highest-ranked exact candidates, retaining all of them only when
+///    their resolved audio sets are pairwise disjoint (the established
+///    split-album case);
+/// 3. otherwise a validated operation-scoped choice among the currently tied,
+///    equally best-ranked candidates.
+///
+/// Role classification is deliberately not consulted here. Selection answers
+/// which CUE description(s) own the operation; only after that decision may a
+/// caller decide whether each selected CUE is a split source or a metadata
+/// artifact. Rejected alternatives never poison a viable winner.
+#[must_use]
+pub fn select_split_cue_folder_members(
+    cue_paths: &[PathBuf],
+    selected_cue: Option<&Path>,
+) -> SplitCueFolderSelection {
+    let mut ordered_paths = cue_paths.to_vec();
+    ordered_paths.sort_by(|left, right| split_cue_path_cmp(left, right));
+    ordered_paths.dedup_by(|left, right| cue_path_key(left) == cue_path_key(right));
+
+    let mut members = Vec::new();
+    let mut rejected = Vec::new();
+    let mut rejected_audio = Vec::new();
+    for cue_path in ordered_paths {
+        match admit_split_cue_member(&cue_path) {
+            Ok(member) => members.push(member),
+            Err(message) => {
+                rejected_audio.extend(resolved_in_folder_audio_references(&cue_path));
+                rejected.push((cue_path, message));
+            }
+        }
+    }
+
+    if members.is_empty() {
+        return SplitCueFolderSelection::NoViable { rejected };
+    }
+
+    if members.len() == 1 {
+        return selected_split_cue_folder_members(
+            &members,
+            members.clone(),
+            rejected_audio,
+            rejected,
+        );
+    }
+
+    let exact_members: Vec<SplitCueAdmissionMember> = members
+        .iter()
+        .filter(|member| member.all_file_references_exact)
+        .cloned()
+        .collect();
+    let candidates = if exact_members.is_empty() {
+        members.clone()
+    } else {
+        exact_members.clone()
+    };
+    if candidates.len() == 1 {
+        return selected_split_cue_folder_members(
+            &members,
+            candidates,
+            rejected_audio,
+            rejected,
+        );
+    }
+
+    if !exact_members.is_empty()
+        && split_cue_member_audio_sets_are_pairwise_disjoint(&exact_members)
+    {
+        return selected_split_cue_folder_members(
+            &members,
+            exact_members,
+            rejected_audio,
+            rejected,
+        );
+    }
+
+    if let Some(selected_cue) = selected_cue {
+        let selected_key = cue_path_key(selected_cue);
+        if let Some(selected) = candidates
+            .iter()
+            .find(|member| cue_path_key(&member.cue_path) == selected_key)
+            .cloned()
+        {
+            return selected_split_cue_folder_members(
+                &members,
+                vec![selected],
+                rejected_audio,
+                rejected,
+            );
+        }
+    }
+
+    SplitCueFolderSelection::NeedsChoice {
+        candidates,
+        rejected,
+    }
+}
+
+fn selected_split_cue_folder_members(
+    all_members: &[SplitCueAdmissionMember],
+    mut selected_members: Vec<SplitCueAdmissionMember>,
+    mut excluded_audio: Vec<PathBuf>,
+    rejected: Vec<(PathBuf, String)>,
+) -> SplitCueFolderSelection {
+    let selected_cue_keys: HashSet<PathBuf> = selected_members
+        .iter()
+        .map(|member| cue_path_key(&member.cue_path))
+        .collect();
+    let selected_audio_keys: HashSet<PathBuf> = selected_members
+        .iter()
+        .flat_map(|member| member.referenced_audio.iter())
+        .map(|path| cue_path_key(path))
+        .collect();
+
+    excluded_audio.extend(
+        all_members
+            .iter()
+            .filter(|member| !selected_cue_keys.contains(&cue_path_key(&member.cue_path)))
+            .flat_map(|member| member.referenced_audio.iter().cloned()),
+    );
+    excluded_audio.retain(|path| !selected_audio_keys.contains(&cue_path_key(path)));
+    selected_members.sort_by(|left, right| split_cue_path_cmp(&left.cue_path, &right.cue_path));
+
+    SplitCueFolderSelection::Selected {
+        members: selected_members,
+        excluded_audio: dedup_split_cue_paths(excluded_audio),
+        rejected,
+    }
+}
+
+fn resolved_in_folder_audio_references(cue_path: &Path) -> Vec<PathBuf> {
+    let Some(parent) = cue_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(sheet) = crate::convert::cue_parser::parse_cue_file(cue_path) else {
+        return Vec::new();
+    };
+    let parent_key = cue_path_key(parent);
+    let mut resolved = Vec::new();
+    for file_ref in sheet
+        .tracks
+        .iter()
+        .filter_map(|track| track.file.as_deref())
+    {
+        let SplitCueReferenceResolution::Resolved(path) =
+            resolve_split_cue_file_reference(parent, file_ref)
+        else {
+            continue;
+        };
+        if path
+            .parent()
+            .map(cue_path_key)
+            .as_ref()
+            == Some(&parent_key)
+        {
+            resolved.push(path);
+        }
+    }
+    dedup_split_cue_paths(resolved)
+}
+
+fn dedup_split_cue_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort_by(|left, right| split_cue_path_cmp(left, right));
+    paths.dedup_by(|left, right| cue_path_key(left) == cue_path_key(right));
+    paths
+}
+
+fn split_cue_member_audio_sets_are_pairwise_disjoint(
+    members: &[SplitCueAdmissionMember],
+) -> bool {
+    let mut seen = HashSet::new();
+    for member in members {
+        for audio_path in &member.referenced_audio {
+            if !seen.insert(cue_path_key(audio_path)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Collect candidate CUEs without recursion. A selected directory contributes
@@ -472,6 +689,7 @@ pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember
     let mut referenced_keys = HashSet::new();
     let mut track_audio_paths = Vec::with_capacity(sheet.tracks.len());
     let mut previous_by_file: BTreeMap<PathBuf, (u32, u32)> = BTreeMap::new();
+    let mut all_file_references_exact = true;
 
     for track in &sheet.tracks {
         let file_ref = track.file.as_deref().ok_or_else(|| {
@@ -488,6 +706,14 @@ pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember
                 cue_path.display()
             )
         })?;
+        let normalized_ref = file_ref.replace('\\', &std::path::MAIN_SEPARATOR.to_string());
+        let raw_path = PathBuf::from(&normalized_ref);
+        let direct = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            parent.join(raw_path)
+        };
+        let direct_is_exact_audio = split_cue_regular_audio_file(&direct);
         let resolved = match resolve_split_cue_file_reference(parent, file_ref) {
             SplitCueReferenceResolution::Resolved(path) => path,
             SplitCueReferenceResolution::Missing => {
@@ -510,6 +736,8 @@ pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember
                 ));
             }
         };
+        all_file_references_exact &= direct_is_exact_audio
+            && cue_path_key(&direct) == cue_path_key(&resolved);
         let meta = std::fs::symlink_metadata(&resolved)
             .map_err(|_| format!("member image missing: {file_ref}"))?;
         if meta.file_type().is_symlink() || !meta.is_file() {
@@ -570,6 +798,7 @@ pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember
         referenced_audio,
         track_audio_paths,
         role,
+        all_file_references_exact,
     })
 }
 
@@ -1001,5 +1230,293 @@ mod tests {
             native_key[1].file_name().and_then(|name| name.to_str()),
             Some("B.cue")
         );
+    }
+
+    #[test]
+    fn same_image_alternatives_prefer_the_unique_exact_filename_match() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let image = td.path().join("Get Off (LP).wv");
+        std::fs::write(&image, b"audio").expect("audio");
+        let fallback = td.path().join("Get Off (LP).cue");
+        let exact = td.path().join("Get Off (LP) WV.cue");
+        for (cue, file_ref) in [
+            (&fallback, "Get Off (LP).wav"),
+            (&exact, "Get Off (LP).wv"),
+        ] {
+            std::fs::write(
+                cue,
+                format!(
+                    "TITLE \"Get Off (LP)\"\nFILE \"{file_ref}\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue");
+        }
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(&[fallback, exact.clone()], None)
+        else {
+            panic!("unique exact match must be selected without a prompt");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&exact));
+        assert!(members[0].all_file_references_exact);
+        assert_eq!(members[0].referenced_audio, vec![image]);
+    }
+
+    #[test]
+    fn exact_metadata_sidecar_beats_fallback_split_source_for_the_same_image() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let image = td.path().join("album.wv");
+        std::fs::write(&image, b"audio").expect("audio");
+        let fallback_split = td.path().join("fallback.cue");
+        let exact_metadata = td.path().join("exact.cue");
+        std::fs::write(
+            &fallback_split,
+            concat!(
+                "FILE \"album.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("fallback split cue");
+        std::fs::write(
+            &exact_metadata,
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("exact metadata cue");
+
+        let SplitCueFolderSelection::Selected {
+            members,
+            excluded_audio,
+            ..
+        } = select_split_cue_folder_members(
+            &[fallback_split, exact_metadata.clone()],
+            None,
+        )
+        else {
+            panic!("the role-neutral exact match must win");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&exact_metadata));
+        assert_eq!(members[0].role, SplitCueMemberRole::MetadataSidecar);
+        assert!(members[0].all_file_references_exact);
+        assert!(
+            excluded_audio.is_empty(),
+            "audio owned by the winner must never be suppressed as alternative-only"
+        );
+        assert_eq!(members[0].referenced_audio, vec![image]);
+    }
+
+    #[test]
+    fn exact_metadata_sidecar_beats_fallback_metadata_alternative() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let image = td.path().join("album.wv");
+        std::fs::write(&image, b"audio").expect("audio");
+        let fallback = td.path().join("fallback.cue");
+        let exact = td.path().join("exact.cue");
+        std::fs::write(
+            &fallback,
+            "FILE \"album.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("fallback metadata cue");
+        std::fs::write(
+            &exact,
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("exact metadata cue");
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(&[fallback, exact.clone()], None)
+        else {
+            panic!("the unique exact metadata sidecar must win without a prompt");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].role, SplitCueMemberRole::MetadataSidecar);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&exact));
+        assert_eq!(members[0].referenced_audio, vec![image]);
+    }
+
+    #[test]
+    fn equally_ranked_metadata_sidecars_for_one_image_prompt_and_honor_the_choice() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let image = td.path().join("album.wv");
+        std::fs::write(&image, b"audio").expect("audio");
+        let first = td.path().join("first.cue");
+        let second = td.path().join("second.cue");
+        for cue in [&first, &second] {
+            std::fs::write(
+                cue,
+                "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            )
+            .expect("metadata cue");
+        }
+
+        let SplitCueFolderSelection::NeedsChoice { candidates, .. } =
+            select_split_cue_folder_members(&[first.clone(), second.clone()], None)
+        else {
+            panic!("equally ranked metadata alternatives must prompt");
+        };
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|member| member.role == SplitCueMemberRole::MetadataSidecar));
+
+        let SplitCueFolderSelection::Selected {
+            members,
+            excluded_audio,
+            ..
+        } = select_split_cue_folder_members(
+            &[first, second.clone()],
+            Some(&second),
+        )
+        else {
+            panic!("the operation-scoped metadata-sidecar choice must be honored");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&second));
+        assert_eq!(members[0].referenced_audio, vec![image]);
+        assert!(excluded_audio.is_empty());
+    }
+
+    #[test]
+    fn all_exact_pairwise_disjoint_cues_continue_to_album_grouping() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mut cues = Vec::new();
+        for side in ["a", "b"] {
+            std::fs::write(td.path().join(format!("side_{side}.flac")), b"audio")
+                .expect("audio");
+            let cue = td.path().join(format!("side_{side}.cue"));
+            std::fs::write(
+                &cue,
+                format!(
+                    "FILE \"side_{side}.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue");
+            cues.push(cue);
+        }
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(&cues, None)
+        else {
+            panic!("disjoint exact split-album cues must remain groupable");
+        };
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|member| member.all_file_references_exact));
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(&cues, Some(&cues[0]))
+        else {
+            panic!("a stale choice must not collapse a currently disjoint exact set");
+        };
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn operation_scoped_choice_is_honored_after_revalidation() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mut cues = Vec::new();
+        for side in ["a", "b"] {
+            std::fs::write(td.path().join(format!("side_{side}.flac")), b"audio")
+                .expect("audio");
+            let cue = td.path().join(format!("side_{side}.cue"));
+            std::fs::write(
+                &cue,
+                format!(
+                    "FILE \"side_{side}.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue");
+            cues.push(cue);
+        }
+
+        assert!(matches!(
+            select_split_cue_folder_members(&cues, None),
+            SplitCueFolderSelection::NeedsChoice { .. }
+        ));
+        let selected = cues[1].clone();
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(&cues, Some(&selected))
+        else {
+            panic!("a validated operation-scoped choice must remain authoritative");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&selected));
+    }
+
+    #[test]
+    fn equally_ranked_fallback_cues_require_an_operation_scoped_choice() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let mut cues = Vec::new();
+        for side in ["a", "b"] {
+            std::fs::write(td.path().join(format!("side_{side}.wv")), b"audio")
+                .expect("audio");
+            let cue = td.path().join(format!("side_{side}.cue"));
+            std::fs::write(
+                &cue,
+                format!(
+                    "FILE \"side_{side}.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue");
+            cues.push(cue);
+        }
+
+        let SplitCueFolderSelection::NeedsChoice { candidates, .. } =
+            select_split_cue_folder_members(&cues, None)
+        else {
+            panic!("equally-ranked fallback cues must prompt");
+        };
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|member| !member.all_file_references_exact));
+    }
+
+    #[test]
+    fn sole_viable_cue_wins_even_when_an_alternative_is_dangling() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(td.path().join("album.flac"), b"audio").expect("audio");
+        let good = td.path().join("good.cue");
+        let bad = td.path().join("bad.cue");
+        std::fs::write(
+            &good,
+            "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("good cue");
+        std::fs::write(
+            &bad,
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("bad cue");
+
+        let SplitCueFolderSelection::Selected { members, rejected, .. } =
+            select_split_cue_folder_members(&[bad.clone(), good.clone()], None)
+        else {
+            panic!("the sole viable cue must be selected");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&good));
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(cue_path_key(&rejected[0].0), cue_path_key(&bad));
+    }
+
+    #[test]
+    fn no_viable_cue_reports_fallback_instead_of_inventing_a_merge() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("missing.cue");
+        std::fs::write(
+            &cue,
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("cue");
+
+        let SplitCueFolderSelection::NoViable { rejected } =
+            select_split_cue_folder_members(&[cue], None)
+        else {
+            panic!("no viable cue must fall back");
+        };
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].1.contains("member image missing"));
     }
 }

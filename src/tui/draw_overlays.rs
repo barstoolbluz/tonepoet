@@ -490,6 +490,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         ActiveOverlay::CuePreview(ref state) => {
             draw_cue_preview(f, state, &mut app.button_map, theme);
         }
+        ActiveOverlay::CueSelect(ref state) => {
+            draw_cue_select(f, state, &mut app.button_map, theme);
+        }
         ActiveOverlay::MbSelect(ref state) => {
             draw_mb_select(f, state, &mut app.button_map, theme);
         }
@@ -8021,6 +8024,153 @@ fn draw_mb_select(
     button_map.record_button(
         super::button_map::TuiButton::MbSelectCancel,
         Rect::new(chunks[5].x + accept_w, chunks[5].y, cancel_w, 1),
+    );
+}
+
+fn draw_cue_select(
+    f: &mut Frame,
+    state: &super::app::CueSelectState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
+    let area = f.size();
+    let width = ((u32::from(area.width) * 70 / 100) as u16)
+        .max(48)
+        .min(area.width.saturating_sub(2));
+    let desired_height = state
+        .candidates
+        .len()
+        .saturating_add(7)
+        .min(usize::from(u16::MAX)) as u16;
+    let height = desired_height.max(10).min(area.height.saturating_sub(2));
+    if width < 4 || height < 6 {
+        return;
+    }
+    let popup = Rect::new(
+        area.width.saturating_sub(width) / 2,
+        area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    let folder = state
+        .parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("folder");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.purple))
+        .title(Span::styled(
+            format!(" Choose CUE · {folder} "),
+            Style::default()
+                .fg(theme.purple)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    if inner.height < 4 || state.candidates.is_empty() {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Multiple CUE files describe viable audio.",
+                Style::default().fg(theme.text_bright),
+            )),
+            Line::from(Span::styled(
+                "Choose one for this operation; alternatives will not be merged.",
+                theme.muted(),
+            )),
+        ]),
+        chunks[0],
+    );
+
+    let visible_height = chunks[1].height as usize;
+    let max_scroll = state.candidates.len().saturating_sub(visible_height);
+    let scroll = state.scroll.min(max_scroll).min(state.selected).max(
+        state
+            .selected
+            .saturating_sub(visible_height.saturating_sub(1)),
+    );
+    let lines = state
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_height)
+        .map(|(index, path)| {
+            let selected = index == state.selected;
+            let basename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| path.to_str().unwrap_or("(unrepresentable path)"));
+            let prefix = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.text_bright)
+                    .bg(theme.surface)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            button_map.record_button(
+                TuiButton::CueSelectRow(index),
+                Rect::new(
+                    chunks[1].x,
+                    chunks[1].y + (index - scroll) as u16,
+                    chunks[1].width,
+                    1,
+                ),
+            );
+            Line::from(Span::styled(format!("{prefix}{basename}"), style))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), chunks[1]);
+
+    let accept_label = " [Use selected] ";
+    let cancel_label = " [Cancel] ";
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                accept_label,
+                Style::default()
+                    .fg(theme.green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                cancel_label,
+                Style::default()
+                    .fg(theme.destructive)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ↑↓ select · Enter accept", theme.muted()),
+        ])),
+        chunks[2],
+    );
+    let accept_width = super::display_width::width(accept_label) as u16;
+    let cancel_width = super::display_width::width(cancel_label) as u16;
+    button_map.record_button(
+        TuiButton::CueSelectAccept,
+        Rect::new(chunks[2].x, chunks[2].y, accept_width, 1),
+    );
+    button_map.record_button(
+        TuiButton::CueSelectCancel,
+        Rect::new(
+            chunks[2].x + accept_width,
+            chunks[2].y,
+            cancel_width,
+            1,
+        ),
     );
 }
 

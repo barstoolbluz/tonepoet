@@ -4684,6 +4684,7 @@ impl BrowseState {
                         cue_artifact_audio: HashSet::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
+                        cue_selection_prompt: None,
                     };
                 }
                 EntryKind::OtherFile if is_cue_sheet_path(&entry.path) => {
@@ -4692,6 +4693,7 @@ impl BrowseState {
                         cue_artifact_audio: HashSet::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
+                        cue_selection_prompt: None,
                     };
                 }
                 EntryKind::Directory => {
@@ -4703,6 +4705,7 @@ impl BrowseState {
                         cue_artifact_audio: HashSet::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
+                        cue_selection_prompt: None,
                     };
                 }
                 _ => {}

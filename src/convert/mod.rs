@@ -561,6 +561,11 @@ impl ConversionManager {
         let expansion = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(&[
             dir.to_path_buf(),
         ]);
+        if let Some(prompt) = expansion.cue_selection_prompt.as_ref() {
+            return Err(ConversionError::ValidationError(
+                prompt.noninteractive_error_message(),
+            ));
+        }
         if let Some(message) = expansion.first_error() {
             if expansion.paths.is_empty() {
                 return Err(ConversionError::ValidationError(message.to_string()));
@@ -3202,6 +3207,38 @@ mod bluray_queue_admission_tests {
         assert_eq!(queue.total_items(), 0, "failed ownership registration must roll back queue admission");
         drop(queue);
         let _ = fs::remove_dir_all(artifact_dir);
+    }
+
+    #[test]
+    fn add_directory_rejects_ambiguous_folder_cues_instead_of_silently_queuing_nothing() {
+        let temp = TempDir::new("add-directory-ambiguous-cues");
+        let album = temp.path.join("album");
+        fs::create_dir_all(&album).expect("album dir");
+        fs::write(album.join("album.flac"), b"placeholder audio").expect("audio");
+        for cue_name in ["album-main.cue", "album-alt.cue"] {
+            fs::write(
+                album.join(cue_name),
+                "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+            )
+            .expect("cue");
+        }
+
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let err = rt
+            .block_on(manager.add_directory(&album, ConversionOptions::default()))
+            .expect_err("ambiguous noninteractive directory admission must fail explicitly");
+
+        match err {
+            ConversionError::ValidationError(message) => {
+                assert!(message.contains("require a selection"));
+                assert!(message.contains("album-main.cue"));
+                assert!(message.contains("album-alt.cue"));
+            }
+            other => panic!("expected validation failure, got {other:?}"),
+        }
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert_eq!(queue.total_items(), 0);
     }
 
     #[test]

@@ -5008,6 +5008,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             operation_id,
             infos,
             active_cue_path,
+            ordinary_paths,
+            metadata_sidecar_cue_paths,
+            cue_admission_warnings,
+            cue_policy,
             result,
         } => {
             if !cue_operation_is_current(app, operation_id) {
@@ -5019,6 +5023,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 operation_id,
                 infos,
                 active_cue_path,
+                ordinary_paths,
+                metadata_sidecar_cue_paths,
+                cue_admission_warnings,
+                cue_policy,
                 result,
             );
         }
@@ -11725,6 +11733,10 @@ mod musicbrainz_completion_dispatch_tests {
                 operation_id,
                 infos: Vec::new(),
                 active_cue_path: None,
+                ordinary_paths: Vec::new(),
+                metadata_sidecar_cue_paths: Vec::new(),
+                cue_admission_warnings: Vec::new(),
+                cue_policy: crate::tui::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
                 result: Err("synthetic grouping failure".to_string()),
             },
             &tx(),

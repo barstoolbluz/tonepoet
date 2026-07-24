@@ -5516,6 +5516,10 @@ pub enum ActiveOverlay {
         changes: Vec<CueImportChange>,
         scroll: usize,
     },
+    /// Operation-scoped chooser for equally-ranked viable CUE descriptions.
+    /// The selected path is fed back into the exact edit/convert continuation;
+    /// it is never persisted as a global preference.
+    CueSelect(Box<CueSelectState>),
     /// GNUDB match selection overlay (when multiple matches are returned).
     GnudbSelect {
         operation_id: crate::tui::message::TagsMbOperationId,
@@ -5563,6 +5567,28 @@ pub enum ActiveOverlay {
         /// `None` = controls mode. `Some(scroll)` = help mode with scroll offset.
         help_scroll: Option<usize>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum CueSelectOperation {
+    Metadata {
+        selection_snapshot: Vec<std::path::PathBuf>,
+        cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+        cue_selection_overrides:
+            crate::convert::queue_expansion::QueueCueSelectionOverrides,
+    },
+    BrowseConvert {
+        request: crate::tui::command::BrowseConvertExpansionRequest,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CueSelectState {
+    pub parent: std::path::PathBuf,
+    pub candidates: Vec<std::path::PathBuf>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub operation: CueSelectOperation,
 }
 
 /// Which field the template builder is editing.
@@ -16501,6 +16527,8 @@ mod browse_convert_expansion_lifecycle_tests {
             selection_snapshot: vec![PathBuf::from(path)],
             browse_in_archive: false,
             dropped_stale_selection_count: 0,
+            cue_selection_overrides:
+                crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
         }
     }
 

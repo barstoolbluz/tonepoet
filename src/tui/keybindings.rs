@@ -5426,6 +5426,47 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
             _ => {}
         },
+        ActiveOverlay::CueSelect(mut state) => {
+            let candidate_count = state.candidates.len();
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("CUE selection cancelled; no changes were applied");
+                }
+                KeyCode::Enter => accept_cue_selection(app, tx, *state),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.selected = state.selected.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CueSelect(state);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.selected = state
+                        .selected
+                        .saturating_add(1)
+                        .min(candidate_count.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::CueSelect(state);
+                }
+                KeyCode::PageUp => {
+                    state.selected = state.selected.saturating_sub(10);
+                    app.active_overlay = ActiveOverlay::CueSelect(state);
+                }
+                KeyCode::PageDown => {
+                    state.selected = state
+                        .selected
+                        .saturating_add(10)
+                        .min(candidate_count.saturating_sub(1));
+                    app.active_overlay = ActiveOverlay::CueSelect(state);
+                }
+                KeyCode::Home => {
+                    state.selected = 0;
+                    app.active_overlay = ActiveOverlay::CueSelect(state);
+                }
+                KeyCode::End => {
+                    state.selected = candidate_count.saturating_sub(1);
+                    app.active_overlay = ActiveOverlay::CueSelect(state);
+                }
+                _ => app.active_overlay = ActiveOverlay::CueSelect(state),
+            }
+        }
         ActiveOverlay::MbSelect(mut state) => {
             // Acceptance transitions the picker to a non-interactive Verifying
             // phase before any worker is spawned. Esc remains the only active
@@ -5986,6 +6027,72 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
         }
         ActiveOverlay::None => {}
+    }
+}
+
+fn cue_operation_selection_snapshot(mut paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    paths = paths
+        .into_iter()
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect();
+    paths.sort_by(|left, right| {
+        left.to_string_lossy()
+            .to_ascii_lowercase()
+            .cmp(&right.to_string_lossy().to_ascii_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+    paths.dedup();
+    paths
+}
+
+fn accept_cue_selection(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    state: CueSelectState,
+) {
+    let CueSelectState {
+        parent,
+        candidates,
+        selected,
+        operation,
+        ..
+    } = state;
+    let Some(selected_cue) = candidates.get(selected).cloned() else {
+        app.active_overlay = ActiveOverlay::None;
+        app.set_status("CUE selection failed: no candidate is selected");
+        return;
+    };
+
+    match operation {
+        CueSelectOperation::Metadata {
+            selection_snapshot,
+            cue_policy,
+            mut cue_selection_overrides,
+        } => {
+            let current = super::command::collect_selection_for_file_ops(app);
+            if cue_operation_selection_snapshot(current)
+                != cue_operation_selection_snapshot(selection_snapshot)
+            {
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("CUE selection expired because the Browse selection changed");
+                return;
+            }
+            cue_selection_overrides.insert(parent, selected_cue);
+            app.active_overlay = ActiveOverlay::None;
+            open_metadata_editor_impl(app, Some(tx), cue_policy, cue_selection_overrides);
+        }
+        CueSelectOperation::BrowseConvert { mut request } => {
+            if !super::command::browse_convert_expansion_selection_still_current(app, &request) {
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("CUE selection expired because the Browse selection changed");
+                return;
+            }
+            request
+                .cue_selection_overrides
+                .insert(parent, selected_cue);
+            app.active_overlay = ActiveOverlay::None;
+            super::command::start_browse_convert_folder_expansion_request(app, tx, request);
+        }
     }
 }
 
@@ -10700,25 +10807,55 @@ fn resolve_metadata_cue_surface(cue_path: &std::path::Path) -> Option<MetadataCu
         .folders
         .into_iter()
         .flat_map(|folder| folder.members)
-        .find(|member| member.contributes_synthetic_album_part())
+        .next()
         .and_then(metadata_cue_surface_from_admitted_member)
 }
 
-fn metadata_cue_admission_inputs(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+#[derive(Debug, Clone)]
+struct MetadataCueAdmissionInput {
+    /// Path supplied to the non-recursive same-folder CUE discovery helper.
+    cue_scope: std::path::PathBuf,
+    /// Canonical folder identity used to decide whether this input had any
+    /// candidate CUEs at all.
+    folder_key: std::path::PathBuf,
+    /// Original metadata-selection scope used only when the folder is truly
+    /// cue-less. An explicitly selected audio file must remain file-scoped;
+    /// an explicitly selected directory keeps ordinary recursive semantics.
+    ordinary_scope: std::path::PathBuf,
+}
+
+fn metadata_cue_admission_inputs(
+    paths: &[std::path::PathBuf],
+) -> Vec<MetadataCueAdmissionInput> {
     let mut inputs = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for path in paths {
-        let input = if matches!(
-            crate::convert::classify::classify_file(path),
-            crate::convert::classify::EntryKind::AudioFile(_)
-        ) {
-            path.parent().unwrap_or(path).to_path_buf()
+        let kind = crate::convert::classify::classify_file(path);
+        let is_audio = matches!(kind, crate::convert::classify::EntryKind::AudioFile(_));
+        let is_directory = path.is_dir();
+        let is_cue = !is_directory && super::cue_parser::is_user_visible_cue_path(path);
+        let (cue_scope, folder, ordinary_scope) = if is_audio {
+            let parent = path.parent().unwrap_or(path).to_path_buf();
+            (parent.clone(), parent, path.clone())
+        } else if is_directory {
+            (path.clone(), path.clone(), path.clone())
+        } else if is_cue {
+            let parent = path.parent().unwrap_or(path).to_path_buf();
+            (path.clone(), parent, path.clone())
         } else {
-            path.clone()
+            (path.clone(), path.clone(), path.clone())
         };
-        let key = metadata_cue_surface_key(&input);
-        if seen.insert(key) {
-            inputs.push(input);
+        let folder_key = metadata_cue_surface_key(&folder);
+        let dedup_key = (
+            metadata_cue_surface_key(&cue_scope),
+            metadata_cue_surface_key(&ordinary_scope),
+        );
+        if seen.insert(dedup_key) {
+            inputs.push(MetadataCueAdmissionInput {
+                cue_scope,
+                folder_key,
+                ordinary_scope,
+            });
         }
     }
     inputs
@@ -10726,36 +10863,155 @@ fn metadata_cue_admission_inputs(paths: &[std::path::PathBuf]) -> Vec<std::path:
 
 struct MetadataCueAdmission {
     surfaces: Vec<MetadataCueSurface>,
+    metadata_sidecar_surfaces: Vec<MetadataCueSurface>,
+    /// Ordinary audio paths selected by role-neutral CUE selection, plus the
+    /// audio discovered in each folder whose CUE candidates were all unusable
+    /// or that had no candidate CUE at all. This is concrete per-selection
+    /// material, not a global yes/no flag.
+    ordinary_paths: Vec<std::path::PathBuf>,
     warnings: Vec<String>,
-    /// True when every rejection was an ALIEN cue (referencing no existing
-    /// in-folder audio — e.g. a published planner artifact with absolute
-    /// source refs). Such rejections may degrade to a plain-files editor;
-    /// a rejected local cue-backed album keeps the atomic refusal.
-    alien_rejections_only: bool,
+    selection_prompt: Option<crate::convert::queue_expansion::QueueCueSelectionPrompt>,
 }
 
 fn collect_metadata_cue_admission(paths: &[std::path::PathBuf]) -> MetadataCueAdmission {
+    collect_metadata_cue_admission_with_selections(
+        paths,
+        &crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
+    )
+}
+
+fn collect_metadata_cue_admission_with_selections(
+    paths: &[std::path::PathBuf],
+    cue_selections: &crate::convert::queue_expansion::QueueCueSelectionOverrides,
+) -> MetadataCueAdmission {
     let inputs = metadata_cue_admission_inputs(paths);
-    let report = crate::convert::split_cue_album::admit_split_cue_folders(&inputs);
-    let alien_rejections_only = !report.rejections.is_empty()
-        && report.rejections.iter().all(|rejection| {
-            !rejection.references_in_folder_audio && !rejection.folder_admitted_local_members
-        });
-    let mut surfaces: Vec<MetadataCueSurface> = report
-        .folders
-        .into_iter()
-        .flat_map(|folder| folder.members)
-        .filter(|member| member.contributes_synthetic_album_part())
-        .filter_map(metadata_cue_surface_from_admitted_member)
-        .collect();
+    let mut cue_scopes = Vec::new();
+    let mut seen_cue_scopes = std::collections::BTreeSet::new();
+    for input in &inputs {
+        let key = metadata_cue_surface_key(&input.cue_scope);
+        if seen_cue_scopes.insert(key) {
+            cue_scopes.push(input.cue_scope.clone());
+        }
+    }
+    let candidate_paths =
+        crate::convert::split_cue_album::split_cue_candidate_paths(&cue_scopes);
+    let mut by_parent: std::collections::BTreeMap<
+        std::path::PathBuf,
+        Vec<std::path::PathBuf>,
+    > = std::collections::BTreeMap::new();
+    for cue_path in candidate_paths {
+        let Some(parent) = cue_path.parent() else {
+            continue;
+        };
+        by_parent
+            .entry(metadata_cue_surface_key(parent))
+            .or_default()
+            .push(cue_path);
+    }
+
+    let mut admitted_members = Vec::new();
+    let mut ordinary_paths = Vec::new();
+    let mut warnings = Vec::new();
+
+    // A selected input with no candidate CUE must continue through the exact
+    // ordinary metadata path used by raw/cue-less selections. Keep this
+    // decision per folder so a valid CUE album in another selected folder
+    // cannot make cue-less audio disappear from the mixed editor.
+    for input in &inputs {
+        if !by_parent.contains_key(&input.folder_key) {
+            ordinary_paths.extend(super::command::expand_audio_paths_for_metadata(&[
+                input.ordinary_scope.clone(),
+            ]));
+        }
+    }
+
+    for (parent, cue_paths) in by_parent {
+        let selected = cue_selections
+            .get(&parent)
+            .or_else(|| cue_selections.iter().find_map(|(key, value)| {
+                (metadata_cue_surface_key(key) == parent).then_some(value)
+            }))
+            .map(std::path::PathBuf::as_path);
+        match crate::convert::split_cue_album::select_split_cue_folder_members(
+            &cue_paths,
+            selected,
+        ) {
+            crate::convert::split_cue_album::SplitCueFolderSelection::Selected {
+                members,
+                ..
+            } => admitted_members.extend(members),
+            crate::convert::split_cue_album::SplitCueFolderSelection::NeedsChoice {
+                candidates,
+                ..
+            } => {
+                return MetadataCueAdmission {
+                    surfaces: Vec::new(),
+                    metadata_sidecar_surfaces: Vec::new(),
+                    ordinary_paths: Vec::new(),
+                    warnings: Vec::new(),
+                    selection_prompt: Some(
+                        crate::convert::queue_expansion::QueueCueSelectionPrompt {
+                            parent,
+                            candidates: candidates
+                                .into_iter()
+                                .map(|member| member.cue_path)
+                                .collect(),
+                        },
+                    ),
+                };
+            }
+            crate::convert::split_cue_album::SplitCueFolderSelection::NoViable {
+                rejected,
+            } => {
+                ordinary_paths.extend(super::command::expand_audio_paths_for_metadata(&[
+                    parent.clone(),
+                ]));
+                let detail = rejected
+                    .into_iter()
+                    .map(|(path, message)| format!("{}: {message}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                warnings.push(format!(
+                    "no CUE in {} resolves to local audio; using ordinary file/TOC discovery{}",
+                    parent.display(),
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    }
+                ));
+            }
+        }
+    }
+
+    let mut surfaces = Vec::new();
+    let mut metadata_sidecar_surfaces = Vec::new();
+    for member in admitted_members {
+        if member.contributes_synthetic_album_part() {
+            if let Some(surface) = metadata_cue_surface_from_admitted_member(member) {
+                surfaces.push(surface);
+            }
+        } else {
+            ordinary_paths.extend(member.referenced_audio.iter().cloned());
+            if let Some(surface) = metadata_cue_surface_from_admitted_member(member) {
+                metadata_sidecar_surfaces.push(surface);
+            }
+        }
+    }
     surfaces.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    metadata_sidecar_surfaces.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    ordinary_paths.sort_by(|a, b| metadata_cue_surface_key(a).cmp(&metadata_cue_surface_key(b)));
+    ordinary_paths.dedup_by(|a, b| metadata_cue_surface_key(a) == metadata_cue_surface_key(b));
     MetadataCueAdmission {
         surfaces,
-        warnings: report.warnings,
-        alien_rejections_only,
+        metadata_sidecar_surfaces,
+        ordinary_paths,
+        warnings,
+        selection_prompt: None,
     }
 }
 
+#[cfg(test)] // superseded in production by collect_metadata_cue_admission_with_selections; retained for regression tests
 fn collect_metadata_cue_surfaces_with_warnings(
     paths: &[std::path::PathBuf],
 ) -> (Vec<MetadataCueSurface>, Vec<String>) {
@@ -12001,16 +12257,18 @@ pub(super) fn build_metadata_editor_for_cue_surfaces_with_mb_release(
     release: &super::musicbrainz::MbRelease,
 ) -> Result<Option<Box<super::app::MetadataEditorState>>, String> {
     let admission = collect_metadata_cue_admission(paths);
+    if admission.selection_prompt.is_some() {
+        return Err(
+            "multiple equally-ranked CUE files require a Browse metadata choice".to_string(),
+        );
+    }
     let mut surfaces = admission.surfaces;
     if surfaces.is_empty() {
         if admission.warnings.is_empty() {
             return Ok(None);
         }
-        if admission.alien_rejections_only {
-            app.set_status(format!(
-                "metadata: ignoring unrelated CUE ({})",
-                admission.warnings.join("; ")
-            ));
+        if !admission.ordinary_paths.is_empty() {
+            app.set_status(format!("metadata: {}", admission.warnings.join("; ")));
             return Ok(None);
         }
         return Err(admission.warnings.join("; "));
@@ -12046,19 +12304,6 @@ pub(super) fn build_metadata_editor_for_cue_surfaces_with_mb_release(
     Ok(Some(state))
 }
 
-fn open_metadata_editor_for_cue_surfaces_with_active(
-    app: &mut AppState,
-    surfaces: Vec<MetadataCueSurface>,
-    active_surface: usize,
-) {
-    open_metadata_editor_for_cue_surfaces_with_active_and_policy(
-        app,
-        surfaces,
-        active_surface,
-        super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
-    );
-}
-
 fn open_metadata_editor_for_cue_surfaces_with_active_and_policy(
     app: &mut AppState,
     surfaces: Vec<MetadataCueSurface>,
@@ -12083,6 +12328,173 @@ fn open_metadata_editor_for_cue_surfaces_with_active_and_policy(
         }
         Err(err) => app.set_status(err),
     }
+}
+
+fn build_plain_metadata_presentation_tab(
+    app: &mut AppState,
+    mut paths: Vec<std::path::PathBuf>,
+    metadata_sidecar_surfaces: &[MetadataCueSurface],
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) -> Result<super::app::PresentationTab, String> {
+    if paths.is_empty() {
+        return Err("No ordinary audio files selected".to_string());
+    }
+
+    let merged = super::probe::read_all_tags_merged_with_metadata(&paths)
+        .map_err(|err| format!("Failed to read tags: {err}"))?;
+    let mut entries = merged.entries;
+    let mut source_metadata = merged.metadata;
+    let mut source_metadata_errors = merged.metadata_errors;
+    let mut embedded_cuesheet_present = paths.len() == 1
+        && metadata_entries_contain_embedded_cuesheet(&entries);
+    let mut sidecar_cuesheet_shadow_present = false;
+    let mut cue_source = None;
+
+    if paths.len() == 1 {
+        let selected_audio_key = metadata_cue_surface_key(&paths[0]);
+        if let Some(surface) = metadata_sidecar_surfaces.iter().find(|surface| {
+            surface.audio_paths.len() == 1
+                && metadata_cue_surface_key(&surface.audio_path) == selected_audio_key
+        }) {
+            let (selected, embedded_present, sidecar_shadow_present) =
+                apply_policy_selected_metadata_cue_source(&mut entries, surface, cue_policy)?;
+            embedded_cuesheet_present = embedded_present;
+            sidecar_cuesheet_shadow_present = sidecar_shadow_present;
+            cue_source = Some(selected.identity);
+        }
+    }
+
+    super::probe::sort_paths_entries_metadata_and_errors_by_track(
+        &mut paths,
+        &mut entries,
+        &mut source_metadata,
+        &mut source_metadata_errors,
+    );
+    let technical_details = metadata_technical_details_for_paths_with_analysis(
+        &paths,
+        &source_metadata,
+        &source_metadata_errors,
+        Some(&app.db),
+        &app.preemph_results,
+    );
+    let auto_populate_allowed: Vec<bool> = technical_details
+        .files
+        .iter()
+        .map(|file| file.file_facts.write_eligibility.is_writable())
+        .collect();
+    let did_auto_populate =
+        ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
+
+    let track_entry = entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("TRACKNUMBER"));
+    let disc_entry = entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"));
+    let has_multi_disc = disc_entry
+        .map(|entry| {
+            entry
+                .per_file_values
+                .iter()
+                .filter(|value| !value.is_empty())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1
+        })
+        .unwrap_or(false);
+    let file_labels = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let track = track_entry
+                .and_then(|entry| entry.per_file_values.get(index))
+                .filter(|value| !value.is_empty());
+            let disc = has_multi_disc
+                .then(|| {
+                    disc_entry
+                        .and_then(|entry| entry.per_file_values.get(index))
+                        .filter(|value| !value.is_empty())
+                })
+                .flatten();
+            match (disc, track) {
+                (Some(disc), Some(track)) => format!("D{disc}.{:>02}", track),
+                (None, Some(track)) => format!("{:>02}", track),
+                _ => path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            }
+        })
+        .collect();
+
+    let mut tab = super::app::PresentationTab::for_files(
+        paths,
+        entries,
+        file_labels,
+        technical_details,
+    );
+    tab.label = "Ordinary audio files".to_string();
+    tab.dirty = did_auto_populate;
+    tab.embedded_cuesheet_present = embedded_cuesheet_present;
+    tab.sidecar_cuesheet_shadow_present = sidecar_cuesheet_shadow_present;
+    tab.cue_source = cue_source;
+    Ok(tab)
+}
+
+fn open_metadata_editor_for_cue_surfaces_and_plain_paths(
+    app: &mut AppState,
+    surfaces: Vec<MetadataCueSurface>,
+    active_surface: usize,
+    ordinary_paths: Vec<std::path::PathBuf>,
+    metadata_sidecar_surfaces: &[MetadataCueSurface],
+    cue_admission_warnings: &[String],
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) {
+    let (cue_state, cue_tracks) = match build_metadata_editor_for_cue_surfaces_with_policy(
+        app,
+        &surfaces,
+        active_surface,
+        cue_policy,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            app.set_status(err);
+            return;
+        }
+    };
+    let mut cue_tab = cue_state.active_surface().clone();
+    if cue_tab.label.is_empty() {
+        cue_tab.label = "CUE album".to_string();
+    }
+    let plain_tab = match build_plain_metadata_presentation_tab(
+        app,
+        ordinary_paths,
+        metadata_sidecar_surfaces,
+        cue_policy,
+    ) {
+        Ok(tab) => tab,
+        Err(err) => {
+            app.set_status(err);
+            return;
+        }
+    };
+    let plain_files = plain_tab.paths.len();
+    let model =
+        super::app::MetadataEditorModel::with_presentations(vec![cue_tab, plain_tab], 0);
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
+        super::app::MetadataEditorState::from_model(model),
+    ));
+    let warning_suffix = if cue_admission_warnings.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", cue_admission_warnings.join("; "))
+    };
+    app.set_status(format!(
+        "metadata: opened CUE album ({cue_tracks} tracks) and {plain_files} ordinary audio file{}{}",
+        if plain_files == 1 { "" } else { "s" },
+        warning_suffix,
+    ));
 }
 
 fn metadata_cue_surfaces_for_grouping_decision(
@@ -12129,6 +12541,10 @@ pub(super) fn handle_metadata_editor_split_cue_album_grouping_complete(
     operation_id: super::message::TagsMbOperationId,
     infos: Vec<super::cue_parser::SingleImageInfo>,
     active_cue_path: Option<std::path::PathBuf>,
+    ordinary_paths: Vec<std::path::PathBuf>,
+    metadata_sidecar_cue_paths: Vec<std::path::PathBuf>,
+    cue_admission_warnings: Vec<String>,
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
     result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
 ) {
     if !super::event_loop::cue_operation_is_current(app, operation_id) {
@@ -12161,11 +12577,30 @@ pub(super) fn handle_metadata_editor_split_cue_album_grouping_complete(
         app.set_status("metadata: split-CUE grouping produced no usable CUE surfaces");
         return;
     }
+    let metadata_sidecar_surfaces: Vec<MetadataCueSurface> = metadata_sidecar_cue_paths
+        .iter()
+        .filter_map(|cue_path| resolve_metadata_cue_surface(cue_path))
+        .collect();
     super::event_loop::finish_cue_operation_if_current(app, operation_id);
-    open_metadata_editor_for_cue_surfaces_with_active(app, surfaces, active_surface);
+    if ordinary_paths.is_empty() {
+        open_metadata_editor_for_cue_surfaces_with_active_and_policy(
+            app,
+            surfaces,
+            active_surface,
+            cue_policy,
+        );
+    } else {
+        open_metadata_editor_for_cue_surfaces_and_plain_paths(
+            app,
+            surfaces,
+            active_surface,
+            ordinary_paths,
+            &metadata_sidecar_surfaces,
+            &cue_admission_warnings,
+            cue_policy,
+        );
+    }
 }
-
-
 
 /// When the editor opens on a single audio file with no embedded
 /// CUESHEET tag but a sidecar `.cue` file alongside, parse the sidecar
@@ -16172,6 +16607,7 @@ pub fn open_metadata_editor(app: &mut AppState) {
         app,
         None,
         super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
+        crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
     );
 }
 
@@ -16180,6 +16616,7 @@ pub fn open_metadata_editor_with_tx(app: &mut AppState, tx: &mpsc::Sender<AppMes
         app,
         Some(tx),
         super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
+        crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
     );
 }
 
@@ -16187,6 +16624,7 @@ fn open_metadata_editor_impl(
     app: &mut AppState,
     tx: Option<&mpsc::Sender<AppMessage>>,
     cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+    cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides,
 ) {
     // Collect paths — expand directories recursively to find nested
     // audio files (e.g., disc 01/disc 02 folders).
@@ -16326,25 +16764,43 @@ fn open_metadata_editor_impl(
     // path opens image-level rows and loses each side/disc's CUESHEET track
     // structure. Surface each cue/image pair as its own presentation tab before
     // falling back to generic audio-file expansion.
-    let admission = collect_metadata_cue_admission(&sel);
+    let admission =
+        collect_metadata_cue_admission_with_selections(&sel, &cue_selection_overrides);
+    if let Some(prompt) = admission.selection_prompt {
+        let Some(_tx) = tx else {
+            app.set_status("metadata: multiple viable CUE files require an interactive choice");
+            return;
+        };
+        app.active_overlay = ActiveOverlay::CueSelect(Box::new(CueSelectState {
+            parent: prompt.parent,
+            candidates: prompt.candidates,
+            selected: 0,
+            scroll: 0,
+            operation: CueSelectOperation::Metadata {
+                selection_snapshot: sel.clone(),
+                cue_policy,
+                cue_selection_overrides,
+            },
+        }));
+        app.set_status("Choose the CUE file to use for this metadata operation");
+        return;
+    }
     let mut cue_surfaces = admission.surfaces;
+    let metadata_sidecar_surfaces = admission.metadata_sidecar_surfaces;
+    let admitted_ordinary_paths = admission.ordinary_paths;
     let cue_admission_warnings = admission.warnings;
+    let cue_fallback_status = (!admitted_ordinary_paths.is_empty()
+        && !cue_admission_warnings.is_empty())
+        .then(|| format!("metadata: {}", cue_admission_warnings.join("; ")));
     if cue_surfaces.is_empty() && !cue_admission_warnings.is_empty() {
-        if admission.alien_rejections_only {
-            // Every rejected cue is alien to this folder (it resolves no
-            // existing in-folder audio — e.g. a stale published planner
-            // sheet with absolute source refs). Don't let it veto editing
-            // the folder's plain audio files: degrade with a visible note
-            // and continue to the generic multi-file path below.
-            app.set_status(format!(
-                "metadata: ignoring unrelated CUE ({})",
-                cue_admission_warnings.join("; ")
-            ));
-        } else {
-            app.set_status(format!(
-                "metadata: {}",
-                cue_admission_warnings.join("; ")
-            ));
+        // No candidate resolved safely. Keep the warning visible, then
+        // continue to the same ordinary file/TOC path used by cue-less
+        // folders instead of letting unusable sidecars dead-end editing.
+        app.set_status(format!(
+            "metadata: {}",
+            cue_admission_warnings.join("; ")
+        ));
+        if admitted_ordinary_paths.is_empty() {
             return;
         }
     }
@@ -16365,8 +16821,33 @@ fn open_metadata_editor_impl(
     // carries its "(Side A)"-style title.
     if cue_surfaces.len() == 1 && sel.len() == 1 && sel[0].is_file() {
         if let Some(parent) = sel[0].parent() {
-            let (album_surfaces, album_warnings) =
-                collect_metadata_cue_surfaces_with_warnings(&[parent.to_path_buf()]);
+            let album_admission = collect_metadata_cue_admission_with_selections(
+                &[parent.to_path_buf()],
+                &cue_selection_overrides,
+            );
+            if let Some(prompt) = album_admission.selection_prompt {
+                let Some(_tx) = tx else {
+                    app.set_status(
+                        "metadata: multiple viable CUE files require an interactive choice",
+                    );
+                    return;
+                };
+                app.active_overlay = ActiveOverlay::CueSelect(Box::new(CueSelectState {
+                    parent: prompt.parent,
+                    candidates: prompt.candidates,
+                    selected: 0,
+                    scroll: 0,
+                    operation: CueSelectOperation::Metadata {
+                        selection_snapshot: sel.clone(),
+                        cue_policy,
+                        cue_selection_overrides,
+                    },
+                }));
+                app.set_status("Choose the CUE file to use for this metadata operation");
+                return;
+            }
+            let album_surfaces = album_admission.surfaces;
+            let album_warnings = album_admission.warnings;
             if album_surfaces.is_empty() && !album_warnings.is_empty() {
                 app.set_status(format!("metadata: {}", album_warnings.join("; ")));
                 return;
@@ -16395,16 +16876,36 @@ fn open_metadata_editor_impl(
                 let active_cue_path = cue_surfaces
                     .get(active_surface)
                     .map(|surface| surface.cue_path.clone());
+                let metadata_sidecar_cue_paths = metadata_sidecar_surfaces
+                    .iter()
+                    .map(|surface| surface.cue_path.clone())
+                    .collect();
                 if crate::tui::command::spawn_split_cue_album_grouping_ladder_for_metadata_editor(
                     app,
                     tx,
                     infos,
                     active_cue_path,
+                    admitted_ordinary_paths.clone(),
+                    metadata_sidecar_cue_paths,
+                    cue_admission_warnings.clone(),
+                    cue_policy,
                 ) {
                     return;
                 }
             }
         }
+    }
+    if !cue_surfaces.is_empty() && !admitted_ordinary_paths.is_empty() {
+        open_metadata_editor_for_cue_surfaces_and_plain_paths(
+            app,
+            cue_surfaces,
+            active_surface,
+            admitted_ordinary_paths,
+            &metadata_sidecar_surfaces,
+            &cue_admission_warnings,
+            cue_policy,
+        );
+        return;
     }
     let one_native_multi_file_surface = cue_surfaces
         .first()
@@ -16427,7 +16928,9 @@ fn open_metadata_editor_impl(
         .iter()
         .filter(|path| super::cue_parser::is_user_visible_cue_path(path))
         .count();
-    let mut paths: Vec<std::path::PathBuf> = if cue_selection_count > 0 && cue_selection_count == sel.len() {
+    let mut paths: Vec<std::path::PathBuf> = if !admitted_ordinary_paths.is_empty() {
+        admitted_ordinary_paths
+    } else if cue_selection_count > 0 && cue_selection_count == sel.len() {
         let resolved: Vec<_> = sel
             .iter()
             .filter_map(|cue| {
@@ -16452,7 +16955,11 @@ fn open_metadata_editor_impl(
     };
 
     if paths.is_empty() {
-        app.set_status("No audio files selected");
+        if let Some(status) = cue_fallback_status {
+            app.set_status(format!("{status}; no supported audio files were found"));
+        } else {
+            app.set_status("No audio files selected");
+        }
         return;
     }
 
@@ -16482,10 +16989,13 @@ fn open_metadata_editor_impl(
     let mut cue_source = None;
     if paths.len() == 1 {
         let selected_audio_key = metadata_cue_surface_key(&paths[0]);
-        let admitted_surface = cue_surfaces.iter().find(|surface| {
-            surface.audio_paths.len() == 1
-                && metadata_cue_surface_key(&surface.audio_path) == selected_audio_key
-        });
+        let admitted_surface = cue_surfaces
+            .iter()
+            .chain(metadata_sidecar_surfaces.iter())
+            .find(|surface| {
+                surface.audio_paths.len() == 1
+                    && metadata_cue_surface_key(&surface.audio_path) == selected_audio_key
+            });
         if let Some(surface) = admitted_surface {
             let (selected, embedded_present, sidecar_shadow_present) =
                 match apply_policy_selected_metadata_cue_source(
@@ -22130,6 +22640,71 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
         _ => {
             app.active_overlay = ActiveOverlay::MbSelect(state);
         }
+    }
+}
+
+fn handle_cue_select_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+        ActiveOverlay::CueSelect(state) => state,
+        other => {
+            app.active_overlay = other;
+            return;
+        }
+    };
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            state.selected = state.selected.saturating_sub(1);
+            app.active_overlay = ActiveOverlay::CueSelect(state);
+        }
+        MouseEventKind::ScrollDown => {
+            state.selected = state
+                .selected
+                .saturating_add(1)
+                .min(state.candidates.len().saturating_sub(1));
+            app.active_overlay = ActiveOverlay::CueSelect(state);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            match app.button_map.find_button_at(mouse.column, mouse.row) {
+                Some(TuiButton::CueSelectRow(index)) if index < state.candidates.len() => {
+                    state.selected = index;
+                    app.active_overlay = ActiveOverlay::CueSelect(state);
+                }
+                Some(TuiButton::CueSelectAccept) => accept_cue_selection(app, tx, *state),
+                Some(TuiButton::CueSelectCancel) => {
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("CUE selection cancelled; no changes were applied");
+                }
+                _ => {
+                    let terminal = crossterm::terminal::size().unwrap_or((80, 24));
+                    let width = ((terminal.0 as u32 * 70 / 100) as u16)
+                        .max(48)
+                        .min(terminal.0.saturating_sub(2));
+                    let desired_height = state
+                        .candidates
+                        .len()
+                        .saturating_add(7)
+                        .min(usize::from(u16::MAX)) as u16;
+                    let height = desired_height.max(10).min(terminal.1.saturating_sub(2));
+                    let x = terminal.0.saturating_sub(width) / 2;
+                    let y = terminal.1.saturating_sub(height) / 2;
+                    let inside = mouse.column >= x
+                        && mouse.column < x.saturating_add(width)
+                        && mouse.row >= y
+                        && mouse.row < y.saturating_add(height);
+                    if inside {
+                        app.active_overlay = ActiveOverlay::CueSelect(state);
+                    } else {
+                        app.set_status("CUE selection cancelled; no changes were applied");
+                    }
+                }
+            }
+        }
+        _ => app.active_overlay = ActiveOverlay::CueSelect(state),
     }
 }
 
@@ -30149,6 +30724,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         handle_metadata_autonumber_mouse(app, mouse);
         return;
     }
+    if matches!(app.active_overlay, ActiveOverlay::CueSelect(_)) {
+        handle_cue_select_mouse(app, mouse, tx);
+        return;
+    }
     // MbSelect picker: dedicated handler (clickable rows, footer pills,
     // right-click context menu, double-click-to-accept).
     if matches!(app.active_overlay, ActiveOverlay::MbSelect(_)) {
@@ -31533,6 +32112,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::MbSelectRow(_)
             | TuiButton::MbSelectAccept
             | TuiButton::MbSelectCancel
+            | TuiButton::CueSelectRow(_)
+            | TuiButton::CueSelectAccept
+            | TuiButton::CueSelectCancel
             | TuiButton::CuePreviewLine(_)
             | TuiButton::CuePreviewSave
             | TuiButton::CuePreviewCancel
@@ -38869,6 +39451,11 @@ mod single_image_metadata_editor_regression_tests {
     use crate::tui::app::{ActiveOverlay, AppState};
     use crate::config::TonepoetConfig;
 
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(4);
+        tx
+    }
+
     fn fixture_tool_available(tool: &str) -> bool {
         let available = std::process::Command::new(tool)
             .arg("-version")
@@ -41018,7 +41605,7 @@ mod single_image_metadata_editor_regression_tests {
     }
 
     #[test]
-    fn mb_apply_alien_cue_degrades_but_malformed_local_cue_refuses() {
+    fn mb_apply_unusable_cues_degrade_to_plain_file_toc_discovery() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album dir");
@@ -41044,7 +41631,8 @@ mod single_image_metadata_editor_regression_tests {
         .expect("alien cue must degrade");
         assert!(degraded.is_none());
         assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
-            message.starts_with("metadata: ignoring unrelated CUE (")
+            message.starts_with("metadata: no CUE in ")
+                && message.contains("using ordinary file/TOC discovery")
         }));
 
         std::fs::remove_file(album.join("album.cue")).expect("remove alien cue");
@@ -41053,13 +41641,18 @@ mod single_image_metadata_editor_regression_tests {
             "FILE \"01 - One.flac\" WAVE\n  TRACK 01 AUDIO\n  TRACK 02 AUDIO\n    INDEX 01 01:00:00\n",
         )
         .expect("malformed local cue");
-        let error = build_metadata_editor_for_cue_surfaces_with_mb_release(
+        let degraded = build_metadata_editor_for_cue_surfaces_with_mb_release(
             &mut app,
             std::slice::from_ref(&album),
             &mb_release_10_tracks(),
         )
-        .expect_err("malformed local cue must preserve atomic refusal");
-        assert!(error.contains("local.cue"), "unexpected refusal: {error}");
+        .expect("malformed local cue must degrade to ordinary discovery");
+        assert!(degraded.is_none());
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.starts_with("metadata: no CUE in ")
+                && message.contains("local.cue")
+                && message.contains("using ordinary file/TOC discovery")
+        }));
     }
 
     #[test]
@@ -41800,6 +42393,676 @@ mod single_image_metadata_editor_regression_tests {
     }
 
     #[test]
+    fn metadata_same_image_alternatives_auto_select_the_unique_exact_cue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("foxy");
+        std::fs::create_dir_all(&album).expect("album");
+        let image = album.join("Get Off (LP).wv");
+        let fallback = album.join("Get Off (LP).cue");
+        let exact = album.join("Get Off (LP) WV.cue");
+        std::fs::write(&image, b"wavpack placeholder").expect("image");
+        std::fs::write(
+            &fallback,
+            "TITLE \"Get Off (LP)\"\nFILE \"Get Off (LP).wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("fallback cue");
+        std::fs::write(
+            &exact,
+            "TITLE \"Get Off (LP)\"\nFILE \"Get Off (LP).wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("exact cue");
+
+        let admission = collect_metadata_cue_admission(&[album]);
+        assert!(admission.selection_prompt.is_none());
+        assert!(admission.warnings.is_empty(), "{:?}", admission.warnings);
+        assert_eq!(admission.surfaces.len(), 1);
+        assert_eq!(admission.surfaces[0].cue_path, exact);
+        assert_eq!(admission.surfaces[0].audio_path, image);
+    }
+
+    #[test]
+    fn metadata_distinct_fallback_cues_prompt_and_apply_only_the_operation_choice() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        let cue_a = album.join("side-a.cue");
+        let cue_b = album.join("side-b.cue");
+        for side in ["a", "b"] {
+            std::fs::write(album.join(format!("side-{side}.wv")), b"image").expect("image");
+            std::fs::write(
+                album.join(format!("side-{side}.cue")),
+                format!(
+                    "FILE \"side-{side}.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue");
+        }
+
+        let unresolved = collect_metadata_cue_admission(std::slice::from_ref(&album));
+        let prompt = unresolved
+            .selection_prompt
+            .expect("equally-ranked fallback cues must prompt");
+        assert_eq!(prompt.candidates, vec![cue_a.clone(), cue_b.clone()]);
+        assert!(unresolved.surfaces.is_empty());
+
+        let mut choices = crate::convert::queue_expansion::QueueCueSelectionOverrides::new();
+        choices.insert(album.clone(), cue_b.clone());
+        let selected = collect_metadata_cue_admission_with_selections(&[album], &choices);
+        assert!(selected.selection_prompt.is_none());
+        assert_eq!(selected.surfaces.len(), 1);
+        assert_eq!(selected.surfaces[0].cue_path, cue_b);
+        assert_ne!(selected.surfaces[0].cue_path, cue_a);
+    }
+
+    #[test]
+    fn edit_metadata_on_ambiguous_folder_opens_the_cue_picker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        for side in ["a", "b"] {
+            std::fs::write(album.join(format!("side-{side}.wv")), b"image").expect("image");
+            std::fs::write(
+                album.join(format!("side-{side}.cue")),
+                format!(
+                    "FILE \"side-{side}.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue");
+        }
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![super::super::browse::BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            crate::convert::classify::EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        open_metadata_editor_with_tx(&mut app, &tx());
+
+        let ActiveOverlay::CueSelect(state) = &app.active_overlay else {
+            panic!("ambiguous Edit Metadata must open the CUE picker");
+        };
+        assert_eq!(state.parent, std::fs::canonicalize(&album).unwrap_or(album));
+        assert_eq!(state.candidates.len(), 2);
+        assert!(matches!(
+            &state.operation,
+            CueSelectOperation::Metadata { .. }
+        ));
+    }
+
+    #[test]
+    fn metadata_sidecar_picker_choice_drives_the_current_edit_operation() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        let image = album.join("album.flac");
+        let first = album.join("first.cue");
+        let second = album.join("second.cue");
+        assert!(create_flac_fixture(&image), "audio fixture");
+        for (cue, title) in [(&first, "First"), (&second, "Second")] {
+            std::fs::write(
+                cue,
+                format!(
+                    "TITLE \"{title}\"\nFILE \"album.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"{title} Track\"\n    INDEX 01 00:00:00\n"
+                ),
+            )
+            .expect("metadata cue");
+        }
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![super::super::browse::BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            crate::convert::classify::EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        let channel = tx();
+        open_metadata_editor_with_tx(&mut app, &channel);
+
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::CueSelect(mut state) = overlay else {
+            panic!("equally ranked metadata sidecars must open the chooser");
+        };
+        assert_eq!(state.candidates, vec![first, second.clone()]);
+        state.selected = 1;
+        accept_cue_selection(&mut app, &channel, *state);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("accepted metadata-sidecar choice must continue the edit operation");
+        };
+        assert_eq!(state.active_surface().paths, vec![image]);
+        assert!(matches!(
+            &state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &second
+        ));
+        let cuesheet = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .and_then(|entry| entry.per_file_values.first())
+            .expect("selected sidecar CUESHEET");
+        assert!(cuesheet.contains("TITLE \"Second\""));
+    }
+
+    #[test]
+    fn metadata_unresolved_only_cue_degrades_to_plain_file_discovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        std::fs::write(album.join("album.flac"), b"audio").expect("audio");
+        std::fs::write(
+            album.join("broken.cue"),
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("cue");
+
+        let audio = album.join("album.flac");
+        let admission = collect_metadata_cue_admission(&[album]);
+        assert!(admission.surfaces.is_empty());
+        assert!(admission.metadata_sidecar_surfaces.is_empty());
+        assert!(admission.selection_prompt.is_none());
+        assert_eq!(admission.ordinary_paths, vec![audio]);
+        assert_eq!(admission.warnings.len(), 1);
+        assert!(admission.warnings[0].contains("ordinary file/TOC discovery"));
+    }
+
+    #[test]
+    fn metadata_role_neutral_selection_prefers_exact_sidecar_over_fallback_split_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        let image = album.join("album.wv");
+        let fallback_split = album.join("fallback.cue");
+        let exact_metadata = album.join("exact.cue");
+        std::fs::write(&image, b"wavpack placeholder").expect("image");
+        std::fs::write(
+            &fallback_split,
+            concat!(
+                "FILE \"album.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("fallback split cue");
+        std::fs::write(
+            &exact_metadata,
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("exact metadata cue");
+
+        let admission = collect_metadata_cue_admission(&[album]);
+        assert!(admission.selection_prompt.is_none());
+        assert!(admission.surfaces.is_empty());
+        assert_eq!(admission.metadata_sidecar_surfaces.len(), 1);
+        assert_eq!(admission.metadata_sidecar_surfaces[0].cue_path, exact_metadata);
+        assert_eq!(admission.ordinary_paths, vec![image]);
+        assert!(admission.warnings.is_empty(), "{:?}", admission.warnings);
+    }
+
+    #[test]
+    fn metadata_exact_sidecar_beats_fallback_metadata_alternative() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        let image = album.join("album.wv");
+        let fallback = album.join("fallback.cue");
+        let exact = album.join("exact.cue");
+        std::fs::write(&image, b"wavpack placeholder").expect("image");
+        std::fs::write(
+            &fallback,
+            "FILE \"album.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("fallback metadata cue");
+        std::fs::write(
+            &exact,
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("exact metadata cue");
+
+        let admission = collect_metadata_cue_admission(&[album]);
+        assert!(admission.selection_prompt.is_none());
+        assert!(admission.surfaces.is_empty());
+        assert_eq!(admission.metadata_sidecar_surfaces.len(), 1);
+        assert_eq!(admission.metadata_sidecar_surfaces[0].cue_path, exact);
+        assert_eq!(admission.ordinary_paths, vec![image]);
+    }
+
+    #[test]
+    fn metadata_sidecar_alternatives_prompt_and_apply_only_the_operation_choice() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        let image = album.join("album.wv");
+        let first = album.join("first.cue");
+        let second = album.join("second.cue");
+        std::fs::write(&image, b"wavpack placeholder").expect("image");
+        for cue in [&first, &second] {
+            std::fs::write(
+                cue,
+                "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            )
+            .expect("metadata cue");
+        }
+
+        let unresolved = collect_metadata_cue_admission(std::slice::from_ref(&album));
+        let prompt = unresolved
+            .selection_prompt
+            .expect("equally ranked metadata sidecars must prompt");
+        assert_eq!(prompt.candidates, vec![first.clone(), second.clone()]);
+        assert!(unresolved.surfaces.is_empty());
+        assert!(unresolved.metadata_sidecar_surfaces.is_empty());
+        assert!(unresolved.ordinary_paths.is_empty());
+
+        let mut choices = crate::convert::queue_expansion::QueueCueSelectionOverrides::new();
+        choices.insert(album.clone(), second.clone());
+        let selected = collect_metadata_cue_admission_with_selections(&[album], &choices);
+        assert!(selected.selection_prompt.is_none());
+        assert!(selected.surfaces.is_empty());
+        assert_eq!(selected.metadata_sidecar_surfaces.len(), 1);
+        assert_eq!(selected.metadata_sidecar_surfaces[0].cue_path, second);
+        assert_eq!(selected.ordinary_paths, vec![image]);
+    }
+
+    #[test]
+    fn metadata_unresolved_only_cue_without_audio_surfaces_the_fallback_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        std::fs::write(
+            album.join("broken.cue"),
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("cue");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![super::super::browse::BrowseEntry::new(
+            album,
+            "album".to_string(),
+            crate::convert::classify::EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        open_metadata_editor(&mut app);
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or_default();
+        assert!(status.contains("no CUE"));
+        assert!(status.contains("ordinary file/TOC discovery"));
+        assert!(status.contains("no supported audio files were found"));
+    }
+
+    #[test]
+    fn mixed_folder_metadata_keeps_valid_cue_album_and_unresolved_folder_audio() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue_album = temp.path().join("cue-album");
+        let plain_album = temp.path().join("plain-album");
+        std::fs::create_dir_all(&cue_album).expect("cue album");
+        std::fs::create_dir_all(&plain_album).expect("plain album");
+
+        let side_a = cue_album.join("side-a.flac");
+        let side_b = cue_album.join("side-b.flac");
+        let plain_audio = plain_album.join("plain.flac");
+        assert!(create_flac_fixture(&side_a), "side A fixture");
+        assert!(create_flac_fixture(&side_b), "side B fixture");
+        assert!(create_flac_fixture(&plain_audio), "plain fixture");
+        std::fs::write(
+            cue_album.join("album.cue"),
+            concat!(
+                "TITLE \"CUE Album\"\n",
+                "FILE \"side-a.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:00:30\n",
+                "FILE \"side-b.flac\" FLAC\n",
+                "  TRACK 03 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 04 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:00:30\n",
+            ),
+        )
+        .expect("valid multi-FILE cue");
+        std::fs::write(
+            plain_album.join("broken.cue"),
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("unresolved cue");
+
+        let admission = collect_metadata_cue_admission(&[
+            cue_album.clone(),
+            plain_album.clone(),
+        ]);
+        assert_eq!(admission.surfaces.len(), 1);
+        assert_eq!(admission.ordinary_paths, vec![plain_audio.clone()]);
+        assert_eq!(admission.warnings.len(), 1);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            super::super::browse::BrowseEntry::new(
+                cue_album.clone(),
+                "cue-album".to_string(),
+                crate::convert::classify::EntryKind::Directory,
+                0,
+                None,
+            ),
+            super::super::browse::BrowseEntry::new(
+                plain_album.clone(),
+                "plain-album".to_string(),
+                crate::convert::classify::EntryKind::Directory,
+                0,
+                None,
+            ),
+        ];
+        app.browse.multi_selected = vec![cue_album, plain_album];
+        app.browse.selected_index = 0;
+
+        open_metadata_editor(&mut app);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("mixed valid/fallback folder selection must open metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        assert!(state.presentation_tabs[0].cue_album_synthetic_sheet.is_some());
+        assert_eq!(state.presentation_tabs[0].paths, vec![side_a, side_b]);
+        assert!(state.presentation_tabs[1].cue_album_synthetic_sheet.is_none());
+        assert_eq!(state.presentation_tabs[1].paths, vec![plain_audio]);
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or_default();
+        assert!(status.contains("ordinary file/TOC discovery"), "{status}");
+    }
+
+    #[test]
+    fn mixed_admission_keeps_cueless_audio_file_selection_file_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue_album = temp.path().join("cue-album");
+        let plain_album = temp.path().join("plain-album");
+        std::fs::create_dir_all(&cue_album).expect("cue album");
+        std::fs::create_dir_all(&plain_album).expect("plain album");
+        std::fs::write(cue_album.join("side-a.wv"), b"a").expect("side A");
+        std::fs::write(cue_album.join("side-b.wv"), b"b").expect("side B");
+        std::fs::write(
+            cue_album.join("album.cue"),
+            concat!(
+                "FILE \"side-a.wv\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.wv\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("multi-FILE cue");
+        let selected = plain_album.join("selected.flac");
+        let sibling = plain_album.join("sibling.flac");
+        std::fs::write(&selected, b"selected").expect("selected audio");
+        std::fs::write(&sibling, b"sibling").expect("sibling audio");
+
+        let admission = collect_metadata_cue_admission(&[
+            cue_album,
+            selected.clone(),
+        ]);
+
+        assert_eq!(admission.surfaces.len(), 1);
+        assert_eq!(admission.ordinary_paths, vec![selected]);
+        assert!(!admission.ordinary_paths.contains(&sibling));
+        assert!(admission.warnings.is_empty());
+    }
+
+    #[test]
+    fn mixed_folder_metadata_keeps_valid_cue_album_and_cueless_folder_audio() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue_album = temp.path().join("cue-album");
+        let plain_album = temp.path().join("plain-album");
+        std::fs::create_dir_all(&cue_album).expect("cue album");
+        std::fs::create_dir_all(&plain_album).expect("plain album");
+
+        let side_a = cue_album.join("side-a.flac");
+        let side_b = cue_album.join("side-b.flac");
+        let plain_audio = plain_album.join("plain.flac");
+        assert!(create_flac_fixture(&side_a), "side A fixture");
+        assert!(create_flac_fixture(&side_b), "side B fixture");
+        assert!(create_flac_fixture(&plain_audio), "plain fixture");
+        std::fs::write(
+            cue_album.join("album.cue"),
+            concat!(
+                "TITLE \"CUE Album\"\n",
+                "FILE \"side-a.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:00:30\n",
+                "FILE \"side-b.flac\" FLAC\n",
+                "  TRACK 03 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 04 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:00:30\n",
+            ),
+        )
+        .expect("valid multi-FILE cue");
+
+        let admission = collect_metadata_cue_admission(&[
+            cue_album.clone(),
+            plain_album.clone(),
+        ]);
+        assert_eq!(admission.surfaces.len(), 1);
+        assert_eq!(admission.ordinary_paths, vec![plain_audio.clone()]);
+        assert!(admission.warnings.is_empty());
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            super::super::browse::BrowseEntry::new(
+                cue_album.clone(),
+                "cue-album".to_string(),
+                crate::convert::classify::EntryKind::Directory,
+                0,
+                None,
+            ),
+            super::super::browse::BrowseEntry::new(
+                plain_album.clone(),
+                "plain-album".to_string(),
+                crate::convert::classify::EntryKind::Directory,
+                0,
+                None,
+            ),
+        ];
+        app.browse.multi_selected = vec![cue_album, plain_album];
+        app.browse.selected_index = 0;
+
+        open_metadata_editor(&mut app);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("mixed valid/cue-less folder selection must open metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        assert!(state.presentation_tabs[0].cue_album_synthetic_sheet.is_some());
+        assert_eq!(state.presentation_tabs[0].paths, vec![side_a, side_b]);
+        assert!(state.presentation_tabs[1].cue_album_synthetic_sheet.is_none());
+        assert_eq!(state.presentation_tabs[1].paths, vec![plain_audio]);
+    }
+
+    #[test]
+    fn asynchronous_grouping_completion_preserves_cueless_folder_audio() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue_album = temp.path().join("split-album");
+        let plain_album = temp.path().join("plain-album");
+        std::fs::create_dir_all(&cue_album).expect("cue album");
+        std::fs::create_dir_all(&plain_album).expect("plain album");
+
+        let side_a = cue_album.join("side-a.flac");
+        let side_b = cue_album.join("side-b.flac");
+        let plain_audio = plain_album.join("plain.flac");
+        assert!(create_flac_fixture(&side_a), "side A fixture");
+        assert!(create_flac_fixture(&side_b), "side B fixture");
+        assert!(create_flac_fixture(&plain_audio), "plain fixture");
+        let side_a_cue = cue_album.join("side-a.cue");
+        let side_b_cue = cue_album.join("side-b.cue");
+        std::fs::write(
+            &side_a_cue,
+            concat!(
+                "TITLE \"Shared Album (Side A)\"\n",
+                "FILE \"side-a.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:00:15\n",
+            ),
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &side_b_cue,
+            concat!(
+                "TITLE \"Shared Album (Side B)\"\n",
+                "FILE \"side-b.flac\" FLAC\n",
+                "  TRACK 03 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 04 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:00:15\n",
+            ),
+        )
+        .expect("side B cue");
+        let admission = collect_metadata_cue_admission(&[
+            cue_album.clone(),
+            plain_album.clone(),
+        ]);
+        assert_eq!(admission.surfaces.len(), 2);
+        assert_eq!(admission.ordinary_paths, vec![plain_audio.clone()]);
+        assert!(admission.warnings.is_empty());
+
+        let mut infos = vec![
+            super::super::cue_parser::detect_single_image_cue(&side_a_cue)
+                .expect("side A info"),
+            super::super::cue_parser::detect_single_image_cue(&side_b_cue)
+                .expect("side B info"),
+        ];
+        infos.sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+        let merged_group = infos
+            .iter()
+            .map(|info| metadata_cue_surface_key(&info.cue_path))
+            .collect();
+        let ordinary_paths = admission.ordinary_paths;
+        let warnings = admission.warnings;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let operation_id = super::super::event_loop::begin_cue_operation(
+            &mut app,
+            "metadata grouping",
+        )
+        .expect("begin metadata grouping");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        handle_metadata_editor_split_cue_album_grouping_complete(
+            &mut app,
+            &tx,
+            operation_id,
+            infos,
+            Some(side_a_cue),
+            ordinary_paths,
+            Vec::new(),
+            warnings,
+            crate::tui::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
+            Ok(Box::new(
+                crate::tui::command::SplitCueAlbumGroupingAsyncOutcome {
+                    decision: crate::tui::command::SplitCueAlbumGroupingDecision {
+                        groups: vec![merged_group],
+                        reason:
+                            crate::tui::command::SplitCueAlbumGroupingReason::TitleSharedPrefix,
+                    },
+                    toc_outcome: None,
+                    cache_writes: Vec::new(),
+                },
+            )),
+        );
+
+        assert!(app.active_cue_operation.is_none());
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("authoritative grouping completion must open the mixed editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        assert!(state.presentation_tabs[0].cue_album_synthetic_sheet.is_some());
+        assert_eq!(state.presentation_tabs[0].paths, vec![side_a, side_b]);
+        assert_eq!(state.presentation_tabs[1].paths, vec![plain_audio]);
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or_default();
+        assert!(status.contains("and 1 ordinary audio file"), "{status}");
+        assert!(!status.contains("ordinary file/TOC discovery"), "{status}");
+    }
+
+    #[test]
+    fn cue_selection_overlay_supports_keyboard_and_mouse_rows() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::CueSelect(Box::new(CueSelectState {
+            parent: std::path::PathBuf::from("album"),
+            candidates: vec![
+                std::path::PathBuf::from("a.cue"),
+                std::path::PathBuf::from("b.cue"),
+            ],
+            selected: 0,
+            scroll: 0,
+            operation: CueSelectOperation::Metadata {
+                selection_snapshot: Vec::new(),
+                cue_policy: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+                cue_selection_overrides:
+                    crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
+            },
+        }));
+
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx(),
+        );
+        let ActiveOverlay::CueSelect(state) = &app.active_overlay else {
+            panic!("CUE picker must remain open after keyboard navigation");
+        };
+        assert_eq!(state.selected, 1);
+
+        app.button_map.record_button(
+            TuiButton::CueSelectRow(0),
+            ratatui::layout::Rect::new(3, 4, 20, 1),
+        );
+        handle_cue_select_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx(),
+        );
+        let ActiveOverlay::CueSelect(state) = &app.active_overlay else {
+            panic!("CUE picker must remain open after row selection");
+        };
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
     fn metadata_cue_surface_collection_is_parent_local_like_the_planner() {
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
@@ -41974,10 +43237,10 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn native_multi_file_cue_opens_as_one_album_from_folder_cue_or_member_image() {
-        assert!(
-            fixture_tool_available("ffmpeg"),
-            "ffmpeg is required for the native multi-FILE editor-routing fixture"
-        );
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album dir");
@@ -42073,8 +43336,161 @@ mod single_image_metadata_editor_regression_tests {
         }
     }
 
+    #[tokio::test]
+    async fn four_file_native_multi_file_album_consolidates_persists_reopens_and_queues_once() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("eighties-movie-hits");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let images: Vec<std::path::PathBuf> = (1..=4)
+            .map(|side| album.join(format!("side-{side}.flac")))
+            .collect();
+        for image in &images {
+            assert!(create_flac_fixture(image), "fixture {}", image.display());
+        }
+        let cue_path = album.join("80s Movie Hits.cue");
+        let mut cue_text = concat!(
+            "PERFORMER \"Various Artists\"\n",
+            "TITLE \"80's Movie Hits\"\n",
+        )
+        .to_string();
+        let mut track_number = 1u32;
+        for side in 1..=4 {
+            cue_text.push_str(&format!("FILE \"side-{side}.flac\" FLAC\n"));
+            for local_track in 1..=2 {
+                cue_text.push_str(&format!(
+                    "  TRACK {track_number:02} AUDIO\n    TITLE \"Side {side} Track {local_track}\"\n    INDEX 01 00:00:{:02}\n",
+                    (local_track - 1) * 15,
+                ));
+                track_number += 1;
+            }
+        }
+        std::fs::write(&cue_path, cue_text).expect("four-file cue");
+
+        let open_album = || {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![super::super::browse::BrowseEntry::new(
+                album.clone(),
+                "eighties-movie-hits".to_string(),
+                crate::convert::classify::EntryKind::Directory,
+                0,
+                None,
+            )];
+            app.browse.selected_index = 0;
+            open_metadata_editor(&mut app);
+            app
+        };
+
+        let mut app = open_album();
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("four-file native multi-FILE album must open in the editor");
+        };
+        assert!(state.presentation_tabs.is_empty());
+        let synthetic = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("unified four-file synthetic sheet");
+        assert_eq!(synthetic.audio_paths, images);
+        assert_eq!(synthetic.track_sources.len(), 8);
+        assert_eq!(state.active_surface().paths.len(), 4);
+        assert_eq!(state.active_surface().file_labels.len(), 8);
+
+        let album_entry = state
+            .active_surface_mut()
+            .entries
+            .iter_mut()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
+            .expect("ALBUM row");
+        album_entry.value = "80's Movie Hits Corrected".to_string();
+        album_entry.is_mixed = false;
+        for value in &mut album_entry.per_file_values {
+            *value = "80's Movie Hits Corrected".to_string();
+        }
+        state.active_surface_mut().dirty = true;
+        state.close_after_successful_save = false;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        let mut completion_seen = false;
+        while !completion_seen {
+            let message = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                rx.recv(),
+            )
+            .await
+            .expect("four-file metadata save worker timed out")
+            .expect("metadata save channel closed before completion");
+            if let AppMessage::MetadataEditorWriteComplete { results, .. } = &message {
+                completion_seen = true;
+                let carrier_saves = results
+                    .iter()
+                    .filter(|result| {
+                        images.iter().any(|image| result.path.as_path() == image.as_path())
+                            && matches!(
+                                &result.outcome,
+                                crate::tui::app::MetadataEditorWriteOutcome::Saved
+                                    | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                            )
+                    })
+                    .count();
+                assert_eq!(carrier_saves, 4, "all four carriers must save: {results:?}");
+                assert!(
+                    results.iter().any(|result| matches!(
+                        &result.outcome,
+                        crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
+                            cue_path: saved_cue,
+                            unchanged: false,
+                            ..
+                        } if saved_cue == &cue_path
+                    )),
+                    "the production save must persist the four-file sidecar: {results:?}"
+                );
+            }
+            crate::tui::event_loop::handle_message(&mut app, message, &tx);
+        }
+        let persisted = crate::tui::cue_parser::parse_cue_file(&cue_path)
+            .expect("persisted four-file CUE remains parseable");
+        assert_eq!(persisted.title.as_deref(), Some("80's Movie Hits Corrected"));
+        assert_eq!(persisted.tracks.len(), 8);
+
+        let reopened = open_album();
+        let ActiveOverlay::MetadataEditor(reopened_state) = &reopened.active_overlay else {
+            panic!("persisted four-file album must reopen");
+        };
+        let reopened_sheet = reopened_state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("reopened unified sheet");
+        assert_eq!(
+            reopened_sheet.album_title.as_deref(),
+            Some("80's Movie Hits Corrected")
+        );
+        assert_eq!(reopened_sheet.audio_paths.len(), 4);
+        assert_eq!(reopened_sheet.track_sources.len(), 8);
+
+        let queue = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(&[
+            album,
+        ]);
+        assert!(queue.cue_selection_prompt.is_none());
+        assert!(queue.expansion_errors.is_empty(), "{:?}", queue.expansion_errors);
+        assert_eq!(queue.paths.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&queue.paths[0]).expect("queued cue canonical path"),
+            std::fs::canonicalize(&cue_path).expect("fixture cue canonical path")
+        );
+        assert!(queue.synthetic_cue_artifacts.is_empty());
+    }
+
     #[test]
-    fn editor_and_queue_share_multi_file_membership_and_atomic_rejection() {
+    fn editor_and_queue_select_the_sole_viable_multi_file_cue() {
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album");
@@ -42131,14 +43547,27 @@ mod single_image_metadata_editor_regression_tests {
 
         std::fs::remove_file(album.join("b2.flac")).expect("remove member image");
         let (surfaces, warnings) = collect_metadata_cue_surfaces_with_warnings(&[album.clone()]);
-        assert!(surfaces.is_empty(), "editor must not retain a survivor subset");
-        assert!(warnings.iter().any(|warning| warning.contains("member image missing")));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(surfaces.len(), 1, "the sole viable cue must be selected");
+        assert_eq!(
+            surfaces[0]
+                .cue_path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("side-a.cue")
+        );
 
         let queue = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(&[
             album,
         ]);
-        assert!(!queue.expansion_errors.is_empty());
-        assert!(queue.synthetic_cue_artifacts.is_empty());
+        assert!(queue.expansion_errors.is_empty(), "{:?}", queue.expansion_errors);
+        assert_eq!(queue.paths.len(), 1);
+        assert!(crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+            &queue.paths[0]
+        ));
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+            &queue.synthetic_cue_artifacts,
+        );
     }
 
 
@@ -42458,6 +43887,178 @@ mod single_image_metadata_editor_regression_tests {
     }
 
     #[test]
+    fn foxy_alternative_cues_select_exact_sidecar_and_persist_save() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (album, image, exact_cue, exact_sidecar) =
+            create_foxy_route_fixture(temp.path(), "alternative-selection");
+        let fallback_cue = album.join("album-fallback.cue");
+        std::fs::write(&fallback_cue, exact_sidecar.replace("album.flac", "album.wav"))
+            .expect("fallback sidecar fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        select_foxy_route(&mut app, &album, temp.path());
+        open_metadata_editor(&mut app);
+
+        let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+            panic!("the unique exact CUE must open without a chooser");
+        };
+        assert!(matches!(
+            &state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &exact_cue
+        ));
+        edit_album_field(state, "ALBUM", "Get Off Exact Selection");
+        state.active_surface_mut().dirty = true;
+        assert!(regenerate_cuesheet_for_save(state).expect("regenerate exact sidecar"));
+
+        let plan = cue_sidecar_writeback_plan_for_state(state)
+            .expect("the selected exact sidecar must own write-back");
+        assert_eq!(plan.cue_path, exact_cue);
+        let result = cue_sidecar_writeback_result_after_successful_image_save(
+            plan,
+            &[crate::tui::app::MetadataEditorWriteResult::saved(image)],
+        )
+        .expect("successful image save must persist the selected sidecar");
+        assert!(matches!(
+            result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
+                unchanged: false,
+                ..
+            }
+        ));
+
+        let reopened = crate::tui::cue_parser::parse_cue_file(&exact_cue)
+            .expect("saved exact sidecar remains parseable");
+        assert_eq!(reopened.title.as_deref(), Some("Get Off Exact Selection"));
+        let untouched_fallback = crate::tui::cue_parser::parse_cue_file(&fallback_cue)
+            .expect("unselected fallback remains parseable");
+        assert_eq!(untouched_fallback.title.as_deref(), Some("Old Sidecar Album"));
+    }
+
+    #[tokio::test]
+    async fn foxy_exact_selection_persists_through_real_wavpack_save_worker() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("foxy-real-wavpack");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let image = album.join("Get Off (LP).wv");
+        let exact_cue = album.join("Get Off (LP) WV.cue");
+        let fallback_cue = album.join("Get Off (LP).cue");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=0.25",
+                "-c:a",
+                "wavpack",
+            ])
+            .arg(&image)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg WavPack fixture");
+        assert!(status.success(), "ffmpeg must create the WavPack fixture");
+        let exact_text = concat!(
+            "PERFORMER \"Foxy\"\n",
+            "TITLE \"Get Off (LP)\"\n",
+            "CATALOG 25AP-1115\n",
+            "FILE \"Get Off (LP).wv\" WAVE\n",
+            "  TRACK 01 AUDIO\n    TITLE \"Tena's Song\"\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    TITLE \"Ready for Love\"\n    INDEX 01 00:00:03\n",
+        );
+        std::fs::write(&exact_cue, exact_text).expect("exact CUE");
+        std::fs::write(
+            &fallback_cue,
+            exact_text.replace("Get Off (LP).wv", "Get Off (LP).wav"),
+        )
+        .expect("fallback CUE");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        select_foxy_route(&mut app, &album, temp.path());
+        open_metadata_editor(&mut app);
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("the exact WavPack CUE must open without a chooser");
+        };
+        assert!(matches!(
+            &state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &exact_cue
+        ));
+        edit_album_field(&mut state, "ALBUM", "Get Off Real WavPack Save");
+        edit_album_field(&mut state, "CATALOGNUMBER", "25AP 1115 PROMO");
+        state.active_surface_mut().dirty = true;
+        state.close_after_successful_save = false;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+
+        let mut completion_seen = false;
+        while !completion_seen {
+            let message = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                rx.recv(),
+            )
+            .await
+            .expect("metadata save worker timed out")
+            .expect("metadata save channel closed before completion");
+            if let AppMessage::MetadataEditorWriteComplete { results, .. } = &message {
+                completion_seen = true;
+                assert!(
+                    results.iter().any(|result| {
+                        result.path.as_path() == image.as_path()
+                            && matches!(
+                                &result.outcome,
+                                crate::tui::app::MetadataEditorWriteOutcome::Saved
+                                    | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                            )
+                    }),
+                    "the production worker must save the real WavPack carrier: {results:?}"
+                );
+                assert!(
+                    results.iter().any(|result| matches!(
+                        &result.outcome,
+                        crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
+                            cue_path,
+                            unchanged: false,
+                            ..
+                        } if cue_path == &exact_cue
+                    )),
+                    "the production worker must persist the exact selected sidecar: {results:?}"
+                );
+            }
+            crate::tui::event_loop::handle_message(&mut app, message, &tx);
+        }
+
+        let persisted_exact = crate::tui::cue_parser::parse_cue_file(&exact_cue)
+            .expect("saved exact CUE remains parseable");
+        assert_eq!(
+            persisted_exact.title.as_deref(),
+            Some("Get Off Real WavPack Save")
+        );
+        assert_eq!(persisted_exact.catalog.as_deref(), Some("25AP 1115 PROMO"));
+        let untouched_fallback = crate::tui::cue_parser::parse_cue_file(&fallback_cue)
+            .expect("unselected fallback CUE remains parseable");
+        assert_eq!(untouched_fallback.title.as_deref(), Some("Get Off (LP)"));
+        assert_eq!(untouched_fallback.catalog.as_deref(), Some("25AP-1115"));
+
+        let reread = crate::tui::probe::read_all_tags_merged(std::slice::from_ref(&image))
+            .expect("re-read saved WavPack tags");
+        let album_value = reread
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
+            .and_then(|entry| entry.per_file_values.first())
+            .map(String::as_str);
+        assert_eq!(album_value, Some("Get Off Real WavPack Save"));
+    }
+
+    #[test]
     fn foxy_folder_cue_and_image_routes_follow_embedded_policy_consistently() {
         let temp = tempfile::tempdir().expect("tempdir");
 
@@ -42481,6 +44082,7 @@ mod single_image_metadata_editor_regression_tests {
                 &mut app,
                 None,
                 crate::convert::pipeline::CueSidecarPolicy::PreferEmbedded,
+                crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
             );
 
             let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {

@@ -197,6 +197,12 @@ pub enum TuiButton {
     /// MbSelect footer "Cancel" pill.
     MbSelectCancel,
 
+    /// CUE selection overlay: clickable candidate row.
+    CueSelectRow(usize),
+    /// CUE selection overlay footer actions.
+    CueSelectAccept,
+    CueSelectCancel,
+
     /// CuePreview overlay: clickable content line (0-based line index).
     CuePreviewLine(usize),
     /// CuePreview footer pills (browsing mode — not currently editing
@@ -384,6 +390,9 @@ impl TuiButton {
             | Self::MbSelectRow(_)
             | Self::MbSelectAccept
             | Self::MbSelectCancel
+            | Self::CueSelectRow(_)
+            | Self::CueSelectAccept
+            | Self::CueSelectCancel
             | Self::CuePreviewLine(_)
             | Self::CuePreviewSave
             | Self::CuePreviewCancel

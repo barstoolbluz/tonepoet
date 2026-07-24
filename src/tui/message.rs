@@ -649,6 +649,10 @@ pub enum AppMessage {
         operation_id: TagsMbOperationId,
         infos: Vec<crate::tui::cue_parser::SingleImageInfo>,
         active_cue_path: Option<std::path::PathBuf>,
+        ordinary_paths: Vec<std::path::PathBuf>,
+        metadata_sidecar_cue_paths: Vec<std::path::PathBuf>,
+        cue_admission_warnings: Vec<String>,
+        cue_policy: crate::convert::pipeline::CueSidecarPolicy,
         result: Result<Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome>, String>,
     },
     /// Completion of in-editor split-CUE discovery for `:tags-mb`. The boxed

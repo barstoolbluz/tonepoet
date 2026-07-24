@@ -1676,6 +1676,9 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
     let expansion =
         tonepoet::convert::queue_expansion::expand_paths_to_audio_with_metadata(&expansion_inputs);
     let mut errors = Vec::new();
+    if let Some(prompt) = expansion.cue_selection_prompt.as_ref() {
+        errors.push(prompt.noninteractive_error_message());
+    }
     if !expansion.expansion_errors.is_empty() {
         if expansion.paths.is_empty() {
             errors.extend(expansion.expansion_errors.iter().cloned());
@@ -3870,6 +3873,27 @@ FILE "side_b.flac" WAVE
         let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
 
         assert_eq!(planned_names(&planned), vec!["album.cue"]);
+    }
+
+    #[test]
+    fn ambiguous_folder_cues_are_reported_instead_of_silently_planning_zero_items() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        touch(&temp.path().join("album.flac"));
+        for cue_name in ["album-main.cue", "album-alt.cue"] {
+            std::fs::write(
+                temp.path().join(cue_name),
+                "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+            )
+            .expect("cue fixture");
+        }
+
+        let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
+
+        assert!(planned.items.is_empty());
+        assert_eq!(planned.errors.len(), 1);
+        assert!(planned.errors[0].contains("require a selection"));
+        assert!(planned.errors[0].contains("album-main.cue"));
+        assert!(planned.errors[0].contains("album-alt.cue"));
     }
 
     /// Explicitly naming a CUE on the command line keeps explicit semantics
