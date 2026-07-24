@@ -7095,6 +7095,21 @@ pub struct CueAlbumSyntheticSheet {
     pub album_catalog: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataCueSource {
+    Sidecar(std::path::PathBuf),
+    Embedded(std::path::PathBuf),
+}
+
+impl MetadataCueSource {
+    pub fn sidecar_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Sidecar(path) => Some(path.as_path()),
+            Self::Embedded(_) => None,
+        }
+    }
+}
+
 /// One presentation surface inside the metadata editor.
 ///
 /// Invariant: this struct owns a presentation's editable rows, labels, dirty
@@ -7153,6 +7168,11 @@ pub struct PresentationTab {
     /// Save-path tombstone for deleting an embedded CUESHEET while leaving any
     /// sidecar-derived synthetic row visible in the editor.
     pub pending_embedded_cuesheet_delete: bool,
+    /// Stable policy-selected CUE authority and save target for this surface.
+    /// A sidecar authority may render a structurally-matched embedded metadata
+    /// upgrade, but save-time routing still follows this retained identity
+    /// instead of rediscovering or guessing another source.
+    pub cue_source: Option<MetadataCueSource>,
     /// Unified split-CUE album state. Present only for same-folder CUE groups
     /// that the album-grouping ladder merged into one album surface.
     pub cue_album_synthetic_sheet: Option<CueAlbumSyntheticSheet>,
@@ -7190,6 +7210,7 @@ impl Default for PresentationTab {
             embedded_cuesheet_present: false,
             sidecar_cuesheet_shadow_present: false,
             pending_embedded_cuesheet_delete: false,
+            cue_source: None,
             cue_album_synthetic_sheet: None,
             cue_album_forced_cleanup: Vec::new(),
         }
@@ -7270,6 +7291,7 @@ impl PresentationTab {
         tab.embedded_cuesheet_present = active.embedded_cuesheet_present;
         tab.sidecar_cuesheet_shadow_present = active.sidecar_cuesheet_shadow_present;
         tab.pending_embedded_cuesheet_delete = active.pending_embedded_cuesheet_delete;
+        tab.cue_source = active.cue_source.clone();
         tab.cue_album_synthetic_sheet = active.cue_album_synthetic_sheet.clone();
         tab
     }

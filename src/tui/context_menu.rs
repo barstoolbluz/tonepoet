@@ -1859,11 +1859,28 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         &paths,
         &audio_paths,
     );
+    let multi_file_cue_discovery = super::command::discover_multi_file_cues_for_sources(
+        &paths,
+        &audio_paths,
+    );
+    let multi_file_cue_layouts = &multi_file_cue_discovery.layouts;
     let active_audio_path = audio_paths
         .first()
         .cloned()
-        .or_else(|| cue_infos.first().map(|info| info.audio_path.clone()));
-    if cue_infos.is_empty() && audio_paths.is_empty() {
+        .or_else(|| cue_infos.first().map(|info| info.audio_path.clone()))
+        .or_else(|| {
+            multi_file_cue_layouts
+                .first()
+                .and_then(|layout| layout.audio_paths.first().cloned())
+        });
+    if !multi_file_cue_discovery.errors.is_empty() {
+        app.set_status(format!(
+            "GNUDB: {}",
+            multi_file_cue_discovery.errors.join("; ")
+        ));
+        return;
+    }
+    if cue_infos.is_empty() && multi_file_cue_layouts.is_empty() && audio_paths.is_empty() {
         app.set_status("No audio files for GNUDB lookup");
         return;
     }
@@ -1874,6 +1891,43 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             return;
         }
     };
+    if !multi_file_cue_layouts.is_empty() {
+        if multi_file_cue_layouts.len() != 1 {
+            super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
+            app.set_status(
+                "GNUDB: multiple native multi-FILE CUE albums are selected; \
+                 select one CUE or one album copy"
+                    .to_string(),
+            );
+            return;
+        }
+        let layout = multi_file_cue_layouts[0].clone();
+        let disc_id = match super::cue_parser::probe_multi_file_cue(layout.clone())
+            .and_then(|info| super::command::multi_file_cue_info_to_cd_sectors(&info))
+            .and_then(|sectors| super::gnudb::compute_disc_id_from_sectors(&sectors))
+        {
+            Ok(disc_id) => disc_id,
+            Err(err) => {
+                super::event_loop::retire_gnudb_operation_with_editor_restore(app, operation_id);
+                app.set_status(format!("GNUDB: {err}"));
+                return;
+            }
+        };
+        app.set_status(format!(
+            "Querying gnudb.org (multi-FILE CUE, disc ID: {})...",
+            disc_id.disc_id
+        ));
+        let paths_for_editor = layout.track_audio_paths;
+        super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
+            let result = super::gnudb::query_gnudb(&disc_id).await;
+            super::message::AppMessage::GnudbQueryComplete {
+                operation_id,
+                result,
+                paths: paths_for_editor,
+            }
+        });
+        return;
+    }
     if cue_infos.len() > 1 {
         if super::command::same_folder_split_cue_infos(&cue_infos) {
             if let Some(decision) =

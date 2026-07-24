@@ -22,7 +22,7 @@ pub struct CueSheet {
     pub date: Option<String>,
     /// Genre (from `REM GENRE`).
     pub genre: Option<String>,
-    /// 13-digit UPC/EAN from a `CATALOG` line.
+    /// Album catalog identifier from a `CATALOG` line.
     pub catalog: Option<String>,
     /// Tracks in order.
     pub tracks: Vec<CueTrack>,
@@ -460,13 +460,15 @@ pub enum CueSidecarWritebackOutcome {
 /// or Windows-1252) when every corrected character is representable. For UTF-8
 /// without BOM and ASCII-compatible legacy encodings, preservation is byte-span
 /// targeted: the decoded text identifies scopes and commands, but the writer
-/// replaces only the value bytes for editable quoted/REM metadata and copies
+/// replaces only the value bytes for editable quoted, REM, and CATALOG metadata and copies
 /// untouched raw lines unchanged. UTF-8 BOM and UTF-16 BOM files are re-encoded
 /// from line-preserved text so the BOM remains byte 0 even when album metadata
 /// must be inserted before the first logical CUE line.
-/// CATALOG and ISRC are intentionally structure/identifier fields for this writer
-/// and are never rewritten. If a legacy source encoding cannot represent the
-/// corrected metadata, write UTF-8 without a BOM rather than lossy replacement.
+/// Album-level CATALOG is rewritten because conversion treats the preferred
+/// sidecar as authoritative for that editable field. Track-level ISRC and all
+/// structural commands remain untouched. If a legacy source encoding cannot
+/// represent the corrected metadata, write UTF-8 without a BOM rather than
+/// lossy replacement.
 /// Values that cannot be represented losslessly in CUE syntax, such as embedded
 /// double quotes in quoted fields, are rejected so the caller can leave the
 /// sidecar stale instead of silently changing metadata. The function never truncates in
@@ -523,6 +525,7 @@ struct ExplicitCueScopeMetadata {
     songwriter: Option<String>,
     date: Option<String>,
     genre: Option<String>,
+    catalog: Option<String>,
 }
 
 fn validate_replacement_cuesheet_quoted_metadata(text: &str) -> Result<(), String> {
@@ -639,6 +642,8 @@ fn explicit_cue_metadata(text: &str) -> ExplicitCueMetadata {
             metadata.album.date = Some(value);
         } else if let Some(value) = parse_rem_field(trimmed, "GENRE") {
             metadata.album.genre = Some(value);
+        } else if let Some(value) = parse_plain_field(trimmed, "CATALOG") {
+            metadata.album.catalog = Some(value);
         }
     }
 
@@ -665,6 +670,7 @@ struct CueScopeLayout {
     songwriter: Option<usize>,
     date: Option<usize>,
     genre: Option<usize>,
+    catalog: Option<usize>,
     insert_after: Option<usize>,
     indent: Option<String>,
 }
@@ -1064,6 +1070,17 @@ fn queue_scope_metadata_byte_edits(
             insertions,
             need_utf8_fallback,
         )?;
+        queue_plain_metadata_byte_edit(
+            lines,
+            layout.catalog,
+            desired.catalog.as_deref(),
+            "CATALOG",
+            layout,
+            source_encoding,
+            replacements,
+            insertions,
+            need_utf8_fallback,
+        )?;
     }
 
     Ok(())
@@ -1129,6 +1146,37 @@ fn queue_rem_metadata_byte_edit(
         }
     } else {
         let line = format_rem_line(&scope_indent(layout), field, value);
+        match encode_text_for_source_line(&line, source_encoding) {
+            Some(bytes) => insertions.push(bytes),
+            None => *need_utf8_fallback = true,
+        }
+    }
+    Ok(())
+}
+
+fn queue_plain_metadata_byte_edit(
+    lines: &[CueRawLine],
+    existing_idx: Option<usize>,
+    desired: Option<&str>,
+    keyword: &str,
+    layout: &CueScopeLayout,
+    source_encoding: CueWriteEncoding,
+    replacements: &mut std::collections::BTreeMap<usize, Vec<u8>>,
+    insertions: &mut Vec<Vec<u8>>,
+    need_utf8_fallback: &mut bool,
+) -> Result<(), String> {
+    let Some(value) = desired else { return Ok(()); };
+    validate_cue_plain_metadata_value(keyword, value)?;
+    if let Some(idx) = existing_idx {
+        match replace_plain_value_bytes(&lines[idx].body, keyword, value, source_encoding)? {
+            ByteLineEdit::Unchanged => {}
+            ByteLineEdit::Rewritten(bytes) => {
+                replacements.insert(idx, bytes);
+            }
+            ByteLineEdit::NeedUtf8Fallback => *need_utf8_fallback = true,
+        }
+    } else {
+        let line = format_plain_line(&scope_indent(layout), keyword, value);
         match encode_text_for_source_line(&line, source_encoding) {
             Some(bytes) => insertions.push(bytes),
             None => *need_utf8_fallback = true,
@@ -1223,6 +1271,35 @@ fn replace_rem_value_bytes(
         out.push(b' ');
     } else {
         out.extend_from_slice(&body[field_end..value_start]);
+    }
+    out.extend_from_slice(&encoded_value);
+    out.extend_from_slice(&body[value_end..]);
+    if out == body {
+        Ok(ByteLineEdit::Unchanged)
+    } else {
+        Ok(ByteLineEdit::Rewritten(out))
+    }
+}
+
+fn replace_plain_value_bytes(
+    body: &[u8],
+    keyword: &str,
+    value: &str,
+    source_encoding: CueWriteEncoding,
+) -> Result<ByteLineEdit, String> {
+    let keyword_end = match_ascii_keyword_at_line_start(body, keyword, source_encoding)
+        .ok_or_else(|| format!("failed to byte-locate {} metadata line in sidecar CUE", keyword))?;
+    let value_start = skip_ascii_whitespace(body, keyword_end);
+    let value_end = trim_ascii_end(body);
+    let Some(encoded_value) = encode_text_for_source_line(value.trim(), source_encoding) else {
+        return Ok(ByteLineEdit::NeedUtf8Fallback);
+    };
+    let mut out = Vec::with_capacity(body.len() + encoded_value.len() + 1);
+    out.extend_from_slice(&body[..keyword_end]);
+    if value_start == keyword_end {
+        out.push(b' ');
+    } else {
+        out.extend_from_slice(&body[keyword_end..value_start]);
     }
     out.extend_from_slice(&encoded_value);
     out.extend_from_slice(&body[value_end..]);
@@ -1364,6 +1441,15 @@ fn queue_scope_metadata_edits(
             replacements,
             insertions,
         )?;
+        queue_plain_metadata_edit(
+            lines,
+            layout.catalog,
+            desired.catalog.as_deref(),
+            "CATALOG",
+            layout,
+            replacements,
+            insertions,
+        )?;
     }
 
     Ok(())
@@ -1417,6 +1503,30 @@ fn queue_rem_metadata_edit(
         }
     } else {
         insertions.push(format_rem_line(&scope_indent(layout), field, value));
+    }
+    Ok(())
+}
+
+fn queue_plain_metadata_edit(
+    lines: &[CueTextLine],
+    existing_idx: Option<usize>,
+    desired: Option<&str>,
+    keyword: &str,
+    layout: &CueScopeLayout,
+    replacements: &mut std::collections::BTreeMap<usize, String>,
+    insertions: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(value) = desired else { return Ok(()); };
+    validate_cue_plain_metadata_value(keyword, value)?;
+    if let Some(idx) = existing_idx {
+        let rewritten = replace_plain_value(&lines[idx].body, keyword, value).unwrap_or_else(|| {
+            format_plain_line(&leading_indent(&lines[idx].body), keyword, value)
+        });
+        if rewritten != lines[idx].body {
+            replacements.insert(idx, rewritten);
+        }
+    } else {
+        insertions.push(format_plain_line(&scope_indent(layout), keyword, value));
     }
     Ok(())
 }
@@ -1490,6 +1600,9 @@ fn record_scope_line(layout: &mut CueScopeLayout, idx: usize, body: &str, album_
     } else if album_scope && parse_rem_field(trimmed, "GENRE").is_some() {
         layout.genre = Some(idx);
         recorded = true;
+    } else if album_scope && strip_keyword_ci(trimmed, "CATALOG").is_some() {
+        layout.catalog = Some(idx);
+        recorded = true;
     }
 
     if recorded && layout.indent.is_none() {
@@ -1561,6 +1674,25 @@ fn replace_quoted_value(body: &str, keyword: &str, value: &str) -> Option<String
     Some(out)
 }
 
+fn replace_plain_value(body: &str, keyword: &str, value: &str) -> Option<String> {
+    let trimmed = body.trim_start();
+    let rest = strip_keyword_ci(trimmed, keyword)?;
+    let keyword_start = body.len() - trimmed.len();
+    let keyword_end = keyword_start + keyword.len();
+    let value_start = keyword_end + rest.len() - rest.trim_start().len();
+    let value_end = body.trim_end().len();
+    let mut out = String::new();
+    out.push_str(&body[..keyword_end]);
+    if value_start == keyword_end {
+        out.push(' ');
+    } else {
+        out.push_str(&body[keyword_end..value_start]);
+    }
+    out.push_str(value.trim());
+    out.push_str(&body[value_end..]);
+    Some(out)
+}
+
 fn replace_rem_value(body: &str, field: &str, value: &str) -> Option<String> {
     let trimmed = body.trim_start();
     let rem_rest = strip_keyword_ci(trimmed, "REM")?;
@@ -1611,6 +1743,10 @@ fn format_rem_line(indent: &str, field: &str, value: &str) -> String {
     format!("{}REM {} {}", indent, field, format_rem_value(value))
 }
 
+fn format_plain_line(indent: &str, keyword: &str, value: &str) -> String {
+    format!("{}{} {}", indent, keyword, value.trim())
+}
+
 fn format_rem_value(value: &str) -> String {
     if value.chars().any(char::is_whitespace) {
         format!("\"{}\"", escape_cue_quoted(value))
@@ -1628,6 +1764,18 @@ fn validate_cue_quoted_metadata_value(field: &str, value: &str) -> Result<(), St
     if value.contains('"') {
         return Err(format!(
             "sidecar CUE was left stale because {} contains a double quote, which CUE quoted strings cannot represent losslessly",
+            field
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cue_plain_metadata_value(field: &str, value: &str) -> Result<(), String> {
+    validate_cue_line_metadata_value(field, value)?;
+    if value.trim().is_empty() {
+        return Err(format!(
+            "sidecar CUE was left stale because {} is empty and cannot be written as a \
+             CUE metadata value",
             field
         ));
     }
@@ -1921,7 +2069,7 @@ pub fn parse_cue(content: &str) -> CueSheet {
                 sheet.genre = Some(val);
                 continue;
             }
-            // CATALOG <13 digits>
+            // CATALOG <album catalog identifier>
             if let Some(val) = strip_keyword_ci(trimmed, "CATALOG").map(|s| s.trim()) {
                 if !val.is_empty() {
                     sheet.catalog = Some(val.to_string());
@@ -2033,6 +2181,16 @@ fn extract_quoted(s: &str) -> Option<String> {
     Some(s[..end].to_string())
 }
 
+/// Parse a non-empty, unquoted command tail such as `CATALOG value`.
+fn parse_plain_field(line: &str, keyword: &str) -> Option<String> {
+    let value = strip_keyword_ci(line, keyword)?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 /// Parse a `REM FIELD value` or `REM FIELD "value"` line.
 fn parse_rem_field(line: &str, field: &str) -> Option<String> {
     let rest = strip_keyword_ci(line, "REM")?.trim_start();
@@ -2104,7 +2262,7 @@ mod tests {
             "REM COMMENT untouched\n",
             "PERFORMER \"Old Artist\"\r\n",
             "TITLE \"Old Album\"\n",
-            "CATALOG 1111111111111\r\n",
+            "catalog\t1111111111111  \r\n",
             "REM GENRE Rock\n",
             "FILE \"image.wav\" WAVE\r\n",
             "  TRACK 01 AUDIO\n",
@@ -2147,7 +2305,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
             "REM COMMENT untouched\n",
             "PERFORMER \"New Artist\"\r\n",
             "TITLE \"New Album\"\n",
-            "CATALOG 1111111111111\r\n",
+            "catalog\t2222222222222  \r\n",
             "REM GENRE Jazz\n",
             "FILE \"image.wav\" WAVE\r\n",
             "  TRACK 01 AUDIO\n",
@@ -2172,7 +2330,8 @@ FILE \"different-generated-name.flac\" FLAC\n\
         );
         let rewritten = std::str::from_utf8(&raw).expect("rewritten UTF-8 cue");
         assert!(!rewritten.contains("different-generated-name.flac"));
-        assert!(!rewritten.contains("2222222222222"));
+        assert!(rewritten.contains("catalog\t2222222222222  "));
+        assert!(!rewritten.contains("1111111111111"));
         assert!(!rewritten.contains("USRC17607841"));
 
         let before_second_save = std::fs::read(&cue_path).expect("read before second save");
@@ -2197,7 +2356,14 @@ FILE \"different-generated-name.flac\" FLAC\n\
         original.extend_from_slice(original_body.as_bytes());
         std::fs::write(&cue_path, &original).expect("write UTF-8 BOM cue");
 
-        let replacement = "TITLE \"New Album\"\nFILE \"generated.flac\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"New Track\"\n    INDEX 01 00:00:00\n";
+        let replacement = concat!(
+            "TITLE \"New Album\"\n",
+            "CATALOG 9876543210123\n",
+            "FILE \"generated.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"New Track\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
         let outcome = rewrite_cue_sidecar_metadata_from_cuesheet(&cue_path, replacement)
             .expect("rewrite UTF-8 BOM cue with inserted album metadata");
         assert_eq!(
@@ -2205,7 +2371,14 @@ FILE \"different-generated-name.flac\" FLAC\n\
             CueSidecarWritebackOutcome::Rewritten { encoding: "UTF-8 BOM".to_string() }
         );
 
-        let expected_body = "TITLE \"New Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"New Track\"\n    INDEX 01 00:00:00\n";
+        let expected_body = concat!(
+            "TITLE \"New Album\"\n",
+            "CATALOG 9876543210123\n",
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"New Track\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
         let mut expected = vec![0xEF, 0xBB, 0xBF];
         expected.extend_from_slice(expected_body.as_bytes());
         let raw = std::fs::read(&cue_path).expect("read rewritten UTF-8 BOM cue");
@@ -2226,6 +2399,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
         let sheet = parse_cue(decoded_with_bom);
         assert_eq!(sheet.title.as_deref(), Some("New Album"));
+        assert_eq!(sheet.catalog.as_deref(), Some("9876543210123"));
         assert_eq!(sheet.tracks.len(), 1);
         assert_eq!(sheet.tracks[0].title.as_deref(), Some("New Track"));
         assert_eq!(sheet.tracks[0].file.as_deref(), Some("album.flac"));

@@ -76,6 +76,52 @@ pub fn compute_disc_id(durations_secs: &[f64]) -> DiscIdResult {
     }
 }
 
+/// Compute a CDDB1 disc ID from exact CD-sector track offsets plus lead-out.
+///
+/// `sectors` uses the same shape as MusicBrainz TOCs: one offset per track,
+/// followed by the lead-out. This avoids converting a native multi-FILE CUE's
+/// exact per-track geometry through floating-point durations before GNUDB.
+pub fn compute_disc_id_from_sectors(sectors: &[u32]) -> Result<DiscIdResult, String> {
+    if sectors.len() < 2 {
+        return Err("GNUDB TOC has no tracks".to_string());
+    }
+    let n_tracks = sectors.len() - 1;
+    if sectors[0] != 150 {
+        return Err("GNUDB TOC must start at the standard 150-frame lead-in".to_string());
+    }
+    if n_tracks > 99 {
+        return Err(format!(
+            "GNUDB TOC has {n_tracks} tracks; CDDB is limited to 99"
+        ));
+    }
+    if sectors.windows(2).any(|pair| pair[1] <= pair[0]) {
+        return Err("GNUDB TOC offsets are not strictly increasing".to_string());
+    }
+
+    let offsets = sectors[..n_tracks].to_vec();
+    let leadout = sectors[n_tracks];
+    let total_secs = leadout / 75 - offsets[0] / 75;
+
+    let mut checksum = 0u32;
+    for &offset in &offsets {
+        let mut secs = offset / 75;
+        while secs > 0 {
+            checksum += secs % 10;
+            secs /= 10;
+        }
+    }
+    checksum %= 255;
+
+    let disc_id =
+        (checksum << 24) | ((total_secs & 0xFFFF) << 8) | (n_tracks as u32 & 0xFF);
+    Ok(DiscIdResult {
+        disc_id: format!("{disc_id:08x}"),
+        offsets,
+        total_secs,
+        n_tracks,
+    })
+}
+
 // ── GNUDB HTTP client ───────────────────────────────────────────────
 
 const GNUDB_BASE: &str = "http://gnudb.gnudb.org/~cddb/cddb.cgi";
@@ -789,6 +835,26 @@ mod gnudb_per_track_tests {
 
         let cues = find_cues_in_dir(td.path());
         assert_eq!(cues, vec![visible], "ImportCue enumeration must not surface hidden dot-cue sidecars");
+    }
+
+    #[test]
+    fn exact_sector_disc_id_matches_duration_based_computation() {
+        let sectors = vec![150, 525, 900, 1200, 1575, 1800];
+        let exact = compute_disc_id_from_sectors(&sectors).expect("exact sector disc ID");
+        let duration_based = compute_disc_id(&[5.0, 5.0, 4.0, 5.0, 3.0]);
+        assert_eq!(exact.disc_id, duration_based.disc_id);
+        assert_eq!(exact.offsets, duration_based.offsets);
+        assert_eq!(exact.total_secs, duration_based.total_secs);
+        assert_eq!(exact.n_tracks, duration_based.n_tracks);
+    }
+
+    #[test]
+    fn exact_sector_disc_id_rejects_invalid_geometry() {
+        assert!(compute_disc_id_from_sectors(&[]).is_err());
+        assert!(compute_disc_id_from_sectors(&[150]).is_err());
+        assert!(compute_disc_id_from_sectors(&[0, 150]).is_err());
+        assert!(compute_disc_id_from_sectors(&[150, 150]).is_err());
+        assert!(compute_disc_id_from_sectors(&[225, 150]).is_err());
     }
 
     fn cuesheet_entry(text: &str) -> TagEntry {

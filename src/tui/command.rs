@@ -1069,6 +1069,273 @@ pub(crate) fn collect_single_image_cue_infos_for_sources(
     infos
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct MultiFileCueDiscovery {
+    pub layouts: Vec<super::cue_parser::MultiFileCueLayout>,
+    pub errors: Vec<String>,
+}
+
+fn rejected_multi_file_cue_is_relevant_to_selection(
+    cue_path: &std::path::Path,
+    sources: &[PathBuf],
+    audio_keys: &std::collections::BTreeSet<PathBuf>,
+) -> bool {
+    let cue_key = cue_info_path_key(cue_path);
+    if sources
+        .iter()
+        .any(|source| source.is_file() && cue_info_path_key(source) == cue_key)
+    {
+        return true;
+    }
+
+    let selected_parent = sources.iter().any(|source| {
+        source.is_dir()
+            && cue_path
+                .parent()
+                .is_some_and(|parent| cue_info_path_key(parent) == cue_info_path_key(source))
+    });
+    let Ok(sheet) = super::cue_parser::parse_cue_file(cue_path) else {
+        // A malformed CUE cannot be associated with one selected audio file
+        // safely. It remains fatal when the user selected the CUE or its whole
+        // folder, but it must not veto an unrelated file-level lookup.
+        return selected_parent;
+    };
+    let Some(parent) = cue_path.parent() else {
+        return selected_parent;
+    };
+    sheet.tracks.iter().any(|track| {
+        track
+            .file
+            .as_deref()
+            .and_then(|file_ref| {
+                super::accuraterip::resolve_cue_file_reference(parent, file_ref)
+            })
+            .is_some_and(|resolved| audio_keys.contains(&cue_info_path_key(&resolved)))
+    })
+}
+
+/// Discover native multi-FILE CUE layouts associated with a Browse/editor
+/// source set. Membership comes from the shared convert-layer admission path;
+/// this collector filters admitted layouts against the selected audio set and
+/// preserves only selection-relevant parse/admission failures. Rejected alien
+/// CUEs cannot veto an ordinary file lookup, while a rejected CUE that was
+/// selected explicitly or references selected audio still fails closed.
+pub(crate) fn discover_multi_file_cues_for_sources(
+    sources: &[PathBuf],
+    audio_paths: &[PathBuf],
+) -> MultiFileCueDiscovery {
+    discover_multi_file_cues_for_sources_with_policy(
+        sources,
+        audio_paths,
+        super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
+    )
+}
+
+pub(crate) fn discover_multi_file_cues_for_sources_with_policy(
+    sources: &[PathBuf],
+    audio_paths: &[PathBuf],
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) -> MultiFileCueDiscovery {
+    let audio_keys: std::collections::BTreeSet<PathBuf> = audio_paths
+        .iter()
+        .map(|path| cue_info_path_key(path))
+        .collect();
+
+    let mut cue_paths = Vec::new();
+    let mut seen_cues = std::collections::BTreeSet::new();
+    for source in sources {
+        collect_cue_paths_from_source(source, &mut cue_paths, &mut seen_cues);
+    }
+    for audio in audio_paths {
+        if let Some(parent) = audio.parent() {
+            collect_cue_paths_from_source(parent, &mut cue_paths, &mut seen_cues);
+        }
+    }
+
+    let mut discovery = MultiFileCueDiscovery::default();
+    for cue_path in cue_paths {
+        let layout = match super::cue_parser::multi_file_cue_layout_for_cue_with_policy(
+            &cue_path,
+            cue_policy,
+        ) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => continue,
+            Err(err) => {
+                if rejected_multi_file_cue_is_relevant_to_selection(
+                    &cue_path,
+                    sources,
+                    &audio_keys,
+                ) {
+                    discovery.errors.push(err);
+                }
+                continue;
+            }
+        };
+        if !audio_keys.is_empty()
+            && !layout
+                .audio_paths
+                .iter()
+                .any(|path| audio_keys.contains(&cue_info_path_key(path)))
+        {
+            continue;
+        }
+        discovery.layouts.push(layout);
+    }
+    discovery
+        .layouts
+        .sort_by(|a, b| a.cue_path.cmp(&b.cue_path));
+    discovery.errors.sort();
+    discovery.errors.dedup();
+    discovery
+}
+
+#[cfg(test)]
+mod multi_file_cue_discovery_tests {
+    use super::*;
+
+    fn write_rejected_multi_file_cue(dir: &std::path::Path, first_member: &str) -> PathBuf {
+        let cue_path = dir.join("broken-album.cue");
+        std::fs::write(
+            &cue_path,
+            format!(
+                r#"FILE "{first_member}" FLAC
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 00:01:00
+FILE "missing.flac" FLAC
+  TRACK 03 AUDIO
+    INDEX 01 00:00:00
+  TRACK 04 AUDIO
+    INDEX 01 00:01:00
+"#
+            ),
+        )
+        .expect("broken CUE fixture");
+        cue_path
+    }
+
+    #[test]
+    fn unrelated_rejected_cue_does_not_veto_selected_audio_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let selected = temp.path().join("selected.flac");
+        let unrelated = temp.path().join("unrelated.flac");
+        std::fs::write(&selected, b"selected").expect("selected audio");
+        std::fs::write(&unrelated, b"unrelated").expect("unrelated audio");
+        write_rejected_multi_file_cue(temp.path(), "unrelated.flac");
+
+        let discovery = discover_multi_file_cues_for_sources(
+            std::slice::from_ref(&selected),
+            std::slice::from_ref(&selected),
+        );
+
+        assert!(discovery.layouts.is_empty());
+        assert!(
+            discovery.errors.is_empty(),
+            "an alien rejected CUE must not block lookup: {:?}",
+            discovery.errors
+        );
+    }
+
+    #[test]
+    fn rejected_cue_referencing_selected_audio_still_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let selected = temp.path().join("selected.flac");
+        std::fs::write(&selected, b"selected").expect("selected audio");
+        write_rejected_multi_file_cue(temp.path(), "selected.flac");
+
+        let discovery = discover_multi_file_cues_for_sources(
+            std::slice::from_ref(&selected),
+            std::slice::from_ref(&selected),
+        );
+
+        assert!(discovery.layouts.is_empty());
+        assert_eq!(discovery.errors.len(), 1);
+        assert!(discovery.errors[0].contains("member image missing"));
+    }
+
+    #[tokio::test]
+    async fn probe_failure_dispatches_cached_album_text_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let side_a = temp.path().join("side-a.flac");
+        let side_b = temp.path().join("side-b.flac");
+        // Existing but deliberately non-audio members make admission succeed
+        // and the real probe path fail deterministically without external tools.
+        std::fs::write(&side_a, b"not audio").expect("side A fixture");
+        std::fs::write(&side_b, b"not audio").expect("side B fixture");
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(
+            &cue_path,
+            r#"PERFORMER "Fallback Artist"
+TITLE "Fallback Album"
+FILE "side-a.flac" FLAC
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 00:01:00
+FILE "side-b.flac" FLAC
+  TRACK 03 AUDIO
+    INDEX 01 00:00:00
+  TRACK 04 AUDIO
+    INDEX 01 00:01:00
+"#,
+        )
+        .expect("CUE fixture");
+        let layout = super::super::cue_parser::multi_file_cue_layout_for_cue(&cue_path)
+            .expect("admission result")
+            .expect("native multi-FILE layout");
+        assert!(
+            super::super::cue_parser::probe_multi_file_cue(layout.clone()).is_err(),
+            "fixture must exercise the probe-failure branch"
+        );
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let cache_key = super::super::musicbrainz::search_cache_key(
+            "Fallback Artist",
+            "Fallback Album",
+            None,
+            None,
+        );
+        app.db
+            .store_mb_search(&cache_key, r#"{"releases":[]}"#)
+            .expect("seed MusicBrainz cache");
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let dispatched = dispatch_multi_file_cue_musicbrainz_lookup(
+            &mut app,
+            &tx,
+            layout,
+            super::super::message::TagsMbOperationId::UNASSIGNED,
+            false,
+            None,
+        );
+
+        assert_eq!(dispatched, MultiFileCueMbDispatch::TextFallback);
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(text, _)| {
+                    text.contains(
+                        "TOC missed, cached text search for \"Fallback Artist / Fallback Album\"",
+                    )
+                }),
+            "probe failure must visibly dispatch the cached text-search fallback: {:?}",
+            app.status_message
+        );
+        let message = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("fallback worker timeout")
+            .expect("fallback completion message");
+        assert!(matches!(
+            message,
+            AppMessage::TagsFromMbComplete {
+                outcome: super::super::message::MbOutcome::Search { outcome: Ok(result), .. },
+                ..
+            } if result.releases.is_empty()
+        ));
+    }
+}
+
 pub(crate) fn paths_for_single_image_cue_infos(
     infos: &[super::cue_parser::SingleImageInfo],
 ) -> Vec<PathBuf> {
@@ -1147,6 +1414,199 @@ fn single_image_cue_info_to_cd_sectors(
     }
     sectors.push(frame as u32);
     super::musicbrainz::build_mb_toc(&sectors).map(|_| sectors)
+}
+
+fn seed_mb_query_from_multi_file_cue(
+    layout: &super::cue_parser::MultiFileCueLayout,
+) -> Option<SacdMbSeed> {
+    let artist = layout.sheet.performer.clone().unwrap_or_default();
+    let album = layout.sheet.title.clone().unwrap_or_default();
+    let catalog = layout.sheet.catalog.clone();
+    let year = layout.sheet.date.clone();
+
+    if artist.trim().is_empty()
+        && album.trim().is_empty()
+        && catalog.as_deref().unwrap_or_default().trim().is_empty()
+        && year.as_deref().unwrap_or_default().trim().is_empty()
+    {
+        None
+    } else {
+        Some(SacdMbSeed {
+            artist,
+            album,
+            catalog,
+            year,
+        })
+    }
+}
+
+/// Convert probe-derived native multi-FILE track geometry into one continuous
+/// Red Book TOC. Authored INDEX-to-INDEX durations stay exact in the CUE's
+/// native 75-frames-per-second domain. Only the final track in each FILE needs
+/// a physical-EOF conversion; that conversion deliberately floors to the last
+/// complete CD sector represented by the file's sample count.
+pub(crate) fn multi_file_cue_info_to_cd_sectors(
+    info: &super::cue_parser::MultiFileCueInfo,
+) -> Result<Vec<u32>, String> {
+    let track_count = info.track_boundaries.len();
+    if track_count == 0 || track_count != info.layout.sheet.tracks.len() {
+        return Err("multi-FILE CUE has inconsistent track geometry".to_string());
+    }
+    if track_count > 99 {
+        return Err(format!(
+            "multi-FILE CUE has {track_count} tracks; CD TOCs are limited to 99"
+        ));
+    }
+
+    let mut sectors = Vec::with_capacity(track_count + 1);
+    let mut frame = CD_TOC_PREGAP_FRAMES as u64;
+    for (index, boundary) in info.track_boundaries.iter().enumerate() {
+        let start_frame = u32::try_from(frame).map_err(|_| {
+            format!(
+                "multi-FILE CUE track {} starts beyond the representable CD TOC range",
+                index + 1
+            )
+        })?;
+        sectors.push(start_frame);
+        let duration_frames = if let Some(end_frame) = boundary.end_frame {
+            u64::from(end_frame.checked_sub(boundary.start_frame).ok_or_else(|| {
+                format!(
+                    "multi-FILE CUE track {} has a zero-length or overlapping CUE boundary",
+                    index + 1
+                )
+            })?)
+        } else {
+            if boundary.sample_rate == 0 {
+                return Err(format!(
+                    "multi-FILE CUE track {} has an invalid zero sample rate",
+                    index + 1
+                ));
+            }
+            let file_end_frame = (boundary.file_total_samples as u128)
+                .checked_mul(75)
+                .ok_or_else(|| {
+                    format!(
+                        "multi-FILE CUE track {} physical EOF overflowed",
+                        index + 1
+                    )
+                })?
+                / boundary.sample_rate as u128;
+            let file_end_frame = u64::try_from(file_end_frame).map_err(|_| {
+                format!(
+                    "multi-FILE CUE track {} physical EOF exceeds the supported range",
+                    index + 1
+                )
+            })?;
+            file_end_frame
+                .checked_sub(u64::from(boundary.start_frame))
+                .ok_or_else(|| {
+                    format!(
+                        "multi-FILE CUE track {} starts beyond physical EOF",
+                        index + 1
+                    )
+                })?
+        };
+        if duration_frames == 0 {
+            return Err(format!(
+                "multi-FILE CUE track {} is shorter than one CD sector",
+                index + 1
+            ));
+        }
+        frame = frame.checked_add(duration_frames).ok_or_else(|| {
+            format!(
+                "multi-FILE CUE track {} overflows the continuous TOC",
+                index + 1
+            )
+        })?;
+    }
+    sectors.push(u32::try_from(frame).map_err(|_| {
+        "multi-FILE CUE lead-out exceeds the representable CD TOC range".to_string()
+    })?);
+    if super::musicbrainz::build_mb_toc(&sectors).is_none() {
+        return Err("multi-FILE CUE produced an invalid or too-short CD TOC".to_string());
+    }
+    Ok(sectors)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiFileCueMbDispatch {
+    Toc,
+    TextFallback,
+    FailedWithoutFallbackMetadata,
+}
+
+fn dispatch_multi_file_cue_musicbrainz_text_fallback(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    layout: &super::cue_parser::MultiFileCueLayout,
+    operation_id: super::message::TagsMbOperationId,
+    editor_park: bool,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
+) -> bool {
+    let Some(seed) = seed_mb_query_from_multi_file_cue(layout) else {
+        return false;
+    };
+    let ctx = super::message::TagsMbContext {
+        operation_id,
+        paths: layout.track_audio_paths.clone(),
+        editor_park,
+        fallback_seed: None,
+        editor_session,
+    };
+    super::event_loop::spawn_tags_mb_text_search(
+        app,
+        tx,
+        seed,
+        ctx,
+        super::event_loop::TextSearchMode::TocFallback,
+    );
+    true
+}
+
+fn dispatch_multi_file_cue_musicbrainz_lookup(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    layout: super::cue_parser::MultiFileCueLayout,
+    operation_id: super::message::TagsMbOperationId,
+    editor_park: bool,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
+) -> MultiFileCueMbDispatch {
+    let fallback_seed = seed_mb_query_from_multi_file_cue(&layout);
+    match super::cue_parser::probe_multi_file_cue(layout.clone())
+        .and_then(|info| multi_file_cue_info_to_cd_sectors(&info))
+    {
+        Ok(sectors) => {
+            spawn_tags_mb_toc_lookup(
+                app,
+                tx,
+                operation_id,
+                vec![super::musicbrainz::TocCandidate::exact(sectors)],
+                layout.track_audio_paths.clone(),
+                editor_park,
+                fallback_seed,
+                editor_session,
+            );
+            MultiFileCueMbDispatch::Toc
+        }
+        Err(err) => {
+            if dispatch_multi_file_cue_musicbrainz_text_fallback(
+                app,
+                tx,
+                &layout,
+                operation_id,
+                editor_park,
+                editor_session,
+            ) {
+                MultiFileCueMbDispatch::TextFallback
+            } else {
+                app.set_status(format!(
+                    ":tags-mb: {err}; no album/artist/catalog/year metadata is available \
+                     for text-search fallback"
+                ));
+                MultiFileCueMbDispatch::FailedWithoutFallbackMetadata
+            }
+        }
+    }
 }
 
 fn split_cue_album_grouping_probe_inputs(
@@ -1883,6 +2343,129 @@ fn in_editor_split_cue_mb_request_from_unified_album(
             .or_else(|| sheet.audio_paths.first().cloned()),
         editor_session: metadata_editor_session_guard(state),
     })
+}
+
+fn native_multi_file_cue_layout_from_editor(
+    state: &super::app::MetadataEditorState,
+) -> Result<Option<super::cue_parser::MultiFileCueLayout>, String> {
+    let surface = state.active_surface();
+    let Some(synthetic) = surface.cue_album_synthetic_sheet.as_ref() else {
+        return Ok(None);
+    };
+    if synthetic.audio_paths.len() < 2 {
+        return Ok(None);
+    }
+    let cue_paths: std::collections::BTreeSet<PathBuf> = synthetic
+        .track_sources
+        .iter()
+        .map(|source| cue_info_path_key(&source.cue_path))
+        .collect();
+    if cue_paths.len() != 1 {
+        return Ok(None);
+    }
+    let cue_path = match surface.cue_source.as_ref() {
+        Some(super::app::MetadataCueSource::Sidecar(path)) => path.clone(),
+        Some(super::app::MetadataCueSource::Embedded(path)) => {
+            return Err(format!(
+                "native multi-FILE editor cannot use embedded CUE source {}",
+                path.display()
+            ));
+        }
+        None => {
+            return Err(
+                "native multi-FILE editor lost its policy-selected CUE source identity"
+                    .to_string(),
+            );
+        }
+    };
+    if !cue_paths.contains(&cue_info_path_key(&cue_path)) {
+        return Err(format!(
+            "native multi-FILE editor source {} does not match its track-to-CUE mapping",
+            cue_path.display()
+        ));
+    }
+    let layout = super::cue_parser::multi_file_cue_layout_for_cue_with_policy(
+        &cue_path,
+        crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "native multi-FILE sidecar {} no longer describes the open album",
+            cue_path.display()
+        )
+    })?;
+    let expected_track_paths: Vec<PathBuf> = synthetic
+        .track_sources
+        .iter()
+        .map(|source| cue_info_path_key(&source.audio_path))
+        .collect();
+    let actual_track_paths: Vec<PathBuf> = layout
+        .track_audio_paths
+        .iter()
+        .map(|path| cue_info_path_key(path))
+        .collect();
+    if expected_track_paths != actual_track_paths {
+        return Err(format!(
+            "native multi-FILE sidecar {} changed after the metadata editor opened",
+            cue_path.display()
+        ));
+    }
+    Ok(Some(layout))
+}
+
+fn dispatch_native_multi_file_editor_tags_mb(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    state_owned: Box<super::app::MetadataEditorState>,
+    layout: super::cue_parser::MultiFileCueLayout,
+) -> bool {
+    use super::app::ActiveOverlay;
+
+    let editor_session = metadata_editor_session_guard(&state_owned);
+    let fallback_seed = seed_sacd_mb_query(&state_owned)
+        .or_else(|| seed_mb_query_from_multi_file_cue(&layout));
+    let result = super::cue_parser::probe_multi_file_cue(layout.clone())
+        .and_then(|info| multi_file_cue_info_to_cd_sectors(&info));
+    app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+
+    match result {
+        Ok(sectors) => {
+            spawn_tags_mb_toc_lookup(
+                app,
+                tx,
+                super::message::TagsMbOperationId::UNASSIGNED,
+                vec![super::musicbrainz::TocCandidate::exact(sectors)],
+                layout.track_audio_paths,
+                /* editor_park */ true,
+                fallback_seed,
+                Some(editor_session),
+            );
+        }
+        Err(err) => {
+            if let Some(seed) = fallback_seed {
+                let ctx = super::message::TagsMbContext {
+                    operation_id: super::message::TagsMbOperationId::UNASSIGNED,
+                    paths: layout.track_audio_paths,
+                    editor_park: true,
+                    fallback_seed: None,
+                    editor_session: Some(editor_session),
+                };
+                super::event_loop::spawn_tags_mb_text_search(
+                    app,
+                    tx,
+                    seed,
+                    ctx,
+                    super::event_loop::TextSearchMode::TocFallback,
+                );
+            } else {
+                app.set_status(format!(
+                    ":tags-mb: {err}; no album/artist/catalog/year metadata is available \
+                     for text-search fallback"
+                ));
+            }
+        }
+    }
+    true
 }
 
 
@@ -4824,8 +5407,18 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 &browse_selection_for_cues,
                 &paths,
             );
+            let multi_file_cue_discovery = discover_multi_file_cues_for_sources(
+                &browse_selection_for_cues,
+                &paths,
+            );
+            let multi_file_cue_layouts = &multi_file_cue_discovery.layouts;
 
-            if paths.is_empty() && cue_infos.is_empty() && cue_metadata_surfaces.is_empty() {
+            if paths.is_empty()
+                && cue_infos.is_empty()
+                && cue_metadata_surfaces.is_empty()
+                && multi_file_cue_layouts.is_empty()
+                && multi_file_cue_discovery.errors.is_empty()
+            {
                 // SACD ISOs are handled by the auto-open block at the
                 // top of this arm (C-2d); anything reaching here is
                 // genuinely a "no audio files" case (empty selection,
@@ -4840,7 +5433,9 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             // selections may not expand to ordinary audio paths, so use the
             // CUE-derived per-track image path vector when needed.
             if let Some(seed) = direct_seed {
-                let ctx_paths = if paths.is_empty() && !cue_metadata_surfaces.is_empty() {
+                let ctx_paths = if multi_file_cue_layouts.len() == 1 {
+                    multi_file_cue_layouts[0].track_audio_paths.clone()
+                } else if paths.is_empty() && !cue_metadata_surfaces.is_empty() {
                     paths_for_cue_metadata_surfaces(&cue_metadata_surfaces)
                 } else if paths.is_empty() && !cue_infos.is_empty() {
                     paths_for_single_image_cue_infos(&cue_infos)
@@ -4860,6 +5455,39 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     seed,
                     ctx,
                     super::event_loop::TextSearchMode::DirectRequest,
+                );
+                return;
+            }
+
+            if !multi_file_cue_discovery.errors.is_empty() {
+                app.set_status(format!(
+                    ":tags-mb: {}",
+                    multi_file_cue_discovery.errors.join("; ")
+                ));
+                return;
+            }
+
+            // One sidecar CUE that owns multiple audio images is one album.
+            // Build its TOC from per-track, per-FILE-local INDEX boundaries;
+            // never fall through to the ordinary whole-file concatenation,
+            // which would incorrectly treat each side/image as one track.
+            if !multi_file_cue_layouts.is_empty() {
+                if multi_file_cue_layouts.len() != 1 {
+                    app.set_status(
+                        ":tags-mb: multiple native multi-FILE CUE albums are selected; \
+                         select one CUE or one album copy"
+                            .to_string(),
+                    );
+                    return;
+                }
+                let layout = multi_file_cue_layouts[0].clone();
+                let _ = dispatch_multi_file_cue_musicbrainz_lookup(
+                    app,
+                    tx,
+                    layout,
+                    super::message::TagsMbOperationId::UNASSIGNED,
+                    /* editor_park */ false,
+                    /* editor_session */ None,
                 );
                 return;
             }
@@ -12462,6 +13090,37 @@ fn try_dispatch_in_editor_tags_mb(
         return Some(true);
     }
 
+    let native_multi_file_layout = match native_multi_file_cue_layout_from_editor(&state_owned) {
+        Ok(layout) => layout,
+        Err(err) => {
+            let fallback_seed = seed_sacd_mb_query(&state_owned);
+            let paths = metadata_editor_tags_mb_context_paths(&state_owned);
+            app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
+            if let Some(seed) = fallback_seed {
+                let ctx = super::message::TagsMbContext {
+                    operation_id: super::message::TagsMbOperationId::UNASSIGNED,
+                    paths,
+                    editor_park: true,
+                    fallback_seed: None,
+                    editor_session: Some(editor_session),
+                };
+                super::event_loop::spawn_tags_mb_text_search(
+                    app,
+                    tx,
+                    seed,
+                    ctx,
+                    super::event_loop::TextSearchMode::TocFallback,
+                );
+            } else {
+                app.set_status(format!(
+                    ":tags-mb: {err}; no album/artist/catalog/year metadata is available \
+                     for text-search fallback"
+                ));
+            }
+            return Some(true);
+        }
+    };
+
     // Compute sectors + fallback eligibility per editor kind. SACD
     // editors derive geometry from their stashed per-area durations
     // and enable the text-search fallback (TOC misses are common for
@@ -12644,6 +13303,13 @@ fn try_dispatch_in_editor_tags_mb(
             },
         };
         (sectors, seed, true)
+    } else if let Some(layout) = native_multi_file_layout {
+        return Some(dispatch_native_multi_file_editor_tags_mb(
+            app,
+            tx,
+            state_owned,
+            layout,
+        ));
     } else if let Some(request) = in_editor_split_cue_mb_request_from_unified_album(&state_owned) {
         app.active_overlay = ActiveOverlay::MetadataEditor(state_owned);
         spawn_in_editor_split_cue_musicbrainz_info_collection(app, tx, request);
