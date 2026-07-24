@@ -16,10 +16,380 @@ pub enum SplitCueAlbumGroupingReason {
     AmbiguousMerge,
 }
 
+impl SplitCueAlbumGroupingReason {
+    #[must_use]
+    pub fn merges_cues(self) -> bool {
+        !matches!(self, Self::PerCueDistinctTocHits)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitCueAlbumGroupingDecision {
     pub groups: Vec<Vec<PathBuf>>,
     pub reason: SplitCueAlbumGroupingReason,
+    /// Validated, operation/session-scoped proof for merged groups. The map is
+    /// private so callers cannot construct membership by combining unrelated
+    /// paths. Provenance is installed only through `with_current_member_provenance`,
+    /// which captures file-object identity and parsed CUE membership while all
+    /// members are readable.
+    merged_group_provenance: BTreeMap<Vec<PathBuf>, SplitCueMergedGroupProvenance>,
+}
+
+const SPLIT_CUE_GROUP_PROVENANCE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitCueFileIdentity {
+    canonical_path: PathBuf,
+    device_inode: Option<(u64, u64)>,
+    created: Option<(u64, u32)>,
+    size: u64,
+    modified: Option<(u64, u32)>,
+}
+
+impl SplitCueFileIdentity {
+    fn capture(path: &Path) -> Option<Self> {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        let device_inode = {
+            use std::os::unix::fs::MetadataExt;
+            Some((metadata.dev(), metadata.ino()))
+        };
+        #[cfg(not(unix))]
+        let device_inode = None;
+        let created = metadata.created().ok().and_then(system_time_key);
+        if device_inode.is_none() && created.is_none() {
+            return None;
+        }
+
+        Some(Self {
+            canonical_path: cue_path_key(path),
+            device_inode,
+            created,
+            size: metadata.len(),
+            modified: metadata.modified().ok().and_then(system_time_key),
+        })
+    }
+
+    fn same_file_object_now(&self) -> bool {
+        let Some(current) = Self::capture(&self.canonical_path) else {
+            return false;
+        };
+        if current.canonical_path != self.canonical_path {
+            return false;
+        }
+        match (self.device_inode, current.device_inode) {
+            (Some(expected), Some(actual)) => {
+                expected == actual
+                    && match (self.created, current.created) {
+                        (Some(expected_created), Some(actual_created)) => {
+                            expected_created == actual_created
+                        }
+                        _ => true,
+                    }
+            }
+            _ => match (self.created, current.created) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => false,
+            },
+        }
+    }
+
+    fn same_snapshot_now(&self) -> bool {
+        Self::capture(&self.canonical_path).is_some_and(|current| &current == self)
+    }
+
+    fn same_snapshot_or_missing_now(&self) -> bool {
+        match std::fs::symlink_metadata(&self.canonical_path) {
+            Ok(_) => self.same_snapshot_now(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
+    }
+}
+
+fn system_time_key(value: std::time::SystemTime) -> Option<(u64, u32)> {
+    let duration = value.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((duration.as_secs(), duration.subsec_nanos()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitCueMembershipFingerprint {
+    album_title: Option<String>,
+    tracks: Vec<SplitCueTrackMembershipFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitCueTrackMembershipFingerprint {
+    number: u32,
+    file: Option<String>,
+    index01_frames: Option<u32>,
+}
+
+impl SplitCueMembershipFingerprint {
+    fn from_sheet(sheet: &crate::convert::cue_parser::CueSheet) -> Self {
+        Self {
+            album_title: sheet.title.as_deref().map(str::trim).map(str::to_owned),
+            tracks: sheet
+                .tracks
+                .iter()
+                .map(|track| SplitCueTrackMembershipFingerprint {
+                    number: track.number,
+                    file: track.file.as_deref().map(normalize_cue_file_reference),
+                    index01_frames: track.index01_frames,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn normalize_cue_file_reference(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitCueMemberProvenance {
+    cue_identity: SplitCueFileIdentity,
+    membership: SplitCueMembershipFingerprint,
+    audio_identities: Vec<SplitCueFileIdentity>,
+}
+
+impl SplitCueMemberProvenance {
+    fn capture(
+        cue_path: &Path,
+        sheet: &crate::convert::cue_parser::CueSheet,
+        audio_paths: &[PathBuf],
+    ) -> Option<Self> {
+        if audio_paths.is_empty() {
+            return None;
+        }
+        let cue_identity = SplitCueFileIdentity::capture(cue_path)?;
+        let mut audio_identities = audio_paths
+            .iter()
+            .map(|path| SplitCueFileIdentity::capture(path))
+            .collect::<Option<Vec<_>>>()?;
+        audio_identities.sort_by(|left, right| {
+            split_cue_path_cmp(&left.canonical_path, &right.canonical_path)
+        });
+        audio_identities.dedup_by(|left, right| left.canonical_path == right.canonical_path);
+        if audio_identities.is_empty() {
+            return None;
+        }
+        Some(Self {
+            cue_identity,
+            membership: SplitCueMembershipFingerprint::from_sheet(sheet),
+            audio_identities,
+        })
+    }
+
+    fn audio_paths(&self) -> Vec<PathBuf> {
+        self.audio_identities
+            .iter()
+            .map(|identity| identity.canonical_path.clone())
+            .collect()
+    }
+
+    fn matches_admitted_member(&self, member: &SplitCueAdmissionMember) -> bool {
+        if !self.cue_identity.same_file_object_now()
+            || self.membership != SplitCueMembershipFingerprint::from_sheet(&member.sheet)
+        {
+            return false;
+        }
+        let current_audio_keys: BTreeSet<PathBuf> = member
+            .referenced_audio
+            .iter()
+            .map(|path| cue_path_key(path))
+            .collect();
+        let recorded_audio_keys: BTreeSet<PathBuf> = self
+            .audio_identities
+            .iter()
+            .map(|identity| identity.canonical_path.clone())
+            .collect();
+        current_audio_keys == recorded_audio_keys
+            && self
+                .audio_identities
+                .iter()
+                .all(SplitCueFileIdentity::same_snapshot_now)
+    }
+
+    fn matches_rejected_member(&self, _rejection: &SplitCueMemberRejection) -> bool {
+        // Rejection is the expected failure transition: the proven CUE may now
+        // be unreadable or parseable-but-invalid, so its current membership
+        // text cannot be required to equal the readable snapshot. File-object
+        // identity proves that this is the same established member; atomic
+        // replacement at the pathname fails that check. Original member audio
+        // may be absent, but any current occupant must still match its captured
+        // object/snapshot before the proven group can suppress it.
+        self.cue_identity.same_file_object_now()
+            && self
+                .audio_identities
+                .iter()
+                .all(SplitCueFileIdentity::same_snapshot_or_missing_now)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitCueMergedGroupProvenance {
+    version: u32,
+    members: BTreeMap<PathBuf, SplitCueMemberProvenance>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SplitCueValidatedMergedGroupFailure {
+    pub cue_paths: Vec<PathBuf>,
+    pub audio_paths: Vec<PathBuf>,
+    pub rejections: Vec<SplitCueMemberRejection>,
+}
+
+impl SplitCueAlbumGroupingDecision {
+    /// Capture authoritative membership evidence from the current filesystem
+    /// while every member is readable and admissible. The decision's own group
+    /// paths are the only inputs: callers cannot attach an unrelated parsed
+    /// sheet or audio list. Any incomplete, cross-folder, non-merge, or
+    /// identity-less group is omitted atomically rather than partially recorded.
+    #[must_use]
+    pub fn with_current_member_provenance(mut self) -> Self {
+        let mut proven = BTreeMap::new();
+        if self.reason.merges_cues() {
+            for group in &self.groups {
+                let group_key = grouping_key_from_paths(group);
+                if group_key.len() < 2 || !same_folder_cue_paths(&group_key) {
+                    continue;
+                }
+                let mut captured = BTreeMap::new();
+                let mut complete = true;
+                for cue_path in &group_key {
+                    let Ok(admitted) = admit_split_cue_member(cue_path) else {
+                        complete = false;
+                        break;
+                    };
+                    let Some(member) = SplitCueMemberProvenance::capture(
+                        &admitted.cue_path,
+                        &admitted.sheet,
+                        &admitted.referenced_audio,
+                    ) else {
+                        complete = false;
+                        break;
+                    };
+                    let cue_parent = cue_path.parent().map(cue_path_key);
+                    if cue_parent.is_none()
+                        || member.audio_identities.iter().any(|identity| {
+                            identity.canonical_path.parent().map(cue_path_key) != cue_parent
+                        })
+                    {
+                        complete = false;
+                        break;
+                    }
+                    captured.insert(cue_path.clone(), member);
+                }
+                if complete && captured.len() == group_key.len() {
+                    proven.insert(
+                        group_key,
+                        SplitCueMergedGroupProvenance {
+                            version: SPLIT_CUE_GROUP_PROVENANCE_VERSION,
+                            members: captured,
+                        },
+                    );
+                }
+            }
+        }
+        self.merged_group_provenance = proven;
+        self
+    }
+
+    #[must_use]
+    pub fn member_audio_matches(&self, cue_path: &Path, expected: &[PathBuf]) -> bool {
+        let cue_key = cue_path_key(cue_path);
+        let expected_keys: BTreeSet<PathBuf> =
+            expected.iter().map(|path| cue_path_key(path)).collect();
+        self.merged_group_provenance.values().any(|group| {
+            group.members.get(&cue_key).is_some_and(|member| {
+                member.audio_paths().into_iter().collect::<BTreeSet<_>>() == expected_keys
+            })
+        })
+    }
+
+    #[must_use]
+    pub fn complete_member_audio_for_group(&self, group: &[PathBuf]) -> Option<Vec<PathBuf>> {
+        let group_key = grouping_key_from_paths(group);
+        let provenance = self.merged_group_provenance.get(&group_key)?;
+        if provenance.version != SPLIT_CUE_GROUP_PROVENANCE_VERSION
+            || provenance.members.len() != group_key.len()
+        {
+            return None;
+        }
+        let mut audio_paths = Vec::new();
+        for cue_path in &group_key {
+            audio_paths.extend(provenance.members.get(cue_path)?.audio_paths());
+        }
+        Some(dedup_split_cue_paths(audio_paths))
+    }
+
+    /// Validate an incomplete merged group against current file identity and
+    /// parsed membership. A changed-in-place CUE may become unreadable while
+    /// retaining its file-object identity; an atomic replacement at the same
+    /// pathname is rejected as stale. Captured audio may be absent, but any
+    /// file currently occupying a captured audio path must match its snapshot.
+    #[must_use]
+    pub fn validated_failed_merged_group(
+        &self,
+        group: &[PathBuf],
+        admitted: &[SplitCueAdmissionMember],
+        rejected: &[SplitCueMemberRejection],
+    ) -> Option<SplitCueValidatedMergedGroupFailure> {
+        if !self.reason.merges_cues() {
+            return None;
+        }
+        let group_key = grouping_key_from_paths(group);
+        let provenance = self.merged_group_provenance.get(&group_key)?;
+        if provenance.version != SPLIT_CUE_GROUP_PROVENANCE_VERSION
+            || group_key.len() < 2
+            || provenance.members.len() != group_key.len()
+        {
+            return None;
+        }
+
+        let admitted_by_key: BTreeMap<PathBuf, &SplitCueAdmissionMember> = admitted
+            .iter()
+            .map(|member| (cue_path_key(&member.cue_path), member))
+            .collect();
+        let rejected_by_key: BTreeMap<PathBuf, &SplitCueMemberRejection> = rejected
+            .iter()
+            .map(|rejection| (cue_path_key(&rejection.cue_path), rejection))
+            .collect();
+        let mut group_rejections = Vec::new();
+        let mut group_audio = Vec::new();
+        let mut admitted_count = 0usize;
+
+        for cue_path in &group_key {
+            let member_provenance = provenance.members.get(cue_path)?;
+            if let Some(member) = admitted_by_key.get(cue_path) {
+                if !member_provenance.matches_admitted_member(member) {
+                    return None;
+                }
+                admitted_count = admitted_count.saturating_add(1);
+            } else if let Some(rejection) = rejected_by_key.get(cue_path) {
+                if !member_provenance.matches_rejected_member(rejection) {
+                    return None;
+                }
+                group_rejections.push((*rejection).clone());
+            } else {
+                return None;
+            }
+            group_audio.extend(member_provenance.audio_paths());
+        }
+
+        if admitted_count == 0 || group_rejections.is_empty() {
+            return None;
+        }
+        Some(SplitCueValidatedMergedGroupFailure {
+            cue_paths: group_key,
+            audio_paths: dedup_split_cue_paths(group_audio),
+            rejections: group_rejections,
+        })
+    }
 }
 
 /// Album title for text lookup over a multi-part CUE album. Side-split rips
@@ -138,6 +508,7 @@ pub fn merge_decision(
     SplitCueAlbumGroupingDecision {
         groups: vec![grouping_key_from_paths(cue_paths)],
         reason,
+        merged_group_provenance: BTreeMap::new(),
     }
 }
 
@@ -156,7 +527,11 @@ pub fn split_each_decision(
         (None, None) => Ordering::Equal,
     });
     groups.dedup();
-    SplitCueAlbumGroupingDecision { groups, reason }
+    SplitCueAlbumGroupingDecision {
+        groups,
+        reason,
+        merged_group_provenance: BTreeMap::new(),
+    }
 }
 
 pub fn title_rung_decision(
@@ -255,6 +630,136 @@ impl SplitCueAdmissionMember {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitCueMemberRejectionReason {
+    ParseFailure { detail: String },
+    NoTracks,
+    NoParent,
+    MissingFileReference { track_number: u32 },
+    MissingIndex01 { track_number: u32 },
+    MissingImage { file_reference: String },
+    AmbiguousImage {
+        file_reference: String,
+        candidates: Vec<PathBuf>,
+    },
+    UnsupportedImage { path: PathBuf },
+    NonRegularImage { path: PathBuf },
+    ImageOutsideCueFolder { path: PathBuf },
+    NonIncreasingIndex {
+        track_number: u32,
+        path: PathBuf,
+        previous_track_number: u32,
+        previous_index: u32,
+    },
+}
+
+impl SplitCueMemberRejectionReason {
+    #[must_use]
+    pub fn is_parse_failure(&self) -> bool {
+        matches!(self, Self::ParseFailure { .. })
+    }
+}
+
+impl std::fmt::Display for SplitCueMemberRejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseFailure { detail } => write!(f, "member CUE invalid: {detail}"),
+            Self::NoTracks => f.write_str("member CUE has no tracks"),
+            Self::NoParent => f.write_str("member CUE has no parent"),
+            Self::MissingFileReference { track_number } => {
+                write!(f, "member CUE track {track_number} has no FILE reference")
+            }
+            Self::MissingIndex01 { track_number } => {
+                write!(f, "member CUE track {track_number} has no INDEX 01")
+            }
+            Self::MissingImage { file_reference } => {
+                write!(f, "member image missing: {file_reference}")
+            }
+            Self::AmbiguousImage {
+                file_reference,
+                candidates,
+            } => write!(
+                f,
+                "member image ambiguous: {file_reference}: {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::UnsupportedImage { path } => {
+                write!(f, "member image is not supported audio: {}", path.display())
+            }
+            Self::NonRegularImage { path } => {
+                write!(f, "member image is not a regular file: {}", path.display())
+            }
+            Self::ImageOutsideCueFolder { path } => {
+                write!(f, "member image is outside the CUE folder: {}", path.display())
+            }
+            Self::NonIncreasingIndex {
+                track_number,
+                path,
+                previous_track_number,
+                previous_index,
+            } => write!(
+                f,
+                "member CUE has non-increasing INDEX 01 for track {track_number} in {}; previous track {previous_track_number} was at frame {previous_index}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Typed admission rejection. `parsed_sheet` is present only when byte-level
+/// parsing succeeded, allowing callers to use title/FILE evidence without
+/// string parsing. It is deliberately absent for parse failures: membership of
+/// an unreadable CUE must come from authoritative grouping provenance, never
+/// from its filename or an error-message prefix.
+#[derive(Debug, Clone)]
+pub struct SplitCueMemberRejection {
+    pub cue_path: PathBuf,
+    pub reason: SplitCueMemberRejectionReason,
+    pub parsed_sheet: Option<Box<crate::convert::cue_parser::CueSheet>>,
+    pub resolved_in_folder_audio: Vec<PathBuf>,
+}
+
+impl SplitCueMemberRejection {
+    fn parse_failure(cue_path: &Path, detail: String) -> Self {
+        Self {
+            cue_path: cue_path.to_path_buf(),
+            reason: SplitCueMemberRejectionReason::ParseFailure { detail },
+            parsed_sheet: None,
+            resolved_in_folder_audio: Vec::new(),
+        }
+    }
+
+    fn from_parsed_sheet(
+        cue_path: &Path,
+        sheet: &crate::convert::cue_parser::CueSheet,
+        reason: SplitCueMemberRejectionReason,
+    ) -> Self {
+        Self {
+            cue_path: cue_path.to_path_buf(),
+            reason,
+            parsed_sheet: Some(Box::new(sheet.clone())),
+            resolved_in_folder_audio: resolved_in_folder_audio_references(cue_path, sheet),
+        }
+    }
+
+    #[must_use]
+    pub fn is_parse_failure(&self) -> bool {
+        self.reason.is_parse_failure()
+    }
+}
+
+impl std::fmt::Display for SplitCueMemberRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.cue_path.display(), self.reason)
+    }
+}
+
+impl std::error::Error for SplitCueMemberRejection {}
+
 #[derive(Debug, Clone)]
 pub struct SplitCueFolderAdmission {
     pub parent: PathBuf,
@@ -290,35 +795,23 @@ pub struct SplitCueFolderRejection {
     pub folder_admitted_local_members: bool,
 }
 
-/// Lenient re-scan used only on the rejection path: does this cue resolve
-/// any existing audio file inside its own folder tree (subfolders included)?
-/// Parse failure counts as YES — fail closed toward atomic refusal.
-fn cue_references_in_folder_audio(cue_path: &Path) -> bool {
-    let Some(parent) = cue_path.parent() else {
-        return false;
-    };
-    let Ok(sheet) = crate::convert::cue_parser::parse_cue_file(cue_path) else {
-        return true;
-    };
-    let parent_key = cue_path_key(parent);
-    let mut refs: Vec<String> = Vec::new();
-    for track in &sheet.tracks {
-        if let Some(file_ref) = track.file.as_ref() {
-            if !refs.iter().any(|existing| existing == file_ref) {
-                refs.push(file_ref.clone());
-            }
-        }
+/// Non-destructive provenance that the shared folder-selection policy
+/// classified multiple parseable multi-FILE CUEs as one album before one or
+/// more members could be rejected. Queue expansion may use this only to
+/// preserve the selected album's synthetic representation; it is deliberately
+/// insufficient for fail-closed suppression, which requires complete
+/// cue-to-audio provenance in `SplitCueAlbumGroupingDecision`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitCueSelectionAlbumGroup {
+    cue_paths: Vec<PathBuf>,
+}
+
+impl SplitCueSelectionAlbumGroup {
+    #[must_use]
+    pub fn contains(&self, cue_path: &Path) -> bool {
+        let cue_key = cue_path_key(cue_path);
+        self.cue_paths.iter().any(|path| *path == cue_key)
     }
-    refs.iter().any(|file_ref| {
-        matches!(
-            resolve_split_cue_file_reference(parent, file_ref),
-            SplitCueReferenceResolution::Resolved(resolved)
-                if resolved
-                    .ancestors()
-                    .skip(1)
-                    .any(|dir| cue_path_key(dir) == parent_key)
-        )
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,9 +828,10 @@ pub enum SplitCueReferenceResolution {
 }
 
 /// Folder-local cue selection outcome shared by metadata editing and queue
-/// expansion. Selection happens before the split-album grouping ladder so
+/// expansion. Selection happens before the full title/TOC grouping ladder so
 /// alternative descriptions of the same image can never be merged into a
-/// synthetic multi-part album.
+/// synthetic multi-part album. It records only a non-destructive title-rung
+/// result needed to preserve representation after a parseable member rejects.
 #[derive(Debug, Clone)]
 pub enum SplitCueFolderSelection {
     /// One unambiguous cue, or an all-exact pairwise-disjoint cue set that may
@@ -348,18 +842,23 @@ pub enum SplitCueFolderSelection {
         /// partially-resolvable rejected CUEs). Queue expansion suppresses
         /// these paths so a selection cannot leak alternatives back as raw jobs.
         excluded_audio: Vec<PathBuf>,
-        rejected: Vec<(PathBuf, String)>,
+        rejected: Vec<SplitCueMemberRejection>,
+        /// Album-group membership established by the shared title rung from
+        /// parseable multi-FILE candidates before selection removed invalid
+        /// members. This is representational provenance only, not authority
+        /// to suppress an unreadable member's unknown audio.
+        selection_album_group: Option<SplitCueSelectionAlbumGroup>,
     },
     /// More than one viable alternative remains after exact-match ranking.
     /// The caller must ask the user to choose exactly one.
     NeedsChoice {
         candidates: Vec<SplitCueAdmissionMember>,
-        rejected: Vec<(PathBuf, String)>,
+        rejected: Vec<SplitCueMemberRejection>,
     },
     /// No candidate resolves safely to local audio. Callers must fall back to
     /// their ordinary file/TOC path and surface the rejection visibly.
     NoViable {
-        rejected: Vec<(PathBuf, String)>,
+        rejected: Vec<SplitCueMemberRejection>,
     },
 }
 
@@ -373,10 +872,12 @@ pub enum SplitCueFolderSelection {
 /// 3. otherwise a validated operation-scoped choice among the currently tied,
 ///    equally best-ranked candidates.
 ///
-/// Role classification is deliberately not consulted here. Selection answers
-/// which CUE description(s) own the operation; only after that decision may a
-/// caller decide whether each selected CUE is a split source or a metadata
-/// artifact. Rejected alternatives never poison a viable winner.
+/// Role classification is consulted only for one narrow duplicate-description
+/// tie: an equally ranked single-image split source dominates a one-track
+/// metadata sidecar for that exact same image. Exact-reference ranking still comes first,
+/// so an exact metadata sidecar continues to beat a fallback split source.
+/// Otherwise selection remains role-neutral. Rejected alternatives never
+/// poison a viable winner.
 #[must_use]
 pub fn select_split_cue_folder_members(
     cue_paths: &[PathBuf],
@@ -392,12 +893,15 @@ pub fn select_split_cue_folder_members(
     for cue_path in ordered_paths {
         match admit_split_cue_member(&cue_path) {
             Ok(member) => members.push(member),
-            Err(message) => {
-                rejected_audio.extend(resolved_in_folder_audio_references(&cue_path));
-                rejected.push((cue_path, message));
+            Err(rejection) => {
+                rejected_audio.extend(rejection.resolved_in_folder_audio.iter().cloned());
+                rejected.push(rejection);
             }
         }
     }
+
+    let selection_album_group =
+        selection_album_group_from_parseable_multi_file_candidates(&members, &rejected);
 
     if members.is_empty() {
         return SplitCueFolderSelection::NoViable { rejected };
@@ -409,6 +913,7 @@ pub fn select_split_cue_folder_members(
             members.clone(),
             rejected_audio,
             rejected,
+            selection_album_group,
         );
     }
 
@@ -417,7 +922,7 @@ pub fn select_split_cue_folder_members(
         .filter(|member| member.all_file_references_exact)
         .cloned()
         .collect();
-    let candidates = if exact_members.is_empty() {
+    let mut candidates = if exact_members.is_empty() {
         members.clone()
     } else {
         exact_members.clone()
@@ -428,17 +933,30 @@ pub fn select_split_cue_folder_members(
             candidates,
             rejected_audio,
             rejected,
+            selection_album_group,
+        );
+    }
+
+    candidates = remove_metadata_sidecars_covered_by_split_sources(candidates);
+    if candidates.len() == 1 {
+        return selected_split_cue_folder_members(
+            &members,
+            candidates,
+            rejected_audio,
+            rejected,
+            selection_album_group,
         );
     }
 
     if !exact_members.is_empty()
-        && split_cue_member_audio_sets_are_pairwise_disjoint(&exact_members)
+        && split_cue_member_audio_sets_are_pairwise_disjoint(&candidates)
     {
         return selected_split_cue_folder_members(
             &members,
-            exact_members,
+            candidates,
             rejected_audio,
             rejected,
+            selection_album_group,
         );
     }
 
@@ -454,6 +972,7 @@ pub fn select_split_cue_folder_members(
                 vec![selected],
                 rejected_audio,
                 rejected,
+                selection_album_group,
             );
         }
     }
@@ -464,11 +983,88 @@ pub fn select_split_cue_folder_members(
     }
 }
 
+fn selection_album_group_from_parseable_multi_file_candidates(
+    members: &[SplitCueAdmissionMember],
+    rejected: &[SplitCueMemberRejection],
+) -> Option<SplitCueSelectionAlbumGroup> {
+    let mut cue_paths = Vec::new();
+    let mut titles = Vec::new();
+
+    for member in members.iter().filter(|member| {
+        member.contributes_synthetic_album_part() && member.referenced_audio.len() > 1
+    }) {
+        cue_paths.push(member.cue_path.clone());
+        titles.push(member.sheet.title.clone().unwrap_or_default());
+    }
+
+    for rejection in rejected {
+        let Some(sheet) = rejection.parsed_sheet.as_deref() else {
+            continue;
+        };
+        if rejection.resolved_in_folder_audio.is_empty()
+            || !cue_sheet_has_multi_file_split_shape(sheet)
+        {
+            continue;
+        }
+        cue_paths.push(rejection.cue_path.clone());
+        titles.push(sheet.title.clone().unwrap_or_default());
+    }
+
+    let decision = title_rung_decision(&cue_paths, &titles)?;
+    let cue_paths = decision.groups.into_iter().next()?;
+    (cue_paths.len() >= 2).then_some(SplitCueSelectionAlbumGroup { cue_paths })
+}
+
+fn cue_sheet_has_multi_file_split_shape(sheet: &crate::convert::cue_parser::CueSheet) -> bool {
+    let mut tracks_by_file: BTreeMap<String, usize> = BTreeMap::new();
+    for file_ref in sheet
+        .tracks
+        .iter()
+        .filter_map(|track| track.file.as_deref())
+    {
+        let normalized = file_ref.replace('\\', "/").to_ascii_lowercase();
+        *tracks_by_file.entry(normalized).or_default() += 1;
+    }
+    tracks_by_file.len() > 1 && tracks_by_file.values().any(|count| *count > 1)
+}
+
+fn remove_metadata_sidecars_covered_by_split_sources(
+    candidates: Vec<SplitCueAdmissionMember>,
+) -> Vec<SplitCueAdmissionMember> {
+    let single_image_split_sources: Vec<PathBuf> = candidates
+        .iter()
+        .filter(|member| {
+            member.role == SplitCueMemberRole::SyntheticAlbumPart
+                && member.referenced_audio.len() == 1
+        })
+        .filter_map(|member| member.referenced_audio.first().map(|path| cue_path_key(path)))
+        .collect();
+    if single_image_split_sources.is_empty() {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .filter(|member| {
+            let is_one_track_single_image_artifact = member.role
+                == SplitCueMemberRole::MetadataSidecar
+                && member.sheet.tracks.len() == 1
+                && member.referenced_audio.len() == 1;
+            !is_one_track_single_image_artifact
+                || match member.referenced_audio.first() {
+                    Some(path) => !single_image_split_sources.contains(&cue_path_key(path)),
+                    None => true,
+                }
+        })
+        .collect()
+}
+
 fn selected_split_cue_folder_members(
     all_members: &[SplitCueAdmissionMember],
     mut selected_members: Vec<SplitCueAdmissionMember>,
     mut excluded_audio: Vec<PathBuf>,
-    rejected: Vec<(PathBuf, String)>,
+    rejected: Vec<SplitCueMemberRejection>,
+    selection_album_group: Option<SplitCueSelectionAlbumGroup>,
 ) -> SplitCueFolderSelection {
     let selected_cue_keys: HashSet<PathBuf> = selected_members
         .iter()
@@ -493,14 +1089,15 @@ fn selected_split_cue_folder_members(
         members: selected_members,
         excluded_audio: dedup_split_cue_paths(excluded_audio),
         rejected,
+        selection_album_group,
     }
 }
 
-fn resolved_in_folder_audio_references(cue_path: &Path) -> Vec<PathBuf> {
+fn resolved_in_folder_audio_references(
+    cue_path: &Path,
+    sheet: &crate::convert::cue_parser::CueSheet,
+) -> Vec<PathBuf> {
     let Some(parent) = cue_path.parent() else {
-        return Vec::new();
-    };
-    let Ok(sheet) = crate::convert::cue_parser::parse_cue_file(cue_path) else {
         return Vec::new();
     };
     let parent_key = cue_path_key(parent);
@@ -637,27 +1234,29 @@ pub fn admit_split_cue_candidate_paths(cue_paths: &[PathBuf]) -> SplitCueAdmissi
         // and would discard the fact that other members admitted cleanly.
         // Both facts feed the caller's degrade-vs-refuse decision.
         let mut members = Vec::with_capacity(cues.len());
-        let mut rejections: Vec<(PathBuf, String)> = Vec::new();
+        let mut rejections: Vec<SplitCueMemberRejection> = Vec::new();
         for cue_path in &cues {
             match admit_split_cue_member(cue_path) {
                 Ok(member) => members.push(member),
-                Err(message) => rejections.push((cue_path.clone(), message)),
+                Err(rejection) => rejections.push(rejection),
             }
         }
         if !rejections.is_empty() {
             report.rejected_folders.push(parent_key.clone());
             let folder_admitted_local_members = !members.is_empty();
-            for (offending_cue, message) in rejections {
+            for rejection in rejections {
+                let offending_cue = rejection.cue_path.clone();
                 report.rejections.push(SplitCueFolderRejection {
                     parent: parent_key.clone(),
                     offending_cue: offending_cue.clone(),
-                    references_in_folder_audio: cue_references_in_folder_audio(&offending_cue),
+                    references_in_folder_audio: rejection.is_parse_failure()
+                        || !rejection.resolved_in_folder_audio.is_empty(),
                     folder_admitted_local_members,
                 });
                 report.warnings.push(format!(
                     "offending CUE {}: {} — conversion will not include this folder ({})",
                     offending_cue.display(),
-                    message,
+                    rejection.reason,
                     parent_key.display()
                 ));
             }
@@ -675,15 +1274,25 @@ pub fn admit_split_cue_candidate_paths(cue_paths: &[PathBuf]) -> SplitCueAdmissi
 
 /// Admit and classify one CUE through the canonical editor/planner policy.
 /// Callers must not re-derive membership or metadata-sidecar semantics.
-pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember, String> {
+pub fn admit_split_cue_member(
+    cue_path: &Path,
+) -> Result<SplitCueAdmissionMember, SplitCueMemberRejection> {
     let sheet = crate::convert::cue_parser::parse_cue_file(cue_path)
-        .map_err(|err| format!("member CUE invalid: {}: {err}", cue_path.display()))?;
+        .map_err(|err| SplitCueMemberRejection::parse_failure(cue_path, err.to_string()))?;
     if sheet.tracks.is_empty() {
-        return Err(format!("member CUE has no tracks: {}", cue_path.display()));
+        return Err(SplitCueMemberRejection::from_parsed_sheet(
+            cue_path,
+            &sheet,
+            SplitCueMemberRejectionReason::NoTracks,
+        ));
     }
-    let parent = cue_path
-        .parent()
-        .ok_or_else(|| format!("member CUE has no parent: {}", cue_path.display()))?;
+    let Some(parent) = cue_path.parent() else {
+        return Err(SplitCueMemberRejection::from_parsed_sheet(
+            cue_path,
+            &sheet,
+            SplitCueMemberRejectionReason::NoParent,
+        ));
+    };
     let parent_key = cue_path_key(parent);
     let mut referenced_audio = Vec::new();
     let mut referenced_keys = HashSet::new();
@@ -692,20 +1301,24 @@ pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember
     let mut all_file_references_exact = true;
 
     for track in &sheet.tracks {
-        let file_ref = track.file.as_deref().ok_or_else(|| {
-            format!(
-                "member CUE track {} has no FILE reference: {}",
-                track.number,
-                cue_path.display()
-            )
-        })?;
-        let index01 = track.index01_frames.ok_or_else(|| {
-            format!(
-                "member CUE track {} has no INDEX 01: {}",
-                track.number,
-                cue_path.display()
-            )
-        })?;
+        let Some(file_ref) = track.file.as_deref() else {
+            return Err(SplitCueMemberRejection::from_parsed_sheet(
+                cue_path,
+                &sheet,
+                SplitCueMemberRejectionReason::MissingFileReference {
+                    track_number: track.number,
+                },
+            ));
+        };
+        let Some(index01) = track.index01_frames else {
+            return Err(SplitCueMemberRejection::from_parsed_sheet(
+                cue_path,
+                &sheet,
+                SplitCueMemberRejectionReason::MissingIndex01 {
+                    track_number: track.number,
+                },
+            ));
+        };
         let normalized_ref = file_ref.replace('\\', &std::path::MAIN_SEPARATOR.to_string());
         let raw_path = PathBuf::from(&normalized_ref);
         let direct = if raw_path.is_absolute() {
@@ -717,61 +1330,82 @@ pub fn admit_split_cue_member(cue_path: &Path) -> Result<SplitCueAdmissionMember
         let resolved = match resolve_split_cue_file_reference(parent, file_ref) {
             SplitCueReferenceResolution::Resolved(path) => path,
             SplitCueReferenceResolution::Missing => {
-                return Err(format!("member image missing: {file_ref}"));
+                return Err(SplitCueMemberRejection::from_parsed_sheet(
+                    cue_path,
+                    &sheet,
+                    SplitCueMemberRejectionReason::MissingImage {
+                        file_reference: file_ref.to_string(),
+                    },
+                ));
             }
             SplitCueReferenceResolution::Ambiguous(paths) => {
-                return Err(format!(
-                    "member image ambiguous: {file_ref}: {}",
-                    paths
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                return Err(SplitCueMemberRejection::from_parsed_sheet(
+                    cue_path,
+                    &sheet,
+                    SplitCueMemberRejectionReason::AmbiguousImage {
+                        file_reference: file_ref.to_string(),
+                        candidates: paths,
+                    },
                 ));
             }
             SplitCueReferenceResolution::UnsupportedTarget(path) => {
-                return Err(format!(
-                    "member image is not supported audio: {}",
-                    path.display()
+                return Err(SplitCueMemberRejection::from_parsed_sheet(
+                    cue_path,
+                    &sheet,
+                    SplitCueMemberRejectionReason::UnsupportedImage { path },
                 ));
             }
         };
         all_file_references_exact &= direct_is_exact_audio
             && cue_path_key(&direct) == cue_path_key(&resolved);
-        let meta = std::fs::symlink_metadata(&resolved)
-            .map_err(|_| format!("member image missing: {file_ref}"))?;
+        let meta = match std::fs::symlink_metadata(&resolved) {
+            Ok(meta) => meta,
+            Err(_) => {
+                return Err(SplitCueMemberRejection::from_parsed_sheet(
+                    cue_path,
+                    &sheet,
+                    SplitCueMemberRejectionReason::MissingImage {
+                        file_reference: file_ref.to_string(),
+                    },
+                ));
+            }
+        };
         if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(format!("member image is not a regular file: {}", resolved.display()));
+            return Err(SplitCueMemberRejection::from_parsed_sheet(
+                cue_path,
+                &sheet,
+                SplitCueMemberRejectionReason::NonRegularImage { path: resolved },
+            ));
         }
         if !matches!(
             crate::convert::classify::classify_file(&resolved),
             crate::convert::classify::EntryKind::AudioFile(_)
         ) {
-            return Err(format!(
-                "member image is not supported audio: {}",
-                resolved.display()
+            return Err(SplitCueMemberRejection::from_parsed_sheet(
+                cue_path,
+                &sheet,
+                SplitCueMemberRejectionReason::UnsupportedImage { path: resolved },
             ));
         }
-        if resolved
-            .parent()
-            .map(cue_path_key)
-            .as_ref()
-            != Some(&parent_key)
-        {
-            return Err(format!(
-                "member image is outside the CUE folder: {}",
-                resolved.display()
+        if resolved.parent().map(cue_path_key).as_ref() != Some(&parent_key) {
+            return Err(SplitCueMemberRejection::from_parsed_sheet(
+                cue_path,
+                &sheet,
+                SplitCueMemberRejectionReason::ImageOutsideCueFolder { path: resolved },
             ));
         }
         let resolved_key = cue_path_key(&resolved);
         if let Some((previous_track, previous_index)) = previous_by_file.get(&resolved_key) {
             if index01 <= *previous_index {
-                return Err(format!(
-                    "member CUE has non-increasing INDEX 01 for track {} in {}; previous track {} was at frame {}",
-                    track.number,
-                    resolved.display(),
-                    previous_track,
-                    previous_index
+                return Err(SplitCueMemberRejection::from_parsed_sheet(
+                    cue_path,
+                    &sheet,
+                    SplitCueMemberRejectionReason::NonIncreasingIndex {
+                        track_number: track.number,
+                        path: resolved,
+                        previous_track_number: *previous_track,
+                        previous_index: *previous_index,
+                    },
                 ));
             }
         }
@@ -911,6 +1545,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merged_group_provenance_requires_every_member_and_ignores_outsiders() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_a = temp.path().join("side-a.cue");
+        let cue_b = temp.path().join("side-b.cue");
+        let outsider = temp.path().join("bonus.cue");
+        let audio_a = temp.path().join("side-a.flac");
+        let audio_b = temp.path().join("side-b.flac");
+        let outsider_audio = temp.path().join("bonus.flac");
+        for audio in [&audio_a, &audio_b, &outsider_audio] {
+            std::fs::write(audio, b"audio").expect("audio fixture");
+        }
+        for (cue, title, audio) in [
+            (&cue_a, "Album Side A", "side-a.flac"),
+            (&cue_b, "Album Side B", "side-b.flac"),
+            (&outsider, "Bonus", "bonus.flac"),
+        ] {
+            std::fs::write(
+                cue,
+                format!(
+                    "TITLE \"{title}\"\nFILE \"{audio}\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("cue fixture");
+        }
+        let group = vec![cue_a.clone(), cue_b.clone()];
+
+        let original_b = std::fs::read(&cue_b).expect("read side B cue");
+        std::fs::write(&cue_b, [0xff, 0xfe, 0x00]).expect("temporarily invalidate side B cue");
+        let incomplete = merge_decision(&group, SplitCueAlbumGroupingReason::AmbiguousMerge)
+            .with_current_member_provenance();
+        assert!(incomplete.complete_member_audio_for_group(&group).is_none());
+
+        std::fs::write(&cue_b, original_b).expect("restore side B cue");
+        let complete = merge_decision(&group, SplitCueAlbumGroupingReason::AmbiguousMerge)
+            .with_current_member_provenance();
+        let recorded = complete
+            .complete_member_audio_for_group(&group)
+            .expect("complete group provenance");
+        assert_eq!(
+            recorded.into_iter().collect::<BTreeSet<_>>(),
+            [cue_path_key(&audio_a), cue_path_key(&audio_b)]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+        );
+        assert!(!complete.member_audio_matches(&outsider, &[outsider_audio]));
+    }
+
+    #[test]
     fn alien_cue_rejection_reports_no_in_folder_audio() {
         let temp = tempfile::tempdir().expect("temp dir");
         // Folder of plain audio + a published planner sheet whose FILE refs
@@ -1008,15 +1690,13 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_cue_rejection_fails_closed() {
+    fn unreadable_cue_rejection_is_typed() {
         let temp = tempfile::tempdir().expect("temp dir");
-        // The lenient re-scan cannot read/parse this cue at all. It must
-        // count as plausibly-local (fail closed toward atomic refusal),
-        // not as an alien sheet safe to ignore.
         let cue = temp.path().join("ghost.cue");
+        let rejection = admit_split_cue_member(&cue).expect_err("missing cue rejects");
         assert!(
-            cue_references_in_folder_audio(&cue),
-            "an unreadable cue must fail closed"
+            rejection.is_parse_failure(),
+            "an unreadable cue must retain a typed parse-failure reason"
         );
     }
 
@@ -1308,6 +1988,90 @@ mod tests {
     }
 
     #[test]
+    fn split_source_role_tiebreak_does_not_remove_unrelated_one_track_sidecar() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let split_image = td.path().join("album.flac");
+        let unrelated_image = td.path().join("interview.flac");
+        let split_cue = td.path().join("album.cue");
+        let unrelated_sidecar = td.path().join("interview.cue");
+        std::fs::write(&split_image, b"audio").expect("split image");
+        std::fs::write(&unrelated_image, b"audio").expect("unrelated image");
+        std::fs::write(
+            &split_cue,
+            concat!(
+                "FILE \"album.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("split cue");
+        std::fs::write(
+            &unrelated_sidecar,
+            "FILE \"interview.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("unrelated metadata cue");
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(
+                &[split_cue.clone(), unrelated_sidecar.clone()],
+                None,
+            )
+        else {
+            panic!("disjoint exact CUEs must remain independently queueable");
+        };
+        let selected: BTreeSet<PathBuf> = members
+            .iter()
+            .map(|member| cue_path_key(&member.cue_path))
+            .collect();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&cue_path_key(&split_cue)));
+        assert!(selected.contains(&cue_path_key(&unrelated_sidecar)));
+    }
+
+    #[test]
+    fn split_source_role_tiebreak_does_not_remove_partial_overlap_sidecar() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let first = td.path().join("first.flac");
+        let second = td.path().join("second.flac");
+        let split_cue = td.path().join("album-split.cue");
+        let partial_sidecar = td.path().join("first-index.cue");
+        std::fs::write(&first, b"audio").expect("first image");
+        std::fs::write(&second, b"audio").expect("second image");
+        std::fs::write(
+            &split_cue,
+            concat!(
+                "FILE \"first.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"second.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("multi-image split cue");
+        std::fs::write(
+            &partial_sidecar,
+            "FILE \"first.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("partial sidecar");
+
+        let SplitCueFolderSelection::NeedsChoice { candidates, .. } =
+            select_split_cue_folder_members(
+                &[split_cue.clone(), partial_sidecar.clone()],
+                None,
+            )
+        else {
+            panic!("partial overlap must remain visible instead of being role-suppressed");
+        };
+        let candidate_paths: BTreeSet<PathBuf> = candidates
+            .iter()
+            .map(|member| cue_path_key(&member.cue_path))
+            .collect();
+        assert_eq!(candidate_paths.len(), 2);
+        assert!(candidate_paths.contains(&cue_path_key(&split_cue)));
+        assert!(candidate_paths.contains(&cue_path_key(&partial_sidecar)));
+    }
+
+    #[test]
     fn exact_metadata_sidecar_beats_fallback_metadata_alternative() {
         let td = tempfile::tempdir().expect("tempdir");
         let image = td.path().join("album.wv");
@@ -1498,7 +2262,7 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&good));
         assert_eq!(rejected.len(), 1);
-        assert_eq!(cue_path_key(&rejected[0].0), cue_path_key(&bad));
+        assert_eq!(cue_path_key(&rejected[0].cue_path), cue_path_key(&bad));
     }
 
     #[test]
@@ -1517,6 +2281,9 @@ mod tests {
             panic!("no viable cue must fall back");
         };
         assert_eq!(rejected.len(), 1);
-        assert!(rejected[0].1.contains("member image missing"));
+        assert!(matches!(
+            rejected[0].reason,
+            SplitCueMemberRejectionReason::MissingImage { .. }
+        ));
     }
 }

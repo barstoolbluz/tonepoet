@@ -15,8 +15,8 @@ use crate::convert::pipeline::CueSidecarPolicy;
 use crate::convert::split_cue_album::{
     common_cue_album_title, decide_with_toc_evidence, grouping_key_from_paths,
     resolve_split_cue_file_reference, select_split_cue_folder_members,
-    SplitCueAlbumGroupingDecision, SplitCueAlbumGroupingReason, SplitCueFolderSelection,
-    SplitCueReferenceResolution,
+    SplitCueAdmissionMember, SplitCueAlbumGroupingDecision, SplitCueAlbumGroupingReason,
+    SplitCueFolderSelection, SplitCueMemberRejection, SplitCueReferenceResolution,
 };
 
 
@@ -465,17 +465,6 @@ where
     Ok((queue, state.visited))
 }
 
-pub(crate) fn expand_paths_to_audio_with_preserved_disc_roots(
-    paths: &[PathBuf],
-    preserved_disc_roots: &[PathBuf],
-) -> QueueExpansionResult {
-    expand_paths_to_audio_with_preserved_disc_roots_using_grouping_decisions(
-        paths,
-        preserved_disc_roots,
-        &QueueSplitCueAlbumGroupingDecisions::new(),
-    )
-}
-
 pub(crate) fn expand_paths_to_audio_with_preserved_disc_roots_using_grouping_decisions(
     paths: &[PathBuf],
     preserved_disc_roots: &[PathBuf],
@@ -515,6 +504,16 @@ struct CueQueueCandidate {
     path: PathBuf,
     path_key: PathBuf,
     explicit: bool,
+    /// Canonical admission result captured during folder selection. Carrying
+    /// it forward avoids reparsing user-controlled CUE bytes between selection
+    /// and synthetic materialization, which would otherwise create a race and
+    /// force broad folder-level suppression on a changed file.
+    admitted_member: Option<SplitCueAdmissionMember>,
+    /// This cue was selected as the sole viable member of a folder that had
+    /// multiple candidate CUEs, and it is itself a native multi-FILE split
+    /// source. Materialize it through the synthetic-album path so the queue
+    /// retains the same one-album representation used before selection.
+    materialize_selected_multi_file_as_synthetic: bool,
 }
 
 impl QueueExpansionPlan {
@@ -557,6 +556,8 @@ impl QueueExpansionPlan {
             path,
             path_key,
             explicit,
+            admitted_member: None,
+            materialize_selected_multi_file_as_synthetic: false,
         });
     }
 
@@ -586,13 +587,22 @@ impl QueueExpansionPlan {
         let cue_sheets = match select_folder_cue_candidates_for_queue(
             cue_sheets,
             &disc_root_keys,
+            grouping_decisions,
             cue_selections,
         ) {
             QueueCueCandidateSelection::Ready {
                 candidates,
                 warnings,
                 suppressed_alternative_audio_keys,
-            } => (candidates, warnings, suppressed_alternative_audio_keys),
+                nonviable_cue_paths,
+                failed_merged_cue_keys,
+            } => (
+                candidates,
+                warnings,
+                suppressed_alternative_audio_keys,
+                nonviable_cue_paths,
+                failed_merged_cue_keys,
+            ),
             QueueCueCandidateSelection::NeedsChoice(prompt) => {
                 return QueueExpansionResult {
                     cue_selection_prompt: Some(prompt),
@@ -604,12 +614,21 @@ impl QueueExpansionPlan {
             cue_sheets,
             cue_selection_warnings,
             mut suppressed_audio_keys,
+            nonviable_cue_paths,
+            failed_merged_cue_keys,
         ) = cue_sheets;
 
         let mut result = Vec::new();
         let mut result_keys = HashSet::new();
         let mut cue_artifact_audio_keys = HashSet::new();
 
+        for cue_path in nonviable_cue_paths {
+            mark_sibling_audio_as_cue_artifacts(
+                &cue_path,
+                &queueable_non_cue,
+                &mut cue_artifact_audio_keys,
+            );
+        }
         for disc_root in disc_roots {
             push_unique_path_with_keys(&mut result, &mut result_keys, disc_root);
         }
@@ -621,7 +640,6 @@ impl QueueExpansionPlan {
             mut synthetic_cue_artifacts,
         ) = push_synthetic_cue_album_groups_for_queue(
             &cue_sheets,
-            &queueable_non_cue,
             &disc_root_keys,
             grouping_decisions,
             &mut result,
@@ -634,13 +652,20 @@ impl QueueExpansionPlan {
         expansion_errors.extend(synthetic_album_warnings);
 
         for cue in cue_sheets {
+            if failed_merged_cue_keys.contains(&cue.path_key) {
+                continue;
+            }
             if grouped_cue_keys.contains(&cue.path_key) {
                 continue;
             }
             if path_key_is_under_any_root(&queue_path_key(&cue.path), &disc_root_keys) {
                 continue;
             }
-            match cue_queue_decision_for_path(&cue.path) {
+            let decision = match cue.admitted_member.as_ref() {
+                Some(member) => Ok(cue_queue_decision_for_member(member)),
+                None => cue_queue_decision_for_path(&cue.path),
+            };
+            match decision {
                 Ok(CueQueueDecision::SplitSource { referenced_audio }) => {
                     push_unique_path_with_keys(&mut result, &mut result_keys, cue.path);
                     for path in referenced_audio {
@@ -721,6 +746,8 @@ enum QueueCueCandidateSelection {
         candidates: Vec<CueQueueCandidate>,
         warnings: Vec<String>,
         suppressed_alternative_audio_keys: HashSet<PathBuf>,
+        nonviable_cue_paths: Vec<PathBuf>,
+        failed_merged_cue_keys: HashSet<PathBuf>,
     },
     NeedsChoice(QueueCueSelectionPrompt),
 }
@@ -728,6 +755,7 @@ enum QueueCueCandidateSelection {
 fn select_folder_cue_candidates_for_queue(
     cue_sheets: Vec<CueQueueCandidate>,
     disc_root_keys: &HashSet<PathBuf>,
+    grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
     cue_selections: &QueueCueSelectionOverrides,
 ) -> QueueCueCandidateSelection {
     let mut by_parent: BTreeMap<PathBuf, Vec<CueQueueCandidate>> = BTreeMap::new();
@@ -746,6 +774,8 @@ fn select_folder_cue_candidates_for_queue(
 
     let mut warnings = Vec::new();
     let mut suppressed_alternative_audio_keys = HashSet::new();
+    let mut nonviable_cue_paths = Vec::new();
+    let mut failed_merged_cue_keys = HashSet::new();
     for (parent, mut candidates) in by_parent {
         candidates.sort_by(|left, right| {
             deterministic_path_sort_key(&left.path).cmp(&deterministic_path_sort_key(&right.path))
@@ -759,23 +789,88 @@ fn select_folder_cue_candidates_for_queue(
             .map(PathBuf::as_path);
         match select_split_cue_folder_members(&cue_paths, selected) {
             SplitCueFolderSelection::Selected {
-                members,
+                mut members,
                 excluded_audio,
-                ..
+                rejected,
+                selection_album_group,
             } => {
+                nonviable_cue_paths.extend(
+                    rejected
+                        .iter()
+                        .map(|rejection| rejection.cue_path.clone()),
+                );
+                if selected.is_none() {
+                    for failure in authoritative_failed_merged_groups(
+                        grouping_decisions,
+                        &members,
+                        &rejected,
+                    ) {
+                        let rejection_details = failure
+                            .rejections
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        warnings.push(format!(
+                            "Cannot queue merged CUE album for {}: {}. Nothing was staged for this proven group; repair the member CUE or select one .cue explicitly.",
+                            parent.display(),
+                            rejection_details,
+                        ));
+                        failed_merged_cue_keys.extend(failure.cue_keys.iter().cloned());
+                        suppressed_alternative_audio_keys
+                            .extend(failure.audio_keys.iter().cloned());
+                    }
+                }
+                for rejection in &rejected {
+                    if failed_merged_cue_keys.contains(&queue_path_key(&rejection.cue_path)) {
+                        continue;
+                    }
+                    warnings.push(format!(
+                        "Suppressed unusable CUE {} independently: {}. No current authoritative album-group membership connected it to another CUE, so other folder content was preserved.",
+                        rejection.cue_path.display(),
+                        rejection.reason,
+                    ));
+                }
+
                 suppressed_alternative_audio_keys.extend(
                     excluded_audio
                         .into_iter()
                         .map(|path| queue_path_key(&path)),
                 );
+                members.retain(|member| {
+                    !failed_merged_cue_keys.contains(&queue_path_key(&member.cue_path))
+                });
+                let materialize_selected_multi_file_as_synthetic = selected.is_none()
+                    && members.len() == 1
+                    && members.first().is_some_and(|member| {
+                        member.contributes_synthetic_album_part()
+                            && member.referenced_audio.len() > 1
+                            && selected_member_has_merged_album_provenance(
+                                member,
+                                &rejected,
+                                selection_album_group.as_ref(),
+                            )
+                    });
                 let selected_keys: HashSet<PathBuf> = members
                     .iter()
                     .map(|member| queue_path_key(&member.cue_path))
                     .collect();
+                let selected_members_by_key: BTreeMap<PathBuf, SplitCueAdmissionMember> =
+                    members
+                        .into_iter()
+                        .map(|member| (queue_path_key(&member.cue_path), member))
+                        .collect();
                 passthrough.extend(
                     candidates
                         .into_iter()
-                        .filter(|candidate| selected_keys.contains(&candidate.path_key)),
+                        .filter(|candidate| selected_keys.contains(&candidate.path_key))
+                        .map(|mut candidate| {
+                            candidate.admitted_member =
+                                selected_members_by_key.get(&candidate.path_key).cloned();
+                            candidate.materialize_selected_multi_file_as_synthetic =
+                                materialize_selected_multi_file_as_synthetic;
+                            candidate
+                        }),
                 );
             }
             SplitCueFolderSelection::NeedsChoice { candidates, .. } => {
@@ -788,9 +883,10 @@ fn select_folder_cue_candidates_for_queue(
                 });
             }
             SplitCueFolderSelection::NoViable { rejected } => {
+                nonviable_cue_paths.extend(candidates.into_iter().map(|candidate| candidate.path));
                 let detail = rejected
                     .into_iter()
-                    .map(|(path, message)| format!("{}: {message}", path.display()))
+                    .map(|rejection| rejection.to_string())
                     .collect::<Vec<_>>()
                     .join("; ");
                 warnings.push(format!(
@@ -813,7 +909,93 @@ fn select_folder_cue_candidates_for_queue(
         candidates: passthrough,
         warnings,
         suppressed_alternative_audio_keys,
+        nonviable_cue_paths,
+        failed_merged_cue_keys,
     }
+}
+
+#[derive(Debug, Clone)]
+struct AuthoritativeMergedGroupFailure {
+    cue_keys: HashSet<PathBuf>,
+    audio_keys: HashSet<PathBuf>,
+    rejections: Vec<SplitCueMemberRejection>,
+}
+
+/// Fail closed only when a validated grouping decision proves the current
+/// admitted and rejected CUEs are still the same file objects and parsed
+/// membership that formed one merged album. Missing, incomplete, replaced, or
+/// otherwise stale provenance is ignored; callers then suppress each rejected
+/// CUE independently and preserve unrelated work.
+fn authoritative_failed_merged_groups(
+    grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
+    selected_members: &[SplitCueAdmissionMember],
+    rejected: &[SplitCueMemberRejection],
+) -> Vec<AuthoritativeMergedGroupFailure> {
+    if selected_members.is_empty() || rejected.is_empty() {
+        return Vec::new();
+    }
+
+    let current_candidate_keys: HashSet<PathBuf> = selected_members
+        .iter()
+        .map(|member| queue_path_key(&member.cue_path))
+        .chain(
+            rejected
+                .iter()
+                .map(|rejection| queue_path_key(&rejection.cue_path)),
+        )
+        .collect();
+    let mut failures = Vec::new();
+    let mut seen_groups = HashSet::new();
+
+    for decision in grouping_decisions.values() {
+        for group in &decision.groups {
+            let group_keys: HashSet<PathBuf> =
+                group.iter().map(|path| queue_path_key(path)).collect();
+            if group_keys.len() < 2 || !group_keys.is_subset(&current_candidate_keys) {
+                continue;
+            }
+            let Some(validated) =
+                decision.validated_failed_merged_group(group, selected_members, rejected)
+            else {
+                continue;
+            };
+            let group_identity = grouping_key_from_paths(&validated.cue_paths);
+            if !seen_groups.insert(group_identity) {
+                continue;
+            }
+            failures.push(AuthoritativeMergedGroupFailure {
+                cue_keys: validated
+                    .cue_paths
+                    .iter()
+                    .map(|path| queue_path_key(path))
+                    .collect(),
+                audio_keys: validated
+                    .audio_paths
+                    .iter()
+                    .map(|path| queue_path_key(path))
+                    .collect(),
+                rejections: validated.rejections,
+            });
+        }
+    }
+    failures
+}
+
+/// Preserve the synthetic one-album queue representation only when the shared
+/// selector itself recorded that the selected and rejected parseable
+/// multi-FILE CUEs passed the album-title grouping rung. Directory membership,
+/// filenames, stems, and display strings are never used as provenance.
+fn selected_member_has_merged_album_provenance(
+    selected: &SplitCueAdmissionMember,
+    rejected: &[SplitCueMemberRejection],
+    selection_album_group: Option<&crate::convert::split_cue_album::SplitCueSelectionAlbumGroup>,
+) -> bool {
+    selection_album_group.is_some_and(|group| {
+        group.contains(&selected.cue_path)
+            && rejected
+                .iter()
+                .any(|rejection| group.contains(&rejection.cue_path))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -826,7 +1008,6 @@ struct SyntheticCueAlbumPart {
 
 fn push_synthetic_cue_album_groups_for_queue(
     cue_sheets: &[CueQueueCandidate],
-    queueable_non_cue: &[PathBuf],
     disc_root_keys: &HashSet<PathBuf>,
     grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
     result: &mut Vec<PathBuf>,
@@ -849,41 +1030,31 @@ fn push_synthetic_cue_album_groups_for_queue(
     let mut nonfatal_errors = Vec::new();
     let mut synthetic_cue_artifacts = HashSet::new();
     for (parent, mut candidates) in by_parent {
-        if candidates.len() < 2 {
+        let materialize_selected_multi_file_as_synthetic = candidates.len() == 1
+            && candidates
+                .first()
+                .is_some_and(|candidate| candidate.materialize_selected_multi_file_as_synthetic);
+        if candidates.len() < 2 && !materialize_selected_multi_file_as_synthetic {
             continue;
         }
         candidates.sort_by(|a, b| deterministic_path_sort_key(&a.path).cmp(&deterministic_path_sort_key(&b.path)));
 
-        let cue_paths: Vec<PathBuf> = candidates.iter().map(|cue| cue.path.clone()).collect();
-        let admission = crate::convert::split_cue_album::admit_split_cue_candidate_paths(&cue_paths);
-        if !admission.warnings.is_empty() || admission.rejected_folders.iter().any(|rejected| rejected == &parent) {
-            fatal_errors.extend(admission.warnings.into_iter().map(|warning| {
-                format!(
-                    "Cannot queue merged CUE album for {}: {}. Nothing was staged for this group; fix the CUE or select a single .cue explicitly.",
-                    parent.display(),
-                    warning
-                )
-            }));
-            for cue in &candidates {
-                grouped.insert(cue.path_key.clone());
-            }
-            suppress_parent_audio_for_failed_synthetic_group(
-                &parent,
-                queueable_non_cue,
-                suppressed_audio_keys,
-            );
-            continue;
-        }
-
-        let Some(admitted_folder) = admission
-            .folders
-            .into_iter()
-            .find(|folder| queue_path_key(&folder.parent) == parent)
-        else {
-            continue;
-        };
         let mut parts = Vec::new();
-        for member in admitted_folder.members {
+        let mut missing_admission_record = false;
+        for candidate in &candidates {
+            let Some(member) = candidate.admitted_member.clone() else {
+                // Folder-selected candidates always carry their canonical
+                // admission result. Refuse to infer it again from mutable CUE
+                // bytes if that invariant is ever broken.
+                fatal_errors.push(format!(
+                    "Cannot queue merged CUE album for {}: selected CUE {} has no retained admission record. Nothing was staged for this group.",
+                    parent.display(),
+                    candidate.path.display(),
+                ));
+                grouped.insert(candidate.path_key.clone());
+                missing_admission_record = true;
+                continue;
+            };
             // Membership role is decided by the shared editor/planner policy.
             // A one-track-per-FILE CUE is a metadata sidecar for already-split
             // files, not a synthetic album part.
@@ -898,7 +1069,23 @@ fn push_synthetic_cue_album_groups_for_queue(
                 referenced_audio: member.referenced_audio,
             });
         }
-        if parts.len() < 2 {
+        if missing_admission_record {
+            for candidate in &candidates {
+                grouped.insert(candidate.path_key.clone());
+                if let Some(member) = &candidate.admitted_member {
+                    suppressed_audio_keys.extend(
+                        member
+                            .referenced_audio
+                            .iter()
+                            .map(|path| queue_path_key(path)),
+                    );
+                }
+            }
+            continue;
+        }
+        if parts.is_empty()
+            || (parts.len() < 2 && !materialize_selected_multi_file_as_synthetic)
+        {
             continue;
         }
         // Two cues referencing the SAME image are alternate track layouts of
@@ -925,20 +1112,28 @@ fn push_synthetic_cue_album_groups_for_queue(
             .iter()
             .map(|part| part.sheet.title.clone().unwrap_or_default())
             .collect();
-        let decision_key = grouping_key_from_paths(&cue_paths);
-        let Some(decision) = grouping_decisions
-            .get(&decision_key)
-            .cloned()
-            .or_else(|| decide_with_toc_evidence(&cue_paths, &titles, None, None))
-        else {
-            continue;
+        let decision = if materialize_selected_multi_file_as_synthetic {
+            crate::convert::split_cue_album::merge_decision(
+                &cue_paths,
+                SplitCueAlbumGroupingReason::AmbiguousMerge,
+            )
+        } else {
+            let decision_key = grouping_key_from_paths(&cue_paths);
+            let Some(decision) = grouping_decisions
+                .get(&decision_key)
+                .cloned()
+                .or_else(|| decide_with_toc_evidence(&cue_paths, &titles, None, None))
+            else {
+                continue;
+            };
+            decision
         };
         if matches!(decision.reason, SplitCueAlbumGroupingReason::PerCueDistinctTocHits) {
             continue;
         }
 
         for group in decision.groups {
-            if group.len() < 2 {
+            if group.len() < 2 && !materialize_selected_multi_file_as_synthetic {
                 continue;
             }
             let group_keys: HashSet<PathBuf> = group.into_iter().collect();
@@ -947,7 +1142,7 @@ fn push_synthetic_cue_album_groups_for_queue(
                 .filter(|part| group_keys.contains(&part.cue_key))
                 .cloned()
                 .collect();
-            if group_parts.len() < 2 {
+            if group_parts.len() < 2 && !materialize_selected_multi_file_as_synthetic {
                 continue;
             }
             group_parts.sort_by(|a, b| deterministic_path_sort_key(&a.cue_path).cmp(&deterministic_path_sort_key(&b.cue_path)));
@@ -1024,24 +1219,6 @@ fn block_failed_synthetic_group(
         grouped.insert(part.cue_key.clone());
         for audio in &part.referenced_audio {
             suppressed_audio_keys.insert(queue_path_key(audio));
-        }
-    }
-}
-
-fn suppress_parent_audio_for_failed_synthetic_group(
-    parent_key: &Path,
-    queueable_non_cue: &[PathBuf],
-    suppressed_audio_keys: &mut HashSet<PathBuf>,
-) {
-    for path in queueable_non_cue {
-        if !is_audio_file_path(path) {
-            continue;
-        }
-        let Some(parent) = path.parent().map(queue_path_key) else {
-            continue;
-        };
-        if parent == parent_key {
-            suppressed_audio_keys.insert(queue_path_key(path));
         }
     }
 }
@@ -1959,15 +2136,22 @@ enum CueQueueDecision {
 }
 
 fn cue_queue_decision_for_path(cue_path: &Path) -> Result<CueQueueDecision, String> {
-    let member = crate::convert::split_cue_album::admit_split_cue_member(cue_path)?;
+    let member = crate::convert::split_cue_album::admit_split_cue_member(cue_path)
+        .map_err(|rejection| rejection.to_string())?;
+    Ok(cue_queue_decision_for_member(&member))
+}
+
+fn cue_queue_decision_for_member(
+    member: &SplitCueAdmissionMember,
+) -> CueQueueDecision {
     if member.contributes_synthetic_album_part() {
-        Ok(CueQueueDecision::SplitSource {
-            referenced_audio: member.referenced_audio,
-        })
+        CueQueueDecision::SplitSource {
+            referenced_audio: member.referenced_audio.clone(),
+        }
     } else {
-        Ok(CueQueueDecision::MetadataArtifact {
-            referenced_audio: member.referenced_audio,
-        })
+        CueQueueDecision::MetadataArtifact {
+            referenced_audio: member.referenced_audio.clone(),
+        }
     }
 }
 
@@ -2609,6 +2793,57 @@ FILE "side_b.flac" WAVE
     }
 
     #[test]
+    fn repeated_synthetic_expansion_is_semantically_stable_and_cleanup_is_idempotent() {
+        let td = tempfile::tempdir().expect("tempdir");
+        write_queue_split_cue_part(
+            td.path(),
+            "side_a",
+            "Album Side A",
+            2,
+            "",
+            false,
+            false,
+        );
+        write_queue_split_cue_part(
+            td.path(),
+            "side_b",
+            "Album Side B",
+            2,
+            "",
+            false,
+            false,
+        );
+
+        let first = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        let second = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert_eq!(first.expansion_errors, Vec::<String>::new());
+        assert_eq!(second.expansion_errors, Vec::<String>::new());
+        assert_eq!(first.paths.len(), 1);
+        assert_eq!(second.paths.len(), 1);
+        assert_ne!(
+            queue_path_key(&first.paths[0]),
+            queue_path_key(&second.paths[0]),
+            "concurrent expansion results must own independent artifact directories",
+        );
+        assert_eq!(
+            std::fs::read(&first.paths[0]).expect("first synthetic CUE"),
+            std::fs::read(&second.paths[0]).expect("second synthetic CUE"),
+            "repeated expansion must produce byte-identical queue semantics",
+        );
+
+        cleanup_synthetic_cue_artifacts(&first.synthetic_cue_artifacts);
+        cleanup_synthetic_cue_artifacts(&first.synthetic_cue_artifacts);
+        assert!(!first.paths[0].exists());
+        assert!(
+            second.paths[0].exists(),
+            "cleaning one expansion must not delete another expansion's artifact",
+        );
+        cleanup_synthetic_cue_artifacts(&second.synthetic_cue_artifacts);
+        cleanup_synthetic_cue_artifacts(&second.synthetic_cue_artifacts);
+        assert!(!second.paths[0].exists());
+    }
+
+    #[test]
     fn folder_expansion_fails_closed_when_merged_cue_group_exceeds_track_limit() {
         let td = tempfile::tempdir().expect("tempdir");
         let a = td.path().join("side_a.flac");
@@ -2790,39 +3025,412 @@ FILE "{image}" WAVE
     }
 
     #[test]
-    fn folder_expansion_fails_closed_when_merged_cue_group_cannot_be_parsed() {
+    fn folder_expansion_a1_proven_merged_group_fails_closed_after_member_becomes_unparseable() {
         let td = tempfile::tempdir().expect("tempdir");
-        let a = td.path().join("side_a.flac");
-        let b = td.path().join("side_b.flac");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
         let cue_a = td.path().join("side_a.cue");
-        let cue_b = td.path().join("side_b.cue");
-        std::fs::write(&a, b"not real flac").unwrap();
-        std::fs::write(&b, b"not real flac").unwrap();
+        let cue_b = td.path().join("disc2.cue");
+        let unrelated_audio = td.path().join("bonus.flac");
+        let unrelated_cue = td.path().join("bonus.cue");
+        let plain_audio = td.path().join("interview.flac");
+        for audio in [&side_a, &side_b, &unrelated_audio, &plain_audio] {
+            std::fs::write(audio, b"not real flac").expect("audio fixture");
+        }
         std::fs::write(
             &cue_a,
-            r#"TITLE "Album Side A"
-FILE "side_a.flac" WAVE
-  TRACK 01 AUDIO
-    INDEX 01 00:00:00
-  TRACK 02 AUDIO
-    INDEX 01 01:00:00
-"#,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
         )
-        .unwrap();
-        std::fs::write(&cue_b, [0xff, 0xfe, 0x00]).unwrap();
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+        std::fs::write(
+            &unrelated_cue,
+            "TITLE \"Bonus Disc\"\nFILE \"bonus.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 02:00:00\n",
+        )
+        .expect("unrelated cue");
+
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(split_cue_album_grouping_key_for_queue(&cue_paths), decision);
+
+        let mut corrupt = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&cue_b)
+            .expect("open proven member in place");
+        std::io::Write::write_all(&mut corrupt, &[0xff, 0xfe, 0x00])
+            .expect("make proven member unparseable without replacing its file object");
+        drop(corrupt);
+
+        let selection = select_split_cue_folder_members(
+            &[cue_a.clone(), cue_b.clone(), unrelated_cue.clone()],
+            None,
+        );
+        let SplitCueFolderSelection::Selected { rejected, .. } = selection else {
+            panic!("fixture must retain valid candidates while rejecting the corrupt member");
+        };
+        assert!(rejected.iter().any(|rejection| {
+            queue_path_key(&rejection.cue_path) == queue_path_key(&cue_b)
+                && matches!(
+                    rejection.reason,
+                    crate::convert::split_cue_album::SplitCueMemberRejectionReason::ParseFailure { .. }
+                )
+        }));
+
+        let expanded = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
+        );
+        for proven_member in [&cue_a, &cue_b, &side_a, &side_b] {
+            assert!(
+                !path_list_contains(&expanded.paths, proven_member),
+                "proven failed group member leaked into queue: {}",
+                proven_member.display(),
+            );
+        }
+        assert!(path_list_contains(&expanded.paths, &unrelated_cue));
+        assert!(!path_list_contains(&expanded.paths, &unrelated_audio));
+        assert!(path_list_contains(&expanded.paths, &plain_audio));
+        assert!(!expanded.paths.is_empty(), "unrelated folder content must survive");
+        assert!(expanded.expansion_errors.iter().any(|error| {
+            error.contains("Cannot queue merged CUE album")
+                && error.contains("member CUE invalid")
+        }));
+    }
+
+    #[test]
+    fn folder_expansion_a2_unknown_malformed_siblings_preserve_valid_album_and_ordinary_audio() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let album_audio = td.path().join("album.flac");
+        let album_cue = td.path().join("album.cue");
+        let same_stem_audio = td.path().join("bonus.flac");
+        let same_stem_bad_cue = td.path().join("bonus.cue");
+        let differently_named_audio = td.path().join("side_b.flac");
+        let differently_named_bad_cue = td.path().join("disc2.cue");
+        for audio in [&album_audio, &same_stem_audio, &differently_named_audio] {
+            std::fs::write(audio, b"not real flac").expect("audio fixture");
+        }
+        std::fs::write(
+            &album_cue,
+            "TITLE \"Main Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("valid cue");
+        std::fs::write(&same_stem_bad_cue, [0xff, 0xfe, 0x00]).expect("same-stem bad cue");
+        std::fs::write(&differently_named_bad_cue, [0xff, 0xfe, 0x00])
+            .expect("differently-named bad cue");
 
         let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
-        assert!(expanded.paths.is_empty(), "parse failure must not fall back to side CUEs or raw images: {:?}", expanded.paths);
-        assert!(
-            expanded.expansion_errors.iter().any(|err| {
-                err.contains("failed to parse")
-                    || err.contains("failed to analyze")
-                    || err.contains("failed to decode")
-                    || err.contains("member CUE invalid")
-            }),
-            "expected a parse/analyze/decode error, got {:?}",
-            expanded.expansion_errors
+        assert!(path_list_contains(&expanded.paths, &album_cue));
+        assert!(!path_list_contains(&expanded.paths, &album_audio));
+        assert!(path_list_contains(&expanded.paths, &same_stem_audio));
+        assert!(path_list_contains(&expanded.paths, &differently_named_audio));
+        assert!(!path_list_contains(&expanded.paths, &same_stem_bad_cue));
+        assert!(!path_list_contains(&expanded.paths, &differently_named_bad_cue));
+        assert!(!expanded.paths.is_empty());
+        assert!(!expanded
+            .expansion_errors
+            .iter()
+            .any(|error| error.contains("Cannot queue merged CUE album")));
+        for malformed_cue in [&same_stem_bad_cue, &differently_named_bad_cue] {
+            let name = malformed_cue
+                .file_name()
+                .and_then(|value| value.to_str())
+                .expect("fixture CUE filename");
+            assert!(expanded.expansion_errors.iter().any(|error| {
+                error.contains("Suppressed unusable CUE")
+                    && error.contains(name)
+                    && error.contains("No current authoritative album-group membership")
+            }));
+        }
+    }
+
+    #[test]
+    fn authoritative_group_provenance_handles_malformed_member_with_different_filename() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("disc2.cue");
+        std::fs::write(&side_a, b"not real flac").expect("side A audio");
+        std::fs::write(&side_b, b"not real flac").expect("side B audio");
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            SplitCueAlbumGroupingReason::AmbiguousMerge,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(split_cue_album_grouping_key_for_queue(&cue_paths), decision);
+        let mut corrupt = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&cue_b)
+            .expect("open side B cue in place");
+        std::io::Write::write_all(&mut corrupt, &[0xff, 0xfe, 0x00])
+            .expect("corrupt side B cue");
+        drop(corrupt);
+
+        let expanded = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
         );
+        assert!(expanded.paths.is_empty(), "proven incomplete group leaked: {:?}", expanded.paths);
+        assert!(expanded
+            .expansion_errors
+            .iter()
+            .any(|error| error.contains("member CUE invalid")));
+    }
+
+    #[test]
+    fn proven_merged_group_fails_closed_when_member_becomes_parseable_but_invalid() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("side_b.cue");
+        std::fs::write(&side_a, b"not real flac").expect("side A audio");
+        std::fs::write(&side_b, b"not real flac").expect("side B audio");
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(split_cue_album_grouping_key_for_queue(&cue_paths), decision);
+
+        let mut invalid = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&cue_b)
+            .expect("open proven cue in place");
+        std::io::Write::write_all(
+            &mut invalid,
+            b"TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n",
+        )
+        .expect("remove INDEX 01 from proven member");
+        drop(invalid);
+
+        let expanded = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
+        );
+        assert!(expanded.paths.is_empty());
+        assert!(expanded.expansion_errors.iter().any(|error| {
+            error.contains("Cannot queue merged CUE album")
+                && error.contains("has no INDEX 01")
+        }));
+    }
+
+    #[test]
+    fn incomplete_group_provenance_never_fails_closed_by_inference() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("disc2.cue");
+        std::fs::write(&side_a, b"not real flac").expect("side A audio");
+        std::fs::write(&side_b, b"not real flac").expect("side B audio");
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(&cue_b, [0xff, 0xfe, 0x00]).expect("bad cue");
+
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            SplitCueAlbumGroupingReason::AmbiguousMerge,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(split_cue_album_grouping_key_for_queue(&cue_paths), decision);
+
+        let expanded = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
+        );
+        assert!(path_list_contains(&expanded.paths, &cue_a));
+        assert!(!path_list_contains(&expanded.paths, &side_a));
+        assert!(path_list_contains(&expanded.paths, &side_b));
+        assert!(expanded.cue_artifact_audio.contains(&side_b));
+        assert!(!expanded
+            .expansion_errors
+            .iter()
+            .any(|error| error.contains("Cannot queue merged CUE album")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_at_same_cue_path_invalidates_group_provenance() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("side_b.cue");
+        std::fs::write(&side_a, b"not real flac").expect("side A audio");
+        std::fs::write(&side_b, b"not real flac").expect("side B audio");
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(split_cue_album_grouping_key_for_queue(&cue_paths), decision);
+
+        std::fs::remove_file(&cue_b).expect("remove original cue object");
+        std::fs::write(&cue_b, [0xff, 0xfe, 0x00]).expect("replacement malformed cue");
+
+        let expanded = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
+        );
+        assert!(path_list_contains(&expanded.paths, &cue_a));
+        assert!(!path_list_contains(&expanded.paths, &side_a));
+        assert!(path_list_contains(&expanded.paths, &side_b));
+        assert!(!expanded
+            .expansion_errors
+            .iter()
+            .any(|error| error.contains("Cannot queue merged CUE album")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_at_same_audio_path_invalidates_group_provenance() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        let cue_a = td.path().join("side_a.cue");
+        let cue_b = td.path().join("side_b.cue");
+        std::fs::write(&side_a, b"original side A").expect("side A audio");
+        std::fs::write(&side_b, b"original side B").expect("side B audio");
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(split_cue_album_grouping_key_for_queue(&cue_paths), decision);
+
+        std::fs::remove_file(&side_b).expect("remove original audio object");
+        std::fs::write(&side_b, b"replacement side B").expect("replacement audio");
+        let mut corrupt = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&cue_b)
+            .expect("open side B cue in place");
+        std::io::Write::write_all(&mut corrupt, &[0xff, 0xfe, 0x00])
+            .expect("corrupt side B cue");
+        drop(corrupt);
+
+        let expanded = expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[td.path().to_path_buf()],
+            &decisions,
+        );
+        assert!(path_list_contains(&expanded.paths, &cue_a));
+        assert!(!path_list_contains(&expanded.paths, &side_a));
+        assert!(path_list_contains(&expanded.paths, &side_b));
+        assert!(!expanded
+            .expansion_errors
+            .iter()
+            .any(|error| error.contains("Cannot queue merged CUE album")));
+    }
+
+    #[test]
+    fn unrelated_rejected_sibling_does_not_change_multi_file_queue_representation() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let first = td.path().join("a1.flac");
+        let second = td.path().join("a2.flac");
+        let bonus_first = td.path().join("bonus1.flac");
+        let selected_cue = td.path().join("side-a.cue");
+        let unrelated_cue = td.path().join("bonus.cue");
+        std::fs::write(&first, b"not real flac").unwrap();
+        std::fs::write(&second, b"not real flac").unwrap();
+        std::fs::write(&bonus_first, b"not real flac").unwrap();
+        std::fs::write(
+            &selected_cue,
+            concat!(
+                "TITLE \"Shared Album Side A\"\n",
+                "FILE \"a1.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"a2.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 04:00:00\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &unrelated_cue,
+            concat!(
+                "TITLE \"Bonus Material\"\n",
+                "FILE \"bonus1.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"missing-bonus2.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 04:00:00\n",
+            ),
+        )
+        .unwrap();
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert_eq!(expanded.paths, vec![selected_cue]);
+        assert!(expanded.synthetic_cue_artifacts.is_empty());
     }
 
 
@@ -3695,6 +4303,47 @@ FILE "10 - Live Version.wav" WAVE
         assert!(path_list_contains(&expanded, &split_cue));
         assert!(!path_list_contains(&expanded, &artifact_cue));
         assert!(!path_list_contains(&expanded, &image));
+    }
+
+    #[test]
+    fn split_source_does_not_suppress_multi_file_metadata_sidecar_by_subset() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let split_cue = td.path().join("album-split.cue");
+        let metadata_cue = td.path().join("album-index.cue");
+        let first = td.path().join("first.flac");
+        let second = td.path().join("second.flac");
+        std::fs::write(&first, b"not real flac").unwrap();
+        std::fs::write(&second, b"not real flac").unwrap();
+        std::fs::write(
+            &split_cue,
+            concat!(
+                "FILE \"first.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"second.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &metadata_cue,
+            concat!(
+                "FILE \"first.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "FILE \"second.flac\" WAVE\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .unwrap();
+
+        let expanded = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        let prompt = expanded
+            .cue_selection_prompt
+            .expect("broader subset coverage must not silently choose by role");
+        assert_eq!(prompt.candidates.len(), 2);
+        assert!(prompt.candidates.iter().any(|path| path == &split_cue));
+        assert!(prompt.candidates.iter().any(|path| path == &metadata_cue));
+        assert!(expanded.paths.is_empty());
     }
 
     #[test]

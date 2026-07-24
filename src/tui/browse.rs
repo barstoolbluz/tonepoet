@@ -178,7 +178,11 @@ pub use crate::convert::queue_expansion::{
     count_audio_files_bounded, expand_paths_to_audio, expand_paths_to_audio_with_metadata,
     QueueExpansionResult,
 };
-use crate::convert::queue_expansion::expand_paths_to_audio_with_preserved_disc_roots;
+use crate::convert::queue_expansion::{
+    expand_paths_to_audio_with_metadata_using_grouping_decisions,
+    expand_paths_to_audio_with_preserved_disc_roots_using_grouping_decisions,
+    QueueSplitCueAlbumGroupingDecisions,
+};
 use crate::convert::queue_expansion::push_unique_path_with_keys;
 pub(crate) use crate::convert::queue_expansion::{
     resolve_cue_file_reference_for_queue, CueReferenceResolution,
@@ -4662,6 +4666,20 @@ impl BrowseState {
     /// The expansion helper (`expand_paths_to_audio`) is screen-agnostic
     /// so Library and future screens can reuse the same logic.
     pub fn collect_selection_for_queue(&self) -> QueueExpansionResult {
+        self.collect_selection_for_queue_with_grouping_decisions(
+            &QueueSplitCueAlbumGroupingDecisions::new(),
+        )
+    }
+
+    /// Queue collection with operation/session-scoped authoritative split-CUE
+    /// grouping evidence. Callers that own metadata/grouping state must use
+    /// this form so stale-validated A policy is identical across Browse and
+    /// conversion planning; callers without evidence pass an empty map and do
+    /// not fabricate membership.
+    pub fn collect_selection_for_queue_with_grouping_decisions(
+        &self,
+        grouping_decisions: &QueueSplitCueAlbumGroupingDecisions,
+    ) -> QueueExpansionResult {
         if !self.multi_selected.is_empty() {
             let selected_paths = self.multi_selected_in_current_directory();
             if selected_paths.is_empty() {
@@ -4669,11 +4687,15 @@ impl BrowseState {
             }
             let preserved_disc_roots = self.multi_selected_disc_source_dir_roots_for(&selected_paths);
             if preserved_disc_roots.is_empty() {
-                return expand_paths_to_audio_with_metadata(&selected_paths);
+                return expand_paths_to_audio_with_metadata_using_grouping_decisions(
+                    &selected_paths,
+                    grouping_decisions,
+                );
             }
-            return expand_paths_to_audio_with_preserved_disc_roots(
+            return expand_paths_to_audio_with_preserved_disc_roots_using_grouping_decisions(
                 &selected_paths,
                 &preserved_disc_roots,
+                grouping_decisions,
             );
         }
         if let Some(entry) = self.selected_entry() {
@@ -4697,7 +4719,10 @@ impl BrowseState {
                     };
                 }
                 EntryKind::Directory => {
-                    return expand_paths_to_audio_with_metadata(&[entry.path.clone()]);
+                    return expand_paths_to_audio_with_metadata_using_grouping_decisions(
+                        &[entry.path.clone()],
+                        grouping_decisions,
+                    );
                 }
                 EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir => {
                     return QueueExpansionResult {
@@ -15712,6 +15737,68 @@ mod disc_directory_navigation_tests {
             assert_eq!(selection.paths, vec![entry.path]);
             assert!(selection.cue_artifact_audio.is_empty());
         }
+    }
+
+    #[test]
+    fn queue_collection_applies_authoritative_failed_group_provenance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let side_a = album.join("side_a.flac");
+        let side_b = album.join("side_b.flac");
+        let cue_a = album.join("side_a.cue");
+        let cue_b = album.join("side_b.cue");
+        let loose = album.join("interview.flac");
+        for audio in [&side_a, &side_b, &loose] {
+            std::fs::write(audio, b"audio fixture").expect("audio fixture");
+        }
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            crate::convert::split_cue_album::SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(
+            crate::convert::queue_expansion::split_cue_album_grouping_key_for_queue(&cue_paths),
+            decision,
+        );
+        let mut corrupt = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&cue_b)
+            .expect("open proven cue in place");
+        std::io::Write::write_all(&mut corrupt, &[0xff, 0xfe, 0x00])
+            .expect("corrupt proven cue");
+        drop(corrupt);
+
+        let mut state = BrowseState::new();
+        state.current_dir = temp.path().to_path_buf();
+        state.entries = vec![BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        state.selected_index = 0;
+        let selection = state.collect_selection_for_queue_with_grouping_decisions(&decisions);
+
+        assert_eq!(selection.paths, vec![loose]);
+        assert!(selection.expansion_errors.iter().any(|warning| {
+            warning.contains("Cannot queue merged CUE album")
+                && warning.contains("member CUE invalid")
+        }));
     }
 
     #[test]

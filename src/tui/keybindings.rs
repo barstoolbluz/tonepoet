@@ -10771,6 +10771,20 @@ fn apply_policy_selected_metadata_cue_source(
         entries,
         selected.sheet.tracks.len(),
     );
+    if selected
+        .sheet
+        .catalog
+        .as_deref()
+        .is_some_and(|catalog| !catalog.trim().is_empty())
+    {
+        cue_album_upsert_unique_album_entry(
+            entries,
+            "CATALOGNUMBER",
+            lofty::tag::ItemKey::CatalogNumber,
+            selected.sheet.catalog.clone(),
+            surface.audio_paths.len(),
+        );
+    }
     Ok((
         selected,
         embedded_cuesheet_present,
@@ -10968,7 +10982,7 @@ fn collect_metadata_cue_admission_with_selections(
                 ]));
                 let detail = rejected
                     .into_iter()
-                    .map(|(path, message)| format!("{}: {message}", path.display()))
+                    .map(|rejection| rejection.to_string())
                     .collect::<Vec<_>>()
                     .join("; ");
                 warnings.push(format!(
@@ -11282,6 +11296,28 @@ fn cue_album_sort_entries(entries: &mut Vec<super::probe::TagEntry>) {
         }
     }
     entries.extend(tail);
+}
+
+fn cue_album_upsert_unique_album_entry(
+    entries: &mut Vec<super::probe::TagEntry>,
+    display_key: &str,
+    item_key: lofty::tag::ItemKey,
+    value: Option<String>,
+    n_paths: usize,
+) {
+    let canonical_key = super::probe::canonical_metadata_display_key(display_key);
+    let mut retained_one = false;
+    entries.retain(|entry| {
+        if super::probe::canonical_metadata_display_key(&entry.display_key) != canonical_key {
+            return true;
+        }
+        if retained_one {
+            return false;
+        }
+        retained_one = true;
+        true
+    });
+    cue_album_upsert_album_entry(entries, display_key, item_key, value, n_paths);
 }
 
 fn cue_album_upsert_album_entry(
@@ -16789,8 +16825,7 @@ fn open_metadata_editor_impl(
     let metadata_sidecar_surfaces = admission.metadata_sidecar_surfaces;
     let admitted_ordinary_paths = admission.ordinary_paths;
     let cue_admission_warnings = admission.warnings;
-    let cue_fallback_status = (!admitted_ordinary_paths.is_empty()
-        && !cue_admission_warnings.is_empty())
+    let cue_fallback_status = (!cue_admission_warnings.is_empty())
         .then(|| format!("metadata: {}", cue_admission_warnings.join("; ")));
     if cue_surfaces.is_empty() && !cue_admission_warnings.is_empty() {
         // No candidate resolved safely. Keep the warning visible, then
@@ -16800,9 +16835,6 @@ fn open_metadata_editor_impl(
             "metadata: {}",
             cue_admission_warnings.join("; ")
         ));
-        if admitted_ordinary_paths.is_empty() {
-            return;
-        }
     }
     let mut active_surface = 0;
     if sel.len() == 1 && sel[0].is_file() {
@@ -42962,7 +42994,7 @@ mod single_image_metadata_editor_regression_tests {
         let merged_group = infos
             .iter()
             .map(|info| metadata_cue_surface_key(&info.cue_path))
-            .collect();
+            .collect::<Vec<_>>();
         let ordinary_paths = admission.ordinary_paths;
         let warnings = admission.warnings;
 
@@ -42985,11 +43017,10 @@ mod single_image_metadata_editor_regression_tests {
             crate::tui::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
             Ok(Box::new(
                 crate::tui::command::SplitCueAlbumGroupingAsyncOutcome {
-                    decision: crate::tui::command::SplitCueAlbumGroupingDecision {
-                        groups: vec![merged_group],
-                        reason:
-                            crate::tui::command::SplitCueAlbumGroupingReason::TitleSharedPrefix,
-                    },
+                    decision: crate::convert::split_cue_album::merge_decision(
+                        &merged_group,
+                        crate::tui::command::SplitCueAlbumGroupingReason::TitleSharedPrefix,
+                    ),
                     toc_outcome: None,
                     cache_writes: Vec::new(),
                 },
@@ -43560,7 +43591,17 @@ mod single_image_metadata_editor_regression_tests {
         let queue = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(&[
             album,
         ]);
-        assert!(queue.expansion_errors.is_empty(), "{:?}", queue.expansion_errors);
+        // Phase 2: side-b.cue dangles (b2.flac removed). Per the A2 contract it is
+        // suppressed independently with a visible no-authority notice, while the
+        // sole viable side-a multi-FILE album still queues. Tolerate that one
+        // expected notice; reject any other expansion error.
+        assert!(
+            queue.expansion_errors.iter().all(|err| {
+                err.contains("Suppressed unusable CUE") && err.contains("side-b.cue")
+            }),
+            "unexpected expansion error: {:?}",
+            queue.expansion_errors
+        );
         assert_eq!(queue.paths.len(), 1);
         assert!(crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
             &queue.paths[0]
@@ -44160,6 +44201,96 @@ mod metadata_cue_source_coverage_tests {
             audio_path: std::path::PathBuf::from("/album/album.flac"),
             sheet: crate::tui::cue_parser::parse_cue(&cue_text),
             cue_text,
+        }
+    }
+
+
+    fn policy_surface_with_catalog(catalog: Option<&str>) -> MetadataCueSurface {
+        let catalog_line = catalog
+            .map(|value| format!("CATALOG {value}\n"))
+            .unwrap_or_default();
+        let cue_text = format!(
+            "PERFORMER \"Sidecar Artist\"\nTITLE \"Sidecar Album\"\n{catalog_line}FILE \"album.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+        );
+        MetadataCueSurface {
+            cue_path: std::path::PathBuf::from("/album/album.cue"),
+            audio_path: std::path::PathBuf::from("/album/album.flac"),
+            audio_paths: vec![std::path::PathBuf::from("/album/album.flac")],
+            track_audio_paths: vec![
+                std::path::PathBuf::from("/album/album.flac"),
+                std::path::PathBuf::from("/album/album.flac"),
+            ],
+            sheet: crate::tui::cue_parser::parse_cue(&cue_text),
+            cue_text,
+        }
+    }
+
+    #[test]
+    fn selected_sidecar_catalognumber_is_unique_idempotent_and_survives_album_edit() {
+        let surface = policy_surface_with_catalog(Some("25AP-1115"));
+        let mut entries = Vec::new();
+        apply_policy_selected_metadata_cue_source(
+            &mut entries,
+            &surface,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("selected sidecar source");
+
+        let catalog_entry = entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CATALOGNUMBER"))
+            .expect("nonempty selected CUE CATALOG must surface");
+        assert_eq!(catalog_entry.value, "25AP-1115");
+
+        entries.push(catalog_entry.clone());
+        apply_policy_selected_metadata_cue_source(
+            &mut entries,
+            &surface,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("repeated selected sidecar source");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.display_key.eq_ignore_ascii_case("CATALOGNUMBER"))
+                .count(),
+            1,
+            "repeated construction must collapse equivalent catalog rows"
+        );
+
+        cue_album_upsert_album_entry(
+            &mut entries,
+            "ALBUM",
+            lofty::tag::ItemKey::AlbumTitle,
+            Some("Edited Album".to_string()),
+            1,
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.display_key.eq_ignore_ascii_case("CATALOGNUMBER"))
+                .count(),
+            1,
+            "editing ALBUM must not remove the selected CUE catalog row"
+        );
+    }
+
+    #[test]
+    fn selected_sidecar_without_catalog_does_not_create_catalognumber_row() {
+        for surface in [
+            policy_surface_with_catalog(None),
+            policy_surface_with_catalog(Some("   ")),
+        ] {
+            let mut entries = Vec::new();
+            apply_policy_selected_metadata_cue_source(
+                &mut entries,
+                &surface,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+            )
+            .expect("selected sidecar source");
+            assert!(entries
+                .iter()
+                .all(|entry| !entry.display_key.eq_ignore_ascii_case("CATALOGNUMBER")));
         }
     }
 

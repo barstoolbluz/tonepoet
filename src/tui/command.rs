@@ -216,8 +216,8 @@ fn is_regular_filesystem_audio_folder_convert_candidate_raw(
 /// Blocking implementation for background workers and narrow tests only. Do
 /// not call this from key handlers, reducers, context-menu dispatch, or command
 /// execution: use `start_browse_convert_folder_expansion` for Browse flows.
+#[cfg(test)]
 #[must_use]
-#[allow(dead_code)]
 pub(crate) fn regular_filesystem_audio_folder_paths_for_convert_blocking(
     browse_in_archive: bool,
     path: &Path,
@@ -229,6 +229,7 @@ pub(crate) fn regular_filesystem_audio_folder_paths_for_convert_blocking(
     )
 }
 
+#[cfg(test)]
 fn regular_filesystem_audio_folder_paths_for_convert_blocking_with_cancel(
     browse_in_archive: bool,
     path: &Path,
@@ -267,8 +268,8 @@ fn regular_filesystem_audio_folder_paths_for_convert_blocking_with_cancel(
 /// Backward-compatible test seam. Production Browse flows must not use this;
 /// the source-text tests below assert that queue/load paths use the async
 /// worker entry point instead.
+#[cfg(test)]
 #[must_use]
-#[allow(dead_code)]
 pub(crate) fn regular_filesystem_audio_folder_paths_for_convert(
     app: &AppState,
     path: &Path,
@@ -963,6 +964,7 @@ fn split_cue_album_grouping_decision_merge(
 ) -> SplitCueAlbumGroupingDecision {
     let cue_paths: Vec<PathBuf> = infos.iter().map(|info| info.cue_path.clone()).collect();
     crate::convert::split_cue_album::merge_decision(&cue_paths, reason)
+        .with_current_member_provenance()
 }
 
 fn split_cue_album_grouping_decision_split_each(
@@ -971,6 +973,7 @@ fn split_cue_album_grouping_decision_split_each(
 ) -> SplitCueAlbumGroupingDecision {
     let cue_paths: Vec<PathBuf> = infos.iter().map(|info| info.cue_path.clone()).collect();
     crate::convert::split_cue_album::split_each_decision(&cue_paths, reason)
+        .with_current_member_provenance()
 }
 
 fn split_cue_infos_for_decision_group(
@@ -7884,7 +7887,11 @@ fn execute_queue_with_post_load(
                 return;
             }
 
-            let selection = app.browse.collect_selection_for_queue();
+            let grouping_decisions =
+                resolved_split_cue_album_grouping_decisions_for_conversion(app, &raw_selection);
+            let selection = app
+                .browse
+                .collect_selection_for_queue_with_grouping_decisions(&grouping_decisions);
             if let Some(err) = selection.first_error() {
                 app.set_status(status_with_stale_selection_notice(
                     dropped_stale_count,
@@ -17236,9 +17243,12 @@ mod execute_queue_state_consistency_tests {
         let async_start = browse_arm
             .find("start_browse_convert_folder_expansion(")
             .expect("regular folder expansion must start a background job");
+        let evidence = browse_arm
+            .find("resolved_split_cue_album_grouping_decisions_for_conversion(app, &raw_selection)")
+            .expect("non-folder Browse collection must snapshot authoritative grouping evidence");
         let collect = browse_arm
-            .find("let selection = app.browse.collect_selection_for_queue();")
-            .expect("queue should collect the browse selection once");
+            .find("collect_selection_for_queue_with_grouping_decisions(&grouping_decisions)")
+            .expect("queue should collect the browse selection with grouping evidence");
         let immediate_finish = browse_arm
             .find("finish_browse_queue_review_after_expansion(app, tx, preset, selection, 0)")
             .expect("non-folder selections should still publish immediately");
@@ -17250,7 +17260,8 @@ mod execute_queue_state_consistency_tests {
         // collect_selection_for_queue(): that collection expands directories
         // with a synchronous recursive walk on the reducer path.
         assert!(candidate_check < async_start);
-        assert!(async_start < collect);
+        assert!(async_start < evidence);
+        assert!(evidence < collect);
         assert!(collect < immediate_finish);
         assert!(immediate_finish < post_load);
         assert!(
@@ -18571,14 +18582,35 @@ mod split_cue_source_coverage_tests {
 
     #[test]
     fn split_cue_grouping_title_rung_merges_shared_prefix() {
-        let infos = split_cue_grouping_fixture(&[
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut infos = split_cue_grouping_fixture(&[
             Some("The Dark Side Of The Moon (Side A)"),
             Some("The Dark Side Of The Moon (Side B)"),
         ]);
+        for (index, info) in infos.iter_mut().enumerate() {
+            let stem = format!("part_{}", index + 1);
+            info.audio_path = temp.path().join(format!("{stem}.wv"));
+            info.cue_path = temp.path().join(format!("{stem}.cue"));
+            std::fs::write(&info.audio_path, b"audio fixture").expect("audio fixture");
+            std::fs::write(
+                &info.cue_path,
+                format!(
+                    "TITLE \"{}\"\nFILE \"{stem}.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 01:00:00\n",
+                    info.sheet.title.as_deref().unwrap_or_default(),
+                ),
+            )
+            .expect("cue fixture");
+        }
         let decision = split_cue_title_rung_decision(&infos).expect("title rung decision");
         assert_eq!(decision.reason, SplitCueAlbumGroupingReason::TitleSharedPrefix);
         assert_eq!(decision.groups.len(), 1);
         assert_eq!(decision.groups[0].len(), 2);
+        assert!(infos.iter().all(|info| {
+            decision.member_audio_matches(
+                &info.cue_path,
+                std::slice::from_ref(&info.audio_path),
+            )
+        }));
     }
 
     #[test]

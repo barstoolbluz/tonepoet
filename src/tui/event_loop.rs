@@ -10347,10 +10347,10 @@ mod musicbrainz_completion_dispatch_tests {
         releases: Vec<crate::tui::musicbrainz::MbRelease>,
     ) -> Box<crate::tui::command::SplitCueAlbumGroupingAsyncOutcome> {
         Box::new(crate::tui::command::SplitCueAlbumGroupingAsyncOutcome {
-            decision: crate::tui::command::SplitCueAlbumGroupingDecision {
-                groups: vec![vec![info.cue_path.clone()]],
-                reason: crate::tui::command::SplitCueAlbumGroupingReason::ConcatTocHit,
-            },
+            decision: crate::convert::split_cue_album::split_each_decision(
+                std::slice::from_ref(&info.cue_path),
+                crate::tui::command::SplitCueAlbumGroupingReason::ConcatTocHit,
+            ),
             toc_outcome: Some(lookup_outcome(releases)),
             cache_writes: Vec::new(),
         })

@@ -101,6 +101,10 @@ pub struct ConversionManager {
     pub queue: Arc<RwLock<ConversionQueue>>,
     pub processor: ConversionProcessor,
     pub config: ConversionConfig,
+    /// Operation/session-scoped authoritative split-CUE grouping evidence.
+    /// Direct manager callers may install decisions captured while all members
+    /// were readable; queue expansion revalidates them before suppressing work.
+    split_cue_album_grouping_decisions: QueueSplitCueAlbumGroupingDecisions,
     paused: bool,
     stop_requested: bool,
     /// Transient synthetic CUE inputs currently owned by queued conversion
@@ -520,6 +524,7 @@ impl ConversionManager {
             queue: Arc::new(RwLock::new(ConversionQueue::new())),
             processor,
             config,
+            split_cue_album_grouping_decisions: QueueSplitCueAlbumGroupingDecisions::new(),
             paused: false,
             stop_requested: false,
             synthetic_cue_artifacts: Arc::new(Mutex::new(HashMap::new())),
@@ -529,6 +534,16 @@ impl ConversionManager {
             conversion_run_generation: Arc::new(AtomicU64::new(0)),
             active_conversion_items: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Replace the manager's operation/session-scoped split-CUE grouping
+    /// evidence. Callers must pass only decisions captured by the shared
+    /// grouping policy; an empty map explicitly means no authoritative proof.
+    pub fn set_split_cue_album_grouping_decisions(
+        &mut self,
+        decisions: QueueSplitCueAlbumGroupingDecisions,
+    ) {
+        self.split_cue_album_grouping_decisions = decisions;
     }
 
     /// Add files to the conversion queue
@@ -558,9 +573,10 @@ impl ConversionManager {
             )));
         }
 
-        let expansion = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(&[
-            dir.to_path_buf(),
-        ]);
+        let expansion = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[dir.to_path_buf()],
+            &self.split_cue_album_grouping_decisions,
+        );
         if let Some(prompt) = expansion.cue_selection_prompt.as_ref() {
             return Err(ConversionError::ValidationError(
                 prompt.noninteractive_error_message(),
@@ -1051,9 +1067,28 @@ impl ConversionManager {
             )));
         }
 
-        Ok(crate::convert::queue_expansion::expand_paths_to_audio(&[
-            dir.to_path_buf(),
-        ]))
+        let mut expansion = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata_using_grouping_decisions(
+            &[dir.to_path_buf()],
+            &self.split_cue_album_grouping_decisions,
+        );
+        if let Some(prompt) = expansion.cue_selection_prompt.as_ref() {
+            return Err(ConversionError::ValidationError(
+                prompt.noninteractive_error_message(),
+            ));
+        }
+        if expansion.paths.is_empty() {
+            if let Some(message) = expansion.first_error() {
+                return Err(ConversionError::ValidationError(message.to_string()));
+            }
+        } else if let Some(message) = expansion.first_error() {
+            log::warn!("directory scan expansion warning: {message}");
+        }
+        if !expansion.synthetic_cue_artifacts.is_empty() {
+            let artifacts = std::mem::take(&mut expansion.synthetic_cue_artifacts);
+            expansion.paths.retain(|path| !artifacts.contains(path));
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&artifacts);
+        }
+        Ok(expansion.paths)
     }
 
     /// Start processing the conversion queue
@@ -3239,6 +3274,64 @@ mod bluray_queue_admission_tests {
         }
         let queue = manager.queue.try_read().expect("queue read lock");
         assert_eq!(queue.total_items(), 0);
+    }
+
+    #[test]
+    fn add_directory_applies_authoritative_failed_group_provenance() {
+        let temp = TempDir::new("add-directory-provenance");
+        let album = temp.path.join("album");
+        fs::create_dir_all(&album).expect("album dir");
+        let side_a = album.join("side_a.flac");
+        let side_b = album.join("side_b.flac");
+        let cue_a = album.join("side_a.cue");
+        let cue_b = album.join("side_b.cue");
+        let loose = album.join("interview.flac");
+        for audio in [&side_a, &side_b, &loose] {
+            fs::write(audio, b"audio fixture").expect("audio fixture");
+        }
+        fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = crate::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            crate::convert::split_cue_album::SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+        .with_current_member_provenance();
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(
+            crate::convert::queue_expansion::split_cue_album_grouping_key_for_queue(&cue_paths),
+            decision,
+        );
+        let mut corrupt = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&cue_b)
+            .expect("open proven cue in place");
+        std::io::Write::write_all(&mut corrupt, &[0xff, 0xfe, 0x00])
+            .expect("corrupt proven cue");
+        drop(corrupt);
+
+        let mut manager = ConversionManager::new(ConversionConfig::default());
+        manager.set_split_cue_album_grouping_decisions(decisions);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(manager.add_directory(&album, ConversionOptions::default()))
+            .expect("unrelated work should keep directory admission usable");
+
+        let queue = manager.queue.try_read().expect("queue read lock");
+        let queued = queue
+            .all_items()
+            .into_iter()
+            .map(|item| item.input_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(queued, vec![loose]);
     }
 
     #[test]

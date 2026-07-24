@@ -1663,6 +1663,20 @@ struct PlannedCliQueue {
 /// does not follow symlinks inside directories (matching Browse); symlinked
 /// layouts need explicit file arguments.
 fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
+    plan_cli_convert_queue_with_grouping_decisions(
+        paths,
+        &tonepoet::convert::queue_expansion::QueueSplitCueAlbumGroupingDecisions::new(),
+    )
+}
+
+/// CLI planner seam for callers that already possess operation/session-scoped
+/// authoritative split-CUE grouping evidence. The ordinary one-shot CLI has no
+/// prior grouping session and therefore passes an empty map rather than
+/// fabricating membership from filenames or directory co-location.
+fn plan_cli_convert_queue_with_grouping_decisions(
+    paths: &[PathBuf],
+    grouping_decisions: &tonepoet::convert::queue_expansion::QueueSplitCueAlbumGroupingDecisions,
+) -> PlannedCliQueue {
     let mut warnings = Vec::new();
     let mut expansion_inputs = Vec::new();
     for path in paths {
@@ -1673,8 +1687,10 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
         expansion_inputs.push(path.clone());
     }
 
-    let expansion =
-        tonepoet::convert::queue_expansion::expand_paths_to_audio_with_metadata(&expansion_inputs);
+    let expansion = tonepoet::convert::queue_expansion::expand_paths_to_audio_with_metadata_using_grouping_decisions(
+        &expansion_inputs,
+        grouping_decisions,
+    );
     let mut errors = Vec::new();
     if let Some(prompt) = expansion.cue_selection_prompt.as_ref() {
         errors.push(prompt.noninteractive_error_message());
@@ -3923,6 +3939,59 @@ FILE "side_b.flac" WAVE
 
         let planned = plan_cli_convert_queue(&[temp.path().to_path_buf(), audio.clone()]);
         assert_eq!(planned_names(&planned), vec!["01 - One.flac"]);
+    }
+
+    #[test]
+    fn cli_planner_applies_authoritative_failed_group_provenance_without_suppressing_unrelated_audio() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let side_a = temp.path().join("side_a.flac");
+        let side_b = temp.path().join("side_b.flac");
+        let cue_a = temp.path().join("side_a.cue");
+        let cue_b = temp.path().join("side_b.cue");
+        let loose = temp.path().join("interview.flac");
+        for audio in [&side_a, &side_b, &loose] {
+            touch(audio);
+        }
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album Side A\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album Side B\"\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side B cue");
+        let cue_paths = vec![cue_a.clone(), cue_b.clone()];
+        let decision = tonepoet::convert::split_cue_album::merge_decision(
+            &cue_paths,
+            tonepoet::convert::split_cue_album::SplitCueAlbumGroupingReason::TitleSharedPrefix,
+        )
+        .with_current_member_provenance();
+        let mut decisions = tonepoet::convert::queue_expansion::QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(
+            tonepoet::convert::queue_expansion::split_cue_album_grouping_key_for_queue(&cue_paths),
+            decision,
+        );
+        let mut corrupt = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&cue_b)
+            .expect("open proven cue in place");
+        std::io::Write::write_all(&mut corrupt, &[0xff, 0xfe, 0x00])
+            .expect("corrupt proven cue");
+        drop(corrupt);
+
+        let planned = plan_cli_convert_queue_with_grouping_decisions(
+            &[temp.path().to_path_buf()],
+            &decisions,
+        );
+        assert_eq!(planned_names(&planned), vec!["interview.flac"]);
+        assert!(planned.errors.is_empty());
+        assert!(planned.warnings.iter().any(|warning| {
+            warning.contains("Cannot queue merged CUE album")
+                && warning.contains("member CUE invalid")
+        }));
     }
 
     /// Suppressed sibling audio from an unresolvable CUE carries the
