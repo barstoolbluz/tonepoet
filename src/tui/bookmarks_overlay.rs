@@ -86,7 +86,13 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState, theme: 
                 Style::default().fg(theme.text_dim)
             };
 
-            let name_display = truncate_right(&entry.name, name_col_w);
+            let target_exists = entry.path.is_dir();
+            let display_name = if target_exists {
+                entry.name.clone()
+            } else {
+                format!("{} (missing)", entry.name)
+            };
+            let name_display = truncate_right(&display_name, name_col_w);
             let name_w = super::display_width::width(&name_display);
             let name_pad = name_col_w.saturating_sub(name_w);
 
@@ -104,7 +110,9 @@ pub fn draw_bookmarks_overlay(f: &mut Frame, state: &mut BookmarksState, theme: 
             };
             let path_display = truncate_left(&path_display, path_col_w);
 
-            let name_style = if is_selected {
+            let name_style = if !target_exists {
+                Style::default().fg(theme.destructive).add_modifier(Modifier::DIM)
+            } else if is_selected {
                 Style::default()
                     .fg(theme.text_bright)
                     .add_modifier(Modifier::BOLD)

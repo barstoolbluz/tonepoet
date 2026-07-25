@@ -1,12 +1,14 @@
 use crate::state::{
-    intersect_rect, ConflictPolicyPreset, DeleteConfirmButton, FilePickerCreateKind, FilePickerFocus,
-    FilePickerHitAction, FilePickerMenuAction, FilePickerSelectionMode, FilePickerState, HitRegion,
-    SaveModeStyle, ToolbarAction,
+    intersect_rect, ConflictPolicyPreset, DeleteConfirmButton, FilePickerContextMenuKind,
+    FilePickerCreateKind, FilePickerFocus, FilePickerHitAction, FilePickerMenuAction,
+    FilePickerMenuEntry, FilePickerSelectionMode, FilePickerState, FilePickerSubmenuKind,
+    HitRegion, SaveModeStyle, ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
+use ratatui::style::Style;
 use std::time::{Duration, SystemTime};
 
 
@@ -102,6 +104,8 @@ impl FilePickerState {
         area: Rect,
         mut image_ctx: ImageRenderContext<'_>,
     ) {
+        self.poll_search();
+        self.poll_paste_task();
         self.clear_hit_regions();
         self.set_last_area(area);
         if area.width < 48 || area.height < 10 {
@@ -116,10 +120,21 @@ impl FilePickerState {
         frame.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(self.theme.border)
-            .title(Span::styled(self.title.clone(), self.theme.title));
-        let inner = block.inner(area);
+            .border_style(self.theme.border);
+        let outer_inner = block.inner(area);
         frame.render_widget(block, area);
+
+        let title_area = Rect::new(outer_inner.x, outer_inner.y, outer_inner.width, 1);
+        let disclosure = if self.maximized { "▾" } else { "▸" };
+        let title = fit_text_left(&format!(" {disclosure} {}", self.title), title_area.width as usize);
+        frame.render_widget(Paragraph::new(title).style(self.theme.toolbar_active), title_area);
+        self.record_hit_region(title_area, FilePickerHitAction::TitleToggleMaximize);
+        let inner = Rect::new(
+            outer_inner.x,
+            outer_inner.y.saturating_add(1),
+            outer_inner.width,
+            outer_inner.height.saturating_sub(1),
+        );
 
         let toolbar_area;
         if self.save_mode_style() == Some(SaveModeStyle::Inline) {
@@ -184,11 +199,11 @@ impl FilePickerState {
         if self.properties_open {
             self.render_properties_popup(frame, area);
         }
+        if matches!(self.focus, FilePickerFocus::Bookmarks | FilePickerFocus::BookmarkName) {
+            self.render_bookmarks_popup(frame, area);
+        }
         if self.focus == FilePickerFocus::DeleteConfirm {
             self.render_delete_confirm_popup(frame, area);
-        }
-        if self.focus == FilePickerFocus::CreateName {
-            self.render_create_name_popup(frame, area);
         }
         if self.save_mode_style() == Some(SaveModeStyle::Modal)
             && self.focus == FilePickerFocus::SaveName
@@ -197,6 +212,9 @@ impl FilePickerState {
         }
         if self.focus == FilePickerFocus::SaveOverwriteConfirm {
             self.render_save_overwrite_confirm_popup(frame, area);
+        }
+        if let Some(task) = self.paste_task.as_mut() {
+            task.progress.render(frame, area);
         }
     }
 
@@ -219,13 +237,16 @@ impl FilePickerState {
             buttons.push(("Rename".to_string(), Some(ToolbarAction::Rename), no_selection));
             buttons.push(("Duplicate".to_string(), Some(ToolbarAction::Duplicate), no_selection));
             buttons.push(("Delete".to_string(), Some(ToolbarAction::Delete), no_selection || !self.operation_policy.allow_delete));
+            buttons.push(("Search".to_string(), Some(ToolbarAction::Search), false));
         } else {
             buttons.push((
                 (if self.menu_open { "File Operations ▴" } else { "File Operations ▾" }).to_string(),
                 Some(ToolbarAction::FileOperations),
                 false,
             ));
+            buttons.push(("Search".to_string(), Some(ToolbarAction::Search), false));
             buttons.push(("Properties".to_string(), Some(ToolbarAction::Properties), self.current_selection().is_none()));
+            buttons.push(("Bookmarks".to_string(), Some(ToolbarAction::Bookmarks), false));
         }
         if self.selection_mode == FilePickerSelectionMode::Directories {
             buttons.push(("Select Folder".to_string(), Some(ToolbarAction::AcceptSelection), false));
@@ -277,25 +298,38 @@ impl FilePickerState {
             .saturating_sub(crate::display_width::width(label) as u16)
             .saturating_sub(go_width)
             .saturating_sub(3);
-        let input = if self.address_editing {
-            text_with_caret(&self.address_buffer, self.address_cursor, input_width as usize)
-        } else {
-            fit_text_left(&self.address_buffer, input_width as usize)
-        };
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(label.to_string(), self.theme.label),
             Span::raw("  "),
-            Span::styled(input, self.theme.text),
-            Span::raw(" "),
-            button_span(go_label, self.theme.button),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        ];
+        if self.address_editing {
+            spans.extend(text_input_spans(
+                &self.address_input,
+                input_width as usize,
+                self.theme.text,
+                self.theme.selected,
+                true,
+            ));
+        } else {
+            spans.push(Span::styled(
+                fit_text_left(&self.address_input.text, input_width as usize),
+                self.theme.text,
+            ));
+        }
+        spans.push(Span::raw(" "));
+        spans.push(button_span(go_label, self.theme.button));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
         let _ = self.record_hit_region_clipped(
             Rect::new(input_x, area.y, input_width, 1),
             area,
             FilePickerHitAction::Address,
         );
-        let go_rect = Rect::new(area.x.saturating_add(area.width.saturating_sub(go_width)), area.y, go_width, 1);
+        let go_rect = Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(go_width)),
+            area.y,
+            go_width,
+            1,
+        );
         if let Some(visible_rect) = self.record_hit_region_clipped(
             go_rect,
             area,
@@ -311,6 +345,10 @@ impl FilePickerState {
         area: Rect,
         image_ctx: &mut ImageRenderContext<'_>,
     ) {
+        if self.search.active {
+            self.render_search(frame, area);
+            return;
+        }
         if self.preview_pane_enabled(area) {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
@@ -331,6 +369,116 @@ impl FilePickerState {
             self.render_tree(frame, panes[0]);
             self.render_file_table(frame, panes[1]);
         }
+    }
+
+    fn render_search(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border)
+            .title("Filesystem Search");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let query_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        let label = "Find: ";
+        let label_width = crate::display_width::width(label) as u16;
+        let query_width = query_area.width.saturating_sub(label_width).saturating_sub(2);
+        let mut query_spans = vec![Span::styled(label.to_string(), self.theme.label)];
+        query_spans.extend(text_input_spans(
+            &self.search.input,
+            query_width as usize,
+            self.theme.text,
+            self.theme.selected,
+            true,
+        ));
+        query_spans.push(Span::styled(" ×", self.theme.accelerator));
+        frame.render_widget(Paragraph::new(Line::from(query_spans)), query_area);
+        self.record_hit_region(
+            Rect::new(
+                inner.x.saturating_add(label_width),
+                inner.y,
+                query_width,
+                1,
+            ),
+            FilePickerHitAction::SearchInput,
+        );
+        self.record_hit_region(
+            Rect::new(inner.x.saturating_add(inner.width.saturating_sub(1)), inner.y, 1, 1),
+            FilePickerHitAction::SearchClose,
+        );
+
+        let result_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(2),
+        );
+        let visible_rows = result_area.height as usize;
+        self.set_file_visible_rows(visible_rows.max(1));
+        self.search.ensure_visible(visible_rows);
+        let mut lines = Vec::new();
+        let mut hits = Vec::new();
+        for (row, index) in (self.search.scroll..self.search.results.len())
+            .take(visible_rows)
+            .enumerate()
+        {
+            let result = &self.search.results[index];
+            let marker = if result.is_dir { "▸ " } else { "  " };
+            let relative = result
+                .path
+                .strip_prefix(&self.current_dir)
+                .unwrap_or(&result.path)
+                .display()
+                .to_string();
+            let text = fit_text_start(&format!("{marker}{relative}"), result_area.width as usize);
+            let style = if index == self.search.cursor {
+                self.theme.selected
+            } else if result.is_dir {
+                self.theme.folder
+            } else {
+                self.theme.text
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+            hits.push(HitRegion {
+                rect: Rect::new(
+                    result_area.x,
+                    result_area.y.saturating_add(row as u16),
+                    result_area.width,
+                    1,
+                ),
+                action: FilePickerHitAction::SearchRow(index),
+            });
+        }
+        if lines.is_empty() && !self.search.input.text.trim().is_empty() {
+            let message = if self.search.searching {
+                "Searching…"
+            } else if self.search.error.is_some() {
+                "Search failed"
+            } else {
+                "No matches"
+            };
+            lines.push(Line::from(Span::styled(message, self.theme.text_dim)));
+        }
+        self.hit_regions.extend(hits);
+        frame.render_widget(Paragraph::new(lines), result_area);
+
+        let status_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(inner.height.saturating_sub(1)),
+            inner.width,
+            1,
+        );
+        let status = if let Some(error) = self.search.error.as_deref() {
+            error.to_string()
+        } else if self.search.searching {
+            format!("{} matches so far · Esc cancels", self.search.results.len())
+        } else {
+            format!("{} matches · Enter opens · Esc closes", self.search.results.len())
+        };
+        frame.render_widget(Paragraph::new(fit_text_left(&status, status_area.width as usize)).style(self.theme.status), status_area);
     }
 
     #[cfg(feature = "image-preview")]
@@ -438,7 +586,11 @@ impl FilePickerState {
     fn render_tree(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if self.focus == FilePickerFocus::Tree { self.theme.border } else { self.theme.border_dim })
+            .border_style(if self.focus == FilePickerFocus::Tree {
+                self.theme.border
+            } else {
+                self.theme.border_dim
+            })
             .title("Folders");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -446,12 +598,28 @@ impl FilePickerState {
         let visible_rows = inner.height as usize;
         self.set_tree_visible_rows(visible_rows);
         self.ensure_tree_cursor_visible(visible_rows);
+
+        let inline_parent_index = if self.focus == FilePickerFocus::CreateName
+            && self.pending_name_source.is_none()
+            && self.context_menu_kind == FilePickerContextMenuKind::Tree
+        {
+            self.pending_name_parent.as_ref().and_then(|parent| {
+                self.tree_nodes
+                    .iter()
+                    .position(|node| same_display_path(&node.path, parent))
+            })
+        } else {
+            None
+        };
+
         let mut lines = Vec::new();
         let mut hits = Vec::new();
-        for (row, idx) in (self.tree_scroll..self.tree_nodes.len())
-            .take(visible_rows)
-            .enumerate()
-        {
+        let mut visual_row = 0usize;
+        for idx in self.tree_scroll..self.tree_nodes.len() {
+            if visual_row >= visible_rows {
+                break;
+            }
+
             let node = &self.tree_nodes[idx];
             let marker = if node.has_children {
                 if node.expanded { "▾" } else { "▸" }
@@ -459,23 +627,90 @@ impl FilePickerState {
                 " "
             };
             let indent = "  ".repeat(node.depth);
-            // Keep the START of the name: the tree is prefix-sorted, so the
-            // leading text (year, artist) is what makes it navigable. Paths in
-            // the address/target displays keep the tail instead (fit_text_right).
-            let label = fit_text_start(&format!("{indent}{marker} {}", node.name), inner.width as usize);
-            let style = if idx == self.tree_cursor && self.focus == FilePickerFocus::Tree {
-                self.theme.selected
-            } else if same_display_path(&node.path, &self.current_dir) {
-                self.theme.title
+            let editing_this = self.focus == FilePickerFocus::CreateName
+                && self
+                    .pending_name_source
+                    .as_ref()
+                    .is_some_and(|path| same_display_path(path, &node.path));
+            let line = if editing_this {
+                let prefix = format!("{indent}{marker} ");
+                let prefix_width = crate::display_width::width(&prefix);
+                let mut spans = vec![Span::raw(prefix)];
+                spans.extend(text_input_spans(
+                    &self.create_name_input,
+                    (inner.width as usize).saturating_sub(prefix_width),
+                    self.theme.text,
+                    self.theme.selected,
+                    true,
+                ));
+                Line::from(spans)
             } else {
-                self.theme.text
+                let label = fit_text_start(
+                    &format!("{indent}{marker} {}", node.name),
+                    inner.width as usize,
+                );
+                let style = if idx == self.tree_cursor && self.focus == FilePickerFocus::Tree {
+                    self.theme.selected
+                } else if same_display_path(&node.path, &self.current_dir) {
+                    self.theme.title
+                } else {
+                    self.theme.text
+                };
+                Line::from(Span::styled(label, style))
             };
-            lines.push(Line::from(Span::styled(label, style)));
+            lines.push(line);
+
+            let row_rect = Rect::new(
+                inner.x,
+                inner.y.saturating_add(visual_row as u16),
+                inner.width,
+                1,
+            );
             hits.push(HitRegion {
-                rect: Rect::new(inner.x, inner.y.saturating_add(row as u16), inner.width, 1),
-                action: FilePickerHitAction::TreeRow(idx),
+                rect: row_rect,
+                action: if editing_this {
+                    FilePickerHitAction::CreateNameEditor
+                } else {
+                    FilePickerHitAction::TreeRow(idx)
+                },
             });
+            if node.has_children && !editing_this {
+                let disclosure_x = inner
+                    .x
+                    .saturating_add((node.depth.saturating_mul(2)) as u16);
+                hits.push(HitRegion {
+                    rect: Rect::new(disclosure_x, row_rect.y, 1, 1),
+                    action: FilePickerHitAction::TreeDisclosure(idx),
+                });
+            }
+            visual_row = visual_row.saturating_add(1);
+
+            if inline_parent_index == Some(idx) && visual_row < visible_rows {
+                let depth = node.depth.saturating_add(1);
+                let prefix = format!("{}  ", "  ".repeat(depth));
+                let prefix_width = crate::display_width::width(&prefix);
+                let mut spans = vec![Span::raw(prefix)];
+                spans.extend(text_input_spans(
+                    &self.create_name_input,
+                    (inner.width as usize).saturating_sub(prefix_width),
+                    self.theme.text,
+                    self.theme.selected,
+                    true,
+                ));
+                lines.push(Line::from(spans));
+                hits.push(HitRegion {
+                    rect: Rect::new(
+                        inner.x,
+                        inner.y.saturating_add(visual_row as u16),
+                        inner.width,
+                        1,
+                    ),
+                    action: FilePickerHitAction::CreateNameEditor,
+                });
+                visual_row = visual_row.saturating_add(1);
+            }
         }
+
         self.hit_regions.extend(hits);
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -483,7 +718,11 @@ impl FilePickerState {
     fn render_file_table(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if self.focus == FilePickerFocus::Files { self.theme.border } else { self.theme.border_dim });
+            .border_style(if self.focus == FilePickerFocus::Files {
+                self.theme.border
+            } else {
+                self.theme.border_dim
+            });
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -494,13 +733,57 @@ impl FilePickerState {
             .style(self.theme.header)
             .bottom_margin(0);
         let mut rows = Vec::new();
-        let mut hits = Vec::new();
+        let mut hits = vec![HitRegion {
+            rect: Rect::new(
+                inner.x,
+                inner.y.saturating_add(1),
+                inner.width,
+                inner.height.saturating_sub(1),
+            ),
+            action: FilePickerHitAction::FilesBackground,
+        }];
+
+        let inline_new = self.focus == FilePickerFocus::CreateName
+            && self.pending_name_source.is_none()
+            && self.context_menu_kind != FilePickerContextMenuKind::Tree;
+        if inline_new && body_capacity > 0 {
+            rows.push(
+                Row::new(vec![
+                    Cell::from(Line::from(text_input_spans(
+                        &self.create_name_input,
+                        (inner.width as usize * 42 / 100).max(1),
+                        self.theme.text,
+                        self.theme.selected,
+                        true,
+                    ))),
+                    Cell::from("--"),
+                    Cell::from(match self.pending_create {
+                        Some(FilePickerCreateKind::Folder) => "New folder",
+                        _ => "New file",
+                    }),
+                    Cell::from("--"),
+                ])
+                .style(self.theme.current_file),
+            );
+            hits.push(HitRegion {
+                rect: Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+                action: FilePickerHitAction::CreateNameEditor,
+            });
+        }
+
+        let inline_row_count = if inline_new { 1 } else { 0 };
+        let available_entries = body_capacity.saturating_sub(inline_row_count);
         for (row, idx) in (self.file_scroll..self.entries.len())
-            .take(body_capacity)
+            .take(available_entries)
             .enumerate()
         {
             let entry = &self.entries[idx];
+            let editing_this = self.focus == FilePickerFocus::CreateName
+                && self.pending_name_source.as_ref().is_some_and(|path| same_display_path(path, &entry.path));
+            let is_marked = self.is_path_multi_selected(&entry.path);
             let style = if idx == self.file_cursor && self.focus == FilePickerFocus::Files {
+                self.theme.button_focused
+            } else if is_marked {
                 self.theme.selected
             } else if self.selection_mode == FilePickerSelectionMode::Directories && !entry.is_dir {
                 self.theme.menu_disabled
@@ -509,9 +792,21 @@ impl FilePickerState {
             } else {
                 self.theme.text
             };
+            let name_cell = if editing_this {
+                Cell::from(Line::from(text_input_spans(
+                    &self.create_name_input,
+                    (inner.width as usize * 42 / 100).max(1),
+                    self.theme.text,
+                    self.theme.selected,
+                    true,
+                )))
+            } else {
+                let marker = if is_marked { "✓ " } else { "" };
+                Cell::from(format!("{marker}{}", entry.name))
+            };
             rows.push(
                 Row::new(vec![
-                    Cell::from(entry.name.clone()),
+                    name_cell,
                     Cell::from(entry.size.map(format_size).unwrap_or_else(|| "--".to_string())),
                     Cell::from(entry.file_type.clone()),
                     Cell::from(entry.modified.map(format_modified).unwrap_or_else(|| "--".to_string())),
@@ -519,8 +814,21 @@ impl FilePickerState {
                 .style(style),
             );
             hits.push(HitRegion {
-                rect: Rect::new(inner.x, inner.y.saturating_add(1).saturating_add(row as u16), inner.width, 1),
-                action: FilePickerHitAction::FileRow(idx),
+                rect: Rect::new(
+                    inner.x,
+                    inner
+                        .y
+                        .saturating_add(1)
+                        .saturating_add(row as u16)
+                        .saturating_add(if inline_new { 1 } else { 0 }),
+                    inner.width,
+                    1,
+                ),
+                action: if editing_this {
+                    FilePickerHitAction::CreateNameEditor
+                } else {
+                    FilePickerHitAction::FileRow(idx)
+                },
             });
         }
         self.hit_regions.extend(hits);
@@ -532,20 +840,14 @@ impl FilePickerState {
             Constraint::Percentage(22),
         ];
         let selected = if body_capacity > 0 && self.file_cursor >= self.file_scroll {
-            Some(self.file_cursor.saturating_sub(self.file_scroll))
+            Some(self.file_cursor - self.file_scroll + inline_row_count)
         } else {
             None
         };
-        self.file_table_state = TableState::default();
-        self.file_table_state.select(selected);
-        let table = Table::new(rows, widths)
-            .header(header)
-            .highlight_style(self.theme.selected)
-            .highlight_symbol(" ");
+        self.file_table_state.select(selected.filter(|index| *index < rows.len()));
+        let table = Table::new(rows, widths).header(header).column_spacing(1);
         frame.render_stateful_widget(table, inner, &mut self.file_table_state);
     }
-
-
 
     fn render_save_name_row(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let label = "Save as:";
@@ -564,13 +866,22 @@ impl FilePickerState {
             .saturating_sub(crate::display_width::width(label) as u16)
             .saturating_sub(crate::display_width::width(&extension_badge) as u16)
             .saturating_sub(3) as usize;
-        let input = text_with_caret(&self.save_name_buffer, self.save_name_cursor, input_width);
         let line = Line::from(vec![
             Span::styled(label.to_string(), self.theme.label),
             Span::raw(" "),
-            Span::styled(input, self.theme.text),
+        ]
+        .into_iter()
+        .chain(text_input_spans(
+            &self.save_name_input,
+            input_width,
+            self.theme.text,
+            self.theme.selected,
+            self.focus == FilePickerFocus::SaveName,
+        ))
+        .chain(std::iter::once(
             Span::styled(extension_badge, self.theme.text_dim),
-        ]);
+        ))
+        .collect::<Vec<_>>());
         frame.render_widget(Paragraph::new(line), area);
         let input_x = area.x.saturating_add(crate::display_width::width(label) as u16 + 1);
         let _ = self.record_hit_region_clipped(
@@ -585,7 +896,7 @@ impl FilePickerState {
             .save_mode
             .as_ref()
             .and_then(|save_mode| save_mode.hide_extension.as_deref());
-        let file_name = append_display_extension(&self.save_name_buffer, extension);
+        let file_name = append_display_extension(&self.save_name_input.text, extension);
         let path = self.current_dir.join(file_name);
         let save_label = "↵ Save";
         let save_width = button_width(save_label);
@@ -656,7 +967,15 @@ impl FilePickerState {
         let count = self.entries.len();
         let total = format_size(self.visible_total_size());
         let error = self.status_error_message();
-        let left = format!("{count} {}", pluralize(count, "item", "items"));
+        let selected_count = self.multi_selected.len();
+        let left = if selected_count > 0 {
+            format!(
+                "{count} {}; {selected_count} selected",
+                pluralize(count, "item", "items")
+            )
+        } else {
+            format!("{count} {}", pluralize(count, "item", "items"))
+        };
         let center = error.unwrap_or_else(|| format!("{total} visible"));
         let right = match self.free_space_bytes {
             Some(bytes) => format!("{} free", format_size(bytes)),
@@ -669,36 +988,46 @@ impl FilePickerState {
     }
 
     fn render_file_operations_menu(&mut self, frame: &mut Frame<'_>, toolbar_area: Rect) {
-        let menu_width = 15;
-        let menu_height = 7;
-        let toolbar_right = toolbar_area.x.saturating_add(toolbar_area.width);
+        let items = self.menu_entries();
+        let bounds = self.last_rendered_area().unwrap_or(toolbar_area);
+        let menu_width = items
+            .iter()
+            .map(|(label, _)| crate::display_width::width(label))
+            .max()
+            .unwrap_or(1)
+            .saturating_add(4)
+            .min(bounds.width.saturating_sub(2) as usize)
+            .max(8) as u16;
+        let menu_height = (items.len() as u16).saturating_add(2).min(bounds.height);
         let fallback_anchor = Rect::new(toolbar_area.x, toolbar_area.y, 1, 1);
-        let anchor = self
-            .toolbar_button_rect(ToolbarAction::FileOperations)
-            .unwrap_or(fallback_anchor);
-        let menu_x = anchor
+        let anchor = self.context_menu_anchor.map(|(x, y)| Rect::new(x, y, 1, 1)).unwrap_or_else(|| {
+            self.toolbar_button_rect(ToolbarAction::FileOperations)
+                .unwrap_or(fallback_anchor)
+        });
+        let max_x = bounds
             .x
-            .min(toolbar_right.saturating_sub(menu_width))
-            .max(toolbar_area.x);
-        let menu_area = Rect::new(menu_x, toolbar_area.y.saturating_add(1), menu_width, menu_height);
+            .saturating_add(bounds.width)
+            .saturating_sub(menu_width);
+        let max_y = bounds
+            .y
+            .saturating_add(bounds.height)
+            .saturating_sub(menu_height);
+        let menu_x = anchor.x.min(max_x).max(bounds.x);
+        let menu_y = anchor.y.saturating_add(1).min(max_y).max(bounds.y);
+        let menu_area = Rect::new(menu_x, menu_y, menu_width, menu_height);
         frame.render_widget(Clear, menu_area);
         let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
         let inner = block.inner(menu_area);
         frame.render_widget(block, menu_area);
-        let items = [
-            ("New      ▸", None),
-            ("Cut", Some(FilePickerMenuAction::Cut)),
-            ("Copy", Some(FilePickerMenuAction::Copy)),
-            ("Paste", Some(FilePickerMenuAction::Paste)),
-            ("Delete", Some(FilePickerMenuAction::Delete)),
-        ];
         let mut lines = Vec::new();
         let mut hits = Vec::new();
-        for (idx, (label, action)) in items.iter().enumerate() {
+        for (idx, (label, entry)) in items.iter().enumerate() {
             let selected = self.focus == FilePickerFocus::Menu && self.menu_cursor == idx;
-            let disabled = action
-                .map(|action| !self.is_menu_action_enabled(action))
-                .unwrap_or_else(|| !self.is_new_menu_enabled());
+            let disabled = match entry {
+                FilePickerMenuEntry::NewSubmenu => !self.is_new_menu_enabled(),
+                FilePickerMenuEntry::SelectionSubmenu => false,
+                FilePickerMenuEntry::Action(action) => !self.is_menu_action_enabled(*action),
+            };
             let style = if disabled {
                 self.theme.menu_disabled
             } else if selected {
@@ -714,9 +1043,10 @@ impl FilePickerState {
                 self.theme.accelerator
             };
             lines.push(menu_line(label, inner.width as usize, style, hot_style));
-            let hit_action = match action {
-                Some(action) => FilePickerHitAction::Menu(*action),
-                None => FilePickerHitAction::MenuNew,
+            let hit_action = match entry {
+                FilePickerMenuEntry::NewSubmenu => FilePickerHitAction::MenuNew,
+                FilePickerMenuEntry::SelectionSubmenu => FilePickerHitAction::MenuSelection,
+                FilePickerMenuEntry::Action(action) => FilePickerHitAction::Menu(*action),
             };
             if !disabled {
                 hits.push(HitRegion {
@@ -729,9 +1059,16 @@ impl FilePickerState {
         frame.render_widget(Paragraph::new(lines), inner);
 
         if self.submenu_open {
-            let submenu_width = 10;
-            let submenu_height = 4;
-            let bounds = self.last_rendered_area().unwrap_or(toolbar_area);
+            let submenu_items = self.submenu_entries();
+            let submenu_width = submenu_items
+                .iter()
+                .map(|(label, _)| crate::display_width::width(label))
+                .max()
+                .unwrap_or(1)
+                .saturating_add(4)
+                .min(bounds.width.saturating_sub(2) as usize)
+                .max(8) as u16;
+            let submenu_height = (submenu_items.len() as u16).saturating_add(2).min(bounds.height);
             let bounds_right = bounds.x.saturating_add(bounds.width);
             let submenu_right_x = menu_area.x.saturating_add(menu_area.width);
             let submenu_x = if submenu_right_x.saturating_add(submenu_width) <= bounds_right {
@@ -739,15 +1076,20 @@ impl FilePickerState {
             } else {
                 menu_area.x.saturating_sub(submenu_width).max(bounds.x)
             };
-            let submenu_area = Rect::new(submenu_x, menu_area.y.saturating_add(1), submenu_width, submenu_height);
+            let selected_parent_row = self.menu_cursor as u16;
+            let submenu_y = menu_area
+                .y
+                .saturating_add(1)
+                .saturating_add(selected_parent_row)
+                .min(bounds.y.saturating_add(bounds.height).saturating_sub(submenu_height));
+            let submenu_area = Rect::new(submenu_x, submenu_y, submenu_width, submenu_height);
             frame.render_widget(Clear, submenu_area);
             let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
             let inner = block.inner(submenu_area);
             frame.render_widget(block, submenu_area);
-            let items = [("File", FilePickerMenuAction::NewFile), ("Folder", FilePickerMenuAction::NewFolder)];
             let mut lines = Vec::new();
             let mut hits = Vec::new();
-            for (idx, (label, action)) in items.iter().enumerate() {
+            for (idx, (label, action)) in submenu_items.iter().enumerate() {
                 let selected = self.focus == FilePickerFocus::Submenu && self.submenu_cursor == idx;
                 let disabled = !self.is_menu_action_enabled(*action);
                 let style = if disabled {
@@ -802,6 +1144,118 @@ impl FilePickerState {
         self.record_hit_region(popup, FilePickerHitAction::PropertiesClose);
     }
 
+    fn render_bookmarks_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let popup = centered_rect(area, 72, 68);
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border)
+            .title(" Bookmarks ");
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let name_row = matches!(self.focus, FilePickerFocus::BookmarkName);
+        let footer_rows = if name_row { 3 } else { 2 };
+        let list_height = inner.height.saturating_sub(footer_rows) as usize;
+        self.bookmarks.ensure_visible(list_height);
+        let list_area = Rect::new(inner.x, inner.y, inner.width, list_height as u16);
+        let mut lines = Vec::new();
+        let mut hits = Vec::new();
+        for (row, index) in (self.bookmarks.scroll..self.bookmarks.entries.len())
+            .take(list_height)
+            .enumerate()
+        {
+            let bookmark = &self.bookmarks.entries[index];
+            let missing = !bookmark.path.is_dir();
+            let suffix = if missing { " (missing)" } else { "" };
+            let label = format!("{} — {}{suffix}", bookmark.name, bookmark.path.display());
+            let style = if index == self.bookmarks.cursor {
+                self.theme.selected
+            } else if missing {
+                self.theme.menu_disabled
+            } else {
+                self.theme.text
+            };
+            lines.push(Line::from(Span::styled(
+                fit_text_start(&label, list_area.width as usize),
+                style,
+            )));
+            hits.push(HitRegion {
+                rect: Rect::new(
+                    list_area.x,
+                    list_area.y.saturating_add(row as u16),
+                    list_area.width,
+                    1,
+                ),
+                action: FilePickerHitAction::BookmarkRow(index),
+            });
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No bookmarks. Press a to add the displayed directory.",
+                self.theme.text_dim,
+            )));
+        }
+        self.hit_regions.extend(hits);
+        frame.render_widget(Paragraph::new(lines), list_area);
+
+        let mut y = inner.y.saturating_add(list_height as u16);
+        if name_row {
+            let label = match self.bookmarks.naming {
+                Some(crate::bookmarks::BookmarkNameAction::Rename(_)) => "Rename: ",
+                _ => "Add: ",
+            };
+            let mut spans = vec![Span::styled(label.to_string(), self.theme.label)];
+            let width = inner
+                .width
+                .saturating_sub(crate::display_width::width(label) as u16) as usize;
+            spans.extend(text_input_spans(
+                &self.bookmarks.name_input,
+                width,
+                self.theme.text,
+                self.theme.selected,
+                true,
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, y, inner.width, 1));
+            y = y.saturating_add(1);
+        }
+        let error = self.bookmarks.error.as_deref().unwrap_or("");
+        frame.render_widget(
+            Paragraph::new(fit_text_left(error, inner.width as usize)).style(self.theme.error),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y = y.saturating_add(1);
+
+        let footer = "a Add  e Rename  d Delete  Enter Open  Esc Close";
+        frame.render_widget(
+            Paragraph::new(fit_text_left(footer, inner.width as usize)).style(self.theme.status),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        self.record_hit_region(
+            Rect::new(inner.x, y, 5.min(inner.width), 1),
+            FilePickerHitAction::BookmarkAdd,
+        );
+        if inner.width > 7 {
+            self.record_hit_region(
+                Rect::new(inner.x.saturating_add(7), y, 8.min(inner.width.saturating_sub(7)), 1),
+                FilePickerHitAction::BookmarkRename,
+            );
+        }
+        if inner.width > 17 {
+            self.record_hit_region(
+                Rect::new(inner.x.saturating_add(17), y, 8.min(inner.width.saturating_sub(17)), 1),
+                FilePickerHitAction::BookmarkDelete,
+            );
+        }
+        self.record_hit_region(
+            Rect::new(popup.x.saturating_add(popup.width.saturating_sub(2)), popup.y, 1, 1),
+            FilePickerHitAction::BookmarkClose,
+        );
+    }
+
     fn render_delete_confirm_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let popup = centered_rect(area, 58, 28);
         frame.render_widget(Clear, popup);
@@ -812,7 +1266,8 @@ impl FilePickerState {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        let target = self.pending_delete.as_deref();
+        let target = self.pending_delete.first();
+        let count = self.pending_delete.len();
         let file_name = target
             .and_then(|path| path.file_name())
             .map(|name| clean_display_text(&name.to_string_lossy()))
@@ -820,7 +1275,11 @@ impl FilePickerState {
         let path_text = target
             .map(|path| clean_display_text(&path.display().to_string()))
             .unwrap_or_else(|| "No pending delete".to_string());
-        let message = format!("Delete \"{file_name}\"?");
+        let message = if count > 1 {
+            format!("Permanently delete {count} selected items?")
+        } else {
+            format!("Permanently delete \"{file_name}\"?")
+        };
         let text_width = inner.width.saturating_sub(4) as usize;
         let path_width = text_width.saturating_sub(2);
         let message_line = indent_text(&message, 2, text_width);
@@ -887,7 +1346,6 @@ impl FilePickerState {
             .and_then(|save_mode| save_mode.hide_extension.as_deref())
             .unwrap_or("");
         let input_width = inner.width.saturating_sub(8) as usize;
-        let input = text_with_caret(&self.save_name_buffer, self.save_name_cursor, input_width);
         let into = fit_text_right(&self.current_dir.display().to_string(), inner.width.saturating_sub(8) as usize);
         let ext = if extension.is_empty() { "(none)" } else { extension };
 
@@ -900,8 +1358,16 @@ impl FilePickerState {
         let button_x = inner.x.saturating_add(inner.width.saturating_sub(total_width) / 2);
         let button_y = inner.y.saturating_add(inner.height.saturating_sub(1));
 
+        let mut name_spans = vec![Span::styled("Name: ", self.theme.label)];
+        name_spans.extend(text_input_spans(
+            &self.save_name_input,
+            input_width,
+            self.theme.text,
+            self.theme.selected,
+            true,
+        ));
         let lines = vec![
-            Line::from(vec![Span::styled("Name: ", self.theme.label), Span::styled(input, self.theme.text)]),
+            Line::from(name_spans),
             Line::from(vec![Span::styled("Into: ", self.theme.label), Span::styled(into, self.theme.text_dim)]),
             Line::from(vec![Span::styled("Ext:  ", self.theme.label), Span::styled(ext.to_string(), self.theme.text_dim)]),
             Line::from(""),
@@ -968,30 +1434,6 @@ impl FilePickerState {
         );
     }
 
-    fn render_create_name_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered_rect(area, 58, 26);
-        frame.render_widget(Clear, popup);
-        let title = match self.pending_name_action {
-            Some(crate::state::FilePickerNameAction::Rename) => "Rename",
-            Some(crate::state::FilePickerNameAction::Duplicate) => "Duplicate",
-            Some(crate::state::FilePickerNameAction::Create(FilePickerCreateKind::Folder)) => "New folder",
-            _ => "New file",
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.border)
-            .title(title);
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        let input_width = inner.width.saturating_sub(8) as usize;
-        let input = text_with_caret(&self.create_name_buffer, self.create_name_cursor, input_width);
-        let lines = vec![
-            Line::from(vec![Span::styled("Name: ", self.theme.label), Span::styled(input, self.theme.text)]),
-            Line::from(""),
-            Line::from(Span::styled("Enter confirms; Esc cancels", self.theme.text_dim)),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-    }
 }
 
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -1030,6 +1472,60 @@ fn button_width(label: &str) -> u16 {
 
 fn button_span(label: &str, style: ratatui::style::Style) -> Span<'static> {
     Span::styled(format!(" {label} "), style)
+}
+
+fn text_input_spans(
+    input: &crate::text_input::TextInputState,
+    width: usize,
+    text_style: Style,
+    selection_style: Style,
+    show_caret: bool,
+) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let (visible_range, _) = input.view_range(width);
+    let visible_start = visible_range.start;
+    let visible_end = visible_range.end;
+    let visible = &input.text[visible_range];
+    let selection = input.selection_range();
+    let mut spans = Vec::new();
+    let mut segment_start = 0usize;
+    let mut current_style = None;
+    for (offset, ch) in visible.char_indices() {
+        let absolute = visible_start.saturating_add(offset);
+        let selected = selection
+            .as_ref()
+            .is_some_and(|range| absolute >= range.start && absolute < range.end);
+        let caret = show_caret && absolute == input.cursor && selection.is_none();
+        let style = if selected || caret {
+            selection_style
+        } else {
+            text_style
+        };
+        if current_style.is_some_and(|existing| existing != style) {
+            spans.push(Span::styled(visible[segment_start..offset].to_string(), current_style.unwrap()));
+            segment_start = offset;
+        }
+        current_style = Some(style);
+        let _ = ch;
+    }
+    if segment_start < visible.len() {
+        spans.push(Span::styled(
+            visible[segment_start..].to_string(),
+            current_style.unwrap_or(text_style),
+        ));
+    }
+    if show_caret && input.cursor == visible_end && selection.is_none() {
+        spans.push(Span::styled(" ", selection_style));
+    }
+    let caret_at_end = show_caret && input.cursor == visible_end && selection.is_none();
+    let used = crate::display_width::width(visible)
+        .saturating_add(if caret_at_end { 1 } else { 0 });
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), text_style));
+    }
+    spans
 }
 
 
@@ -1363,7 +1859,7 @@ mod tests {
         let area = Rect::new(0, 0, 48, 12);
         terminal.draw(|frame| picker.render(frame, area)).expect("draw");
 
-        let toolbar_area = Rect::new(1, 1, 46, 1);
+        let toolbar_area = Rect::new(1, 2, 46, 1);
         for hit in picker.hit_regions().iter() {
             match hit.action {
                 FilePickerHitAction::Toolbar(ToolbarAction::Go) => {}
@@ -1382,6 +1878,77 @@ mod tests {
             "toolbar geometry not clipped: {:?}",
             file_ops
         );
+    }
+
+    #[test]
+    fn inline_name_editor_owns_its_mouse_hit_region() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        fs::write(&file, b"audio").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        let index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == file)
+            .expect("file visible");
+        picker.set_file_cursor(index, 8);
+        assert!(picker.begin_rename_current());
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 116, 18)))
+            .expect("draw");
+
+        assert!(picker.hit_regions().iter().any(|hit| {
+            hit.action == FilePickerHitAction::CreateNameEditor
+        }));
+        assert!(!picker.hit_regions().iter().any(|hit| {
+            hit.action == FilePickerHitAction::FileRow(index)
+        }));
+    }
+
+    #[test]
+    fn toolbar_exposes_a_visible_search_action() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 116, 18)))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(
+            picker.toolbar_button_rect(ToolbarAction::Search).is_some(),
+            "the picker must expose the same visible Search affordance as Browse"
+        );
+        assert!(rendered.contains("Search"));
+    }
+
+    #[test]
+    fn bookmark_footer_advertises_the_shared_e_rename_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.focus = FilePickerFocus::Bookmarks;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 116, 18)))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("e Rename"));
+        assert!(!rendered.contains("r Rename"));
     }
 
     #[test]
@@ -1501,9 +2068,9 @@ mod tests {
             .draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 24)))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        // The popup's message line ("Delete \"front 2.jpg\"?") also contains
-        // " Delete " and renders above the buttons; the buttons are the LAST
-        // occurrence on screen.
+        // The popup's message line ("Permanently delete \"front 2.jpg\"?") renders
+        // above the buttons; the buttons are the LAST occurrence of " Delete "
+        // on screen.
         let delete = find_text_last(buffer, " Delete ", 100, 30).expect("delete button text");
         let cancel = find_text_last(buffer, " Cancel ", 100, 30).expect("cancel button text");
 
@@ -1543,7 +2110,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
 
         assert!(rendered.contains("Confirm"));
-        assert!(rendered.contains("Delete \"front 2.jpg\"?"));
+        assert!(rendered.contains("Permanently delete \"front 2.jpg\"?"));
         assert!(rendered.contains("Delete"));
         assert!(rendered.contains("Cancel"));
         assert!(!rendered.contains("configured delete policy"));

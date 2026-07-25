@@ -1712,6 +1712,10 @@ pub struct SearchState {
     pub active: bool,
     /// Which element has keyboard focus.
     pub focus: SearchFocus,
+    /// Navigation pane that owned Browse before this search session opened.
+    /// Captured only on the inactive -> active transition so repeated search
+    /// invocations refocus the input without losing the original return pane.
+    pub return_navigation_pane: Option<BrowseNavigationPane>,
     /// Debounce: instant of last keystroke (search fires after 200ms idle).
     pub last_keystroke: Option<std::time::Instant>,
     /// True while an async search is in flight.
@@ -1743,6 +1747,7 @@ impl SearchState {
             sort_dir: SortDir::Desc,
             active: false,
             focus: SearchFocus::Input,
+            return_navigation_pane: None,
             last_keystroke: None,
             searching: false,
             tag_cache: std::collections::HashMap::new(),
@@ -1946,6 +1951,21 @@ pub enum BrowsePaneId {
     Info,
 }
 
+/// Keyboard-active navigation pane within Browse. Metadata focus remains a
+/// separate field-level state; this enum governs tree-vs-file-list movement,
+/// expansion/collapse, type-ahead, and selection commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseNavigationPane {
+    Tree,
+    Files,
+}
+
+impl Default for BrowseNavigationPane {
+    fn default() -> Self {
+        Self::Files
+    }
+}
+
 /// Configurable browse table columns. The core table renderer always keeps
 /// `Name` available; audio-specific columns are optional and render as empty
 /// values for non-audio entries until probe data is available.
@@ -2140,6 +2160,16 @@ impl Default for BrowseDragState {
 /// is the shared state model consumed by `tree.rs` and the picker renderer.
 pub type BrowseTreeNode = tui_file_picker::TreeNode;
 
+/// Clipboard paste metadata retained until the background file-task worker
+/// emits structured terminal accounting. Destinations are preplanned in the
+/// same order as the normalized clipboard roots.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingClipboardPaste {
+    pub session_id: u64,
+    pub clipboard: tui_file_picker::FilesystemClipboard,
+    pub destinations: Vec<PathBuf>,
+}
+
 /// State for the browse screen
 #[derive(Debug, Clone)]
 pub struct BrowseState {
@@ -2168,6 +2198,13 @@ pub struct BrowseState {
 
     /// Multi-selected file paths
     pub multi_selected: Vec<PathBuf>,
+
+    /// Shared in-memory filesystem clipboard used by Cut/Copy/Paste.
+    pub filesystem_clipboard: Option<tui_file_picker::FilesystemClipboard>,
+
+    /// Background paste reconciliation context. Only the matching session may
+    /// consume it; stale worker completions are ignored.
+    pub(crate) pending_clipboard_paste: Option<PendingClipboardPaste>,
 
     /// Anchor for one-shot extend selection: the most recent toggled or
     /// clicked selectable row. Path-based so it survives refresh/sort/filter.
@@ -2404,9 +2441,14 @@ pub struct BrowseState {
     /// Instant of the last type-ahead keystroke, for timeout reset.
     pub type_ahead_last_keystroke: Option<Instant>,
 
+    /// Pane that currently owns keyboard navigation and type-ahead.
+    pub navigation_pane: BrowseNavigationPane,
+
     /// Explore pane directory tree. Expanded/collapsed state is session-local.
     pub tree_nodes: Vec<BrowseTreeNode>,
     pub tree_cursor: usize,
+    /// Last tree-row click, keyed by path, for shared 500ms double-click semantics.
+    pub tree_last_click: Option<(PathBuf, Instant)>,
     pub tree_scroll: usize,
     pub tree_visible_height: usize,
 
@@ -2753,6 +2795,8 @@ impl BrowseState {
             scroll_offset: 0,
             visible_height: 0,
             multi_selected: Vec::new(),
+            filesystem_clipboard: None,
+            pending_clipboard_paste: None,
             multi_select_anchor: None,
             selection_mode: SelectionMode::Normal,
             drag_state: BrowseDragState::default(),
@@ -2813,8 +2857,10 @@ impl BrowseState {
             cursor_restore_target: None,
             type_ahead_buffer: String::new(),
             type_ahead_last_keystroke: None,
+            navigation_pane: BrowseNavigationPane::Files,
             tree_nodes: initial_browse_tree_nodes(&start_dir, config.show_hidden),
             tree_cursor: 0,
+            tree_last_click: None,
             tree_scroll: 0,
             tree_visible_height: 0,
             explore_enabled,
@@ -2941,6 +2987,7 @@ impl BrowseState {
             BrowsePaneId::Browse => return,
         }
         self.browse_maximized = self.explore_collapsed && self.info_collapsed;
+        self.repair_navigation_pane_visibility();
     }
 
     pub fn toggle_pane_enabled(&mut self, pane: BrowsePaneId) {
@@ -2949,6 +2996,7 @@ impl BrowseState {
             BrowsePaneId::Info => self.info_enabled = !self.info_enabled,
             BrowsePaneId::Browse => return,
         }
+        self.repair_navigation_pane_visibility();
     }
 
     pub fn toggle_browse_maximized(&mut self) {
@@ -2961,6 +3009,7 @@ impl BrowseState {
             self.info_collapsed = true;
             self.browse_maximized = true;
         }
+        self.repair_navigation_pane_visibility();
     }
 
     pub fn reset_browse_layout(&mut self) {
@@ -2969,6 +3018,7 @@ impl BrowseState {
         self.explore_collapsed = false;
         self.info_collapsed = false;
         self.browse_maximized = false;
+        self.repair_navigation_pane_visibility();
     }
 
     /// Apply persisted Browse preferences to the live session without replacing
@@ -2997,6 +3047,7 @@ impl BrowseState {
         self.info_collapsed = config.layout_info == "collapsed";
         self.browse_maximized = self.explore_collapsed && self.info_collapsed;
         self.search_result_cap = config.search_result_cap;
+        self.repair_navigation_pane_visibility();
         self.close_options_menu();
 
         if previous_hidden != self.show_hidden {
@@ -3050,13 +3101,151 @@ impl BrowseState {
         self.tree_nodes.get(index).map(|node| node.path.clone())
     }
 
+    pub fn set_navigation_pane(&mut self, pane: BrowseNavigationPane) {
+        let pane = match pane {
+            BrowseNavigationPane::Tree if !self.explore_focus_available() => {
+                BrowseNavigationPane::Files
+            }
+            pane => pane,
+        };
+        if self.navigation_pane != pane {
+            self.navigation_pane = pane;
+            self.clear_type_ahead();
+        }
+    }
+
+    /// Whether the Explore tree is both rendered and available for keyboard
+    /// focus. A collapsed rail is a layout control, not an interactive tree.
+    pub fn explore_focus_available(&self) -> bool {
+        self.explore_enabled && !self.explore_collapsed
+    }
+
+    /// Whether the Info pane is both rendered and available for keyboard
+    /// focus. Metadata availability is checked separately by the app layer.
+    pub fn info_focus_available(&self) -> bool {
+        self.info_enabled && !self.info_collapsed
+    }
+
+    /// Repair navigation focus after a layout/configuration transition. Files
+    /// is always visible, so it is the fail-safe owner when Explore disappears.
+    pub fn repair_navigation_pane_visibility(&mut self) {
+        if self.navigation_pane == BrowseNavigationPane::Tree
+            && !self.explore_focus_available()
+        {
+            self.set_navigation_pane(BrowseNavigationPane::Files);
+        }
+    }
+
+    pub fn tree_navigation_active(&self) -> bool {
+        self.navigation_pane == BrowseNavigationPane::Tree && self.explore_focus_available()
+    }
+
+    pub fn files_navigation_active(&self) -> bool {
+        self.navigation_pane == BrowseNavigationPane::Files || !self.explore_focus_available()
+    }
+
     pub fn select_tree_index(&mut self, index: usize) -> Option<PathBuf> {
         if index >= self.tree_nodes.len() {
             return None;
         }
+        self.set_navigation_pane(BrowseNavigationPane::Tree);
         self.tree_cursor = index;
         self.ensure_tree_visible();
         self.tree_nodes.get(index).map(|node| node.path.clone())
+    }
+
+    pub fn move_tree_up(&mut self) {
+        if self.tree_cursor > 0 {
+            self.tree_cursor -= 1;
+            self.ensure_tree_visible();
+        }
+    }
+
+    pub fn move_tree_down(&mut self) {
+        if self.tree_cursor + 1 < self.tree_nodes.len() {
+            self.tree_cursor += 1;
+            self.ensure_tree_visible();
+        }
+    }
+
+    pub fn move_tree_top(&mut self) {
+        self.tree_cursor = 0;
+        self.ensure_tree_visible();
+    }
+
+    pub fn move_tree_bottom(&mut self) {
+        if !self.tree_nodes.is_empty() {
+            self.tree_cursor = self.tree_nodes.len() - 1;
+            self.ensure_tree_visible();
+        }
+    }
+
+    pub fn page_tree_up(&mut self) {
+        let step = self.tree_visible_height.saturating_sub(1).max(1);
+        self.tree_cursor = self.tree_cursor.saturating_sub(step);
+        self.ensure_tree_visible();
+    }
+
+    pub fn page_tree_down(&mut self) {
+        if self.tree_nodes.is_empty() {
+            return;
+        }
+        let step = self.tree_visible_height.saturating_sub(1).max(1);
+        self.tree_cursor = self
+            .tree_cursor
+            .saturating_add(step)
+            .min(self.tree_nodes.len() - 1);
+        self.ensure_tree_visible();
+    }
+
+    /// Standard tree Left behavior: collapse the selected expanded node; when
+    /// already collapsed, move to its nearest visible ancestor.
+    pub fn collapse_tree_cursor(&mut self) {
+        let Some(node) = self.tree_nodes.get(self.tree_cursor) else {
+            return;
+        };
+        if node.expanded {
+            self.toggle_tree_node(self.tree_cursor);
+            return;
+        }
+        let depth = node.depth;
+        if depth == 0 {
+            return;
+        }
+        if let Some(parent) = self.tree_nodes[..self.tree_cursor]
+            .iter()
+            .rposition(|candidate| candidate.depth < depth)
+        {
+            self.tree_cursor = parent;
+            self.ensure_tree_visible();
+        }
+    }
+
+    /// Standard tree Right behavior: expand a collapsed node; when already
+    /// expanded, move to its first visible child.
+    pub fn expand_tree_cursor(&mut self) {
+        let Some(node) = self.tree_nodes.get(self.tree_cursor) else {
+            return;
+        };
+        if node.has_children && !node.expanded {
+            self.toggle_tree_node(self.tree_cursor);
+            return;
+        }
+        let depth = node.depth;
+        if self
+            .tree_nodes
+            .get(self.tree_cursor + 1)
+            .is_some_and(|candidate| candidate.depth > depth)
+        {
+            self.tree_cursor += 1;
+            self.ensure_tree_visible();
+        }
+    }
+
+    pub fn selected_tree_path(&self) -> Option<PathBuf> {
+        self.tree_nodes
+            .get(self.tree_cursor)
+            .map(|node| node.path.clone())
     }
 
     pub fn toggle_tree_node(&mut self, index: usize) {
@@ -4037,7 +4226,124 @@ impl BrowseState {
         false
     }
 
-    /// Navigate directly to a given path
+    /// Remap navigation history and the displayed directory after successful
+    /// cut/paste relocation. Returns true when the displayed directory moved.
+    pub(crate) fn remap_navigation_after_cut(
+        &mut self,
+        clipboard: &tui_file_picker::FilesystemClipboard,
+        destinations: &[PathBuf],
+    ) -> bool {
+        for path in &mut self.nav_history {
+            if let Some(remapped) =
+                tui_file_picker::remap_path_after_cut(path, clipboard, destinations)
+            {
+                *path = remapped;
+            }
+        }
+        let Some(remapped_current) = tui_file_picker::remap_path_after_cut(
+            &self.current_dir,
+            clipboard,
+            destinations,
+        ) else {
+            return false;
+        };
+        self.invalidate_path_validation();
+        self.current_dir = remapped_current;
+        self.selected_index = 0;
+        self.reset_nav_state();
+        true
+    }
+
+    /// Remap navigation state after an in-place tree rename that relocates the
+    /// displayed directory or one of its ancestors.
+    pub(crate) fn remap_navigation_after_rename(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+    ) -> bool {
+        let remap = |path: &Path| {
+            path.strip_prefix(source)
+                .ok()
+                .map(|suffix| destination.join(suffix))
+        };
+        for path in &mut self.nav_history {
+            if let Some(remapped) = remap(path) {
+                *path = remapped;
+            }
+        }
+        let Some(remapped_current) = remap(&self.current_dir) else {
+            return false;
+        };
+        self.invalidate_path_validation();
+        self.current_dir = remapped_current;
+        self.selected_index = 0;
+        self.reset_nav_state();
+        true
+    }
+
+    /// Repair the current directory and navigation history after a permanent
+    /// delete. Deleted history entries collapse to their nearest surviving
+    /// ancestor, and adjacent duplicates are removed without introducing a new
+    /// history entry for the repair itself. Returns true when the displayed
+    /// directory changed.
+    pub(crate) fn repair_navigation_after_delete(&mut self) -> bool {
+        let Some(repaired_current) = nearest_existing_directory(&self.current_dir) else {
+            return false;
+        };
+        let old_index = self.nav_history_index;
+        let mut repaired_history: Vec<PathBuf> = Vec::with_capacity(self.nav_history.len());
+        let mut repaired_index = 0usize;
+
+        for (index, path) in self.nav_history.iter().enumerate() {
+            let Some(repaired) = nearest_existing_directory(path) else {
+                continue;
+            };
+            let target_index = if repaired_history
+                .last()
+                .is_some_and(|previous| same_path(previous, &repaired))
+            {
+                repaired_history.len().saturating_sub(1)
+            } else {
+                repaired_history.push(repaired);
+                repaired_history.len().saturating_sub(1)
+            };
+            if index == old_index {
+                repaired_index = target_index;
+            }
+        }
+
+        if repaired_history.is_empty() {
+            repaired_history.push(repaired_current.clone());
+            repaired_index = 0;
+        } else if !repaired_history
+            .get(repaired_index)
+            .is_some_and(|path| same_path(path, &repaired_current))
+        {
+            if let Some(index) = repaired_history
+                .iter()
+                .position(|path| same_path(path, &repaired_current))
+            {
+                repaired_index = index;
+            } else {
+                repaired_history.truncate(repaired_index.saturating_add(1));
+                repaired_history.push(repaired_current.clone());
+                repaired_index = repaired_history.len().saturating_sub(1);
+            }
+        }
+
+        let moved = !same_path(&self.current_dir, &repaired_current);
+        self.nav_history = repaired_history;
+        self.nav_history_index = repaired_index.min(self.nav_history.len().saturating_sub(1));
+        if moved {
+            self.invalidate_path_validation();
+            self.current_dir = repaired_current;
+            self.selected_index = 0;
+            self.reset_nav_state();
+        }
+        moved
+    }
+
+    /// Navigate directly to a given path.
     pub fn navigate_to(&mut self, path: PathBuf) {
         if path.is_dir() {
             if same_path(&self.current_dir, &path) {
@@ -4222,8 +4528,44 @@ impl BrowseState {
         self.type_ahead_last_keystroke = None;
     }
 
-    /// Append a character to the type-ahead buffer and jump to the first
-    /// matching entry. Resets the buffer first if the timeout has elapsed.
+    fn apply_type_ahead_match(&mut self) {
+        let idx = match self.navigation_pane {
+            BrowseNavigationPane::Files => tui_file_picker::first_type_ahead_match(
+                self.entries
+                    .iter()
+                    .map(|entry| tui_file_picker::TypeAheadCandidate {
+                        name: &entry.name,
+                        is_dir: entry.is_dir(),
+                    }),
+                &self.type_ahead_buffer,
+            ),
+            BrowseNavigationPane::Tree => tui_file_picker::first_type_ahead_match(
+                self.tree_nodes
+                    .iter()
+                    .map(|node| tui_file_picker::TypeAheadCandidate {
+                        name: &node.name,
+                        is_dir: true,
+                    }),
+                &self.type_ahead_buffer,
+            ),
+        };
+
+        if let Some(idx) = idx {
+            match self.navigation_pane {
+                BrowseNavigationPane::Files => {
+                    self.selected_index = idx;
+                    self.ensure_visible();
+                }
+                BrowseNavigationPane::Tree => {
+                    self.tree_cursor = idx;
+                    self.ensure_tree_visible();
+                }
+            }
+        }
+    }
+
+    /// Append a character to the type-ahead buffer and jump within the
+    /// keyboard-active navigation pane. Resets the buffer after the timeout.
     pub fn type_ahead_push(&mut self, c: char) {
         if let Some(last) = self.type_ahead_last_keystroke {
             if last.elapsed() >= TYPE_AHEAD_TIMEOUT {
@@ -4233,47 +4575,18 @@ impl BrowseState {
 
         self.type_ahead_buffer.push(c);
         self.type_ahead_last_keystroke = Some(Instant::now());
-
-        let query = self.type_ahead_buffer.to_lowercase();
-        // Priority 1: prefix match.
-        // Priority 2: substring/contains match.
-        let idx = self
-            .entries
-            .iter()
-            .position(|e| e.name_lower.starts_with(&query))
-            .or_else(|| {
-                self.entries
-                    .iter()
-                    .position(|e| e.name_lower.contains(&query))
-            });
-        if let Some(idx) = idx {
-            self.selected_index = idx;
-            self.ensure_visible();
-        }
+        self.apply_type_ahead_match();
     }
 
-    /// Remove the last character from the type-ahead buffer and re-search.
-    /// If the buffer becomes empty, clears the type-ahead state entirely.
+    /// Remove the last character from the type-ahead buffer and re-search the
+    /// active pane. If the buffer becomes empty, clear the type-ahead state.
     pub fn type_ahead_pop(&mut self) {
         self.type_ahead_buffer.pop();
         if self.type_ahead_buffer.is_empty() {
             self.type_ahead_last_keystroke = None;
         } else {
             self.type_ahead_last_keystroke = Some(Instant::now());
-            let query = self.type_ahead_buffer.to_lowercase();
-            let idx = self
-                .entries
-                .iter()
-                .position(|e| e.name_lower.starts_with(&query))
-                .or_else(|| {
-                    self.entries
-                        .iter()
-                        .position(|e| e.name_lower.contains(&query))
-                });
-            if let Some(idx) = idx {
-                self.selected_index = idx;
-                self.ensure_visible();
-            }
+            self.apply_type_ahead_match();
         }
     }
 
@@ -4576,6 +4889,21 @@ impl BrowseState {
         }
     }
 
+    pub fn select_all_visible(&mut self) {
+        self.prune_stale_multi_selection_for_current_directory();
+        for path in self
+            .entries
+            .iter()
+            .filter(|entry| !matches!(entry.kind, EntryKind::ParentDir))
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>()
+        {
+            self.push_unique_selection(path);
+        }
+        self.discard_multi_select_anchor_if_unselected();
+        self.selection_mode = SelectionMode::Normal;
+    }
+
     pub fn toggle_all_visible_selection(&mut self) {
         self.prune_stale_multi_selection_for_current_directory();
         let visible_paths: Vec<PathBuf> = self
@@ -4856,6 +5184,7 @@ impl BrowseState {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.search.active = false;
+        self.search.return_navigation_pane = None;
         self.search.input = TextInputState::new(String::new());
         self.search.focus = SearchFocus::Input;
         self.search.last_keystroke = None;
@@ -4863,6 +5192,7 @@ impl BrowseState {
         self.clear_search_tag_cache();
         self.search.cancel = None;
         self.search.generation = self.search.generation.wrapping_add(1);
+        self.set_navigation_pane(BrowseNavigationPane::Files);
     }
 
     fn clear_archive_tag_cache_for_archive(&mut self, archive_path: &Path) {
@@ -4871,7 +5201,7 @@ impl BrowseState {
             .retain(|synthetic_path, _| !synthetic_path.starts_with(archive_path));
     }
 
-    fn rebuild_tree_preserving_expansion(&mut self) {
+    pub(crate) fn rebuild_tree_preserving_expansion(&mut self) {
         let expanded_paths = self
             .tree_nodes
             .iter()
@@ -5012,10 +5342,26 @@ impl BrowseState {
     /// result rows visible. Treat repeated toolbar/Search-key activation as a
     /// focus action; explicit close/toggle paths continue to call close_search().
     pub fn open_search(&mut self) {
+        // Repeated invocation is a refocus operation, not a new search
+        // session. Preserve the pane captured by the first activation.
         if self.search.active {
             self.search.focus = SearchFocus::Input;
             return;
         }
+
+        self.repair_navigation_pane_visibility();
+        let return_pane = if self.tree_navigation_active() {
+            BrowseNavigationPane::Tree
+        } else {
+            BrowseNavigationPane::Files
+        };
+        self.search.return_navigation_pane = Some(return_pane);
+
+        // Search owns keyboard routing while active. Results use the file list,
+        // but ordinary cancellation restores the captured visible pane. Drop
+        // pane-local type-ahead so it cannot resume unexpectedly afterward.
+        self.set_navigation_pane(BrowseNavigationPane::Files);
+        self.clear_type_ahead();
         self.search.active = true;
         self.search.focus = SearchFocus::Input;
         self.search.input = TextInputState::new(String::new());
@@ -5027,17 +5373,25 @@ impl BrowseState {
 
     /// Close the search panel and restore the normal directory listing.
     pub fn close_search(&mut self) {
+        let return_pane = self
+            .search
+            .return_navigation_pane
+            .take()
+            .unwrap_or(BrowseNavigationPane::Files);
+
         // Cancel any in-flight async search.
         if let Some(ref flag) = self.search.cancel {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.search.active = false;
         self.search.input = TextInputState::new(String::new());
+        self.search.focus = SearchFocus::Input;
         self.search.last_keystroke = None;
         self.search.searching = false;
         self.clear_search_tag_cache();
         self.search.cancel = None;
         self.search.generation = self.search.generation.wrapping_add(1);
+        self.set_navigation_pane(return_pane);
         // Restore normal listing.
         self.apply_view_preserving_cursor();
     }
@@ -10010,6 +10364,110 @@ mod browse_pane_toggle_tests {
     }
 
     #[test]
+    fn search_close_restores_captured_navigation_pane_with_visibility_fallback() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = true;
+        browse.explore_collapsed = false;
+        browse.set_navigation_pane(BrowseNavigationPane::Tree);
+
+        browse.open_search();
+        assert_eq!(
+            browse.search.return_navigation_pane,
+            Some(BrowseNavigationPane::Tree),
+        );
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+
+        browse.search.input = TextInputState::new("album".to_string());
+        browse.entries = vec![BrowseEntry::new(
+            PathBuf::from("album.flac"),
+            "album.flac".to_string(),
+            EntryKind::AudioFile(AudioFormat::Flac),
+            1,
+            None,
+        )];
+        browse.selected_index = 0;
+        browse.search.searching = true;
+        let visible_results = browse.entries.clone();
+
+        browse.open_search();
+        assert_eq!(
+            browse.search.return_navigation_pane,
+            Some(BrowseNavigationPane::Tree),
+            "refocus must preserve the first captured pane",
+        );
+        assert_eq!(browse.search.input.text, "album");
+        assert_eq!(browse.entries.len(), visible_results.len());
+        assert_eq!(browse.entries[0].path, visible_results[0].path);
+        assert!(browse.search.searching);
+
+        browse.close_search();
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Tree);
+        assert_eq!(browse.search.input.text, "");
+        assert!(!browse.search.searching);
+
+        browse.open_search();
+        assert_eq!(
+            browse.search.input.text, "",
+            "a new Browse search session must start with an empty query",
+        );
+        browse.close_search();
+
+        browse.open_search();
+        browse.explore_collapsed = true;
+        browse.close_search();
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+
+        browse.explore_collapsed = false;
+        browse.set_navigation_pane(BrowseNavigationPane::Tree);
+        browse.open_search();
+        browse.close_search_for_navigation();
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+        assert_eq!(browse.search.return_navigation_pane, None);
+    }
+
+    #[test]
+    fn hidden_explore_pane_cannot_own_keyboard_focus() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = false;
+        browse.explore_collapsed = false;
+
+        browse.set_navigation_pane(BrowseNavigationPane::Tree);
+
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+        assert!(!browse.tree_navigation_active());
+    }
+
+    #[test]
+    fn disabling_or_collapsing_focused_explore_repairs_focus_to_files() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = true;
+        browse.explore_collapsed = false;
+        browse.set_navigation_pane(BrowseNavigationPane::Tree);
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Tree);
+
+        browse.toggle_pane_enabled(BrowsePaneId::Explore);
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+
+        browse.toggle_pane_enabled(BrowsePaneId::Explore);
+        browse.set_navigation_pane(BrowseNavigationPane::Tree);
+        browse.toggle_pane(BrowsePaneId::Explore);
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+    }
+
+    #[test]
+    fn maximizing_browse_repairs_tree_focus_to_files() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = true;
+        browse.explore_collapsed = false;
+        browse.set_navigation_pane(BrowseNavigationPane::Tree);
+
+        browse.toggle_browse_maximized();
+
+        assert!(browse.browse_maximized);
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+    }
+
+    #[test]
     fn captured_browsing_config_includes_side_pane_enabled_state() {
         let mut browse = BrowseState::new();
         browse.explore_enabled = false;
@@ -10063,6 +10521,24 @@ mod browse_pane_toggle_tests {
         assert!(captured.layout_info_enabled);
         assert_eq!(captured.layout_explore, "collapsed");
         assert_eq!(captured.layout_info, "open");
+    }
+
+    #[test]
+    fn applying_config_with_explore_hidden_repairs_existing_tree_focus() {
+        let mut browse = BrowseState::new();
+        browse.explore_enabled = true;
+        browse.explore_collapsed = false;
+        browse.set_navigation_pane(BrowseNavigationPane::Tree);
+        let config = crate::config::BrowsingConfig {
+            layout_explore_enabled: false,
+            layout_explore: "open".to_string(),
+            ..crate::config::BrowsingConfig::default()
+        };
+
+        browse.apply_browsing_config(&config);
+
+        assert_eq!(browse.navigation_pane, BrowseNavigationPane::Files);
+        assert!(!browse.explore_focus_available());
     }
 }
 
@@ -10835,6 +11311,18 @@ fn extract_tag_sort_key(path: &Path, sort: SearchSort) -> String {
 /// completion acceptance, or settled-focus scheduling.
 fn same_scanned_path(left: &Path, right: &Path) -> bool {
     left == right
+}
+
+fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !candidate.pop() {
+            return None;
+        }
+    }
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -16590,15 +17078,27 @@ mod selection_behavior_tests {
     }
 
     #[test]
-    fn select_all_toggle_and_invert_operate_only_on_visible_non_parent_entries() {
+    fn select_all_is_idempotent_and_toggle_remains_a_distinct_operation() {
         let mut state = selection_state();
 
-        state.toggle_all_visible_selection();
+        state.select_all_visible();
         assert_eq!(selected_names(&state), vec!["a.flac", "b.flac", "c.flac"]);
         assert!(!state.multi_selected.iter().any(|path| path.ends_with("..")));
 
+        state.select_all_visible();
+        assert_eq!(
+            selected_names(&state),
+            vec!["a.flac", "b.flac", "c.flac"],
+            "Select All must never deselect an already selected visible set"
+        );
+
         state.toggle_all_visible_selection();
         assert!(state.multi_selected.is_empty());
+    }
+
+    #[test]
+    fn toggle_and_invert_operate_only_on_visible_non_parent_entries() {
+        let mut state = selection_state();
 
         state.toggle_selection_at_index(1);
         assert_eq!(state.multi_select_anchor, Some(state.entries[1].path.clone()));

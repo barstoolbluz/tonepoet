@@ -476,6 +476,13 @@ pub enum AppMessage {
         session_id: u64,
         update: tui_file_picker::FileTaskProgressUpdate,
     },
+    /// Structured top-level completion accounting for a hosted file task.
+    /// This is separate from progress presentation so callers can repair
+    /// clipboards and navigation after partial moves without scraping status text.
+    FileTaskComplete {
+        session_id: u64,
+        report: tui_file_picker::FileTaskCompletionReport,
+    },
     /// Result of add/replace/remove artwork launched from the Artwork tab.
     MetadataEditorArtworkWriteComplete {
         session_id: u64,

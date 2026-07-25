@@ -2914,10 +2914,14 @@ name = "tui-file-picker"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "dirs",
  "image",
+ "libc",
  "ratatui",
  "ratatui-image",
+ "serde",
  "tempfile",
+ "toml",
  "unicode-width 0.1.14",
 ]
 

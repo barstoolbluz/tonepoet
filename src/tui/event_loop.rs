@@ -297,6 +297,7 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
                 | tui_file_picker::FileTaskProgressUpdate::Failed { .. }
                 | tui_file_picker::FileTaskProgressUpdate::Aborted { .. }
         ),
+        AppMessage::FileTaskComplete { .. } => true,
         _ => false,
     }
 }
@@ -636,12 +637,8 @@ fn check_pending_browse_rename(app: &mut AppState) {
     app.last_browse_click = None;
 
     match entry_info {
-        Some((name, kind)) if !matches!(kind, EntryKind::ParentDir) => {
-            app.active_overlay = ActiveOverlay::TextEdit {
-                input: TextInputState::new(name),
-                target: TextEditTarget::BrowseRename(path),
-                label: "rename".to_string(),
-            };
+        Some((_name, kind)) if !matches!(kind, EntryKind::ParentDir) => {
+            super::keybindings::begin_browse_inline_rename(app, path);
         }
         _ => {
             // Entry no longer visible or is ParentDir — silently drop.
@@ -1044,13 +1041,181 @@ fn reduce_file_task_progress(
     if let Some(status) = status_to_set {
         app.set_status(status);
     }
-    if refresh_after_terminal {
+    let defer_clipboard_refresh = terminal
+        && app
+            .browse
+            .pending_clipboard_paste
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id);
+    if refresh_after_terminal && !defer_clipboard_refresh {
         app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
         super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
     }
 }
 
+
+
+fn path_lexists(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn reduce_file_task_complete(
+    app: &mut AppState,
+    session_id: u64,
+    report: tui_file_picker::FileTaskCompletionReport,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let matches_pending = app
+        .browse
+        .pending_clipboard_paste
+        .as_ref()
+        .is_some_and(|pending| pending.session_id == session_id);
+    if !matches_pending {
+        return;
+    }
+    let pending = app
+        .browse
+        .pending_clipboard_paste
+        .take()
+        .expect("matching pending clipboard paste checked above");
+
+    let mut completed_sources = Vec::new();
+    let mut completed_destinations = Vec::new();
+    let mut retry_sources = Vec::new();
+    let mut unavailable_sources = 0usize;
+    let mut completion_warnings = Vec::new();
+    let mut incomplete_details = Vec::new();
+
+    for (index, source) in pending.clipboard.paths().iter().enumerate() {
+        let expected_destination = pending.destinations.get(index);
+        let root = report.roots.iter().find(|root| {
+            root.source == *source
+                && expected_destination.is_some_and(|destination| root.destination == *destination)
+        });
+        let completed = root.is_some_and(|root| match root.disposition {
+            tui_file_picker::FileTaskRootDisposition::Completed => {
+                if report.is_move {
+                    !path_lexists(source) && path_lexists(&root.destination)
+                } else {
+                    path_lexists(source) && path_lexists(&root.destination)
+                }
+            }
+            tui_file_picker::FileTaskRootDisposition::CompletedWithWarning => {
+                path_lexists(&root.destination)
+            }
+            _ => false,
+        });
+        if completed {
+            let root = root.expect("completed root checked above");
+            completed_sources.push(source.clone());
+            completed_destinations.push(root.destination.clone());
+            if root.disposition == tui_file_picker::FileTaskRootDisposition::CompletedWithWarning {
+                completion_warnings.push(
+                    root.message
+                        .clone()
+                        .unwrap_or_else(|| format!("completed {} with a warning", source.display())),
+                );
+            }
+        } else {
+            if let Some(root) = root {
+                let detail = root.message.clone().unwrap_or_else(|| {
+                    format!("{:?}", root.disposition)
+                });
+                incomplete_details.push(format!(
+                    "{} → {}: {}",
+                    source.display(),
+                    root.destination.display(),
+                    detail
+                ));
+            }
+            if path_lexists(source) {
+                retry_sources.push(source.clone());
+            } else {
+                unavailable_sources = unavailable_sources.saturating_add(1);
+            }
+        }
+    }
+
+    if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
+        && !completed_sources.is_empty()
+    {
+        if let Some(completed_clipboard) = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            completed_sources.clone(),
+        ) {
+            app.browse
+                .remap_navigation_after_cut(&completed_clipboard, &completed_destinations);
+        }
+    }
+
+    let all_completed = completed_sources.len() == pending.clipboard.paths().len();
+    app.browse.filesystem_clipboard = if all_completed {
+        if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Copy {
+            Some(pending.clipboard.clone())
+        } else {
+            None
+        }
+    } else {
+        tui_file_picker::FilesystemClipboard::new(pending.clipboard.mode(), retry_sources.clone())
+    };
+
+    app.browse.rebuild_tree_preserving_expansion();
+    app.browse.refresh_with_search(Some(tx));
+    app.browse.probe_current_with_db(tx, Some(&app.db));
+    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+    if let Some(last) = completed_destinations.last() {
+        if let Some(index) = app.browse.entries.iter().position(|entry| &entry.path == last) {
+            app.browse.selected_index = index;
+            app.browse.ensure_visible();
+        }
+    }
+
+    let mut status = if all_completed {
+        format!(
+            "Pasted {} item{}",
+            completed_sources.len(),
+            if completed_sources.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "Paste partially completed: {} completed, {} ready to retry",
+            completed_sources.len(),
+            retry_sources.len()
+        )
+    };
+    if unavailable_sources > 0 {
+        status.push_str(&format!(
+            ", {} source{} unavailable and not retained in the clipboard",
+            unavailable_sources,
+            if unavailable_sources == 1 { "" } else { "s" }
+        ));
+    }
+    if !completion_warnings.is_empty() {
+        status.push_str(&format!(
+            "; {} completed with cleanup/durability warning{}: {}",
+            completion_warnings.len(),
+            if completion_warnings.len() == 1 { "" } else { "s" },
+            completion_warnings.join(" | ")
+        ));
+    }
+    if !incomplete_details.is_empty() {
+        const MAX_STATUS_DETAILS: usize = 3;
+        let shown = incomplete_details
+            .iter()
+            .take(MAX_STATUS_DETAILS)
+            .cloned()
+            .collect::<Vec<_>>();
+        status.push_str(&format!("; incomplete: {}", shown.join(" | ")));
+        if incomplete_details.len() > shown.len() {
+            status.push_str(&format!(
+                " | … and {} more",
+                incomplete_details.len().saturating_sub(shown.len())
+            ));
+        }
+    }
+    app.set_status(status);
+}
 
 fn matching_file_picker_conflict_policy(
     app: &AppState,
@@ -4087,6 +4252,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         }
         AppMessage::FileTaskProgress { session_id, update } => {
             reduce_file_task_progress(app, session_id, update, tx);
+        }
+        AppMessage::FileTaskComplete { session_id, report } => {
+            reduce_file_task_complete(app, session_id, report, tx);
         }
         AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
             if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {

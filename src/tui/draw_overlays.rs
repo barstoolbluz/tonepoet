@@ -5286,7 +5286,11 @@ fn draw_file_picker_overlay(
     // intentionally does not mirror these regions into ButtonRenderMap; the
     // underscore argument documents that this modal's mouse contract is
     // crate-authoritative.
-    let area = file_picker_overlay_area(parent);
+    let area = if session.picker.is_maximized() {
+        parent
+    } else {
+        file_picker_overlay_area(parent)
+    };
     let free_space = fs2::available_space(session.picker.current_dir()).ok();
     session.picker.set_free_space_bytes(free_space);
     session

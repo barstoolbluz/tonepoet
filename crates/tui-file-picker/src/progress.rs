@@ -262,6 +262,66 @@ impl ProgressTotals {
     }
 }
 
+/// Disposition of one top-level root in a file task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTaskRootDisposition {
+    Completed,
+    /// The destination is complete and authoritative, but a post-commit step
+    /// such as source cleanup or durability synchronization raised a warning.
+    CompletedWithWarning,
+    Skipped,
+    Failed,
+    NotAttempted,
+}
+
+impl FileTaskRootDisposition {
+    pub fn is_completed(self) -> bool {
+        matches!(self, Self::Completed | Self::CompletedWithWarning)
+    }
+}
+
+/// Terminal accounting for one top-level source and its resolved destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTaskRootResult {
+    pub source: std::path::PathBuf,
+    pub destination: std::path::PathBuf,
+    pub disposition: FileTaskRootDisposition,
+    pub message: Option<String>,
+}
+
+/// Structured terminal report emitted separately from the presentation-oriented
+/// progress update. Hosts use this to reconcile cut clipboards, navigation
+/// history, and retry state after partial success, failure, skip, or abort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTaskCompletionReport {
+    pub is_move: bool,
+    pub roots: Vec<FileTaskRootResult>,
+}
+
+impl FileTaskCompletionReport {
+    pub fn completed_mappings(&self) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+        self.roots
+            .iter()
+            .filter(|root| root.disposition.is_completed())
+            .map(|root| (root.source.clone(), root.destination.clone()))
+            .collect()
+    }
+
+    pub fn retry_sources(&self) -> Vec<std::path::PathBuf> {
+        self.roots
+            .iter()
+            .filter(|root| !root.disposition.is_completed())
+            .map(|root| root.source.clone())
+            .collect()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.roots
+            .iter()
+            .all(|root| root.disposition.is_completed())
+    }
+}
+
 /// Snapshot or event supplied by the host to update the reusable overlay.
 ///
 /// Applying an update is a pure state transition: no filesystem mutation,

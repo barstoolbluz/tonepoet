@@ -6132,7 +6132,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             if app.current_screen != AppScreen::Browse {
                 app.set_status(":search only works on the browse screen");
             } else {
-                app.browse.open_search();
+                super::keybindings::open_browse_search(app);
                 app.browse.search.recursive = recursive;
             }
         }
@@ -7379,6 +7379,7 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
 
     let trimmed = args.trim();
     if trimmed.is_empty() {
+        app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
         app.bookmarks.open_overlay();
         return;
     }
@@ -7390,14 +7391,26 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
 
     match sub.as_str() {
         "add" => {
+            app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
             let path = app.browse.current_dir.clone();
             let name = if rest.is_empty() {
                 super::bookmarks::BookmarksState::default_name_for_path(&path)
             } else {
                 rest.to_string()
             };
-            app.bookmarks.add_with_db(name.clone(), path, &app.db);
-            app.set_status(format!("bookmark added: {}", name));
+            if app.bookmarks.add_with_db(name.clone(), path, &app.db) {
+                if let Some(warning) = app.bookmarks.take_warning() {
+                    app.set_status(format!("bookmark added with warning: {warning}"));
+                } else {
+                    app.set_status(format!("bookmark added: {}", name));
+                }
+            } else {
+                let detail = app
+                    .bookmarks
+                    .take_warning()
+                    .unwrap_or_else(|| "bookmark could not be saved".to_string());
+                app.set_status(detail);
+            }
         }
         other => {
             app.set_status(format!("unknown :bm subcommand: {}", other));

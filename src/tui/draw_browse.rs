@@ -154,16 +154,36 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
 
     let hover = app.hover_target;
     let inline_edit = app.browse_inline_edit.clone();
+    let navigation_focus_active = app.browse_info_focus.is_none()
+        && (!app.browse.search.active
+            || app.browse.search.focus == super::browse::SearchFocus::Results);
 
     if app.browse.explore_enabled {
         if app.browse.explore_collapsed {
             draw_collapsed_pane(f, explore_area, BrowsePaneId::Explore, "explore", &mut app.button_map, theme);
         } else {
-            draw_explore_pane(f, explore_area, &mut app.browse, &mut app.button_map, hover, theme);
+            draw_explore_pane(
+                f,
+                explore_area,
+                &mut app.browse,
+                inline_edit.as_ref(),
+                &mut app.button_map,
+                hover,
+                navigation_focus_active,
+                theme,
+            );
         }
     }
 
-    draw_browse_list(f, list_area, &mut app.browse, inline_edit.as_ref(), hover, theme);
+    draw_browse_list(
+        f,
+        list_area,
+        &mut app.browse,
+        inline_edit.as_ref(),
+        hover,
+        navigation_focus_active,
+        theme,
+    );
     let create_row_active = matches!(
         app.browse_inline_edit.as_ref().map(|state| &state.target),
         Some(crate::tui::app::BrowseInlineEditTarget::Create { dir, .. }) if dir == &app.browse.current_dir
@@ -350,8 +370,10 @@ fn draw_explore_pane(
     f: &mut Frame,
     area: Rect,
     browse: &mut BrowseState,
+    inline_edit: Option<&BrowseInlineEditState>,
     buttons: &mut ButtonRenderMap,
     hover: Option<TuiButton>,
+    navigation_focus_active: bool,
     theme: super::theme::Theme,
 ) {
     if area.height < 3 || area.width < 6 {
@@ -377,44 +399,128 @@ fn draw_explore_pane(
     ));
 
     let content_height = (area.height as usize).saturating_sub(2);
-    let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), content_height as u16);
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        content_height as u16,
+    );
 
-    // Render top border, side borders, and bottom border
     f.render_widget(Paragraph::new(top_line), Rect::new(area.x, area.y, area.width, 1));
     for row in 0..content_height {
         let y = area.y + 1 + row as u16;
-        f.render_widget(Paragraph::new("│").style(theme.border(border_color)), Rect::new(area.x, y, 1, 1));
-        f.render_widget(Paragraph::new("│").style(theme.border(border_color)), Rect::new(area.x + area.width - 1, y, 1, 1));
-    }
-    f.render_widget(Paragraph::new(bot_line), Rect::new(area.x, area.y + area.height - 1, area.width, 1));
-
-    buttons.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Explore), Rect::new(area.x + 1, area.y, title_w as u16, 1));
-
-    browse.set_tree_visible_height(inner.height as usize);
-    let start = browse.tree_scroll;
-    let end = (start + inner.height as usize).min(browse.tree_nodes.len());
-    let lines = browse.tree_nodes[start..end]
-        .iter()
-        .enumerate()
-        .map(|(row, node)| {
-            let absolute = start + row;
-            render_browse_tree_node_line(
-                node,
-                absolute == browse.tree_cursor,
-                hover == Some(TuiButton::BrowseTreeNode(absolute)),
-                theme,
-            )
-        })
-        .collect::<Vec<_>>();
-    for (row, absolute) in (start..end).enumerate() {
-        buttons.record_button(
-            TuiButton::BrowseTreeNode(absolute),
-            Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+        f.render_widget(
+            Paragraph::new("│").style(theme.border(border_color)),
+            Rect::new(area.x, y, 1, 1),
+        );
+        f.render_widget(
+            Paragraph::new("│").style(theme.border(border_color)),
+            Rect::new(area.x + area.width - 1, y, 1, 1),
         );
     }
-    f.render_widget(Paragraph::new(lines), inner);
-}
+    f.render_widget(
+        Paragraph::new(bot_line),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+    );
 
+    buttons.record_button(
+        TuiButton::BrowsePaneToggle(BrowsePaneId::Explore),
+        Rect::new(area.x + 1, area.y, title_w as u16, 1),
+    );
+
+    browse.set_tree_visible_height(inner.height as usize);
+    f.render_widget(Clear, inner);
+
+    let create = inline_edit.and_then(|state| match &state.target {
+        BrowseInlineEditTarget::Create { dir, .. } => Some((dir, &state.input)),
+        _ => None,
+    });
+    let rename = inline_edit.and_then(|state| match &state.target {
+        BrowseInlineEditTarget::Rename { path } => Some((path, &state.input)),
+        _ => None,
+    });
+
+    let start = browse.tree_scroll;
+    let mut visual_row = 0usize;
+    let mut absolute = start;
+    let mut editor_cursor = None;
+    while absolute < browse.tree_nodes.len() && visual_row < inner.height as usize {
+        let node = &browse.tree_nodes[absolute];
+        let row_area = Rect::new(inner.x, inner.y + visual_row as u16, inner.width, 1);
+        let disclosure_x = inner
+            .x
+            .saturating_add((node.depth.saturating_mul(2)) as u16)
+            .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
+        let row_hovered = hover == Some(TuiButton::BrowseTreeNode(absolute))
+            || hover == Some(TuiButton::BrowseTreeDisclosure(absolute));
+
+        if rename.is_some_and(|(path, _)| path == &node.path) {
+            let input = rename.expect("rename predicate established").1;
+            let glyph = if node.has_children {
+                if node.expanded { "▾" } else { "▸" }
+            } else {
+                " "
+            };
+            let prefix = format!("{}{} ", "  ".repeat(node.depth), glyph);
+            let prefix_width = super::display_width::width(&prefix);
+            let input_width = (inner.width as usize).saturating_sub(prefix_width).max(1);
+            let mut spans = vec![Span::styled(prefix, theme.text_style())];
+            spans.extend(render_inline_value_with_embedded_cursor(input, input_width, theme));
+            f.render_widget(Paragraph::new(Line::from(spans)), row_area);
+            buttons.record_button(TuiButton::BrowseTreeInlineEdit, row_area);
+            editor_cursor = Some((
+                inner.x.saturating_add(prefix_width as u16).saturating_add(
+                    inline_cursor_col(input, input_width) as u16,
+                ),
+                row_area.y,
+            ));
+        } else {
+            let line = render_browse_tree_node_line(
+                node,
+                absolute == browse.tree_cursor
+                    && navigation_focus_active
+                    && browse.tree_navigation_active(),
+                row_hovered,
+                theme,
+            );
+            f.render_widget(Paragraph::new(line), row_area);
+            buttons.record_button(TuiButton::BrowseTreeNode(absolute), row_area);
+            if node.has_children {
+                buttons.record_button(
+                    TuiButton::BrowseTreeDisclosure(absolute),
+                    Rect::new(disclosure_x, row_area.y, 1, 1),
+                );
+            }
+        }
+        visual_row += 1;
+
+        if visual_row < inner.height as usize
+            && create.is_some_and(|(dir, _)| dir == &node.path)
+        {
+            let input = create.expect("create predicate established").1;
+            let prefix = format!("{}  + ", "  ".repeat(node.depth));
+            let prefix_width = super::display_width::width(&prefix);
+            let input_width = (inner.width as usize).saturating_sub(prefix_width).max(1);
+            let mut spans = vec![Span::styled(prefix, Style::default().fg(theme.amber))];
+            spans.extend(render_inline_value_with_embedded_cursor(input, input_width, theme));
+            let create_area = Rect::new(inner.x, inner.y + visual_row as u16, inner.width, 1);
+            f.render_widget(Paragraph::new(Line::from(spans)), create_area);
+            buttons.record_button(TuiButton::BrowseTreeInlineEdit, create_area);
+            editor_cursor = Some((
+                inner.x.saturating_add(prefix_width as u16).saturating_add(
+                    inline_cursor_col(input, input_width) as u16,
+                ),
+                create_area.y,
+            ));
+            visual_row += 1;
+        }
+        absolute += 1;
+    }
+
+    if let Some((x, y)) = editor_cursor {
+        f.set_cursor(x.min(inner.x + inner.width.saturating_sub(1)), y);
+    }
+}
 
 fn render_browse_tree_node_line(
     node: &super::browse::BrowseTreeNode,
@@ -1625,6 +1731,7 @@ fn draw_browse_list(
     browse: &mut BrowseState,
     inline_edit: Option<&BrowseInlineEditState>,
     hover: Option<super::button_map::TuiButton>,
+    navigation_focus_active: bool,
     theme: super::theme::Theme,
 ) {
     if area.height < 4 || area.width < 20 {
@@ -1811,7 +1918,9 @@ fn draw_browse_list(
 
         for i in start..end {
             let entry = &browse.entries[i];
-            let is_selected = i == browse.selected_index;
+            let is_selected = i == browse.selected_index
+                && navigation_focus_active
+                && browse.files_navigation_active();
             let is_checked = browse.is_multi_selected(&entry.path);
             let is_range_preview = browse.is_range_preview_index(i);
             let is_hovered =

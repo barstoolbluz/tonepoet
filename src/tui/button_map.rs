@@ -236,6 +236,10 @@ pub enum TuiButton {
     BrowsePaneToggle(crate::tui::browse::BrowsePaneId),
     BrowsePaneTitle(crate::tui::browse::BrowsePaneId),
     BrowseTreeNode(usize),
+    /// Disclosure glyph within a Browse tree row; toggles expansion without navigation.
+    BrowseTreeDisclosure(usize),
+    /// Inline name editor rendered inside the Browse tree pane.
+    BrowseTreeInlineEdit,
     BrowseOptionsShowHidden,
     BrowseOptionsLayout,
     BrowseOptionsToggleExplore,
@@ -562,6 +566,8 @@ impl TuiButton {
             | Self::BrowsePaneToggle(_)
             | Self::BrowsePaneTitle(_)
             | Self::BrowseTreeNode(_)
+            | Self::BrowseTreeDisclosure(_)
+            | Self::BrowseTreeInlineEdit
             | Self::BrowseOptionsShowHidden
             | Self::BrowseOptionsLayout
             | Self::BrowseOptionsToggleExplore

@@ -115,6 +115,29 @@ pub enum ContextAction {
     CopyTo,
     /// Move the selected file(s) to a destination (opens directory picker).
     MoveTo,
+    /// Put the current Browse selection on the shared filesystem clipboard.
+    CutSelection,
+    /// Put a copy of the current Browse selection on the shared filesystem clipboard.
+    CopySelection,
+    /// Paste the shared filesystem clipboard into the displayed directory.
+    PasteSelection,
+    /// Duplicate selected files in place.
+    DuplicateSelection,
+    /// Open a single file in the user's configured system editor.
+    OpenSystemDefault(PathBuf),
+    /// Tree-pane operations carry their target explicitly so a later cursor
+    /// change cannot redirect the operation.
+    TreeNewFile(PathBuf),
+    TreeNewFolder(PathBuf),
+    TreeRename(PathBuf),
+    TreeCut(PathBuf),
+    TreeCopy(PathBuf),
+    TreePaste(PathBuf),
+    TreeDelete(PathBuf),
+    /// Address-bar text clipboard operations.
+    PathTextCut,
+    PathTextCopy,
+    PathTextPaste,
     /// Refresh the browse listing.
     Refresh,
     /// Open the bulk rename wizard for selected audio files.
@@ -285,6 +308,15 @@ fn item(label: &str, action: ContextAction) -> ContextMenuEntry {
     })
 }
 
+fn item_enabled(label: &str, action: ContextAction, enabled: bool) -> ContextMenuEntry {
+    ContextMenuEntry::Item(ContextMenuItem {
+        label: label.to_string(),
+        action,
+        shortcut: None,
+        enabled,
+    })
+}
+
 fn separator() -> ContextMenuEntry {
     ContextMenuEntry::Separator
 }
@@ -367,10 +399,23 @@ fn build_convert_submenu(app: &AppState) -> ContextMenuEntry {
 
 /// Build the "File operations" submenu (Rename, Bulk Rename, Copy/Move,
 /// Delete). `include_bulk_rename` adds the Bulk Rename option for audio files.
-fn build_file_ops_submenu(include_bulk_rename: bool) -> ContextMenuEntry {
-    let mut children = vec![item("Rename", ContextAction::RenameEntry)];
+fn build_file_ops_submenu(
+    include_bulk_rename: bool,
+    allow_single_item_actions: bool,
+    allow_duplicate: bool,
+) -> ContextMenuEntry {
+    let mut children = vec![
+        item("Cut", ContextAction::CutSelection),
+        item("Copy", ContextAction::CopySelection),
+    ];
+    if allow_single_item_actions {
+        children.push(item("Rename", ContextAction::RenameEntry));
+    }
     if include_bulk_rename {
         children.push(item("Bulk Rename", ContextAction::BulkRename));
+    }
+    if allow_duplicate {
+        children.push(item("Duplicate", ContextAction::DuplicateSelection));
     }
     children.push(item("Copy to...", ContextAction::CopyTo));
     children.push(item("Move to...", ContextAction::MoveTo));
@@ -607,6 +652,24 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 
     let mut items = Vec::new();
     let effective_kind = effective_browse_context_entry_kind(&entry.kind, &entry.path);
+    let selected_path_is_marked = app
+        .browse
+        .multi_selected
+        .iter()
+        .any(|path| path == &entry.path);
+    let bulk_selection = selected_path_is_marked && app.browse.multi_selected.len() > 1;
+    let allow_single_item_actions = !bulk_selection;
+    let selection_paths: Vec<&PathBuf> = if selected_path_is_marked && !app.browse.multi_selected.is_empty() {
+        app.browse.multi_selected.iter().collect()
+    } else {
+        vec![&entry.path]
+    };
+    let selection_all_files = selection_paths.iter().all(|path| {
+        app.browse.entries.iter().any(|candidate| {
+            candidate.path.as_path() == path.as_path()
+                && !matches!(candidate.kind, EntryKind::Directory | EntryKind::ParentDir)
+        })
+    });
 
     match &effective_kind {
         EntryKind::AudioFile(_) => {
@@ -624,7 +687,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
             items.push(separator());
-            items.push(build_file_ops_submenu(true));
+            items.push(build_file_ops_submenu(true, allow_single_item_actions, selection_all_files));
             items.push(item(
                 "Copy path",
                 ContextAction::CopyPath(entry.path.clone()),
@@ -640,7 +703,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(separator());
             items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Set Password", ContextAction::SetArchivePassword));
-            items.push(build_file_ops_submenu(false));
+            items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item(
                 "Copy path",
                 ContextAction::CopyPath(entry.path.clone()),
@@ -669,7 +732,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_tagging_submenu(false));
             items.push(build_utilities_submenu(app));
             items.push(separator());
-            items.push(build_file_ops_submenu(false));
+            items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::DvdAudioIso
@@ -702,7 +765,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_tagging_submenu(false));
             items.push(build_utilities_submenu(app));
             items.push(separator());
-            items.push(build_file_ops_submenu(false));
+            items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::Directory => {
@@ -722,7 +785,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
-            items.push(build_file_ops_submenu(false));
+            items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item(
                 "Copy path",
                 ContextAction::CopyPath(entry.path.clone()),
@@ -755,7 +818,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Select Inverse", ContextAction::SelectInverse));
             items.push(item("Deselect", ContextAction::Deselect));
             items.push(separator());
-            items.push(build_file_ops_submenu(false));
+            items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item(
                 "Copy path",
                 ContextAction::CopyPath(entry.path.clone()),
@@ -763,19 +826,95 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         }
     }
 
+    if allow_single_item_actions && entry.path.is_file() {
+        items.push(separator());
+        items.push(item(
+            "Open/Edit with System Default",
+            ContextAction::OpenSystemDefault(entry.path.clone()),
+        ));
+    }
+
     items
+}
+
+
+/// Build the context menu for a right-clicked Browse tree directory.
+pub fn build_browse_tree_menu(app: &AppState, index: usize) -> Vec<ContextMenuEntry> {
+    let Some(node) = app.browse.tree_nodes.get(index) else {
+        return Vec::new();
+    };
+    let path = node.path.clone();
+    let mutable = path.parent().is_some();
+    let paste_enabled = app
+        .browse
+        .filesystem_clipboard
+        .as_ref()
+        .is_some_and(|clipboard| {
+            !clipboard.is_empty() && clipboard.paths().iter().all(|source| source.exists())
+        });
+    vec![
+        ContextMenuEntry::Submenu {
+            label: "New".to_string(),
+            children: vec![
+                item("File", ContextAction::TreeNewFile(path.clone())),
+                item("Folder", ContextAction::TreeNewFolder(path.clone())),
+            ],
+        },
+        separator(),
+        item_enabled("Cut", ContextAction::TreeCut(path.clone()), mutable),
+        item("Copy", ContextAction::TreeCopy(path.clone())),
+        item_enabled("Paste", ContextAction::TreePaste(path.clone()), paste_enabled),
+        separator(),
+        item_enabled("Rename", ContextAction::TreeRename(path.clone()), mutable),
+        item_enabled("Delete permanently", ContextAction::TreeDelete(path.clone()), mutable),
+        separator(),
+        item("Copy path", ContextAction::CopyPath(path)),
+    ]
+}
+
+/// Build the address-bar text-editing menu. The path editor is opened before
+/// this builder is called, so its selection is the authoritative target.
+pub fn build_browse_path_menu(app: &AppState) -> Vec<ContextMenuEntry> {
+    let has_selection = app
+        .browse
+        .path_input
+        .as_ref()
+        .is_some_and(|input| input.has_selection());
+    vec![
+        item_enabled("Cut", ContextAction::PathTextCut, has_selection),
+        item_enabled("Copy", ContextAction::PathTextCopy, has_selection),
+        item("Paste", ContextAction::PathTextPaste),
+    ]
 }
 
 /// Build the context menu for a right-click on empty space in the browse list.
 pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
-    let _ = app; // used in future for conditional items
     vec![
-        item("New file", ContextAction::NewFile),
-        item("New folder", ContextAction::NewFolder),
-        separator(),
-        item("Select All", ContextAction::SelectAll),
-        item("Select Inverse", ContextAction::SelectInverse),
-        item("Deselect", ContextAction::Deselect),
+        ContextMenuEntry::Submenu {
+            label: "New".to_string(),
+            children: vec![
+                item("File", ContextAction::NewFile),
+                item("Folder", ContextAction::NewFolder),
+            ],
+        },
+        ContextMenuEntry::Submenu {
+            label: "Selection".to_string(),
+            children: vec![
+                item("Select All", ContextAction::SelectAll),
+                item("Invert Selection", ContextAction::SelectInverse),
+                item("Deselect All", ContextAction::Deselect),
+            ],
+        },
+        item_enabled(
+            "Paste",
+            ContextAction::PasteSelection,
+            app.browse
+                .filesystem_clipboard
+                .as_ref()
+                .is_some_and(|clipboard| {
+                    !clipboard.is_empty() && clipboard.paths().iter().all(|path| path.exists())
+                }),
+        ),
         separator(),
         item("Refresh", ContextAction::Refresh),
         item("Toggle hidden", ContextAction::ToggleHidden),
@@ -915,6 +1054,11 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         | ContextAction::ConvertWithPreset(_) => Some("conversion"),
         ContextAction::EditMetadata(_) => Some("inline metadata editing"),
         ContextAction::CopyTo | ContextAction::MoveTo => Some("copy/move"),
+        ContextAction::CutSelection
+        | ContextAction::CopySelection
+        | ContextAction::PasteSelection
+        | ContextAction::DuplicateSelection => Some("filesystem clipboard operation"),
+        ContextAction::OpenSystemDefault(_) => Some("system-default editing"),
         ContextAction::BulkRename => Some("bulk rename"),
         ContextAction::Analyze => Some("analysis"),
         ContextAction::SetArchivePassword => Some("archive password editing"),
@@ -1154,6 +1298,77 @@ pub fn execute_context_action(
         ContextAction::NewFolder => {
             super::keybindings::begin_browse_create(app, super::app::BrowseCreateKind::Folder);
         }
+        ContextAction::TreeNewFile(path) => {
+            super::keybindings::begin_browse_create_in(
+                app,
+                path,
+                super::app::BrowseCreateKind::File,
+            );
+        }
+        ContextAction::TreeNewFolder(path) => {
+            super::keybindings::begin_browse_create_in(
+                app,
+                path,
+                super::app::BrowseCreateKind::Folder,
+            );
+        }
+        ContextAction::TreeRename(path) => {
+            super::keybindings::begin_browse_inline_rename(app, path);
+        }
+        ContextAction::TreeCut(path) => {
+            if let Some(clipboard) = tui_file_picker::FilesystemClipboard::new(
+                tui_file_picker::FilePickerClipboardMode::Cut,
+                vec![path],
+            ) {
+                app.browse.filesystem_clipboard = Some(clipboard);
+                app.set_status("Cut tree folder");
+            }
+        }
+        ContextAction::TreeCopy(path) => {
+            if let Some(clipboard) = tui_file_picker::FilesystemClipboard::new(
+                tui_file_picker::FilePickerClipboardMode::Copy,
+                vec![path],
+            ) {
+                app.browse.filesystem_clipboard = Some(clipboard);
+                app.set_status("Copied tree folder");
+            }
+        }
+        ContextAction::TreePaste(target_dir) => {
+            let Some(clipboard) = app.browse.filesystem_clipboard.clone() else {
+                app.set_status("Nothing to paste");
+                return;
+            };
+            super::keybindings::start_filesystem_clipboard_paste(
+                app,
+                clipboard,
+                target_dir,
+                tx,
+            );
+        }
+        ContextAction::TreeDelete(path) => {
+            app.active_overlay = ActiveOverlay::Confirmation {
+                message: format!(
+                    "Permanently delete this folder?\n\n{}\n\nThis cannot be undone.",
+                    path.display()
+                ),
+                action: ConfirmAction::DeleteSelection(vec![path]),
+            };
+        }
+        ContextAction::PathTextCut => {
+            if let Some(input) = app.browse.path_input.as_mut() {
+                input.cut_selection();
+            }
+        }
+        ContextAction::PathTextCopy => {
+            if let Some(input) = app.browse.path_input.as_mut() {
+                input.copy_selection();
+            }
+        }
+        ContextAction::PathTextPaste => {
+            if let Some(input) = app.browse.path_input.as_mut() {
+                input.paste_clipboard();
+            }
+        }
         ContextAction::RenameEntry => {
             if app.browse.is_in_archive() {
                 let can_rename = app
@@ -1199,6 +1414,91 @@ pub fn execute_context_action(
             // staged edits rather than direct filesystem paths.
             let cmd = super::command::Command::Delete;
             super::command::execute_command(app, cmd, tx);
+        }
+        cut_or_copy @ (ContextAction::CutSelection | ContextAction::CopySelection) => {
+            if app.browse.is_in_archive() {
+                archive_synthetic_file_op_status(app, "filesystem clipboard operation");
+                return;
+            }
+            let selection = super::command::collect_selection_for_file_ops_scoped(app);
+            let mode = if matches!(cut_or_copy, ContextAction::CutSelection) {
+                tui_file_picker::FilePickerClipboardMode::Cut
+            } else {
+                tui_file_picker::FilePickerClipboardMode::Copy
+            };
+            match tui_file_picker::FilesystemClipboard::new(mode, selection.paths) {
+                Some(clipboard) => {
+                    let count = clipboard.paths().len();
+                    app.browse.filesystem_clipboard = Some(clipboard);
+                    app.set_status(format!(
+                        "{} {count} item{}",
+                        if mode == tui_file_picker::FilePickerClipboardMode::Cut {
+                            "Cut"
+                        } else {
+                            "Copied"
+                        },
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                None => app.set_status("No items selected"),
+            }
+            super::command::surface_stale_selection_notice(app, selection.dropped_stale_count);
+        }
+        ContextAction::PasteSelection => {
+            if app.browse.is_in_archive() {
+                archive_synthetic_file_op_status(app, "paste");
+                return;
+            }
+            let Some(clipboard) = app.browse.filesystem_clipboard.clone() else {
+                app.set_status("Nothing to paste");
+                return;
+            };
+            super::keybindings::start_filesystem_clipboard_paste(
+                app,
+                clipboard,
+                app.browse.current_dir.clone(),
+                tx,
+            );
+        }
+        ContextAction::DuplicateSelection => {
+            if app.browse.is_in_archive() {
+                archive_synthetic_file_op_status(app, "duplicate");
+                return;
+            }
+            let selection = super::command::collect_selection_for_file_ops_scoped(app);
+            match tui_file_picker::duplicate_files_in_place(
+                &selection.paths,
+                tui_file_picker::FileOperationPolicy::default(),
+            ) {
+                Ok(created) => {
+                    app.browse.refresh_with_search(Some(tx));
+                    app.browse.multi_selected = created.clone();
+                    if let Some(last) = created.last() {
+                        if let Some(index) = app.browse.entries.iter().position(|entry| &entry.path == last) {
+                            app.browse.selected_index = index;
+                            app.browse.ensure_visible();
+                        }
+                    }
+                    app.set_status(format!(
+                        "Duplicated {} file{}",
+                        created.len(),
+                        if created.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                Err(err) => app.set_status(format!("Duplicate failed: {}", err.message())),
+            }
+            super::command::surface_stale_selection_notice(app, selection.dropped_stale_count);
+        }
+        ContextAction::OpenSystemDefault(path) => {
+            if !path.is_file() {
+                app.set_status("Open/Edit with System Default is available for files only");
+                return;
+            }
+            match super::external_editor::open_in_editor(&path) {
+                Ok(true) => app.set_status(format!("Closed editor: {}", path.display())),
+                Ok(false) => app.set_status(format!("Editor exited unsuccessfully: {}", path.display())),
+                Err(err) => app.set_status(format!("Could not open {}: {err}", path.display())),
+            }
         }
         ContextAction::SetArchivePassword => {
             let cmd = super::command::Command::Password;
@@ -1621,13 +1921,26 @@ pub fn execute_context_action(
             }
         }
         ContextAction::OpenBookmarks => {
+            app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
             app.bookmarks.open_overlay();
         }
         ContextAction::BookmarkCurrentDir => {
+            app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
             let path = app.browse.current_dir.clone();
             let name = super::bookmarks::BookmarksState::default_name_for_path(&path);
-            app.bookmarks.add_with_db(name.clone(), path, &app.db);
-            app.set_status(format!("bookmark added: {}", name));
+            if app.bookmarks.add_with_db(name.clone(), path, &app.db) {
+                if let Some(warning) = app.bookmarks.take_warning() {
+                    app.set_status(format!("bookmark added with warning: {warning}"));
+                } else {
+                    app.set_status(format!("bookmark added: {}", name));
+                }
+            } else {
+                let detail = app
+                    .bookmarks
+                    .take_warning()
+                    .unwrap_or_else(|| "bookmark could not be saved".to_string());
+                app.set_status(detail);
+            }
         }
 
         // ── Convert ─────────────────────────────────────────────────

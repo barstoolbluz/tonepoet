@@ -5,7 +5,6 @@
 //! and have no cap.
 
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::text_input::TextInputState;
@@ -15,13 +14,6 @@ use super::text_input::TextInputState;
 pub struct Bookmark {
     pub name: String,
     pub path: PathBuf,
-}
-
-/// The on-disk wrapper: a TOML file with a top-level `[[entries]]` array.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct BookmarksFile {
-    #[serde(default)]
-    entries: Vec<Bookmark>,
 }
 
 /// Naming mode for the bookmarks overlay: either adding a new bookmark for
@@ -47,28 +39,83 @@ pub struct BookmarksState {
     pub overlay_scroll: usize,
     pub overlay_visible_rows: usize,
     pub naming: Option<BookmarkNaming>,
+    /// Non-fatal warning from an authoritative commit or SQLite mirror repair.
+    pub last_warning: Option<String>,
 }
 
 impl BookmarksState {
-    /// Load bookmarks from disk, or return empty state on missing file / parse error.
+    /// Load bookmarks from disk. Missing storage is an empty list; corruption,
+    /// permission failures, and other read errors remain visible to the user.
     pub fn load() -> Self {
-        let path = Self::storage_path();
         let mut state = Self::default();
-        if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(file) = toml::from_str::<BookmarksFile>(&text) {
-                state.entries = file.entries;
+        match tui_file_picker::load_bookmarks() {
+            Ok(entries) => {
+                state.entries = entries
+                    .into_iter()
+                    .map(|entry| Bookmark { name: entry.name, path: entry.path })
+                    .collect();
+            }
+            Err(error) => {
+                log::warn!("bookmarks: could not load shared store: {error}");
+                state.last_warning = Some(format!("Could not load bookmarks: {error}"));
             }
         }
         state
     }
 
-    /// Load from SQLite DB (preferred) with TOML import fallback.
+    /// Load the shared TOML store first, then mirror it into SQLite. A valid
+    /// existing TOML file is authoritative even when empty. Only a genuinely
+    /// absent TOML file may fall back to SQLite and be republished.
     pub fn load_from_db(db: &crate::db::Database) -> Self {
-        let mut state = Self::default();
+        let storage_path = tui_file_picker::bookmark_storage_path();
+        let shared_store_probe = std::fs::symlink_metadata(&storage_path);
+        let shared_store_absent = matches!(
+            shared_store_probe.as_ref(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        match tui_file_picker::load_bookmarks() {
+            Ok(entries) if !shared_store_absent => {
+                let mut state = Self {
+                    entries: entries
+                        .into_iter()
+                        .map(|entry| Bookmark {
+                            name: entry.name,
+                            path: entry.path,
+                        })
+                        .collect(),
+                    ..Self::default()
+                };
+                // A valid, explicitly empty TOML store is authoritative too:
+                // mirror it by clearing stale SQLite rows rather than reviving them.
+                if let Err(error) = state.sync_to_db(db) {
+                    log::warn!("bookmarks: SQLite mirror reconciliation failed: {error}");
+                    state.last_warning = Some(error);
+                }
+                return state;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log::warn!(
+                    "bookmarks: could not read shared store {}: {}",
+                    storage_path.display(),
+                    err
+                );
+                if !shared_store_absent {
+                    // An existing shared store is authoritative even when it is
+                    // temporarily unreadable or malformed. Likewise, a metadata
+                    // probe error other than NotFound is not evidence of
+                    // absence. Do not resurrect a stale SQLite mirror and
+                    // diverge from the picker.
+                    let mut state = Self::default();
+                    state.last_warning = Some(err.to_string());
+                    return state;
+                }
+            }
+        }
 
-        // Try loading from DB first.
-        if let Ok(rows) = db.list_bookmarks() {
-            if !rows.is_empty() {
+        let mut state = Self::default();
+        match db.list_bookmarks() {
+            Ok(rows) => {
                 state.entries = rows
                     .into_iter()
                     .map(|(_id, name, path)| Bookmark {
@@ -76,96 +123,220 @@ impl BookmarksState {
                         path: PathBuf::from(path),
                     })
                     .collect();
-                return state;
-            }
-        }
-
-        // DB empty — try importing from TOML.
-        let toml_path = Self::storage_path();
-        if let Ok(text) = fs::read_to_string(&toml_path) {
-            if let Ok(file) = toml::from_str::<BookmarksFile>(&text) {
-                for bm in &file.entries {
-                    let _ = db.add_bookmark(&bm.name, &bm.path.display().to_string());
+                // Publish only when the TOML store is genuinely absent. The
+                // initializer re-checks under the interprocess lock; if another
+                // process won the race, adopt its authoritative entries instead
+                // of overwriting them with this stale SQLite snapshot.
+                if shared_store_absent && !state.entries.is_empty() {
+                    let seed = state.as_records();
+                    match tui_file_picker::initialize_bookmarks_if_absent(&seed) {
+                        Ok(initialization) => {
+                            state.entries = initialization
+                                .entries
+                                .into_iter()
+                                .map(|entry| Bookmark {
+                                    name: entry.name,
+                                    path: entry.path,
+                                })
+                                .collect();
+                            state.last_warning = initialization
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.warning())
+                                .map(str::to_string);
+                            if !initialization.initialized {
+                                if let Err(error) = state.sync_to_db(db) {
+                                    log::warn!(
+                                        "bookmarks: concurrent TOML winner could not be mirrored to SQLite: {error}"
+                                    );
+                                    state.last_warning = Some(match state.last_warning.take() {
+                                        Some(existing) => format!("{existing}; {error}"),
+                                        None => error,
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("bookmarks: SQLite migration to TOML failed: {error}");
+                            let authoritative_path_is_not_absent = match std::fs::symlink_metadata(
+                                &storage_path,
+                            ) {
+                                Ok(_) => true,
+                                Err(probe_error) => {
+                                    probe_error.kind() != std::io::ErrorKind::NotFound
+                                }
+                            };
+                            if authoritative_path_is_not_absent {
+                                // The authoritative path appeared after the
+                                // initial probe but could not be adopted. Do not
+                                // keep presenting the stale SQLite snapshot as if
+                                // it were authoritative.
+                                state.entries.clear();
+                            }
+                            state.last_warning = Some(error.to_string());
+                        }
+                    }
                 }
-                state.entries = file.entries;
+            }
+            Err(error) => {
+                log::warn!("bookmarks: SQLite fallback read failed: {error}");
+                state.last_warning = Some(error.to_string());
             }
         }
-
         state
     }
 
-    /// Persist entries to disk. Best-effort: returns Err on IO failure but
-    /// callers can ignore it (non-critical feature).
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::storage_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    /// Persist entries to the authoritative shared TOML store.
+    ///
+    /// This whole-list API is retained for one-time migration. Interactive
+    /// edits use mutation APIs so they cannot overwrite concurrent changes.
+    pub fn save(&self) -> std::io::Result<tui_file_picker::BookmarkSaveStatus> {
+        tui_file_picker::save_bookmarks_atomic(&self.as_records())
+    }
+
+    fn as_records(&self) -> Vec<tui_file_picker::BookmarkRecord> {
+        self.entries
+            .iter()
+            .map(|entry| tui_file_picker::BookmarkRecord {
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+            })
+            .collect()
+    }
+
+    fn apply_commit(&mut self, commit: tui_file_picker::BookmarkCommit) {
+        self.entries = commit
+            .entries
+            .into_iter()
+            .map(|entry| Bookmark {
+                name: entry.name,
+                path: entry.path,
+            })
+            .collect();
+        self.overlay_selected = commit
+            .affected_index
+            .min(self.entries.len().saturating_sub(1));
+        self.ensure_visible();
+        self.last_warning = commit.status.warning().map(str::to_string);
+    }
+
+    fn apply_mutation(&mut self, mutation: tui_file_picker::BookmarkMutation) -> bool {
+        match tui_file_picker::mutate_bookmarks_atomic(mutation) {
+            Ok(commit) => {
+                self.apply_commit(commit);
+                true
+            }
+            Err(error) => {
+                log::warn!("bookmarks: authoritative mutation failed: {error}");
+                self.last_warning = Some(error.to_string());
+                false
+            }
         }
-        let file = BookmarksFile {
-            entries: self.entries.clone(),
-        };
-        let text = toml::to_string_pretty(&file)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        fs::write(&path, text)
     }
 
-    /// Path to the bookmarks TOML file.
-    fn storage_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("tonepoet")
-            .join("bookmarks.toml")
+    /// Add a bookmark and persist it against the latest authoritative state.
+    pub fn add(&mut self, name: String, path: PathBuf) -> bool {
+        self.apply_mutation(tui_file_picker::BookmarkMutation::Add(
+            tui_file_picker::BookmarkRecord { name, path },
+        ))
     }
 
-    // ── CRUD helpers (in-memory only; wrappers call save) ───────────
-
-    /// Add a bookmark and persist.
-    pub fn add(&mut self, name: String, path: PathBuf) {
-        self.add_in_memory(name, path);
-        let _ = self.save();
+    /// Add a bookmark, then reconcile the SQLite compatibility mirror.
+    pub fn add_with_db(
+        &mut self,
+        name: String,
+        path: PathBuf,
+        db: &crate::db::Database,
+    ) -> bool {
+        if !self.add(name, path) {
+            return false;
+        }
+        self.reconcile_mirror(db);
+        true
     }
 
-    /// Add a bookmark, persisting to both TOML and SQLite.
-    pub fn add_with_db(&mut self, name: String, path: PathBuf, db: &crate::db::Database) {
-        self.add_in_memory(name, path);
-        let _ = self.save();
-        self.sync_to_db(db);
-    }
-
-    /// Remove a bookmark, persisting to both TOML and SQLite.
+    /// Remove a bookmark, then reconcile the SQLite compatibility mirror.
     pub fn remove_with_db(&mut self, index: usize, db: &crate::db::Database) -> bool {
-        if self.remove_in_memory(index) {
-            let _ = self.save();
-            self.sync_to_db(db);
-            true
-        } else {
-            false
+        if !self.remove(index) {
+            return false;
+        }
+        self.reconcile_mirror(db);
+        true
+    }
+
+    fn reconcile_mirror(&mut self, db: &crate::db::Database) {
+        if let Err(error) = self.sync_to_db(db) {
+            log::warn!("bookmarks: SQLite mirror reconciliation failed: {error}");
+            self.last_warning = Some(match self.last_warning.take() {
+                Some(existing) => format!("{existing}; {error}"),
+                None => error,
+            });
         }
     }
 
-    /// Sync the entire in-memory bookmark list to the DB (clear + rebuild).
-    /// Simple and correct for small lists (typically 5-20 bookmarks).
-    fn sync_to_db(&self, db: &crate::db::Database) {
-        // Clear existing DB bookmarks.
-        let _ = db.clear_bookmarks();
-        // Re-insert all.
-        for bm in &self.entries {
-            let _ = db.add_bookmark(&bm.name, &bm.path.display().to_string());
+    /// Rebuild the SQLite compatibility mirror with checked rollback.
+    ///
+    /// SQLite is not authoritative. If rebuilding fails, this function makes a
+    /// best-effort restoration of the prior mirror and returns every failure to
+    /// the caller; no database error is discarded.
+    fn sync_to_db(&self, db: &crate::db::Database) -> Result<(), String> {
+        let previous = db
+            .list_bookmarks()
+            .map_err(|error| format!("could not snapshot SQLite bookmarks: {error}"))?;
+
+        let rebuild = || -> Result<(), String> {
+            db.clear_bookmarks()
+                .map_err(|error| format!("could not clear SQLite bookmarks: {error}"))?;
+            for bookmark in &self.entries {
+                db.add_bookmark(&bookmark.name, &bookmark.path.display().to_string())
+                    .map_err(|error| {
+                        format!(
+                            "could not mirror bookmark '{}' ({}): {error}",
+                            bookmark.name,
+                            bookmark.path.display()
+                        )
+                    })?;
+            }
+            Ok(())
+        };
+
+        if let Err(rebuild_error) = rebuild() {
+            let restore = (|| -> Result<(), String> {
+                db.clear_bookmarks()
+                    .map_err(|error| format!("could not clear partial SQLite mirror: {error}"))?;
+                for (_id, name, path) in &previous {
+                    db.add_bookmark(name, path).map_err(|error| {
+                        format!("could not restore SQLite bookmark '{name}' ({path}): {error}")
+                    })?;
+                }
+                Ok(())
+            })();
+            return match restore {
+                Ok(()) => Err(format!(
+                    "{rebuild_error}; restored the previous SQLite mirror"
+                )),
+                Err(restore_error) => Err(format!(
+                    "{rebuild_error}; SQLite rollback also failed: {restore_error}"
+                )),
+            };
         }
+        Ok(())
     }
 
-    fn add_in_memory(&mut self, name: String, path: PathBuf) {
-        self.entries.push(Bookmark { name, path });
-    }
-
-    /// Remove the entry at `index` and persist. Returns true if the index was valid.
+    /// Remove the entry at `index` from the authoritative store.
     pub fn remove(&mut self, index: usize) -> bool {
-        if self.remove_in_memory(index) {
-            let _ = self.save();
-            true
-        } else {
-            false
-        }
+        let Some(expected) = self.entries.get(index).map(|entry| {
+            tui_file_picker::BookmarkRecord {
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+            }
+        }) else {
+            return false;
+        };
+        self.apply_mutation(tui_file_picker::BookmarkMutation::Remove {
+            expected_index: index,
+            expected,
+        })
     }
 
     fn remove_in_memory(&mut self, index: usize) -> bool {
@@ -183,14 +354,25 @@ impl BookmarksState {
         true
     }
 
-    /// Rename the entry at `index` and persist. Returns true on success.
+    /// Rename the entry at `index` in the authoritative store.
     pub fn rename_at(&mut self, index: usize, new_name: String) -> bool {
-        if self.rename_at_in_memory(index, new_name) {
-            let _ = self.save();
-            true
-        } else {
-            false
-        }
+        let Some(expected) = self.entries.get(index).map(|entry| {
+            tui_file_picker::BookmarkRecord {
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+            }
+        }) else {
+            return false;
+        };
+        self.apply_mutation(tui_file_picker::BookmarkMutation::Rename {
+            expected_index: index,
+            expected,
+            new_name,
+        })
+    }
+
+    fn add_in_memory(&mut self, name: String, path: PathBuf) {
+        self.entries.push(Bookmark { name, path });
     }
 
     fn rename_at_in_memory(&mut self, index: usize, new_name: String) -> bool {
@@ -200,6 +382,10 @@ impl BookmarksState {
         } else {
             false
         }
+    }
+
+    pub fn take_warning(&mut self) -> Option<String> {
+        self.last_warning.take()
     }
 
     // ── Overlay navigation ──────────────────────────────────────────
@@ -300,63 +486,47 @@ impl BookmarksState {
     /// Commit the current naming operation (Add or Rename) if the input is
     /// non-empty. Returns true if a change was committed.
     pub fn commit_naming(&mut self) -> bool {
-        let naming = match self.naming.take() {
-            Some(n) => n,
-            None => return false,
+        let Some(naming) = self.naming.clone() else {
+            return false;
         };
         let committed = match naming {
             BookmarkNaming::Add { input, path } => {
                 let name = input.text.trim().to_string();
-                if name.is_empty() {
-                    false
-                } else {
-                    self.add(name, path);
-                    true
-                }
+                !name.is_empty() && self.add(name, path)
             }
             BookmarkNaming::Rename { input, idx } => {
                 let name = input.text.trim().to_string();
-                if name.is_empty() {
-                    false
-                } else {
-                    self.rename_at(idx, name)
-                }
+                !name.is_empty() && self.rename_at(idx, name)
             }
         };
+        if committed {
+            self.naming = None;
+        }
         committed
     }
 
-    /// Commit the naming operation, syncing to DB.
+    /// Commit the naming operation and reconcile the SQLite mirror.
     pub fn commit_naming_with_db(&mut self, db: &crate::db::Database) -> bool {
-        let naming = match self.naming.take() {
-            Some(n) => n,
-            None => return false,
+        let Some(naming) = self.naming.clone() else {
+            return false;
         };
         let committed = match naming {
             BookmarkNaming::Add { input, path } => {
                 let name = input.text.trim().to_string();
-                if name.is_empty() {
-                    false
-                } else {
-                    self.add_in_memory(name, path);
-                    let _ = self.save();
-                    true
-                }
+                !name.is_empty() && self.add_with_db(name, path, db)
             }
             BookmarkNaming::Rename { input, idx } => {
                 let name = input.text.trim().to_string();
-                if name.is_empty() {
+                if name.is_empty() || !self.rename_at(idx, name) {
                     false
-                } else if self.rename_at_in_memory(idx, name) {
-                    let _ = self.save();
-                    true
                 } else {
-                    false
+                    self.reconcile_mirror(db);
+                    true
                 }
             }
         };
         if committed {
-            self.sync_to_db(db);
+            self.naming = None;
         }
         committed
     }
@@ -537,7 +707,7 @@ mod tests {
         }
         let ok = s.commit_naming();
         assert!(!ok);
-        assert!(s.naming.is_none());
+        assert!(s.naming.is_some());
         assert_eq!(s.entries.len(), 0);
     }
 
