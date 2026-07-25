@@ -2172,14 +2172,89 @@ pub struct BrowseScrollbarDrag {
 /// is the shared state model consumed by `tree.rs` and the picker renderer.
 pub type BrowseTreeNode = tui_file_picker::TreeNode;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseMoveRecoveryProof {
+    pub source_manifest: tui_file_picker::SourceManifest,
+    pub destination_manifest: tui_file_picker::DestinationManifest,
+}
+
+/// Exact source-to-destination mappings and authoritative publication proofs
+/// retained after an incomplete Browse cut/paste. Keeping this separate from
+/// the clipboard prevents a retry from allocating suffixed destinations while
+/// allowing unattempted roots to retain mappings without fabricated proofs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowsePasteRetryPlan {
+    pub plan: tui_file_picker::PastePlan,
+    pub recovery_by_source:
+        std::collections::BTreeMap<PathBuf, BrowseMoveRecoveryProof>,
+}
+
+impl BrowsePasteRetryPlan {
+    pub fn from_plan(plan: tui_file_picker::PastePlan) -> Self {
+        Self {
+            plan,
+            recovery_by_source: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn matches(
+        &self,
+        clipboard: &tui_file_picker::FilesystemClipboard,
+        destination_dir: &Path,
+    ) -> bool {
+        self.plan.mode == tui_file_picker::FilePickerClipboardMode::Cut
+            && clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
+            && self.plan.mappings.len() == clipboard.paths().len()
+            && self
+                .plan
+                .mappings
+                .iter()
+                .zip(clipboard.paths())
+                .all(|(mapping, source)| {
+                    mapping.source.as_path() == source.as_path()
+                        && mapping
+                            .destination
+                            .parent()
+                            .is_some_and(|parent| same_path(parent, destination_dir))
+                })
+    }
+
+    pub fn retain_sources(&self, sources: &[PathBuf]) -> Option<Self> {
+        let mappings = self
+            .plan
+            .mappings
+            .iter()
+            .filter(|mapping| sources.iter().any(|source| source == &mapping.source))
+            .cloned()
+            .collect::<Vec<_>>();
+        if mappings.is_empty() {
+            return None;
+        }
+        let mut recovery_by_source = std::collections::BTreeMap::new();
+        for mapping in &mappings {
+            if let Some(proof) = self.recovery_by_source.get(&mapping.source) {
+                recovery_by_source.insert(mapping.source.clone(), proof.clone());
+            }
+        }
+        Some(Self {
+            plan: tui_file_picker::PastePlan {
+                mode: tui_file_picker::FilePickerClipboardMode::Cut,
+                mappings,
+            },
+            recovery_by_source,
+        })
+    }
+}
+
 /// Clipboard paste metadata retained until the background file-task worker
-/// emits structured terminal accounting. Destinations are preplanned in the
-/// same order as the normalized clipboard roots.
+/// emits structured terminal accounting. The exact retry token owns the
+/// source-to-destination mapping and any reusable publication proof.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingClipboardPaste {
     pub session_id: u64,
     pub clipboard: tui_file_picker::FilesystemClipboard,
-    pub destinations: Vec<PathBuf>,
+    pub plan: tui_file_picker::PastePlan,
+    pub retry_plan: Option<BrowsePasteRetryPlan>,
 }
 
 /// State for the browse screen
@@ -2213,6 +2288,10 @@ pub struct BrowseState {
 
     /// Shared in-memory filesystem clipboard used by Cut/Copy/Paste.
     pub filesystem_clipboard: Option<tui_file_picker::FilesystemClipboard>,
+
+    /// Exact mappings/proofs retained only for an incomplete cut. A new Cut or
+    /// Copy command clears this token.
+    pub(crate) filesystem_clipboard_retry_plan: Option<BrowsePasteRetryPlan>,
 
     /// Background paste reconciliation context. Only the matching session may
     /// consume it; stale worker completions are ignored.
@@ -2809,6 +2888,7 @@ impl BrowseState {
             visible_height: 0,
             multi_selected: Vec::new(),
             filesystem_clipboard: None,
+            filesystem_clipboard_retry_plan: None,
             pending_clipboard_paste: None,
             multi_select_anchor: None,
             selection_mode: SelectionMode::Normal,
@@ -4255,13 +4335,14 @@ impl BrowseState {
         false
     }
 
-    /// Remap navigation history and the displayed directory after successful
-    /// cut/paste relocation. Returns true when the displayed directory moved.
-    pub(crate) fn remap_navigation_after_cut(
+    /// Remap every navigation-history entry affected by a cut/paste relocation.
+    /// This is intentionally independent of current-directory repair so one
+    /// root cannot suppress history repair for another root.
+    pub(crate) fn remap_navigation_history_after_cut(
         &mut self,
         clipboard: &tui_file_picker::FilesystemClipboard,
         destinations: &[PathBuf],
-    ) -> bool {
+    ) {
         for path in &mut self.nav_history {
             if let Some(remapped) =
                 tui_file_picker::remap_path_after_cut(path, clipboard, destinations)
@@ -4269,6 +4350,15 @@ impl BrowseState {
                 *path = remapped;
             }
         }
+    }
+
+    /// Remap the displayed directory after cut/paste relocation. Returns true
+    /// when the current directory moved.
+    pub(crate) fn remap_current_after_cut(
+        &mut self,
+        clipboard: &tui_file_picker::FilesystemClipboard,
+        destinations: &[PathBuf],
+    ) -> bool {
         let Some(remapped_current) = tui_file_picker::remap_path_after_cut(
             &self.current_dir,
             clipboard,
@@ -4281,6 +4371,16 @@ impl BrowseState {
         self.selected_index = 0;
         self.reset_nav_state();
         true
+    }
+
+    /// Remap history and the displayed directory after a completed cut/paste.
+    pub(crate) fn remap_navigation_after_cut(
+        &mut self,
+        clipboard: &tui_file_picker::FilesystemClipboard,
+        destinations: &[PathBuf],
+    ) -> bool {
+        self.remap_navigation_history_after_cut(clipboard, destinations);
+        self.remap_current_after_cut(clipboard, destinations)
     }
 
     /// Remap navigation state after an in-place tree rename that relocates the

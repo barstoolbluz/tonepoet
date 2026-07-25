@@ -8951,6 +8951,9 @@ pub(super) fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
     if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
         return paths.clone();
     }
+    if let Some(paths) = app.browse_context_action_paths.as_ref() {
+        return paths.clone();
+    }
     app.browse.action_selection_in_current_directory()
 }
 
@@ -8960,6 +8963,12 @@ pub(super) fn collect_selection_for_file_ops(app: &AppState) -> Vec<PathBuf> {
 /// surface observability instead of silently hiding an invariant failure.
 pub(super) fn collect_selection_for_file_ops_scoped(app: &mut AppState) -> ScopedFileSelection {
     if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
+        return ScopedFileSelection {
+            paths: paths.clone(),
+            dropped_stale_count: 0,
+        };
+    }
+    if let Some(paths) = app.browse_context_action_paths.as_ref() {
         return ScopedFileSelection {
             paths: paths.clone(),
             dropped_stale_count: 0,

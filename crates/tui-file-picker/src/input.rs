@@ -1329,6 +1329,92 @@ mod tests {
     }
 
     #[test]
+    fn right_click_on_unmarked_file_targets_only_that_file_without_marking_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.flac");
+        let second = temp.path().join("second.flac");
+        fs::write(&first, b"first").expect("first file");
+        fs::write(&second, b"second").expect("second file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        let first_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == first)
+            .expect("first visible");
+        let second_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == second)
+            .expect("second visible");
+        picker.set_file_cursor(first_index, 8);
+        assert!(picker.toggle_current_multi_selection());
+        picker.record_hit_region(
+            Rect::new(5, 6, 20, 1),
+            FilePickerHitAction::FileRow(second_index),
+        );
+
+        let _ = picker.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 6,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::default(),
+        );
+
+        assert_eq!(picker.multi_selected_paths(), std::slice::from_ref(&first));
+        assert_eq!(picker.action_paths(), vec![second]);
+    }
+
+    #[test]
+    fn right_click_on_marked_file_preserves_marked_set_for_actions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.flac");
+        let second = temp.path().join("second.flac");
+        fs::write(&first, b"first").expect("first file");
+        fs::write(&second, b"second").expect("second file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        let first_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == first)
+            .expect("first visible");
+        let second_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == second)
+            .expect("second visible");
+        picker.set_file_cursor(first_index, 8);
+        assert!(picker.toggle_current_multi_selection());
+        picker.set_file_cursor(second_index, 8);
+        assert!(picker.toggle_current_multi_selection());
+        picker.record_hit_region(
+            Rect::new(5, 6, 20, 1),
+            FilePickerHitAction::FileRow(second_index),
+        );
+
+        let _ = picker.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 6,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::default(),
+        );
+
+        assert_eq!(picker.multi_selected_paths(), &[first.clone(), second.clone()]);
+        assert_eq!(picker.action_paths(), vec![first, second]);
+    }
+
+    #[test]
     fn empty_click_does_not_restore_stale_menu_focus() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut picker = FilePickerState::new(FilePickerConfig {

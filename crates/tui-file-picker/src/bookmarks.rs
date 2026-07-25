@@ -2,15 +2,18 @@
 
 use crate::text_input::TextInputState;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(unix))]
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 #[cfg(not(unix))]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_TARGET_STATUS_RESULTS_PER_POLL: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookmarkRecord {
@@ -98,13 +101,28 @@ pub(crate) enum BookmarkNameAction {
     Rename(usize),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BookmarkTargetStatus {
+    Checking,
+    Reachable,
+    Missing,
+    Unavailable(String),
+}
+
+#[derive(Debug)]
+struct BookmarkTargetStatusResult {
+    generation: u64,
+    path: PathBuf,
+    status: BookmarkTargetStatus,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BookmarkFile {
     #[serde(default)]
     entries: Vec<BookmarkRecord>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct FilePickerBookmarks {
     pub entries: Vec<BookmarkRecord>,
     pub cursor: usize,
@@ -112,27 +130,54 @@ pub(crate) struct FilePickerBookmarks {
     pub naming: Option<BookmarkNameAction>,
     pub name_input: TextInputState,
     pub error: Option<String>,
+    target_statuses: HashMap<PathBuf, BookmarkTargetStatus>,
+    target_status_generation: u64,
+    target_status_receiver: Option<mpsc::Receiver<BookmarkTargetStatusResult>>,
+}
+
+impl Clone for FilePickerBookmarks {
+    fn clone(&self) -> Self {
+        let needs_refresh = self
+            .target_statuses
+            .values()
+            .any(|status| matches!(status, BookmarkTargetStatus::Checking));
+        let mut cloned = Self {
+            entries: self.entries.clone(),
+            cursor: self.cursor,
+            scroll: self.scroll,
+            naming: self.naming,
+            name_input: self.name_input.clone(),
+            error: self.error.clone(),
+            target_statuses: self.target_statuses.clone(),
+            target_status_generation: self.target_status_generation,
+            target_status_receiver: None,
+        };
+        if needs_refresh {
+            cloned.request_target_statuses();
+        }
+        cloned
+    }
 }
 
 impl Default for FilePickerBookmarks {
     fn default() -> Self {
-        match load_bookmarks() {
-            Ok(entries) => Self {
-                entries,
-                cursor: 0,
-                scroll: 0,
-                naming: None,
-                name_input: TextInputState::empty(),
-                error: None,
-            },
-            Err(error) => Self {
-                entries: Vec::new(),
-                cursor: 0,
-                scroll: 0,
-                naming: None,
-                name_input: TextInputState::empty(),
-                error: Some(format!("could not load bookmarks: {error}")),
-            },
+        let (entries, error) = match load_bookmarks() {
+            Ok(entries) => (entries, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("could not load bookmarks: {error}")),
+            ),
+        };
+        Self {
+            entries,
+            cursor: 0,
+            scroll: 0,
+            naming: None,
+            name_input: TextInputState::empty(),
+            error,
+            target_statuses: HashMap::new(),
+            target_status_generation: 0,
+            target_status_receiver: None,
         }
     }
 }
@@ -141,12 +186,110 @@ impl FilePickerBookmarks {
     pub fn reload(&mut self) {
         match load_bookmarks() {
             Ok(entries) => {
-                self.entries = entries;
-                self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
                 self.error = None;
+                self.replace_entries(entries);
             }
             Err(err) => self.error = Some(err.to_string()),
         }
+    }
+
+    pub fn replace_entries(&mut self, entries: Vec<BookmarkRecord>) {
+        self.entries = entries;
+        self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.request_target_statuses();
+    }
+
+    pub fn request_target_statuses(&mut self) {
+        self.target_status_generation = self.target_status_generation.wrapping_add(1);
+        let generation = self.target_status_generation;
+        let paths = self
+            .entries
+            .iter()
+            .map(|bookmark| bookmark.path.clone())
+            .collect::<Vec<_>>();
+        self.target_statuses.clear();
+        for path in &paths {
+            self.target_statuses
+                .insert(path.clone(), BookmarkTargetStatus::Checking);
+        }
+        if paths.is_empty() {
+            self.target_status_receiver = None;
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.target_status_receiver = Some(receiver);
+        if let Err(error) = thread::Builder::new()
+            .name("tonepoet-picker-bookmark-health".to_string())
+            .spawn(move || {
+                for path in paths {
+                    let status = match fs::metadata(&path) {
+                        Ok(metadata) if metadata.is_dir() => BookmarkTargetStatus::Reachable,
+                        Ok(_) => BookmarkTargetStatus::Missing,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            BookmarkTargetStatus::Missing
+                        }
+                        Err(error) => BookmarkTargetStatus::Unavailable(error.to_string()),
+                    };
+                    if sender
+                        .send(BookmarkTargetStatusResult {
+                            generation,
+                            path,
+                            status,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        {
+            self.target_status_receiver = None;
+            let message = format!("could not start bookmark status worker: {error}");
+            for status in self.target_statuses.values_mut() {
+                *status = BookmarkTargetStatus::Unavailable(message.clone());
+            }
+            self.error = Some(message);
+        }
+    }
+
+    pub fn poll_target_statuses(&mut self) {
+        for _ in 0..MAX_TARGET_STATUS_RESULTS_PER_POLL {
+            let result = {
+                let Some(receiver) = self.target_status_receiver.as_ref() else {
+                    return;
+                };
+                receiver.try_recv()
+            };
+            match result {
+                Ok(result) => {
+                    if result.generation == self.target_status_generation
+                        && self.entries.iter().any(|bookmark| bookmark.path == result.path)
+                    {
+                        self.target_statuses.insert(result.path, result.status);
+                    }
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.target_status_receiver = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn target_status(&self, path: &Path) -> BookmarkTargetStatus {
+        self.target_statuses
+            .get(path)
+            .cloned()
+            .unwrap_or(BookmarkTargetStatus::Checking)
+    }
+
+    #[cfg(test)]
+    pub fn set_target_status_for_test(&mut self, path: PathBuf, status: BookmarkTargetStatus) {
+        self.target_status_generation = self.target_status_generation.wrapping_add(1);
+        self.target_status_receiver = None;
+        self.target_statuses.insert(path, status);
     }
 
     pub fn ensure_visible(&mut self, visible_rows: usize) {
@@ -627,6 +770,135 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_bookmark_health_result_is_discarded_by_generation() {
+        let path = PathBuf::from("/stale-bookmark-fixture");
+        let mut bookmarks = FilePickerBookmarks {
+            entries: vec![BookmarkRecord {
+                name: "Fixture".to_string(),
+                path: path.clone(),
+            }],
+            cursor: 0,
+            scroll: 0,
+            naming: None,
+            name_input: TextInputState::empty(),
+            error: None,
+            target_statuses: HashMap::from([(
+                path.clone(),
+                BookmarkTargetStatus::Checking,
+            )]),
+            target_status_generation: 7,
+            target_status_receiver: None,
+        };
+        let (sender, receiver) = mpsc::channel();
+        bookmarks.target_status_receiver = Some(receiver);
+        sender
+            .send(BookmarkTargetStatusResult {
+                generation: 6,
+                path: path.clone(),
+                status: BookmarkTargetStatus::Reachable,
+            })
+            .expect("stale result");
+        drop(sender);
+
+        bookmarks.poll_target_statuses();
+
+        assert_eq!(
+            bookmarks.target_status(&path),
+            BookmarkTargetStatus::Checking,
+            "an obsolete worker must not overwrite the current request"
+        );
+    }
+
+    #[test]
+    fn bookmark_cursor_movement_does_not_restart_filesystem_probes() {
+        let mut bookmarks = FilePickerBookmarks {
+            entries: vec![
+                BookmarkRecord {
+                    name: "One".to_string(),
+                    path: PathBuf::from("/one"),
+                },
+                BookmarkRecord {
+                    name: "Two".to_string(),
+                    path: PathBuf::from("/two"),
+                },
+            ],
+            cursor: 0,
+            scroll: 0,
+            naming: None,
+            name_input: TextInputState::empty(),
+            error: None,
+            target_statuses: HashMap::new(),
+            target_status_generation: 42,
+            target_status_receiver: None,
+        };
+
+        bookmarks.move_cursor(1, 4);
+
+        assert_eq!(bookmarks.cursor, 1);
+        assert_eq!(bookmarks.target_status_generation, 42);
+        assert!(bookmarks.target_status_receiver.is_none());
+    }
+
+    #[test]
+    fn bookmark_status_polling_is_bounded_per_render_tick() {
+        let entries = (0..65)
+            .map(|index| BookmarkRecord {
+                name: format!("Bookmark {index}"),
+                path: PathBuf::from(format!("/bookmark-{index}")),
+            })
+            .collect::<Vec<_>>();
+        let target_statuses = entries
+            .iter()
+            .map(|entry| (entry.path.clone(), BookmarkTargetStatus::Checking))
+            .collect::<HashMap<_, _>>();
+        let mut bookmarks = FilePickerBookmarks {
+            entries: entries.clone(),
+            cursor: 0,
+            scroll: 0,
+            naming: None,
+            name_input: TextInputState::empty(),
+            error: None,
+            target_statuses,
+            target_status_generation: 9,
+            target_status_receiver: None,
+        };
+        let (sender, receiver) = mpsc::channel();
+        bookmarks.target_status_receiver = Some(receiver);
+        for entry in entries {
+            sender
+                .send(BookmarkTargetStatusResult {
+                    generation: 9,
+                    path: entry.path,
+                    status: BookmarkTargetStatus::Reachable,
+                })
+                .expect("queued status");
+        }
+        drop(sender);
+
+        bookmarks.poll_target_statuses();
+        assert_eq!(
+            bookmarks
+                .target_statuses
+                .values()
+                .filter(|status| matches!(status, BookmarkTargetStatus::Reachable))
+                .count(),
+            MAX_TARGET_STATUS_RESULTS_PER_POLL
+        );
+        assert!(bookmarks.target_status_receiver.is_some());
+
+        bookmarks.poll_target_statuses();
+        assert_eq!(
+            bookmarks
+                .target_statuses
+                .values()
+                .filter(|status| matches!(status, BookmarkTargetStatus::Reachable))
+                .count(),
+            65
+        );
+        assert!(bookmarks.target_status_receiver.is_none());
+    }
 
     #[test]
     fn bookmark_toml_schema_is_compatible_with_app_store() {

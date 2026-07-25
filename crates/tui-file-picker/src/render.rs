@@ -105,6 +105,7 @@ impl FilePickerState {
     ) {
         self.poll_search();
         self.poll_paste_task();
+        self.bookmarks.poll_target_statuses();
         self.clear_hit_regions();
         self.set_last_area(area);
         if area.width < 48 || area.height < 10 {
@@ -1144,7 +1145,7 @@ impl FilePickerState {
     }
 
     fn render_bookmarks_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered_rect(area, 72, 68);
+        let popup = centered_rect(area, 84, 74);
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1157,10 +1158,62 @@ impl FilePickerState {
         }
 
         let name_row = matches!(self.focus, FilePickerFocus::BookmarkName);
-        let footer_rows = if name_row { 3 } else { 2 };
-        let list_height = inner.height.saturating_sub(footer_rows) as usize;
+        let mut constraints = vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(5),
+        ];
+        if name_row {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} bookmark{}",
+                self.bookmarks.entries.len(),
+                if self.bookmarks.entries.len() == 1 { "" } else { "s" }
+            ))
+            .style(self.theme.label),
+            rows[0],
+        );
+
+        let body = rows[2];
+        let (list_area, detail_area) = if body.width >= 64 {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(46),
+                    Constraint::Length(1),
+                    Constraint::Percentage(54),
+                ])
+                .split(body);
+            (columns[0], columns[2])
+        } else {
+            let stacked = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(55),
+                    Constraint::Length(1),
+                    Constraint::Percentage(45),
+                ])
+                .split(body);
+            (stacked[0], stacked[2])
+        };
+
+        let list_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border)
+            .title(" list ");
+        let list_inner = list_block.inner(list_area);
+        frame.render_widget(list_block, list_area);
+        let list_height = list_inner.height.max(1) as usize;
         self.bookmarks.ensure_visible(list_height);
-        let list_area = Rect::new(inner.x, inner.y, inner.width, list_height as u16);
         let mut lines = Vec::new();
         let mut hits = Vec::new();
         for (row, index) in (self.bookmarks.scroll..self.bookmarks.entries.len())
@@ -1168,25 +1221,35 @@ impl FilePickerState {
             .enumerate()
         {
             let bookmark = &self.bookmarks.entries[index];
-            let missing = !bookmark.path.is_dir();
-            let suffix = if missing { " (missing)" } else { "" };
+            let target_status = self.bookmarks.target_status(&bookmark.path);
+            let suffix = match &target_status {
+                crate::bookmarks::BookmarkTargetStatus::Checking => " (checking)",
+                crate::bookmarks::BookmarkTargetStatus::Reachable => "",
+                crate::bookmarks::BookmarkTargetStatus::Missing => " (missing)",
+                crate::bookmarks::BookmarkTargetStatus::Unavailable(_) => " (unavailable)",
+            };
             let label = format!("{} — {}{suffix}", bookmark.name, bookmark.path.display());
             let style = if index == self.bookmarks.cursor {
                 self.theme.selected
-            } else if missing {
-                self.theme.menu_disabled
             } else {
-                self.theme.text
+                match target_status {
+                    crate::bookmarks::BookmarkTargetStatus::Reachable => self.theme.text,
+                    crate::bookmarks::BookmarkTargetStatus::Checking => self.theme.text_dim,
+                    crate::bookmarks::BookmarkTargetStatus::Missing
+                    | crate::bookmarks::BookmarkTargetStatus::Unavailable(_) => {
+                        self.theme.menu_disabled
+                    }
+                }
             };
             lines.push(Line::from(Span::styled(
-                fit_text_start(&label, list_area.width as usize),
+                fit_text_start(&label, list_inner.width as usize),
                 style,
             )));
             hits.push(HitRegion {
                 rect: Rect::new(
-                    list_area.x,
-                    list_area.y.saturating_add(row as u16),
-                    list_area.width,
+                    list_inner.x,
+                    list_inner.y.saturating_add(row as u16),
+                    list_inner.width,
                     1,
                 ),
                 action: FilePickerHitAction::BookmarkRow(index),
@@ -1194,14 +1257,88 @@ impl FilePickerState {
         }
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No bookmarks. Press a to add the displayed directory.",
+                "No bookmarks yet. Press a to add the displayed directory.",
                 self.theme.text_dim,
             )));
         }
         self.hit_regions.extend(hits);
-        frame.render_widget(Paragraph::new(lines), list_area);
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            list_inner,
+        );
 
-        let mut y = inner.y.saturating_add(list_height as u16);
+        let selected = self
+            .bookmarks
+            .entries
+            .get(self.bookmarks.cursor)
+            .cloned();
+        let detail_title = selected
+            .as_ref()
+            .map(|bookmark| format!(" {} ", bookmark.name))
+            .unwrap_or_else(|| " details ".to_string());
+        let detail_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border)
+            .title(detail_title);
+        let detail_inner = detail_block.inner(detail_area);
+        frame.render_widget(detail_block, detail_area);
+        let detail_lines = if let Some(bookmark) = selected {
+            let target_status = self.bookmarks.target_status(&bookmark.path);
+            let (status_label, status_style, detail_help) = match &target_status {
+                crate::bookmarks::BookmarkTargetStatus::Checking => (
+                    "checking",
+                    self.theme.text_dim,
+                    "Target health is being checked outside the render loop. e renames; d removes only the bookmark.",
+                ),
+                crate::bookmarks::BookmarkTargetStatus::Reachable => (
+                    "reachable",
+                    self.theme.status,
+                    "Enter opens this directory. e renames; d removes only the bookmark.",
+                ),
+                crate::bookmarks::BookmarkTargetStatus::Missing => (
+                    "missing",
+                    self.theme.error,
+                    "The target no longer exists. e renames; d removes only the bookmark.",
+                ),
+                crate::bookmarks::BookmarkTargetStatus::Unavailable(_) => (
+                    "unavailable",
+                    self.theme.error,
+                    "The target could not be checked. e renames; d removes only the bookmark.",
+                ),
+            };
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("path    ", self.theme.label),
+                    Span::styled(bookmark.path.display().to_string(), self.theme.text),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("status  ", self.theme.label),
+                    Span::styled(status_label, status_style),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(detail_help, self.theme.text_dim)),
+            ];
+            if let crate::bookmarks::BookmarkTargetStatus::Unavailable(message) = target_status {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("detail  ", self.theme.label),
+                    Span::styled(message, self.theme.error),
+                ]));
+            }
+            lines
+        } else {
+            vec![Line::from(Span::styled(
+                "No bookmark selected. Press a to add the displayed directory.",
+                self.theme.text_dim,
+            ))]
+        };
+        frame.render_widget(
+            Paragraph::new(detail_lines).wrap(Wrap { trim: false }),
+            detail_inner,
+        );
+
+        let mut next_row = 3usize;
         if name_row {
             let label = match self.bookmarks.naming {
                 Some(crate::bookmarks::BookmarkNameAction::Rename(_)) => "Rename: ",
@@ -1218,39 +1355,54 @@ impl FilePickerState {
                 self.theme.selected,
                 true,
             ));
-            frame.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, y, inner.width, 1));
-            y = y.saturating_add(1);
+            frame.render_widget(Paragraph::new(Line::from(spans)), rows[next_row]);
+            next_row += 1;
         }
         let error = self.bookmarks.error.as_deref().unwrap_or("");
         frame.render_widget(
-            Paragraph::new(fit_text_left(error, inner.width as usize)).style(self.theme.error),
-            Rect::new(inner.x, y, inner.width, 1),
+            Paragraph::new(error).style(self.theme.error).wrap(Wrap { trim: false }),
+            rows[next_row],
         );
-        y = y.saturating_add(1);
+        next_row += 1;
 
         let footer = "a Add  e Rename  d Delete  Enter Open  Esc Close";
         frame.render_widget(
-            Paragraph::new(fit_text_left(footer, inner.width as usize)).style(self.theme.status),
-            Rect::new(inner.x, y, inner.width, 1),
+            Paragraph::new(footer).style(self.theme.status).wrap(Wrap { trim: false }),
+            rows[next_row],
         );
         self.record_hit_region(
-            Rect::new(inner.x, y, 5.min(inner.width), 1),
+            Rect::new(rows[next_row].x, rows[next_row].y, 5.min(rows[next_row].width), 1),
             FilePickerHitAction::BookmarkAdd,
         );
-        if inner.width > 7 {
+        if rows[next_row].width > 7 {
             self.record_hit_region(
-                Rect::new(inner.x.saturating_add(7), y, 8.min(inner.width.saturating_sub(7)), 1),
+                Rect::new(
+                    rows[next_row].x.saturating_add(7),
+                    rows[next_row].y,
+                    8.min(rows[next_row].width.saturating_sub(7)),
+                    1,
+                ),
                 FilePickerHitAction::BookmarkRename,
             );
         }
-        if inner.width > 17 {
+        if rows[next_row].width > 17 {
             self.record_hit_region(
-                Rect::new(inner.x.saturating_add(17), y, 8.min(inner.width.saturating_sub(17)), 1),
+                Rect::new(
+                    rows[next_row].x.saturating_add(17),
+                    rows[next_row].y,
+                    8.min(rows[next_row].width.saturating_sub(17)),
+                    1,
+                ),
                 FilePickerHitAction::BookmarkDelete,
             );
         }
         self.record_hit_region(
-            Rect::new(popup.x.saturating_add(popup.width.saturating_sub(2)), popup.y, 1, 1),
+            Rect::new(
+                popup.x.saturating_add(popup.width.saturating_sub(2)),
+                popup.y,
+                1,
+                1,
+            ),
             FilePickerHitAction::BookmarkClose,
         );
     }
@@ -1913,6 +2065,41 @@ mod tests {
             "the picker must expose the same visible Search affordance as Browse"
         );
         assert!(rendered.contains("Search"));
+    }
+
+    #[test]
+    fn bookmark_render_uses_cached_health_without_restatting_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("remote-album");
+        std::fs::create_dir(&target).expect("target");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.bookmarks.replace_entries(vec![crate::bookmarks::BookmarkRecord {
+            name: "Remote album".to_string(),
+            path: target.clone(),
+        }]);
+        picker.bookmarks.set_target_status_for_test(
+            target.clone(),
+            crate::bookmarks::BookmarkTargetStatus::Reachable,
+        );
+        std::fs::remove_dir(&target).expect("remove after cached probe");
+        picker.focus = FilePickerFocus::Bookmarks;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 116, 18)))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("reachable"));
+        assert!(!rendered.contains("missing"));
+        assert!(
+            !target.exists(),
+            "fixture proves render did not derive health from the current filesystem state"
+        );
     }
 
     #[test]

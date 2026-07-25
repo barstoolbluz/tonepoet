@@ -9553,6 +9553,14 @@ pub struct BrowseInlineEditState {
     pub input: crate::tui::text_input::TextInputState,
 }
 
+/// Browse text field that currently owns a left-button drag selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseTextMouseTarget {
+    FileInlineEdit,
+    TreeInlineEdit,
+    PathInput,
+}
+
 /// Keyboard focus inside the Browse info pane.
 ///
 /// The browse list keeps its existing type-ahead navigation until the user
@@ -10210,6 +10218,11 @@ pub struct AppState {
     /// confirmed action from observing later cursor/selection drift.
     pub bulk_guard_frozen_paths: Option<Vec<PathBuf>>,
 
+    /// Transient path payload owned by an open Browse entry context menu.
+    /// Right-click never mutates persistent marks: an unmarked row freezes
+    /// only that row, while a marked row freezes the current marked set.
+    pub browse_context_action_paths: Option<Vec<PathBuf>>,
+
     /// Parked BulkRenameState while a per-line TextEdit is open.
     /// Set when `e` is pressed on a BulkRename row; consumed when
     /// the TextEdit commits or is cancelled.
@@ -10371,6 +10384,10 @@ pub struct AppState {
 
     /// Active inline editor in the Browse screen (file-list rename or info-pane metadata).
     pub browse_inline_edit: Option<BrowseInlineEditState>,
+
+    /// Mouse-selection ownership for Browse text fields. This prevents a drag
+    /// inside an editor from leaking through to list range selection.
+    pub browse_text_mouse_target: Option<BrowseTextMouseTarget>,
 
     /// Keyboard focus in the Browse info pane. This is deliberately separate
     /// from `browse_inline_edit`: focus may sit on a metadata row before the
@@ -11069,6 +11086,7 @@ impl AppState {
             active_overlay,
             bulk_guard_bypass: None,
             bulk_guard_frozen_paths: None,
+            browse_context_action_paths: None,
             pending_bulk_rename: None,
             pending_metadata_editor: None,
             pending_browse_archive_metadata: None,
@@ -11105,6 +11123,7 @@ impl AppState {
             last_disc_browser_stream_click: None,
             pending_browse_rename: None,
             browse_inline_edit: None,
+            browse_text_mouse_target: None,
             browse_info_focus: None,
             recent,
             bookmarks,

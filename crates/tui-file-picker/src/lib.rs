@@ -44,9 +44,13 @@ pub use bookmarks::{
 pub use name_validation::{validate_file_name, NameValidationError};
 pub use source_guard::{
     capture_manifest, capture_manifest_with_cancel, digest_open_file,
-    preserve_open_file_metadata, snapshot_open_file, snapshot_path, verify_path, ContentDigest,
-    DestinationManifest, Sha256, SourceEntryProof, SourceIdentity, SourceKind, SourceManifest,
-    SourceSnapshot,
+    filesystem_capabilities, filesystem_identity_policy, filesystem_identity_policy_notice,
+    preserve_open_file_metadata, record_filesystem_capability, snapshot_open_file,
+    snapshot_open_handle, snapshot_path, verify_path, verify_path_with_capabilities,
+    CapabilitySupport, ContentDigest, DestinationManifest, FileOperationIoCounters,
+    FilesystemCapabilities, FilesystemCapabilityKind, FilesystemIdentityPolicy,
+    FilesystemSemantics, RenameSourceProof, RenameVerification, Sha256, SourceEntryProof,
+    SourceIdentity, SourceKind, SourceManifest, SourceSnapshot, verify_committed_rename,
 };
 pub use search::FileSearchResult;
 pub use progress::{
@@ -60,8 +64,9 @@ pub use state::{
     FilePickerClipboard, FilePickerClipboardMode, FilePickerConfig, FilePickerCreateKind,
     FilePickerEntry, FilePickerError, FilePickerFocus, FilePickerHitAction,
     FilePickerMenuAction, FilePickerSelectionMode, FilePickerSortKey, FilePickerState,
-    duplicate_files_in_place, paste_filesystem_clipboard, plan_filesystem_paste, HitRegion,
-    PasteFailure, PasteMapping, PastePlan, PasteSuccess, PasteWarning, SaveModeConfig,
+    duplicate_files_in_place, paste_filesystem_clipboard,
+    paste_filesystem_clipboard_with_retry, plan_filesystem_paste, HitRegion,
+    PasteFailure, PasteMapping, PastePlan, PasteRetryPlan, PasteSuccess, PasteWarning, SaveModeConfig,
     SaveModeStyle, SymlinkCopyPolicy, SymlinkPolicy, ToolbarAction, TreeNode,
 };
 pub use theme::FilePickerTheme;

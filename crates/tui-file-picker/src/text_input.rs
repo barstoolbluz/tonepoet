@@ -621,6 +621,84 @@ impl TextInputState {
         (self.text[range].to_string(), cursor_col)
     }
 
+    /// Resolve a terminal-cell column in the currently visible field to a
+    /// UTF-8 byte boundary in the full input text.
+    ///
+    /// The mapping uses the same horizontal-scroll and display-width policy as
+    /// [`Self::view_range`]. Clicking the first cell of a wide glyph places the
+    /// cursor before it; clicking its later cell places the cursor after it.
+    /// Columns outside the field clamp to the nearest visible boundary.
+    pub fn byte_index_for_view_column(&self, width: usize, column: usize) -> usize {
+        if width == 0 {
+            return self.cursor.min(self.text.len());
+        }
+
+        let (range, _) = self.view_range(width);
+        let target = column.min(width);
+        let mut display_col = 0usize;
+        let mut last_boundary = range.start;
+
+        for (relative_byte, ch) in self.text[range.clone()].char_indices() {
+            let byte = range.start + relative_byte;
+            let next = byte + ch.len_utf8();
+            let cell_width = crate::display_width::char_width(ch);
+
+            if cell_width == 0 {
+                last_boundary = next;
+                continue;
+            }
+            if target <= display_col {
+                return byte;
+            }
+            let cell_end = display_col.saturating_add(cell_width);
+            if target < cell_end {
+                let offset = target.saturating_sub(display_col);
+                return if offset.saturating_mul(2) < cell_width {
+                    byte
+                } else {
+                    next
+                };
+            }
+
+            display_col = cell_end;
+            last_boundary = next;
+        }
+
+        last_boundary.min(range.end)
+    }
+
+    /// Place the cursor from a mouse column and clear any prior selection.
+    pub fn place_cursor_from_view_column(&mut self, width: usize, column: usize) {
+        self.cursor = self.byte_index_for_view_column(width, column);
+        self.clear_selection();
+    }
+
+    /// Begin a mouse-drag selection at a display column. A simple click leaves
+    /// an empty anchor which is collapsed when the button is released.
+    pub fn begin_mouse_selection(&mut self, width: usize, column: usize) {
+        let cursor = self.byte_index_for_view_column(width, column);
+        self.cursor = cursor;
+        self.select_all = false;
+        self.selection_anchor = Some(cursor);
+    }
+
+    /// Extend an in-progress mouse selection to a display column.
+    pub fn drag_mouse_selection(&mut self, width: usize, column: usize) {
+        let anchor = self.selection_anchor.unwrap_or(self.cursor);
+        self.cursor = self.byte_index_for_view_column(width, column);
+        self.select_all = false;
+        self.selection_anchor = Some(anchor);
+    }
+
+    /// Finish a mouse selection. A click without movement becomes an ordinary
+    /// insertion cursor rather than retaining an empty selection anchor.
+    pub fn end_mouse_selection(&mut self) {
+        if self.selection_anchor == Some(self.cursor) {
+            self.selection_anchor = None;
+        }
+        self.select_all = false;
+    }
+
 }
 
 /// Walk forward from a byte index, returning the next char boundary.
@@ -1429,6 +1507,37 @@ mod tests {
         assert_eq!(visible, "x");
         assert_eq!(cursor_col, 1);
         assert!(!visible.starts_with('\u{301}'));
+    }
+
+    #[test]
+    fn mouse_column_mapping_uses_scrolled_display_cells() {
+        let mut input = TextInputState::new("ab日本z".to_string());
+        input.cursor_end();
+
+        let (range, _) = input.view_range(4);
+        assert_eq!(&input.text[range.clone()], "本z");
+        assert_eq!(input.byte_index_for_view_column(4, 0), range.start);
+        assert_eq!(input.byte_index_for_view_column(4, 1), range.start + "本".len());
+        assert_eq!(input.byte_index_for_view_column(4, 2), range.start + "本".len());
+        assert_eq!(input.byte_index_for_view_column(4, 3), range.end);
+    }
+
+    #[test]
+    fn mouse_click_and_drag_follow_windows_selection_contract() {
+        let mut input = TextInputState::new_selected("track.flac".to_string());
+
+        input.begin_mouse_selection(32, 2);
+        assert!(!input.has_selection());
+        assert_eq!(input.cursor, 2);
+        input.drag_mouse_selection(32, 7);
+        assert_eq!(input.selection_range(), Some(2..7));
+        input.end_mouse_selection();
+        assert_eq!(&input.text[input.selection_range().expect("drag selection")], "ack.f");
+
+        input.begin_mouse_selection(32, 4);
+        input.end_mouse_selection();
+        assert!(!input.has_selection());
+        assert_eq!(input.cursor, 4);
     }
 
     #[test]

@@ -1068,6 +1068,7 @@ fn reduce_file_task_complete(
     app: &mut AppState,
     session_id: u64,
     report: tui_file_picker::FileTaskCompletionReport,
+    worker_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let matches_pending = app
@@ -1090,9 +1091,14 @@ fn reduce_file_task_complete(
     let mut unavailable_sources = 0usize;
     let mut completion_warnings = Vec::new();
     let mut incomplete_details = Vec::new();
+    let mut incomplete_navigation_mappings = Vec::new();
 
     for (index, source) in pending.clipboard.paths().iter().enumerate() {
-        let expected_destination = pending.destinations.get(index);
+        let expected_destination = pending
+            .plan
+            .mappings
+            .get(index)
+            .map(|mapping| &mapping.destination);
         let root = report.roots.iter().find(|root| {
             root.source == *source
                 && expected_destination.is_some_and(|destination| root.destination == *destination)
@@ -1137,10 +1143,19 @@ fn reduce_file_task_complete(
                 retry_sources.push(source.clone());
             } else {
                 unavailable_sources = unavailable_sources.saturating_add(1);
+                if report.is_move {
+                    if let Some(root) = root.filter(|root| path_lexists(&root.destination)) {
+                        incomplete_navigation_mappings.push(tui_file_picker::PasteMapping {
+                            source: source.clone(),
+                            destination: root.destination.clone(),
+                        });
+                    }
+                }
             }
         }
     }
 
+    let mut current_directory_remapped = false;
     if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
         && !completed_sources.is_empty()
     {
@@ -1148,8 +1163,32 @@ fn reduce_file_task_complete(
             tui_file_picker::FilePickerClipboardMode::Cut,
             completed_sources.clone(),
         ) {
-            app.browse
+            current_directory_remapped = app
+                .browse
                 .remap_navigation_after_cut(&completed_clipboard, &completed_destinations);
+        }
+    }
+    if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut {
+        for mapping in &incomplete_navigation_mappings {
+            let Some(incomplete_clipboard) = tui_file_picker::FilesystemClipboard::new(
+                tui_file_picker::FilePickerClipboardMode::Cut,
+                vec![mapping.source.clone()],
+            ) else {
+                continue;
+            };
+            // History repair is independent per root. A completed root may have
+            // already moved current_dir, but that must not leave a history entry
+            // beneath a separately, partially removed source root stale.
+            app.browse.remap_navigation_history_after_cut(
+                &incomplete_clipboard,
+                std::slice::from_ref(&mapping.destination),
+            );
+            if !current_directory_remapped {
+                current_directory_remapped = app.browse.remap_current_after_cut(
+                    &incomplete_clipboard,
+                    std::slice::from_ref(&mapping.destination),
+                );
+            }
         }
     }
 
@@ -1162,6 +1201,18 @@ fn reduce_file_task_complete(
         }
     } else {
         tui_file_picker::FilesystemClipboard::new(pending.clipboard.mode(), retry_sources.clone())
+    };
+    app.browse.filesystem_clipboard_retry_plan = if !all_completed
+        && pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
+    {
+        worker_retry_plan.or_else(|| {
+            pending
+                .retry_plan
+                .as_ref()
+                .and_then(|retry| retry.retain_sources(&retry_sources))
+        })
+    } else {
+        None
     };
 
     app.browse.rebuild_tree_preserving_expansion();
@@ -4371,8 +4422,12 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         AppMessage::FileTaskProgress { session_id, update } => {
             reduce_file_task_progress(app, session_id, update, tx);
         }
-        AppMessage::FileTaskComplete { session_id, report } => {
-            reduce_file_task_complete(app, session_id, report, tx);
+        AppMessage::FileTaskComplete {
+            session_id,
+            report,
+            retry_plan,
+        } => {
+            reduce_file_task_complete(app, session_id, report, retry_plan, tx);
         }
         AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
             if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
@@ -5733,9 +5788,115 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
         }
-        _ => {
-            // Paste ignored outside text-entry contexts.
+        ActiveOverlay::FileTaskProgress(_) => {
+            app.set_status(
+                "terminal paste is unavailable while file-task progress is open; close it before editing text",
+            );
         }
+        _ => {
+            // Browse-local editors are not ActiveOverlay variants. Route the
+            // terminal clipboard through the same focus precedence as key
+            // dispatch and replace any active selection at the cursor.
+            if app.current_screen != super::app::AppScreen::Browse {
+                return;
+            }
+            let first_line = text.lines().next().unwrap_or("");
+            if let Some(edit) = app.browse_inline_edit.as_mut() {
+                edit.input.insert_string(first_line);
+                return;
+            }
+            if app.browse.search.active {
+                if app.browse.search.focus == super::browse::SearchFocus::Input {
+                    app.browse.search.input.insert_string(first_line);
+                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
+                } else {
+                    app.set_status(
+                        "terminal paste has no focused text field; Tab to the search input first",
+                    );
+                }
+                return;
+            }
+            if let Some(input) = app.browse.path_input.as_mut() {
+                input.insert_string(first_line);
+                return;
+            }
+            if let Some(input) = app.browse.filter_input.as_mut() {
+                input.insert_string(first_line);
+                app.browse.update_filter_from_input();
+                return;
+            }
+            app.set_status(
+                "terminal paste has no focused text editor; Ctrl+V is reserved for file paste",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod browse_bracketed_paste_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{BrowseInlineEditState, BrowseInlineEditTarget};
+    use crate::tui::text_input::TextInputState;
+
+    #[test]
+    fn bracketed_paste_replaces_browse_inline_selection() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Browse;
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename {
+                path: std::path::PathBuf::from("track.flac"),
+            },
+            input: TextInputState::new_selected("track.flac".to_string()),
+        });
+
+        handle_paste(&mut app, "renamed.flac\nignored");
+
+        let input = &app.browse_inline_edit.as_ref().expect("inline edit").input;
+        assert_eq!(input.text, "renamed.flac");
+        assert_eq!(input.cursor, "renamed.flac".len());
+    }
+
+    #[test]
+    fn bracketed_paste_routes_by_browse_text_focus_precedence() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Browse;
+        app.browse.search.active = true;
+        app.browse.search.focus = super::super::browse::SearchFocus::Input;
+        app.browse.search.input = TextInputState::new_selected("old search".to_string());
+        app.browse.path_input = Some(TextInputState::new_selected("/old/path".to_string()));
+        app.browse.filter_input = Some(TextInputState::new_selected("old filter".to_string()));
+
+        handle_paste(&mut app, "new search");
+
+        assert_eq!(app.browse.search.input.text, "new search");
+        assert_eq!(
+            app.browse.path_input.as_ref().expect("path input").text,
+            "/old/path"
+        );
+        assert_eq!(
+            app.browse.filter_input.as_ref().expect("filter input").text,
+            "old filter"
+        );
+
+        app.browse.search.active = false;
+        handle_paste(&mut app, "/new/path");
+        assert_eq!(
+            app.browse.path_input.as_ref().expect("path input").text,
+            "/new/path"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_without_text_focus_explains_ctrl_v_file_paste_split() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Browse;
+
+        handle_paste(&mut app, "text");
+
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("Ctrl+V is reserved for file paste")
+        }));
     }
 }
 
@@ -13145,4 +13306,83 @@ mod async_message_drain_tests {
         assert!(!app.browse.folder_classification_pending_for(&path));
         assert!(!app.browse.has_valid_folder_classification_for_identity(&path, stale_identity));
     }
+    #[test]
+    fn completed_and_partially_removed_browse_roots_repair_current_and_history_independently() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_a = temp.path().join("source-a");
+        let source_b = temp.path().join("source-b");
+        let destination_a = temp.path().join("destination-a");
+        let destination_b = temp.path().join("destination-b");
+        std::fs::create_dir_all(destination_a.join("current")).expect("destination a");
+        std::fs::create_dir_all(destination_b.join("history")).expect("destination b");
+
+        let mapping_a = tui_file_picker::PasteMapping {
+            source: source_a.clone(),
+            destination: destination_a.clone(),
+        };
+        let mapping_b = tui_file_picker::PasteMapping {
+            source: source_b.clone(),
+            destination: destination_b.clone(),
+        };
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source_a.clone(), source_b.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Cut,
+            mappings: vec![mapping_a.clone(), mapping_b.clone()],
+        };
+        let session_id = 991;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = source_a.join("current");
+        app.browse.nav_history = vec![
+            source_a.join("current"),
+            source_b.join("history"),
+        ];
+        app.browse.nav_history_index = 0;
+        app.browse.filesystem_clipboard = Some(clipboard.clone());
+        app.browse.pending_clipboard_paste = Some(crate::tui::browse::PendingClipboardPaste {
+            session_id,
+            clipboard,
+            plan,
+            retry_plan: None,
+        });
+        let report = tui_file_picker::FileTaskCompletionReport {
+            is_move: true,
+            roots: vec![
+                tui_file_picker::FileTaskRootResult {
+                    source: source_a.clone(),
+                    destination: destination_a.clone(),
+                    disposition: tui_file_picker::FileTaskRootDisposition::Completed,
+                    message: None,
+                },
+                tui_file_picker::FileTaskRootResult {
+                    source: source_b.clone(),
+                    destination: destination_b.clone(),
+                    disposition: tui_file_picker::FileTaskRootDisposition::Failed,
+                    message: Some(
+                        "destination complete; source partially removed from quarantine"
+                            .to_string(),
+                    ),
+                },
+            ],
+        };
+        let (tx, _rx) = mpsc::channel(8);
+
+        reduce_file_task_complete(&mut app, session_id, report, None, &tx);
+
+        assert_eq!(app.browse.current_dir, destination_a.join("current"));
+        assert_eq!(
+            app.browse.nav_history,
+            vec![destination_a.join("current"), destination_b.join("history")]
+        );
+        assert!(
+            app.browse.filesystem_clipboard.is_none(),
+            "neither vanished source can be advertised as retryable"
+        );
+        assert!(app.browse.filesystem_clipboard_retry_plan.is_none());
+    }
+
 }

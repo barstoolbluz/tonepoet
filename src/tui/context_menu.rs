@@ -1341,6 +1341,7 @@ pub fn execute_context_action(
                 vec![path],
             ) {
                 app.browse.filesystem_clipboard = Some(clipboard);
+                app.browse.filesystem_clipboard_retry_plan = None;
                 app.set_status("Cut tree folder");
             }
         }
@@ -1350,6 +1351,7 @@ pub fn execute_context_action(
                 vec![path],
             ) {
                 app.browse.filesystem_clipboard = Some(clipboard);
+                app.browse.filesystem_clipboard_retry_plan = None;
                 app.set_status("Copied tree folder");
             }
         }
@@ -1450,6 +1452,7 @@ pub fn execute_context_action(
                 Some(clipboard) => {
                     let count = clipboard.paths().len();
                     app.browse.filesystem_clipboard = Some(clipboard);
+                    app.browse.filesystem_clipboard_retry_plan = None;
                     app.set_status(format!(
                         "{} {count} item{}",
                         if mode == tui_file_picker::FilePickerClipboardMode::Cut {

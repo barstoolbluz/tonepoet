@@ -806,15 +806,7 @@ fn draw_metadata_autonumber(
     };
     f.render_widget(Clear, popup);
     let border_color = metadata_autonumber_border_color(owner_dirty, theme);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            format!(" Auto-number: {} ", state.target.title()),
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, format!(" Auto-number: {} ", state.target.title()), border_color, theme);
     f.render_widget(block, popup);
     let inner = popup.inner(&ratatui::layout::Margin {
         horizontal: 2,
@@ -1102,15 +1094,7 @@ fn draw_batch_list(f: &mut Frame, app: &AppState, stored_scroll: usize, theme: s
     let popup = centered_rect(popup_w, popup_h, area);
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.amber))
-        .title(Span::styled(
-            format!(" batch · {} files ", paths.len()),
-            Style::default()
-                .fg(theme.amber)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, format!(" batch · {} files ", paths.len()), theme.amber, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1251,15 +1235,7 @@ fn draw_confirmation(
     let popup = centered_rect(popup_w, 9, area);
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.amber))
-        .title(Span::styled(
-            " Confirm ",
-            Style::default()
-                .fg(theme.amber)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Confirm ", theme.amber, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1337,13 +1313,7 @@ fn draw_error_detail(f: &mut Frame, error: &str, theme: super::theme::Theme) {
     let popup = centered_rect(60, 12, area);
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.destructive))
-        .title(Span::styled(
-            " Error Detail ",
-            Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Error Detail ", theme.destructive, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1368,15 +1338,7 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: s
     let popup = centered_rect(70, 16, area);
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.cyan))
-        .title(Span::styled(
-            " Item Info ",
-            Style::default()
-                .fg(theme.cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Item Info ", theme.cyan, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1528,15 +1490,7 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState, the
     let popup = centered_rect(60, 7, area);
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.blue))
-        .title(Span::styled(
-            " Add File/Folder Path ",
-            Style::default()
-                .fg(theme.blue)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Add File/Folder Path ", theme.blue, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1585,15 +1539,7 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
     let popup = centered_rect(popup_width, 7, area);
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.blue))
-        .title(Span::styled(
-            format!(" Edit {} ", label),
-            Style::default()
-                .fg(theme.blue)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, format!(" Edit {} ", label), theme.blue, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1667,15 +1613,7 @@ fn draw_format_settings(
     };
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.green))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.green)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, theme.green, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -2989,15 +2927,7 @@ fn draw_format_settings_help(f: &mut Frame, kind: &FormatSettingsKind, scroll: u
     };
 
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.blue))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.blue)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, theme.blue, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -3491,15 +3421,7 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState, theme: super::theme:
 
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.amber))
-        .title(Span::styled(
-            " Bulk Rename -- Template ",
-            Style::default()
-                .fg(theme.amber)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Bulk Rename -- Template ", theme.amber, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -3690,6 +3612,7 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState, theme: super::theme:
 
             if is_selected {
                 let sel_style = Style::default()
+                    .fg(theme.text_bright)
                     .bg(theme.selection_bg)
                     .add_modifier(Modifier::BOLD);
                 f.render_widget(Paragraph::new(line).style(sel_style), row_area);
@@ -3746,15 +3669,7 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
 
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.purple))
-        .title(Span::styled(
-            " Analysis Results ",
-            Style::default()
-                .fg(theme.purple)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Analysis Results ", theme.purple, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -4288,15 +4203,7 @@ fn draw_metadata_presentation_dropdown_popup(
         visible_rows.saturating_add(2),
     );
     f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.cyan))
-        .title(Span::styled(
-            " Presentation ",
-            Style::default()
-                .fg(theme.cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Presentation ", theme.cyan, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -4782,15 +4689,7 @@ fn draw_metadata_editor(
     } else {
         theme.cyan
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, border_color, theme);
     f.render_widget(block, popup);
 
     if state.shows_presentation_control() {
@@ -6272,15 +6171,7 @@ fn draw_verify(f: &mut Frame, results: &[super::verify::VerifyResult], scroll: u
 
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.green))
-        .title(Span::styled(
-            " Verify Results ",
-            Style::default()
-                .fg(theme.green)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Verify Results ", theme.green, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -6382,15 +6273,7 @@ fn draw_bit_compare(f: &mut Frame, results: &[super::bit_compare::CompareResult]
 
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.cyan))
-        .title(Span::styled(
-            " Bit Compare Results ",
-            Style::default()
-                .fg(theme.cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Bit Compare Results ", theme.cyan, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -6513,15 +6396,7 @@ fn draw_preemphasis(
 
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.purple))
-        .title(Span::styled(
-            " Pre-emphasis Detection ",
-            Style::default()
-                .fg(theme.purple)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, " Pre-emphasis Detection ", theme.purple, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -6648,15 +6523,7 @@ fn draw_cue_import_review(f: &mut Frame, changes: &[super::app::CueImportChange]
         changes.len(),
         if changes.len() == 1 { "" } else { "s" }
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.cyan))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, theme.cyan, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -6752,15 +6619,7 @@ fn draw_gnudb_select(
         matches.len(),
         if matches.len() == 1 { "" } else { "es" }
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.cyan))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, theme.cyan, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -6846,15 +6705,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
     };
     let title = format!(" {} — {} / {} ", prefix, artist, page.album);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.cyan))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, theme.cyan, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -7083,15 +6934,7 @@ fn draw_accuraterip_verify(f: &mut Frame, state: &super::app::ArVerifyState, the
         format!(" AccurateRip Verification — {} tracks ", n_tracks)
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, border_color, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -7261,15 +7104,7 @@ fn draw_ar_batch_report(f: &mut Frame, result: &super::accuraterip::ArBatchResul
         theme.destructive
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, border_color, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -7442,15 +7277,7 @@ fn draw_ctdb_verify(f: &mut Frame, state: &super::app::CtdbVerifyState, theme: s
         format!(" CUETools DB Verification — {} tracks ", n_tracks)
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, title, border_color, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -7620,15 +7447,7 @@ fn draw_cue_preview(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| state.write_path.display().to_string());
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.amber))
-        .title(Span::styled(
-            format!(" CUE preview · {} ", title_name),
-            Style::default()
-                .fg(theme.amber)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, format!(" CUE preview · {} ", title_name), theme.amber, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -7874,19 +7693,11 @@ fn draw_mb_select(
 
     f.render_widget(Clear, popup);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.purple))
-        .title(Span::styled(
-            if verifying {
+    let block = super::draw::solid_title_block(popup, if verifying {
                 " MusicBrainz · verifying selection ".to_string()
             } else {
                 format!(" MusicBrainz · {} matches ", state.releases.len())
-            },
-            Style::default()
-                .fg(theme.purple)
-                .add_modifier(Modifier::BOLD),
-        ));
+            }, theme.purple, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -8068,15 +7879,7 @@ fn draw_cue_select(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("folder");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.purple))
-        .title(Span::styled(
-            format!(" Choose CUE · {folder} "),
-            Style::default()
-                .fg(theme.purple)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = super::draw::solid_title_block(popup, format!(" Choose CUE · {folder} "), theme.purple, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     if inner.height < 4 || state.candidates.is_empty() {

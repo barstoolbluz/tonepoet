@@ -508,6 +508,7 @@ pub enum AppMessage {
     FileTaskComplete {
         session_id: u64,
         report: tui_file_picker::FileTaskCompletionReport,
+        retry_plan: Option<crate::tui::browse::BrowsePasteRetryPlan>,
     },
     /// Result of add/replace/remove artwork launched from the Artwork tab.
     MetadataEditorArtworkWriteComplete {

@@ -301,8 +301,9 @@ impl Default for SymlinkCopyPolicy {
 pub enum CrossDeviceCutPolicy {
     /// Refuse cross-device cut/paste if `rename` cannot complete atomically.
     Reject,
-    /// Copy to the destination with staging, then delete the source under the
-    /// configured delete policy.
+    /// Copy to the destination with staging, verify it, then recursively
+    /// remove the quarantined source tree as completion of the authorized move.
+    /// The separate explicit-delete policy does not limit move cleanup.
     CopyThenDelete,
 }
 
@@ -345,7 +346,8 @@ pub struct FileOperationPolicy {
     pub symlink_copy: SymlinkCopyPolicy,
     /// Policy for cut/paste when `rename` crosses devices.
     pub cross_device_cut: CrossDeviceCutPolicy,
-    /// Policy for permanent deletion. Recursive deletion is opt-in.
+    /// Policy for explicit permanent deletion commands. Recursive deletion is
+    /// opt-in. This does not restrict cleanup of a copied-and-verified move.
     pub delete: DeletePolicy,
 }
 
@@ -395,6 +397,16 @@ pub enum FilePickerError {
         destination: PathBuf,
         message: String,
     },
+    OperationCommittedButUnverified {
+        source: PathBuf,
+        destination: PathBuf,
+        message: String,
+    },
+    DestinationCommittedMoveIncomplete {
+        source: PathBuf,
+        destination: PathBuf,
+        message: String,
+    },
     NoPendingDelete,
     StaleHitRegions { expected: Rect, received: Rect },
 }
@@ -431,6 +443,18 @@ impl FilePickerError {
                 "Operation committed from {} to {}, but requires attention: {}",
                 source.display(),
                 destination.display(),
+                message
+            ),
+            Self::OperationCommittedButUnverified { source, destination, message } => format!(
+                "Operation failed after publishing {} from {} because the destination could not be verified: {}",
+                destination.display(),
+                source.display(),
+                message
+            ),
+            Self::DestinationCommittedMoveIncomplete { source, destination, message } => format!(
+                "Move incomplete after publishing {} from {}: {}",
+                destination.display(),
+                source.display(),
                 message
             ),
             Self::NoPendingDelete => "No delete is pending".to_string(),
@@ -634,6 +658,8 @@ pub(crate) struct PickerPasteTask {
     control: Arc<AtomicU8>,
     clipboard: FilesystemClipboard,
     target_dir: PathBuf,
+    plan: PastePlan,
+    retry_plan: Option<PasteRetryPlan>,
 }
 
 impl fmt::Debug for PickerPasteTask {
@@ -643,6 +669,8 @@ impl fmt::Debug for PickerPasteTask {
             .field("has_receiver", &self.receiver.is_some())
             .field("clipboard", &self.clipboard)
             .field("target_dir", &self.target_dir)
+            .field("plan", &self.plan)
+            .field("retry_plan", &self.retry_plan)
             .finish()
     }
 }
@@ -662,6 +690,8 @@ impl Clone for PickerPasteTask {
             control: Arc::new(AtomicU8::new(PASTE_CONTROL_ABORT)),
             clipboard: self.clipboard.clone(),
             target_dir: self.target_dir.clone(),
+            plan: self.plan.clone(),
+            retry_plan: self.retry_plan.clone(),
         }
     }
 }
@@ -706,6 +736,9 @@ pub struct FilePickerState {
     pub(crate) sort_reverse: bool,
     pub(crate) clipboard: Option<FilesystemClipboard>,
     pub(crate) paste_task: Option<PickerPasteTask>,
+    /// Exact source-to-destination mappings retained after an incomplete cut.
+    /// This prevents retries from allocating a suffixed duplicate path.
+    paste_retry_plan: Option<PasteRetryPlan>,
     pub(crate) pending_delete: Vec<PathBuf>,
     pub(crate) delete_confirm_button: DeleteConfirmButton,
     pub(crate) properties_open: bool,
@@ -776,6 +809,7 @@ impl FilePickerState {
             sort_reverse: false,
             clipboard: None,
             paste_task: None,
+            paste_retry_plan: None,
             pending_delete: Vec::new(),
             delete_confirm_button: DeleteConfirmButton::Cancel,
             properties_open: false,
@@ -896,14 +930,11 @@ impl FilePickerState {
     }
 
     pub(crate) fn apply_file_context_target(&mut self, index: usize) {
+        // Context targeting is deliberately separate from persistent marking.
+        // Moving the cursor gives the menu a concrete one-item target when the
+        // row is unmarked; action_paths() still expands to the marked set when
+        // the clicked row is already part of that set.
         self.set_file_cursor(index, self.file_visible_rows());
-        let Some(path) = self.current_selection().map(|entry| entry.path.clone()) else {
-            return;
-        };
-        if !self.is_path_multi_selected(&path) {
-            self.multi_selected.clear();
-            self.multi_selected.push(path);
-        }
     }
 
     pub fn is_maximized(&self) -> bool {
@@ -1044,7 +1075,7 @@ impl FilePickerState {
 
         match crate::mutate_bookmarks_atomic(mutation) {
             Ok(commit) => {
-                self.bookmarks.entries = commit.entries;
+                self.bookmarks.replace_entries(commit.entries);
                 self.bookmarks.cursor = commit.affected_index;
                 let warning = commit.status.warning().map(str::to_string);
                 self.cancel_bookmark_name();
@@ -1069,7 +1100,7 @@ impl FilePickerState {
             expected,
         }) {
             Ok(commit) => {
-                self.bookmarks.entries = commit.entries;
+                self.bookmarks.replace_entries(commit.entries);
                 self.bookmarks.cursor = commit.affected_index;
                 self.bookmarks.error = commit.status.warning().map(str::to_string);
             }
@@ -2120,7 +2151,7 @@ impl FilePickerState {
             .strip_prefix(&source)
             .ok()
             .map(|suffix| destination.join(suffix));
-        rename_no_replace(&source, &destination).map_err(|err| {
+        let rename_mode = rename_no_replace(&source, &destination).map_err(|err| {
             if err.kind() == io::ErrorKind::AlreadyExists {
                 FilePickerError::DestinationExists(destination.clone())
             } else {
@@ -2150,14 +2181,25 @@ impl FilePickerState {
         } else {
             self.select_tree_node_for_current_dir();
         }
+        let mut committed_warnings = rename_mode
+            .degraded_warning()
+            .map(str::to_string)
+            .into_iter()
+            .collect::<Vec<_>>();
         if let Err(err) = sync_directory(&parent) {
+            committed_warnings.push(format!(
+                "parent-directory synchronization failed: {err}"
+            ));
+        }
+        if !committed_warnings.is_empty() {
             // The rename is already visible and must not be presented as an
             // uncommitted failure. Keep the repaired in-memory state and surface
-            // a durability warning while returning success to close the editor.
+            // any degraded-capability or durability warning while returning
+            // success to close the editor.
             self.set_error(committed_operation_warning(
                 &source,
                 &destination,
-                format!("rename committed, but parent-directory synchronization failed: {err}"),
+                format!("rename committed: {}", committed_warnings.join("; ")),
             ));
         }
         Ok(())
@@ -2321,6 +2363,7 @@ impl FilePickerState {
             FilesystemClipboard::new(FilePickerClipboardMode::Cut, paths)
                 .ok_or(FilePickerError::NoSelection)?,
         );
+        self.paste_retry_plan = None;
         self.clear_error();
         Ok(())
     }
@@ -2344,6 +2387,7 @@ impl FilePickerState {
             FilesystemClipboard::new(FilePickerClipboardMode::Copy, paths)
                 .ok_or(FilePickerError::NoSelection)?,
         );
+        self.paste_retry_plan = None;
         self.clear_error();
         Ok(())
     }
@@ -2377,7 +2421,18 @@ impl FilePickerState {
             return Err(FilePickerError::NotADirectory(target_dir.to_path_buf()));
         }
         let clipboard = self.clipboard.clone().ok_or(FilePickerError::ClipboardEmpty)?;
-        let plan = plan_filesystem_paste(&clipboard, target_dir)?;
+        let retry_plan = self.paste_retry_plan.clone();
+        let (plan, resume_existing_destinations) = plan_filesystem_paste_with_retry(
+            &clipboard,
+            target_dir,
+            retry_plan.as_ref(),
+        )?;
+        // Preserve an exact retry plan while a resumed operation is in flight,
+        // so a worker disconnect cannot lose the original destination mapping.
+        // Fresh plans have no prior recovery identity to retain.
+        if !resume_existing_destinations {
+            self.paste_retry_plan = None;
+        }
         let control = Arc::new(AtomicU8::new(PASTE_CONTROL_RUNNING));
         let (sender, receiver) = mpsc::channel();
         let mut progress = crate::FileTaskProgressState::new(
@@ -2405,9 +2460,19 @@ impl FilePickerState {
             control: Arc::clone(&control),
             clipboard: clipboard.clone(),
             target_dir: target_dir.to_path_buf(),
+            plan: plan.clone(),
+            retry_plan: retry_plan.clone(),
         });
         let policy = self.operation_policy;
-        thread::spawn(move || run_picker_paste_worker(plan, policy, control, sender));
+        thread::spawn(move || {
+            run_picker_paste_worker(
+                plan,
+                policy,
+                retry_plan,
+                control,
+                sender,
+            )
+        });
         self.close_menu();
         Ok(())
     }
@@ -2462,11 +2527,14 @@ impl FilePickerState {
         };
         let clipboard = task.clipboard.clone();
         let target_dir = task.target_dir.clone();
-        let (completed, remaining_sources, warnings, error) = match result {
-            Ok(success) => (success.mappings, Vec::new(), success.warnings, None),
+        let task_plan = task.plan.clone();
+        let task_retry_plan = task.retry_plan.clone();
+        let (completed, remaining_sources, failure_retry_plan, warnings, error) = match result {
+            Ok(success) => (success.mappings, Vec::new(), None, success.warnings, None),
             Err(failure) => (
                 failure.completed,
                 failure.remaining_sources,
+                failure.retry_plan,
                 failure.warnings,
                 Some(failure.error),
             ),
@@ -2475,6 +2543,22 @@ impl FilePickerState {
             .into_iter()
             .filter(|source| fs::symlink_metadata(source).is_ok())
             .collect::<Vec<_>>();
+        self.paste_retry_plan = if clipboard.mode() == FilePickerClipboardMode::Cut
+            && !remaining_sources.is_empty()
+        {
+            let prior_retry = failure_retry_plan
+                .as_ref()
+                .or(task_retry_plan.as_ref());
+            retry_plan_for_sources(
+                &task_plan,
+                &remaining_sources,
+                prior_retry,
+                None,
+                None,
+            )
+        } else {
+            None
+        };
         let completed_sources = completed
             .iter()
             .map(|mapping| mapping.source.clone())
@@ -2483,7 +2567,22 @@ impl FilePickerState {
             .iter()
             .map(|mapping| mapping.destination.clone())
             .collect::<Vec<_>>();
-        let remapped_current = if clipboard.mode() == FilePickerClipboardMode::Cut
+        let incomplete_navigation_mapping = error.as_ref().and_then(|error| match error {
+            FilePickerError::DestinationCommittedMoveIncomplete {
+                source,
+                destination,
+                ..
+            } if fs::symlink_metadata(source).is_err()
+                && fs::symlink_metadata(destination).is_ok() =>
+            {
+                Some(PasteMapping {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                })
+            }
+            _ => None,
+        });
+        let mut remapped_current = if clipboard.mode() == FilePickerClipboardMode::Cut
             && !completed_sources.is_empty()
         {
             FilesystemClipboard::new(FilePickerClipboardMode::Cut, completed_sources.clone())
@@ -2510,6 +2609,37 @@ impl FilePickerState {
         } else {
             None
         };
+        if let Some(mapping) = incomplete_navigation_mapping.as_ref() {
+            if let Some(incomplete_clipboard) = FilesystemClipboard::new(
+                FilePickerClipboardMode::Cut,
+                vec![mapping.source.clone()],
+            ) {
+                // History repair is independent for every affected root. A
+                // completed root may already have remapped the current
+                // directory, but that must not suppress repair of history
+                // entries beneath a separately, partially deleted root.
+                for path in self
+                    .history_back
+                    .iter_mut()
+                    .chain(self.history_forward.iter_mut())
+                {
+                    if let Some(remapped) = crate::remap_path_after_cut(
+                        path,
+                        &incomplete_clipboard,
+                        std::slice::from_ref(&mapping.destination),
+                    ) {
+                        *path = remapped;
+                    }
+                }
+                if remapped_current.is_none() {
+                    remapped_current = crate::remap_path_after_cut(
+                        &self.current_dir,
+                        &incomplete_clipboard,
+                        std::slice::from_ref(&mapping.destination),
+                    );
+                }
+            }
+        }
 
         let all_completed = completed.len() == clipboard.paths().len();
         self.clipboard = if all_completed {
@@ -2525,6 +2655,14 @@ impl FilePickerState {
         let mut refresh_parents = HashSet::new();
         refresh_parents.insert(target_dir.clone());
         for mapping in &completed {
+            if let Some(parent) = mapping.source.parent() {
+                refresh_parents.insert(parent.to_path_buf());
+            }
+            if let Some(parent) = mapping.destination.parent() {
+                refresh_parents.insert(parent.to_path_buf());
+            }
+        }
+        if let Some(mapping) = incomplete_navigation_mapping.as_ref() {
             if let Some(parent) = mapping.source.parent() {
                 refresh_parents.insert(parent.to_path_buf());
             }
@@ -2884,6 +3022,69 @@ pub struct PastePlan {
     pub mappings: Vec<PasteMapping>,
 }
 
+/// Authoritative copy-time and post-publication evidence retained for one
+/// incomplete move. The source manifest owns the copy-time digest/tree proof;
+/// the destination manifest owns the identity of the exact published objects
+/// that passed the single content-verification traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MoveRecoveryProof {
+    source_manifest: crate::SourceManifest,
+    destination_manifest: crate::DestinationManifest,
+}
+
+/// Exact recovery token for an incomplete cut/move.
+///
+/// The public plan preserves source-to-destination identity. Private per-root
+/// evidence lets the executor reuse already-established source and destination
+/// proofs without recopying. Strict mounts can reuse retained destination identity;
+/// reduced-semantics mounts perform one irreducible destination rehash before
+/// destructive cleanup. Callers should treat this value as opaque and pass it back to
+/// [`paste_filesystem_clipboard_with_retry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasteRetryPlan {
+    plan: PastePlan,
+    recovery_by_source: std::collections::BTreeMap<PathBuf, MoveRecoveryProof>,
+}
+
+impl PasteRetryPlan {
+    /// Create an exact-mapping retry token without retained proof evidence.
+    /// This compatibility constructor still prevents destination suffixing;
+    /// tokens returned by `PasteFailure` additionally reuse authoritative
+    /// copy-time proof and are therefore the preferred recovery path.
+    pub fn from_plan(plan: PastePlan) -> Self {
+        Self {
+            plan,
+            recovery_by_source: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn plan(&self) -> &PastePlan {
+        &self.plan
+    }
+
+    pub fn mappings(&self) -> &[PasteMapping] {
+        &self.plan.mappings
+    }
+
+    fn recovery_for(&self, source: &Path) -> Option<&MoveRecoveryProof> {
+        self.recovery_by_source.get(source)
+    }
+}
+
+impl std::ops::Deref for PasteRetryPlan {
+    type Target = PastePlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+impl From<PastePlan> for PasteRetryPlan {
+    fn from(plan: PastePlan) -> Self {
+        Self::from_plan(plan)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasteWarning {
     pub mapping: PasteMapping,
@@ -2896,15 +3097,34 @@ pub struct PasteSuccess {
     pub warnings: Vec<PasteWarning>,
 }
 
-/// Structured partial failure. `completed` is authoritative and ordered;
-/// `remaining_sources` contains only roots that were not committed and can be
-/// used to construct a retry-only clipboard without duplicating prior work.
+/// Structured partial failure. `completed` contains only roots whose requested
+/// copy or move semantics completed successfully. `remaining_sources` contains
+/// roots that can be retried, including a source retained after destination
+/// publication failed verification; published-but-unverified destinations are
+/// deliberately not represented as completed mappings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasteFailure {
     pub completed: Vec<PasteMapping>,
     pub remaining_sources: Vec<PathBuf>,
+    /// Exact source-to-destination mappings that may be supplied to
+    /// `paste_filesystem_clipboard_with_retry` for an idempotent retry.
+    /// This is populated only for retained cut sources whose original
+    /// destination mapping is still authoritative.
+    pub retry_plan: Option<PasteRetryPlan>,
     pub warnings: Vec<PasteWarning>,
     pub error: FilePickerError,
+}
+
+fn classify_paste_root_result(
+    result: Result<(), FilePickerError>,
+) -> Result<Option<String>, FilePickerError> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(FilePickerError::OperationCommittedWithWarning { message, .. }) => {
+            Ok(Some(message))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl fmt::Display for PasteFailure {
@@ -2914,6 +3134,44 @@ impl fmt::Display for PasteFailure {
 }
 
 impl std::error::Error for PasteFailure {}
+
+fn plan_filesystem_paste_with_retry(
+    clipboard: &FilesystemClipboard,
+    destination_dir: &Path,
+    retry: Option<&PasteRetryPlan>,
+) -> Result<(PastePlan, bool), FilePickerError> {
+    if let Some(retry) = retry {
+        if retry_plan_matches(retry, clipboard, destination_dir) {
+            return Ok((retry.plan.clone(), true));
+        }
+        return Err(FilePickerError::WrongSelectionMode(
+            "retry plan does not match this cut clipboard and destination directory",
+        ));
+    }
+    plan_filesystem_paste(clipboard, destination_dir).map(|plan| (plan, false))
+}
+
+fn retry_plan_matches(
+    retry: &PasteRetryPlan,
+    clipboard: &FilesystemClipboard,
+    destination_dir: &Path,
+) -> bool {
+    retry.plan.mode == FilePickerClipboardMode::Cut
+        && clipboard.mode() == FilePickerClipboardMode::Cut
+        && retry.plan.mappings.len() == clipboard.paths().len()
+        && retry
+            .plan
+            .mappings
+            .iter()
+            .zip(clipboard.paths())
+            .all(|(mapping, source)| {
+                mapping.source.as_path() == source.as_path()
+                    && mapping
+                        .destination
+                        .parent()
+                        .is_some_and(|parent| same_path(parent, destination_dir))
+            })
+}
 
 pub fn plan_filesystem_paste(
     clipboard: &FilesystemClipboard,
@@ -2949,62 +3207,67 @@ pub fn plan_filesystem_paste(
 
 /// Paste a shared filesystem clipboard into `destination_dir`.
 ///
-/// This synchronous compatibility entry point returns structured partial
-/// accounting. Interactive surfaces should execute the plan on a background
-/// worker, but tests and non-interactive callers can still use this function
-/// without losing completed mappings or retry state.
+/// This starts a new operation plan. If it returns `PasteFailure` with a
+/// `retry_plan`, pass that plan to `paste_filesystem_clipboard_with_retry` on
+/// the next attempt so an already-published destination is verified and reused
+/// rather than renamed to a duplicate destination.
 pub fn paste_filesystem_clipboard(
     clipboard: &FilesystemClipboard,
     destination_dir: &Path,
     policy: FileOperationPolicy,
 ) -> Result<PasteSuccess, PasteFailure> {
-    let plan = plan_filesystem_paste(clipboard, destination_dir).map_err(|error| PasteFailure {
-        completed: Vec::new(),
-        remaining_sources: clipboard.paths().to_vec(),
-        warnings: Vec::new(),
-        error,
-    })?;
-    let mut completed = Vec::with_capacity(plan.mappings.len());
-    let mut warnings = Vec::new();
-    for (index, mapping) in plan.mappings.iter().enumerate() {
-        let result = match plan.mode {
-            FilePickerClipboardMode::Cut => {
-                move_path_with_policy(&mapping.source, &mapping.destination, policy)
-            }
-            FilePickerClipboardMode::Copy => {
-                safe_copy_path(&mapping.source, &mapping.destination, policy)
-            }
-        };
-        match result {
-            Ok(()) => completed.push(mapping.clone()),
-            Err(FilePickerError::OperationCommittedWithWarning { message, .. }) => {
-                completed.push(mapping.clone());
-                warnings.push(PasteWarning {
-                    mapping: mapping.clone(),
-                    message,
-                });
-            }
-            Err(error) => {
-                let remaining_sources = plan.mappings[index..]
-                    .iter()
-                    .map(|mapping| mapping.source.clone())
-                    .filter(|source| fs::symlink_metadata(source).is_ok())
-                    .collect();
-                return Err(PasteFailure {
-                    completed,
-                    remaining_sources,
-                    warnings,
-                    error,
-                });
-            }
+    paste_filesystem_clipboard_with_retry(clipboard, destination_dir, policy, None)
+}
+
+/// Paste a shared filesystem clipboard, optionally resuming the exact mapping
+/// returned by a prior `PasteFailure`.
+///
+/// A supplied retry plan is accepted only when it exactly matches the cut
+/// clipboard and destination directory. Matching existing destinations are
+/// content-verified before only the outstanding source cleanup is resumed.
+pub fn paste_filesystem_clipboard_with_retry(
+    clipboard: &FilesystemClipboard,
+    destination_dir: &Path,
+    policy: FileOperationPolicy,
+    retry_plan: Option<&PasteRetryPlan>,
+) -> Result<PasteSuccess, PasteFailure> {
+    if let Some(retry_plan) = retry_plan {
+        if !retry_plan_matches(retry_plan, clipboard, destination_dir) {
+            return Err(PasteFailure {
+                completed: Vec::new(),
+                remaining_sources: clipboard.paths().to_vec(),
+                retry_plan: None,
+                warnings: Vec::new(),
+                error: FilePickerError::WrongSelectionMode(
+                    "retry plan does not match this cut clipboard and destination directory",
+                ),
+            });
         }
     }
-    Ok(PasteSuccess { mappings: completed, warnings })
+    let (plan, _resume_existing_destinations) =
+        plan_filesystem_paste_with_retry(clipboard, destination_dir, retry_plan).map_err(|error| {
+            PasteFailure {
+                completed: Vec::new(),
+                remaining_sources: clipboard.paths().to_vec(),
+                retry_plan: None,
+                warnings: Vec::new(),
+                error,
+            }
+        })?;
+    let mut progress =
+        |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+    execute_paste_plan_progress_with_resume(
+        &plan,
+        policy,
+        retry_plan,
+        &mut progress,
+    )
 }
 
 fn run_picker_paste_worker(
     plan: PastePlan,
     policy: FileOperationPolicy,
+    retry_plan: Option<PasteRetryPlan>,
     control: Arc<AtomicU8>,
     sender: mpsc::Sender<PickerPasteMessage>,
 ) {
@@ -3061,36 +3324,191 @@ fn run_picker_paste_worker(
         }
         Ok(())
     };
-    let result = execute_paste_plan_progress(&plan, policy, &mut progress);
+    let result = execute_paste_plan_progress_with_resume(
+        &plan,
+        policy,
+        retry_plan.as_ref(),
+        &mut progress,
+    );
     let _ = sender.send(PickerPasteMessage::Finished(result));
 }
 
+#[derive(Debug)]
+struct PasteRootExecution {
+    result: Result<(), FilePickerError>,
+    recovery: Option<MoveRecoveryProof>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
 fn execute_paste_plan_progress(
     plan: &PastePlan,
     policy: FileOperationPolicy,
     progress: &mut FileOperationProgress<'_>,
 ) -> Result<PasteSuccess, PasteFailure> {
+    execute_paste_plan_progress_with_resume(plan, policy, None, progress)
+}
+
+fn execute_paste_plan_progress_with_resume(
+    plan: &PastePlan,
+    policy: FileOperationPolicy,
+    retry_plan: Option<&PasteRetryPlan>,
+    progress: &mut FileOperationProgress<'_>,
+) -> Result<PasteSuccess, PasteFailure> {
+    let mut io = crate::FileOperationIoCounters::default();
+    execute_paste_plan_progress_with_resume_accounted(
+        plan,
+        policy,
+        retry_plan,
+        progress,
+        &mut io,
+    )
+}
+
+fn execute_paste_plan_progress_with_resume_accounted(
+    plan: &PastePlan,
+    policy: FileOperationPolicy,
+    retry_plan: Option<&PasteRetryPlan>,
+    progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<PasteSuccess, PasteFailure> {
+    execute_paste_plan_progress_with_recovery(plan, retry_plan, |mode, mapping| {
+        let mut recovery = None;
+        let result = match mode {
+            FilePickerClipboardMode::Cut => {
+                let retained_recovery =
+                    retry_plan.and_then(|retry| retry.recovery_for(&mapping.source));
+                let destination_exists = fs::symlink_metadata(&mapping.destination).is_ok();
+                if retry_plan.is_some() && (retained_recovery.is_some() || destination_exists) {
+                    copy_then_delete_progress_with_resume_accounted(
+                        &mapping.source,
+                        &mapping.destination,
+                        policy,
+                        progress,
+                        true,
+                        retained_recovery,
+                        &mut recovery,
+                        io,
+                    )
+                } else {
+                    // An exact retry token can also contain roots that were never
+                    // attempted. Preserve their reserved destination, but still
+                    // take the normal rename-first O(1) path when it is absent.
+                    move_path_with_policy_progress_accounted_with_recovery(
+                        &mapping.source,
+                        &mapping.destination,
+                        policy,
+                        progress,
+                        &mut recovery,
+                        io,
+                    )
+                }
+            }
+            FilePickerClipboardMode::Copy => {
+                match safe_copy_path_progress_with_notices_accounted(
+                    &mapping.source,
+                    &mapping.destination,
+                    policy,
+                    progress,
+                    io,
+                ) {
+                    Ok(mut outcome) => {
+                        if let Some(control_error) = outcome.post_publication_control {
+                            outcome.notices.push(format!(
+                                "progress control changed after the verified copy completed: {}",
+                                control_error.message()
+                            ));
+                        }
+                        if outcome.notices.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(committed_operation_warning(
+                                &mapping.source,
+                                &mapping.destination,
+                                outcome.notices.join("; "),
+                            ))
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        PasteRootExecution { result, recovery }
+    })
+}
+
+fn retry_plan_for_sources(
+    plan: &PastePlan,
+    remaining_sources: &[PathBuf],
+    prior_retry: Option<&PasteRetryPlan>,
+    current_source: Option<&Path>,
+    current_recovery: Option<MoveRecoveryProof>,
+) -> Option<PasteRetryPlan> {
+    if plan.mode != FilePickerClipboardMode::Cut || remaining_sources.is_empty() {
+        return None;
+    }
+    let mappings = plan
+        .mappings
+        .iter()
+        .filter(|mapping| remaining_sources.iter().any(|source| source == &mapping.source))
+        .cloned()
+        .collect::<Vec<_>>();
+    if mappings.is_empty() {
+        return None;
+    }
+
+    let mut recovery_by_source = std::collections::BTreeMap::new();
+    if let Some(prior_retry) = prior_retry {
+        for mapping in &mappings {
+            if let Some(recovery) = prior_retry.recovery_for(&mapping.source) {
+                recovery_by_source.insert(mapping.source.clone(), recovery.clone());
+            }
+        }
+    }
+    if let (Some(source), Some(recovery)) = (current_source, current_recovery) {
+        if remaining_sources.iter().any(|remaining| remaining == source) {
+            recovery_by_source.insert(source.to_path_buf(), recovery);
+        }
+    }
+
+    Some(PasteRetryPlan {
+        plan: PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings,
+        },
+        recovery_by_source,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
+fn execute_paste_plan_progress_with<F>(
+    plan: &PastePlan,
+    mut execute_root: F,
+) -> Result<PasteSuccess, PasteFailure>
+where
+    F: FnMut(FilePickerClipboardMode, &PasteMapping) -> Result<(), FilePickerError>,
+{
+    execute_paste_plan_progress_with_recovery(plan, None, |mode, mapping| PasteRootExecution {
+        result: execute_root(mode, mapping),
+        recovery: None,
+    })
+}
+
+fn execute_paste_plan_progress_with_recovery<F>(
+    plan: &PastePlan,
+    prior_retry: Option<&PasteRetryPlan>,
+    mut execute_root: F,
+) -> Result<PasteSuccess, PasteFailure>
+where
+    F: FnMut(FilePickerClipboardMode, &PasteMapping) -> PasteRootExecution,
+{
     let mut completed = Vec::new();
     let mut retry_sources = Vec::new();
     let mut warnings = Vec::new();
     for (index, mapping) in plan.mappings.iter().enumerate() {
-        let result = match plan.mode {
-            FilePickerClipboardMode::Cut => move_path_with_policy_progress(
-                &mapping.source,
-                &mapping.destination,
-                policy,
-                progress,
-            ),
-            FilePickerClipboardMode::Copy => safe_copy_path_progress(
-                &mapping.source,
-                &mapping.destination,
-                policy,
-                progress,
-            ),
-        };
-        match result {
-            Ok(()) => completed.push(mapping.clone()),
-            Err(FilePickerError::OperationCommittedWithWarning { message, .. }) => {
+        let PasteRootExecution { result, recovery } = execute_root(plan.mode, mapping);
+        match classify_paste_root_result(result) {
+            Ok(None) => completed.push(mapping.clone()),
+            Ok(Some(message)) => {
                 completed.push(mapping.clone());
                 warnings.push(PasteWarning {
                     mapping: mapping.clone(),
@@ -3112,9 +3530,17 @@ fn execute_paste_plan_progress(
                         .map(|mapping| mapping.source.clone())
                         .filter(|source| fs::symlink_metadata(source).is_ok()),
                 );
+                let retry_plan = retry_plan_for_sources(
+                    plan,
+                    &retry_sources,
+                    prior_retry,
+                    Some(&mapping.source),
+                    recovery,
+                );
                 return Err(PasteFailure {
                     completed,
                     remaining_sources: retry_sources,
+                    retry_plan,
                     warnings,
                     error,
                 });
@@ -3124,9 +3550,17 @@ fn execute_paste_plan_progress(
     if retry_sources.is_empty() {
         Ok(PasteSuccess { mappings: completed, warnings })
     } else {
+        let retry_plan = retry_plan_for_sources(
+            plan,
+            &retry_sources,
+            prior_retry,
+            None,
+            None,
+        );
         Err(PasteFailure {
             completed,
             remaining_sources: retry_sources,
+            retry_plan,
             warnings,
             error: FilePickerError::OperationSkipped,
         })
@@ -3201,6 +3635,53 @@ fn duplicate_candidate_path(source: &Path) -> PathBuf {
 
 type FileOperationProgress<'a> = dyn FnMut(&Path, &Path, u64, bool) -> Result<(), FilePickerError> + 'a;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialMoveRoute {
+    NativeRename,
+    CopyThenDelete,
+}
+
+fn initial_move_route(
+    _source_capabilities: crate::FilesystemCapabilities,
+    _destination_capabilities: crate::FilesystemCapabilities,
+    force_copy_then_delete: bool,
+) -> InitialMoveRoute {
+    if force_copy_then_delete {
+        InitialMoveRoute::CopyThenDelete
+    } else {
+        // Capability limitations select the proof used after rename. They do
+        // not make recursive copying the first choice.
+        InitialMoveRoute::NativeRename
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_FORCE_COPY_THEN_DELETE_MOVE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static TEST_STOP_MOVE_AFTER_VERIFIED_PUBLICATION: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+#[cfg(test)]
+fn take_test_force_copy_then_delete_move() -> bool {
+    TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.replace(false))
+}
+
+#[cfg(not(test))]
+fn take_test_force_copy_then_delete_move() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_test_stop_move_after_verified_publication() -> bool {
+    TEST_STOP_MOVE_AFTER_VERIFIED_PUBLICATION.with(|flag| flag.replace(false))
+}
+
+#[cfg(not(test))]
+fn take_test_stop_move_after_verified_publication() -> bool {
+    false
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
 fn move_path_with_policy(
     source: &Path,
     destination: &Path,
@@ -3210,38 +3691,109 @@ fn move_path_with_policy(
     move_path_with_policy_progress(source, destination, policy, &mut progress)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
 fn move_path_with_policy_progress(
     source: &Path,
     destination: &Path,
     policy: FileOperationPolicy,
     progress: &mut FileOperationProgress<'_>,
 ) -> Result<(), FilePickerError> {
+    let mut io = crate::FileOperationIoCounters::default();
+    move_path_with_policy_progress_accounted(
+        source,
+        destination,
+        policy,
+        progress,
+        &mut io,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
+fn move_path_with_policy_progress_accounted(
+    source: &Path,
+    destination: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
+    let mut recovery = None;
+    move_path_with_policy_progress_accounted_with_recovery(
+        source,
+        destination,
+        policy,
+        progress,
+        &mut recovery,
+        io,
+    )
+}
+
+fn move_path_with_policy_progress_accounted_with_recovery(
+    source: &Path,
+    destination: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    recovery_out: &mut Option<MoveRecoveryProof>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
     progress(source, destination, 0, false)?;
-    let source_snapshot = crate::snapshot_path(source)
-        .map_err(|error| io_error("capture move source identity", source, error))?;
+    let route = initial_move_route(
+        crate::filesystem_capabilities(source),
+        crate::filesystem_capabilities(destination),
+        take_test_force_copy_then_delete_move(),
+    );
+    if route == InitialMoveRoute::CopyThenDelete {
+        return copy_then_delete_progress_with_resume_accounted(
+            source,
+            destination,
+            policy,
+            progress,
+            false,
+            None,
+            recovery_out,
+            io,
+        );
+    }
+
+    let rename_proof = crate::RenameSourceProof::capture(source)
+        .map_err(|error| io_error("capture native-rename source proof", source, error))?;
+    io.rename_attempts = io.rename_attempts.saturating_add(1);
     match rename_no_replace(source, destination) {
-        Ok(()) => {
-            let identity_error = match crate::snapshot_path(destination) {
-                Ok(moved_snapshot) => source_snapshot.verify_same_identity(&moved_snapshot).err(),
-                Err(error) => Some(format!("could not re-identify moved source: {error}")),
-            };
-            if let Some(message) = identity_error {
-                // The rename has committed, but the destination pathname no
-                // longer proves ownership of the moved object. Do not attempt
-                // pathname rollback: that could move an unrelated replacement
-                // into the source name. Leave both names untouched and surface
-                // the unproven committed state.
-                return Err(committed_operation_warning(
+        Ok(rename_mode) => {
+            if matches!(rename_mode, RenameNoReplaceMode::CheckedBestEffort) {
+                io.rename_fallbacks = io.rename_fallbacks.saturating_add(1);
+            }
+            let destination_capabilities = crate::filesystem_capabilities(destination);
+            crate::verify_committed_rename(
+                source,
+                destination,
+                &rename_proof,
+                destination_capabilities,
+            )
+            .map_err(|message| {
+                committed_operation_unverified(
                     source,
                     destination,
                     format!(
-                        "move committed, but the destination no longer proves it names the captured source object: {message}"
+                        "native rename committed, but the pathname transition could not be proven: {message}"
                     ),
-                ));
+                )
+            })?;
+
+            let mut warnings = rename_mode
+                .degraded_warning()
+                .map(str::to_string)
+                .into_iter()
+                .collect::<Vec<_>>();
+            if destination_capabilities.identity_policy()
+                == crate::FilesystemIdentityPolicy::ContentVerifiedPortable
+            {
+                warnings.push(
+                    "native rename was accepted using retained-handle/type/size/path-transition evidence because stable inode or nanosecond timestamp semantics are unavailable"
+                        .to_string(),
+                );
             }
-            let mut warnings = Vec::new();
             if let Some(parent) = destination.parent() {
-                if let Err(err) = sync_directory(parent) {
+                if let Err(err) = sync_directory_accounted(parent, io) {
                     warnings.push(format!(
                         "destination parent directory synchronization failed: {err}"
                     ));
@@ -3249,7 +3801,7 @@ fn move_path_with_policy_progress(
             }
             if let Some(parent) = source.parent() {
                 if destination.parent() != Some(parent) {
-                    if let Err(err) = sync_directory(parent) {
+                    if let Err(err) = sync_directory_accounted(parent, io) {
                         warnings.push(format!(
                             "source parent directory synchronization failed: {err}"
                         ));
@@ -3258,7 +3810,7 @@ fn move_path_with_policy_progress(
             }
             if let Err(err) = progress(source, destination, 0, true) {
                 warnings.push(format!(
-                    "progress control changed after the atomic move committed: {}",
+                    "progress control changed after the move committed: {}",
                     err.message()
                 ));
             }
@@ -3281,178 +3833,384 @@ fn move_path_with_policy_progress(
                 destination: destination.to_path_buf(),
             }),
             CrossDeviceCutPolicy::CopyThenDelete => {
-                copy_then_delete_progress(source, destination, policy, progress)
+                copy_then_delete_progress_with_resume_accounted(
+                    source,
+                    destination,
+                    policy,
+                    progress,
+                    false,
+                    None,
+                    recovery_out,
+                    io,
+                )
             }
         },
-        Err(err) if err.kind() == io::ErrorKind::Unsupported => match policy.cross_device_cut {
-            CrossDeviceCutPolicy::Reject => Err(io_error("move without replacement", source, err)),
-            CrossDeviceCutPolicy::CopyThenDelete => {
-                copy_then_delete_progress(source, destination, policy, progress)
-            }
-        },
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            // Atomic and checked best-effort rename were both unavailable.
+            // This is a same-operation capability failure rather than an
+            // explicit-delete request, so the verified copy/quarantine path is
+            // the safe functional fallback even when cross-device moves are
+            // otherwise disabled.
+            copy_then_delete_progress_with_resume_accounted(
+                source,
+                destination,
+                policy,
+                progress,
+                false,
+                None,
+                recovery_out,
+                io,
+            )
+        }
         Err(err) => Err(io_error("move", source, err)),
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
 fn copy_then_delete_progress(
     source: &Path,
     destination: &Path,
     policy: FileOperationPolicy,
     progress: &mut FileOperationProgress<'_>,
 ) -> Result<(), FilePickerError> {
-    let mut manifest_control_error = None;
-    let manifest_result = crate::capture_manifest_with_cancel(source, |path| {
-        if manifest_control_error.is_some() {
-            return false;
-        }
-        match progress(path, destination, 0, false) {
-            Ok(()) => true,
-            Err(error) => {
-                manifest_control_error = Some(error);
-                false
-            }
-        }
-    });
-    if let Some(error) = manifest_control_error {
-        return Err(error);
-    }
-    let manifest = manifest_result.map_err(|message| FilePickerError::Io {
-        op: "capture stable move source",
-        path: source.to_path_buf(),
-        message,
-    })?;
+    let mut io = crate::FileOperationIoCounters::default();
+    copy_then_delete_progress_accounted(source, destination, policy, progress, &mut io)
+}
 
-    match safe_copy_path_progress(source, destination, policy, progress) {
-        Ok(()) => {}
-        Err(FilePickerError::OperationCommittedWithWarning { message, .. }) => {
-            return Err(committed_operation_warning(
-                source,
-                destination,
-                format!("destination published; source retained because {message}"),
-            ));
-        }
-        Err(error) => return Err(error),
-    }
-    let mut destination_verification_control_error = None;
-    let destination_verification = manifest.capture_verified_copy_at_with_cancel(destination, |path| {
-        if destination_verification_control_error.is_some() {
-            return false;
-        }
-        match progress(path, destination, 0, false) {
-            Ok(()) => true,
-            Err(error) => {
-                destination_verification_control_error = Some(error);
-                false
-            }
-        }
-    });
-    if let Some(error) = destination_verification_control_error {
-        return Err(committed_operation_warning(
-            source,
-            destination,
-            format!(
-                "destination published; source retained because destination verification was interrupted: {}",
-                error.message()
-            ),
-        ));
-    }
-    let destination_manifest = match destination_verification {
-        Ok(destination_manifest) => destination_manifest,
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
+fn copy_then_delete_progress_accounted(
+    source: &Path,
+    destination: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
+    let mut recovery = None;
+    copy_then_delete_progress_with_resume_accounted(
+        source,
+        destination,
+        policy,
+        progress,
+        false,
+        None,
+        &mut recovery,
+        io,
+    )
+}
+
+fn copy_then_delete_progress_with_resume_accounted(
+    source: &Path,
+    destination: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    resume_existing_destination: bool,
+    retained_recovery: Option<&MoveRecoveryProof>,
+    recovery_out: &mut Option<MoveRecoveryProof>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
+    let identity_policy_warning = crate::filesystem_identity_policy_notice(source);
+    let destination_preexisted = match fs::symlink_metadata(destination) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => {
-            return Err(committed_operation_warning(
-                source,
+            return Err(io_error(
+                "inspect originally planned destination",
                 destination,
-                format!("destination published, but content/identity verification failed; source retained: {error}"),
+                error,
             ));
         }
     };
 
-    let quarantine = match quarantine_picker_source(source) {
-        Ok(path) => path,
-        Err(error) => {
-            return Err(committed_operation_warning(
-                source,
-                destination,
-                format!("destination published; source retained because safe cleanup could not begin: {error}"),
-            ))
-        }
-    };
-    let mut source_verification_control_error = None;
-    let source_verification = manifest.verify_at_with_cancel(&quarantine, |path| {
-        if source_verification_control_error.is_some() {
-            return false;
-        }
-        match progress(path, destination, 0, false) {
-            Ok(()) => true,
-            Err(error) => {
-                source_verification_control_error = Some(error);
-                false
+    let copy_outcome = if resume_existing_destination && destination_preexisted {
+        if let Some(retained_recovery) = retained_recovery {
+            io.destination_tree_walks = io.destination_tree_walks.saturating_add(1);
+            let mut destination_control_error = None;
+            let verification = retained_recovery
+                .destination_manifest
+                .verify_reused_copy_at_with_cancel(
+                    &retained_recovery.source_manifest,
+                    destination,
+                    |path| {
+                        if destination_control_error.is_some() {
+                            return false;
+                        }
+                        match progress(path, destination, 0, false) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                destination_control_error = Some(error);
+                                false
+                            }
+                        }
+                    },
+                );
+            if let Some(error) = destination_control_error {
+                return Err(error);
+            }
+            let destination_bytes_rehashed = verification.map_err(|error| {
+                destination_committed_move_incomplete(
+                    source,
+                    destination,
+                    format!(
+                        "the originally planned retry destination no longer matches the retained authoritative publication proof; source cleanup was not attempted: {error}"
+                    ),
+                )
+            })?;
+            io.destination_bytes_hashed = io
+                .destination_bytes_hashed
+                .saturating_add(destination_bytes_rehashed);
+            VerifiedCopyOutcome {
+                source_manifest: retained_recovery.source_manifest.clone(),
+                destination_manifest: retained_recovery.destination_manifest.clone(),
+                notices: vec![format!(
+                    "retry reused the original verified publication proof for {}; no data was recopied{}",
+                    destination.display(),
+                    if destination_bytes_rehashed == 0 {
+                        " and strict mount evidence avoided a destination rehash"
+                    } else {
+                        "; weak mount identity required one destination verification rehash"
+                    }
+                )],
+                post_publication_control: None,
+            }
+        } else {
+            // Compatibility recovery tokens may preserve only the exact mapping.
+            // In that case, establish fresh authority once without recopying.
+            let mut manifest_control_error = None;
+            io.source_tree_walks = io.source_tree_walks.saturating_add(1);
+            let manifest_result = crate::capture_manifest_with_cancel(source, |path| {
+                if manifest_control_error.is_some() {
+                    return false;
+                }
+                match progress(path, destination, 0, false) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        manifest_control_error = Some(error);
+                        false
+                    }
+                }
+            });
+            if let Some(error) = manifest_control_error {
+                return Err(error);
+            }
+            let source_manifest = manifest_result.map_err(|message| FilePickerError::Io {
+                op: "capture retry source proof",
+                path: source.to_path_buf(),
+                message,
+            })?;
+            let compatibility_rehash_bytes = source_manifest.total_file_bytes();
+            io.source_bytes_hashed = io
+                .source_bytes_hashed
+                .saturating_add(compatibility_rehash_bytes);
+            io.bytes_redundantly_rehashed = io
+                .bytes_redundantly_rehashed
+                .saturating_add(compatibility_rehash_bytes);
+            io.destination_tree_walks = io.destination_tree_walks.saturating_add(1);
+            io.destination_bytes_hashed = io
+                .destination_bytes_hashed
+                .saturating_add(source_manifest.total_file_bytes());
+            let mut destination_control_error = None;
+            let destination_manifest_result = source_manifest
+                .capture_verified_copy_at_with_cancel(destination, |path| {
+                    if destination_control_error.is_some() {
+                        return false;
+                    }
+                    match progress(path, destination, 0, false) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            destination_control_error = Some(error);
+                            false
+                        }
+                    }
+                });
+            if let Some(error) = destination_control_error {
+                return Err(error);
+            }
+            let destination_manifest = destination_manifest_result.map_err(|error| {
+                destination_committed_move_incomplete(
+                    source,
+                    destination,
+                    format!(
+                        "the originally planned retry destination differs from the retained source; source cleanup was not attempted: {error}"
+                    ),
+                )
+            })?;
+            VerifiedCopyOutcome {
+                source_manifest,
+                destination_manifest,
+                notices: vec![format!(
+                    "retry reused the originally planned destination {} after verifying it against the retained source; no data was recopied",
+                    destination.display()
+                )],
+                post_publication_control: None,
             }
         }
-    });
-    if let Some(error) = source_verification_control_error {
-        let recovery = restore_picker_quarantine(&quarantine, source);
-        return Err(committed_operation_warning(
+    } else {
+        safe_copy_path_progress_with_notices_accounted(
             source,
             destination,
-            format!(
-                "destination published; source verification was interrupted before cleanup and no source object was deleted: {}; {recovery}",
-                error.message()
+            policy,
+            progress,
+            io,
+        )?
+    };
+
+    let authoritative_recovery = MoveRecoveryProof {
+        source_manifest: copy_outcome.source_manifest.clone(),
+        destination_manifest: copy_outcome.destination_manifest.clone(),
+    };
+
+    if let Some(control_error) = copy_outcome.post_publication_control {
+        let reason = match control_error {
+            FilePickerError::OperationSkipped => {
+                "the user skipped the move after the destination was published and verified"
+                    .to_string()
+            }
+            FilePickerError::OperationCancelled => {
+                "the user aborted the move after the destination was published and verified"
+                    .to_string()
+            }
+            other => format!(
+                "progress handling stopped the move after the destination was published and verified: {}",
+                other.message()
             ),
-        ));
-    }
-    if let Err(error) = source_verification {
-        let recovery = restore_picker_quarantine(&quarantine, source);
-        return Err(committed_operation_warning(
+        };
+        let notices = if copy_outcome.notices.is_empty() {
+            String::new()
+        } else {
+            format!("; copy notices: {}", copy_outcome.notices.join("; "))
+        };
+        *recovery_out = Some(authoritative_recovery.clone());
+        return Err(destination_committed_move_incomplete(
             source,
             destination,
             format!(
-                "destination published, but source identity/content changed before cleanup; no source object was deleted: {error}; {recovery}"
+                "{reason}; source cleanup did not begin, so the source remains in place{notices}"
             ),
         ));
     }
 
-    if let Err(error) = delete_verified_quarantine_progress(
-        &quarantine,
+    if take_test_stop_move_after_verified_publication() {
+        *recovery_out = Some(authoritative_recovery.clone());
+        return Err(destination_committed_move_incomplete(
+            source,
+            destination,
+            "test-injected stop after verified destination publication; source cleanup did not begin"
+                .to_string(),
+        ));
+    }
+
+    let (quarantine, quarantine_mode) =
+        match quarantine_picker_source_accounted(source, io) {
+            Ok(result) => result,
+            Err(error) => {
+                *recovery_out = Some(authoritative_recovery.clone());
+                return Err(destination_committed_move_incomplete(
+                    source,
+                    destination,
+                    format!("safe cleanup could not begin: {error}"),
+                ))
+            }
+        };
+
+    // Quarantine publication and final source removal are separate durable
+    // transitions. Synchronize the source parent at each boundary, but retain
+    // pragmatic degraded operation on filesystems that cannot sync directories.
+    let mut quarantine_durability_warning = None;
+    if let Some(parent) = source.parent() {
+        if let Err(error) = sync_directory_accounted(parent, io) {
+            quarantine_durability_warning = Some(format!(
+                "source was quarantined, but source-parent synchronization failed; cleanup continued in degraded durability mode: {error}"
+            ));
+        }
+    }
+
+    io.source_tree_walks = io.source_tree_walks.saturating_add(1);
+    let cleanup_outcome = match delete_verified_quarantine_progress_accounted(
         &quarantine,
         destination,
-        policy.delete,
-        &manifest,
-        &destination_manifest,
+        &copy_outcome.source_manifest,
+        &copy_outcome.destination_manifest,
         progress,
+        io,
     ) {
-        return Err(committed_operation_warning(
-            source,
-            destination,
-            format!(
-                "destination published, but verified source cleanup did not complete; remnants remain quarantined at {}: {}",
-                quarantine.display(),
-                error.message()
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            let detail = if failure.deleted_entries == 0 {
+                let (restored, recovery) = try_restore_picker_quarantine_accounted(
+                    &quarantine,
+                    source,
+                    io,
+                );
+                if restored
+                    && matches!(
+                        &failure.error,
+                        FilePickerError::OperationSkipped | FilePickerError::OperationCancelled
+                    )
+                {
+                    *recovery_out = Some(authoritative_recovery.clone());
+                }
+                format!(
+                    "verified source cleanup stopped before any quarantined entry was deleted: {}; {}",
+                    failure.error.message(),
+                    recovery
+                )
+            } else {
+                format!(
+                    "verified source cleanup stopped after deleting {} quarantined entr{}; undeleted remnants remain at {}: {}",
+                    failure.deleted_entries,
+                    if failure.deleted_entries == 1 { "y" } else { "ies" },
+                    quarantine.display(),
+                    failure.error.message()
+                )
+            };
+            return Err(destination_committed_move_incomplete(
+                source,
+                destination,
+                detail,
+            ));
+        }
+    };
+
+    let mut completion_warnings = copy_outcome.notices;
+    completion_warnings.extend(quarantine_durability_warning);
+    if let Some(control_error) = cleanup_outcome.post_completion_control {
+        let message = match control_error {
+            FilePickerError::OperationSkipped =>
+                "a skip request arrived after the verified source root was already deleted; the move completed".to_string(),
+            FilePickerError::OperationCancelled =>
+                "an abort request arrived after the verified source root was already deleted; the move completed".to_string(),
+            other => format!(
+                "progress handling reported an error after the verified source root was already deleted; the move completed: {}",
+                other.message()
             ),
-        ));
+        };
+        completion_warnings.push(message);
     }
     if let Some(container) = quarantine.parent() {
         if let Err(err) = fs::remove_dir(container) {
             if err.kind() != io::ErrorKind::NotFound {
-                return Err(committed_operation_warning(
-                    source,
-                    destination,
-                    format!(
-                        "verified source removed, but empty quarantine {} could not be removed: {err}",
-                        container.display()
-                    ),
+                completion_warnings.push(format!(
+                    "verified source removed, but empty quarantine {} could not be removed: {err}",
+                    container.display()
                 ));
             }
         }
     }
     if let Some(parent) = source.parent() {
-        if let Err(err) = sync_directory(parent) {
-            return Err(committed_operation_warning(
-                source,
-                destination,
-                format!("verified source removed, but source-parent synchronization failed: {err}"),
+        if let Err(err) = sync_directory_accounted(parent, io) {
+            completion_warnings.push(format!(
+                "verified source removed, but source-parent synchronization failed: {err}"
             ));
         }
+    }
+    completion_warnings.extend(quarantine_mode.degraded_warning().map(str::to_string));
+    completion_warnings.extend(identity_policy_warning);
+    if !completion_warnings.is_empty() {
+        return Err(committed_operation_warning(
+            source,
+            destination,
+            format!("move completed: {}", completion_warnings.join("; ")),
+        ));
     }
     Ok(())
 }
@@ -3460,7 +4218,10 @@ fn copy_then_delete_progress(
 static PICKER_SOURCE_QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn quarantine_picker_source(source: &Path) -> Result<PathBuf, String> {
+fn quarantine_picker_source_accounted(
+    source: &Path,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(PathBuf, RenameNoReplaceMode), String> {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     let pid = std::process::id();
     for _ in 0..256 {
@@ -3480,12 +4241,18 @@ fn quarantine_picker_source(source: &Path) -> Result<PathBuf, String> {
             }
         }
         let quarantine = container.join("payload");
+        io.rename_attempts = io.rename_attempts.saturating_add(1);
         match rename_no_replace(source, &quarantine) {
-            Ok(()) => return Ok(quarantine),
+            Ok(mode) => {
+                if matches!(mode, RenameNoReplaceMode::CheckedBestEffort) {
+                    io.rename_fallbacks = io.rename_fallbacks.saturating_add(1);
+                }
+                return Ok((quarantine, mode));
+            }
             Err(error) => {
                 let _ = fs::remove_dir(&container);
                 return Err(format!(
-                    "could not atomically quarantine {} without replacing another path: {error}",
+                    "could not quarantine {} without replacing another path: {error}",
                     source.display()
                 ));
             }
@@ -3497,10 +4264,21 @@ fn quarantine_picker_source(source: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-fn try_restore_picker_quarantine(quarantine: &Path, original: &Path) -> (bool, String) {
+fn try_restore_picker_quarantine_accounted(
+    quarantine: &Path,
+    original: &Path,
+    io: &mut crate::FileOperationIoCounters,
+) -> (bool, String) {
+    io.rename_attempts = io.rename_attempts.saturating_add(1);
     match rename_no_replace(quarantine, original) {
-        Ok(()) => {
+        Ok(mode) => {
+            if matches!(mode, RenameNoReplaceMode::CheckedBestEffort) {
+                io.rename_fallbacks = io.rename_fallbacks.saturating_add(1);
+            }
             let mut details = vec![format!("source restored to {}", original.display())];
+            if let Some(warning) = mode.degraded_warning() {
+                details.push(warning.to_string());
+            }
             if let Some(container) = quarantine.parent() {
                 if let Err(error) = fs::remove_dir(container) {
                     if error.kind() != io::ErrorKind::NotFound {
@@ -3512,7 +4290,7 @@ fn try_restore_picker_quarantine(quarantine: &Path, original: &Path) -> (bool, S
                 }
             }
             if let Some(parent) = original.parent() {
-                if let Err(error) = sync_directory(parent) {
+                if let Err(error) = sync_directory_accounted(parent, io) {
                     details.push(format!(
                         "restored source parent could not be synchronized: {error}"
                     ));
@@ -3531,18 +4309,66 @@ fn try_restore_picker_quarantine(quarantine: &Path, original: &Path) -> (bool, S
     }
 }
 
-fn restore_picker_quarantine(quarantine: &Path, original: &Path) -> String {
-    try_restore_picker_quarantine(quarantine, original).1
+#[derive(Debug)]
+struct VerifiedQuarantineCleanupOutcome {
+    /// A callback error observed only after the complete verified source root
+    /// had already been removed. The move is complete; callers report this as
+    /// a committed warning rather than an incomplete move.
+    post_completion_control: Option<FilePickerError>,
 }
 
-fn delete_verified_quarantine_progress(
+#[derive(Debug)]
+struct VerifiedQuarantineCleanupFailure {
+    error: FilePickerError,
+    /// Number of quarantined entries irreversibly removed before the failure.
+    deleted_entries: usize,
+}
+
+fn delete_verified_quarantine_progress_accounted(
     root: &Path,
-    path: &Path,
     destination: &Path,
-    policy: DeletePolicy,
     manifest: &crate::SourceManifest,
     destination_manifest: &crate::DestinationManifest,
     progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<VerifiedQuarantineCleanupOutcome, VerifiedQuarantineCleanupFailure> {
+    let mut deleted_entries = 0usize;
+    let mut post_completion_control = None;
+    io.destination_entry_verification_passes = io
+        .destination_entry_verification_passes
+        .saturating_add(1);
+    match delete_verified_quarantine_entry_progress_accounted(
+        root,
+        root,
+        destination,
+        manifest,
+        destination_manifest,
+        progress,
+        &mut deleted_entries,
+        &mut post_completion_control,
+        io,
+    ) {
+        Ok(()) => Ok(VerifiedQuarantineCleanupOutcome {
+            post_completion_control,
+        }),
+        Err(error) => Err(VerifiedQuarantineCleanupFailure {
+            error,
+            deleted_entries,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delete_verified_quarantine_entry_progress_accounted(
+    root: &Path,
+    path: &Path,
+    destination: &Path,
+    manifest: &crate::SourceManifest,
+    destination_manifest: &crate::DestinationManifest,
+    progress: &mut FileOperationProgress<'_>,
+    deleted_entries: &mut usize,
+    post_completion_control: &mut Option<FilePickerError>,
+    io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
     progress(path, destination, 0, false)?;
     let relative = path.strip_prefix(root).map_err(|_| FilePickerError::Io {
@@ -3550,78 +4376,141 @@ fn delete_verified_quarantine_progress(
         path: path.to_path_buf(),
         message: "quarantine traversal escaped its root".to_string(),
     })?;
-    manifest
-        .verify_entry_at(relative, path)
-        .map_err(|message| FilePickerError::Io {
-            op: "verify quarantined source entry",
-            path: path.to_path_buf(),
-            message,
-        })?;
     let expected = manifest.expected_snapshot(relative).ok_or_else(|| FilePickerError::Io {
         op: "verify quarantined source manifest",
         path: path.to_path_buf(),
         message: "unplanned source entry appeared during cleanup".to_string(),
     })?;
-
-    if expected.kind() == crate::SourceKind::Directory {
-        match policy {
-            DeletePolicy::FilesAndEmptyDirectories => {}
-            DeletePolicy::Recursive => {
-                let mut children = fs::read_dir(path)
-                    .map_err(|err| io_error("read quarantined source directory", path, err))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|err| io_error("read quarantined source entry", path, err))?;
-                children.sort_by_key(|entry| entry.file_name());
-                for child in children {
-                    delete_verified_quarantine_progress(
-                        root,
-                        &child.path(),
-                        destination,
-                        policy,
-                        manifest,
-                        destination_manifest,
-                        progress,
-                    )?;
-                }
-            }
-        }
-    }
-
-    if expected.kind() != crate::SourceKind::Directory {
-        manifest
-            .verify_entry_at(relative, path)
-            .map_err(|message| FilePickerError::Io {
-                op: "verify source content and identity immediately before deletion",
-                path: path.to_path_buf(),
-                message,
-            })?;
-    }
-
-    let immediately_before_delete = crate::snapshot_path(path)
-        .map_err(|error| io_error("re-identify source immediately before deletion", path, error))?;
-    expected
-        .verify_same_identity(&immediately_before_delete)
-        .map_err(|message| FilePickerError::Io {
-            op: "verify source identity immediately before deletion",
-            path: path.to_path_buf(),
-            message,
-        })?;
-
-    // Make the corresponding destination proof the final gate before source
-    // removal. The source lives inside a private quarantine at this point; if
-    // the destination disappeared, changed contents, or changed pathname
-    // identity after the earlier whole-tree verification, cleanup stops here.
     let destination_path = if relative.as_os_str().is_empty() {
         destination.to_path_buf()
     } else {
         destination.join(relative)
     };
+
+    // Verify the quarantined source first. Destination stability is checked
+    // afterward as the final gate immediately before this source entry is
+    // removed, minimizing the unavoidable pathname-to-unlink race.
+
+    if expected.kind() == crate::SourceKind::Directory {
+        let source_bytes_rehashed = manifest
+            .verify_cleanup_entry_at(relative, path)
+            .map_err(|message| FilePickerError::Io {
+                op: "verify quarantined source directory",
+                path: path.to_path_buf(),
+                message,
+            })?;
+        io.source_bytes_hashed = io
+            .source_bytes_hashed
+            .saturating_add(source_bytes_rehashed);
+        let mut children = fs::read_dir(path)
+            .map_err(|err| io_error("read quarantined source directory", path, err))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| io_error("read quarantined source entry", path, err))?;
+        children.sort_by_key(|entry| entry.file_name());
+        let actual_children = children
+            .iter()
+            .map(|entry| entry.file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_children = manifest.expected_direct_children(relative);
+        if actual_children != expected_children {
+            return Err(FilePickerError::Io {
+                op: "verify quarantined source membership",
+                path: path.to_path_buf(),
+                message: "source tree membership changed after the copy-time proof was captured"
+                    .to_string(),
+            });
+        }
+        for child in children {
+            delete_verified_quarantine_entry_progress_accounted(
+                root,
+                &child.path(),
+                destination,
+                manifest,
+                destination_manifest,
+                progress,
+                deleted_entries,
+                post_completion_control,
+                io,
+            )?;
+        }
+        let before_remove = crate::snapshot_path(path)
+            .map_err(|error| io_error("re-identify source directory before removal", path, error))?;
+        expected
+            .verify_same_identity_with_policy(
+                &before_remove,
+                crate::filesystem_identity_policy(path),
+            )
+            .map_err(|message| FilePickerError::Io {
+                op: "verify source directory identity before removal",
+                path: path.to_path_buf(),
+                message,
+            })?;
+        verify_destination_entry_before_source_deletion(
+            path,
+            &destination_path,
+            relative,
+            manifest,
+            destination_manifest,
+            progress,
+            io,
+        )?;
+        fs::remove_dir(path)
+            .map_err(|err| io_error("delete quarantined source directory", path, err))?;
+    } else {
+        let source_bytes_rehashed = manifest
+            .verify_cleanup_entry_at(relative, path)
+            .map_err(|message| FilePickerError::Io {
+                op: "verify source content and identity immediately before deletion",
+                path: path.to_path_buf(),
+                message,
+            })?;
+        io.source_bytes_hashed = io
+            .source_bytes_hashed
+            .saturating_add(source_bytes_rehashed);
+        verify_destination_entry_before_source_deletion(
+            path,
+            &destination_path,
+            relative,
+            manifest,
+            destination_manifest,
+            progress,
+            io,
+        )?;
+        fs::remove_file(path)
+            .map_err(|err| io_error("delete quarantined source file", path, err))?;
+    }
+    *deleted_entries = (*deleted_entries).saturating_add(1);
+
+    match progress(path, destination, 0, true) {
+        Ok(()) => Ok(()),
+        Err(error) if path == root => {
+            *post_completion_control = Some(error);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_destination_entry_before_source_deletion(
+    source_path: &Path,
+    destination_path: &Path,
+    relative: &Path,
+    manifest: &crate::SourceManifest,
+    destination_manifest: &crate::DestinationManifest,
+    progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
+    // Strict mounts use the exact post-content-verification version token,
+    // including ctime. Reduced-semantics mounts perform the irreducible final
+    // destination digest read here, after source verification and immediately
+    // before unlinking the corresponding source entry.
     let mut verification_interruption = None;
-    let destination_verification = destination_manifest.verify_entry_at_with_cancel(
+    let verification = destination_manifest.verify_entry_at_with_cancel_counted(
         manifest,
         relative,
-        &destination_path,
-        &mut |verified_path| match progress(path, verified_path, 0, false) {
+        destination_path,
+        &mut |verified_path| match progress(source_path, verified_path, 0, false) {
             Ok(()) => true,
             Err(error) => {
                 verification_interruption = Some(error);
@@ -3632,20 +4521,15 @@ fn delete_verified_quarantine_progress(
     if let Some(error) = verification_interruption {
         return Err(error);
     }
-    destination_verification.map_err(|message| FilePickerError::Io {
-        op: "verify destination immediately before source deletion",
-        path: destination_path,
+    let destination_bytes_rehashed = verification.map_err(|message| FilePickerError::Io {
+        op: "revalidate verified destination before source deletion",
+        path: destination_path.to_path_buf(),
         message,
     })?;
-
-    if immediately_before_delete.kind() == crate::SourceKind::Directory {
-        fs::remove_dir(path)
-            .map_err(|err| io_error("delete quarantined source directory", path, err))?;
-    } else {
-        fs::remove_file(path)
-            .map_err(|err| io_error("delete quarantined source file", path, err))?;
-    }
-    progress(path, destination, 0, true)
+    io.destination_bytes_hashed = io
+        .destination_bytes_hashed
+        .saturating_add(destination_bytes_rehashed);
+    Ok(())
 }
 
 fn committed_operation_warning(
@@ -3654,6 +4538,30 @@ fn committed_operation_warning(
     message: String,
 ) -> FilePickerError {
     FilePickerError::OperationCommittedWithWarning {
+        source: source.to_path_buf(),
+        destination: destination.to_path_buf(),
+        message,
+    }
+}
+
+fn committed_operation_unverified(
+    source: &Path,
+    destination: &Path,
+    message: String,
+) -> FilePickerError {
+    FilePickerError::OperationCommittedButUnverified {
+        source: source.to_path_buf(),
+        destination: destination.to_path_buf(),
+        message,
+    }
+}
+
+fn destination_committed_move_incomplete(
+    source: &Path,
+    destination: &Path,
+    message: String,
+) -> FilePickerError {
+    FilePickerError::DestinationCommittedMoveIncomplete {
         source: source.to_path_buf(),
         destination: destination.to_path_buf(),
         message,
@@ -3849,7 +4757,7 @@ fn unique_path_reserving(path: &Path, reserved: &HashSet<PathBuf>) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_no_replace_fast(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -3891,19 +4799,109 @@ fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_no_replace_fast(source: &Path, destination: &Path) -> io::Result<()> {
     // std::fs::rename maps to a no-replace move on Windows when the destination
     // already exists.
     fs::rename(source, destination)
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_no_replace_fast(source: &Path, destination: &Path) -> io::Result<()> {
     let _ = (source, destination);
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "atomic no-replace rename is unavailable on this target; refusing an unsafe fallback",
+        "atomic no-replace rename is unavailable on this target",
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameNoReplaceMode {
+    Atomic,
+    /// The filesystem rejected the atomic no-replace primitive. We checked
+    /// that the destination was absent immediately before a plain rename.
+    /// Another process can still create the destination in that narrow window;
+    /// callers surface this honest degraded-mode notice after the commit.
+    CheckedBestEffort,
+}
+
+impl RenameNoReplaceMode {
+    fn degraded_warning(self) -> Option<&'static str> {
+        matches!(self, Self::CheckedBestEffort).then_some(
+            "filesystem lacks atomic no-clobber rename; used a checked best-effort rename",
+        )
+    }
+}
+
+fn checked_best_effort_rename_no_replace(
+    source: &Path,
+    destination: &Path,
+) -> io::Result<RenameNoReplaceMode> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("destination already exists: {}", destination.display()),
+            ));
+        }
+        Err(probe) if probe.kind() == io::ErrorKind::NotFound => {}
+        Err(probe) => return Err(probe),
+    }
+    fs::rename(source, destination)?;
+    Ok(RenameNoReplaceMode::CheckedBestEffort)
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
+fn rename_no_replace_with<F>(
+    source: &Path,
+    destination: &Path,
+    fast_path: F,
+) -> io::Result<RenameNoReplaceMode>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    match fast_path(source, destination) {
+        Ok(()) => Ok(RenameNoReplaceMode::Atomic),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            checked_best_effort_rename_no_replace(source, destination)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<RenameNoReplaceMode> {
+    if crate::filesystem_capabilities(destination).atomic_no_replace_rename
+        == crate::CapabilitySupport::Unsupported
+    {
+        return checked_best_effort_rename_no_replace(source, destination);
+    }
+    match rename_no_replace_fast(source, destination) {
+        Ok(()) => {
+            crate::record_filesystem_capability(
+                destination,
+                crate::FilesystemCapabilityKind::AtomicNoReplaceRename,
+                crate::CapabilitySupport::Supported,
+            );
+            Ok(RenameNoReplaceMode::Atomic)
+        }
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            crate::record_filesystem_capability(
+                destination,
+                crate::FilesystemCapabilityKind::AtomicNoReplaceRename,
+                crate::CapabilitySupport::Unsupported,
+            );
+            checked_best_effort_rename_no_replace(source, destination)
+        }
+        Err(error) => {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                crate::record_filesystem_capability(
+                    destination,
+                    crate::FilesystemCapabilityKind::AtomicNoReplaceRename,
+                    crate::CapabilitySupport::Supported,
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 fn safe_copy_path(src: &Path, dst: &Path, policy: FileOperationPolicy) -> Result<(), FilePickerError> {
@@ -3917,6 +4915,98 @@ fn safe_copy_path_progress(
     policy: FileOperationPolicy,
     progress: &mut FileOperationProgress<'_>,
 ) -> Result<(), FilePickerError> {
+    let mut io = crate::FileOperationIoCounters::default();
+    match safe_copy_path_progress_with_notices_accounted(src, dst, policy, progress, &mut io) {
+        Ok(mut outcome) => {
+            if let Some(control_error) = outcome.post_publication_control {
+                outcome.notices.push(format!(
+                    "progress control changed after the verified copy completed: {}",
+                    control_error.message()
+                ));
+            }
+            if outcome.notices.is_empty() {
+                Ok(())
+            } else {
+                Err(committed_operation_warning(
+                    src,
+                    dst,
+                    outcome.notices.join("; "),
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedCopyOutcome {
+    /// The authoritative copy-time source proof. File digests are computed in
+    /// the same read that writes private staging; no preliminary hash pass is
+    /// performed on the normal copy route.
+    source_manifest: crate::SourceManifest,
+    /// Identity snapshots for the exact published objects that passed the one
+    /// authoritative destination content-verification traversal.
+    destination_manifest: crate::DestinationManifest,
+    /// Non-fatal metadata, cleanup, or durability limitations observed after
+    /// content authority was established.
+    notices: Vec<String>,
+    /// A control event delivered by the publication-layer `completed == true`
+    /// callback after the final destination has been verified. Copy callers
+    /// may report this as a completed-copy warning. Move callers must treat it
+    /// as incomplete because source cleanup has not begun.
+    post_publication_control: Option<FilePickerError>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // retained synchronous compatibility/test entry point
+fn safe_copy_path_progress_with_notices_and_verifier<F>(
+    src: &Path,
+    dst: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    verify_published: F,
+) -> Result<VerifiedCopyOutcome, FilePickerError>
+where
+    F: FnOnce(&crate::SourceManifest, &Path) -> Result<crate::DestinationManifest, String>,
+{
+    let mut io = crate::FileOperationIoCounters::default();
+    safe_copy_path_progress_with_notices_and_verifier_accounted(
+        src,
+        dst,
+        policy,
+        progress,
+        &mut io,
+        verify_published,
+    )
+}
+
+fn safe_copy_path_progress_with_notices_accounted(
+    src: &Path,
+    dst: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<VerifiedCopyOutcome, FilePickerError> {
+    safe_copy_path_progress_with_notices_and_verifier_accounted(
+        src,
+        dst,
+        policy,
+        progress,
+        io,
+        |manifest, published| manifest.capture_verified_copy_at(published),
+    )
+}
+
+fn safe_copy_path_progress_with_notices_and_verifier_accounted<F>(
+    src: &Path,
+    dst: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+    verify_published: F,
+) -> Result<VerifiedCopyOutcome, FilePickerError>
+where
+    F: FnOnce(&crate::SourceManifest, &Path) -> Result<crate::DestinationManifest, String>,
+{
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     if fs::symlink_metadata(dst).is_ok() {
         return Err(FilePickerError::DestinationExists(dst.to_path_buf()));
@@ -3925,69 +5015,73 @@ fn safe_copy_path_progress(
     let staging = staging_container.join("payload");
     let mut visited = HashSet::new();
     let mut metadata_warnings = Vec::new();
-    let mut publication_identity_warning = None;
+    let mut source_manifest = crate::SourceManifest::default();
+    io.source_tree_walks = io.source_tree_walks.saturating_add(1);
     let result = copy_path_to_staging(
+        src,
         src,
         &staging,
         policy,
         &mut visited,
         progress,
         &mut metadata_warnings,
+        &mut source_manifest,
+        io,
     )
     .and_then(|()| {
         progress(src, dst, 0, false)?;
-        let staged_identity = crate::snapshot_path(&staging)
-            .map_err(|error| io_error("identify completed staged copy", &staging, error))?;
-        rename_no_replace(&staging, dst).map_err(|err| {
+        io.rename_attempts = io.rename_attempts.saturating_add(1);
+        let publication_mode = rename_no_replace(&staging, dst).map_err(|err| {
             if err.kind() == io::ErrorKind::AlreadyExists {
                 FilePickerError::DestinationExists(dst.to_path_buf())
             } else {
                 io_error("commit staged copy", dst, err)
             }
         })?;
-        publication_identity_warning = match crate::snapshot_path(dst) {
-            Ok(destination_identity) => staged_identity
-                .verify_same_identity(&destination_identity)
-                .err()
-                .map(|message| format!(
-                    "final destination no longer names the staged object published by this operation: {message}"
-                )),
-            Err(error) => Some(format!(
-                "could not re-identify the final destination after publication: {error}"
-            )),
-        };
-        Ok(())
+        if matches!(publication_mode, RenameNoReplaceMode::CheckedBestEffort) {
+            io.rename_fallbacks = io.rename_fallbacks.saturating_add(1);
+        }
+        if let Some(warning) = publication_mode.degraded_warning() {
+            metadata_warnings.push(warning.to_string());
+        }
+        io.destination_tree_walks = io.destination_tree_walks.saturating_add(1);
+        io.destination_bytes_hashed = io
+            .destination_bytes_hashed
+            .saturating_add(source_manifest.total_file_bytes());
+        let destination_manifest = verify_published(&source_manifest, dst).map_err(|message| {
+            committed_operation_unverified(
+                src,
+                dst,
+                format!(
+                    "post-publication content verification failed; source retained: {message}"
+                ),
+            )
+        })?;
+        Ok(destination_manifest)
     });
     match result {
-        Ok(()) => {
-            let mut warnings = metadata_warnings;
-            if let Some(warning) = publication_identity_warning {
-                warnings.push(warning);
-            }
+        Ok(destination_manifest) => {
+            let mut notices = metadata_warnings;
             if let Err(err) = fs::remove_dir(&staging_container) {
                 if err.kind() != io::ErrorKind::NotFound {
-                    warnings.push(format!(
+                    notices.push(format!(
                         "could not remove empty staging directory {}: {err}",
                         staging_container.display()
                     ));
                 }
             }
-            if let Err(err) = sync_directory(parent) {
-                warnings.push(format!(
-                    "destination directory synchronization failed: {err}"
+            if let Err(err) = sync_directory_accounted(parent, io) {
+                notices.push(format!(
+                    "destination directory synchronization failed after verified publication: {err}"
                 ));
             }
-            if let Err(err) = progress(src, dst, 0, true) {
-                warnings.push(format!(
-                    "progress control changed after copy publication: {}",
-                    err.message()
-                ));
-            }
-            if warnings.is_empty() {
-                Ok(())
-            } else {
-                Err(committed_operation_warning(src, dst, warnings.join("; ")))
-            }
+            let post_publication_control = progress(src, dst, 0, true).err();
+            Ok(VerifiedCopyOutcome {
+                source_manifest,
+                destination_manifest,
+                notices,
+                post_publication_control,
+            })
         }
         Err(err) => {
             cleanup_staging(&staging_container);
@@ -3996,46 +5090,77 @@ fn safe_copy_path_progress(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_path_to_staging(
+    root_src: &Path,
     src: &Path,
     dst: &Path,
     policy: FileOperationPolicy,
     visited: &mut HashSet<PathBuf>,
     progress: &mut FileOperationProgress<'_>,
     metadata_warnings: &mut Vec<String>,
+    source_manifest: &mut crate::SourceManifest,
+    io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
     progress(src, dst, 0, false)?;
     let source_snapshot = crate::snapshot_path(src)
         .map_err(|err| io_error("capture source identity", src, err))?;
-    let symlink_metadata = fs::symlink_metadata(src).map_err(|err| io_error("read metadata", src, err))?;
+    let relative = src.strip_prefix(root_src).map_err(|_| FilePickerError::Io {
+        op: "build copy-time source manifest",
+        path: src.to_path_buf(),
+        message: "source traversal escaped its root".to_string(),
+    })?.to_path_buf();
+    let symlink_metadata = fs::symlink_metadata(src)
+        .map_err(|err| io_error("read metadata", src, err))?;
     if symlink_metadata.file_type().is_symlink() {
         match policy.symlink_copy {
-            SymlinkCopyPolicy::Reject => return Err(FilePickerError::SymlinkRejected(src.to_path_buf())),
+            SymlinkCopyPolicy::Reject => {
+                return Err(FilePickerError::SymlinkRejected(src.to_path_buf()))
+            }
             SymlinkCopyPolicy::FollowTarget => {}
         }
     }
     let metadata = fs::metadata(src).map_err(|err| io_error("read target metadata", src, err))?;
     if metadata.is_dir() {
-        let src_canon = src.canonicalize().map_err(|err| io_error("canonicalize source", src, err))?;
+        let src_canon = src
+            .canonicalize()
+            .map_err(|err| io_error("canonicalize source", src, err))?;
         let dst_parent_canon = dst
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .canonicalize()
             .map_err(|err| io_error("canonicalize destination parent", dst, err))?;
         if dst_parent_canon.starts_with(&src_canon) || !visited.insert(src_canon.clone()) {
-            return Err(FilePickerError::CopyCycleRejected { source: src_canon, destination: dst.to_path_buf() });
+            return Err(FilePickerError::CopyCycleRejected {
+                source: src_canon,
+                destination: dst.to_path_buf(),
+            });
         }
+        source_manifest
+            .insert(relative, source_snapshot.clone(), None)
+            .map_err(|message| FilePickerError::Io {
+                op: "record copy-time directory proof",
+                path: src.to_path_buf(),
+                message,
+            })?;
         fs::create_dir(dst).map_err(|err| io_error("create staged directory", dst, err))?;
         let result = copy_dir_contents(
+            root_src,
             src,
             dst,
             policy,
             visited,
             progress,
             metadata_warnings,
+            source_manifest,
+            io,
         )
         .and_then(|()| {
-            match crate::verify_path(src, &source_snapshot) {
+            match crate::verify_path_with_capabilities(
+                src,
+                &source_snapshot,
+                crate::filesystem_capabilities(src),
+            ) {
                 Ok(()) => metadata_warnings.extend(
                     preserve_copied_metadata(src, dst, &metadata)
                         .into_iter()
@@ -4046,7 +5171,19 @@ fn copy_path_to_staging(
                     src.display()
                 )),
             }
-            sync_directory(dst).map_err(|err| io_error("sync copied directory", dst, err))
+            if let Err(err) = sync_directory_accounted(dst, io) {
+                if crate::filesystem_identity_policy(dst)
+                    == crate::FilesystemIdentityPolicy::ContentVerifiedPortable
+                {
+                    metadata_warnings.push(format!(
+                        "{}: directory synchronization is unavailable on this filesystem: {err}",
+                        dst.display()
+                    ));
+                } else {
+                    return Err(io_error("sync copied directory", dst, err));
+                }
+            }
+            Ok(())
         });
         visited.remove(&src_canon);
         result?;
@@ -4057,14 +5194,22 @@ fn copy_path_to_staging(
         } else {
             None
         };
-        copy_regular_file(
+        let (proof_snapshot, digest) = copy_regular_file(
             src,
             dst,
             &metadata,
             expected_snapshot,
             progress,
             metadata_warnings,
+            io,
         )?;
+        source_manifest
+            .insert(relative, proof_snapshot, Some(digest))
+            .map_err(|message| FilePickerError::Io {
+                op: "record copy-time file proof",
+                path: src.to_path_buf(),
+                message,
+            })?;
         progress(src, dst, 0, true)
     } else {
         Err(FilePickerError::Io {
@@ -4075,26 +5220,37 @@ fn copy_path_to_staging(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_dir_contents(
+    root_src: &Path,
     src: &Path,
     dst: &Path,
     policy: FileOperationPolicy,
     visited: &mut HashSet<PathBuf>,
     progress: &mut FileOperationProgress<'_>,
     metadata_warnings: &mut Vec<String>,
+    source_manifest: &mut crate::SourceManifest,
+    io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
-    for entry in fs::read_dir(src).map_err(|err| io_error("read directory", src, err))? {
+    let mut entries = fs::read_dir(src)
+        .map_err(|err| io_error("read directory", src, err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| io_error("read directory entry", src, err))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         progress(src, dst, 0, false)?;
-        let entry = entry.map_err(|err| io_error("read directory entry", src, err))?;
         let child_src = entry.path();
         let child_dst = dst.join(entry.file_name());
         copy_path_to_staging(
+            root_src,
             &child_src,
             &child_dst,
             policy,
             visited,
             progress,
             metadata_warnings,
+            source_manifest,
+            io,
         )?;
     }
     Ok(())
@@ -4107,13 +5263,17 @@ fn copy_regular_file(
     expected_snapshot: Option<&crate::SourceSnapshot>,
     progress: &mut FileOperationProgress<'_>,
     metadata_warnings: &mut Vec<String>,
-) -> Result<(), FilePickerError> {
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(crate::SourceSnapshot, crate::ContentDigest), FilePickerError> {
     let mut source = fs::File::open(src).map_err(|err| io_error("open source file", src, err))?;
     let opened_snapshot = crate::snapshot_open_file(&source)
         .map_err(|err| io_error("capture opened source identity", src, err))?;
     if let Some(expected) = expected_snapshot {
         expected
-            .verify_same_object_and_version(&opened_snapshot)
+            .verify_same_object_and_version_with_capabilities(
+                &opened_snapshot,
+                crate::filesystem_capabilities(src),
+            )
             .map_err(|message| FilePickerError::Io {
                 op: "verify source identity before copying",
                 path: src.to_path_buf(),
@@ -4130,16 +5290,22 @@ fn copy_regular_file(
         .map_err(|err| io_error("create staged file", dst, err))?;
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut copied = 0u64;
+    let mut sha = crate::Sha256::new();
     loop {
         progress(src, dst, 0, false)?;
-        let read = source.read(&mut buffer).map_err(|err| io_error("read source file", src, err))?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(|err| io_error("read source file", src, err))?;
         if read == 0 {
             break;
         }
         destination
             .write_all(&buffer[..read])
             .map_err(|err| io_error("write staged file", dst, err))?;
+        sha.update(&buffer[..read]);
         copied = copied.saturating_add(read as u64);
+        io.bytes_copied = io.bytes_copied.saturating_add(read as u64);
+        io.source_bytes_hashed = io.source_bytes_hashed.saturating_add(read as u64);
         progress(src, dst, read as u64, false)?;
     }
     let final_snapshot = crate::snapshot_open_file(&source)
@@ -4161,17 +5327,16 @@ fn copy_regular_file(
             ),
         });
     }
-    destination
-        .sync_all()
-        .map_err(|err| io_error("sync staged file", dst, err))?;
     metadata_warnings.extend(
         crate::preserve_open_file_metadata(&source, &destination)
             .into_iter()
             .map(|warning| format!("{}: {warning}", src.display())),
     );
+    io.file_sync_calls = io.file_sync_calls.saturating_add(1);
     destination
         .sync_all()
-        .map_err(|err| io_error("sync staged file metadata", dst, err))
+        .map_err(|err| io_error("sync staged file and metadata", dst, err))?;
+    Ok((opened_snapshot, sha.finalize()))
 }
 
 fn preserve_copied_metadata(
@@ -4358,10 +5523,45 @@ fn create_unique_staging_directory(parent: &Path) -> Result<PathBuf, FilePickerE
     })
 }
 
+fn sync_directory_accounted(
+    path: &Path,
+    io: &mut crate::FileOperationIoCounters,
+) -> io::Result<()> {
+    io.directory_sync_calls = io.directory_sync_calls.saturating_add(1);
+    sync_directory(path)
+}
+
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        fs::File::open(path)?.sync_all()
+        if crate::filesystem_capabilities(path).directory_sync
+            == crate::CapabilitySupport::Unsupported
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory synchronization is unsupported on this mount",
+            ));
+        }
+        let result = fs::File::open(path).and_then(|directory| directory.sync_all());
+        let support = match &result {
+            Ok(()) => crate::CapabilitySupport::Supported,
+            Err(error)
+                if error.kind() == io::ErrorKind::Unsupported
+                    || matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+                    ) =>
+            {
+                crate::CapabilitySupport::Unsupported
+            }
+            Err(_) => crate::CapabilitySupport::Unknown,
+        };
+        crate::record_filesystem_capability(
+            path,
+            crate::FilesystemCapabilityKind::DirectorySync,
+            support,
+        );
+        result
     }
     #[cfg(not(unix))]
     {
@@ -4664,6 +5864,958 @@ mod tests {
         assert_eq!(fs::read(&destination).expect("destination remains"), b"destination");
     }
 
+    #[test]
+    fn post_publication_verification_failure_is_a_failed_committed_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        fs::write(&source, b"source").expect("source");
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+
+        let error = safe_copy_path_progress_with_notices_and_verifier(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+            |_manifest, _published| Err("fixture verification failure".to_string()),
+        )
+        .expect_err("published but unverified destination must fail");
+
+        assert!(matches!(
+            error,
+            FilePickerError::OperationCommittedButUnverified { .. }
+        ));
+        assert_eq!(fs::read(&source).expect("source retained"), b"source");
+        assert_eq!(
+            fs::read(&destination).expect("destination preserved for inspection"),
+            b"source"
+        );
+    }
+
+    #[test]
+    fn only_verified_committed_warnings_are_classified_as_completed() {
+        let source = PathBuf::from("source");
+        let destination = PathBuf::from("destination");
+        assert_eq!(
+            classify_paste_root_result(Err(committed_operation_warning(
+                &source,
+                &destination,
+                "verified copy; directory sync unavailable".to_string(),
+            )))
+            .expect("verified warning remains completed"),
+            Some("verified copy; directory sync unavailable".to_string())
+        );
+        assert!(matches!(
+            classify_paste_root_result(Err(committed_operation_unverified(
+                &source,
+                &destination,
+                "content verification failed".to_string(),
+            ))),
+            Err(FilePickerError::OperationCommittedButUnverified { .. })
+        ));
+        assert!(matches!(
+            classify_paste_root_result(Err(destination_committed_move_incomplete(
+                &source,
+                &destination,
+                "source cleanup incomplete".to_string(),
+            ))),
+            Err(FilePickerError::DestinationCommittedMoveIncomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn final_control_after_verified_copy_is_a_completed_copy_warning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        fs::write(&source, b"source").expect("source");
+
+        let mut completed_callbacks = 0usize;
+        let mut staging_completion_seen = false;
+        let mut publication_seen = false;
+        let mut progress =
+            |_source: &Path, callback_destination: &Path, _bytes: u64, completed: bool| {
+                if !completed {
+                    return Ok(());
+                }
+                completed_callbacks += 1;
+                if callback_destination == destination.as_path() && destination.exists() {
+                    publication_seen = true;
+                    Err(FilePickerError::OperationSkipped)
+                } else {
+                    staging_completion_seen = true;
+                    Ok(())
+                }
+            };
+        let result = safe_copy_path_progress(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+        );
+
+        assert!(staging_completion_seen, "staging must complete before publication");
+        assert!(publication_seen, "control must be injected after publication");
+        assert_eq!(completed_callbacks, 2);
+        assert!(matches!(
+            classify_paste_root_result(result),
+            Ok(Some(message)) if message.contains("verified copy completed")
+        ));
+        assert_eq!(fs::read(&source).expect("source retained"), b"source");
+        assert_eq!(
+            fs::read(&destination).expect("verified copy retained"),
+            b"source"
+        );
+    }
+
+    fn assert_one_root_cut_stopped_after_publication_is_incomplete(
+        control_error: FilePickerError,
+        expected_reason: &str,
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        let destination = destination_dir.join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = plan_filesystem_paste(&clipboard, &destination_dir).expect("paste plan");
+        assert_eq!(plan.mappings.len(), 1);
+
+        let mut completed_callbacks = 0usize;
+        let mut staging_completion_seen = false;
+        let mut publication_seen = false;
+        let mut progress =
+            |_source: &Path, callback_destination: &Path, _bytes: u64, completed: bool| {
+                if !completed {
+                    return Ok(());
+                }
+                completed_callbacks += 1;
+                if callback_destination == destination.as_path() && destination.exists() {
+                    publication_seen = true;
+                    Err(control_error.clone())
+                } else {
+                    staging_completion_seen = true;
+                    Ok(())
+                }
+            };
+        let failure = execute_paste_plan_progress_with(&plan, |mode, mapping| {
+            assert_eq!(mode, FilePickerClipboardMode::Cut);
+            copy_then_delete_progress(
+                &mapping.source,
+                &mapping.destination,
+                FileOperationPolicy::default(),
+                &mut progress,
+            )
+        })
+        .expect_err("a stopped post-publication move must not return PasteSuccess");
+
+        assert!(staging_completion_seen, "staging completion must precede publication");
+        assert!(publication_seen, "the destination must exist before control is injected");
+        assert_eq!(
+            completed_callbacks, 2,
+            "the injected control event must occur on the final verified-copy callback"
+        );
+        assert!(failure.completed.is_empty());
+        assert_eq!(failure.remaining_sources, vec![source.clone()]);
+        match &failure.error {
+            FilePickerError::DestinationCommittedMoveIncomplete {
+                source: failed_source,
+                destination: failed_destination,
+                message,
+            } => {
+                assert_eq!(failed_source, &source);
+                assert_eq!(failed_destination, &destination);
+                assert!(message.contains(expected_reason), "message={message}");
+                assert!(
+                    message.contains("source cleanup did not begin"),
+                    "message={message}"
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(fs::read(&source).expect("source retained"), b"audio");
+        assert_eq!(
+            fs::read(&destination).expect("verified destination retained"),
+            b"audio"
+        );
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: source_dir.clone(),
+            ..FilePickerConfig::default()
+        });
+        picker.clipboard = Some(clipboard.clone());
+        picker.paste_task = Some(PickerPasteTask {
+            progress: crate::FileTaskProgressState::new(
+                crate::FileTaskKind::Move,
+                "Moving files",
+                picker.theme.clone(),
+            ),
+            receiver: None,
+            control: Arc::new(AtomicU8::new(PASTE_CONTROL_RUNNING)),
+            clipboard,
+            target_dir: destination_dir,
+            plan: plan.clone(),
+            retry_plan: None,
+        });
+        picker.finish_picker_paste(Err(failure));
+
+        assert_eq!(
+            picker
+                .clipboard
+                .as_ref()
+                .expect("cut retry state retained")
+                .paths(),
+            &[source.clone()]
+        );
+        assert_eq!(
+            picker
+                .paste_retry_plan
+                .as_ref()
+                .expect("exact retry plan retained")
+                .mappings,
+            vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }]
+        );
+        assert_eq!(picker.current_dir(), source_dir.as_path());
+        let task = picker.paste_task.as_ref().expect("failed progress retained");
+        assert!(matches!(task.progress.phase, crate::FileTaskPhase::Failed));
+    }
+
+    #[test]
+    fn final_skip_after_verified_publication_keeps_one_root_cut_incomplete() {
+        assert_one_root_cut_stopped_after_publication_is_incomplete(
+            FilePickerError::OperationSkipped,
+            "user skipped the move",
+        );
+    }
+
+    #[test]
+    fn final_abort_after_verified_publication_keeps_one_root_cut_incomplete() {
+        assert_one_root_cut_stopped_after_publication_is_incomplete(
+            FilePickerError::OperationCancelled,
+            "user aborted the move",
+        );
+    }
+
+    fn assert_control_after_complete_source_deletion_is_a_completed_move(
+        control_error: FilePickerError,
+        expected_text: &str,
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        fs::write(&source, b"audio").expect("source");
+
+        let mut root_delete_callback_seen = false;
+        let mut progress =
+            |callback_source: &Path, callback_destination: &Path, _bytes: u64, completed: bool| {
+                if completed
+                    && callback_destination == destination.as_path()
+                    && !callback_source.exists()
+                {
+                    root_delete_callback_seen = true;
+                    Err(control_error.clone())
+                } else {
+                    Ok(())
+                }
+            };
+        let plan = PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings: vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        };
+        let success = execute_paste_plan_progress_with(&plan, |mode, mapping| {
+            assert_eq!(mode, FilePickerClipboardMode::Cut);
+            copy_then_delete_progress(
+                &mapping.source,
+                &mapping.destination,
+                FileOperationPolicy::default(),
+                &mut progress,
+            )
+        })
+        .expect("a control event after root deletion must remain a completed move");
+
+        assert!(
+            root_delete_callback_seen,
+            "control must be injected only after the source root was removed"
+        );
+        assert_eq!(&success.mappings, &plan.mappings);
+        assert!(success.warnings.iter().any(|warning| {
+            warning.message.contains(expected_text)
+                && warning.message.contains("move completed")
+        }));
+        assert!(!source.exists(), "completed move source must remain deleted");
+        assert_eq!(
+            fs::read(&destination).expect("destination retained"),
+            b"audio"
+        );
+    }
+
+    #[test]
+    fn skip_after_complete_source_deletion_is_a_completed_move_warning() {
+        assert_control_after_complete_source_deletion_is_a_completed_move(
+            FilePickerError::OperationSkipped,
+            "skip request arrived after",
+        );
+    }
+
+    #[test]
+    fn abort_after_complete_source_deletion_is_a_completed_move_warning() {
+        assert_control_after_complete_source_deletion_is_a_completed_move(
+            FilePickerError::OperationCancelled,
+            "abort request arrived after",
+        );
+    }
+
+    #[test]
+    fn control_before_source_deletion_restores_the_original_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        fs::write(&source, b"audio").expect("source");
+
+        let mut post_quarantine_control_seen = false;
+        let mut progress =
+            |callback_source: &Path, callback_destination: &Path, _bytes: u64, completed: bool| {
+                if !completed
+                    && callback_destination == destination.as_path()
+                    && destination.exists()
+                    && !source.exists()
+                    && callback_source.file_name() == Some(OsStr::new("payload"))
+                {
+                    post_quarantine_control_seen = true;
+                    Err(FilePickerError::OperationSkipped)
+                } else {
+                    Ok(())
+                }
+            };
+        let error = copy_then_delete_progress(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+        )
+        .expect_err("control before deletion must stop the move");
+
+        assert!(
+            post_quarantine_control_seen,
+            "control must be injected after quarantine but before source deletion"
+        );
+        assert!(matches!(
+            error,
+            FilePickerError::DestinationCommittedMoveIncomplete { message, .. }
+                if message.contains("cleanup stopped before any quarantined entry was deleted")
+                    && message.contains("source restored to")
+        ));
+        assert_eq!(fs::read(&source).expect("source restored"), b"audio");
+        assert_eq!(
+            fs::read(&destination).expect("verified destination retained"),
+            b"audio"
+        );
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("temp entries")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tui-file-picker-source-quarantine-")),
+            "restoration must remove the empty quarantine container"
+        );
+    }
+
+    #[test]
+    fn control_after_child_deletion_is_an_incomplete_recursive_move() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let source_nested = source.join("nested");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(&source_nested).expect("source directory");
+        fs::write(source.join("a.flac"), b"a").expect("a");
+        fs::write(source_nested.join("b.flac"), b"b").expect("b");
+        let policy = FileOperationPolicy {
+            delete: DeletePolicy::Recursive,
+            ..FileOperationPolicy::default()
+        };
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings: vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        };
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: source_nested.clone(),
+            ..FilePickerConfig::default()
+        });
+
+        let mut child_delete_callback_seen = false;
+        let mut progress =
+            |callback_source: &Path, _destination: &Path, _bytes: u64, completed: bool| {
+                if completed
+                    && callback_source.file_name() == Some(OsStr::new("a.flac"))
+                    && !callback_source.exists()
+                {
+                    child_delete_callback_seen = true;
+                    Err(FilePickerError::OperationSkipped)
+                } else {
+                    Ok(())
+                }
+            };
+        let failure = execute_paste_plan_progress_with(&plan, |mode, mapping| {
+            assert_eq!(mode, FilePickerClipboardMode::Cut);
+            copy_then_delete_progress(
+                &mapping.source,
+                &mapping.destination,
+                policy,
+                &mut progress,
+            )
+        })
+        .expect_err("a stopped recursive cleanup must remain incomplete");
+
+        assert!(child_delete_callback_seen);
+        assert!(matches!(
+            &failure.error,
+            FilePickerError::DestinationCommittedMoveIncomplete { message, .. }
+                if message.contains("after deleting 1 quarantined entry")
+                    && message.contains("undeleted remnants remain")
+        ));
+        assert!(!source.exists(), "partially deleted source remains quarantined");
+        assert_eq!(fs::read(destination.join("a.flac")).expect("destination a"), b"a");
+        assert_eq!(
+            fs::read(destination.join("nested/b.flac")).expect("destination b"),
+            b"b"
+        );
+
+        picker.clipboard = Some(clipboard.clone());
+        picker.paste_task = Some(PickerPasteTask {
+            progress: crate::FileTaskProgressState::new(
+                crate::FileTaskKind::Move,
+                "Moving files",
+                picker.theme.clone(),
+            ),
+            receiver: None,
+            control: Arc::new(AtomicU8::new(PASTE_CONTROL_RUNNING)),
+            clipboard,
+            target_dir: temp.path().to_path_buf(),
+            plan,
+            retry_plan: None,
+        });
+        picker.finish_picker_paste(Err(failure));
+
+        let expected_current = destination.join("nested");
+        assert_eq!(
+            picker.current_dir(),
+            expected_current.as_path(),
+            "a current directory under an irreversibly removed source must adopt the verified destination"
+        );
+        assert!(picker.clipboard.is_none(), "partial deletion has no complete retry source");
+        assert!(picker.paste_retry_plan.is_none());
+        assert!(matches!(
+            picker
+                .paste_task
+                .as_ref()
+                .expect("failed task retained")
+                .progress
+                .phase,
+            crate::FileTaskPhase::Failed
+        ));
+    }
+
+    #[test]
+    fn default_policy_recursively_cleans_verified_directory_move_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_parent = temp.path().join("source-parent");
+        let destination_parent = temp.path().join("destination-parent");
+        let source = source_parent.join("album");
+        let destination = destination_parent.join("album");
+        fs::create_dir_all(source.join("disc/notes")).expect("source tree");
+        fs::create_dir(&destination_parent).expect("destination parent");
+        fs::write(source.join("disc/track.flac"), b"audio").expect("track");
+        fs::write(source.join("disc/notes/readme.txt"), b"notes").expect("notes");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+
+        let policy = FileOperationPolicy::default();
+        assert_eq!(policy.delete, DeletePolicy::FilesAndEmptyDirectories);
+        TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.set(true));
+        let success = paste_filesystem_clipboard(&clipboard, &destination_parent, policy)
+            .expect("default-policy portable directory move must complete");
+
+        assert_eq!(
+            success.mappings,
+            vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }]
+        );
+        assert!(!source.exists(), "verified move cleanup must remove the source tree");
+        assert_eq!(
+            fs::read(destination.join("disc/track.flac")).expect("destination track"),
+            b"audio"
+        );
+        assert_eq!(
+            fs::read(destination.join("disc/notes/readme.txt")).expect("destination notes"),
+            b"notes"
+        );
+    }
+
+    #[test]
+    fn default_explicit_delete_policy_still_refuses_nonempty_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("album");
+        fs::create_dir(&directory).expect("directory");
+        fs::write(directory.join("track.flac"), b"audio").expect("track");
+
+        let error = delete_path(&directory, DeletePolicy::FilesAndEmptyDirectories)
+            .expect_err("explicit default delete must not recurse");
+
+        assert!(directory.exists());
+        assert_eq!(fs::read(directory.join("track.flac")).expect("track"), b"audio");
+        assert!(matches!(error, FilePickerError::Io { .. }));
+    }
+
+    #[test]
+    fn retained_cut_retry_reuses_original_destination_without_duplicate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        let destination = destination_dir.join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let initial_plan = plan_filesystem_paste(&clipboard, &destination_dir).expect("plan");
+
+        let mut publication_seen = false;
+        let mut first_progress =
+            |_source: &Path, callback_destination: &Path, _bytes: u64, completed: bool| {
+                if completed
+                    && callback_destination == destination.as_path()
+                    && destination.exists()
+                {
+                    publication_seen = true;
+                    Err(FilePickerError::OperationSkipped)
+                } else {
+                    Ok(())
+                }
+            };
+        let first_failure = execute_paste_plan_progress_with(&initial_plan, |mode, mapping| {
+            assert_eq!(mode, FilePickerClipboardMode::Cut);
+            copy_then_delete_progress(
+                &mapping.source,
+                &mapping.destination,
+                FileOperationPolicy::default(),
+                &mut first_progress,
+            )
+        })
+        .expect_err("first move must stop after verified publication");
+        assert!(publication_seen);
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: source_dir.clone(),
+            ..FilePickerConfig::default()
+        });
+        picker.clipboard = Some(clipboard.clone());
+        picker.paste_task = Some(PickerPasteTask {
+            progress: crate::FileTaskProgressState::new(
+                crate::FileTaskKind::Move,
+                "Moving files",
+                picker.theme.clone(),
+            ),
+            receiver: None,
+            control: Arc::new(AtomicU8::new(PASTE_CONTROL_RUNNING)),
+            clipboard: clipboard.clone(),
+            target_dir: destination_dir.clone(),
+            plan: initial_plan.clone(),
+            retry_plan: None,
+        });
+        picker.finish_picker_paste(Err(first_failure));
+
+        let (retry_plan, resume_existing) = plan_filesystem_paste_with_retry(
+            picker.clipboard.as_ref().expect("cut clipboard retained"),
+            &destination_dir,
+            picker.paste_retry_plan.as_ref(),
+        )
+        .expect("retry plan");
+        assert!(resume_existing);
+        assert_eq!(&retry_plan.mappings, &initial_plan.mappings);
+        assert_eq!(
+            retry_plan.mappings[0].destination.as_path(),
+            destination.as_path()
+        );
+
+        let retained_retry = picker
+            .paste_retry_plan
+            .clone()
+            .expect("retained retry evidence");
+        let mut retry_progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+        let retry_success = execute_paste_plan_progress_with_resume(
+            &retry_plan,
+            FileOperationPolicy::default(),
+            Some(&retained_retry),
+            &mut retry_progress,
+        )
+        .expect("retry must verify the existing destination and finish cleanup");
+        assert_eq!(&retry_success.mappings, &retry_plan.mappings);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).expect("single destination"), b"audio");
+        assert!(!destination_dir.join("track 2.flac").exists());
+        let destination_entries = fs::read_dir(&destination_dir)
+            .expect("read destination")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("destination entries");
+        assert_eq!(destination_entries.len(), 1, "retry must not create a duplicate");
+
+        let retry_clipboard = picker.clipboard.clone().expect("retry clipboard");
+        picker.paste_task = Some(PickerPasteTask {
+            progress: crate::FileTaskProgressState::new(
+                crate::FileTaskKind::Move,
+                "Moving files",
+                picker.theme.clone(),
+            ),
+            receiver: None,
+            control: Arc::new(AtomicU8::new(PASTE_CONTROL_RUNNING)),
+            clipboard: retry_clipboard,
+            target_dir: destination_dir,
+            plan: retry_plan,
+            retry_plan: None,
+        });
+        picker.finish_picker_paste(Ok(retry_success));
+        assert!(picker.clipboard.is_none(), "completed cut retry clears clipboard");
+        assert!(picker.paste_retry_plan.is_none(), "completed retry clears exact plan");
+    }
+
+    #[test]
+    fn public_retry_api_reuses_exact_destination_after_incomplete_move() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        let destination = destination_dir.join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+
+        TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.set(true));
+        TEST_STOP_MOVE_AFTER_VERIFIED_PUBLICATION.with(|flag| flag.set(true));
+        let first_failure = paste_filesystem_clipboard(
+            &clipboard,
+            &destination_dir,
+            FileOperationPolicy::default(),
+        )
+        .expect_err("first public attempt must stop after verified publication");
+
+        assert!(matches!(
+            &first_failure.error,
+            FilePickerError::DestinationCommittedMoveIncomplete { .. }
+        ));
+        assert_eq!(fs::read(&source).expect("retained source"), b"audio");
+        assert_eq!(fs::read(&destination).expect("published destination"), b"audio");
+        let retry_plan = first_failure
+            .retry_plan
+            .expect("public failure must return the exact retry mapping");
+        assert_eq!(
+            retry_plan.mappings,
+            vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }]
+        );
+
+        let success = paste_filesystem_clipboard_with_retry(
+            &clipboard,
+            &destination_dir,
+            FileOperationPolicy::default(),
+            Some(&retry_plan),
+        )
+        .expect("public retry must verify and reuse the original destination");
+
+        assert_eq!(success.mappings, retry_plan.mappings);
+        assert!(!source.exists(), "retry must finish source cleanup");
+        assert_eq!(fs::read(&destination).expect("single destination"), b"audio");
+        assert!(!destination_dir.join("track 2.flac").exists());
+        let entries = fs::read_dir(&destination_dir)
+            .expect("destination entries")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("destination entries");
+        assert_eq!(entries.len(), 1, "public retry must not duplicate the destination");
+    }
+
+    #[test]
+    fn public_retry_api_rejects_a_plan_for_another_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        let other_destination_dir = temp.path().join("other-destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        fs::create_dir(&other_destination_dir).expect("other destination dir");
+        let source = source_dir.join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let stale_plan = PasteRetryPlan::from_plan(PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings: vec![PasteMapping {
+                source: source.clone(),
+                destination: other_destination_dir.join("track.flac"),
+            }],
+        });
+
+        let failure = paste_filesystem_clipboard_with_retry(
+            &clipboard,
+            &destination_dir,
+            FileOperationPolicy::default(),
+            Some(&stale_plan),
+        )
+        .expect_err("a retry plan for another destination must be rejected");
+
+        assert!(matches!(
+            &failure.error,
+            FilePickerError::WrongSelectionMode(
+                "retry plan does not match this cut clipboard and destination directory"
+            )
+        ));
+        assert!(failure.retry_plan.is_none());
+        assert_eq!(fs::read(&source).expect("source retained"), b"audio");
+        assert!(
+            fs::read_dir(&destination_dir)
+                .expect("destination entries")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retained_cut_retry_refuses_mismatched_original_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        let destination = destination_dir.join("track.flac");
+        fs::write(&source, b"source").expect("source");
+        fs::write(&destination, b"different").expect("mismatched destination");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let retry_plan = PasteRetryPlan::from_plan(PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings: vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        });
+        let (selected_plan, resume_existing) = plan_filesystem_paste_with_retry(
+            &clipboard,
+            &destination_dir,
+            Some(&retry_plan),
+        )
+        .expect("retry plan");
+        assert!(resume_existing);
+
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+        let failure = execute_paste_plan_progress_with_resume(
+            &selected_plan,
+            FileOperationPolicy::default(),
+            Some(&retry_plan),
+            &mut progress,
+        )
+        .expect_err("mismatched retained destination must fail closed");
+        assert!(matches!(
+            failure.error,
+            FilePickerError::DestinationCommittedMoveIncomplete { message, .. }
+                if message.contains("originally planned retry destination differs")
+        ));
+        assert_eq!(fs::read(&source).expect("source retained"), b"source");
+        assert_eq!(fs::read(&destination).expect("destination retained"), b"different");
+        assert!(!destination_dir.join("track 2.flac").exists());
+    }
+
+    #[test]
+    fn failed_committed_move_keeps_cut_clipboard_and_does_not_remap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        let destination = destination_dir.join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+        fs::write(&destination, b"audio").expect("published destination");
+
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: source_dir.clone(),
+            ..FilePickerConfig::default()
+        });
+        picker.clipboard = Some(clipboard.clone());
+        let failed_plan = PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings: vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        };
+        picker.paste_task = Some(PickerPasteTask {
+            progress: crate::FileTaskProgressState::new(
+                crate::FileTaskKind::Move,
+                "Moving files",
+                picker.theme.clone(),
+            ),
+            receiver: None,
+            control: Arc::new(AtomicU8::new(PASTE_CONTROL_RUNNING)),
+            clipboard,
+            target_dir: destination_dir.clone(),
+            plan: failed_plan,
+            retry_plan: None,
+        });
+
+        picker.finish_picker_paste(Err(PasteFailure {
+            completed: Vec::new(),
+            remaining_sources: vec![source.clone()],
+            retry_plan: Some(PasteRetryPlan::from_plan(PastePlan {
+                mode: FilePickerClipboardMode::Cut,
+                mappings: vec![PasteMapping {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                }],
+            })),
+            warnings: Vec::new(),
+            error: committed_operation_unverified(
+                &source,
+                &destination,
+                "fixture verification failure".to_string(),
+            ),
+        }));
+
+        assert_eq!(
+            picker
+                .clipboard
+                .as_ref()
+                .expect("retry clipboard retained")
+                .paths(),
+            &[source.clone()]
+        );
+        assert_eq!(picker.current_dir(), source_dir.as_path());
+        let task = picker.paste_task.as_ref().expect("failed progress retained");
+        assert!(task.progress.is_terminal());
+        assert!(matches!(task.progress.phase, crate::FileTaskPhase::Failed));
+        assert!(task.progress.status.contains("partially completed"));
+    }
+
+    #[test]
+    fn completed_and_incomplete_roots_repair_current_and_history_independently() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_a = temp.path().join("source-a");
+        let destination_a = temp.path().join("destination-a");
+        let source_b = temp.path().join("source-b");
+        let destination_b = temp.path().join("destination-b");
+        fs::create_dir_all(destination_a.join("current")).expect("destination a");
+        fs::create_dir_all(destination_b.join("history/future")).expect("destination b");
+
+        let mapping_a = PasteMapping {
+            source: source_a.clone(),
+            destination: destination_a.clone(),
+        };
+        let mapping_b = PasteMapping {
+            source: source_b.clone(),
+            destination: destination_b.clone(),
+        };
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source_a.clone(), source_b.clone()],
+        )
+        .expect("clipboard");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.current_dir = source_a.join("current");
+        picker.history_back = vec![source_b.join("history")];
+        picker.history_forward = vec![source_b.join("history/future")];
+        picker.clipboard = Some(clipboard.clone());
+        picker.paste_task = Some(PickerPasteTask {
+            progress: crate::FileTaskProgressState::new(
+                crate::FileTaskKind::Move,
+                "Moving files",
+                picker.theme.clone(),
+            ),
+            receiver: None,
+            control: Arc::new(AtomicU8::new(PASTE_CONTROL_RUNNING)),
+            clipboard,
+            target_dir: temp.path().to_path_buf(),
+            plan: PastePlan {
+                mode: FilePickerClipboardMode::Cut,
+                mappings: vec![mapping_a.clone(), mapping_b.clone()],
+            },
+            retry_plan: None,
+        });
+
+        picker.finish_picker_paste(Err(PasteFailure {
+            completed: vec![mapping_a],
+            remaining_sources: Vec::new(),
+            retry_plan: None,
+            warnings: Vec::new(),
+            error: destination_committed_move_incomplete(
+                &source_b,
+                &destination_b,
+                "fixture partial quarantine cleanup".to_string(),
+            ),
+        }));
+
+        assert_eq!(picker.current_dir(), destination_a.join("current").as_path());
+        assert_eq!(picker.history_back, vec![destination_b.join("history")]);
+        assert_eq!(
+            picker.history_forward,
+            vec![destination_b.join("history/future")]
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn interactive_rename_never_replaces_a_concurrently_existing_destination() {
@@ -4706,6 +6858,42 @@ mod tests {
 
         assert!(picker.commit_create_name());
         assert_eq!(picker.current_dir(), temp.path().join("renamed").join("nested"));
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_first_local_move_keeps_atomic_rename_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).expect("source");
+        fs::write(source.join("track.flac"), b"audio").expect("track");
+        let original = fs::symlink_metadata(&source).expect("source metadata");
+        if crate::filesystem_identity_policy(&source)
+            != crate::FilesystemIdentityPolicy::Strict
+        {
+            return;
+        }
+
+        let result = move_path_with_policy(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+        );
+        match result {
+            Ok(()) | Err(FilePickerError::OperationCommittedWithWarning { .. }) => {}
+            Err(error) => panic!("local directory move failed: {error}"),
+        }
+
+        let moved = fs::symlink_metadata(&destination).expect("destination metadata");
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (moved.dev(), moved.ino()),
+            "known local directory moves must retain the atomic rename fast path"
+        );
         assert!(!source.exists());
     }
 
@@ -4789,6 +6977,47 @@ mod tests {
         assert_eq!(entry.file_type, "Symlink");
     }
 
+    #[test]
+    fn rename_no_replace_degrades_when_atomic_primitive_is_unsupported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        fs::write(&source, b"audio").expect("source");
+
+        let mode = rename_no_replace_with(&source, &destination, |_source, _destination| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fixture: no atomic no-clobber rename",
+            ))
+        })
+        .expect("checked fallback should commit");
+
+        assert_eq!(mode, RenameNoReplaceMode::CheckedBestEffort);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).expect("destination"), b"audio");
+    }
+
+    #[test]
+    fn rename_no_replace_degraded_path_still_refuses_existing_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        fs::write(&source, b"source").expect("source");
+        fs::write(&destination, b"existing").expect("destination");
+
+        let error = rename_no_replace_with(&source, &destination, |_source, _destination| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fixture: no atomic no-clobber rename",
+            ))
+        })
+        .expect_err("existing destination must be preserved");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).expect("source preserved"), b"source");
+        assert_eq!(fs::read(&destination).expect("destination preserved"), b"existing");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn atomic_no_replace_rename_preserves_both_paths_on_collision() {
@@ -4800,7 +7029,6 @@ mod tests {
 
         match rename_no_replace(&source, &destination) {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) if error.kind() == io::ErrorKind::Unsupported => return,
             result => panic!("unexpected no-replace result: {result:?}"),
         }
 
@@ -4831,4 +7059,342 @@ mod tests {
     fn make_symlink(src: &Path, dst: &Path) -> io::Result<()> {
         std::os::windows::fs::symlink_file(src, dst)
     }
+
+    fn assert_completed_operation(result: Result<(), FilePickerError>) {
+        match result {
+            Ok(()) | Err(FilePickerError::OperationCommittedWithWarning { .. }) => {}
+            other => panic!("operation did not complete: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_filesystem_native_rename_has_zero_full_content_reads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).expect("source dir");
+        fs::write(source.join("track.flac"), b"audio").expect("track");
+        let mut io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+
+        assert_completed_operation(move_path_with_policy_progress_accounted(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut io,
+        ));
+
+        assert_eq!(io.rename_attempts, 1);
+        assert_eq!(io.bytes_copied, 0);
+        assert_eq!(io.source_bytes_hashed, 0);
+        assert_eq!(io.destination_bytes_hashed, 0);
+        assert_eq!(io.source_tree_walks, 0);
+        assert_eq!(io.destination_tree_walks, 0);
+        assert_eq!(io.destination_entry_verification_passes, 0);
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("track.flac")).expect("moved"), b"audio");
+    }
+
+    #[test]
+    fn reduced_semantics_select_rename_before_copy_fallback() {
+        let reduced = crate::FilesystemCapabilities {
+            semantics: crate::FilesystemSemantics::NetworkOrReduced,
+            stable_path_identity: crate::CapabilitySupport::Unsupported,
+            nanosecond_timestamps: crate::CapabilitySupport::Unsupported,
+            extended_attributes: crate::CapabilitySupport::Unknown,
+            directory_sync: crate::CapabilitySupport::Unknown,
+            atomic_no_replace_rename: crate::CapabilitySupport::Unsupported,
+            filesystem_type: Some(0x6573_5546),
+        };
+        assert_eq!(
+            initial_move_route(reduced, reduced, false),
+            InitialMoveRoute::NativeRename,
+            "reduced inode/timestamp semantics must change the proof, not bypass native rename"
+        );
+    }
+
+    #[test]
+    fn unavoidable_file_move_fuses_copy_hash_and_uses_one_destination_tree_pass() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let destination = temp.path().join("moved.flac");
+        let bytes = b"deterministic audio payload";
+        fs::write(&source, bytes).expect("source");
+        let portable_destination = crate::filesystem_identity_policy(temp.path())
+            == crate::FilesystemIdentityPolicy::ContentVerifiedPortable;
+        TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.set(true));
+        let mut io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+
+        assert_completed_operation(move_path_with_policy_progress_accounted(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut io,
+        ));
+
+        let len = bytes.len() as u64;
+        assert_eq!(io.bytes_copied, len);
+        let expected_destination_hash = len.saturating_add(
+            portable_destination.then_some(len).unwrap_or(0),
+        );
+        assert_eq!(
+            io.destination_bytes_hashed,
+            expected_destination_hash,
+            "publication verification reads the destination once; reduced-semantics cleanup performs one irreducible final rehash"
+        );
+        assert_eq!(io.bytes_redundantly_rehashed, 0);
+        assert_eq!(io.destination_tree_walks, 1);
+        assert_eq!(
+            io.destination_entry_verification_passes,
+            1,
+            "cleanup performs one separately counted stability pass; this file route performs no directory-membership enumeration"
+        );
+        assert_eq!(io.source_tree_walks, 2, "copy traversal plus fused verify/delete traversal");
+        assert_eq!(
+            io.source_bytes_hashed,
+            len.saturating_mul(2),
+            "copy-time hashing and the final post-quarantine source digest are the two authoritative source reads"
+        );
+        assert_eq!(io.file_sync_calls, 1, "the staged file is synchronized once");
+        assert_eq!(
+            io.directory_sync_calls, 3,
+            "publication, quarantine, and final source removal are distinct durable boundaries"
+        );
+        assert_eq!(fs::read(&destination).expect("destination"), bytes);
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn destination_mutation_after_publication_revokes_source_cleanup_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"original").expect("source");
+        TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.set(true));
+        let mut io = crate::FileOperationIoCounters::default();
+        let mut mutation_injected = false;
+        // The completed=true event for an entry fires only after its source
+        // was already deleted, so the mutation must land in the post-quarantine
+        // window: source is gone (quarantined as "payload"), destination is
+        // published, and the pre-deletion stability gate has yet to run.
+        let mut progress =
+            |_callback_source: &Path, reported_destination: &Path, _bytes: u64, completed: bool| {
+                // The post-quarantine window is identified by the source having
+                // been renamed away while the destination is committed; the
+                // callback's source-path shape varies by verification flow, so
+                // it must not be part of the predicate.
+                if !completed
+                    && !mutation_injected
+                    && reported_destination == destination.as_path()
+                    && destination.exists()
+                    && !source.exists()
+                {
+                    fs::write(&destination, b"replaced")
+                        .expect("same-length post-verification mutation");
+                    // A same-size rewrite inside one kernel timestamp tick is
+                    // metadata-invisible to the strict no-content-read gate
+                    // (documented residual, same class as the rename TOCTOU
+                    // disclosure). Move the version token deterministically the
+                    // way any real-world mutation eventually does.
+                    let mutated = fs::File::options()
+                        .write(true)
+                        .open(&destination)
+                        .expect("reopen mutated destination");
+                    mutated
+                        .set_modified(
+                            std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+                        )
+                        .expect("advance mutated destination mtime");
+                    mutation_injected = true;
+                }
+                Ok(())
+            };
+
+        let error = move_path_with_policy_progress_accounted(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut io,
+        )
+        .expect_err("stale destination proof must prevent source deletion");
+
+        assert!(mutation_injected, "mutation must occur after publication");
+        assert!(matches!(
+            error,
+            FilePickerError::DestinationCommittedMoveIncomplete { .. }
+        ));
+        assert_eq!(fs::read(&source).expect("source restored"), b"original");
+        assert_eq!(fs::read(&destination).expect("mutated destination retained"), b"replaced");
+        assert_eq!(io.destination_tree_walks, 1);
+        assert_eq!(io.destination_entry_verification_passes, 1);
+    }
+
+    #[test]
+    fn retry_plan_with_unattempted_roots_keeps_exact_paths_and_native_rename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let first = source_dir.join("first.flac");
+        let second = source_dir.join("second.flac");
+        fs::write(&first, b"first").expect("first");
+        fs::write(&second, b"second").expect("second");
+        let plan = PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings: vec![
+                PasteMapping {
+                    source: first.clone(),
+                    destination: destination_dir.join("first.flac"),
+                },
+                PasteMapping {
+                    source: second.clone(),
+                    destination: destination_dir.join("second.flac"),
+                },
+            ],
+        };
+        let retry = PasteRetryPlan::from_plan(plan.clone());
+        let mut io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+
+        let success = execute_paste_plan_progress_with_resume_accounted(
+            &plan,
+            FileOperationPolicy::default(),
+            Some(&retry),
+            &mut progress,
+            &mut io,
+        )
+        .expect("unattempted exact-plan roots must use the ordinary rename-first route");
+
+        assert_eq!(success.mappings, plan.mappings);
+        assert_eq!(io.rename_attempts, 2);
+        assert_eq!(io.bytes_copied, 0);
+        assert_eq!(io.source_bytes_hashed, 0);
+        assert_eq!(io.destination_bytes_hashed, 0);
+        assert!(!destination_dir.join("first 2.flac").exists());
+        assert!(!destination_dir.join("second 2.flac").exists());
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn retry_of_verified_destination_performs_no_recopy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        fs::write(&source, b"audio").expect("source");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = plan_filesystem_paste(&clipboard, &destination_dir).expect("plan");
+        TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.set(true));
+        TEST_STOP_MOVE_AFTER_VERIFIED_PUBLICATION.with(|flag| flag.set(true));
+        let mut first_io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+        let failure = execute_paste_plan_progress_with_resume_accounted(
+            &plan,
+            FileOperationPolicy::default(),
+            None,
+            &mut progress,
+            &mut first_io,
+        )
+        .expect_err("first move must stop after verified publication");
+        let retry = failure.retry_plan.expect("exact retry plan");
+        let mut retry_io = crate::FileOperationIoCounters::default();
+        let mut retry_progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+        let recovered = execute_paste_plan_progress_with_resume_accounted(
+            retry.plan(),
+            FileOperationPolicy::default(),
+            Some(&retry),
+            &mut retry_progress,
+            &mut retry_io,
+        )
+        .expect("retry");
+
+        assert_eq!(recovered.mappings, retry.mappings);
+        assert!(
+            retry.recovery_for(&source).is_some(),
+            "failure must retain authoritative source/destination proof"
+        );
+        assert_eq!(retry_io.bytes_copied, 0, "verified retry must not recopy data");
+        let expected_destination_rehash = if crate::filesystem_identity_policy(
+            &destination_dir.join("track.flac"),
+        ) == crate::FilesystemIdentityPolicy::ContentVerifiedPortable
+        {
+            (b"audio".len() as u64).saturating_mul(2)
+        } else {
+            0
+        };
+        assert_eq!(
+            retry_io.destination_bytes_hashed,
+            expected_destination_rehash,
+            "strict mounts reuse exact version evidence; portable mounts require one retry proof read plus one final pre-delete rehash"
+        );
+        assert_eq!(retry_io.destination_tree_walks, 1);
+        assert_eq!(retry_io.destination_entry_verification_passes, 1);
+        assert!(!destination_dir.join("track 2.flac").exists());
+        assert_eq!(fs::read(destination_dir.join("track.flac")).expect("destination"), b"audio");
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn unavoidable_directory_move_has_bounded_tree_walks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let destination = temp.path().join("moved-album");
+        fs::create_dir(&source).expect("source dir");
+        fs::create_dir(source.join("disc")).expect("disc");
+        fs::write(source.join("disc").join("track.flac"), b"audio").expect("track");
+        let portable_destination = crate::filesystem_identity_policy(temp.path())
+            == crate::FilesystemIdentityPolicy::ContentVerifiedPortable;
+        TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.set(true));
+        let mut io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+
+        assert_completed_operation(move_path_with_policy_progress_accounted(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut io,
+        ));
+
+        assert_eq!(io.source_tree_walks, 2);
+        assert_eq!(io.destination_tree_walks, 1);
+        assert_eq!(io.destination_entry_verification_passes, 1);
+        assert_eq!(io.bytes_redundantly_rehashed, 0);
+        let expected_source_hash = 5u64.saturating_add(
+            portable_destination.then_some(5).unwrap_or(0),
+        );
+        assert_eq!(
+            io.source_bytes_hashed,
+            expected_source_hash,
+            "strict descendant ctime tokens avoid a second content read; portable mounts require the final digest"
+        );
+        let expected_destination_hash = 5u64.saturating_add(
+            portable_destination.then_some(5).unwrap_or(0),
+        );
+        assert_eq!(io.destination_bytes_hashed, expected_destination_hash);
+        assert_eq!(io.file_sync_calls, 1);
+        assert_eq!(
+            io.directory_sync_calls, 5,
+            "two staged directories plus publication, quarantine, and final removal"
+        );
+        assert_eq!(fs::read(destination.join("disc/track.flac")).expect("track"), b"audio");
+        assert!(!source.exists());
+    }
+
 }

@@ -50,7 +50,7 @@ pub enum TuiButton {
     DiscSubfoldersPill(usize),
     WriteLogPill(usize),
     ContainerPill(usize),
-    /// ⚙ pill on the container row (below-the-fold) to open format-specific settings overlay.
+    /// Settings pill on the container row (below the fold).
     FormatSettingsButton,
     /// Verify toggle pills inside the FormatSettings overlay.
     FormatSettingsVerify(usize),
@@ -232,6 +232,10 @@ pub enum TuiButton {
     /// The Browse pane's inline create-name row (focus-preserving click target).
     BrowseCreateRow,
     BrowseBreadcrumb, // click to edit path
+    /// Precise editable text cells inside a Browse list rename/create row.
+    BrowseFileInlineEdit,
+    /// Precise editable text cells inside the Browse path bar.
+    BrowsePathInlineEdit,
     BrowseToolbarBack,
     BrowseToolbarForward,
     BrowseToolbarUp,
@@ -569,6 +573,8 @@ impl TuiButton {
             | Self::BrowseList
             | Self::BrowseCreateRow
             | Self::BrowseBreadcrumb
+            | Self::BrowseFileInlineEdit
+            | Self::BrowsePathInlineEdit
             | Self::BrowseToolbarBack
             | Self::BrowseToolbarForward
             | Self::BrowseToolbarUp

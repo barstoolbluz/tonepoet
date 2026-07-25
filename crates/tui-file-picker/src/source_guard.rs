@@ -5,13 +5,496 @@
 //! SHA-256 implementation so callers can prove that the bytes copied are still
 //! the bytes present immediately before source cleanup.
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
 
 const MAX_MANIFEST_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_DEPTH: usize = 1_024;
+
+
+/// Deterministic per-operation filesystem I/O accounting.
+///
+/// These counters are intentionally byte- and call-based rather than timing-
+/// based so tests can detect accidental proof amplification without depending
+/// on machine or mount performance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileOperationIoCounters {
+    pub bytes_copied: u64,
+    pub source_bytes_hashed: u64,
+    pub destination_bytes_hashed: u64,
+    pub bytes_redundantly_rehashed: u64,
+    pub source_tree_walks: u64,
+    /// Complete recursive destination membership/content-enumeration passes.
+    pub destination_tree_walks: u64,
+    /// Complete manifest-wide destination stability passes performed while the
+    /// source tree is traversed for cleanup. Strict mounts use exact metadata
+    /// tokens without a second destination enumeration; portable mounts may
+    /// rehash files and re-enumerate directory membership.
+    pub destination_entry_verification_passes: u64,
+    pub rename_attempts: u64,
+    pub rename_fallbacks: u64,
+    pub file_sync_calls: u64,
+    pub directory_sync_calls: u64,
+}
+
+impl FileOperationIoCounters {
+    pub fn merge(&mut self, other: Self) {
+        self.bytes_copied = self.bytes_copied.saturating_add(other.bytes_copied);
+        self.source_bytes_hashed = self
+            .source_bytes_hashed
+            .saturating_add(other.source_bytes_hashed);
+        self.destination_bytes_hashed = self
+            .destination_bytes_hashed
+            .saturating_add(other.destination_bytes_hashed);
+        self.bytes_redundantly_rehashed = self
+            .bytes_redundantly_rehashed
+            .saturating_add(other.bytes_redundantly_rehashed);
+        self.source_tree_walks = self.source_tree_walks.saturating_add(other.source_tree_walks);
+        self.destination_tree_walks = self
+            .destination_tree_walks
+            .saturating_add(other.destination_tree_walks);
+        self.destination_entry_verification_passes = self
+            .destination_entry_verification_passes
+            .saturating_add(other.destination_entry_verification_passes);
+        self.rename_attempts = self.rename_attempts.saturating_add(other.rename_attempts);
+        self.rename_fallbacks = self.rename_fallbacks.saturating_add(other.rename_fallbacks);
+        self.file_sync_calls = self.file_sync_calls.saturating_add(other.file_sync_calls);
+        self.directory_sync_calls = self
+            .directory_sync_calls
+            .saturating_add(other.directory_sync_calls);
+    }
+}
+
+/// Whether a mount capability has been established. `Unknown` is deliberately
+/// not treated as support: destructive cleanup falls back to content-authority
+/// checks whenever the stronger local-filesystem semantics cannot be proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemSemantics {
+    StableLocal,
+    NetworkOrReduced,
+    Unknown,
+}
+
+/// Per-mount capabilities used by file-operation safety policy. Identity and
+/// timestamp guarantees are independent from metadata and publication
+/// capabilities; a mount can therefore degrade only the proof that it lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilesystemCapabilities {
+    pub semantics: FilesystemSemantics,
+    pub stable_path_identity: CapabilitySupport,
+    pub nanosecond_timestamps: CapabilitySupport,
+    pub extended_attributes: CapabilitySupport,
+    pub directory_sync: CapabilitySupport,
+    pub atomic_no_replace_rename: CapabilitySupport,
+    pub filesystem_type: Option<u64>,
+}
+
+impl FilesystemCapabilities {
+    const fn stable_local(filesystem_type: Option<u64>) -> Self {
+        Self {
+            semantics: FilesystemSemantics::StableLocal,
+            stable_path_identity: CapabilitySupport::Supported,
+            nanosecond_timestamps: CapabilitySupport::Supported,
+            extended_attributes: CapabilitySupport::Unknown,
+            directory_sync: CapabilitySupport::Unknown,
+            atomic_no_replace_rename: CapabilitySupport::Unknown,
+            filesystem_type,
+        }
+    }
+
+    const fn reduced(filesystem_type: Option<u64>) -> Self {
+        Self {
+            semantics: FilesystemSemantics::NetworkOrReduced,
+            stable_path_identity: CapabilitySupport::Unsupported,
+            nanosecond_timestamps: CapabilitySupport::Unsupported,
+            extended_attributes: CapabilitySupport::Unknown,
+            directory_sync: CapabilitySupport::Unknown,
+            atomic_no_replace_rename: CapabilitySupport::Unknown,
+            filesystem_type,
+        }
+    }
+
+    const fn conservative(filesystem_type: Option<u64>) -> Self {
+        Self {
+            semantics: FilesystemSemantics::Unknown,
+            stable_path_identity: CapabilitySupport::Unknown,
+            nanosecond_timestamps: CapabilitySupport::Unknown,
+            extended_attributes: CapabilitySupport::Unknown,
+            directory_sync: CapabilitySupport::Unknown,
+            atomic_no_replace_rename: CapabilitySupport::Unknown,
+            filesystem_type,
+        }
+    }
+
+    const fn assumed_strict() -> Self {
+        Self {
+            semantics: FilesystemSemantics::StableLocal,
+            stable_path_identity: CapabilitySupport::Supported,
+            nanosecond_timestamps: CapabilitySupport::Supported,
+            extended_attributes: CapabilitySupport::Supported,
+            directory_sync: CapabilitySupport::Supported,
+            atomic_no_replace_rename: CapabilitySupport::Supported,
+            filesystem_type: None,
+        }
+    }
+
+    const fn assumed_portable() -> Self {
+        Self::conservative(None)
+    }
+
+    pub const fn identity_policy(self) -> FilesystemIdentityPolicy {
+        if matches!(self.stable_path_identity, CapabilitySupport::Supported)
+            && matches!(self.nanosecond_timestamps, CapabilitySupport::Supported)
+        {
+            FilesystemIdentityPolicy::Strict
+        } else {
+            FilesystemIdentityPolicy::ContentVerifiedPortable
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemCapabilityKind {
+    StablePathIdentity,
+    NanosecondTimestamps,
+    ExtendedAttributes,
+    DirectorySync,
+    AtomicNoReplaceRename,
+}
+
+/// Strength of pathname/object identity evidence available on the containing
+/// filesystem. This remains as a compact compatibility view; the underlying
+/// decision is derived from the full independent capability record above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemIdentityPolicy {
+    Strict,
+    ContentVerifiedPortable,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LinuxMountKey {
+    device: u64,
+}
+
+#[cfg(target_os = "linux")]
+static FILESYSTEM_CAPABILITY_CACHE: OnceLock<Mutex<HashMap<LinuxMountKey, FilesystemCapabilities>>> =
+    OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn capability_cache() -> &'static Mutex<HashMap<LinuxMountKey, FilesystemCapabilities>> {
+    FILESYSTEM_CAPABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn nearest_existing_probe_path(path: &Path) -> io::Result<PathBuf> {
+    let mut probe = path.to_path_buf();
+    loop {
+        match fs::symlink_metadata(&probe) {
+            Ok(metadata) => {
+                if metadata.file_type().is_file() || metadata.file_type().is_dir() {
+                    return Ok(probe);
+                }
+                if !probe.pop() {
+                    return Ok(PathBuf::from("."));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !probe.pop() || probe.as_os_str().is_empty() {
+                    return Ok(PathBuf::from("."));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_descriptor(path: &Path) -> io::Result<(LinuxMountKey, PathBuf)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = nearest_existing_probe_path(path)?;
+    let device = fs::symlink_metadata(&probe)?.dev();
+    Ok((LinuxMountKey { device }, probe))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_filesystem_type(path: &Path) -> io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("filesystem probe path contains NUL: {}", path.display()),
+        )
+    })?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() }.f_type as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_filesystem_type(filesystem_type: u64) -> FilesystemCapabilities {
+    const EXT_SUPER_MAGIC: u64 = 0x0000_ef53;
+    const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const RAMFS_MAGIC: u64 = 0x8584_58f6;
+    const ZFS_SUPER_MAGIC: u64 = 0x2fc1_2fc1;
+    const F2FS_SUPER_MAGIC: u64 = 0xf2f5_2010;
+    const JFS_SUPER_MAGIC: u64 = 0x3153_464a;
+
+    const CIFS_SUPER_MAGIC: u64 = 0xff53_4d42;
+    const SMB2_SUPER_MAGIC: u64 = 0xfe53_4d42;
+    const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+    const NTFS3_SUPER_MAGIC: u64 = 0x5346_544e;
+    const NFS_SUPER_MAGIC: u64 = 0x0000_6969;
+    const V9FS_MAGIC: u64 = 0x0102_1997;
+    const CEPH_SUPER_MAGIC: u64 = 0x00c3_6400;
+    const CODA_SUPER_MAGIC: u64 = 0x7375_7245;
+    const AFS_SUPER_MAGIC: u64 = 0x5346_414f;
+    const MSDOS_SUPER_MAGIC: u64 = 0x0000_4d44;
+    const EXFAT_SUPER_MAGIC: u64 = 0x2011_bab0;
+    const HFS_SUPER_MAGIC: u64 = 0x0000_4244;
+    const HFSPLUS_SUPER_MAGIC: u64 = 0x482b;
+
+    if matches!(
+        filesystem_type,
+        EXT_SUPER_MAGIC
+            | XFS_SUPER_MAGIC
+            | BTRFS_SUPER_MAGIC
+            | TMPFS_MAGIC
+            | RAMFS_MAGIC
+            | ZFS_SUPER_MAGIC
+            | F2FS_SUPER_MAGIC
+            | JFS_SUPER_MAGIC
+    ) {
+        FilesystemCapabilities::stable_local(Some(filesystem_type))
+    } else if matches!(
+        filesystem_type,
+        CIFS_SUPER_MAGIC
+            | SMB2_SUPER_MAGIC
+            | FUSE_SUPER_MAGIC
+            | NTFS3_SUPER_MAGIC
+            | NFS_SUPER_MAGIC
+            | V9FS_MAGIC
+            | CEPH_SUPER_MAGIC
+            | CODA_SUPER_MAGIC
+            | AFS_SUPER_MAGIC
+            | MSDOS_SUPER_MAGIC
+            | EXFAT_SUPER_MAGIC
+            | HFS_SUPER_MAGIC
+            | HFSPLUS_SUPER_MAGIC
+    ) {
+        FilesystemCapabilities::reduced(Some(filesystem_type))
+    } else {
+        // An unrecognized mount is never silently promoted to strict local
+        // semantics. It remains portable until its guarantees are known.
+        FilesystemCapabilities::conservative(Some(filesystem_type))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_path_handle_identity(path: &Path) -> CapabilitySupport {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return CapabilitySupport::Unknown,
+    };
+    let opened = match snapshot_open_handle(&file) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return CapabilitySupport::Unknown,
+    };
+    let pathname = match snapshot_path(path) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return CapabilitySupport::Unknown,
+    };
+    if opened.kind == pathname.kind && opened.identity == pathname.identity {
+        CapabilitySupport::Supported
+    } else {
+        CapabilitySupport::Unsupported
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn merge_observed_identity(
+    baseline: CapabilitySupport,
+    semantics: FilesystemSemantics,
+    observed: CapabilitySupport,
+) -> CapabilitySupport {
+    match semantics {
+        FilesystemSemantics::NetworkOrReduced => CapabilitySupport::Unsupported,
+        FilesystemSemantics::StableLocal => match observed {
+            CapabilitySupport::Supported | CapabilitySupport::Unsupported => observed,
+            CapabilitySupport::Unknown => baseline,
+        },
+        FilesystemSemantics::Unknown => observed,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_extended_attributes(path: &Path) -> CapabilitySupport {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(path) => path,
+        Err(_) => return CapabilitySupport::Unknown,
+    };
+    let result = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+    if result >= 0 {
+        return CapabilitySupport::Supported;
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EOPNOTSUPP)
+        || error.raw_os_error() == Some(libc::ENOTSUP)
+    {
+        CapabilitySupport::Unsupported
+    } else {
+        CapabilitySupport::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux_capabilities(path: &Path) -> FilesystemCapabilities {
+    let Ok((key, probe)) = linux_mount_descriptor(path) else {
+        return FilesystemCapabilities::conservative(None);
+    };
+    if let Ok(cache) = capability_cache().lock() {
+        if let Some(capabilities) = cache.get(&key) {
+            return *capabilities;
+        }
+    }
+
+    let mut capabilities = linux_filesystem_type(&probe)
+        .map(classify_linux_filesystem_type)
+        .unwrap_or_else(|_| FilesystemCapabilities::conservative(None));
+    let observed_identity = probe_path_handle_identity(&probe);
+    capabilities.stable_path_identity = merge_observed_identity(
+        capabilities.stable_path_identity,
+        capabilities.semantics,
+        observed_identity,
+    );
+    capabilities.extended_attributes = probe_extended_attributes(&probe);
+
+    if let Ok(mut cache) = capability_cache().lock() {
+        // Preserve any runtime observation installed while this thread was
+        // probing; a stale baseline must never overwrite a known capability.
+        return *cache.entry(key).or_insert(capabilities);
+    }
+    capabilities
+}
+
+pub fn filesystem_capabilities(path: &Path) -> FilesystemCapabilities {
+    #[cfg(target_os = "linux")]
+    {
+        return probe_linux_capabilities(path);
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return FilesystemCapabilities {
+            semantics: FilesystemSemantics::StableLocal,
+            stable_path_identity: CapabilitySupport::Supported,
+            nanosecond_timestamps: CapabilitySupport::Supported,
+            extended_attributes: CapabilitySupport::Unsupported,
+            directory_sync: CapabilitySupport::Unknown,
+            atomic_no_replace_rename: CapabilitySupport::Supported,
+            filesystem_type: None,
+        };
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = path;
+        FilesystemCapabilities::conservative(None)
+    }
+}
+
+fn update_capability_record(
+    capabilities: &mut FilesystemCapabilities,
+    capability: FilesystemCapabilityKind,
+    support: CapabilitySupport,
+) {
+    match capability {
+        FilesystemCapabilityKind::StablePathIdentity => {
+            capabilities.stable_path_identity = support
+        }
+        FilesystemCapabilityKind::NanosecondTimestamps => {
+            capabilities.nanosecond_timestamps = support
+        }
+        FilesystemCapabilityKind::ExtendedAttributes => {
+            capabilities.extended_attributes = support
+        }
+        FilesystemCapabilityKind::DirectorySync => capabilities.directory_sync = support,
+        FilesystemCapabilityKind::AtomicNoReplaceRename => {
+            capabilities.atomic_no_replace_rename = support
+        }
+    }
+}
+
+/// Records a capability learned from an actual operation on the mount. This
+/// lets runtime rename and directory-sync attempts refine the cached per-device
+/// record instead of repeating unsupported probes or relying only on type
+/// heuristics.
+pub fn record_filesystem_capability(
+    path: &Path,
+    capability: FilesystemCapabilityKind,
+    support: CapabilitySupport,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        // Populate the complete baseline first. Otherwise an early runtime
+        // observation (for example rename support) could create a partial
+        // cache entry and accidentally suppress the identity/xattr probes.
+        let baseline = probe_linux_capabilities(path);
+        let Ok((key, _probe)) = linux_mount_descriptor(path) else {
+            return;
+        };
+        let mut cache = match capability_cache().lock() {
+            Ok(cache) => cache,
+            Err(_) => return,
+        };
+        let entry = cache.entry(key).or_insert(baseline);
+        update_capability_record(entry, capability, support);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, capability, support);
+    }
+}
+
+pub fn filesystem_identity_policy(path: &Path) -> FilesystemIdentityPolicy {
+    filesystem_capabilities(path).identity_policy()
+}
+
+pub fn filesystem_identity_policy_notice(path: &Path) -> Option<String> {
+    let capabilities = filesystem_capabilities(path);
+    (capabilities.identity_policy() == FilesystemIdentityPolicy::ContentVerifiedPortable).then(|| {
+        format!(
+            "filesystem guarantees are reduced or unproven ({:?}; identity={:?}, timestamp-ns={:?}, xattrs={:?}, directory-sync={:?}, atomic-no-replace={:?}); native renames use retained-handle/type/size/path-transition evidence, while unavoidable copy/delete cleanup uses content hashes and tree membership",
+            capabilities.semantics,
+            capabilities.stable_path_identity,
+            capabilities.nanosecond_timestamps,
+            capabilities.extended_attributes,
+            capabilities.directory_sync,
+            capabilities.atomic_no_replace_rename,
+        )
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
@@ -106,8 +589,75 @@ impl SourceSnapshot {
         Ok(())
     }
 
+    pub fn verify_same_identity_with_policy(
+        &self,
+        current: &Self,
+        policy: FilesystemIdentityPolicy,
+    ) -> Result<(), String> {
+        if self.kind != current.kind {
+            return Err(format!("source kind changed from {:?} to {:?}", self.kind, current.kind));
+        }
+        if policy == FilesystemIdentityPolicy::Strict {
+            if self.identity != current.identity {
+                return Err("source object identity changed".to_string());
+            }
+            return Ok(());
+        }
+
+        let same_length = match (&self.version, &current.version) {
+            #[cfg(unix)]
+            (SourceVersion::Unix { len: left, .. }, SourceVersion::Unix { len: right, .. }) => {
+                left == right
+            }
+            #[cfg(windows)]
+            (
+                SourceVersion::Windows { len: left, .. },
+                SourceVersion::Windows { len: right, .. },
+            ) => left == right,
+            #[cfg(not(any(unix, windows)))]
+            (
+                SourceVersion::Portable { len: left, .. },
+                SourceVersion::Portable { len: right, .. },
+            ) => left == right,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        };
+        if self.kind != SourceKind::Directory && !same_length {
+            return Err("source length changed".to_string());
+        }
+        if self.kind == SourceKind::Symlink && self.symlink_target != current.symlink_target {
+            return Err("symlink target changed".to_string());
+        }
+        Ok(())
+    }
+
     pub fn verify_same_object_after_rename(&self, current: &Self) -> Result<(), String> {
-        self.verify_same_identity(current)?;
+        self.verify_same_object_after_rename_with_capabilities(
+            current,
+            FilesystemCapabilities::assumed_strict(),
+        )
+    }
+
+    pub fn verify_same_object_after_rename_with_policy(
+        &self,
+        current: &Self,
+        policy: FilesystemIdentityPolicy,
+    ) -> Result<(), String> {
+        let capabilities = match policy {
+            FilesystemIdentityPolicy::Strict => FilesystemCapabilities::assumed_strict(),
+            FilesystemIdentityPolicy::ContentVerifiedPortable => {
+                FilesystemCapabilities::assumed_portable()
+            }
+        };
+        self.verify_same_object_after_rename_with_capabilities(current, capabilities)
+    }
+
+    pub fn verify_same_object_after_rename_with_capabilities(
+        &self,
+        current: &Self,
+        capabilities: FilesystemCapabilities,
+    ) -> Result<(), String> {
+        self.verify_same_identity_with_policy(current, capabilities.identity_policy())?;
         let stable = match (&self.version, &current.version) {
             #[cfg(unix)]
             (
@@ -130,26 +680,60 @@ impl SourceSnapshot {
                     ..
                 },
             ) => {
-                left_len == right_len
-                    && left_mode == right_mode
-                    && left_uid == right_uid
-                    && left_gid == right_gid
-                    && left_mtime_sec == right_mtime_sec
-                    && left_mtime_nsec == right_mtime_nsec
+                if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+                    left_len == right_len
+                        && left_mode == right_mode
+                        && left_uid == right_uid
+                        && left_gid == right_gid
+                        && left_mtime_sec == right_mtime_sec
+                        && left_mtime_nsec == right_mtime_nsec
+                } else {
+                    let length_stable = self.kind == SourceKind::Directory || left_len == right_len;
+                    let timestamp_stable = match capabilities.nanosecond_timestamps {
+                        CapabilitySupport::Supported => {
+                            left_mtime_sec == right_mtime_sec
+                                && left_mtime_nsec == right_mtime_nsec
+                        }
+                        CapabilitySupport::Unsupported | CapabilitySupport::Unknown => {
+                            (*left_mtime_sec).abs_diff(*right_mtime_sec) <= 2
+                        }
+                    };
+                    length_stable && timestamp_stable
+                }
             }
             #[cfg(windows)]
             (SourceVersion::Windows { .. }, SourceVersion::Windows { .. }) => {
-                self.version == current.version
+                if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+                    self.version == current.version
+                } else {
+                    self.len() == current.len()
+                }
             }
             #[cfg(not(any(unix, windows)))]
             (SourceVersion::Portable { .. }, SourceVersion::Portable { .. }) => {
-                self.version == current.version
+                if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+                    self.version == current.version
+                } else {
+                    self.len() == current.len()
+                }
             }
         };
         if stable {
             Ok(())
         } else {
             Err("source metadata/content change token changed".to_string())
+        }
+    }
+
+    pub fn verify_same_object_and_version_with_capabilities(
+        &self,
+        current: &Self,
+        capabilities: FilesystemCapabilities,
+    ) -> Result<(), String> {
+        if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+            self.verify_same_object_and_version(current)
+        } else {
+            self.verify_same_object_after_rename_with_capabilities(current, capabilities)
         }
     }
 
@@ -190,13 +774,17 @@ pub fn snapshot_path(path: &Path) -> io::Result<SourceSnapshot> {
     })
 }
 
-pub fn snapshot_open_file(file: &File) -> io::Result<SourceSnapshot> {
+/// Snapshot an already-open regular-file or directory handle without
+/// re-resolving its pathname. This is the general primitive used by mount
+/// capability probes; callers that require regular-file semantics should use
+/// [`snapshot_open_file`].
+pub fn snapshot_open_handle(file: &File) -> io::Result<SourceSnapshot> {
     let metadata = file.metadata()?;
     let kind = kind_from_metadata(&metadata)?;
-    if kind != SourceKind::File {
+    if kind == SourceKind::Symlink {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "opened handle is not a regular file",
+            "opened handle unexpectedly resolved as a symlink",
         ));
     }
     Ok(SourceSnapshot {
@@ -205,6 +793,164 @@ pub fn snapshot_open_file(file: &File) -> io::Result<SourceSnapshot> {
         version: version_from_metadata(&metadata),
         symlink_target: None,
     })
+}
+
+pub fn snapshot_open_file(file: &File) -> io::Result<SourceSnapshot> {
+    let snapshot = snapshot_open_handle(file)?;
+    if snapshot.kind != SourceKind::File {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "opened handle is not a regular file",
+        ));
+    }
+    Ok(snapshot)
+}
+
+
+/// Evidence retained across a native rename. Opening directories is supported
+/// on Unix and may be unavailable on other platforms; the handle proof is
+/// therefore optional, while the captured pathname snapshot is mandatory.
+pub struct RenameSourceProof {
+    snapshot: SourceSnapshot,
+    open_handle: Option<File>,
+    open_snapshot: Option<SourceSnapshot>,
+}
+
+impl RenameSourceProof {
+    pub fn capture(path: &Path) -> io::Result<Self> {
+        let snapshot = snapshot_path(path)?;
+        let (open_handle, open_snapshot) = if snapshot.kind() == SourceKind::Symlink {
+            (None, None)
+        } else {
+            match File::open(path) {
+                Ok(handle) => match snapshot_open_handle(&handle) {
+                    Ok(open_snapshot) => (Some(handle), Some(open_snapshot)),
+                    Err(_) => (None, None),
+                },
+                Err(_) => (None, None),
+            }
+        };
+        Ok(Self {
+            snapshot,
+            open_handle,
+            open_snapshot,
+        })
+    }
+
+    pub fn snapshot(&self) -> &SourceSnapshot {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameVerification {
+    /// The destination mount lacks strict pathname identity or nanosecond
+    /// timestamp guarantees, so the committed rename was accepted using the
+    /// cheaper retained-handle/type/size/path-transition proof.
+    pub portable_evidence: bool,
+}
+
+/// Verify a committed native rename without reading file contents.
+///
+/// A successful same-filesystem rename is itself the primary ownership event.
+/// We additionally require disappearance of the source pathname, appearance
+/// of the expected destination kind/size/target, stability of any retained
+/// open handle, and strict path identity when the mount advertises it. Reduced-
+/// semantics mounts deliberately use the cheaper type/size/path-transition
+/// proof rather than forcing a recursive copy merely because inode or
+/// nanosecond timestamp evidence is weak.
+pub fn verify_committed_rename(
+    source: &Path,
+    destination: &Path,
+    proof: &RenameSourceProof,
+    destination_capabilities: FilesystemCapabilities,
+) -> Result<RenameVerification, String> {
+    match fs::symlink_metadata(source) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(format!(
+                "source pathname still exists after rename: {}",
+                source.display()
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not prove source pathname disappearance after rename: {error}"
+            ))
+        }
+    }
+
+    let destination_snapshot = snapshot_path(destination)
+        .map_err(|error| format!("could not identify renamed destination: {error}"))?;
+    if destination_capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+        proof
+            .snapshot
+            .verify_same_object_after_rename_with_capabilities(
+                &destination_snapshot,
+                destination_capabilities,
+            )?;
+    } else {
+        // Reduced-semantics mounts may round or synthesize timestamps during a
+        // successful rename. Require only the trustworthy pathname evidence
+        // here; any retained handle below supplies the stronger object proof.
+        // This avoids turning an otherwise successful O(1) rename into a
+        // recursive copy solely because timestamp fidelity is weak.
+        proof
+            .snapshot
+            .verify_same_identity_with_policy(
+                &destination_snapshot,
+                FilesystemIdentityPolicy::ContentVerifiedPortable,
+            )?;
+    }
+
+    if let (Some(handle), Some(open_before)) = (&proof.open_handle, &proof.open_snapshot) {
+        let open_after = snapshot_open_handle(handle)
+            .map_err(|error| format!("could not re-identify retained rename handle: {error}"))?;
+        if destination_capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+            open_before
+                .verify_same_object_and_version(&open_after)
+                .map_err(|error| format!("source changed while native rename committed: {error}"))?;
+        } else {
+            open_before
+                .verify_same_identity_with_policy(
+                    &open_after,
+                    FilesystemIdentityPolicy::ContentVerifiedPortable,
+                )
+                .map_err(|error| {
+                    format!("retained source handle changed while native rename committed: {error}")
+                })?;
+        }
+        open_after
+            .verify_same_identity_with_policy(
+                &destination_snapshot,
+                destination_capabilities.identity_policy(),
+            )
+            .map_err(|error| {
+                format!(
+                    "renamed destination no longer corresponds to the retained source handle: {error}"
+                )
+            })?;
+    } else if destination_capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+        proof
+            .snapshot
+            .verify_same_identity(&destination_snapshot)
+            .map_err(|error| format!("renamed destination identity is unproven: {error}"))?;
+    }
+
+    Ok(RenameVerification {
+        portable_evidence: destination_capabilities.identity_policy()
+            == FilesystemIdentityPolicy::ContentVerifiedPortable,
+    })
+}
+
+pub fn verify_path_with_capabilities(
+    path: &Path,
+    expected: &SourceSnapshot,
+    capabilities: FilesystemCapabilities,
+) -> Result<(), String> {
+    let current = snapshot_path(path)
+        .map_err(|error| format!("could not re-read source identity: {error}"))?;
+    expected.verify_same_object_and_version_with_capabilities(&current, capabilities)
 }
 
 pub fn verify_path(path: &Path, expected: &SourceSnapshot) -> Result<(), String> {
@@ -740,6 +1486,205 @@ mod tests {
         assert!(error.contains("identity changed"), "unexpected error: {error}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_classifier_is_strict_only_for_known_local_filesystems() {
+        const EXT_SUPER_MAGIC: u64 = 0x0000_ef53;
+        const NFS_SUPER_MAGIC: u64 = 0x0000_6969;
+        const V9FS_MAGIC: u64 = 0x0102_1997;
+        const UNKNOWN_MAGIC: u64 = 0xdead_beef;
+
+        let ext = classify_linux_filesystem_type(EXT_SUPER_MAGIC);
+        assert_eq!(ext.semantics, FilesystemSemantics::StableLocal);
+        assert_eq!(ext.identity_policy(), FilesystemIdentityPolicy::Strict);
+
+        for filesystem_type in [NFS_SUPER_MAGIC, V9FS_MAGIC] {
+            let capabilities = classify_linux_filesystem_type(filesystem_type);
+            assert_eq!(
+                capabilities.semantics,
+                FilesystemSemantics::NetworkOrReduced
+            );
+            assert_eq!(
+                capabilities.stable_path_identity,
+                CapabilitySupport::Unsupported
+            );
+            assert_eq!(
+                capabilities.nanosecond_timestamps,
+                CapabilitySupport::Unsupported
+            );
+            assert_eq!(
+                capabilities.identity_policy(),
+                FilesystemIdentityPolicy::ContentVerifiedPortable
+            );
+        }
+
+        let unknown = classify_linux_filesystem_type(UNKNOWN_MAGIC);
+        assert_eq!(unknown.semantics, FilesystemSemantics::Unknown);
+        assert_eq!(
+            unknown.identity_policy(),
+            FilesystemIdentityPolicy::ContentVerifiedPortable,
+            "an unrecognized mount must never be silently promoted to strict semantics"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_first_capability_probe_preserves_local_identity_semantics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        fs::write(&file, b"audio").expect("file");
+        let missing_destination = temp.path().join("new").join("album");
+
+        let directory_observation = probe_path_handle_identity(temp.path());
+        assert_eq!(
+            directory_observation,
+            CapabilitySupport::Supported,
+            "directory handles must participate in pathname/open-handle identity probes"
+        );
+        let mut simulated_local = FilesystemCapabilities::stable_local(None);
+        simulated_local.stable_path_identity = merge_observed_identity(
+            simulated_local.stable_path_identity,
+            simulated_local.semantics,
+            directory_observation,
+        );
+        assert_eq!(
+            simulated_local.identity_policy(),
+            FilesystemIdentityPolicy::Strict,
+            "a successful directory observation must preserve a known-local strict baseline"
+        );
+        assert_eq!(
+            nearest_existing_probe_path(&missing_destination).expect("nearest probe"),
+            temp.path(),
+            "a nonexistent destination must be classified from its nearest existing directory"
+        );
+
+        let (key, probe) = linux_mount_descriptor(temp.path()).expect("mount descriptor");
+        capability_cache().lock().expect("cache").remove(&key);
+        let baseline = classify_linux_filesystem_type(
+            linux_filesystem_type(&probe).expect("filesystem type"),
+        );
+        let directory_first = filesystem_capabilities(&missing_destination);
+        let regular_file_second = filesystem_capabilities(&file);
+
+        assert_eq!(
+            directory_first.semantics,
+            regular_file_second.semantics,
+            "directory and regular-file probes on one device must retain the same semantics"
+        );
+        assert_eq!(
+            directory_first.stable_path_identity,
+            regular_file_second.stable_path_identity,
+            "a later regular-file lookup must not repair or alter a bad directory-first cache entry"
+        );
+        assert_eq!(
+            directory_first.identity_policy(),
+            regular_file_second.identity_policy(),
+            "the cached move policy must be stable after a directory-first lookup"
+        );
+        if baseline.semantics == FilesystemSemantics::StableLocal {
+            assert_eq!(
+                directory_first.identity_policy(),
+                FilesystemIdentityPolicy::Strict,
+                "a directory-first probe must not route a known local device through recursive portable moves"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inapplicable_identity_observation_does_not_erase_known_local_support() {
+        assert_eq!(
+            merge_observed_identity(
+                CapabilitySupport::Supported,
+                FilesystemSemantics::StableLocal,
+                CapabilitySupport::Unknown,
+            ),
+            CapabilitySupport::Supported
+        );
+        assert_eq!(
+            merge_observed_identity(
+                CapabilitySupport::Unknown,
+                FilesystemSemantics::Unknown,
+                CapabilitySupport::Unknown,
+            ),
+            CapabilitySupport::Unknown
+        );
+    }
+
+    #[test]
+    fn capability_updates_are_independent() {
+        let mut capabilities = FilesystemCapabilities::conservative(None);
+        update_capability_record(
+            &mut capabilities,
+            FilesystemCapabilityKind::DirectorySync,
+            CapabilitySupport::Supported,
+        );
+        update_capability_record(
+            &mut capabilities,
+            FilesystemCapabilityKind::AtomicNoReplaceRename,
+            CapabilitySupport::Unsupported,
+        );
+
+        assert_eq!(
+            capabilities.stable_path_identity,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            capabilities.nanosecond_timestamps,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            capabilities.extended_attributes,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(capabilities.directory_sync, CapabilitySupport::Supported);
+        assert_eq!(
+            capabilities.atomic_no_replace_rename,
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.identity_policy(),
+            FilesystemIdentityPolicy::ContentVerifiedPortable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(irrefutable_let_patterns)] // other cfg targets add enum variants
+    fn portable_rename_policy_tolerates_pseudo_inode_and_timestamp_precision_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        fs::write(&source, b"original").expect("write source");
+        let captured = snapshot_path(&source).expect("capture source");
+        let mut reopened = captured.clone();
+
+        if let SourceIdentity::Unix { device, inode } = &mut reopened.identity {
+            *device = device.wrapping_add(1);
+            *inode = inode.wrapping_add(1);
+        }
+        if let SourceVersion::Unix { mtime_nsec, .. } = &mut reopened.version {
+            *mtime_nsec = 0;
+        }
+
+        assert!(captured.verify_same_object_after_rename(&reopened).is_err());
+        captured
+            .verify_same_object_after_rename_with_policy(
+                &reopened,
+                FilesystemIdentityPolicy::ContentVerifiedPortable,
+            )
+            .expect("portable policy must defer to manifest/content proof");
+
+        if let SourceVersion::Unix { len, .. } = &mut reopened.version {
+            *len = len.saturating_add(1);
+        }
+        assert!(captured
+            .verify_same_object_after_rename_with_policy(
+                &reopened,
+                FilesystemIdentityPolicy::ContentVerifiedPortable,
+            )
+            .is_err());
+    }
+
     #[test]
     fn manifest_rejects_same_object_content_mutation() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -820,6 +1765,201 @@ mod tests {
         assert_eq!(fs::read(&displaced).expect("original copy retained"), b"original");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn strict_destination_stability_uses_exact_ctime_version_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"original").expect("write source");
+        let source_manifest = capture_manifest(&source).expect("capture source manifest");
+        fs::copy(&source, &destination).expect("copy destination");
+        let mut destination_manifest = source_manifest
+            .capture_verified_copy_at(&destination)
+            .expect("capture verified destination");
+
+        let expected = destination_manifest
+            .entries
+            .get_mut(Path::new(""))
+            .expect("root destination proof");
+        match &mut expected.version {
+            SourceVersion::Unix {
+                ctime_sec,
+                ctime_nsec,
+                ..
+            } => {
+                if *ctime_nsec < 999_999_999 {
+                    *ctime_nsec += 1;
+                } else {
+                    *ctime_nsec = 0;
+                    *ctime_sec = (*ctime_sec).saturating_add(1);
+                }
+            }
+        }
+
+        let current = snapshot_path(&destination).expect("current destination snapshot");
+        expected
+            .verify_same_object_after_rename_with_capabilities(
+                &current,
+                FilesystemCapabilities::assumed_strict(),
+            )
+            .expect("the rename comparator intentionally ignores ctime");
+
+        let mut keep_going = |_: &Path| true;
+        let error = destination_manifest
+            .verify_entry_at_with_cancel_with_capabilities(
+                &source_manifest,
+                Path::new(""),
+                &destination,
+                FilesystemCapabilities::assumed_strict(),
+                &mut keep_going,
+            )
+            .expect_err("the post-verification stability gate must include ctime");
+        assert!(error.contains("version"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn portable_destination_stability_rehashes_before_source_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"original").expect("write source");
+        let source_manifest = capture_manifest(&source).expect("capture source manifest");
+        fs::copy(&source, &destination).expect("copy destination");
+        let destination_manifest = source_manifest
+            .capture_verified_copy_at(&destination)
+            .expect("capture verified destination");
+
+        fs::write(&destination, b"replaced").expect("same-length in-place mutation");
+
+        let mut keep_going = |_: &Path| true;
+        let error = destination_manifest
+            .verify_entry_at_with_cancel_with_capabilities(
+                &source_manifest,
+                Path::new(""),
+                &destination,
+                FilesystemCapabilities::assumed_portable(),
+                &mut keep_going,
+            )
+            .expect_err("portable final rehash must revoke cleanup authority");
+        assert!(error.contains("digest"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_source_cleanup_rejects_ctime_only_descendant_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let quarantine = temp.path().join("quarantine");
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("track.bin"), b"original").expect("source child");
+        let mut manifest = capture_manifest(&source).expect("capture source manifest");
+        fs::rename(&source, &quarantine).expect("quarantine source root");
+
+        let proof = manifest
+            .entries
+            .get_mut(Path::new("track.bin"))
+            .expect("child proof");
+        match &mut proof.snapshot.version {
+            SourceVersion::Unix {
+                ctime_sec,
+                ctime_nsec,
+                ..
+            } => {
+                if *ctime_nsec < 999_999_999 {
+                    *ctime_nsec += 1;
+                } else {
+                    *ctime_nsec = 0;
+                    *ctime_sec = (*ctime_sec).saturating_add(1);
+                }
+            }
+        }
+
+        let mut keep_going = |_: &Path| true;
+        let error = verify_source_entry_after_root_rename_with_capabilities(
+            &quarantine.join("track.bin"),
+            proof,
+            false,
+            FilesystemCapabilities::assumed_strict(),
+            &mut keep_going,
+        )
+        .expect_err("strict descendant cleanup must include the copy-time ctime token");
+        assert!(error.contains("changed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn portable_destination_stability_rechecks_directory_membership() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("track.bin"), b"original").expect("source child");
+        let source_manifest = capture_manifest(&source).expect("capture source manifest");
+        fs::create_dir(&destination).expect("destination directory");
+        fs::copy(source.join("track.bin"), destination.join("track.bin"))
+            .expect("copy destination child");
+        let destination_manifest = source_manifest
+            .capture_verified_copy_at(&destination)
+            .expect("capture verified destination");
+
+        fs::write(destination.join("unexpected.bin"), b"unexpected")
+            .expect("add unexpected destination entry");
+
+        let mut keep_going = |_: &Path| true;
+        let error = destination_manifest
+            .verify_entry_at_with_cancel_with_capabilities(
+                &source_manifest,
+                Path::new(""),
+                &destination,
+                FilesystemCapabilities::assumed_portable(),
+                &mut keep_going,
+            )
+            .expect_err("portable directory membership change must revoke cleanup authority");
+        assert!(error.contains("membership"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn destination_verifiers_enumerate_each_directory_once_per_recursive_pass() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).expect("source directory");
+        fs::create_dir(source.join("disc")).expect("source nested directory");
+        fs::write(source.join("disc/track.bin"), b"audio").expect("source file");
+        fs::create_dir(&destination).expect("destination directory");
+        fs::create_dir(destination.join("disc")).expect("destination nested directory");
+        fs::copy(
+            source.join("disc/track.bin"),
+            destination.join("disc/track.bin"),
+        )
+        .expect("destination file");
+        let source_manifest = capture_manifest(&source).expect("source manifest");
+
+        reset_test_destination_directory_enumerations();
+        let destination_manifest = source_manifest
+            .capture_verified_copy_at(&destination)
+            .expect("initial destination verification");
+        assert_eq!(
+            take_test_destination_directory_enumerations(),
+            2,
+            "initial verification must enumerate the root and nested directory exactly once"
+        );
+
+        reset_test_destination_directory_enumerations();
+        destination_manifest
+            .verify_reused_copy_at_with_cancel(
+                &source_manifest,
+                &destination,
+                |_: &Path| true,
+            )
+            .expect("retry destination verification");
+        assert_eq!(
+            take_test_destination_directory_enumerations(),
+            2,
+            "retry verification must reuse each directory listing for membership and descent"
+        );
+    }
+
     #[test]
     fn destination_identity_manifest_rejects_same_content_replacement() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -836,22 +1976,32 @@ mod tests {
         fs::rename(&destination, &displaced).expect("displace verified destination");
         fs::write(&destination, b"original").expect("write same-content replacement");
 
+        let mut keep_going = |_: &Path| true;
         let error = destination_manifest
-            .verify_entry_at(&source_manifest, Path::new(""), &destination)
-            .expect_err("same-content replacement must revoke destination ownership");
-        assert!(error.contains("identity"), "unexpected error: {error}");
+            .verify_entry_at_with_cancel_with_capabilities(
+                &source_manifest,
+                Path::new(""),
+                &destination,
+                FilesystemCapabilities::assumed_strict(),
+                &mut keep_going,
+            )
+            .expect_err("strict destination proof must reject same-content replacement");
+        assert!(
+            error.contains("object") || error.contains("version"),
+            "unexpected error: {error}"
+        );
         assert_eq!(fs::read(&destination).expect("replacement retained"), b"original");
         assert_eq!(fs::read(&displaced).expect("verified copy retained"), b"original");
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceEntryProof {
     pub snapshot: SourceSnapshot,
     pub digest: Option<ContentDigest>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceManifest {
     entries: std::collections::BTreeMap<PathBuf, SourceEntryProof>,
 }
@@ -860,12 +2010,28 @@ pub struct SourceManifest {
 /// whole-tree content verification. A later source cleanup step must satisfy
 /// both this destination-ownership proof and the source manifest's content
 /// proof before it may remove the corresponding quarantined source object.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DestinationManifest {
     entries: std::collections::BTreeMap<PathBuf, SourceSnapshot>,
 }
 
 impl DestinationManifest {
+    pub fn insert(
+        &mut self,
+        relative_path: PathBuf,
+        snapshot: SourceSnapshot,
+    ) -> Result<(), String> {
+        if self.entries.insert(relative_path.clone(), snapshot).is_some() {
+            return Err(format!(
+                "duplicate destination manifest entry: {}",
+                relative_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reconfirm that an entry which passed authoritative content verification
+    /// still authorizes destructive source cleanup.
     pub fn verify_entry_at(
         &self,
         source_manifest: &SourceManifest,
@@ -891,6 +2057,59 @@ impl DestinationManifest {
     where
         F: FnMut(&Path) -> bool,
     {
+        self.verify_entry_at_with_cancel_counted(
+            source_manifest,
+            relative_path,
+            path,
+            keep_going,
+        )
+        .map(|_| ())
+    }
+
+    /// Counted form of the final destination-stability proof.
+    ///
+    /// Strict mounts use the exact captured object/version token, including
+    /// ctime. The weaker comparator used specifically for a rename transition
+    /// is deliberately not reused here because no destination rename occurs
+    /// after this manifest is captured.
+    ///
+    /// Reduced-semantics mounts cannot make pathname identity or coarse
+    /// timestamps authoritative. Regular files are therefore rehashed once,
+    /// immediately before the corresponding source entry is removed. The
+    /// returned byte count lets callers account for that irreducible final read.
+    pub fn verify_entry_at_with_cancel_counted<F>(
+        &self,
+        source_manifest: &SourceManifest,
+        relative_path: &Path,
+        path: &Path,
+        keep_going: &mut F,
+    ) -> Result<u64, String>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        self.verify_entry_at_with_cancel_with_capabilities(
+            source_manifest,
+            relative_path,
+            path,
+            filesystem_capabilities(path),
+            keep_going,
+        )
+    }
+
+    fn verify_entry_at_with_cancel_with_capabilities<F>(
+        &self,
+        source_manifest: &SourceManifest,
+        relative_path: &Path,
+        path: &Path,
+        capabilities: FilesystemCapabilities,
+        keep_going: &mut F,
+    ) -> Result<u64, String>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        if !keep_going(path) {
+            return Err("destination ownership verification was interrupted".to_string());
+        }
         let expected_destination = self.entries.get(relative_path).ok_or_else(|| {
             format!(
                 "destination entry has no captured identity proof: {}",
@@ -903,16 +2122,330 @@ impl DestinationManifest {
                 relative_path.display()
             )
         })?;
+
+        if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+            verify_exact_destination_entry(path, expected_destination)?;
+            return Ok(0);
+        }
+
+        if source_proof.snapshot.kind() == SourceKind::Directory {
+            verify_portable_destination_directory_membership(
+                path,
+                source_manifest.expected_direct_children(relative_path),
+            )?;
+        }
         let current_destination = verify_destination_entry(path, source_proof, keep_going)?;
         expected_destination
-            .verify_same_object_and_version(&current_destination)
+            .verify_same_identity_with_policy(
+                &current_destination,
+                FilesystemIdentityPolicy::ContentVerifiedPortable,
+            )
             .map_err(|error| {
                 format!(
-                    "destination object changed after initial verification at {}: {error}",
+                    "destination object changed after content verification at {}: {error}",
                     path.display()
                 )
-            })
+            })?;
+        Ok(if source_proof.snapshot.kind() == SourceKind::File {
+            source_proof.snapshot.len()
+        } else {
+            0
+        })
     }
+
+    /// Revalidate a previously verified published tree for retry.
+    ///
+    /// Strict mounts reuse retained pathname identity/version evidence without
+    /// rereading file contents. Reduced-semantics mounts cannot prove that a
+    /// same-size pathname still contains the previously verified bytes across
+    /// operation attempts, so each regular file is rehashed exactly once. The
+    /// snapshot returned by that same read is reused for the retained-object
+    /// comparison; no second pathname verification helper restats the entry.
+    pub fn verify_reused_copy_at_with_cancel<F>(
+        &self,
+        source_manifest: &SourceManifest,
+        root: &Path,
+        mut keep_going: F,
+    ) -> Result<u64, String>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        if !self.entries.keys().eq(source_manifest.entries.keys()) {
+            return Err(
+                "retry destination proof no longer corresponds to the source manifest"
+                    .to_string(),
+            );
+        }
+        let mut visited = std::collections::BTreeSet::new();
+        let mut destination_bytes_rehashed = 0u64;
+        verify_reused_destination_node(
+            self,
+            source_manifest,
+            root,
+            Path::new(""),
+            0,
+            &mut visited,
+            &mut destination_bytes_rehashed,
+            &mut keep_going,
+        )?;
+        let expected: std::collections::BTreeSet<PathBuf> =
+            source_manifest.entries.keys().cloned().collect();
+        if visited != expected {
+            let missing = expected
+                .difference(&visited)
+                .take(8)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            return Err(format!(
+                "retry destination tree is missing expected entries: [{}]",
+                missing.join(", ")
+            ));
+        }
+        Ok(destination_bytes_rehashed)
+    }
+
+}
+
+fn verify_portable_destination_directory_membership(
+    path: &Path,
+    expected_children: std::collections::BTreeSet<std::ffi::OsString>,
+) -> Result<(), String> {
+    let actual_children = sorted_directory_entries(path)?
+        .into_iter()
+        .map(|entry| entry.file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual_children == expected_children {
+        Ok(())
+    } else {
+        Err(format!(
+            "destination directory membership changed after content verification at {}",
+            path.display()
+        ))
+    }
+}
+
+fn verify_exact_destination_entry(
+    path: &Path,
+    expected: &SourceSnapshot,
+) -> Result<(), String> {
+    if expected.kind() == SourceKind::File {
+        let file = File::open(path)
+            .map_err(|error| format!("open verified destination {}: {error}", path.display()))?;
+        let opened = snapshot_open_file(&file)
+            .map_err(|error| format!("identify verified destination {}: {error}", path.display()))?;
+        expected
+            .verify_same_object_and_version(&opened)
+            .map_err(|error| {
+                format!(
+                    "destination object/version changed after content verification at {}: {error}",
+                    path.display()
+                )
+            })?;
+        let pathname = snapshot_path(path)
+            .map_err(|error| format!("re-identify destination path {}: {error}", path.display()))?;
+        opened
+            .verify_same_object_and_version(&pathname)
+            .map_err(|error| {
+                format!(
+                    "destination pathname changed after content verification at {}: {error}",
+                    path.display()
+                )
+            })?;
+        return Ok(());
+    }
+
+    let current = snapshot_path(path)
+        .map_err(|error| format!("re-identify destination {}: {error}", path.display()))?;
+    expected
+        .verify_same_object_and_version(&current)
+        .map_err(|error| {
+            format!(
+                "destination object/version changed after content verification at {}: {error}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_DESTINATION_DIRECTORY_ENUMERATIONS: std::cell::Cell<u64> =
+        std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+fn reset_test_destination_directory_enumerations() {
+    TEST_DESTINATION_DIRECTORY_ENUMERATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn take_test_destination_directory_enumerations() -> u64 {
+    TEST_DESTINATION_DIRECTORY_ENUMERATIONS.with(|count| count.replace(0))
+}
+
+fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, String> {
+    #[cfg(test)]
+    TEST_DESTINATION_DIRECTORY_ENUMERATIONS.with(|count| {
+        count.set(count.get().saturating_add(1));
+    });
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| format!("read destination directory {}: {error}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read destination entry {}: {error}", path.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_verified_destination_node<F>(
+    source_manifest: &SourceManifest,
+    path: &Path,
+    relative: &Path,
+    depth: usize,
+    visited: &mut std::collections::BTreeSet<PathBuf>,
+    destination_manifest: &mut DestinationManifest,
+    keep_going: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    if depth > MAX_MANIFEST_DEPTH {
+        return Err(format!(
+            "destination tree exceeds the maximum supported nesting depth of {MAX_MANIFEST_DEPTH}: {}",
+            path.display()
+        ));
+    }
+    if !visited.insert(relative.to_path_buf()) {
+        return Err(format!(
+            "duplicate destination entry while verifying {}",
+            relative.display()
+        ));
+    }
+    if visited.len() > source_manifest.entries.len() {
+        return Err(format!(
+            "destination tree contains an unexpected entry: {}",
+            relative.display()
+        ));
+    }
+    let proof = source_manifest.entries.get(relative).ok_or_else(|| {
+        format!(
+            "destination tree contains an unexpected entry: {}",
+            relative.display()
+        )
+    })?;
+    let snapshot = verify_destination_entry(path, proof, keep_going)?;
+    destination_manifest.insert(relative.to_path_buf(), snapshot)?;
+
+    if proof.snapshot.kind() == SourceKind::Directory {
+        for entry in sorted_directory_entries(path)? {
+            let child_relative = relative.join(entry.file_name());
+            capture_verified_destination_node(
+                source_manifest,
+                &entry.path(),
+                &child_relative,
+                depth + 1,
+                visited,
+                destination_manifest,
+                keep_going,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_reused_destination_node<F>(
+    destination_manifest: &DestinationManifest,
+    source_manifest: &SourceManifest,
+    path: &Path,
+    relative: &Path,
+    depth: usize,
+    visited: &mut std::collections::BTreeSet<PathBuf>,
+    destination_bytes_rehashed: &mut u64,
+    keep_going: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    if depth > MAX_MANIFEST_DEPTH {
+        return Err(format!(
+            "retry destination tree exceeds the maximum supported nesting depth of {MAX_MANIFEST_DEPTH}: {}",
+            path.display()
+        ));
+    }
+    if !visited.insert(relative.to_path_buf()) {
+        return Err(format!(
+            "duplicate retry destination entry while verifying {}",
+            relative.display()
+        ));
+    }
+    if visited.len() > source_manifest.entries.len() {
+        return Err(format!(
+            "retry destination tree contains an unexpected entry: {}",
+            relative.display()
+        ));
+    }
+    let source_proof = source_manifest.entries.get(relative).ok_or_else(|| {
+        format!(
+            "retry destination tree contains an unexpected entry: {}",
+            relative.display()
+        )
+    })?;
+
+    let directory_entries = if source_proof.snapshot.kind() == SourceKind::Directory {
+        let expected_destination = destination_manifest.entries.get(relative).ok_or_else(|| {
+            format!(
+                "retry destination entry has no retained proof: {}",
+                relative.display()
+            )
+        })?;
+        let capabilities = filesystem_capabilities(path);
+        if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+            if !keep_going(path) {
+                return Err("retry destination verification was interrupted".to_string());
+            }
+            verify_exact_destination_entry(path, expected_destination)?;
+        } else {
+            let current = verify_destination_entry(path, source_proof, keep_going)?;
+            expected_destination
+                .verify_same_identity_with_policy(
+                    &current,
+                    FilesystemIdentityPolicy::ContentVerifiedPortable,
+                )
+                .map_err(|error| {
+                    format!(
+                        "retry destination object changed at {}: {error}",
+                        path.display()
+                    )
+                })?;
+        }
+        Some(sorted_directory_entries(path)?)
+    } else {
+        let rehashed = destination_manifest.verify_entry_at_with_cancel_counted(
+            source_manifest,
+            relative,
+            path,
+            keep_going,
+        )?;
+        *destination_bytes_rehashed = (*destination_bytes_rehashed).saturating_add(rehashed);
+        None
+    };
+
+    if let Some(entries) = directory_entries {
+        for entry in entries {
+            let child_relative = relative.join(entry.file_name());
+            verify_reused_destination_node(
+                destination_manifest,
+                source_manifest,
+                &entry.path(),
+                &child_relative,
+                depth + 1,
+                visited,
+                destination_bytes_rehashed,
+                keep_going,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl SourceManifest {
@@ -924,12 +2457,42 @@ impl SourceManifest {
         self.entries.get(relative_path).map(|entry| &entry.snapshot)
     }
 
-    /// Revalidate one manifest entry at its current pathname.
-    ///
-    /// This is intended for the final cleanup gate after a source root has
-    /// been atomically quarantined. Regular files are opened and hashed from
-    /// the handle, the handle is rechecked for mutation, and the pathname is
-    /// proven to still name that handle before the caller may unlink it.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn total_file_bytes(&self) -> u64 {
+        self.entries
+            .values()
+            .filter(|entry| entry.snapshot.kind() == SourceKind::File)
+            .fold(0u64, |total, entry| total.saturating_add(entry.snapshot.len()))
+    }
+
+    pub fn entry_proof(&self, relative_path: &Path) -> Option<&SourceEntryProof> {
+        self.entries.get(relative_path)
+    }
+
+    pub fn relative_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.entries.keys()
+    }
+
+    pub fn expected_direct_children(
+        &self,
+        relative_directory: &Path,
+    ) -> std::collections::BTreeSet<std::ffi::OsString> {
+        self.entries
+            .keys()
+            .filter_map(|relative| {
+                let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+                (parent == relative_directory)
+                    .then(|| relative.file_name().map(|name| name.to_os_string()))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// Revalidate one manifest entry at its quarantined pathname immediately
+    /// before unlinking it.
     pub fn verify_entry_at(
         &self,
         relative_path: &Path,
@@ -948,13 +2511,46 @@ impl SourceManifest {
     where
         F: FnMut(&Path) -> bool,
     {
+        self.verify_cleanup_entry_at_with_cancel(relative_path, path, keep_going)
+            .map(|_| ())
+    }
+
+    /// Counted cleanup form. For strict mounts, non-root entries retain an
+    /// exact copy-time version token: renaming the source root does not rename
+    /// descendants, so ctime remains authoritative and no content read is
+    /// needed. A regular file that is itself the moved root is rehashed because
+    /// the quarantine rename changes that file's ctime. Reduced-semantics mounts
+    /// likewise rehash regular files.
+    pub fn verify_cleanup_entry_at(
+        &self,
+        relative_path: &Path,
+        path: &Path,
+    ) -> Result<u64, String> {
+        let mut keep_going = |_: &Path| true;
+        self.verify_cleanup_entry_at_with_cancel(relative_path, path, &mut keep_going)
+    }
+
+    pub fn verify_cleanup_entry_at_with_cancel<F>(
+        &self,
+        relative_path: &Path,
+        path: &Path,
+        keep_going: &mut F,
+    ) -> Result<u64, String>
+    where
+        F: FnMut(&Path) -> bool,
+    {
         let proof = self.entries.get(relative_path).ok_or_else(|| {
             format!(
                 "unplanned source entry appeared during cleanup: {}",
                 relative_path.display()
             )
         })?;
-        verify_source_entry(path, proof, keep_going)
+        verify_source_entry_after_root_rename(
+            path,
+            proof,
+            relative_path.as_os_str().is_empty(),
+            keep_going,
+        )
     }
 
     /// Revalidate one destination entry against the source proof used to copy it.
@@ -1049,41 +2645,32 @@ impl SourceManifest {
     where
         F: FnMut(&Path) -> bool,
     {
-        let actual = enumerate_relative_paths_with_cancel(
+        if !self.entries.contains_key(Path::new("")) {
+            return Err("source manifest has no root entry".to_string());
+        }
+        let mut destination_manifest = DestinationManifest::default();
+        let mut visited = std::collections::BTreeSet::new();
+        capture_verified_destination_node(
+            self,
             root,
-            self.entries.len().saturating_add(1),
+            Path::new(""),
+            0,
+            &mut visited,
+            &mut destination_manifest,
             &mut keep_going,
         )?;
         let expected: std::collections::BTreeSet<PathBuf> =
             self.entries.keys().cloned().collect();
-        if actual != expected {
-            return Err(
-                "destination tree membership does not match the copied source manifest"
-                    .to_string(),
-            );
-        }
-
-        let mut destination_manifest = DestinationManifest::default();
-        for (relative, proof) in &self.entries {
-            let path = if relative.as_os_str().is_empty() {
-                root.to_path_buf()
-            } else {
-                root.join(relative)
-            };
-            if !keep_going(&path) {
-                return Err("destination verification was interrupted".to_string());
-            }
-            let snapshot = verify_destination_entry(&path, proof, &mut keep_going)?;
-            if destination_manifest
-                .entries
-                .insert(relative.clone(), snapshot)
-                .is_some()
-            {
-                return Err(format!(
-                    "duplicate destination manifest entry: {}",
-                    relative.display()
-                ));
-            }
+        if visited != expected {
+            let missing = expected
+                .difference(&visited)
+                .take(8)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            return Err(format!(
+                "destination tree is missing expected entries: [{}]",
+                missing.join(", ")
+            ));
         }
         Ok(destination_manifest)
     }
@@ -1128,16 +2715,56 @@ impl SourceManifest {
             ));
         }
 
-        for (relative, proof) in &self.entries {
+        for relative in self.entries.keys() {
             let path = if relative.as_os_str().is_empty() {
                 root.to_path_buf()
             } else {
                 root.join(relative)
             };
-            verify_source_entry(&path, proof, &mut keep_going)?;
+            self.verify_entry_at_with_cancel(relative, &path, &mut keep_going)?;
         }
         Ok(())
     }
+}
+
+#[allow(dead_code)]
+fn verify_portable_path_file_digest<F>(
+    path: &Path,
+    expected: ContentDigest,
+    keep_going: &mut F,
+    role: &str,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    if !keep_going(path) {
+        return Err(format!("{role} pathname verification was interrupted"));
+    }
+    let mut file = File::open(path)
+        .map_err(|error| format!("re-open {role} pathname {}: {error}", path.display()))?;
+    let before = snapshot_open_file(&file)
+        .map_err(|error| format!("identify re-opened {role} {}: {error}", path.display()))?;
+    let digest = digest_open_file_with_cancel(&mut file, path, keep_going)
+        .map_err(|error| format!("digest re-opened {role} {}: {error}", path.display()))?;
+    let after = snapshot_open_file(&file)
+        .map_err(|error| format!("re-identify re-opened {role} {}: {error}", path.display()))?;
+    before.verify_same_object_and_version(&after).map_err(|error| {
+        format!("re-opened {role} changed while being verified at {}: {error}", path.display())
+    })?;
+    let pathname = snapshot_path(path)
+        .map_err(|error| format!("re-identify {role} pathname {}: {error}", path.display()))?;
+    after
+        .verify_same_identity_with_policy(&pathname, FilesystemIdentityPolicy::ContentVerifiedPortable)
+        .map_err(|error| {
+            format!("{role} pathname changed after portable verification at {}: {error}", path.display())
+        })?;
+    if digest != expected {
+        return Err(format!(
+            "{role} pathname content digest mismatch after portable re-open at {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn verify_destination_entry<F>(
@@ -1176,7 +2803,13 @@ where
             })?;
             let path_snapshot = snapshot_path(path)
                 .map_err(|error| format!("re-identify destination path {}: {error}", path.display()))?;
-            opened.verify_same_identity(&path_snapshot).map_err(|error| {
+            let path_policy = filesystem_identity_policy(path);
+            let path_binding = if path_policy == FilesystemIdentityPolicy::Strict {
+                after.verify_same_object_and_version(&path_snapshot)
+            } else {
+                after.verify_same_identity_with_policy(&path_snapshot, path_policy)
+            };
+            path_binding.map_err(|error| {
                 format!(
                     "destination path changed while being verified at {}: {error}",
                     path.display()
@@ -1217,11 +2850,31 @@ where
         .map_err(|error| format!("identify destination directory {}: {error}", path.display()))
 }
 
-fn verify_source_entry<F>(
+fn verify_source_entry_after_root_rename<F>(
     path: &Path,
     proof: &SourceEntryProof,
+    moved_root: bool,
     keep_going: &mut F,
-) -> Result<(), String>
+) -> Result<u64, String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    verify_source_entry_after_root_rename_with_capabilities(
+        path,
+        proof,
+        moved_root,
+        filesystem_capabilities(path),
+        keep_going,
+    )
+}
+
+fn verify_source_entry_after_root_rename_with_capabilities<F>(
+    path: &Path,
+    proof: &SourceEntryProof,
+    moved_root: bool,
+    capabilities: FilesystemCapabilities,
+    keep_going: &mut F,
+) -> Result<u64, String>
 where
     F: FnMut(&Path) -> bool,
 {
@@ -1234,10 +2887,43 @@ where
                 .map_err(|error| format!("open {} for verification: {error}", path.display()))?;
             let before = snapshot_open_file(&file)
                 .map_err(|error| format!("identify {}: {error}", path.display()))?;
+            let strict_descendant = capabilities.identity_policy()
+                == FilesystemIdentityPolicy::Strict
+                && !moved_root;
+
+            if strict_descendant {
+                // Renaming the root does not rename descendants. Their exact
+                // copy-time identity/version token, including ctime, therefore
+                // remains authoritative and avoids a second content read.
+                proof
+                    .snapshot
+                    .verify_same_object_and_version(&before)
+                    .map_err(|error| {
+                        format!("{} changed before cleanup: {error}", path.display())
+                    })?;
+                let pathname = snapshot_path(path)
+                    .map_err(|error| format!("re-identify path {}: {error}", path.display()))?;
+                before
+                    .verify_same_object_and_version(&pathname)
+                    .map_err(|error| {
+                        format!(
+                            "{} pathname changed before cleanup: {error}",
+                            path.display()
+                        )
+                    })?;
+                return Ok(0);
+            }
+
+            // A regular file that is itself the quarantined root has a new ctime
+            // because of the rename. Reduced-semantics mounts also lack an exact
+            // pathname version token. In either case the copy-time digest is the
+            // irreducible final authority immediately before unlink.
             proof
                 .snapshot
-                .verify_same_object_after_rename(&before)
-                .map_err(|error| format!("{} changed before cleanup: {error}", path.display()))?;
+                .verify_same_object_after_rename_with_capabilities(&before, capabilities)
+                .map_err(|error| {
+                    format!("{} changed before cleanup: {error}", path.display())
+                })?;
             let digest = digest_open_file_with_cancel(&mut file, path, keep_going)
                 .map_err(|error| format!("digest {}: {error}", path.display()))?;
             let after = snapshot_open_file(&file)
@@ -1249,7 +2935,17 @@ where
                 })?;
             let pathname = snapshot_path(path)
                 .map_err(|error| format!("re-identify path {}: {error}", path.display()))?;
-            after.verify_same_identity(&pathname).map_err(|error| {
+            let pathname_binding = if capabilities.identity_policy()
+                == FilesystemIdentityPolicy::Strict
+            {
+                after.verify_same_object_and_version(&pathname)
+            } else {
+                after.verify_same_identity_with_policy(
+                    &pathname,
+                    FilesystemIdentityPolicy::ContentVerifiedPortable,
+                )
+            };
+            pathname_binding.map_err(|error| {
                 format!(
                     "{} pathname changed while its opened object was being verified: {error}",
                     path.display()
@@ -1261,21 +2957,47 @@ where
                     path.display()
                 ));
             }
+            Ok(proof.snapshot.len())
         }
         SourceKind::Directory => {
             let current = snapshot_path(path)
                 .map_err(|error| format!("identify {}: {error}", path.display()))?;
-            proof
-                .snapshot
-                .verify_same_object_after_rename(&current)
+            let precheck = if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+                if moved_root {
+                    proof
+                        .snapshot
+                        .verify_same_object_after_rename_with_capabilities(&current, capabilities)
+                } else {
+                    proof.snapshot.verify_same_object_and_version(&current)
+                }
+            } else {
+                proof.snapshot.verify_same_identity_with_policy(
+                    &current,
+                    FilesystemIdentityPolicy::ContentVerifiedPortable,
+                )
+            };
+            precheck
                 .map_err(|error| format!("{} changed before cleanup: {error}", path.display()))?;
+            Ok(0)
         }
         SourceKind::Symlink => {
             let before = snapshot_path(path)
                 .map_err(|error| format!("identify {}: {error}", path.display()))?;
-            proof
-                .snapshot
-                .verify_same_object_after_rename(&before)
+            let precheck = if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+                if moved_root {
+                    proof
+                        .snapshot
+                        .verify_same_object_after_rename_with_capabilities(&before, capabilities)
+                } else {
+                    proof.snapshot.verify_same_object_and_version(&before)
+                }
+            } else {
+                proof.snapshot.verify_same_identity_with_policy(
+                    &before,
+                    FilesystemIdentityPolicy::ContentVerifiedPortable,
+                )
+            };
+            precheck
                 .map_err(|error| format!("{} changed before cleanup: {error}", path.display()))?;
             let target = fs::read_link(path)
                 .map_err(|error| format!("read symlink {}: {error}", path.display()))?;
@@ -1292,9 +3014,9 @@ where
                     path.display()
                 ));
             }
+            Ok(0)
         }
     }
-    Ok(())
 }
 
 pub fn digest_open_file(file: &mut File) -> io::Result<ContentDigest> {

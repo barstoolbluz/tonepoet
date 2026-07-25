@@ -14,6 +14,35 @@ use super::convert_screen::draw_convert_screen;
 use super::draw_overlays::draw_overlay;
 use super::draw_queue::draw_queue_screen;
 
+/// Build the common overlay frame with a full-width inverted title bar.
+///
+/// Padding the title span to the block's entire inner width makes the title a
+/// true solid bar while preserving `Block::inner` geometry for every caller.
+pub(crate) fn solid_title_block(
+    area: Rect,
+    title: impl AsRef<str>,
+    border_color: ratatui::style::Color,
+    theme: super::theme::Theme,
+) -> Block<'static> {
+    let width = area.width.saturating_sub(2) as usize;
+    let label = format!(" {} ", title.as_ref().trim());
+    let mut fitted = super::display_width::fit_prefix(&label, width);
+    let fitted_width = super::display_width::width(&fitted);
+    if fitted_width < width {
+        fitted.push_str(&" ".repeat(width - fitted_width));
+    }
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            fitted,
+            Style::default()
+                .fg(theme.bg)
+                .bg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+}
+
 /// Main draw function dispatching to screen-specific renderers
 pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     let theme = app.theme;
@@ -405,6 +434,7 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
 
             let style = if is_sel {
                 Style::default()
+                    .fg(theme.text_bright)
                     .bg(theme.selection_bg)
                     .add_modifier(Modifier::BOLD)
             } else {

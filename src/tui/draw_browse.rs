@@ -188,7 +188,13 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         app.browse_inline_edit.as_ref().map(|state| &state.target),
         Some(crate::tui::app::BrowseInlineEditTarget::Create { dir, .. }) if dir == &app.browse.current_dir
     );
-    register_browse_buttons(&mut app.button_map, list_area, &app.browse, create_row_active);
+    register_browse_buttons(
+        &mut app.button_map,
+        list_area,
+        &app.browse,
+        inline_edit.as_ref(),
+        create_row_active,
+    );
     if let Some((track, thumb)) = list_scrollbar {
         app.button_map.record_button(
             TuiButton::ScrollbarTrack(ScrollbarSurface::BrowseList),
@@ -358,7 +364,7 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     // rectangles for both trailing actions so the breadcrumb never overlaps them.
     let row_area = Rect::new(area.x + 1, area.y + 3, area.width.saturating_sub(2), 1);
     const GO_WIDTH: u16 = 5;
-    const BOOKMARK_WIDTH: u16 = 6;
+    const BOOKMARK_WIDTH: u16 = 13;
     let action_width = GO_WIDTH.saturating_add(BOOKMARK_WIDTH);
     let path_area = Rect::new(
         row_area.x,
@@ -368,12 +374,30 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     );
     draw_breadcrumb_inline(f, path_area, &app.browse, theme);
     app.button_map.record_button(TuiButton::BrowseBreadcrumb, path_area);
+    if app.browse.path_input.is_some() {
+        let prefix_width = (super::display_width::width(" path: ") as u16).min(path_area.width);
+        let input_width = path_area
+            .width
+            .saturating_sub(prefix_width)
+            .saturating_sub(1);
+        if input_width > 0 {
+            app.button_map.record_button(
+                TuiButton::BrowsePathInlineEdit,
+                Rect::new(
+                    path_area.x.saturating_add(prefix_width),
+                    path_area.y,
+                    input_width,
+                    1,
+                ),
+            );
+        }
+    }
     if row_area.width >= action_width {
         let go = Rect::new(row_area.right().saturating_sub(action_width), row_area.y, GO_WIDTH, 1);
         let bookmarks = Rect::new(go.right(), row_area.y, BOOKMARK_WIDTH, 1);
         f.render_widget(Paragraph::new(" Go ").style(browse_toolbar_button_style(theme)), go);
         f.render_widget(
-            Paragraph::new(" ★ ▾ ").style(browse_toolbar_button_style(theme)),
+            Paragraph::new(" bookmarks ▾ ").style(browse_toolbar_button_style(theme)),
             bookmarks,
         );
         app.button_map.record_button(TuiButton::BrowsePathGo, go);
@@ -520,7 +544,15 @@ fn draw_explore_pane(
             let mut spans = vec![Span::styled(prefix, theme.text_style())];
             spans.extend(render_inline_value_with_embedded_cursor(input, input_width, theme));
             f.render_widget(Paragraph::new(Line::from(spans)), row_area);
-            buttons.record_button(TuiButton::BrowseTreeInlineEdit, row_area);
+            buttons.record_button(
+                TuiButton::BrowseTreeInlineEdit,
+                Rect::new(
+                    row_area.x.saturating_add(prefix_width as u16),
+                    row_area.y,
+                    input_width as u16,
+                    1,
+                ),
+            );
             editor_cursor = Some((
                 inner.x.saturating_add(prefix_width as u16).saturating_add(
                     inline_cursor_col(input, input_width) as u16,
@@ -559,7 +591,15 @@ fn draw_explore_pane(
             spans.extend(render_inline_value_with_embedded_cursor(input, input_width, theme));
             let create_area = Rect::new(inner.x, inner.y + visual_row as u16, inner.width, 1);
             f.render_widget(Paragraph::new(Line::from(spans)), create_area);
-            buttons.record_button(TuiButton::BrowseTreeInlineEdit, create_area);
+            buttons.record_button(
+                TuiButton::BrowseTreeInlineEdit,
+                Rect::new(
+                    create_area.x.saturating_add(prefix_width as u16),
+                    create_area.y,
+                    input_width as u16,
+                    1,
+                ),
+            );
             editor_cursor = Some((
                 inner.x.saturating_add(prefix_width as u16).saturating_add(
                     inline_cursor_col(input, input_width) as u16,
@@ -612,7 +652,10 @@ fn render_browse_tree_node_line(
     let indent = "  ".repeat(node.depth);
     let mut style = theme.text_style();
     if selected {
-        style = style.bg(theme.selection_bg).fg(theme.bg);
+        style = style
+            .bg(theme.selection_bg)
+            .fg(theme.text_bright)
+            .add_modifier(Modifier::BOLD);
     } else if hovered {
         style = style.bg(theme.surface);
     }
@@ -883,7 +926,10 @@ fn draw_bookmarks_dropdown(
         let button = TuiButton::BrowseBookmarkDropdownRow(index);
         let hovered = hover == Some(button);
         let style = if selected || hovered {
-            Style::default().fg(theme.text_bright).bg(theme.selection_bg)
+            Style::default()
+                .fg(theme.text_bright)
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD)
         } else if missing {
             Style::default()
                 .fg(theme.destructive)
@@ -927,7 +973,7 @@ fn draw_bookmarks_dropdown(
     draw_dropdown_action_row(
         f,
         add_area,
-        " ★ Bookmark this",
+        " Bookmark this dir",
         state.dropdown_selected == add_index,
         hover == Some(TuiButton::BrowseBookmarkDropdownAdd),
         theme,
@@ -935,7 +981,7 @@ fn draw_bookmarks_dropdown(
     draw_dropdown_action_row(
         f,
         manage_area,
-        " ⚙ Manage…",
+        " Manage bookmarks…",
         state.dropdown_selected == manage_index,
         hover == Some(TuiButton::BrowseBookmarkDropdownManage),
         theme,
@@ -957,7 +1003,10 @@ fn draw_dropdown_action_row(
     theme: super::theme::Theme,
 ) {
     let style = if selected || hovered {
-        Style::default().fg(theme.text_bright).bg(theme.selection_bg)
+        Style::default()
+            .fg(theme.text_bright)
+            .bg(theme.selection_bg)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.cyan)
     };
@@ -1816,6 +1865,7 @@ fn register_browse_buttons(
     buttons: &mut ButtonRenderMap,
     area: Rect,
     browse: &BrowseState,
+    inline_edit: Option<&BrowseInlineEditState>,
     create_row_active: bool,
 ) {
     if area.height < 4 || area.width < 20 {
@@ -1831,6 +1881,11 @@ fn register_browse_buttons(
         return;
     }
     let columns = browse_column_layout(inner_w, &browse.columns);
+    let name_width = name_column_width(&columns);
+    let inline_rename_path = inline_edit.and_then(|state| match &state.target {
+        BrowseInlineEditTarget::Rename { path } => Some(path),
+        _ => None,
+    });
 
     // Column x-offsets (relative to area.x). The header sits immediately above
     // result rows; an active search panel occupies the first two rows inside
@@ -1885,9 +1940,19 @@ fn register_browse_buttons(
     let end = (start + entry_capacity).min(browse.entries.len());
     if create_row_active && content_height > 0 {
         let create_row = (end - start).min(content_height - 1) as u16;
+        let y = entry_y_start + create_row;
         buttons.record_button(
             TuiButton::BrowseCreateRow,
-            Rect::new(area.x + 1, entry_y_start + create_row, inner_w as u16, 1),
+            Rect::new(area.x + 1, y, inner_w as u16, 1),
+        );
+        buttons.record_button(
+            TuiButton::BrowseFileInlineEdit,
+            Rect::new(
+                area.x + 1 + ROW_PREFIX as u16,
+                y,
+                name_width as u16,
+                1,
+            ),
         );
     }
     for (row, i) in (start..end).enumerate() {
@@ -1905,6 +1970,17 @@ fn register_browse_buttons(
                 1,
             ),
         );
+        if inline_rename_path.is_some_and(|path| path == &browse.entries[i].path) {
+            buttons.record_button(
+                TuiButton::BrowseFileInlineEdit,
+                Rect::new(
+                    area.x + 1 + ROW_PREFIX as u16,
+                    y,
+                    name_width as u16,
+                    1,
+                ),
+            );
+        }
     }
 }
 
@@ -2486,7 +2562,7 @@ fn render_entry_line(
 
     // Selected row gets a subtle bg highlight; hovered row gets a dimmer one.
     let bg = if is_selected {
-        Some(theme.border_dim)
+        Some(theme.selection_bg)
     } else if is_range_preview {
         Some(theme.selection_bg)
     } else if is_hovered {
@@ -2498,6 +2574,12 @@ fn render_entry_line(
         for span in spans.iter_mut() {
             if !matches!(span.content.as_ref(), "│") {
                 span.style = span.style.bg(bg_color);
+                if is_selected {
+                    span.style = span
+                        .style
+                        .fg(theme.text_bright)
+                        .add_modifier(Modifier::BOLD);
+                }
             }
         }
     }

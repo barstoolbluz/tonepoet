@@ -102,22 +102,30 @@ pub fn draw_bookmarks_overlay(
 
     draw_header(f, rows[0], state, current_dir, theme);
 
-    let two_column = inner.width >= TWO_COLUMN_MIN_WIDTH;
-    let body_columns = if two_column {
-        Layout::default()
+    if inner.width >= TWO_COLUMN_MIN_WIDTH {
+        let body_columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(43), Constraint::Length(2), Constraint::Percentage(57)])
-            .split(rows[2])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(100), Constraint::Length(0), Constraint::Length(0)])
-            .split(rows[2])
-    };
-
-    draw_bookmark_list(f, body_columns[0], state, button_map, theme);
-    if two_column {
+            .constraints([
+                Constraint::Percentage(43),
+                Constraint::Length(2),
+                Constraint::Percentage(57),
+            ])
+            .split(rows[2]);
+        draw_bookmark_list(f, body_columns[0], state, button_map, theme);
         draw_detail_card(f, body_columns[2], state, theme);
+    } else {
+        // Medium widths retain the complete manager anatomy by stacking the
+        // detail card below the list instead of silently dropping it.
+        let body_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(55),
+                Constraint::Length(1),
+                Constraint::Percentage(45),
+            ])
+            .split(rows[2]);
+        draw_bookmark_list(f, body_rows[0], state, button_map, theme);
+        draw_detail_card(f, body_rows[2], state, theme);
     }
 
     draw_footer(f, rows[3], theme);
@@ -262,7 +270,9 @@ fn draw_bookmark_rows(
             "(no bookmarks match the filter)"
         };
         f.render_widget(
-            Paragraph::new(text).style(Style::default().fg(theme.text_dim)),
+            Paragraph::new(text)
+                .style(Style::default().fg(theme.text_dim))
+                .wrap(Wrap { trim: false }),
             list_area,
         );
         return;
@@ -421,6 +431,23 @@ fn draw_detail_card(
     theme: super::theme::Theme,
 ) {
     let Some(bookmark) = state.selected_filtered() else {
+        let card = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.text_dim))
+            .title(Span::styled(
+                " details ",
+                Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+            ));
+        let inner = card.inner(area);
+        f.render_widget(card, area);
+        f.render_widget(
+            Paragraph::new(
+                "no bookmark selected — press a to add the current directory",
+            )
+            .style(Style::default().fg(theme.text_dim))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
         return;
     };
     let card = Block::default()
@@ -436,10 +463,10 @@ fn draw_detail_card(
     let target_status = state.target_status(&bookmark.path);
     let missing = target_status == Some(BookmarkTargetStatus::Missing);
     let (status_text, status_color) = match target_status {
-        Some(BookmarkTargetStatus::Reachable) => ("● reachable", theme.green),
-        Some(BookmarkTargetStatus::Missing) => ("✕ missing", theme.destructive),
-        Some(BookmarkTargetStatus::Unavailable) => ("? unavailable", theme.amber),
-        None => ("… checking", theme.amber),
+        Some(BookmarkTargetStatus::Reachable) => ("reachable", theme.green),
+        Some(BookmarkTargetStatus::Missing) => ("missing", theme.destructive),
+        Some(BookmarkTargetStatus::Unavailable) => ("unavailable", theme.amber),
+        None => ("checking", theme.amber),
     };
     let mut lines = vec![
         Line::from(vec![

@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -1659,10 +1659,7 @@ pub fn draw_theme_builder(
 fn draw_two_pane_builder(f: &mut Frame, state: &ThemeBuilderState, button_map: &mut ButtonRenderMap, theme: theme::Theme) {
     let area = scaled_centered_rect(92, 28, f.size());
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(Span::styled(" Theme Builder ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, " Theme Builder ", theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1826,10 +1823,7 @@ fn draw_slot_list(f: &mut Frame, area: Rect, state: &ThemeBuilderState, button_m
 }
 
 fn draw_edit_card(f: &mut Frame, area: Rect, state: &ThemeBuilderState, button_map: &mut ButtonRenderMap, theme: theme::Theme) {
-    let block = Block::default()
-        .title(Span::styled(format!(" {} ", state.selected_slot.label()), Style::default().fg(theme.header).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, format!(" {} ", state.selected_slot.label()), theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let color = state.selected_color();
@@ -1862,10 +1856,7 @@ fn draw_edit_card(f: &mut Frame, area: Rect, state: &ThemeBuilderState, button_m
 }
 
 fn draw_preview_card(f: &mut Frame, area: Rect, state: &ThemeBuilderState, theme: theme::Theme) {
-    let block = Block::default()
-        .title(Span::styled(" Live preview ", Style::default().fg(theme.header).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, " Live preview ", theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let lines = preview_lines(state, theme, inner.height as usize);
@@ -1882,10 +1873,7 @@ fn draw_derived_card(f: &mut Frame, area: Rect, state: &ThemeBuilderState, butto
     let auto_color = state.selected_derived_auto_color();
     let color = state.selected_derived_display_color();
     let (r, g, b) = theme::rgb_tuple(color);
-    let block = Block::default()
-        .title(Span::styled(format!(" {} ", spec.key), Style::default().fg(theme.header).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, format!(" {} ", spec.key), theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let toggle = if locked {
@@ -2149,10 +2137,7 @@ fn draw_gallery_overlay(f: &mut Frame, state: &ThemeBuilderState, button_map: &m
     let families = visible_gallery_families(state);
     let area = scaled_centered_rect(78, 22, f.size());
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(Span::styled(" Themes ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, " Themes ", theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2250,10 +2235,7 @@ fn draw_more_menu(f: &mut Frame, state: &ThemeBuilderState, button_map: &mut But
         .unwrap_or_else(|| screen.y.saturating_add(screen.height.saturating_sub(height + 3)));
     let area = Rect::new(x, y, width, height);
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(Span::styled(" More ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, " More ", theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let mut lines = Vec::new();
@@ -2273,10 +2255,7 @@ fn draw_more_menu(f: &mut Frame, state: &ThemeBuilderState, button_map: &mut But
 fn draw_apply_dialog(f: &mut Frame, state: &ThemeBuilderState, button_map: &mut ButtonRenderMap, theme: theme::Theme) {
     let area = scaled_centered_rect(64, 18, f.size());
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(Span::styled(" Apply / Resolve Theme ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, " Apply / Resolve Theme ", theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let theme_locks = state.palette.derived_locks.len();
@@ -2313,10 +2292,7 @@ fn draw_apply_dialog(f: &mut Frame, state: &ThemeBuilderState, button_map: &mut 
 fn draw_delete_confirm_dialog(f: &mut Frame, state: &ThemeBuilderState, button_map: &mut ButtonRenderMap, theme: theme::Theme) {
     let area = scaled_centered_rect(58, 10, f.size());
     f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(Span::styled(" Confirm Theme Deletion ", Style::default().fg(theme.destructive).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.destructive));
+    let block = super::draw::solid_title_block(area, " Confirm Theme Deletion ", theme.destructive, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let lines = vec![
@@ -2348,10 +2324,7 @@ fn draw_theme_file_dialog(
     let area = scaled_centered_rect(74, 11, f.size());
     f.render_widget(Clear, area);
     let title = if export { " Export Theme File " } else { " Import Theme File " };
-    let block = Block::default()
-        .title(Span::styled(title, Style::default().fg(theme.title).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = super::draw::solid_title_block(area, title, theme.border, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
 

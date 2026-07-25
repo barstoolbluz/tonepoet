@@ -137,6 +137,10 @@ pub struct BookmarksState {
     pub mirror_needs_repair: bool,
     /// Non-fatal warning from an authoritative commit or SQLite mirror repair.
     pub last_warning: Option<String>,
+    /// True only after the authoritative TOML store has been read or an absent
+    /// store has been resolved through the guarded SQLite migration path. This
+    /// prevents an empty default state from clearing the compatibility mirror.
+    authoritative_store_loaded: bool,
 }
 
 impl BookmarksState {
@@ -146,6 +150,7 @@ impl BookmarksState {
         let mut state = Self::default();
         match tui_file_picker::load_bookmarks() {
             Ok(entries) => {
+                state.authoritative_store_loaded = true;
                 state.entries = entries
                     .into_iter()
                     .map(|entry| Bookmark { name: entry.name, path: entry.path })
@@ -172,6 +177,7 @@ impl BookmarksState {
         match tui_file_picker::load_bookmarks() {
             Ok(entries) if !shared_store_absent => {
                 let mut state = Self {
+                    authoritative_store_loaded: true,
                     entries: entries
                         .into_iter()
                         .map(|entry| Bookmark {
@@ -216,6 +222,7 @@ impl BookmarksState {
                         path: PathBuf::from(path),
                     })
                     .collect();
+                state.authoritative_store_loaded = true;
                 // Publish only when the TOML store is genuinely absent. The
                 // initializer re-checks under the interprocess lock; if another
                 // process won the race, adopt its authoritative entries instead
@@ -232,17 +239,34 @@ impl BookmarksState {
                                     path: entry.path,
                                 })
                                 .collect();
-                            state.last_warning = initialization
+                            let storage_warning = initialization
                                 .status
                                 .as_ref()
                                 .and_then(|status| status.warning())
                                 .map(str::to_string);
+                            state.last_warning = if initialization.initialized {
+                                let notice = format!(
+                                    "migrated {} bookmarks from the database",
+                                    state.entries.len()
+                                );
+                                Some(match storage_warning {
+                                    Some(warning) => format!("{notice}; {warning}"),
+                                    None => notice,
+                                })
+                            } else {
+                                storage_warning
+                            };
                             if !initialization.initialized {
                                 state.reconcile_mirror(db);
                             }
                         }
                         Err(error) => {
                             log::warn!("bookmarks: SQLite migration to TOML failed: {error}");
+                            // The absent-store handoff did not resolve to an
+                            // authoritative TOML snapshot. Keep the mirror guard
+                            // closed so a later UI action cannot treat this
+                            // provisional SQLite state as authoritative.
+                            state.authoritative_store_loaded = false;
                             let authoritative_path_is_not_absent = match std::fs::symlink_metadata(
                                 &storage_path,
                             ) {
@@ -466,6 +490,13 @@ impl BookmarksState {
     /// Reload TOML and replace the SQLite mirror in one transaction while the
     /// authoritative bookmark lock remains held.
     fn reconcile_mirror(&mut self, db: &crate::db::Database) {
+        if !self.authoritative_store_loaded {
+            let message =
+                "bookmark mirror reconciliation refused before the authoritative store was loaded";
+            log::warn!("bookmarks: {message}");
+            self.last_warning = Some(message.to_string());
+            return;
+        }
         match tui_file_picker::reconcile_bookmarks_locked(|entries| {
             let mirror = entries
                 .iter()
@@ -1174,6 +1205,36 @@ impl BookmarksState {
 mod tests {
     use super::*;
 
+    static BOOKMARK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TestConfigHome {
+        old_xdg: Option<std::ffi::OsString>,
+    }
+
+    impl TestConfigHome {
+        fn install(path: &std::path::Path) -> Self {
+            let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", path);
+            Self { old_xdg }
+        }
+    }
+
+    impl Drop for TestConfigHome {
+        fn drop(&mut self) {
+            match self.old_xdg.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    fn with_isolated_bookmark_store(test: impl FnOnce()) {
+        let _guard = BOOKMARK_ENV_LOCK.lock().expect("bookmark env lock");
+        let temp = tempfile::tempdir().expect("config tempdir");
+        let _home = TestConfigHome::install(temp.path());
+        test();
+    }
+
     fn make_state_with_entries(n: usize, visible: usize) -> BookmarksState {
         let mut s = BookmarksState::default();
         s.entries = (0..n)
@@ -1618,6 +1679,98 @@ mod tests {
             .map(|(_, name, _)| name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["Second", "First", "Third"]);
+    }
+
+    #[test]
+    fn absent_store_migrates_sqlite_once_in_position_order() {
+        with_isolated_bookmark_store(|| {
+            let db = crate::db::Database::open_memory().expect("memory database");
+            db.add_bookmark("Second", "/second").expect("seed second");
+            db.add_bookmark("First", "/first").expect("seed first");
+
+            let first = BookmarksState::load_from_db(&db);
+            assert_eq!(
+                first.entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+                vec!["Second", "First"]
+            );
+            assert!(first
+                .last_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("migrated 2 bookmarks from the database")));
+            assert!(tui_file_picker::bookmark_storage_path().is_file());
+
+            let second = BookmarksState::load_from_db(&db);
+            assert_eq!(
+                second.entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+                vec!["Second", "First"]
+            );
+            assert_ne!(
+                second.last_warning.as_deref(),
+                Some("migrated 2 bookmarks from the database")
+            );
+            assert_eq!(db.list_bookmarks().expect("mirror").len(), 2);
+        });
+    }
+
+    #[test]
+    fn absent_store_migration_never_clears_nonempty_sqlite_mirror() {
+        with_isolated_bookmark_store(|| {
+            let db = crate::db::Database::open_memory().expect("memory database");
+            db.add_bookmark("Only", "/only").expect("seed");
+
+            let state = BookmarksState::load_from_db(&db);
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(db.list_bookmarks().expect("mirror").len(), 1);
+        });
+    }
+
+    #[test]
+    fn present_empty_store_is_authoritative_and_clears_sqlite_mirror() {
+        with_isolated_bookmark_store(|| {
+            tui_file_picker::save_bookmarks_atomic(&[]).expect("write empty store");
+            let db = crate::db::Database::open_memory().expect("memory database");
+            db.add_bookmark("Stale", "/stale").expect("seed stale mirror");
+
+            let state = BookmarksState::load_from_db(&db);
+            assert!(state.entries.is_empty());
+            assert!(db.list_bookmarks().expect("mirror").is_empty());
+        });
+    }
+
+    #[test]
+    fn present_malformed_store_is_visible_and_never_revives_or_clears_sqlite() {
+        with_isolated_bookmark_store(|| {
+            let storage = tui_file_picker::bookmark_storage_path();
+            std::fs::create_dir_all(storage.parent().expect("storage parent"))
+                .expect("create storage parent");
+            std::fs::write(&storage, b"this is not valid toml = [")
+                .expect("write malformed store");
+            let db = crate::db::Database::open_memory().expect("memory database");
+            db.add_bookmark("Keep", "/keep").expect("seed mirror");
+
+            let state = BookmarksState::load_from_db(&db);
+
+            assert!(state.entries.is_empty(), "malformed authoritative store is not replaced by SQLite");
+            assert_eq!(db.list_bookmarks().expect("mirror").len(), 1);
+            assert!(state.last_warning.as_deref().is_some_and(|warning| !warning.is_empty()));
+        });
+    }
+
+    #[test]
+    fn mirror_reconciliation_refuses_unloaded_default_state() {
+        with_isolated_bookmark_store(|| {
+            let db = crate::db::Database::open_memory().expect("memory database");
+            db.add_bookmark("Keep", "/keep").expect("seed mirror");
+            let mut state = BookmarksState::default();
+
+            state.reconcile_mirror(&db);
+
+            assert_eq!(db.list_bookmarks().expect("mirror").len(), 1);
+            assert!(state
+                .last_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("before the authoritative store was loaded")));
+        });
     }
 
     #[test]
