@@ -3124,6 +3124,44 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically replace the complete bookmark compatibility mirror.
+    ///
+    /// Readers observe either the previous complete sequence or the new
+    /// complete sequence. A process crash or insertion error cannot expose an
+    /// empty/partial mirror because deletion and reinsertion commit together.
+    pub fn replace_bookmarks_transactional(
+        &self,
+        bookmarks: &[(String, String)],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("bookmarks tx begin: {}", e))?;
+
+        tx.execute("DELETE FROM bookmarks", [])
+            .map_err(|e| format!("bookmarks clear: {}", e))?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO bookmarks (name, path, position) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| format!("bookmark insert prepare: {}", e))?;
+            for (position, (name, path)) in bookmarks.iter().enumerate() {
+                let position = i64::try_from(position)
+                    .map_err(|_| "bookmark position exceeds SQLite integer range".to_string())?;
+                insert
+                    .execute(params![name, path, position])
+                    .map_err(|e| {
+                        format!("could not mirror bookmark '{}' ({}): {}", name, path, e)
+                    })?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("bookmarks tx commit: {}", e))?;
+        Ok(())
+    }
+
     /// Clear all bookmarks (for full sync from in-memory state).
     pub fn clear_bookmarks(&self) -> Result<(), String> {
         self.conn
@@ -4613,6 +4651,65 @@ mod tests {
         // Most recent first.
         assert_eq!(recent[0].0, "/music/b.flac");
         assert_eq!(recent[1].0, "/music/a.flac");
+    }
+
+    #[test]
+    fn replace_bookmarks_transactional_preserves_exact_order() {
+        let db = Database::open_memory().unwrap();
+        db.add_bookmark("stale", "/stale").unwrap();
+        db.replace_bookmarks_transactional(&[
+            ("Second".to_string(), "/two".to_string()),
+            ("First".to_string(), "/one".to_string()),
+        ])
+        .unwrap();
+
+        let rows = db.list_bookmarks().unwrap();
+        assert_eq!(
+            rows.into_iter()
+                .map(|(_, name, path)| (name, path))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Second".to_string(), "/two".to_string()),
+                ("First".to_string(), "/one".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_bookmarks_transactional_rolls_back_on_insert_failure() {
+        let db = Database::open_memory().unwrap();
+        db.replace_bookmarks_transactional(&[
+            ("Original A".to_string(), "/a".to_string()),
+            ("Original B".to_string(), "/b".to_string()),
+        ])
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_injected_bookmark
+                 BEFORE INSERT ON bookmarks
+                 WHEN NEW.name = 'FAIL'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected bookmark mirror failure');
+                 END;",
+            )
+            .unwrap();
+
+        let result = db.replace_bookmarks_transactional(&[
+            ("Replacement".to_string(), "/replacement".to_string()),
+            ("FAIL".to_string(), "/fail".to_string()),
+        ]);
+        assert!(result.is_err());
+
+        let rows = db.list_bookmarks().unwrap();
+        assert_eq!(
+            rows.into_iter()
+                .map(|(_, name, path)| (name, path))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Original A".to_string(), "/a".to_string()),
+                ("Original B".to_string(), "/b".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -426,6 +426,28 @@ fn build_file_ops_submenu(
     }
 }
 
+fn build_select_submenu(include_current_item: bool) -> ContextMenuEntry {
+    let mut children = Vec::with_capacity(if include_current_item { 4 } else { 3 });
+    if include_current_item {
+        children.push(item("This item", ContextAction::Select));
+    }
+    children.push(item("All", ContextAction::SelectAll));
+    children.push(item("Invert selection", ContextAction::SelectInverse));
+    children.push(item("Deselect", ContextAction::Deselect));
+    ContextMenuEntry::Submenu {
+        label: "Select".to_string(),
+        children,
+    }
+}
+
+fn push_properties_footer(items: &mut Vec<ContextMenuEntry>) {
+    if !matches!(items.last(), Some(ContextMenuEntry::Separator)) {
+        items.push(separator());
+    }
+    items.push(item("Properties", ContextAction::EditMetadataFull));
+}
+
+
 
 /// Archive browse entries use synthetic paths (`archive/inner`) that do not
 /// exist on the host filesystem. Only expose actions here that either navigate
@@ -449,15 +471,11 @@ fn archive_file_ops_submenu(entry: &BrowseEntry) -> Option<ContextMenuEntry> {
 
 fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry> {
     let mut items = Vec::new();
+    let include_properties = matches!(&entry.kind, EntryKind::AudioFile(_) | EntryKind::Directory);
 
     match &entry.kind {
         EntryKind::AudioFile(_) => {
-            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
-            items.push(separator());
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             if let Some(file_ops) = archive_file_ops_submenu(entry) {
                 items.push(separator());
                 items.push(file_ops);
@@ -466,25 +484,17 @@ fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry>
         }
         EntryKind::Directory => {
             items.push(item("Open", ContextAction::OpenEntry));
-            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(separator());
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::ParentDir => {
             items.push(item("Go up", ContextAction::OpenEntry));
             items.push(separator());
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(false));
         }
         _ => {
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             if let Some(file_ops) = archive_file_ops_submenu(entry) {
                 items.push(separator());
                 items.push(file_ops);
@@ -493,6 +503,9 @@ fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry>
         }
     }
 
+    if include_properties {
+        push_properties_footer(&mut items);
+    }
     items
 }
 
@@ -502,7 +515,7 @@ fn archive_synthetic_file_op_status(app: &mut AppState, operation: &str) {
     ));
 }
 
-/// Build the "Tagging" submenu (MusicBrainz lookup, CUE import).
+/// Build the "Tags & Tagging" submenu (metadata editor, MusicBrainz lookup, CUE import).
 /// `has_cue` controls whether the CUE import option is shown.
 ///
 /// Note: "Get tags from gnudb.org" was hidden 2026-05-10 because
@@ -515,7 +528,11 @@ fn archive_synthetic_file_op_status(app: &mut AppState, operation: &str) {
 /// entry below if the HTTP endpoint comes back, or migrate the
 /// client to CDDBP if a longer-term fix is wanted.
 fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
-    let mut children = vec![item("Get tags from MusicBrainz", ContextAction::TagsFromMb)];
+    let mut children = vec![
+        item("Edit metadata", ContextAction::EditMetadataFull),
+        separator(),
+        item("Get tags from MusicBrainz", ContextAction::TagsFromMb),
+    ];
     if has_cue {
         children.push(item(
             "Get tags from CUE",
@@ -541,7 +558,7 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
         }));
     }
     ContextMenuEntry::Submenu {
-        label: "Tagging".to_string(),
+        label: "Tags & Tagging".to_string(),
         children,
     }
 }
@@ -652,6 +669,20 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 
     let mut items = Vec::new();
     let effective_kind = effective_browse_context_entry_kind(&entry.kind, &entry.path);
+    let include_properties = matches!(
+        &effective_kind,
+        EntryKind::AudioFile(_)
+            | EntryKind::Archive
+            | EntryKind::SacdIso
+            | EntryKind::DvdAudioIso
+            | EntryKind::DvdAudioDir
+            | EntryKind::DvdVideoIso
+            | EntryKind::DvdVideoDir
+            | EntryKind::BlurayIso
+            | EntryKind::BlurayDir
+            | EntryKind::Directory
+    ) || matches!(&effective_kind, EntryKind::OtherFile)
+        && crate::convert::classify::is_cue_sheet_path(&entry.path);
     let selected_path_is_marked = app
         .browse
         .multi_selected
@@ -675,12 +706,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::AudioFile(_) => {
             items.push(build_convert_submenu(app));
             items.push(separator());
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             items.push(separator());
-            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
             let has_cue = audio_file_is_cue_bearing(&entry.path);
             items.push(build_tagging_submenu(has_cue));
@@ -696,13 +723,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::Archive => {
             items.push(build_convert_submenu(app));
             items.push(separator());
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             items.push(separator());
-            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Set Password", ContextAction::SetArchivePassword));
+            items.push(build_tagging_submenu(false));
             items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item(
                 "Copy path",
@@ -722,12 +746,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                     items.push(submenu);
                 }
             }
-            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(separator());
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             items.push(separator());
             items.push(build_tagging_submenu(false));
             items.push(build_utilities_submenu(app));
@@ -754,13 +774,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 }
             }
             items.push(separator());
-            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
             items.push(separator());
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             items.push(separator());
             items.push(build_tagging_submenu(false));
             items.push(build_utilities_submenu(app));
@@ -772,7 +788,6 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item("Open", ContextAction::OpenEntry));
-            items.push(item("Edit metadata", ContextAction::EditMetadataFull));
             items.push(item("Analyze", ContextAction::Analyze));
             // Directory menu construction must not synchronously scan the
             // directory for CUE files. Show CUE-capable actions for directories
@@ -780,10 +795,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_tagging_submenu(true));
             items.push(build_disk_tools_submenu());
             items.push(build_utilities_submenu(app));
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             items.push(separator());
             items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item(
@@ -794,15 +806,13 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         EntryKind::ParentDir => {
             items.push(item("Go up", ContextAction::OpenEntry));
             items.push(separator());
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(false));
         }
         EntryKind::OtherFile => {
             // CUE files are convertible (they reference an image file).
             let is_cue = crate::convert::classify::is_cue_sheet_path(&entry.path);
             if is_cue {
                 items.push(build_convert_submenu(app));
-                items.push(item("Edit metadata", ContextAction::EditMetadataFull));
                 items.push(build_tagging_submenu(true));
                 items.push(separator());
             }
@@ -813,10 +823,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 }
                 items.push(separator());
             }
-            items.push(item("Select", ContextAction::Select));
-            items.push(item("Select All", ContextAction::SelectAll));
-            items.push(item("Select Inverse", ContextAction::SelectInverse));
-            items.push(item("Deselect", ContextAction::Deselect));
+            items.push(build_select_submenu(true));
             items.push(separator());
             items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item(
@@ -827,11 +834,31 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     }
 
     if allow_single_item_actions && entry.path.is_file() {
-        items.push(separator());
-        items.push(item(
-            "Open/Edit with System Default",
-            ContextAction::OpenSystemDefault(entry.path.clone()),
-        ));
+        let insertion = items
+            .iter()
+            .rposition(|entry| {
+                matches!(
+                    entry,
+                    ContextMenuEntry::Item(ContextMenuItem {
+                        action: ContextAction::CopyPath(_),
+                        ..
+                    })
+                )
+            })
+            .unwrap_or(items.len());
+        items.splice(
+            insertion..insertion,
+            [
+                separator(),
+                item(
+                    "Open/Edit with System Default",
+                    ContextAction::OpenSystemDefault(entry.path.clone()),
+                ),
+            ],
+        );
+    }
+    if include_properties {
+        push_properties_footer(&mut items);
     }
 
     items
@@ -897,14 +924,7 @@ pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 item("Folder", ContextAction::NewFolder),
             ],
         },
-        ContextMenuEntry::Submenu {
-            label: "Selection".to_string(),
-            children: vec![
-                item("Select All", ContextAction::SelectAll),
-                item("Invert Selection", ContextAction::SelectInverse),
-                item("Deselect All", ContextAction::Deselect),
-            ],
-        },
+        build_select_submenu(false),
         item_enabled(
             "Paste",
             ContextAction::PasteSelection,
@@ -1923,6 +1943,8 @@ pub fn execute_context_action(
         ContextAction::OpenBookmarks => {
             app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
             app.bookmarks.open_overlay();
+            super::keybindings::request_bookmark_target_statuses(app, tx);
+            super::keybindings::request_selected_bookmark_detail(app, tx);
         }
         ContextAction::BookmarkCurrentDir => {
             app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
@@ -2760,6 +2782,44 @@ mod tests {
     }
 
     #[test]
+    fn select_submenu_uses_one_canonical_shape() {
+        let ContextMenuEntry::Submenu { label, children } = build_select_submenu(true) else {
+            panic!("entry selection must be a submenu");
+        };
+        assert_eq!(label, "Select");
+        assert_eq!(
+            menu_labels_recursive(&children),
+            vec!["This item", "All", "Invert selection", "Deselect"]
+        );
+
+        let ContextMenuEntry::Submenu { label, children } = build_select_submenu(false) else {
+            panic!("empty-space selection must be a submenu");
+        };
+        assert_eq!(label, "Select");
+        assert_eq!(
+            menu_labels_recursive(&children),
+            vec!["All", "Invert selection", "Deselect"]
+        );
+    }
+
+    #[test]
+    fn tags_and_tagging_starts_with_metadata_editor_then_separator() {
+        let ContextMenuEntry::Submenu { label, children } = build_tagging_submenu(false) else {
+            panic!("tagging menu must be a submenu");
+        };
+        assert_eq!(label, "Tags & Tagging");
+        assert!(matches!(
+            children.first(),
+            Some(ContextMenuEntry::Item(ContextMenuItem {
+                label,
+                action: ContextAction::EditMetadataFull,
+                ..
+            })) if label == "Edit metadata"
+        ));
+        assert!(matches!(children.get(1), Some(ContextMenuEntry::Separator)));
+    }
+
+    #[test]
     fn tagging_submenu_cue_entries_dispatch_to_cuesheet_actions() {
         let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(true) else {
             panic!("tagging menu must be a submenu");
@@ -2779,6 +2839,37 @@ mod tests {
             )),
             "CUE-labelled menu entries must not dispatch to generic Edit metadata"
         );
+    }
+
+    #[test]
+    fn archive_browse_menu_includes_canonical_tagging_submenu() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![BrowseEntry::new(
+            PathBuf::from("archive.zip"),
+            "archive.zip".to_string(),
+            EntryKind::Archive,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        let menu = build_browse_entry_menu(&app);
+        let tagging = menu.iter().find_map(|entry| match entry {
+            ContextMenuEntry::Submenu { label, children } if label == "Tags & Tagging" => {
+                Some(children)
+            }
+            _ => None,
+        });
+        let children = tagging.expect("archive must expose Tags & Tagging");
+        assert!(matches!(
+            children.first(),
+            Some(ContextMenuEntry::Item(ContextMenuItem {
+                label,
+                action: ContextAction::EditMetadataFull,
+                ..
+            })) if label == "Edit metadata"
+        ));
     }
 
     #[test]
@@ -2802,7 +2893,7 @@ mod tests {
 
         let menu = build_browse_entry_menu(&app);
         let labels = menu_labels_recursive(&menu);
-        assert!(labels.iter().any(|label| label == "Tagging"));
+        assert!(labels.iter().any(|label| label == "Tags & Tagging"));
         assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueView)));
         assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueEdit)));
         assert!(menu_contains_action(&menu, |action| matches!(action, ContextAction::BrowseCueDelete)));
@@ -2930,7 +3021,7 @@ mod tests {
         ));
         let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
 
-        assert!(labels.iter().any(|label| label == "Edit metadata"));
+        assert!(labels.iter().any(|label| label == "Properties"));
         assert!(labels.iter().any(|label| label == "Rename"));
         for forbidden in [
             "Bulk Rename",
@@ -2938,7 +3029,7 @@ mod tests {
             "Move to...",
             "Delete permanently",
             "Analyze",
-            "Tagging",
+            "Tags & Tagging",
             "Utilities",
             "Disc Tools",
         ] {
@@ -2955,7 +3046,7 @@ mod tests {
         let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
 
         assert!(labels.iter().any(|label| label == "Open"));
-        assert!(labels.iter().any(|label| label == "Edit metadata"));
+        assert!(labels.iter().any(|label| label == "Properties"));
         for forbidden in [
             "File operations",
             "Rename",
@@ -3305,4 +3396,90 @@ mod tests {
         assert!(status.contains("ARTIST restored to MusicBrainz values"));
         assert!(status.contains("warning: 1 carrier"));
     }
+
+    #[test]
+    fn properties_is_the_bottom_footer_after_copy_path_for_all_supported_entry_builders() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixtures = vec![
+            (
+                temp.path().join("audio.flac"),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            ),
+            (temp.path().join("archive.zip"), EntryKind::Archive),
+            (temp.path().join("disc.iso"), EntryKind::SacdIso),
+            (temp.path().join("dvd.iso"), EntryKind::DvdAudioIso),
+            (temp.path().join("sheet.cue"), EntryKind::OtherFile),
+        ];
+
+        for (path, kind) in fixtures {
+            std::fs::write(&path, b"fixture").expect("fixture file");
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![BrowseEntry::new(
+                path.clone(),
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                kind,
+                0,
+                None,
+            )];
+            let menu = build_browse_entry_menu(&app);
+            assert!(matches!(
+                menu.last(),
+                Some(ContextMenuEntry::Item(ContextMenuItem {
+                    label,
+                    action: ContextAction::EditMetadataFull,
+                    ..
+                })) if label == "Properties"
+            ));
+            assert!(matches!(
+                menu.get(menu.len().saturating_sub(2)),
+                Some(ContextMenuEntry::Separator)
+            ));
+            assert!(matches!(
+                menu.get(menu.len().saturating_sub(3)),
+                Some(ContextMenuEntry::Item(ContextMenuItem {
+                    action: ContextAction::CopyPath(_),
+                    ..
+                }))
+            ));
+        }
+
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory).expect("directory fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            directory,
+            "directory".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        let menu = build_browse_entry_menu(&app);
+        assert!(matches!(
+            menu.last(),
+            Some(ContextMenuEntry::Item(ContextMenuItem {
+                label,
+                action: ContextAction::EditMetadataFull,
+                ..
+            })) if label == "Properties"
+        ));
+        assert!(matches!(
+            menu.get(menu.len().saturating_sub(2)),
+            Some(ContextMenuEntry::Separator)
+        ));
+        assert!(matches!(
+            menu.get(menu.len().saturating_sub(3)),
+            Some(ContextMenuEntry::Item(ContextMenuItem {
+                action: ContextAction::CopyPath(_),
+                ..
+            }))
+        ));
+    }
+
 }

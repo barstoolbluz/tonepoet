@@ -4186,7 +4186,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.recent.open_overlay();
         }
         Command::Bookmarks(args) => {
-            execute_bookmarks(app, &args);
+            execute_bookmarks(app, &args, tx);
         }
         Command::Password => {
             if app.current_screen != AppScreen::Browse {
@@ -7371,7 +7371,7 @@ fn execute_filter(app: &mut AppState, arg: Option<&str>, tx: &mpsc::Sender<AppMe
 ///   `:bm add`          → quick-add current browse dir with default name (last
 ///                        path component), no overlay
 ///   `:bm add <name>`   → quick-add current browse dir with the given name
-fn execute_bookmarks(app: &mut AppState, args: &str) {
+fn execute_bookmarks(app: &mut AppState, args: &str, tx: &mpsc::Sender<AppMessage>) {
     if app.current_screen != AppScreen::Browse {
         app.set_status(":bookmarks only works on the browse screen");
         return;
@@ -7381,6 +7381,8 @@ fn execute_bookmarks(app: &mut AppState, args: &str) {
     if trimmed.is_empty() {
         app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
         app.bookmarks.open_overlay();
+        super::keybindings::request_bookmark_target_statuses(app, tx);
+        super::keybindings::request_selected_bookmark_detail(app, tx);
         return;
     }
 

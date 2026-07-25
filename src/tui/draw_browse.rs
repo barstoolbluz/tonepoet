@@ -13,7 +13,7 @@ use ratatui::{
 
 use super::app::{AppState, BrowseInfoFocus, BrowseInlineEditState, BrowseInlineEditTarget};
 use super::browse::{BrowseColumn, BrowseDirectorySummaryColdWorkPolicy, BrowseEntry, BrowseOptionsMenu, BrowsePaneId, BrowseState, CachedInfo, EntryKind, FolderAudioSummary, FolderClassificationKind, FolderContentClassification, FormatFilter, SortBy, SortDir};
-use super::button_map::{ButtonRenderMap, TuiButton};
+use super::button_map::{ButtonRenderMap, ScrollbarSurface, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
 use super::inline_edit::{inline_cursor_col, render_inline_value_with_embedded_cursor};
@@ -175,7 +175,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         }
     }
 
-    draw_browse_list(
+    let list_scrollbar = draw_browse_list(
         f,
         list_area,
         &mut app.browse,
@@ -189,6 +189,16 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         Some(crate::tui::app::BrowseInlineEditTarget::Create { dir, .. }) if dir == &app.browse.current_dir
     );
     register_browse_buttons(&mut app.button_map, list_area, &app.browse, create_row_active);
+    if let Some((track, thumb)) = list_scrollbar {
+        app.button_map.record_button(
+            TuiButton::ScrollbarTrack(ScrollbarSurface::BrowseList),
+            track,
+        );
+        app.button_map.record_button(
+            TuiButton::ScrollbarThumb(ScrollbarSurface::BrowseList),
+            thumb,
+        );
+    }
     // The Browse pane is maximized/restored by double-clicking its title.
     // Do not also register the title glyph as a single-click toggle: Browse
     // never collapses, and a destructive single-click here violates the
@@ -224,9 +234,13 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     );
 
     if app.browse.options_menu.is_open() {
+        let anchor = app
+            .button_map
+            .button_rect(TuiButton::BrowseToolbarOptions)
+            .unwrap_or_else(|| options_button_anchor_for_toolbar(chunks[1]));
         draw_options_menu(
             f,
-            chunks[1],
+            anchor,
             area,
             &app.browse,
             &app.config.performance.browsing.archive_listing,
@@ -234,6 +248,24 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
             app.hover_target,
             theme,
         );
+    }
+    if app.bookmarks.dropdown_open {
+        if let Some(anchor) = app.button_map.button_rect(TuiButton::BrowseBookmarksToggle) {
+            draw_bookmarks_dropdown(
+                f,
+                anchor,
+                area,
+                &mut app.bookmarks,
+                &mut app.button_map,
+                app.hover_target,
+                theme,
+            );
+        } else {
+            // The path-row affordance itself can disappear at extreme sizes.
+            // Do not retain keyboard ownership for a dropdown that has neither
+            // an anchor nor any visible hit targets.
+            app.bookmarks.close_dropdown();
+        }
     }
 }
 
@@ -322,14 +354,30 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     x = x.saturating_add(12);
     draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarSearch, x, y, " Search ", true, theme);
 
-    // Render path bar on line 3, inside the borders
-    let path_area = Rect::new(area.x + 1, area.y + 3, area.width.saturating_sub(2), 1);
+    // Render path bar on line 3, inside the borders. Reserve explicit hit
+    // rectangles for both trailing actions so the breadcrumb never overlaps them.
+    let row_area = Rect::new(area.x + 1, area.y + 3, area.width.saturating_sub(2), 1);
+    const GO_WIDTH: u16 = 5;
+    const BOOKMARK_WIDTH: u16 = 6;
+    let action_width = GO_WIDTH.saturating_add(BOOKMARK_WIDTH);
+    let path_area = Rect::new(
+        row_area.x,
+        row_area.y,
+        row_area.width.saturating_sub(action_width),
+        1,
+    );
     draw_breadcrumb_inline(f, path_area, &app.browse, theme);
     app.button_map.record_button(TuiButton::BrowseBreadcrumb, path_area);
-    if path_area.width > 6 {
-        let go = Rect::new(path_area.x + path_area.width - 5, path_area.y, 5, 1);
+    if row_area.width >= action_width {
+        let go = Rect::new(row_area.right().saturating_sub(action_width), row_area.y, GO_WIDTH, 1);
+        let bookmarks = Rect::new(go.right(), row_area.y, BOOKMARK_WIDTH, 1);
         f.render_widget(Paragraph::new(" Go ").style(browse_toolbar_button_style(theme)), go);
+        f.render_widget(
+            Paragraph::new(" ★ ▾ ").style(browse_toolbar_button_style(theme)),
+            bookmarks,
+        );
         app.button_map.record_button(TuiButton::BrowsePathGo, go);
+        app.button_map.record_button(TuiButton::BrowseBookmarksToggle, bookmarks);
     }
 }
 
@@ -428,13 +476,14 @@ fn draw_explore_pane(
         Rect::new(area.x + 1, area.y, title_w as u16, 1),
     );
 
-    browse.set_tree_visible_height(inner.height as usize);
-    f.render_widget(Clear, inner);
-
     let create = inline_edit.and_then(|state| match &state.target {
         BrowseInlineEditTarget::Create { dir, .. } => Some((dir, &state.input)),
         _ => None,
     });
+    let tree_entry_capacity = effective_entry_capacity(inner.height as usize, create.is_some());
+    browse.set_tree_visible_height(tree_entry_capacity);
+    f.render_widget(Clear, inner);
+
     let rename = inline_edit.and_then(|state| match &state.target {
         BrowseInlineEditTarget::Rename { path } => Some((path, &state.input)),
         _ => None,
@@ -442,9 +491,13 @@ fn draw_explore_pane(
 
     let start = browse.tree_scroll;
     let mut visual_row = 0usize;
+    let mut rendered_nodes = 0usize;
     let mut absolute = start;
     let mut editor_cursor = None;
-    while absolute < browse.tree_nodes.len() && visual_row < inner.height as usize {
+    while absolute < browse.tree_nodes.len()
+        && rendered_nodes < tree_entry_capacity
+        && visual_row < inner.height as usize
+    {
         let node = &browse.tree_nodes[absolute];
         let row_area = Rect::new(inner.x, inner.y + visual_row as u16, inner.width, 1);
         let disclosure_x = inner
@@ -493,6 +546,7 @@ fn draw_explore_pane(
             }
         }
         visual_row += 1;
+        rendered_nodes += 1;
 
         if visual_row < inner.height as usize
             && create.is_some_and(|(dir, _)| dir == &node.path)
@@ -515,6 +569,24 @@ fn draw_explore_pane(
             visual_row += 1;
         }
         absolute += 1;
+    }
+
+    if let Some((track, thumb)) = draw_vertical_scrollbar(
+        f,
+        Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height),
+        browse.tree_nodes.len(),
+        browse.tree_visible_height,
+        browse.tree_scroll,
+        theme,
+    ) {
+        buttons.record_button(
+            TuiButton::ScrollbarTrack(ScrollbarSurface::BrowseTree),
+            track,
+        );
+        buttons.record_button(
+            TuiButton::ScrollbarThumb(ScrollbarSurface::BrowseTree),
+            thumb,
+        );
     }
 
     if let Some((x, y)) = editor_cursor {
@@ -591,7 +663,7 @@ fn draw_collapsed_pane(
 
 fn draw_options_menu(
     f: &mut Frame,
-    toolbar_area: Rect,
+    anchor: Rect,
     screen_area: Rect,
     browse: &BrowseState,
     archive_listing_mode: &str,
@@ -601,7 +673,7 @@ fn draw_options_menu(
 ) {
     let root_rows = options_root_rows(browse);
     let geometry = options_menu_geometry_for_area(
-        toolbar_area,
+        anchor,
         screen_area,
         browse,
         archive_listing_mode,
@@ -664,18 +736,28 @@ pub(super) fn browse_toolbar_area_for_screen(screen_area: Rect) -> Rect {
         .split(screen_area)[1]
 }
 
+pub(super) fn options_button_anchor_for_toolbar(toolbar_area: Rect) -> Rect {
+    Rect::new(
+        toolbar_area.x.saturating_add(34),
+        toolbar_area.y.saturating_add(1),
+        12.min(toolbar_area.width),
+        1,
+    )
+}
+
+
 pub(super) fn options_menu_geometry_for_area(
-    toolbar_area: Rect,
+    anchor: Rect,
     screen_area: Rect,
     browse: &BrowseState,
     archive_listing_mode: &str,
 ) -> OptionsMenuGeometry {
     let root_rows = options_root_rows(browse);
-    let root_width = options_menu_panel_width("Options", &root_rows, toolbar_area.width);
+    let root_width = options_menu_panel_width("Options", &root_rows, screen_area.width);
     let root_height = root_rows.len() as u16 + 2;
-    let preferred_x = toolbar_area.x.saturating_add(30);
-    let root_y = toolbar_area.y.saturating_add(1);
-    let root_x = clamp_menu_x(preferred_x, root_width, toolbar_area);
+    let root_x = clamp_menu_x(anchor.x, root_width, screen_area);
+    let preferred_y = anchor.y.saturating_add(anchor.height);
+    let root_y = clamp_menu_y(preferred_y, root_height, screen_area);
     let root_area = Rect::new(root_x, root_y, root_width, root_height);
     let active_parent = active_options_parent_button(browse.options_menu);
 
@@ -706,6 +788,211 @@ pub(super) fn options_menu_geometry_for_area(
         root_area,
         submenu_area,
     }
+}
+
+fn effective_entry_capacity(total_rows: usize, inline_create_active: bool) -> usize {
+    total_rows.saturating_sub(usize::from(inline_create_active))
+}
+
+fn bookmark_dropdown_fits(screen_area: Rect) -> bool {
+    screen_area.width >= 8 && screen_area.height >= 6
+}
+
+#[cfg(test)]
+mod viewport_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn inline_create_reserves_one_authoritative_entry_row() {
+        assert_eq!(effective_entry_capacity(10, false), 10);
+        assert_eq!(effective_entry_capacity(10, true), 9);
+        assert_eq!(effective_entry_capacity(0, true), 0);
+
+        let visible = effective_entry_capacity(10, true);
+        let final_offset = 100usize.saturating_sub(visible);
+        assert_eq!(final_offset, 91);
+        let metrics = tui_file_picker::ScrollbarMetrics::new(100, visible, final_offset, 10)
+            .expect("scrollbar metrics");
+        assert_eq!(metrics.max_offset, final_offset);
+        assert_eq!(metrics.thumb_start + metrics.thumb_len, metrics.track_len);
+    }
+
+    #[test]
+    fn dropdown_minimum_geometry_is_explicit() {
+        assert!(!bookmark_dropdown_fits(Rect::new(0, 0, 7, 6)));
+        assert!(!bookmark_dropdown_fits(Rect::new(0, 0, 8, 5)));
+        assert!(bookmark_dropdown_fits(Rect::new(0, 0, 8, 6)));
+    }
+}
+
+fn draw_bookmarks_dropdown(
+    f: &mut Frame,
+    anchor: Rect,
+    screen_area: Rect,
+    state: &mut super::bookmarks::BookmarksState,
+    buttons: &mut ButtonRenderMap,
+    hover: Option<TuiButton>,
+    theme: super::theme::Theme,
+) {
+    // Never leave an invisible modal active. If the terminal cannot preserve
+    // the dropdown's minimum geometry, close it and return keyboard ownership
+    // to the underlying Browse surface.
+    if !bookmark_dropdown_fits(screen_area) {
+        state.close_dropdown();
+        return;
+    }
+
+    let longest = state
+        .entries
+        .iter()
+        .map(|entry| super::display_width::width(&entry.name).saturating_add(4))
+        .max()
+        .unwrap_or(18)
+        .max(20);
+    let width = longest.min(40).saturating_add(2) as u16;
+    let width = width.min(screen_area.width);
+    let max_bookmark_rows = screen_area.height.saturating_sub(5).min(10) as usize;
+    state.set_dropdown_visible_rows(max_bookmark_rows);
+    let visible_bookmarks = state.entries.len().min(max_bookmark_rows);
+    let height = visible_bookmarks as u16 + 5;
+    let x = clamp_menu_x(anchor.right().saturating_sub(width), width, screen_area);
+    let y = clamp_menu_y(anchor.bottom(), height, screen_area);
+    let area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.green))
+        .title(Span::styled(
+            " Bookmarks ",
+            Style::default().fg(theme.green).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let start = state.dropdown_scroll;
+    let end = (start + max_bookmark_rows).min(state.entries.len());
+    let mut targets = Vec::new();
+    for (row, index) in (start..end).enumerate() {
+        let entry = &state.entries[index];
+        let selected = state.dropdown_selected == index;
+        let target_status = state.target_status(&entry.path);
+        let missing = target_status == Some(super::bookmarks::BookmarkTargetStatus::Missing);
+        let unavailable =
+            target_status == Some(super::bookmarks::BookmarkTargetStatus::Unavailable);
+        let button = TuiButton::BrowseBookmarkDropdownRow(index);
+        let hovered = hover == Some(button);
+        let style = if selected || hovered {
+            Style::default().fg(theme.text_bright).bg(theme.selection_bg)
+        } else if missing {
+            Style::default()
+                .fg(theme.destructive)
+                .add_modifier(Modifier::DIM)
+        } else if unavailable {
+            Style::default().fg(theme.amber).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let prefix = if missing {
+            " ! "
+        } else if unavailable {
+            " ? "
+        } else if selected {
+            " ▸ "
+        } else {
+            "   "
+        };
+        let row_area = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let name = super::display_width::truncate_right(
+            &entry.name,
+            inner.width.saturating_sub(3) as usize,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(prefix, style), Span::styled(name, style)]))
+                .style(style),
+            row_area,
+        );
+        targets.push((button, row_area));
+    }
+
+    let separator_y = inner.y.saturating_add(visible_bookmarks as u16);
+    f.render_widget(
+        Paragraph::new("─".repeat(inner.width as usize)).style(Style::default().fg(theme.border_dim)),
+        Rect::new(inner.x, separator_y, inner.width, 1),
+    );
+    let add_index = state.entries.len();
+    let manage_index = add_index + 1;
+    let add_area = Rect::new(inner.x, separator_y + 1, inner.width, 1);
+    let manage_area = Rect::new(inner.x, separator_y + 2, inner.width, 1);
+    draw_dropdown_action_row(
+        f,
+        add_area,
+        " ★ Bookmark this",
+        state.dropdown_selected == add_index,
+        hover == Some(TuiButton::BrowseBookmarkDropdownAdd),
+        theme,
+    );
+    draw_dropdown_action_row(
+        f,
+        manage_area,
+        " ⚙ Manage…",
+        state.dropdown_selected == manage_index,
+        hover == Some(TuiButton::BrowseBookmarkDropdownManage),
+        theme,
+    );
+
+    for (button, rect) in targets {
+        buttons.record_button(button, rect);
+    }
+    buttons.record_button(TuiButton::BrowseBookmarkDropdownAdd, add_area);
+    buttons.record_button(TuiButton::BrowseBookmarkDropdownManage, manage_area);
+}
+
+fn draw_dropdown_action_row(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    selected: bool,
+    hovered: bool,
+    theme: super::theme::Theme,
+) {
+    let style = if selected || hovered {
+        Style::default().fg(theme.text_bright).bg(theme.selection_bg)
+    } else {
+        Style::default().fg(theme.cyan)
+    };
+    f.render_widget(Paragraph::new(label).style(style), area);
+}
+
+fn draw_vertical_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    theme: super::theme::Theme,
+) -> Option<(Rect, Rect)> {
+    let metrics = tui_file_picker::ScrollbarMetrics::new(
+        total,
+        visible,
+        offset,
+        area.height as usize,
+    )?;
+    let track_lines = (0..area.height)
+        .map(|_| Line::from(Span::styled("░", Style::default().fg(theme.text_dim))))
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(track_lines), area);
+    let thumb = Rect::new(
+        area.x,
+        area.y.saturating_add(metrics.thumb_start as u16),
+        1,
+        metrics.thumb_len as u16,
+    );
+    let thumb_lines = (0..metrics.thumb_len)
+        .map(|_| Line::from(Span::styled("█", Style::default().fg(theme.title))))
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(thumb_lines), thumb);
+    Some((area, thumb))
 }
 
 fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
@@ -1107,7 +1394,12 @@ mod options_menu_tests {
         let screen = Rect::new(0, 0, 120, 30);
         let toolbar = browse_toolbar_area_for_screen(screen);
 
-        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let geometry = options_menu_geometry_for_area(
+            options_button_anchor_for_toolbar(toolbar),
+            screen,
+            &browse,
+            "auto",
+        );
         let submenu = geometry.submenu_area.expect("layout submenu");
 
         assert_eq!(submenu.y, geometry.root_area.y + 2);
@@ -1122,11 +1414,16 @@ mod options_menu_tests {
         let screen = Rect::new(7, 3, 120, 30);
         let toolbar = browse_toolbar_area_for_screen(screen);
 
-        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let geometry = options_menu_geometry_for_area(
+            options_button_anchor_for_toolbar(toolbar),
+            screen,
+            &browse,
+            "auto",
+        );
         let submenu = geometry.submenu_area.expect("layout submenu");
 
         assert!(geometry.root_area.x >= screen.x);
-        assert_eq!(geometry.root_area.y, screen.y + 8);
+        assert_eq!(geometry.root_area.y, screen.y + 9);
         assert!(submenu.x >= screen.x);
         assert!(submenu.y >= screen.y);
         assert!(geometry.contains(submenu.x + 1, submenu.y));
@@ -1733,9 +2030,9 @@ fn draw_browse_list(
     hover: Option<super::button_map::TuiButton>,
     navigation_focus_active: bool,
     theme: super::theme::Theme,
-) {
+) -> Option<(Rect, Rect)> {
     if area.height < 4 || area.width < 20 {
-        return;
+        return None;
     }
 
     let border_color = theme.cyan;
@@ -1787,7 +2084,14 @@ fn draw_browse_list(
         3
     };
     let content_height = (area.height as usize).saturating_sub(reserved);
-    browse.visible_height = content_height;
+    let create_input = inline_edit.and_then(|state| match &state.target {
+        BrowseInlineEditTarget::Create { dir, .. } if dir == &browse.current_dir => {
+            Some(&state.input)
+        }
+        _ => None,
+    });
+    let entry_capacity = effective_entry_capacity(content_height, create_input.is_some());
+    browse.set_visible_height(entry_capacity);
 
     let column_layout = browse_column_layout(inner_w, &browse.columns);
     let name_w = name_column_width(&column_layout);
@@ -1866,10 +2170,6 @@ fn draw_browse_list(
     ));
 
     let mut rename_cursor: Option<(usize, u16)> = None;
-    let create_input = inline_edit.and_then(|state| match &state.target {
-        BrowseInlineEditTarget::Create { dir, .. } if dir == &browse.current_dir => Some(&state.input),
-        _ => None,
-    });
 
     if let Some(err) = &browse.error {
         lines.push(bordered_line(
@@ -1910,10 +2210,9 @@ fn draw_browse_list(
         }
     } else {
         let start = browse.scroll_offset;
-        // A create prompt is an active editor, not optional decoration. Reserve
-        // one list row so it remains visible even when the directory fills the
-        // viewport; otherwise typing would edit an off-screen field.
-        let entry_capacity = content_height.saturating_sub(usize::from(create_input.is_some()));
+        // The same effective capacity drives rendering and BrowseState's
+        // scrolling/cursor/scrollbar calculations. This keeps the final entry
+        // reachable while an inline creation editor owns one visual row.
         let end = (start + entry_capacity).min(browse.entries.len());
 
         for i in start..end {
@@ -2006,6 +2305,20 @@ fn draw_browse_list(
         let cursor_y = browse_entry_y_start(area, browse.search.active) + row as u16;
         f.set_cursor(cursor_x, cursor_y);
     }
+
+    draw_vertical_scrollbar(
+        f,
+        Rect::new(
+            area.right().saturating_sub(2),
+            browse_entry_y_start(area, browse.search.active),
+            1,
+            content_height as u16,
+        ),
+        browse.entries.len(),
+        browse.visible_height,
+        browse.scroll_offset,
+        theme,
+    )
 }
 
 

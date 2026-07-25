@@ -9,6 +9,7 @@ pub mod archive_listing;
 pub mod bit_compare;
 pub mod bookmarks;
 pub mod bookmarks_overlay;
+pub mod bookmark_workers;
 pub mod browse;
 pub mod button_map;
 pub mod disc_browser;

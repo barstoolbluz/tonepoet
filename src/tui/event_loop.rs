@@ -282,6 +282,10 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
         | AppMessage::PathValidationComplete { .. }
         | AppMessage::SearchComplete { .. }
         | AppMessage::ArchiveListingComplete { .. }
+        | AppMessage::BookmarkTargetsLoaded { .. }
+        | AppMessage::BookmarkActivationResolved { .. }
+        | AppMessage::BookmarkDetailStarted { .. }
+        | AppMessage::BookmarkDetailLoaded { .. }
         | AppMessage::MetadataWriteComplete { .. }
         | AppMessage::OffsetCorrectionComplete { .. }
         | AppMessage::CtdbRepairComplete { .. } => true,
@@ -2814,6 +2818,96 @@ fn handle_convert_audio_probe_complete(
     publish_probe_status_with_sentinel_clamp(app, status, was_sentinel_selected);
 }
 
+fn handle_bookmark_detail_loaded_with_retry<F>(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    path: std::path::PathBuf,
+    result: Result<super::bookmarks::BookmarkDetail, String>,
+    retry_selected: F,
+) where
+    F: FnOnce(&mut AppState, &mpsc::Sender<AppMessage>),
+{
+    if app.bookmarks.apply_detail_result(generation, path, result) {
+        // A previously selected detail may have been refused because the
+        // bounded queue was full. Every current-generation completion releases
+        // one slot, so deterministically retry the current selection now.
+        retry_selected(app, tx);
+    }
+}
+
+pub(super) fn handle_bookmark_detail_loaded(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    path: std::path::PathBuf,
+    result: Result<super::bookmarks::BookmarkDetail, String>,
+) {
+    handle_bookmark_detail_loaded_with_retry(
+        app,
+        tx,
+        generation,
+        path,
+        result,
+        super::keybindings::request_selected_bookmark_detail,
+    );
+}
+
+#[cfg(test)]
+mod bookmark_detail_retry_regression_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    fn empty_detail() -> super::super::bookmarks::BookmarkDetail {
+        super::super::bookmarks::BookmarkDetail {
+            item_count: 0,
+            entries: Vec::new(),
+            omitted_count: 0,
+        }
+    }
+
+    #[test]
+    fn current_detail_completion_always_invokes_selected_retry() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.bookmarks.open_overlay();
+        let generation = app.bookmarks.detail_generation;
+        let completed_path = std::path::PathBuf::from("/completed");
+        let (tx, _rx) = mpsc::channel(1);
+        let mut retried = false;
+
+        handle_bookmark_detail_loaded_with_retry(
+            &mut app,
+            &tx,
+            generation,
+            completed_path,
+            Ok(empty_detail()),
+            |_, _| retried = true,
+        );
+
+        assert!(retried, "current completion must refill selected detail work");
+    }
+
+    #[test]
+    fn stale_detail_completion_does_not_invoke_retry() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.bookmarks.open_overlay();
+        let stale_generation = app.bookmarks.detail_generation.wrapping_sub(1);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut retried = false;
+
+        handle_bookmark_detail_loaded_with_retry(
+            &mut app,
+            &tx,
+            stale_generation,
+            std::path::PathBuf::from("/stale"),
+            Ok(empty_detail()),
+            |_, _| retried = true,
+        );
+
+        assert!(!retried, "stale completion must not refill current work");
+    }
+}
+
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::ClearTrackProgress {
@@ -3037,6 +3131,30 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
         }
         AppMessage::Redraw => {} // Just triggers a redraw via the loop
+        AppMessage::BookmarkTargetsLoaded { generation, statuses } => {
+            app.bookmarks.apply_target_statuses(generation, statuses);
+            // Refill the bounded status queue as completions free capacity. This
+            // preserves a hard worker/queue bound without leaving bookmarks
+            // permanently unprobed when the collection exceeds that bound.
+            super::keybindings::request_bookmark_target_statuses(app, tx);
+            super::keybindings::request_selected_bookmark_detail(app, tx);
+        }
+        AppMessage::BookmarkActivationResolved {
+            generation,
+            request_id,
+            path,
+            result,
+        } => {
+            super::keybindings::handle_bookmark_activation_result(
+                app, tx, generation, request_id, path, result,
+            );
+        }
+        AppMessage::BookmarkDetailStarted { generation, path } => {
+            app.bookmarks.apply_detail_started(generation, &path);
+        }
+        AppMessage::BookmarkDetailLoaded { generation, path, result } => {
+            handle_bookmark_detail_loaded(app, tx, generation, path, result);
+        }
         AppMessage::BrowseConvertExpansionComplete {
             generation,
             request,

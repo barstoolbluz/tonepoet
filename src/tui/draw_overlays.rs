@@ -574,7 +574,13 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
 
     // Bookmarks overlay (independent of ActiveOverlay — uses its own flag)
     if app.bookmarks.overlay_open {
-        super::bookmarks_overlay::draw_bookmarks_overlay(f, &mut app.bookmarks, theme);
+        super::bookmarks_overlay::draw_bookmarks_overlay(
+            f,
+            &mut app.bookmarks,
+            &app.browse.current_dir,
+            &mut app.button_map,
+            theme,
+        );
     }
 }
 

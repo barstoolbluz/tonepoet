@@ -14,6 +14,13 @@ pub enum MetadataFieldKind {
     Year,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbarSurface {
+    BrowseList,
+    BrowseTree,
+    BookmarkManager,
+}
+
 /// Identifies a clickable element in the TUI
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TuiButton {
@@ -233,6 +240,13 @@ pub enum TuiButton {
     BrowseToolbarSearch,
     BrowseToolbarShowHidden,
     BrowsePathGo,
+    BrowseBookmarksToggle,
+    BrowseBookmarkDropdownRow(usize),
+    BrowseBookmarkDropdownAdd,
+    BrowseBookmarkDropdownManage,
+    BookmarkManagerRow(usize),
+    ScrollbarTrack(ScrollbarSurface),
+    ScrollbarThumb(ScrollbarSurface),
     BrowsePaneToggle(crate::tui::browse::BrowsePaneId),
     BrowsePaneTitle(crate::tui::browse::BrowsePaneId),
     BrowseTreeNode(usize),
@@ -563,6 +577,13 @@ impl TuiButton {
             | Self::BrowseToolbarSearch
             | Self::BrowseToolbarShowHidden
             | Self::BrowsePathGo
+            | Self::BrowseBookmarksToggle
+            | Self::BrowseBookmarkDropdownRow(_)
+            | Self::BrowseBookmarkDropdownAdd
+            | Self::BrowseBookmarkDropdownManage
+            | Self::BookmarkManagerRow(_)
+            | Self::ScrollbarTrack(_)
+            | Self::ScrollbarThumb(_)
             | Self::BrowsePaneToggle(_)
             | Self::BrowsePaneTitle(_)
             | Self::BrowseTreeNode(_)
@@ -663,6 +684,14 @@ impl ButtonRenderMap {
     /// internal vector mutably.
     pub fn recorded_buttons(&self) -> &[(TuiButton, Rect)] {
         &self.button_bounds
+    }
+
+    /// Return the most recently registered rectangle for `button`.
+    pub fn button_rect(&self, button: TuiButton) -> Option<Rect> {
+        self.button_bounds
+            .iter()
+            .rev()
+            .find_map(|(candidate, rect)| (*candidate == button).then_some(*rect))
     }
 
 

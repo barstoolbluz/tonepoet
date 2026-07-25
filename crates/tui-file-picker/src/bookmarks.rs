@@ -18,6 +18,12 @@ pub struct BookmarkRecord {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookmarkMoveDirection {
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookmarkMutation {
     Add(BookmarkRecord),
@@ -29,6 +35,11 @@ pub enum BookmarkMutation {
     Remove {
         expected_index: usize,
         expected: BookmarkRecord,
+    },
+    Move {
+        expected_index: usize,
+        expected: BookmarkRecord,
+        direction: BookmarkMoveDirection,
     },
 }
 
@@ -51,7 +62,21 @@ impl BookmarkSaveStatus {
 pub struct BookmarkCommit {
     pub entries: Vec<BookmarkRecord>,
     pub affected_index: usize,
+    /// Whether the requested mutation changed the authoritative sequence.
+    pub changed: bool,
     pub status: BookmarkSaveStatus,
+}
+
+/// Result of a bookmark mutation whose secondary mirror reconciliation ran
+/// while the authoritative bookmark lock was still held.
+///
+/// The TOML commit remains authoritative. A mirror failure is returned
+/// separately so callers can adopt the committed entries and surface the
+/// secondary failure without pretending that the mutation itself rolled back.
+#[derive(Debug)]
+pub struct BookmarkReconciledCommit<E> {
+    pub commit: BookmarkCommit,
+    pub reconcile_result: Result<(), E>,
 }
 
 /// Result of a lock-protected first-time store initialization.
@@ -233,23 +258,70 @@ pub fn initialize_bookmarks_if_absent(
 /// Apply one bookmark mutation against the latest authoritative state under an
 /// interprocess lock, then atomically publish the resulting file.
 pub fn mutate_bookmarks_atomic(mutation: BookmarkMutation) -> io::Result<BookmarkCommit> {
+    with_bookmark_lock(|| mutate_bookmarks_unlocked(mutation))
+}
+
+/// Apply one bookmark mutation and reconcile a secondary mirror before the
+/// authoritative interprocess lock is released.
+///
+/// `reconcile` receives the latest committed TOML sequence and whether the
+/// requested mutation changed that sequence. Keeping the callback inside the
+/// same lock closes the stale-writer window between an authoritative commit and
+/// mirror replacement. The callback should make its own replacement atomic
+/// (for example, with one SQLite transaction).
+pub fn mutate_bookmarks_atomic_with_reconcile<E>(
+    mutation: BookmarkMutation,
+    reconcile: impl FnOnce(&[BookmarkRecord], bool) -> Result<(), E>,
+) -> io::Result<BookmarkReconciledCommit<E>> {
     with_bookmark_lock(|| {
-        let mut entries = load_bookmarks_unlocked()?;
-        let affected_index = apply_mutation(&mut entries, mutation)?;
-        let status = save_bookmarks_atomic_unlocked(&entries)?;
-        Ok(BookmarkCommit {
-            entries,
-            affected_index,
-            status,
+        let commit = mutate_bookmarks_unlocked(mutation)?;
+        let reconcile_result = reconcile(&commit.entries, commit.changed);
+        Ok(BookmarkReconciledCommit {
+            commit,
+            reconcile_result,
         })
     })
 }
 
-fn apply_mutation(entries: &mut Vec<BookmarkRecord>, mutation: BookmarkMutation) -> io::Result<usize> {
-    let affected_index = match mutation {
+/// Reload the authoritative sequence and reconcile a secondary mirror while
+/// the bookmark interprocess lock remains held.
+///
+/// This is used for startup/repair paths that do not themselves mutate TOML but
+/// must not race a newer mutation while replacing the mirror.
+pub fn reconcile_bookmarks_locked<E>(
+    reconcile: impl FnOnce(&[BookmarkRecord]) -> Result<(), E>,
+) -> io::Result<(Vec<BookmarkRecord>, Result<(), E>)> {
+    with_bookmark_lock(|| {
+        let entries = load_bookmarks_unlocked()?;
+        let result = reconcile(&entries);
+        Ok((entries, result))
+    })
+}
+
+fn mutate_bookmarks_unlocked(mutation: BookmarkMutation) -> io::Result<BookmarkCommit> {
+    let mut entries = load_bookmarks_unlocked()?;
+    let (affected_index, changed) = apply_mutation(&mut entries, mutation)?;
+    let status = if changed {
+        save_bookmarks_atomic_unlocked(&entries)?
+    } else {
+        BookmarkSaveStatus::Durable
+    };
+    Ok(BookmarkCommit {
+        entries,
+        affected_index,
+        changed,
+        status,
+    })
+}
+
+fn apply_mutation(
+    entries: &mut Vec<BookmarkRecord>,
+    mutation: BookmarkMutation,
+) -> io::Result<(usize, bool)> {
+    let (affected_index, changed) = match mutation {
         BookmarkMutation::Add(entry) => {
             entries.push(entry);
-            entries.len().saturating_sub(1)
+            (entries.len().saturating_sub(1), true)
         }
         BookmarkMutation::Rename {
             expected_index,
@@ -257,8 +329,9 @@ fn apply_mutation(entries: &mut Vec<BookmarkRecord>, mutation: BookmarkMutation)
             new_name,
         } => {
             let index = resolve_expected_entry(entries, expected_index, &expected)?;
+            let changed = entries[index].name != new_name;
             entries[index].name = new_name;
-            index
+            (index, changed)
         }
         BookmarkMutation::Remove {
             expected_index,
@@ -266,10 +339,28 @@ fn apply_mutation(entries: &mut Vec<BookmarkRecord>, mutation: BookmarkMutation)
         } => {
             let index = resolve_expected_entry(entries, expected_index, &expected)?;
             entries.remove(index);
-            index.min(entries.len().saturating_sub(1))
+            (index.min(entries.len().saturating_sub(1)), true)
+        }
+        BookmarkMutation::Move {
+            expected_index,
+            expected,
+            direction,
+        } => {
+            let index = resolve_expected_entry(entries, expected_index, &expected)?;
+            let destination = match direction {
+                BookmarkMoveDirection::Up => index.saturating_sub(1),
+                BookmarkMoveDirection::Down => {
+                    (index + 1).min(entries.len().saturating_sub(1))
+                }
+            };
+            let changed = destination != index;
+            if changed {
+                entries.swap(index, destination);
+            }
+            (destination, changed)
         }
     };
-    Ok(affected_index)
+    Ok((affected_index, changed))
 }
 
 fn resolve_expected_entry(
@@ -576,6 +667,26 @@ mod tests {
     }
 
     #[test]
+    fn rename_mutation_reports_successful_no_op_without_rewrite_intent() {
+        let expected = BookmarkRecord {
+            name: "Music".to_string(),
+            path: PathBuf::from("/music"),
+        };
+        let mut entries = vec![expected.clone()];
+        let result = apply_mutation(
+            &mut entries,
+            BookmarkMutation::Rename {
+                expected_index: 0,
+                expected: expected.clone(),
+                new_name: expected.name.clone(),
+            },
+        )
+        .expect("rename no-op");
+        assert_eq!(result, (0, false));
+        assert_eq!(entries, vec![expected]);
+    }
+
+    #[test]
     fn mutation_rejects_ambiguous_concurrent_duplicates() {
         let expected = BookmarkRecord {
             name: "Music".to_string(),
@@ -592,4 +703,115 @@ mod tests {
         .expect_err("ambiguous mutation must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn move_mutation_relocates_unique_entry_then_swaps() {
+        let expected = BookmarkRecord {
+            name: "Music".to_string(),
+            path: PathBuf::from("/music"),
+        };
+        let mut entries = vec![
+            BookmarkRecord {
+                name: "Inserted".to_string(),
+                path: PathBuf::from("/inserted"),
+            },
+            expected.clone(),
+            BookmarkRecord {
+                name: "Downloads".to_string(),
+                path: PathBuf::from("/downloads"),
+            },
+        ];
+        let affected = apply_mutation(
+            &mut entries,
+            BookmarkMutation::Move {
+                expected_index: 0,
+                expected,
+                direction: BookmarkMoveDirection::Down,
+            },
+        )
+        .expect("move");
+        assert_eq!(affected, (2, true));
+        assert_eq!(entries[2].name, "Music");
+    }
+
+    #[test]
+    fn move_mutation_is_idempotent_at_boundaries() {
+        let first = BookmarkRecord {
+            name: "First".to_string(),
+            path: PathBuf::from("/first"),
+        };
+        let last = BookmarkRecord {
+            name: "Last".to_string(),
+            path: PathBuf::from("/last"),
+        };
+        let mut entries = vec![first.clone(), last.clone()];
+        assert_eq!(
+            apply_mutation(
+                &mut entries,
+                BookmarkMutation::Move {
+                    expected_index: 0,
+                    expected: first.clone(),
+                    direction: BookmarkMoveDirection::Up,
+                },
+            )
+            .expect("top no-op"),
+            (0, false)
+        );
+        assert_eq!(
+            apply_mutation(
+                &mut entries,
+                BookmarkMutation::Move {
+                    expected_index: 1,
+                    expected: last.clone(),
+                    direction: BookmarkMoveDirection::Down,
+                },
+            )
+            .expect("bottom no-op"),
+            (1, false)
+        );
+        assert_eq!(entries, vec![first, last]);
+    }
+
+    #[test]
+    fn moved_order_survives_toml_round_trip() {
+        let first = BookmarkRecord {
+            name: "First".to_string(),
+            path: PathBuf::from("/first"),
+        };
+        let second = BookmarkRecord {
+            name: "Second".to_string(),
+            path: PathBuf::from("/second"),
+        };
+        let third = BookmarkRecord {
+            name: "Third".to_string(),
+            path: PathBuf::from("/third"),
+        };
+        let mut entries = vec![first, second.clone(), third];
+        apply_mutation(
+            &mut entries,
+            BookmarkMutation::Move {
+                expected_index: 1,
+                expected: second,
+                direction: BookmarkMoveDirection::Up,
+            },
+        )
+        .expect("move");
+
+        let serialized = toml::to_string(&BookmarkFile {
+            entries: entries.clone(),
+        })
+        .expect("serialize");
+        let reparsed: BookmarkFile = toml::from_str(&serialized).expect("parse");
+
+        assert_eq!(reparsed.entries, entries);
+        assert_eq!(
+            reparsed
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Second", "First", "Third"]
+        );
+    }
+
 }

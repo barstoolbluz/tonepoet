@@ -1,16 +1,17 @@
 //! Key event dispatch by screen/focus
 
 use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use super::app::*;
 use super::browse::BrowseOptionsMenu;
-use super::button_map::TuiButton;
+use super::button_map::{ScrollbarSurface, TuiButton};
 use super::draw_browse::{
-    browse_toolbar_area_for_screen, options_menu_geometry_for_area, OptionsMenuGeometry,
+    browse_toolbar_area_for_screen, options_button_anchor_for_toolbar,
+    options_menu_geometry_for_area, OptionsMenuGeometry,
 };
 use super::message::AppMessage;
 use crate::convert::{ConversionOptions, ConversionStatus};
@@ -103,6 +104,13 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
         app.set_status("browse refreshed");
+        return;
+    }
+
+    // The bookmark dropdown is click-modal and must preempt any underlying
+    // Browse focus domain after it opens, including search and path editing.
+    if app.current_screen == AppScreen::Browse && app.bookmarks.dropdown_open {
+        handle_bookmarks_dropdown_key(app, key, tx);
         return;
     }
 
@@ -1210,8 +1218,12 @@ fn options_menu_geometry_for_current_browse_area(app: &AppState) -> Option<Optio
         Rect::new(0, 0, width, height)
     });
     let toolbar_area = browse_toolbar_area_for_screen(screen_area);
+    let anchor = app
+        .button_map
+        .button_rect(TuiButton::BrowseToolbarOptions)
+        .unwrap_or_else(|| options_button_anchor_for_toolbar(toolbar_area));
     Some(options_menu_geometry_for_area(
-        toolbar_area,
+        anchor,
         screen_area,
         &app.browse,
         &app.config.performance.browsing.archive_listing,
@@ -1335,7 +1347,12 @@ mod options_menu_hover_tests {
         browse.options_menu = BrowseOptionsMenu::Layout;
         let screen = Rect::new(0, 0, 120, 30);
         let toolbar = browse_toolbar_area_for_screen(screen);
-        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let geometry = options_menu_geometry_for_area(
+            options_button_anchor_for_toolbar(toolbar),
+            screen,
+            &browse,
+            "auto",
+        );
         let submenu = geometry.submenu_area.expect("layout submenu");
 
         assert_eq!(
@@ -1356,10 +1373,15 @@ mod options_menu_hover_tests {
         browse.options_menu = BrowseOptionsMenu::Layout;
         let screen = Rect::new(11, 5, 120, 30);
         let toolbar = browse_toolbar_area_for_screen(screen);
-        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let geometry = options_menu_geometry_for_area(
+            options_button_anchor_for_toolbar(toolbar),
+            screen,
+            &browse,
+            "auto",
+        );
         let submenu = geometry.submenu_area.expect("layout submenu");
 
-        assert_eq!(geometry.root_area.y, screen.y + 8);
+        assert_eq!(geometry.root_area.y, screen.y + 9);
         assert_eq!(
             options_menu_hover_next_menu_at(
                 BrowseOptionsMenu::Layout,
@@ -1377,7 +1399,12 @@ mod options_menu_hover_tests {
         browse.options_menu = BrowseOptionsMenu::Layout;
         let screen = Rect::new(0, 0, 120, 30);
         let toolbar = browse_toolbar_area_for_screen(screen);
-        let geometry = options_menu_geometry_for_area(toolbar, screen, &browse, "auto");
+        let geometry = options_menu_geometry_for_area(
+            options_button_anchor_for_toolbar(toolbar),
+            screen,
+            &browse,
+            "auto",
+        );
 
         assert_eq!(
             options_menu_hover_next_menu_at(
@@ -1478,7 +1505,7 @@ fn activate_browse_entry(
         app.browse.toggle_selection_at_index(idx);
         app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
         app.set_status(
-            "archive entry selected; use Edit Tags or Rename for archive-aware changes",
+            "archive entry selected; use Tags & Tagging or Rename for archive-aware changes",
         );
         app.browse.probe_current_with_db(tx, Some(&app.db));
         super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
@@ -1634,7 +1661,7 @@ fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
 fn browse_archive_inline_metadata_status(app: &mut AppState) {
     clear_browse_info_focus(app);
     app.browse_inline_edit = None;
-    app.set_status("archive metadata: use Edit Tags to stage changes and repackage the archive");
+    app.set_status("archive metadata: use Tags & Tagging to stage changes and repackage the archive");
 }
 
 fn browse_metadata_focus_available(app: &AppState) -> bool {
@@ -2242,8 +2269,8 @@ mod inline_edit_behavior_tests {
     use super::*;
     use crate::config::TonepoetConfig;
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
     use ratatui::layout::Rect;
     use tokio::sync::mpsc;
 
@@ -2939,7 +2966,7 @@ mod inline_edit_behavior_tests {
         assert!(app
             .status_message
             .as_ref()
-            .map(|(message, _)| message.contains("use Edit Tags"))
+            .map(|(message, _)| message.contains("use Tags & Tagging"))
             .unwrap_or(false));
     }
 
@@ -3808,6 +3835,45 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     // In particular, `/` and `.` must not become tree-prefix characters merely
     // because Explore currently owns keyboard navigation.
     match (key.code, key.modifiers) {
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            if app.bookmarks.dropdown_open {
+                app.bookmarks.close_dropdown();
+            } else {
+                app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
+                app.bookmarks.toggle_dropdown();
+                app.browse.scrollbar_drag = None;
+                app.browse.close_options_menu();
+                request_bookmark_target_statuses(app, tx);
+            }
+            return;
+        }
+        (KeyCode::Char('c' | 'x' | 'v'), KeyModifiers::CONTROL) => {
+            if app.browse.is_in_archive() {
+                app.set_status("filesystem clipboard is unavailable inside archive listings");
+                return;
+            }
+            let action = if app.browse.tree_navigation_active() {
+                let Some(path) = app.browse.selected_tree_path() else {
+                    app.set_status("tree clipboard action has no selected directory");
+                    return;
+                };
+                match key.code {
+                    KeyCode::Char('c') => super::context_menu::ContextAction::TreeCopy(path),
+                    KeyCode::Char('x') => super::context_menu::ContextAction::TreeCut(path),
+                    KeyCode::Char('v') => super::context_menu::ContextAction::TreePaste(path),
+                    _ => unreachable!(),
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('c') => super::context_menu::ContextAction::CopySelection,
+                    KeyCode::Char('x') => super::context_menu::ContextAction::CutSelection,
+                    KeyCode::Char('v') => super::context_menu::ContextAction::PasteSelection,
+                    _ => unreachable!(),
+                }
+            };
+            super::context_menu::execute_context_action(app, action, tx, false);
+            return;
+        }
         (KeyCode::Char('/'), KeyModifiers::NONE | KeyModifiers::SHIFT)
         | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
             open_browse_search(app);
@@ -4076,10 +4142,10 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                         // into a deterministic directory, returned only a status message, and
                         // left no ownership/cleanup model for the extracted file. Keep Enter as
                         // selection-only; archive mutations must use explicit archive-aware flows
-                        // such as Rename or Edit Tags.
+                        // such as Rename or Tags & Tagging.
                         app.browse.toggle_selection();
                         app.set_status(
-                            "archive entry selected; use Edit Tags or Rename for archive-aware changes",
+                            "archive entry selected; use Tags & Tagging or Rename for archive-aware changes",
                         );
                     }
                     _ => {
@@ -4217,6 +4283,14 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 /// Handle keys when the search panel is active.
 fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use super::browse::SearchFocus;
+
+    if matches!(key.code, KeyCode::Char('c' | 'x' | 'v'))
+        && key.modifiers == KeyModifiers::CONTROL
+        && app.browse.search.focus != SearchFocus::Input
+    {
+        app.set_status("filesystem clipboard is unavailable in search results; close search first");
+        return;
+    }
 
     // Search-local focus changes outrank the controls and result list. A slash
     // typed in the search input remains query text; elsewhere it refocuses the
@@ -6856,15 +6930,16 @@ fn handle_context_menu_key(
         }
         KeyCode::Up | KeyCode::Char('k') => {
             let cur = levels.last_mut().unwrap();
-            if cur.selected > 0 {
-                cur.selected -= 1;
+            let n = selectable_indices(&cur.entries).len();
+            if n > 0 {
+                cur.selected = if cur.selected == 0 { n - 1 } else { cur.selected - 1 };
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let cur = levels.last_mut().unwrap();
             let n = selectable_indices(&cur.entries).len();
-            if cur.selected + 1 < n {
-                cur.selected += 1;
+            if n > 0 {
+                cur.selected = (cur.selected + 1) % n;
             }
         }
         _ => {
@@ -6920,16 +6995,7 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
-    let mut levels = vec![super::context_menu::MenuLevel::new(entries)];
-    // If the root's first entry is a Submenu, auto-push it so users
-    // see the cascade preview without first arrowing down.
-    if let Some(crate::tui::context_menu::ContextMenuEntry::Submenu { children, .. }) =
-        levels[0].entries.first()
-    {
-        if levels.len() < super::context_menu::MAX_CONTEXT_MENU_DEPTH {
-            levels.push(super::context_menu::MenuLevel::new(children.clone()));
-        }
-    }
+    let levels = vec![super::context_menu::MenuLevel::new(entries)];
 
     app.active_overlay = ActiveOverlay::ContextMenu {
         levels,
@@ -25900,7 +25966,9 @@ fn apply_text_edit(
                 }
             } else {
                 if !path.is_file() {
-                    app.set_status("metadata: selected path is not a writable filesystem file; use Edit Tags for archive entries");
+                    app.set_status(
+                        "metadata: selected path is not a writable filesystem file; use Tags & Tagging for archive entries",
+                    );
                     return;
                 }
                 path
@@ -31365,32 +31433,429 @@ fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
     }
 }
 
+fn queue_bookmark_activation(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    path: std::path::PathBuf,
+    surface: super::bookmarks::BookmarkActivationSurface,
+) {
+    if app.bookmarks.pending_activation.is_some() {
+        let message = "bookmark target check already in progress".to_string();
+        match surface {
+            super::bookmarks::BookmarkActivationSurface::Dropdown => app.set_status(message),
+            super::bookmarks::BookmarkActivationSurface::Manager => {
+                app.bookmarks.feedback = Some(message)
+            }
+        }
+        return;
+    }
+
+    let pending = app.bookmarks.begin_activation(path.clone(), surface);
+    let queued = super::bookmark_workers::try_queue_activation(
+        pending.generation,
+        pending.request_id,
+        path.clone(),
+        app.bookmarks.worker_generation_guard(),
+        tx.clone(),
+    );
+    if let Err(error) = queued {
+        let _ = app.bookmarks.take_matching_activation(
+            pending.generation,
+            pending.request_id,
+            &error.path,
+        );
+        use super::bookmark_workers::BookmarkEnqueueFailure;
+        let message = match error.failure {
+            BookmarkEnqueueFailure::StaleGeneration => return,
+            BookmarkEnqueueFailure::QueueFull => format!(
+                "bookmark target check queue is busy; try again: {}",
+                error.path.display()
+            ),
+            BookmarkEnqueueFailure::WorkersUnavailable => format!(
+                "bookmark target workers are unavailable; retry later or restart Tonepoet: {}",
+                error.path.display()
+            ),
+        };
+        match surface {
+            super::bookmarks::BookmarkActivationSurface::Dropdown => app.set_status(message),
+            super::bookmarks::BookmarkActivationSurface::Manager => {
+                app.bookmarks.feedback = Some(message)
+            }
+        }
+        return;
+    }
+
+    let message = format!("checking bookmark target: {}", path.display());
+    match surface {
+        super::bookmarks::BookmarkActivationSurface::Dropdown => app.set_status(message),
+        super::bookmarks::BookmarkActivationSurface::Manager => {
+            app.bookmarks.feedback = Some(message)
+        }
+    }
+}
+
+pub(super) fn handle_bookmark_activation_result(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    request_id: u64,
+    path: std::path::PathBuf,
+    result: Result<(), String>,
+) {
+    let Some(pending) = app
+        .bookmarks
+        .take_matching_activation(generation, request_id, &path)
+    else {
+        return;
+    };
+
+    if let Err(error) = result {
+        match pending.surface {
+            super::bookmarks::BookmarkActivationSurface::Dropdown => app.set_status(error),
+            super::bookmarks::BookmarkActivationSurface::Manager => {
+                app.bookmarks.feedback = Some(error)
+            }
+        }
+        return;
+    }
+
+    match pending.surface {
+        super::bookmarks::BookmarkActivationSurface::Dropdown => {
+            if !app.bookmarks.dropdown_open {
+                return;
+            }
+            app.bookmarks.close_dropdown();
+        }
+        super::bookmarks::BookmarkActivationSurface::Manager => {
+            if !app.bookmarks.overlay_open {
+                return;
+            }
+            app.bookmarks.close_overlay();
+        }
+    }
+
+    let display = path.display().to_string();
+    app.browse.navigate_to(path);
+    app.browse.probe_current_with_db(tx, Some(&app.db));
+    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+    app.set_status(format!("cd: {display}"));
+}
+
+fn activate_bookmark_dropdown_choice(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    use super::bookmarks::{BookmarkActivationSurface, BookmarkDropdownChoice};
+
+    match app.bookmarks.dropdown_choice() {
+        BookmarkDropdownChoice::Bookmark(index) => {
+            let Some(bookmark) = app.bookmarks.entries.get(index).cloned() else {
+                app.bookmarks.close_dropdown();
+                return;
+            };
+            queue_bookmark_activation(
+                app,
+                tx,
+                bookmark.path,
+                BookmarkActivationSurface::Dropdown,
+            );
+        }
+        BookmarkDropdownChoice::AddCurrent => {
+            let current = app.browse.current_dir.clone();
+            app.bookmarks.open_overlay();
+            app.bookmarks.start_add(current);
+            request_bookmark_target_statuses(app, tx);
+            request_selected_bookmark_detail(app, tx);
+        }
+        BookmarkDropdownChoice::Manage => {
+            app.bookmarks.open_overlay();
+            request_bookmark_target_statuses(app, tx);
+            request_selected_bookmark_detail(app, tx);
+        }
+    }
+}
+
+fn handle_bookmarks_dropdown_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            app.bookmarks.close_dropdown();
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            app.bookmarks.dropdown_move(-1);
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            app.bookmarks.dropdown_move(1);
+        }
+        (KeyCode::Home, _) => {
+            app.bookmarks.dropdown_selected = 0;
+            app.bookmarks.ensure_dropdown_visible();
+        }
+        (KeyCode::End, _) => {
+            app.bookmarks.dropdown_selected = app.bookmarks.dropdown_choice_count().saturating_sub(1);
+            app.bookmarks.ensure_dropdown_visible();
+        }
+        (KeyCode::Enter, _) => activate_bookmark_dropdown_choice(app, tx),
+        _ => {}
+    }
+}
+
+pub(super) fn request_bookmark_target_statuses(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if !app.bookmarks.overlay_open && !app.bookmarks.dropdown_open {
+        return;
+    }
+    let generation = app.bookmarks.detail_generation;
+    let generation_guard = app.bookmarks.worker_generation_guard();
+
+    while let Some(path) = app.bookmarks.next_target_probe_candidate() {
+        if !app.bookmarks.mark_target_probe_queued(path.clone()) {
+            app.bookmarks.commit_target_probe_candidate();
+            continue;
+        }
+        match super::bookmark_workers::try_queue_status(
+            generation,
+            path,
+            std::sync::Arc::clone(&generation_guard),
+            tx.clone(),
+        ) {
+            Ok(()) => app.bookmarks.commit_target_probe_candidate(),
+            Err(error) => {
+                app.bookmarks.cancel_target_probe(&error.path);
+                use super::bookmark_workers::BookmarkEnqueueFailure;
+                match error.failure {
+                    BookmarkEnqueueFailure::StaleGeneration => {}
+                    BookmarkEnqueueFailure::QueueFull => {
+                        log::debug!(
+                            "bookmark status queue reached its bound; refill will resume at {}",
+                            error.path.display()
+                        );
+                    }
+                    BookmarkEnqueueFailure::WorkersUnavailable => {
+                        let message =
+                            "bookmark target workers are unavailable; retry later or restart Tonepoet"
+                                .to_string();
+                        if app.bookmarks.overlay_open {
+                            app.bookmarks.feedback = Some(message);
+                        } else {
+                            app.set_status(message);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+pub(super) fn request_selected_bookmark_detail(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if !app.bookmarks.overlay_open {
+        return;
+    }
+    let Some(path) = app
+        .bookmarks
+        .selected_filtered()
+        .map(|bookmark| bookmark.path.clone())
+    else {
+        return;
+    };
+    if app.bookmarks.target_status(&path)
+        != Some(super::bookmarks::BookmarkTargetStatus::Reachable)
+    {
+        return;
+    }
+    let retrying = matches!(
+        app.bookmarks.detail_state(&path),
+        Some(super::bookmarks::BookmarkDetailState::QueueUnavailable(_))
+            | Some(super::bookmarks::BookmarkDetailState::WorkerUnavailable(_))
+    );
+    if !app.bookmarks.mark_detail_queued(path.clone()) {
+        return;
+    }
+    let generation = app.bookmarks.detail_generation;
+    match super::bookmark_workers::try_queue_detail(
+        generation,
+        path.clone(),
+        app.bookmarks.worker_generation_guard(),
+        tx.clone(),
+    ) {
+        Ok(()) if retrying => {
+            app.bookmarks.feedback = Some(format!(
+                "bookmark detail retry queued: {}",
+                path.display()
+            ));
+        }
+        Ok(()) => {}
+        Err(error) => {
+            use super::bookmark_workers::BookmarkEnqueueFailure;
+            match error.failure {
+                BookmarkEnqueueFailure::StaleGeneration => {
+                    app.bookmarks.clear_detail_request(&error.path);
+                }
+                BookmarkEnqueueFailure::QueueFull => {
+                    let message = format!(
+                        "detail queue busy; waiting to retry: {}",
+                        error.path.display()
+                    );
+                    app.bookmarks
+                        .mark_detail_queue_unavailable(error.path, message.clone());
+                    app.bookmarks.feedback = Some(message);
+                }
+                BookmarkEnqueueFailure::WorkersUnavailable => {
+                    let message = format!(
+                        "bookmark detail workers are unavailable; retry selection or restart Tonepoet: {}",
+                        error.path.display()
+                    );
+                    app.bookmarks
+                        .mark_detail_worker_unavailable(error.path, message.clone());
+                    app.bookmarks.feedback = Some(message);
+                }
+            }
+        }
+    }
+}
+
+fn reorder_selected_bookmark(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    direction: tui_file_picker::BookmarkMoveDirection,
+) {
+    let index = app.bookmarks.overlay_selected;
+    let name = app.bookmarks.selected().map(|entry| entry.name.clone());
+    let filtered_view = !app.bookmarks.filter_text().trim().is_empty();
+    let (direction_label, boundary_label) = match direction {
+        tui_file_picker::BookmarkMoveDirection::Down => ("down", "last"),
+        tui_file_picker::BookmarkMoveDirection::Up => ("up", "first"),
+    };
+
+    match app.bookmarks.move_at_with_db(index, direction, &app.db) {
+        Some(true) => {
+            app.bookmarks.feedback = name.map(|name| {
+                if filtered_view {
+                    format!(
+                        "moved \"{name}\" {direction_label} in saved order; filtered view may be unchanged"
+                    )
+                } else {
+                    format!("moved \"{name}\" {direction_label}")
+                }
+            });
+            request_selected_bookmark_detail(app, tx);
+        }
+        Some(false) => {
+            let warning = app.bookmarks.take_warning();
+            app.bookmarks.feedback = name.map(|name| {
+                boundary_bookmark_feedback(&name, boundary_label, warning.as_deref())
+            });
+        }
+        None => {
+            let warning = app
+                .bookmarks
+                .take_warning()
+                .unwrap_or_else(|| "authoritative bookmark store rejected the move".to_string());
+            app.bookmarks.feedback = Some(format!("bookmark move failed: {warning}"));
+        }
+    }
+}
+
+fn boundary_bookmark_feedback(
+    name: &str,
+    boundary_label: &str,
+    warning: Option<&str>,
+) -> String {
+    let base = format!("\"{name}\" is already {boundary_label} in saved order");
+    match warning {
+        Some(warning) => format!("{base} · mirror warning: {warning}"),
+        None => base,
+    }
+}
+
+fn unchanged_bookmark_feedback(warning: Option<String>) -> String {
+    match warning {
+        Some(warning) => format!("bookmark name unchanged · mirror warning: {warning}"),
+        None => "bookmark name unchanged".to_string(),
+    }
+}
+
+fn selected_manager_bookmark_path(
+    bookmarks: &super::bookmarks::BookmarksState,
+) -> Option<std::path::PathBuf> {
+    bookmarks
+        .selected_filtered()
+        .map(|bookmark| bookmark.path.clone())
+}
+
+fn queue_selected_manager_bookmark_activation(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let Some(path) = selected_manager_bookmark_path(&app.bookmarks) else {
+        return;
+    };
+    queue_bookmark_activation(
+        app,
+        tx,
+        path,
+        super::bookmarks::BookmarkActivationSurface::Manager,
+    );
+}
+
 /// Handle key events while the bookmarks overlay is open.
-/// Has two modes:
-/// - Browse mode: list navigation + add/delete/rename/cd actions
-/// - Naming mode (Add or Rename): text input with Enter=commit, Esc=cancel
+/// - Browse mode: list navigation + add/delete/rename/cd actions.
+/// - Filter mode: navigation remains filtered, Enter preserves go/activation,
+///   and Shift+J/K changes one position in the complete persisted sequence.
+/// - Naming mode: text input with Enter=commit and Esc=cancel.
 fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
-    use super::bookmarks::BookmarkNaming;
+    use super::bookmarks::{BookmarkNaming, BookmarkNamingCommit};
     use super::text_input::handle_text_input_key;
 
-    // Naming sub-mode routes text-input keys to the TextInputState.
     if app.bookmarks.naming.is_some() {
         match (key.code, key.modifiers) {
             (KeyCode::Enter, _) => {
-                if app.bookmarks.commit_naming_with_db(&app.db) {
-                    if let Some(warning) = app.bookmarks.take_warning() {
-                        app.set_status(format!("bookmark saved with warning: {warning}"));
+                let description = match app.bookmarks.naming.as_ref() {
+                    Some(BookmarkNaming::Add { input, .. }) => {
+                        format!("added bookmark \"{}\"", input.text.trim())
                     }
-                } else {
-                    let detail = app
-                        .bookmarks
-                        .take_warning()
-                        .unwrap_or_else(|| "name is empty or change could not be saved".to_string());
-                    app.set_status(format!("bookmark: {detail}"));
+                    Some(BookmarkNaming::Rename { input, .. }) => {
+                        format!("renamed bookmark to \"{}\"", input.text.trim())
+                    }
+                    None => String::new(),
+                };
+                match app.bookmarks.commit_naming_with_db(&app.db) {
+                    BookmarkNamingCommit::Changed => {
+                        app.bookmarks.feedback = Some(description);
+                        if let Some(warning) = app.bookmarks.take_warning() {
+                            app.bookmarks.feedback = Some(format!(
+                                "{} · durability warning: {}",
+                                app.bookmarks.feedback.as_deref().unwrap_or("bookmark saved"),
+                                warning
+                            ));
+                        }
+                        request_bookmark_target_statuses(app, tx);
+                        request_selected_bookmark_detail(app, tx);
+                    }
+                    BookmarkNamingCommit::Unchanged => {
+                        let warning = app.bookmarks.take_warning();
+                        app.bookmarks.feedback = Some(unchanged_bookmark_feedback(warning));
+                    }
+                    BookmarkNamingCommit::Failed => {
+                        let detail = app.bookmarks.take_warning().unwrap_or_else(|| {
+                            "name is empty or change could not be saved".to_string()
+                        });
+                        app.bookmarks.feedback = Some(format!("bookmark: {detail}"));
+                    }
                 }
             }
             (KeyCode::Esc, _) => {
                 app.bookmarks.cancel_naming();
+                app.bookmarks.feedback = Some("edit cancelled".to_string());
             }
             _ => {
                 if let Some(naming) = &mut app.bookmarks.naming {
@@ -31405,79 +31870,210 @@ fn handle_bookmarks_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Se
         return;
     }
 
-    // Browse mode.
+    if app.bookmarks.filter_input.is_some() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                app.bookmarks.clear_filter();
+                app.bookmarks.feedback = Some("filter cleared".to_string());
+                request_selected_bookmark_detail(app, tx);
+            }
+            (KeyCode::Up, _) => {
+                app.bookmarks.overlay_move_up();
+                request_selected_bookmark_detail(app, tx);
+            }
+            (KeyCode::Down, _) => {
+                app.bookmarks.overlay_move_down();
+                request_selected_bookmark_detail(app, tx);
+            }
+            (KeyCode::PageUp, _) => {
+                app.bookmarks.overlay_page_up();
+                request_selected_bookmark_detail(app, tx);
+            }
+            (KeyCode::PageDown, _) => {
+                app.bookmarks.overlay_page_down();
+                request_selected_bookmark_detail(app, tx);
+            }
+            (KeyCode::Enter, _) => {
+                app.bookmarks.snap_selection_to_filter();
+                queue_selected_manager_bookmark_activation(app, tx);
+            }
+            (KeyCode::Char('J'), KeyModifiers::SHIFT) => {
+                reorder_selected_bookmark(
+                    app,
+                    tx,
+                    tui_file_picker::BookmarkMoveDirection::Down,
+                );
+            }
+            (KeyCode::Char('K'), KeyModifiers::SHIFT) => {
+                reorder_selected_bookmark(
+                    app,
+                    tx,
+                    tui_file_picker::BookmarkMoveDirection::Up,
+                );
+            }
+            _ => {
+                if let Some(input) = &mut app.bookmarks.filter_input {
+                    handle_text_input_key(input, &key);
+                }
+                app.bookmarks.snap_selection_to_filter();
+                request_selected_bookmark_detail(app, tx);
+            }
+        }
+        return;
+    }
+
     match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => {
-            app.bookmarks.close_overlay();
+        (KeyCode::Esc, _) => app.bookmarks.close_overlay(),
+        (KeyCode::Char('/'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            app.bookmarks.begin_filter();
         }
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
             app.bookmarks.overlay_move_up();
+            request_selected_bookmark_detail(app, tx);
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
             app.bookmarks.overlay_move_down();
+            request_selected_bookmark_detail(app, tx);
         }
         (KeyCode::PageUp, _) => {
             app.bookmarks.overlay_page_up();
+            request_selected_bookmark_detail(app, tx);
         }
         (KeyCode::PageDown, _) => {
             app.bookmarks.overlay_page_down();
+            request_selected_bookmark_detail(app, tx);
         }
         (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
             app.bookmarks.overlay_move_top();
+            request_selected_bookmark_detail(app, tx);
         }
         (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
             app.bookmarks.overlay_move_bottom();
+            request_selected_bookmark_detail(app, tx);
+        }
+        (KeyCode::Char('J'), KeyModifiers::SHIFT) => {
+            reorder_selected_bookmark(
+                app,
+                tx,
+                tui_file_picker::BookmarkMoveDirection::Down,
+            );
+        }
+        (KeyCode::Char('K'), KeyModifiers::SHIFT) => {
+            reorder_selected_bookmark(
+                app,
+                tx,
+                tui_file_picker::BookmarkMoveDirection::Up,
+            );
         }
         (KeyCode::Char('a'), KeyModifiers::NONE) => {
-            // Add current browse directory as a bookmark.
-            let path = app.browse.current_dir.clone();
-            app.bookmarks.start_add(path);
+            app.bookmarks.start_add(app.browse.current_dir.clone());
         }
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
-            let idx = app.bookmarks.overlay_selected;
-            if app.bookmarks.remove_with_db(idx, &app.db) {
+            let index = app.bookmarks.overlay_selected;
+            let name = app.bookmarks.selected().map(|entry| entry.name.clone());
+            if app.bookmarks.remove_with_db(index, &app.db) {
+                app.bookmarks.feedback = name.map(|name| format!("deleted bookmark \"{name}\""));
                 if let Some(warning) = app.bookmarks.take_warning() {
-                    app.set_status(format!("bookmark removed with warning: {warning}"));
+                    app.bookmarks.feedback = Some(format!(
+                        "{} · durability warning: {}",
+                        app.bookmarks.feedback.as_deref().unwrap_or("bookmark deleted"),
+                        warning
+                    ));
                 }
+                request_bookmark_target_statuses(app, tx);
+                request_selected_bookmark_detail(app, tx);
             } else {
-                let detail = app
-                    .bookmarks
-                    .take_warning()
-                    .unwrap_or_else(|| "bookmark could not be removed".to_string());
-                app.set_status(detail);
+                app.bookmarks.feedback = Some(
+                    app.bookmarks
+                        .take_warning()
+                        .unwrap_or_else(|| "bookmark could not be removed".to_string()),
+                );
             }
-            // Overlay stays open; if entries became empty, next render shows
-            // the "(no bookmarks)" placeholder.
         }
         (KeyCode::Char('e'), KeyModifiers::NONE) => {
-            let idx = app.bookmarks.overlay_selected;
-            app.bookmarks.start_rename(idx);
+            app.bookmarks.start_rename(app.bookmarks.overlay_selected);
         }
         (KeyCode::Enter, _) => {
-            let path = match app.bookmarks.selected() {
-                Some(b) => b.path.clone(),
-                None => {
-                    app.bookmarks.close_overlay();
-                    return;
-                }
-            };
-            app.bookmarks.close_overlay();
-            // Navigate directly with the stored PathBuf — no string round-trip
-            // needed since bookmark paths are absolute.
-            if !path.is_dir() {
-                app.set_status(format!(
-                    "bookmark: path no longer exists: {}",
-                    path.display()
-                ));
-                return;
-            }
-            let display = path.display().to_string();
-            app.browse.navigate_to(path);
-            app.browse.probe_current_with_db(tx, Some(&app.db));
-            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-            app.set_status(format!("cd: {}", display));
+            queue_selected_manager_bookmark_activation(app, tx);
         }
         _ => {}
+    }
+}
+
+
+#[cfg(test)]
+mod bookmark_manager_activation_regression_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    #[test]
+    fn unchanged_rename_surfaces_failed_mirror_repair() {
+        assert_eq!(
+            unchanged_bookmark_feedback(Some("SQLite transaction failed".to_string())),
+            "bookmark name unchanged · mirror warning: SQLite transaction failed"
+        );
+        assert_eq!(
+            unchanged_bookmark_feedback(None),
+            "bookmark name unchanged"
+        );
+    }
+
+    #[test]
+    fn boundary_reorder_feedback_quotes_name_and_surfaces_mirror_warning() {
+        assert_eq!(
+            boundary_bookmark_feedback("Archive", "last", None),
+            "\"Archive\" is already last in saved order"
+        );
+        assert_eq!(
+            boundary_bookmark_feedback(
+                "Archive",
+                "first",
+                Some("SQLite transaction failed"),
+            ),
+            "\"Archive\" is already first in saved order · mirror warning: SQLite transaction failed"
+        );
+    }
+
+    #[test]
+    fn filtered_enter_queues_manager_activation_for_selected_result() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.bookmarks.entries = vec![
+            super::super::bookmarks::Bookmark {
+                name: "Alpha".to_string(),
+                path: std::path::PathBuf::from("/alpha"),
+            },
+            super::super::bookmarks::Bookmark {
+                name: "Hidden".to_string(),
+                path: std::path::PathBuf::from("/hidden"),
+            },
+            super::super::bookmarks::Bookmark {
+                name: "Alpine".to_string(),
+                path: std::path::PathBuf::from("/alpine"),
+            },
+        ];
+        app.bookmarks.open_overlay();
+        app.bookmarks.filter_input = Some(
+            super::super::text_input::TextInputState::new("alp".to_string()),
+        );
+        app.bookmarks.overlay_selected = 2;
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_bookmarks_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+
+        let pending = app
+            .bookmarks
+            .pending_activation
+            .as_ref()
+            .expect("filtered Enter must queue activation");
+        assert_eq!(pending.path, std::path::PathBuf::from("/alpine"));
+        assert_eq!(
+            pending.surface,
+            super::super::bookmarks::BookmarkActivationSurface::Manager
+        );
     }
 }
 
@@ -32640,6 +33236,215 @@ fn retry_failed(app: &mut AppState) {
 
 /// Handle mouse events
 
+fn manager_overlay_contains(app: &AppState, x: u16, y: u16) -> bool {
+    let screen = app.browse.last_render_area.unwrap_or_else(|| {
+        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+        Rect::new(0, 0, width, height)
+    });
+    let area = super::bookmarks_overlay::bookmarks_overlay_area(screen);
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
+
+fn handle_bookmarks_manager_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let target = app.button_map.find_button_at(mouse.column, mouse.row);
+    let track = app
+        .button_map
+        .button_rect(TuiButton::ScrollbarTrack(ScrollbarSurface::BookmarkManager));
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if manager_overlay_contains(app, mouse.column, mouse.row) {
+                let next = if mouse.kind == MouseEventKind::ScrollUp {
+                    app.bookmarks.overlay_scroll.saturating_sub(3)
+                } else {
+                    app.bookmarks.overlay_scroll.saturating_add(3)
+                };
+                app.bookmarks.set_overlay_scroll(next);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            match target {
+                Some(TuiButton::BookmarkManagerRow(index)) => {
+                    if index < app.bookmarks.entries.len() {
+                        app.bookmarks.overlay_selected = index;
+                        app.bookmarks.snap_selection_to_filter();
+                        app.bookmarks.feedback = None;
+                        request_selected_bookmark_detail(app, tx);
+                    }
+                }
+                Some(TuiButton::ScrollbarTrack(ScrollbarSurface::BookmarkManager))
+                | Some(TuiButton::ScrollbarThumb(ScrollbarSurface::BookmarkManager)) => {
+                    if let Some(track) = track {
+                        let filtered_len = app.bookmarks.filtered_indices().len();
+                        if let Some(metrics) = tui_file_picker::ScrollbarMetrics::new(
+                            filtered_len,
+                            app.bookmarks.overlay_visible_rows,
+                            app.bookmarks.overlay_scroll,
+                            track.height as usize,
+                        ) {
+                            let row = mouse.row.saturating_sub(track.y) as usize;
+                            match metrics.press(row) {
+                                tui_file_picker::ScrollbarPress::PageUp => {
+                                    app.bookmarks.set_overlay_scroll(
+                                        app.bookmarks
+                                            .overlay_scroll
+                                            .saturating_sub(app.bookmarks.overlay_visible_rows.max(1)),
+                                    );
+                                }
+                                tui_file_picker::ScrollbarPress::PageDown => {
+                                    app.bookmarks.set_overlay_scroll(
+                                        app.bookmarks
+                                            .overlay_scroll
+                                            .saturating_add(app.bookmarks.overlay_visible_rows.max(1)),
+                                    );
+                                }
+                                tui_file_picker::ScrollbarPress::Thumb { grab_offset } => {
+                                    app.bookmarks.scrollbar_grab_offset = Some(grab_offset);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ if !manager_overlay_contains(app, mouse.column, mouse.row) => {
+                    app.bookmarks.close_overlay();
+                }
+                _ => {}
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let (Some(grab_offset), Some(track)) =
+                (app.bookmarks.scrollbar_grab_offset, track)
+            {
+                let filtered_len = app.bookmarks.filtered_indices().len();
+                if let Some(metrics) = tui_file_picker::ScrollbarMetrics::new(
+                    filtered_len,
+                    app.bookmarks.overlay_visible_rows,
+                    app.bookmarks.overlay_scroll,
+                    track.height as usize,
+                ) {
+                    let row = mouse.row.saturating_sub(track.y) as usize;
+                    app.bookmarks
+                        .set_overlay_scroll(metrics.offset_for_drag(row, grab_offset));
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.bookmarks.scrollbar_grab_offset = None;
+        }
+        _ => {}
+    }
+}
+
+fn browse_scrollbar_metrics(
+    app: &AppState,
+    kind: super::browse::BrowseScrollbarKind,
+) -> Option<(Rect, tui_file_picker::ScrollbarMetrics)> {
+    let (surface, total, visible, offset) = match kind {
+        super::browse::BrowseScrollbarKind::List => (
+            ScrollbarSurface::BrowseList,
+            app.browse.entries.len(),
+            app.browse.visible_height,
+            app.browse.scroll_offset,
+        ),
+        super::browse::BrowseScrollbarKind::Tree => (
+            ScrollbarSurface::BrowseTree,
+            app.browse.tree_nodes.len(),
+            app.browse.tree_visible_height,
+            app.browse.tree_scroll,
+        ),
+    };
+    let track = app
+        .button_map
+        .button_rect(TuiButton::ScrollbarTrack(surface))?;
+    let metrics = tui_file_picker::ScrollbarMetrics::new(
+        total,
+        visible,
+        offset,
+        track.height as usize,
+    )?;
+    Some((track, metrics))
+}
+
+fn handle_browse_scrollbar_mouse(app: &mut AppState, mouse: MouseEvent) -> bool {
+    use super::browse::{BrowseNavigationPane, BrowseScrollbarDrag, BrowseScrollbarKind};
+
+    if let Some(drag) = app.browse.scrollbar_drag {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((track, metrics)) = browse_scrollbar_metrics(app, drag.kind) {
+                    let row = mouse.row.saturating_sub(track.y) as usize;
+                    let offset = metrics.offset_for_drag(row, drag.grab_offset);
+                    match drag.kind {
+                        BrowseScrollbarKind::List => app.browse.set_scroll_offset(offset),
+                        BrowseScrollbarKind::Tree => app.browse.set_tree_scroll_offset(offset),
+                    }
+                }
+                return true;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                app.browse.scrollbar_drag = None;
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return false;
+    }
+    let target = app.button_map.find_button_at(mouse.column, mouse.row);
+    let kind = match target {
+        Some(TuiButton::ScrollbarTrack(ScrollbarSurface::BrowseList))
+        | Some(TuiButton::ScrollbarThumb(ScrollbarSurface::BrowseList)) => {
+            BrowseScrollbarKind::List
+        }
+        Some(TuiButton::ScrollbarTrack(ScrollbarSurface::BrowseTree))
+        | Some(TuiButton::ScrollbarThumb(ScrollbarSurface::BrowseTree)) => {
+            BrowseScrollbarKind::Tree
+        }
+        _ => return false,
+    };
+    let Some((track, metrics)) = browse_scrollbar_metrics(app, kind) else {
+        return true;
+    };
+    let row = mouse.row.saturating_sub(track.y) as usize;
+    match metrics.press(row) {
+        tui_file_picker::ScrollbarPress::PageUp => match kind {
+            BrowseScrollbarKind::List => {
+                app.browse.set_navigation_pane(BrowseNavigationPane::Files);
+                app.browse.scroll_viewport(-(app.browse.visible_height.max(1) as i32));
+            }
+            BrowseScrollbarKind::Tree => {
+                app.browse.set_navigation_pane(BrowseNavigationPane::Tree);
+                app.browse
+                    .scroll_tree_viewport(-(app.browse.tree_visible_height.max(1) as i32));
+            }
+        },
+        tui_file_picker::ScrollbarPress::PageDown => match kind {
+            BrowseScrollbarKind::List => {
+                app.browse.set_navigation_pane(BrowseNavigationPane::Files);
+                app.browse.scroll_viewport(app.browse.visible_height.max(1) as i32);
+            }
+            BrowseScrollbarKind::Tree => {
+                app.browse.set_navigation_pane(BrowseNavigationPane::Tree);
+                app.browse
+                    .scroll_tree_viewport(app.browse.tree_visible_height.max(1) as i32);
+            }
+        },
+        tui_file_picker::ScrollbarPress::Thumb { grab_offset } => {
+            app.browse.scrollbar_drag = Some(BrowseScrollbarDrag { kind, grab_offset });
+        }
+    }
+    true
+}
+
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
     // Metadata editor mouse: intercept all events when the editor is open.
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
@@ -32740,6 +33545,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
+    if app.bookmarks.overlay_open {
+        handle_bookmarks_manager_mouse(app, mouse, tx);
+        return;
+    }
+
     // Generic overlay mouse: click-outside-to-close + footer pill clicks
     // for all overlays (except MetadataEditor which has its own handler,
     // and ContextMenu which has its own hover/click system).
@@ -32762,6 +33572,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             context_menu_mouse_hover(app, mouse.column, mouse.row);
             return;
         }
+    }
+
+    if app.current_screen == AppScreen::Browse
+        && matches!(app.active_overlay, ActiveOverlay::None)
+        && !app.bookmarks.dropdown_open
+        && handle_browse_scrollbar_mouse(app, mouse)
+    {
+        return;
     }
 
     // Browse drag range selection. This is checked before generic hover
@@ -32832,6 +33650,20 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return; // Move events don't trigger actions.
     }
 
+    if app.current_screen == AppScreen::Browse
+        && app.bookmarks.dropdown_open
+        && matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+    {
+        let visible = app.bookmarks.dropdown_visible_rows.max(1);
+        let max_scroll = app.bookmarks.entries.len().saturating_sub(visible);
+        app.bookmarks.dropdown_scroll = match mouse.kind {
+            MouseEventKind::ScrollUp => app.bookmarks.dropdown_scroll.saturating_sub(3),
+            MouseEventKind::ScrollDown => app.bookmarks.dropdown_scroll.saturating_add(3).min(max_scroll),
+            _ => app.bookmarks.dropdown_scroll,
+        };
+        return;
+    }
+
     // Scroll wheel: ignore while any overlay is open.
     if matches!(
         mouse.kind,
@@ -32855,19 +33687,30 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         }
         if app.current_screen == AppScreen::Browse {
             app.browse.tree_last_click = None;
-            let over_list = matches!(
-                app.button_map.find_button_at(mouse.column, mouse.row),
+            match app.button_map.find_button_at(mouse.column, mouse.row) {
                 Some(TuiButton::BrowseList)
-                    | Some(TuiButton::BrowseEntry(_))
-                    | Some(TuiButton::BrowseEntryGutter(_))
-                    | Some(TuiButton::BrowseColumn(_))
-            );
-            if over_list {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => app.browse.scroll_viewport(-3),
-                    MouseEventKind::ScrollDown => app.browse.scroll_viewport(3),
-                    _ => {}
+                | Some(TuiButton::BrowseEntry(_))
+                | Some(TuiButton::BrowseEntryGutter(_))
+                | Some(TuiButton::BrowseColumn(_))
+                | Some(TuiButton::ScrollbarTrack(ScrollbarSurface::BrowseList))
+                | Some(TuiButton::ScrollbarThumb(ScrollbarSurface::BrowseList)) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.browse.scroll_viewport(-3),
+                        MouseEventKind::ScrollDown => app.browse.scroll_viewport(3),
+                        _ => {}
+                    }
                 }
+                Some(TuiButton::BrowseTreeNode(_))
+                | Some(TuiButton::BrowseTreeDisclosure(_))
+                | Some(TuiButton::ScrollbarTrack(ScrollbarSurface::BrowseTree))
+                | Some(TuiButton::ScrollbarThumb(ScrollbarSurface::BrowseTree)) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.browse.scroll_tree_viewport(-3),
+                        MouseEventKind::ScrollDown => app.browse.scroll_tree_viewport(3),
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         } else if app.current_screen == AppScreen::Convert {
             if matches!(
@@ -32997,6 +33840,36 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
+    }
+
+    if app.current_screen == AppScreen::Browse
+        && matches!(app.active_overlay, ActiveOverlay::None)
+        && app.bookmarks.dropdown_open
+        && matches!(mouse.kind, MouseEventKind::Down(_))
+    {
+        let clicked = app.button_map.find_button_at(mouse.column, mouse.row);
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.bookmarks.close_dropdown();
+            return;
+        }
+        match clicked {
+            Some(TuiButton::BrowseBookmarkDropdownRow(index)) => {
+                app.bookmarks.dropdown_selected = index;
+                app.bookmarks.ensure_dropdown_visible();
+                activate_bookmark_dropdown_choice(app, tx);
+            }
+            Some(TuiButton::BrowseBookmarkDropdownAdd) => {
+                app.bookmarks.dropdown_selected = app.bookmarks.entries.len();
+                activate_bookmark_dropdown_choice(app, tx);
+            }
+            Some(TuiButton::BrowseBookmarkDropdownManage) => {
+                app.bookmarks.dropdown_selected = app.bookmarks.entries.len().saturating_add(1);
+                activate_bookmark_dropdown_choice(app, tx);
+            }
+            Some(TuiButton::BrowseBookmarksToggle) => app.bookmarks.close_dropdown(),
+            _ => app.bookmarks.close_dropdown(),
+        }
+        return;
     }
 
     // Right-click → select the clicked target, then open its context
@@ -33882,6 +34755,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.set_status("browse refreshed");
             }
             TuiButton::BrowseToolbarOptions => {
+                app.bookmarks.close_dropdown();
                 app.browse.toggle_options_menu();
             }
             TuiButton::BrowseToolbarSearch => {
@@ -33892,6 +34766,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
                 persist_browse_config(app);
             }
+            TuiButton::BrowseBookmarksToggle => {
+                app.browse.close_options_menu();
+                app.bookmarks = super::bookmarks::BookmarksState::load_from_db(&app.db);
+                app.bookmarks.toggle_dropdown();
+                app.browse.scrollbar_drag = None;
+                request_bookmark_target_statuses(app, tx);
+            }
+            TuiButton::BrowseBookmarkDropdownRow(_)
+            | TuiButton::BrowseBookmarkDropdownAdd
+            | TuiButton::BrowseBookmarkDropdownManage
+            | TuiButton::BookmarkManagerRow(_)
+            | TuiButton::ScrollbarTrack(_)
+            | TuiButton::ScrollbarThumb(_) => {}
             TuiButton::BrowsePathGo => {
                 if let Some(input) = app.browse.path_input.as_ref() {
                     let path = input.text.clone();
@@ -47902,4 +48789,172 @@ mod file_picker_browse_parity_regression_tests {
         assert!(message.contains("editor unavailable"));
         assert!(message.contains("file.flac"));
     }
+
+    #[test]
+    fn path_ctrl_c_copies_text_without_replacing_filesystem_clipboard() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.path_input = Some(super::super::text_input::TextInputState::new_selected(
+            "/music/album".to_string(),
+        ));
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &tx,
+        );
+
+        let input = app.browse.path_input.as_ref().expect("path input");
+        assert_eq!(input.clipboard, "/music/album");
+        assert!(app.browse.filesystem_clipboard.is_none());
+    }
+
+    #[test]
+    fn files_ctrl_c_uses_existing_filesystem_clipboard_action() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(file.clone())];
+        app.browse
+            .set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &tx,
+        );
+
+        let clipboard = app
+            .browse
+            .filesystem_clipboard
+            .as_ref()
+            .expect("filesystem clipboard");
+        assert_eq!(
+            clipboard.mode(),
+            tui_file_picker::FilePickerClipboardMode::Copy
+        );
+        assert_eq!(clipboard.paths(), std::slice::from_ref(&file));
+    }
+
+    #[test]
+    fn tree_ctrl_x_targets_the_tree_cursor_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("album");
+        std::fs::create_dir(&directory).expect("fixture directory");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.explore_enabled = true;
+        app.browse.explore_collapsed = false;
+        app.browse.tree_nodes = vec![tui_file_picker::TreeNode {
+            path: directory.clone(),
+            name: "album".to_string(),
+            depth: 0,
+            expanded: false,
+            has_children: false,
+        }];
+        app.browse.select_tree_index(0);
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &tx,
+        );
+
+        let clipboard = app
+            .browse
+            .filesystem_clipboard
+            .as_ref()
+            .expect("tree clipboard");
+        assert_eq!(clipboard.mode(), tui_file_picker::FilePickerClipboardMode::Cut);
+        assert_eq!(clipboard.paths(), std::slice::from_ref(&directory));
+    }
+
+    #[test]
+    fn search_results_refuse_filesystem_clipboard_shortcuts() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.search.active = true;
+        app.browse.search.focus = crate::tui::browse::SearchFocus::Results;
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &tx,
+        );
+
+        assert!(app.browse.filesystem_clipboard.is_none());
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("unavailable in search results")));
+    }
+
+    #[test]
+    fn context_menu_navigation_wraps_and_skips_nonselectable_rows() {
+        use crate::tui::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem, MenuLevel};
+
+        let item = |label: &str| {
+            ContextMenuEntry::Item(ContextMenuItem {
+                label: label.to_string(),
+                action: ContextAction::Refresh,
+                shortcut: None,
+                enabled: true,
+            })
+        };
+        let entries = vec![item("First"), ContextMenuEntry::Separator, item("Last")];
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_context_menu_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            vec![MenuLevel::new(entries.clone())],
+            (0, 0),
+            &tx,
+        );
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("context menu");
+        };
+        assert_eq!(levels[0].selected, 1);
+        let wrapped_levels = levels.clone();
+
+        handle_context_menu_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            wrapped_levels,
+            (0, 0),
+            &tx,
+        );
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("context menu");
+        };
+        assert_eq!(levels[0].selected, 0);
+    }
+
+    #[test]
+    fn opening_entry_context_menu_keeps_focus_at_the_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_audio_entry(file)];
+
+        open_context_menu(&mut app, 4, 4);
+
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("context menu");
+        };
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].selected, 0);
+    }
+
 }

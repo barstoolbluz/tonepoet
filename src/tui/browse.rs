@@ -2152,6 +2152,18 @@ impl Default for BrowseDragState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseScrollbarKind {
+    List,
+    Tree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowseScrollbarDrag {
+    pub kind: BrowseScrollbarKind,
+    pub grab_offset: usize,
+}
+
 /// Explore pane tree node. Reuse the file-picker tree node type directly so
 /// Browse and the picker share one filesystem-tree data model.
 ///
@@ -2451,6 +2463,7 @@ pub struct BrowseState {
     pub tree_last_click: Option<(PathBuf, Instant)>,
     pub tree_scroll: usize,
     pub tree_visible_height: usize,
+    pub scrollbar_drag: Option<BrowseScrollbarDrag>,
 
     /// Three-pane Browse layout state. Browse itself is never fully collapsed.
     /// `*_enabled` controls whether a side pane participates in layout at all;
@@ -2863,6 +2876,7 @@ impl BrowseState {
             tree_last_click: None,
             tree_scroll: 0,
             tree_visible_height: 0,
+            scrollbar_drag: None,
             explore_enabled,
             info_enabled,
             explore_collapsed,
@@ -3092,9 +3106,24 @@ impl BrowseState {
         };
     }
 
+    pub fn set_visible_height(&mut self, height: usize) {
+        let changed = self.visible_height != height;
+        self.visible_height = height;
+        let max_scroll = self.entries.len().saturating_sub(height);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+        if changed {
+            self.ensure_visible();
+        }
+    }
+
     pub fn set_tree_visible_height(&mut self, height: usize) {
+        let changed = self.tree_visible_height != height;
         self.tree_visible_height = height;
-        self.ensure_tree_visible();
+        let max_scroll = self.tree_nodes.len().saturating_sub(height);
+        self.tree_scroll = self.tree_scroll.min(max_scroll);
+        if changed {
+            self.ensure_tree_visible();
+        }
     }
 
     pub fn tree_node_path(&self, index: usize) -> Option<PathBuf> {
@@ -4622,10 +4651,37 @@ impl BrowseState {
             return;
         }
         let max_offset = self.entries.len().saturating_sub(self.visible_height);
-        let new_offset = (self.scroll_offset as i32 + delta)
-            .max(0)
-            .min(max_offset as i32) as usize;
-        self.scroll_offset = new_offset;
+        self.scroll_offset = if delta < 0 {
+            self.scroll_offset.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.scroll_offset
+                .saturating_add(delta as usize)
+                .min(max_offset)
+        };
+    }
+
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        let max_offset = self.entries.len().saturating_sub(self.visible_height);
+        self.scroll_offset = offset.min(max_offset);
+    }
+
+    pub fn scroll_tree_viewport(&mut self, delta: i32) {
+        if self.tree_visible_height == 0 || self.tree_nodes.is_empty() {
+            return;
+        }
+        let max_offset = self.tree_nodes.len().saturating_sub(self.tree_visible_height);
+        self.tree_scroll = if delta < 0 {
+            self.tree_scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.tree_scroll
+                .saturating_add(delta as usize)
+                .min(max_offset)
+        };
+    }
+
+    pub fn set_tree_scroll_offset(&mut self, offset: usize) {
+        let max_offset = self.tree_nodes.len().saturating_sub(self.tree_visible_height);
+        self.tree_scroll = offset.min(max_offset);
     }
 
     /// Scroll to keep the selected index visible
@@ -11703,6 +11759,54 @@ mod tests {
             identity.modified,
         );
         (dir, path, entry, identity, mtime_unix)
+    }
+
+    #[test]
+    fn unchanged_list_viewport_height_preserves_pointer_scroll() {
+        let mut state = BrowseState::new();
+        state.entries = (0..20)
+            .map(|index| BrowseEntry::new(
+                PathBuf::from(format!("/list/{index}")),
+                format!("entry-{index}"),
+                EntryKind::Directory,
+                0,
+                None,
+            ))
+            .collect();
+        state.selected_index = 0;
+        state.visible_height = 5;
+        state.set_scroll_offset(10);
+        assert_eq!(state.scroll_offset, 10);
+
+        state.set_visible_height(5);
+        assert_eq!(
+            state.scroll_offset, 10,
+            "a render pass must not recenter a list viewport moved by wheel or scrollbar"
+        );
+    }
+
+    #[test]
+    fn unchanged_tree_viewport_height_preserves_pointer_scroll() {
+        let mut state = BrowseState::new();
+        state.tree_nodes = (0..20)
+            .map(|index| tui_file_picker::TreeNode {
+                path: PathBuf::from(format!("/tree/{index}")),
+                name: format!("node-{index}"),
+                depth: 0,
+                expanded: false,
+                has_children: false,
+            })
+            .collect();
+        state.tree_cursor = 0;
+        state.tree_visible_height = 5;
+        state.set_tree_scroll_offset(10);
+        assert_eq!(state.tree_scroll, 10);
+
+        state.set_tree_visible_height(5);
+        assert_eq!(
+            state.tree_scroll, 10,
+            "a render pass must not recenter a tree viewport moved by wheel or scrollbar"
+        );
     }
 
     #[test]

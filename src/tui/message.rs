@@ -150,6 +150,32 @@ pub enum AppMessage {
     },
     /// Force a redraw
     Redraw,
+    /// Bookmark target reachability loaded off the event thread.
+    BookmarkTargetsLoaded {
+        generation: u64,
+        statuses: Vec<(
+            std::path::PathBuf,
+            crate::tui::bookmarks::BookmarkTargetStatus,
+        )>,
+    },
+    /// Bookmark activation revalidated on the dedicated filesystem worker pool.
+    BookmarkActivationResolved {
+        generation: u64,
+        request_id: u64,
+        path: std::path::PathBuf,
+        result: Result<(), String>,
+    },
+    /// A dedicated bookmark detail worker has begun the filesystem scan.
+    BookmarkDetailStarted {
+        generation: u64,
+        path: std::path::PathBuf,
+    },
+    /// Lazy, non-recursive bookmark detail loaded off the event thread.
+    BookmarkDetailLoaded {
+        generation: u64,
+        path: std::path::PathBuf,
+        result: Result<crate::tui::bookmarks::BookmarkDetail, String>,
+    },
     /// Result of asynchronous Browse regular-folder expansion for Convert/Queue
     /// handoff. The reducer accepts this only when the generation and captured
     /// selection still match the active pending expansion.

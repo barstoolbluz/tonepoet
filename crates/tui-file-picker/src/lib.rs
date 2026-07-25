@@ -8,6 +8,7 @@
 pub mod click_timing;
 pub mod display_width;
 pub mod name_validation;
+pub mod scrollbar;
 pub mod source_guard;
 pub mod text_input;
 pub mod type_ahead;
@@ -22,9 +23,9 @@ mod state;
 mod theme;
 mod tree;
 
+pub use click_timing::{classify_click, ClickDisposition, ClickTracker, DOUBLE_CLICK_WINDOW};
 pub use filter::FilePickerFilter;
 pub use filesystem_clipboard::{remap_path_after_cut, FilesystemClipboard};
-pub use click_timing::{classify_click, ClickDisposition, ClickTracker, DOUBLE_CLICK_WINDOW};
 pub use text_input::{
     apply_path_completion, apply_tab_completion, apply_template_variable_completion,
     handle_text_input_key, handle_text_input_key_with_boundaries, CompletionMode,
@@ -35,8 +36,10 @@ pub use type_ahead::{
 };
 pub use bookmarks::{
     bookmark_storage_path, initialize_bookmarks_if_absent, load_bookmarks,
-    mutate_bookmarks_atomic, save_bookmarks_atomic, BookmarkCommit,
-    BookmarkInitialization, BookmarkMutation, BookmarkRecord, BookmarkSaveStatus,
+    mutate_bookmarks_atomic, mutate_bookmarks_atomic_with_reconcile,
+    reconcile_bookmarks_locked, save_bookmarks_atomic, BookmarkCommit,
+    BookmarkInitialization, BookmarkMoveDirection, BookmarkMutation,
+    BookmarkReconciledCommit, BookmarkRecord, BookmarkSaveStatus,
 };
 pub use name_validation::{validate_file_name, NameValidationError};
 pub use source_guard::{
@@ -65,3 +68,5 @@ pub use theme::FilePickerTheme;
 pub use tree::{initial_tree_nodes_with_hidden, expand_tree_to_path, refresh_tree_children, child_directories};
 
 pub use ratatui::layout::Rect;
+
+pub use scrollbar::{ScrollbarMetrics, ScrollbarPress};
