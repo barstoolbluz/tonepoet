@@ -1528,7 +1528,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::Terminal;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {

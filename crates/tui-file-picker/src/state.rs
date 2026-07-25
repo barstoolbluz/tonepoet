@@ -2661,10 +2661,6 @@ impl FilePickerState {
         true
     }
 
-    fn move_path(&mut self, source: &Path, destination: &Path) -> Result<(), FilePickerError> {
-        move_path_with_policy(source, destination, self.operation_policy)
-    }
-
     pub fn request_delete_current(&mut self) -> bool {
         if !self.operation_policy.allow_delete {
             self.set_error(FilePickerError::OperationDisabled("delete"));

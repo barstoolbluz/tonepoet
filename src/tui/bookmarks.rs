@@ -339,6 +339,7 @@ impl BookmarksState {
         })
     }
 
+    #[cfg(test)]
     fn remove_in_memory(&mut self, index: usize) -> bool {
         if index >= self.entries.len() {
             return false;
@@ -371,10 +372,12 @@ impl BookmarksState {
         })
     }
 
+    #[cfg(test)]
     fn add_in_memory(&mut self, name: String, path: PathBuf) {
         self.entries.push(Bookmark { name, path });
     }
 
+    #[cfg(test)]
     fn rename_at_in_memory(&mut self, index: usize, new_name: String) -> bool {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.name = new_name;

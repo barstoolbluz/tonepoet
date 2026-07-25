@@ -1,12 +1,11 @@
 use crate::state::{
     intersect_rect, ConflictPolicyPreset, DeleteConfirmButton, FilePickerContextMenuKind,
-    FilePickerCreateKind, FilePickerFocus, FilePickerHitAction, FilePickerMenuAction,
-    FilePickerMenuEntry, FilePickerSelectionMode, FilePickerState, FilePickerSubmenuKind,
-    HitRegion, SaveModeStyle, ToolbarAction,
+    FilePickerCreateKind, FilePickerFocus, FilePickerHitAction, FilePickerMenuEntry,
+    FilePickerSelectionMode, FilePickerState, HitRegion, SaveModeStyle, ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 use ratatui::style::Style;
 use std::time::{Duration, SystemTime};
@@ -1554,22 +1553,6 @@ fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'st
     if count == 1 { singular } else { plural }
 }
 
-fn text_with_caret(text: &str, cursor: usize, width: usize) -> String {
-    let cursor = nearest_char_boundary(text, cursor.min(text.len()));
-    let mut marked = String::with_capacity(text.len() + 3);
-    marked.push_str(&text[..cursor]);
-    marked.push('▌');
-    marked.push_str(&text[cursor..]);
-    fit_text_right(&marked, width)
-}
-
-fn nearest_char_boundary(text: &str, mut cursor: usize) -> usize {
-    while cursor > 0 && !text.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    cursor
-}
-
 fn menu_line(label: &str, width: usize, style: ratatui::style::Style, _hot_style: ratatui::style::Style) -> Line<'static> {
     let padded = fit_text_left(label, width);
     Line::from(Span::styled(padded, style))
@@ -2170,42 +2153,6 @@ mod tests {
             return None;
         }
         for y in (0..height).rev() {
-            for x in 0..=width.saturating_sub(text_width) {
-                if symbols
-                    .iter()
-                    .all(|(offset, symbol)| {
-                        buffer
-                            .get(x.saturating_add(*offset as u16), y)
-                            .symbol()
-                            == symbol.as_str()
-                    })
-                {
-                    return Some((x, y));
-                }
-            }
-        }
-        None
-    }
-
-    fn find_text(buffer: &Buffer, text: &str, width: u16, height: u16) -> Option<(u16, u16)> {
-        let mut symbols: Vec<(usize, String)> = Vec::new();
-        let mut offset = 0usize;
-        for ch in text.chars() {
-            let ch_width = crate::display_width::char_width(ch);
-            if ch_width == 0 {
-                if let Some((_, symbol)) = symbols.last_mut() {
-                    symbol.push(ch);
-                }
-                continue;
-            }
-            symbols.push((offset, ch.to_string()));
-            offset = offset.saturating_add(ch_width);
-        }
-        let text_width = u16::try_from(offset).ok()?;
-        if text_width == 0 || text_width > width {
-            return None;
-        }
-        for y in 0..height {
             for x in 0..=width.saturating_sub(text_width) {
                 if symbols
                     .iter()
