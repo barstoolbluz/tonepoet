@@ -977,9 +977,14 @@ impl FilePickerState {
             format!("{count} {}", pluralize(count, "item", "items"))
         };
         let center = error.unwrap_or_else(|| format!("{total} visible"));
-        let right = match self.free_space_bytes {
+        let free_space = match self.free_space_bytes {
             Some(bytes) => format!("{} free", format_size(bytes)),
             None => "free space unavailable".to_string(),
+        };
+        let right = if self.operation_policy.allow_paste {
+            format!("Ctrl+V/P Paste | {free_space}")
+        } else {
+            free_space
         };
         let width = area.width as usize;
         let line = distribute_status(&left, &center, &right, width);
@@ -2119,6 +2124,26 @@ mod tests {
 
         assert!(rendered.contains("e Rename"));
         assert!(!rendered.contains("r Rename"));
+    }
+
+    #[test]
+    fn picker_status_advertises_both_paste_chords_for_files_and_tree_navigation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        for focus in [FilePickerFocus::Files, FilePickerFocus::Tree] {
+            picker.set_focus(focus);
+            terminal
+                .draw(|frame| picker.render(frame, Rect::new(0, 0, 116, 18)))
+                .expect("draw");
+            let rendered = format!("{:?}", terminal.backend().buffer());
+            assert!(rendered.contains("Ctrl+V/P Paste"), "focus={focus:?}");
+        }
     }
 
     #[test]

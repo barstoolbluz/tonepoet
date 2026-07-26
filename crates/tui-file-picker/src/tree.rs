@@ -59,10 +59,6 @@ struct HasChildDirectoriesCache {
 
 static HAS_CHILD_DIRECTORIES_CACHE: OnceLock<Mutex<HasChildDirectoriesCache>> = OnceLock::new();
 
-pub fn initial_tree_nodes(current_dir: &Path) -> Vec<TreeNode> {
-    initial_tree_nodes_with_hidden(current_dir, false)
-}
-
 /// Build initial tree nodes using the same filesystem discovery rules as the
 /// file picker, with an explicit hidden-directory policy for hosts such as the
 /// Browse screen.

@@ -174,9 +174,12 @@ pub fn count_audio_files_bounded(paths: &[PathBuf], limit: usize) -> usize {
     count
 }
 
-/// Expands files/directories to queueable paths using the historical
-/// `Vec<PathBuf>` API. This adapter cannot transfer ownership of transient
-/// synthetic CUE artifacts, so it cleans and omits them; queue-building callers
+/// Expands files/directories to queueable conversion sources using the
+/// historical `Vec<PathBuf>` API. Sources include ordinary audio, CUE sheets,
+/// supported archive containers, and positively identified disc images under
+/// the authoritative direct-source policy. This adapter cannot transfer
+/// ownership of transient synthetic CUE artifacts, so it cleans and omits
+/// them; queue-building callers
 /// that may materialize merged split-CUE albums must use
 /// `expand_paths_to_audio_with_metadata()` and register returned artifacts.
 pub fn expand_paths_to_audio(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -4928,33 +4931,105 @@ mod ogg_tta_cue_queue_tests {
 #[cfg(test)]
 mod direct_queue_source_policy_expansion_tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    const SUPPORTED_ARCHIVES: &[&str] = &[
+        "album.7z",
+        "album.zip",
+        "album.rar",
+        "album.tar",
+        "album.cab",
+        "album.dmg",
+        "album.tgz",
+        "album.tbz2",
+        "album.txz",
+        "album.tar.gz",
+        "album.tar.bz2",
+        "album.tar.xz",
+        "album.tar.zst",
+        "album.tar.lz",
+        "album.tar.lzma",
+    ];
+
+    fn write_sacd_iso_fixture(path: &Path) {
+        const SECTOR_SIZE: u64 = 2_048;
+        const MASTER_TOC_LSN: u64 = 510;
+        const MASTER_TOC_MAGIC: &[u8; 8] = b"SACDMTOC";
+        let mut file = std::fs::File::create(path).expect("create SACD ISO fixture");
+        file.set_len((MASTER_TOC_LSN + 1) * SECTOR_SIZE)
+            .expect("size SACD ISO fixture");
+        file.seek(SeekFrom::Start(MASTER_TOC_LSN * SECTOR_SIZE))
+            .expect("seek SACD ISO fixture");
+        file.write_all(MASTER_TOC_MAGIC)
+            .expect("write SACD ISO magic");
+    }
 
     #[test]
-    fn folder_queue_expansion_uses_shared_direct_source_policy_not_local_audio_list() {
+    fn explicit_recursive_and_bounded_expansion_share_every_supported_archive() {
         let td = tempfile::tempdir().expect("tempdir");
-        let admitted = [
-            "track.ape",
-            "track.dsf",
-            "track.dff",
-            "track.shn",
-            "track.ogg",
-            "track.tta",
-            "track.7z",
-        ];
-        for name in admitted {
-            std::fs::write(td.path().join(name), b"fixture").expect("fixture");
+        let nested = td.path().join("nested").join("archives");
+        std::fs::create_dir_all(&nested).expect("nested archive fixture dir");
+
+        for name in SUPPORTED_ARCHIVES {
+            std::fs::write(nested.join(name), b"archive fixture").expect("archive fixture");
         }
-        for name in ["notes.txt", "track.zip", "track.tar.gz", "track.dmg", "track.cab"] {
-            std::fs::write(td.path().join(name), b"fixture").expect("fixture");
+        let audio = nested.join("track.flac");
+        let rejected = nested.join("notes.txt");
+        let generic_iso = nested.join("generic.iso");
+        std::fs::write(&audio, b"audio fixture").expect("audio fixture");
+        std::fs::write(&rejected, b"text fixture").expect("text fixture");
+        std::fs::write(&generic_iso, b"generic ISO fixture").expect("ISO fixture");
+
+        for name in SUPPORTED_ARCHIVES {
+            let path = nested.join(name);
+            let explicit = expand_paths_to_audio_with_metadata(std::slice::from_ref(&path));
+            assert_eq!(explicit.paths, vec![path.clone()], "explicit {name}");
+            assert!(explicit.expansion_errors.is_empty(), "explicit {name}");
         }
 
-        let expanded = expand_paths_to_audio(&[td.path().to_path_buf()]);
-        for name in admitted {
-            assert!(path_list_contains(&expanded, &td.path().join(name)), "{name}");
+        let recursive = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        for name in SUPPORTED_ARCHIVES {
+            assert!(
+                path_list_contains(&recursive.paths, &nested.join(name)),
+                "recursive {name}"
+            );
         }
-        for name in ["notes.txt", "track.zip", "track.tar.gz", "track.dmg", "track.cab"] {
-            assert!(!path_list_contains(&expanded, &td.path().join(name)), "{name}");
+        assert!(path_list_contains(&recursive.paths, &audio));
+        assert!(!path_list_contains(&recursive.paths, &rejected));
+        assert!(!path_list_contains(&recursive.paths, &generic_iso));
+
+        let (bounded, visited) = expand_paths_to_audio_with_metadata_limited(
+            &[td.path().to_path_buf()],
+            1_000,
+            || false,
+        )
+        .expect("bounded expansion");
+        assert!(visited >= SUPPORTED_ARCHIVES.len());
+        for name in SUPPORTED_ARCHIVES {
+            assert!(
+                path_list_contains(&bounded.paths, &nested.join(name)),
+                "bounded {name}"
+            );
         }
+        assert!(path_list_contains(&bounded.paths, &audio));
+        assert!(!path_list_contains(&bounded.paths, &rejected));
+        assert!(!path_list_contains(&bounded.paths, &generic_iso));
+    }
+
+    #[test]
+    fn queue_expansion_preserves_probe_admitted_disc_images_and_rejects_generic_iso() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let sacd = td.path().join("sacd.iso");
+        let generic = td.path().join("generic.iso");
+        write_sacd_iso_fixture(&sacd);
+        std::fs::write(&generic, b"generic ISO fixture").expect("generic ISO fixture");
+
+        let explicit = expand_paths_to_audio_with_metadata(std::slice::from_ref(&sacd));
+        assert_eq!(explicit.paths, vec![sacd.clone()]);
+
+        let recursive = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert!(path_list_contains(&recursive.paths, &sacd));
+        assert!(!path_list_contains(&recursive.paths, &generic));
     }
 }
 

@@ -8,7 +8,7 @@ use ratatui::Frame;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_MAX_ERROR_RECORDS: usize = 8;
+const DEFAULT_MAX_ERROR_RECORDS: usize = 256;
 const DEFAULT_MAX_CONFLICT_RECORDS: usize = 8;
 const MIN_PROGRESS_DIALOG_WIDTH: u16 = 52;
 const PROGRESS_DIALOG_HEIGHT: u16 = 12;
@@ -537,6 +537,7 @@ enum ProgressHitAction {
     SkipCurrent,
     Abort,
     Acknowledge,
+    ToggleDetails,
     Conflict(ConflictAction),
     ToggleApplyAll,
 }
@@ -567,11 +568,14 @@ pub struct FileTaskProgressState {
     pub conflict_records: Vec<ConflictPromptState>,
     pub error_records: Vec<FileTaskErrorRecord>,
     pub max_error_records: usize,
+    completion_report: Option<FileTaskCompletionReport>,
     pub max_conflict_records: usize,
     started_at: Instant,
     updated_at: Instant,
     hit_regions: Vec<ProgressHitRegion>,
     last_area: Option<Rect>,
+    details_open: bool,
+    details_scroll: u16,
 }
 
 impl FileTaskProgressState {
@@ -591,11 +595,14 @@ impl FileTaskProgressState {
             conflict_records: Vec::new(),
             error_records: Vec::new(),
             max_error_records: DEFAULT_MAX_ERROR_RECORDS,
+            completion_report: None,
             max_conflict_records: DEFAULT_MAX_CONFLICT_RECORDS,
             started_at: now,
             updated_at: now,
             hit_regions: Vec::new(),
             last_area: None,
+            details_open: false,
+            details_scroll: 0,
         }
     }
 
@@ -749,13 +756,71 @@ impl FileTaskProgressState {
         Some(Duration::from_secs((total - self.totals.bytes_done) / rate))
     }
 
+    pub fn has_details(&self) -> bool {
+        !self.status.is_empty()
+            || !self.error_records.is_empty()
+            || self.completion_report.as_ref().is_some_and(|report| {
+                report.roots.iter().any(|root| root.message.is_some())
+            })
+    }
+
+    pub fn open_details(&mut self) {
+        if self.is_terminal() && self.has_details() {
+            self.details_open = true;
+            self.details_scroll = 0;
+        }
+    }
+
+    /// Retain the authoritative terminal root report for post-completion
+    /// inspection. The live progress error list remains bounded, while this
+    /// report preserves every terminal warning/failure message exactly once.
+    pub fn append_completion_report(&mut self, report: &FileTaskCompletionReport) {
+        self.completion_report = Some(report.clone());
+        self.updated_at = Instant::now();
+    }
+
+    /// Return the authoritative terminal root report retained for diagnostics.
+    #[must_use]
+    pub fn completion_report(&self) -> Option<&FileTaskCompletionReport> {
+        self.completion_report.as_ref()
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> FileTaskUserAction {
         if self.conflict.is_some() {
             return self.handle_conflict_key(key);
         }
 
         if self.is_terminal() {
+            if self.details_open {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('d') => {
+                        self.details_open = false;
+                        self.details_scroll = 0;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.details_scroll = self.details_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.details_scroll = self.details_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => {
+                        self.details_scroll = self.details_scroll.saturating_sub(8);
+                    }
+                    KeyCode::PageDown => {
+                        self.details_scroll = self.details_scroll.saturating_add(8);
+                    }
+                    KeyCode::Home => self.details_scroll = 0,
+                    KeyCode::End => self.details_scroll = u16::MAX,
+                    KeyCode::Enter | KeyCode::Char('q') => return FileTaskUserAction::Acknowledge,
+                    _ => {}
+                }
+                return FileTaskUserAction::None;
+            }
             return match key.code {
+                KeyCode::Char('d') if self.has_details() => {
+                    self.open_details();
+                    FileTaskUserAction::None
+                }
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => FileTaskUserAction::Acknowledge,
                 _ => FileTaskUserAction::None,
             };
@@ -799,6 +864,11 @@ impl FileTaskProgressState {
             ProgressHitAction::SkipCurrent => FileTaskUserAction::SkipCurrent,
             ProgressHitAction::Abort => FileTaskUserAction::Abort,
             ProgressHitAction::Acknowledge => FileTaskUserAction::Acknowledge,
+            ProgressHitAction::ToggleDetails => {
+                self.details_open = !self.details_open;
+                self.details_scroll = 0;
+                FileTaskUserAction::None
+            }
             ProgressHitAction::Conflict(action) => self.choose_conflict_action(action),
             ProgressHitAction::ToggleApplyAll => {
                 if let Some(conflict) = self.conflict.as_mut() {
@@ -870,6 +940,8 @@ impl FileTaskProgressState {
         self.last_area = Some(area);
         let dialog_height = if self.conflict.is_some() {
             CONFLICT_DIALOG_HEIGHT
+        } else if self.details_open {
+            area.height.min(30).max(16)
         } else {
             PROGRESS_DIALOG_HEIGHT
         };
@@ -893,6 +965,8 @@ impl FileTaskProgressState {
         frame.render_widget(Clear, dialog_area);
         if self.conflict.is_some() {
             self.render_conflict(frame, dialog_area);
+        } else if self.details_open {
+            self.render_details_dialog(frame, dialog_area);
         } else {
             self.render_progress_dialog(frame, dialog_area);
         }
@@ -915,6 +989,98 @@ impl FileTaskProgressState {
         self.render_rule(frame, area, 9, '\u{251c}', '\u{2524}');
         self.render_action_row(frame, area, 10, self.progress_buttons());
         self.render_rule(frame, area, 11, '\u{2514}', '\u{2518}');
+    }
+
+    fn render_details_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(Paragraph::new("").style(self.theme.progress_dialog), area);
+        self.render_title_bar_with_title(frame, area, 0, "File task details");
+        let action_rule_row = area.height.saturating_sub(3);
+        let action_row = area.height.saturating_sub(2);
+        let bottom_row = area.height.saturating_sub(1);
+        let content = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(4),
+        );
+        let text = wrap_text_to_cells(&self.details_text(), content.width as usize).join("\n");
+        let max_scroll = text
+            .split('\n')
+            .count()
+            .saturating_sub(content.height as usize)
+            .min(u16::MAX as usize) as u16;
+        self.details_scroll = self.details_scroll.min(max_scroll);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(self.theme.progress_text)
+                .scroll((self.details_scroll, 0)),
+            content,
+        );
+        self.render_rule(frame, area, action_rule_row, '\u{251c}', '\u{2524}');
+        self.render_action_row(frame, area, action_row, self.detail_buttons());
+        self.render_rule(frame, area, bottom_row, '\u{2514}', '\u{2518}');
+    }
+
+    fn details_text(&self) -> String {
+        let mut sections = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut detail_index = 1usize;
+        if !self.status.is_empty() {
+            sections.push(format!("Status: {}", self.status));
+        }
+
+        if let Some(report) = self.completion_report.as_ref() {
+            for root in &report.roots {
+                let Some(message) = root.message.as_ref() else { continue; };
+                seen.insert((
+                    Some(root.source.clone()),
+                    Some(root.destination.clone()),
+                    message.clone(),
+                ));
+                let label = root
+                    .source
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| root.source.display().to_string());
+                sections.push(
+                    [
+                        format!("{}. {}", detail_index, label),
+                        format!("Source: {}", root.source.display()),
+                        format!("Destination: {}", root.destination.display()),
+                        format!("Result: {:?}", root.disposition),
+                        message.clone(),
+                    ]
+                    .join("\n"),
+                );
+                detail_index = detail_index.saturating_add(1);
+            }
+        }
+
+        for error in &self.error_records {
+            let key = (
+                error.source.clone(),
+                error.destination.clone(),
+                error.message.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut lines = vec![format!("{}. {}", detail_index, error.item_label)];
+            if let Some(source) = error.source.as_ref() {
+                lines.push(format!("Source: {}", source.display()));
+            }
+            if let Some(destination) = error.destination.as_ref() {
+                lines.push(format!("Destination: {}", destination.display()));
+            }
+            lines.push(error.message.clone());
+            sections.push(lines.join("\n"));
+            detail_index = detail_index.saturating_add(1);
+        }
+        if sections.is_empty() {
+            "No retained details for this task.".to_string()
+        } else {
+            sections.join("\n\n")
+        }
     }
 
     fn render_conflict(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1169,7 +1335,20 @@ impl FileTaskProgressState {
 
     fn progress_buttons(&self) -> Vec<(String, ProgressHitAction, Style)> {
         if self.is_terminal() {
-            return vec![(" OK ".to_string(), ProgressHitAction::Acknowledge, self.theme.progress_button)];
+            let mut buttons = Vec::new();
+            if self.has_details() {
+                buttons.push((
+                    " d Details ".to_string(),
+                    ProgressHitAction::ToggleDetails,
+                    self.theme.progress_button,
+                ));
+            }
+            buttons.push((
+                " OK ".to_string(),
+                ProgressHitAction::Acknowledge,
+                self.theme.progress_button,
+            ));
+            return buttons;
         }
         if matches!(&self.kind, FileTaskKind::Archive) {
             return vec![(
@@ -1187,6 +1366,21 @@ impl FileTaskProgressState {
             (pause_label.to_string(), ProgressHitAction::PauseResume, self.theme.progress_button),
             (" s Skip ".to_string(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
             (" Esc Abort ".to_string(), ProgressHitAction::Abort, self.theme.progress_destructive),
+        ]
+    }
+
+    fn detail_buttons(&self) -> Vec<(String, ProgressHitAction, Style)> {
+        vec![
+            (
+                " d Summary ".to_string(),
+                ProgressHitAction::ToggleDetails,
+                self.theme.progress_button,
+            ),
+            (
+                " OK ".to_string(),
+                ProgressHitAction::Acknowledge,
+                self.theme.progress_button,
+            ),
         ]
     }
 
@@ -1348,6 +1542,38 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
     let x2 = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
     let y2 = a.y.saturating_add(a.height).min(b.y.saturating_add(b.height));
     (x2 > x1 && y2 > y1).then(|| Rect::new(x1, y1, x2 - x1, y2 - y1))
+}
+
+fn wrap_text_to_cells(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+
+    for logical_line in text.split('\n') {
+        if logical_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut line = String::new();
+        let mut cells = 0usize;
+        for ch in logical_line.chars() {
+            let ch_cells = crate::display_width::char_width(ch);
+            if ch_cells > 0 && cells > 0 && cells.saturating_add(ch_cells) > width {
+                wrapped.push(std::mem::take(&mut line));
+                cells = 0;
+            }
+            line.push(ch);
+            cells = cells.saturating_add(ch_cells);
+        }
+        if !line.is_empty() {
+            wrapped.push(line);
+        }
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
 }
 
 fn fit_text(text: &str, max: usize) -> (String, bool) {
@@ -2262,4 +2488,96 @@ mod tests {
         assert!(rendered.contains("broken.flac"));
         assert!(rendered.contains("write failed"));
     }
+
+    #[test]
+    fn detail_wrapping_preserves_combining_marks_at_cell_boundaries() {
+        let wrapped = wrap_text_to_cells("abe\u{301}cd", 2);
+        assert_eq!(wrapped, vec!["ab", "e\u{301}c", "d"]);
+        assert!(wrapped
+            .iter()
+            .all(|line| !line.starts_with('\u{301}')));
+    }
+
+    #[test]
+    fn terminal_details_wrap_and_scroll_without_losing_long_diagnostics() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Move,
+            "Moving files",
+            FilePickerTheme::default(),
+        );
+        let mut error = FileTaskErrorRecord::new(
+            "album",
+            concat!(
+                "BEGIN-DIAGNOSTIC native rename committed but the retained source handle ",
+                "reported reduced filesystem identity semantics; the destination path was ",
+                "present and complete, the source path was absent, and the operation was ",
+                "therefore retained as completed-with-warning. Additional audit context is ",
+                "kept here rather than truncated in the status bar.\nEND-DIAGNOSTIC"
+            ),
+        );
+        error.source = Some(PathBuf::from("/source/album"));
+        error.destination = Some(PathBuf::from("/destination/album"));
+        state.record_error(error);
+        state.apply_update(FileTaskProgressUpdate::Failed {
+            status: "Move completed with a retained warning".to_string(),
+            totals: ProgressTotals::default(),
+        });
+        state.open_details();
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| state.render(frame, Rect::new(0, 0, 60, 20)))
+            .expect("draw details");
+        let first_page = format!("{:?}", terminal.backend().buffer());
+        assert!(first_page.contains("BEGIN-DIAGNOSTIC"));
+        assert!(first_page.contains("File task details"));
+
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            FileTaskUserAction::None,
+        );
+        terminal
+            .draw(|frame| state.render(frame, Rect::new(0, 0, 60, 20)))
+            .expect("draw scrolled details");
+        let last_page = format!("{:?}", terminal.backend().buffer());
+        assert!(last_page.contains("END-DIAGNOSTIC"));
+        assert!(state.details_text().contains("BEGIN-DIAGNOSTIC"));
+        assert!(state.details_text().contains("END-DIAGNOSTIC"));
+    }
+
+    #[test]
+    fn completion_report_is_retained_once_with_full_root_context() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Move,
+            "Moving files",
+            FilePickerTheme::default(),
+        );
+        state.max_error_records = 1;
+        state.apply_update(FileTaskProgressUpdate::Finished {
+            status: "Move completed with warnings".to_string(),
+            totals: ProgressTotals::default(),
+        });
+        let report = FileTaskCompletionReport {
+            is_move: true,
+            roots: (1..=3)
+                .map(|index| FileTaskRootResult {
+                    source: PathBuf::from(format!("/source/album-{index}")),
+                    destination: PathBuf::from(format!("/destination/album-{index}")),
+                    disposition: FileTaskRootDisposition::CompletedWithWarning,
+                    message: Some(format!("full retained warning text {index}")),
+                })
+                .collect(),
+        };
+
+        state.append_completion_report(&report);
+        state.append_completion_report(&report);
+
+        let details = state.details_text();
+        assert_eq!(details.matches("full retained warning text").count(), 3);
+        assert!(details.contains("Source: /source/album-1"));
+        assert!(details.contains("Destination: /destination/album-3"));
+        assert_eq!(details.matches("Result: CompletedWithWarning").count(), 3);
+    }
+
 }

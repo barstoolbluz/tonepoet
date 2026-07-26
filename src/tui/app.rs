@@ -695,35 +695,50 @@ pub(crate) const PROBE_IN_PROGRESS_NOTICE: &str = "Probing...";
 pub(crate) const ARCHIVE_PREVIEW_EXTRACTING_NOTICE: &str = "Extracting archive...";
 
 
-/// Archives enter the queue as containers and cannot be interrogated as audio
-/// at source-selection time. Keep `.iso` probeable because SACD/DVD/Blu-ray
-/// detection uses it as a real disc source.
+/// Return true when the authoritative source-admission policy routes `path`
+/// through archive extraction/preview rather than ordinary audio probing.
+///
+/// This wrapper exists for the probe scheduler; it deliberately owns no
+/// extension list so `:e`, Browse, recent-source, file-input, and queue paths
+/// cannot drift from archive-preview admission.
 pub(crate) fn is_nonprobeable_source_for_probe(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.to_ascii_lowercase())
-        .unwrap_or_default();
+    crate::convert::source_admission::is_archive_preview_source_path(path)
+}
 
-    if name.ends_with(".tar.gz")
-        || name.ends_with(".tar.bz2")
-        || name.ends_with(".tar.xz")
-        || name.ends_with(".tar.zst")
-        || name.ends_with(".tar.lz")
-        || name.ends_with(".tar.lzma")
-    {
-        return true;
+#[cfg(test)]
+mod direct_source_probe_policy_tests {
+    use super::is_nonprobeable_source_for_probe;
+    use std::path::Path;
+
+    #[test]
+    fn every_supported_archive_preview_source_bypasses_audio_probe() {
+        for name in [
+            "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.cab",
+            "album.dmg",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+        ] {
+            assert!(is_nonprobeable_source_for_probe(Path::new(name)), "{name}");
+        }
     }
 
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            matches!(
-                e.to_ascii_lowercase().as_str(),
-                "7z" | "zip" | "rar" | "tar" | "cab" | "dmg" | "tgz" | "tbz2" | "txz"
-            )
-        })
-        .unwrap_or(false)
+    #[test]
+    fn audio_cue_and_generic_iso_do_not_enter_archive_preview() {
+        for name in ["track.flac", "disc.cue", "disc.iso", "notes.txt"] {
+            assert!(!is_nonprobeable_source_for_probe(Path::new(name)), "{name}");
+        }
+    }
 }
 
 pub(crate) fn source_probe_initial_notice(path: &Path) -> Option<String> {
@@ -1034,18 +1049,160 @@ pub(crate) fn archive_preview_password_for_path(
     app: &mut AppState,
     path: &Path,
 ) -> Result<Option<String>, String> {
-    archive_password_for_path(app, path)
+    if let Some(password) = app.archive_passwords.get(path).cloned() {
+        return Ok(Some(password));
+    }
+    stored_archive_password(app)
+        .map_err(|error| format!("{error} for '{}'", path.display()))
+}
+
+/// Successful archive-preview dispatch. The generation/path pair is the exact
+/// ownership identity installed into `ConvertState` before the worker starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchivePreviewStarted {
+    pub generation: u64,
+    pub archive_path: PathBuf,
+}
+
+/// Preflight failures for archive-preview activation. Every variant is raised
+/// before the current Convert source, metadata, screen, generation, recents, or
+/// pending-preview ownership is changed.
+#[derive(Debug)]
+pub(crate) enum ArchivePreviewStartError {
+    UnsupportedPath(PathBuf),
+    WorkerChannelClosed,
+    RuntimeUnavailable(String),
+    GenerationExhausted,
+    PasswordResolution(String),
+    StagingAllocation {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for ArchivePreviewStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPath(path) => write!(
+                formatter,
+                "Archive-preview activation refused for unsupported path: {}",
+                path.display()
+            ),
+            Self::WorkerChannelClosed => formatter.write_str(
+                "Cannot open archive preview: the TUI worker channel is closed; the operation was not started",
+            ),
+            Self::RuntimeUnavailable(error) => write!(
+                formatter,
+                "Cannot open archive preview: no active asynchronous runtime is available ({error}); the operation was not started",
+            ),
+            Self::GenerationExhausted => formatter.write_str(
+                "Cannot open archive preview: source generation counter is exhausted; the operation was not started",
+            ),
+            Self::PasswordResolution(error) => write!(
+                formatter,
+                "Cannot open archive preview: {error}; the operation was not started"
+            ),
+            Self::StagingAllocation { path, source } => write!(
+                formatter,
+                "Cannot open archive preview: failed to allocate staging directory {}: {}; the operation was not started",
+                path.display(),
+                source
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ArchivePreviewStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StagingAllocation { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Removes a preflight-created staging directory unless ownership is
+/// transferred to the archive-preview worker.
+struct ArchivePreviewStagingGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ArchivePreviewStagingGuard {
+    fn create(path: PathBuf) -> Result<Self, ArchivePreviewStartError> {
+        std::fs::create_dir(&path).map_err(|source| {
+            ArchivePreviewStartError::StagingAllocation {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        Ok(Self { path, armed: true })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ArchivePreviewStagingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 pub(crate) fn install_archive_preview_convert_source(
     app: &mut AppState,
     path: PathBuf,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
-) {
-    app.cancel_browse_convert_expansion();
-    app.probe_generation = app.probe_generation.saturating_add(1);
-    let generation = app.probe_generation;
+) -> Result<ArchivePreviewStarted, ArchivePreviewStartError> {
+    install_archive_preview_convert_source_with_password_resolver(
+        app,
+        path,
+        tx,
+        archive_preview_password_for_path,
+    )
+}
 
+fn install_archive_preview_convert_source_with_password_resolver<F>(
+    app: &mut AppState,
+    path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    resolve_password: F,
+) -> Result<ArchivePreviewStarted, ArchivePreviewStartError>
+where
+    F: FnOnce(&mut AppState, &Path) -> Result<Option<String>, String>,
+{
+    // Complete every fallible prerequisite before touching the currently
+    // installed source. This makes activation failure-atomic even when secret
+    // storage, runtime ownership, channel ownership, or staging allocation is
+    // unavailable.
+    if !crate::convert::source_admission::is_archive_preview_source_path(&path) {
+        return Err(ArchivePreviewStartError::UnsupportedPath(path));
+    }
+    if tx.is_closed() {
+        return Err(ArchivePreviewStartError::WorkerChannelClosed);
+    }
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|error| ArchivePreviewStartError::RuntimeUnavailable(error.to_string()))?;
+    let generation = app
+        .probe_generation
+        .checked_add(1)
+        .ok_or(ArchivePreviewStartError::GenerationExhausted)?;
+    let password = resolve_password(app, &path)
+        .map_err(ArchivePreviewStartError::PasswordResolution)?;
+    let pending = create_pending_archive_preview(generation, path.clone());
+    let staging_dir = pending.staging_dir.clone();
+    let mut staging_guard = ArchivePreviewStagingGuard::create(staging_dir.clone())?;
+    let cancel = pending.cancel.clone();
+    let tool_paths = app.manager.config.tool_paths.clone();
+
+    // Commit section: all operations below are in-memory/infallible. The
+    // receiver cannot observe a worker result until the pending owner and
+    // generation have been installed.
+    app.cancel_browse_convert_expansion();
+    app.probe_generation = generation;
     clear_source_metadata_in_convert(&mut app.convert);
     app.convert.set_source_mode(SourceMode::from_single_pending_probe(
         path.clone(),
@@ -1054,23 +1211,10 @@ pub(crate) fn install_archive_preview_convert_source(
     app.convert.apply_source_defaults();
     let baseline = ConvertProbeBaseline::capture(&app.convert);
     app.current_screen = AppScreen::Convert;
-    app.recent.record_use_with_db(&path, &app.db);
-
-    let pending = create_pending_archive_preview(generation, path.clone());
-    let staging_dir = pending.staging_dir.clone();
-    let cancel = pending.cancel.clone();
     app.convert.install_pending_archive_preview(pending);
 
-    let password = match archive_preview_password_for_path(app, &path) {
-        Ok(password) => password,
-        Err(error) => {
-            app.convert.clear_pending_archive_preview();
-            app.set_status(error);
-            return;
-        }
-    };
-    let tool_paths = app.manager.config.tool_paths.clone();
-    spawn_archive_preview(
+    let _ = spawn_archive_preview(
+        &runtime,
         generation,
         path.clone(),
         baseline,
@@ -1080,13 +1224,24 @@ pub(crate) fn install_archive_preview_convert_source(
         tool_paths,
         tx,
     );
+    staging_guard.disarm();
+
+    // Recent-history persistence is deliberately post-dispatch: a source is
+    // never recorded when preflight says that no operation started.
+    app.recent.record_use_with_db(&path, &app.db);
     app.set_status(format!(
         "Extracting archive: {}",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
+
+    Ok(ArchivePreviewStarted {
+        generation,
+        archive_path: path,
+    })
 }
 
 pub(crate) fn spawn_archive_preview(
+    runtime: &tokio::runtime::Handle,
     generation: u64,
     archive_path: PathBuf,
     baseline: ConvertProbeBaseline,
@@ -1095,8 +1250,8 @@ pub(crate) fn spawn_archive_preview(
     archive_password: Option<String>,
     tool_paths: std::collections::HashMap<String, PathBuf>,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
-) {
-    tokio::spawn(async move {
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move {
         let result_path = archive_path.clone();
         let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
         let item_id = format!("archive-preview-{}", generation);
@@ -1198,7 +1353,7 @@ pub(crate) fn spawn_archive_preview(
                 baseline,
             })
             .await;
-    });
+    })
 }
 
 /// Spawn a Convert-owned cursor probe for a batch preview path. Generic browse
@@ -5257,7 +5412,15 @@ impl ConvertState {
         self.clear_pending_archive_preview();
         self.source.mode.cleanup_archive_preview_staging();
         let retained_paths = mode.all_paths();
+        self.source.cue_artifact_audio.retain(|path| {
+            crate::convert::queue_expansion::path_list_contains_queue_identity(
+                &retained_paths,
+                path,
+            )
+        });
         self.source.cleanup_synthetic_cue_artifacts_not_in(&retained_paths);
+        self.source.batch_probe_pending = None;
+        self.source.batch_probe_debounce = None;
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
         self.refresh_source_constraints_preserving_format_selection();
@@ -5921,10 +6084,23 @@ pub enum FileTaskControl {
     },
 }
 
+/// Ownership role for a file-task progress surface.
+///
+/// A retained-results viewer is presentation-only. It deliberately carries the
+/// original task session id for correlation, but it never participates in task
+/// ordering, sends worker controls, or writes its clone back into authoritative
+/// retained state when dismissed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTaskProgressSessionRole {
+    LiveTask,
+    RetainedViewer,
+}
+
 /// Host wrapper around the reusable crate-owned progress overlay.
 #[derive(Debug, Clone)]
 pub struct FileTaskProgressSession {
     pub session_id: u64,
+    pub role: FileTaskProgressSessionRole,
     pub progress: tui_file_picker::FileTaskProgressState,
     pub controls: mpsc::Sender<FileTaskControl>,
 }
@@ -5936,9 +6112,34 @@ impl FileTaskProgressSession {
     ) -> Self {
         Self {
             session_id: next_file_task_session_id(),
+            role: FileTaskProgressSessionRole::LiveTask,
             progress,
             controls,
         }
+    }
+
+    pub fn retained_viewer(
+        session_id: u64,
+        progress: tui_file_picker::FileTaskProgressState,
+    ) -> Self {
+        let (controls, receiver) = mpsc::channel();
+        drop(receiver);
+        Self {
+            session_id,
+            role: FileTaskProgressSessionRole::RetainedViewer,
+            progress,
+            controls,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_live_task(&self) -> bool {
+        matches!(self.role, FileTaskProgressSessionRole::LiveTask)
+    }
+
+    #[must_use]
+    pub const fn is_retained_viewer(&self) -> bool {
+        matches!(self.role, FileTaskProgressSessionRole::RetainedViewer)
     }
 
     pub fn set_theme(&mut self, theme: tui_file_picker::FilePickerTheme) {
@@ -10209,6 +10410,19 @@ pub struct AppState {
     // Overlays
     pub active_overlay: ActiveOverlay,
 
+    /// Most recent terminal file-task state, retained after its live overlay is
+    /// dismissed so full warnings/failures remain inspectable via `:messages`.
+    pub last_file_task_progress: Option<(u64, tui_file_picker::FileTaskProgressState)>,
+
+    /// Test-only capture seam for proving that Browse activation selected the
+    /// semantic View flow without launching an external pager.
+    #[cfg(test)]
+    pub test_view_file_dispatches: Option<Vec<std::path::PathBuf>>,
+
+    /// Show routine capability-degradation notices for file operations. Quiet
+    /// is the safe default; failures and data-affecting warnings are unaffected.
+    pub file_task_verbose_degrade_notices: bool,
+
     /// One-shot bypass consumed when replaying a bulk operation after the
     /// user accepted its confirmation dialog.
     pub bulk_guard_bypass: Option<BulkOperationKind>,
@@ -11084,6 +11298,10 @@ impl AppState {
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
             active_overlay,
+            last_file_task_progress: None,
+            #[cfg(test)]
+            test_view_file_dispatches: None,
+            file_task_verbose_degrade_notices: false,
             bulk_guard_bypass: None,
             bulk_guard_frozen_paths: None,
             browse_context_action_paths: None,
@@ -11487,11 +11705,26 @@ impl AppState {
             _ => {}
         }
 
+        if let Some((_, progress)) = self.last_file_task_progress.as_mut() {
+            progress.set_theme(picker_theme.clone());
+        }
+
         if let Some(state) = self.pending_metadata_editor.as_mut() {
             if let Some(file_picker) = state.file_picker.as_mut() {
                 file_picker.set_theme(picker_theme);
             }
         }
+    }
+
+    /// Install a live file-task overlay and seed its session-owned retained
+    /// state before any worker update can race with presentation changes.
+    ///
+    /// `last_file_task_progress` therefore tracks the newest task from launch,
+    /// not only after a terminal overlay happens to remain open.
+    pub fn install_file_task_progress(&mut self, session: FileTaskProgressSession) {
+        debug_assert!(session.is_live_task());
+        self.last_file_task_progress = Some((session.session_id, session.progress.clone()));
+        self.active_overlay = ActiveOverlay::FileTaskProgress(session);
     }
 
     pub fn cycle_ui_theme(&mut self, forward: bool) {
@@ -11820,65 +12053,176 @@ impl AppState {
         }
     }
 
-    /// Phase 6f: seed the Convert screen from CLI `tonepoet tui <paths>`
-    /// invocation. Probes the first file, builds `SourceMode::Single` or
-    /// `SourceMode::Batch` from the paths, populates the editable metadata
-    /// pane from the first file's tags, and lands on the Convert screen
-    /// instead of the configured default screen. Routes through Convert
-    /// for review — no back door to the queue.
+    /// Seed the Convert screen from CLI `tonepoet tui <paths>` arguments.
     ///
-    /// Invalid paths (missing, directories, unreadable) are logged via
-    /// `log::warn` and skipped. If all paths are invalid the method is
-    /// a no-op beyond setting a status message.
+    /// Every concrete path is classified by the authoritative direct-source
+    /// admission policy before any source or screen state changes. Ordinary
+    /// audio files may form a batch. Archive previews, CUE sheets, and disc
+    /// images are singleton workflows and are therefore rejected atomically
+    /// when mixed with any other supported path. Unsupported, missing, and
+    /// directory paths are logged and skipped; if none remain, this method does
+    /// not mutate the current source or screen.
     pub fn seed_from_cli_paths(&mut self, paths: Vec<PathBuf>) {
-        let original_count = paths.len();
-        let valid: Vec<PathBuf> = paths
-            .into_iter()
-            .filter(|p| {
-                if !p.exists() {
-                    log::warn!("cli: path does not exist: {}", p.display());
-                    return false;
-                }
-                if p.is_dir() {
-                    log::warn!(
-                        "cli: directories not supported in TUI mode — use `tonepoet convert <dir>` or navigate via `:cd` on the Browse screen: {}",
-                        p.display()
-                    );
-                    return false;
-                }
-                true
-            })
-            .collect();
+        self.seed_from_cli_paths_with_archive_starter(
+            paths,
+            install_archive_preview_convert_source,
+        );
+    }
 
-        let valid_count = valid.len();
-        if valid.is_empty() {
+    fn seed_from_cli_paths_with_archive_starter<F>(
+        &mut self,
+        paths: Vec<PathBuf>,
+        start_archive: F,
+    ) where
+        F: FnOnce(
+            &mut AppState,
+            PathBuf,
+            tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+        ) -> Result<ArchivePreviewStarted, ArchivePreviewStartError>,
+    {
+        use crate::convert::source_admission::{direct_source_kind, DirectSourceKind};
+
+        let original_count = paths.len();
+        let mut admitted: Vec<(PathBuf, DirectSourceKind)> = Vec::new();
+
+        for path in paths {
+            if !path.exists() {
+                log::warn!("cli: path does not exist: {}", path.display());
+                continue;
+            }
+            if path.is_dir() {
+                log::warn!(
+                    "cli: directories not supported in TUI mode — use `tonepoet convert <dir>` or navigate via `:cd` on the Browse screen: {}",
+                    path.display()
+                );
+                continue;
+            }
+            if !path.is_file() {
+                log::warn!(
+                    "cli: non-regular source path skipped: {}",
+                    path.display()
+                );
+                continue;
+            }
+
+            match direct_source_kind(&path) {
+                Some(kind) => admitted.push((path, kind)),
+                None => log::warn!(
+                    "cli: unsupported conversion source skipped: {}",
+                    path.display()
+                ),
+            }
+        }
+
+        let skipped = original_count.saturating_sub(admitted.len());
+        if admitted.is_empty() {
             if original_count > 0 {
                 self.set_status(format!(
-                    "cli: {} invalid path(s) skipped; see log",
+                    "cli: {} unsupported or invalid path(s) skipped; no source loaded; see log",
                     original_count
                 ));
             }
             return;
         }
 
+        // Archives, CUE sheets, and disc images each expand into a specialized
+        // source model. Combining one with another path would either discard
+        // its track/container semantics or silently ignore a valid argument.
+        // Refuse the entire supported set before any state mutation instead.
+        if admitted.len() > 1
+            && admitted
+                .iter()
+                .any(|(_, kind)| *kind != DirectSourceKind::Audio)
+        {
+            let supported_count = admitted.len();
+            log::warn!(
+                "cli: incompatible supported source mix refused atomically: {:?}",
+                admitted
+                    .iter()
+                    .map(|(path, kind)| (path.display().to_string(), *kind))
+                    .collect::<Vec<_>>()
+            );
+            self.set_status(format!(
+                "cli: archives, CUE sheets, and disc images must be opened one at a time; no source loaded ({} supported, {} skipped)",
+                supported_count, skipped
+            ));
+            return;
+        }
+
+        if admitted.len() == 1 && admitted[0].1 == DirectSourceKind::ArchivePreview {
+            let (archive_path, _) = admitted
+                .pop()
+                .expect("one admitted CLI path must contain one element");
+            let Some(tx) = self.tui_tx.clone() else {
+                self.set_status(
+                    "cli: cannot open archive preview because the TUI worker channel is unavailable",
+                );
+                return;
+            };
+
+            let archive_name = archive_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            match start_archive(self, archive_path, tx) {
+                Ok(started) => {
+                    debug_assert_eq!(self.probe_generation, started.generation);
+                    debug_assert_eq!(
+                        started.archive_path.file_name().and_then(|name| name.to_str()),
+                        Some(archive_name.as_str())
+                    );
+                    if skipped > 0 {
+                        self.set_status(format!(
+                            "Extracting archive: {} ({} skipped, see log)",
+                            archive_name, skipped
+                        ));
+                    }
+                }
+                Err(error) => {
+                    log::warn!("cli: archive preview was not started: {error}");
+                    // Preserve the exact preflight failure. In particular, do
+                    // not replace secret-store errors with a false extraction
+                    // status merely because other CLI arguments were skipped.
+                    self.set_status(error.to_string());
+                }
+            }
+            return;
+        }
+
+        let mut valid: Vec<PathBuf> = admitted.into_iter().map(|(path, _)| path).collect();
+        if valid.len() > 1 {
+            // `SourceMode::from_paths` sorts batch paths. Sort before probing so
+            // the first path's info/metadata is attached to the same cursor-0
+            // path that the resulting batch exposes.
+            valid.sort();
+        }
+        let valid_count = valid.len();
         let first = valid[0].clone();
         let (info, metadata, probe_notice) = if is_cue_sheet_path_for_preview(&first) {
             match probe_cue_proxy_source(&first) {
                 Ok(result) => (result.info, result.metadata, result.probe_notice),
-                Err(e) => {
-                    log::warn!("cli: CUE proxy probe failed for {}: {}", first.display(), e);
+                Err(error) => {
+                    log::warn!(
+                        "cli: CUE proxy probe failed for {}: {}",
+                        first.display(),
+                        error
+                    );
                     (
                         None,
                         crate::tui::probe::SourceMetadata::default(),
-                        Some(format!("CUE proxy probe failed: {}; set format manually", e)),
+                        Some(format!(
+                            "CUE proxy probe failed: {}; set format manually",
+                            error
+                        )),
                     )
                 }
             }
         } else {
             let info = match crate::tui::probe::probe_audio(&first) {
-                Ok(i) => Some(i),
-                Err(e) => {
-                    log::warn!("cli: probe failed for {}: {}", first.display(), e);
+                Ok(info) => Some(info),
+                Err(error) => {
+                    log::warn!("cli: probe failed for {}: {}", first.display(), error);
                     None
                 }
             };
@@ -11893,22 +12237,30 @@ impl AppState {
         self.convert.metadata.genre = metadata.genre.clone();
         self.convert.metadata.year = metadata.year.clone();
 
-        // Build the mode (Single for 1 file, Batch for N) and populate
-        // first-file probe/metadata in the appropriate variant.
-        let mut mode = if valid.len() == 1 {
-            SourceMode::from_single_with_probe_notice(first.clone(), None, SourceMetadata::default(), probe_notice.clone())
+        // Build the mode (Single for one direct source, Batch for an all-audio
+        // set) and populate first-file probe/metadata in the correct variant.
+        let mut mode = if valid_count == 1 {
+            SourceMode::from_single_with_probe_notice(
+                first.clone(),
+                None,
+                SourceMetadata::default(),
+                probe_notice.clone(),
+            )
         } else {
+            debug_assert!(valid.iter().all(|path| {
+                direct_source_kind(path) == Some(DirectSourceKind::Audio)
+            }));
             SourceMode::from_paths(valid)
         };
         match &mut mode {
             SourceMode::Single {
                 info: slot,
-                metadata: meta_slot,
+                metadata: metadata_slot,
                 probe_notice: single_probe_notice,
                 ..
             } => {
                 *slot = info;
-                *meta_slot = metadata;
+                *metadata_slot = metadata;
                 *single_probe_notice = probe_notice.clone();
             }
             SourceMode::Batch {
@@ -11925,14 +12277,14 @@ impl AppState {
             }
             SourceMode::MultiTrack {
                 info: slot,
-                metadata: meta_slot,
+                metadata: metadata_slot,
                 ..
             } => {
                 *slot = info;
-                *meta_slot = metadata;
+                *metadata_slot = metadata;
             }
             SourceMode::Empty => {
-                // Unreachable — valid.is_empty() check guards against 0 paths.
+                unreachable!("non-empty admitted CLI paths cannot produce an empty source")
             }
         }
         self.convert.set_source_mode(mode);
@@ -11944,16 +12296,11 @@ impl AppState {
         // Record the first file in the recent-files history.
         self.recent.record_use_with_db(&first, &self.db);
 
-        // Override the configured default screen — CLI file args always
-        // land on Convert. Esc is a no-op (previous_screen stays None)
-        // since this is a "permanent load" intent, not a cancelable
-        // review. Consistent with `:e`, Browse Enter, and recent-files
-        // load paths.
+        // CLI file arguments intentionally land on Convert for review. This is
+        // a permanent load intent, matching :e, Browse activation, and recent
+        // sources rather than a cancelable return-to-previous-screen flow.
         self.current_screen = AppScreen::Convert;
 
-        // Surface how many paths were filtered out so the user knows
-        // something was skipped without having to tail the log file.
-        let skipped = original_count.saturating_sub(valid_count);
         let skipped_suffix = if skipped > 0 {
             format!(" ({} skipped, see log)", skipped)
         } else {
@@ -11975,6 +12322,426 @@ impl AppState {
             )
         };
         self.set_status(status);
+    }
+}
+
+#[cfg(test)]
+mod cli_seed_admission_tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        std::fs::write(path, contents).expect("write CLI seed fixture");
+    }
+
+    fn install_existing_source(app: &mut AppState, path: PathBuf) {
+        app.convert.set_source_mode(SourceMode::Single {
+            path,
+            info: None,
+            metadata: SourceMetadata::default(),
+            probe_notice: None,
+        });
+    }
+
+    fn write_sacd_iso_fixture(path: &Path) {
+        const SECTOR_SIZE: u64 = 2_048;
+        const MASTER_TOC_LSN: u64 = 510;
+        const MASTER_TOC_MAGIC: &[u8; 8] = b"SACDMTOC";
+        let mut file = std::fs::File::create(path).expect("create SACD ISO fixture");
+        file.set_len((MASTER_TOC_LSN + 1) * SECTOR_SIZE)
+            .expect("size SACD ISO fixture");
+        file.seek(SeekFrom::Start(MASTER_TOC_LSN * SECTOR_SIZE))
+            .expect("seek SACD ISO fixture");
+        file.write_all(MASTER_TOC_MAGIC)
+            .expect("write SACD ISO magic");
+    }
+
+    #[test]
+    fn unsupported_cli_paths_preserve_existing_source_and_screen() {
+        for name in ["cover.jpg", "notes.txt", "unknown.bin", "generic.iso"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let rejected = temp.path().join(name);
+            write_file(&rejected, b"not a supported source");
+            let existing = temp.path().join("existing.flac");
+            write_file(&existing, b"existing source");
+
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Queue;
+            install_existing_source(&mut app, existing.clone());
+
+            app.seed_from_cli_paths(vec![rejected]);
+
+            assert_eq!(app.current_screen, AppScreen::Queue, "{name}");
+            assert_eq!(
+                app.convert.source.mode.current_path(),
+                Some(&existing),
+                "{name}"
+            );
+            let status = app
+                .status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str())
+                .unwrap_or("");
+            assert!(status.contains("no source loaded"), "{name}: {status}");
+        }
+    }
+
+    #[test]
+    fn every_supported_archive_cli_seed_requires_the_archive_preview_channel() {
+        for name in [
+            "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.cab",
+            "album.dmg",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let archive = temp.path().join(name);
+            write_file(&archive, b"archive fixture");
+            let existing = temp.path().join("existing.flac");
+            write_file(&existing, b"existing source");
+
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Queue;
+            install_existing_source(&mut app, existing.clone());
+
+            app.seed_from_cli_paths(vec![archive]);
+
+            assert_eq!(app.current_screen, AppScreen::Queue, "{name}");
+            assert_eq!(
+                app.convert.source.mode.current_path(),
+                Some(&existing),
+                "{name}"
+            );
+            assert!(app.convert.pending_archive_preview.is_none(), "{name}");
+            let status = app
+                .status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str())
+                .unwrap_or("");
+            assert!(
+                status.contains("worker channel is unavailable"),
+                "{name}: {status}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn single_archive_cli_seed_enters_archive_preview_workflow() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let rejected = temp.path().join("cover.jpg");
+        write_file(&archive, b"archive fixture");
+        write_file(&rejected, b"image fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        app.tui_tx = Some(tx);
+
+        app.seed_from_cli_paths(vec![rejected, archive.clone()]);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.current_path(), Some(&archive));
+        assert!(
+            app.convert
+                .pending_archive_preview_matches(app.probe_generation, &archive),
+            "CLI archive must use the asynchronous archive-preview owner"
+        );
+        assert_eq!(
+            app.convert.source.mode.persistent_probe_notice(),
+            Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE)
+        );
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("1 skipped"), "{status}");
+        app.convert.clear_pending_archive_preview();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cli_archive_password_failure_is_failure_atomic_and_preserves_the_real_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let rejected = temp.path().join("cover.jpg");
+        let existing = temp.path().join("existing.flac");
+        write_file(&archive, b"archive fixture");
+        write_file(&rejected, b"image fixture");
+        write_file(&existing, b"existing source");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Queue;
+        app.previous_screen = Some(AppScreen::Browse);
+        app.probe_generation = 41;
+        install_existing_source(&mut app, existing.clone());
+        app.convert.metadata.title = Some("Existing title".to_string());
+        app.convert.metadata.artist = Some("Existing artist".to_string());
+        app.convert.metadata.album = Some("Existing album".to_string());
+        app.convert.metadata.album_artist_for_conversion =
+            Some("Existing album artist".to_string());
+        app.convert.metadata.genre = Some("Existing genre".to_string());
+        app.convert.metadata.year = Some("1973".to_string());
+        app.recent.record_use_with_db(&existing, &app.db);
+
+        let source_before = format!("{:?}", app.convert.source.mode);
+        let metadata_before = (
+            app.convert.metadata.title.clone(),
+            app.convert.metadata.artist.clone(),
+            app.convert.metadata.album.clone(),
+            app.convert.metadata.album_artist_for_conversion.clone(),
+            app.convert.metadata.genre.clone(),
+            app.convert.metadata.year.clone(),
+        );
+        let format_before = ConvertProbeFormatSnapshot::capture(&app.convert.format);
+        let recent_before = app
+            .recent
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        let generation_before = app.probe_generation;
+        let screen_before = app.current_screen;
+        let previous_screen_before = app.previous_screen;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        app.tui_tx = Some(tx);
+        app.seed_from_cli_paths_with_archive_starter(
+            vec![rejected, archive.clone()],
+            |app, path, tx| {
+                install_archive_preview_convert_source_with_password_resolver(
+                    app,
+                    path,
+                    tx,
+                    |_app, path| {
+                        Err(format!(
+                            "injected secret-store failure for '{}'",
+                            path.display()
+                        ))
+                    },
+                )
+            },
+        );
+
+        assert_eq!(app.current_screen, screen_before);
+        assert_eq!(app.previous_screen, previous_screen_before);
+        assert_eq!(app.convert.source.mode.current_path(), Some(&existing));
+        assert_eq!(format!("{:?}", app.convert.source.mode), source_before);
+        assert_eq!(
+            (
+                app.convert.metadata.title.clone(),
+                app.convert.metadata.artist.clone(),
+                app.convert.metadata.album.clone(),
+                app.convert.metadata.album_artist_for_conversion.clone(),
+                app.convert.metadata.genre.clone(),
+                app.convert.metadata.year.clone(),
+            ),
+            metadata_before
+        );
+        assert_eq!(
+            ConvertProbeFormatSnapshot::capture(&app.convert.format),
+            format_before
+        );
+        assert_eq!(app.probe_generation, generation_before);
+        assert!(app.convert.pending_archive_preview.is_none());
+        assert_eq!(
+            app.recent
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            recent_before
+        );
+        assert!(rx.try_recv().is_err(), "no preview worker message may be emitted");
+
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("injected secret-store failure"), "{status}");
+        assert!(status.contains("operation was not started"), "{status}");
+        assert!(!status.contains("Extracting archive"), "{status}");
+        assert!(!status.contains("skipped"), "{status}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_archive_worker_channel_is_failure_atomic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let existing = temp.path().join("existing.flac");
+        write_file(&archive, b"archive fixture");
+        write_file(&existing, b"existing source");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Queue;
+        app.previous_screen = Some(AppScreen::Browse);
+        app.probe_generation = 73;
+        install_existing_source(&mut app, existing.clone());
+        app.convert.metadata.title = Some("Existing title".to_string());
+        app.recent.record_use_with_db(&existing, &app.db);
+
+        let source_before = format!("{:?}", app.convert.source.mode);
+        let metadata_before = (
+            app.convert.metadata.title.clone(),
+            app.convert.metadata.artist.clone(),
+            app.convert.metadata.album.clone(),
+            app.convert.metadata.album_artist_for_conversion.clone(),
+            app.convert.metadata.genre.clone(),
+            app.convert.metadata.year.clone(),
+        );
+        let recent_before = app
+            .recent
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        let generation_before = app.probe_generation;
+        let screen_before = app.current_screen;
+        let previous_screen_before = app.previous_screen;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let error = install_archive_preview_convert_source(&mut app, archive, tx)
+            .expect_err("closed worker channel must reject archive activation");
+
+        assert!(matches!(error, ArchivePreviewStartError::WorkerChannelClosed));
+        assert_eq!(app.current_screen, screen_before);
+        assert_eq!(app.previous_screen, previous_screen_before);
+        assert_eq!(app.convert.source.mode.current_path(), Some(&existing));
+        assert_eq!(format!("{:?}", app.convert.source.mode), source_before);
+        assert_eq!(
+            (
+                app.convert.metadata.title.clone(),
+                app.convert.metadata.artist.clone(),
+                app.convert.metadata.album.clone(),
+                app.convert.metadata.album_artist_for_conversion.clone(),
+                app.convert.metadata.genre.clone(),
+                app.convert.metadata.year.clone(),
+            ),
+            metadata_before
+        );
+        assert_eq!(app.probe_generation, generation_before);
+        assert!(app.convert.pending_archive_preview.is_none());
+        assert_eq!(
+            app.recent
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            recent_before
+        );
+    }
+
+    #[test]
+    fn rejected_paths_may_be_skipped_around_one_audio_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("track.flac");
+        let image = temp.path().join("cover.jpg");
+        write_file(&audio, b"audio fixture");
+        write_file(&image, b"image fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.seed_from_cli_paths(vec![image, audio.clone()]);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.current_path(), Some(&audio));
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("1 skipped"), "{status}");
+    }
+
+    #[test]
+    fn multiple_audio_cli_paths_form_an_audio_only_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("z-last.flac");
+        let second = temp.path().join("a-first.wav");
+        write_file(&first, b"first audio fixture");
+        write_file(&second, b"second audio fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.seed_from_cli_paths(vec![first.clone(), second.clone()]);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        match &app.convert.source.mode {
+            SourceMode::Batch { paths, .. } => {
+                assert_eq!(paths, &vec![second, first]);
+            }
+            other => panic!("expected CLI audio batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn specialized_cli_sources_are_singleton_and_mixed_sets_are_atomic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("track.flac");
+        let archive = temp.path().join("album.zip");
+        let cue = temp.path().join("album.cue");
+        let disc = temp.path().join("album.iso");
+        let existing = temp.path().join("existing.flac");
+        write_file(&audio, b"audio fixture");
+        write_file(&archive, b"archive fixture");
+        write_file(
+            &cue,
+            b"FILE \"track.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        );
+        write_sacd_iso_fixture(&disc);
+        write_file(&existing, b"existing source");
+
+        for paths in [
+            vec![archive.clone(), audio.clone()],
+            vec![cue.clone(), audio.clone()],
+            vec![disc.clone(), audio.clone()],
+            vec![archive.clone(), cue.clone()],
+        ] {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Queue;
+            install_existing_source(&mut app, existing.clone());
+
+            app.seed_from_cli_paths(paths);
+
+            assert_eq!(app.current_screen, AppScreen::Queue);
+            assert_eq!(app.convert.source.mode.current_path(), Some(&existing));
+            assert!(app.convert.pending_archive_preview.is_none());
+            let status = app
+                .status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str())
+                .unwrap_or("");
+            assert!(status.contains("must be opened one at a time"), "{status}");
+        }
+    }
+
+    #[test]
+    fn single_supported_disc_image_is_not_rejected_by_cli_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let disc = temp.path().join("album.iso");
+        write_sacd_iso_fixture(&disc);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.seed_from_cli_paths(vec![disc.clone()]);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.current_path(), Some(&disc));
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(!status.contains("unsupported"), "{status}");
     }
 }
 

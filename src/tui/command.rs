@@ -718,7 +718,7 @@ pub(crate) fn handle_browse_convert_expansion_complete(
 
     match request.target {
         BrowseConvertExpansionTarget::ConvertSource => {
-            install_browse_convert_source_paths(
+            let _ = install_browse_convert_source_paths(
                 app,
                 tx,
                 expansion.queue,
@@ -2615,6 +2615,9 @@ pub const COMMAND_NAMES: &[&str] = &[
     "sortdir",
     "filter",
     "refresh",
+    "messages",
+    "task-messages",
+    "file-notices",
     "new-file",
     "new-folder",
     "rename",
@@ -2879,6 +2882,10 @@ pub enum Command {
     Filter(Option<String>),
     /// Refresh the current browse directory from the filesystem.
     Refresh,
+    /// Reopen the full retained warning/failure text for the most recent file task.
+    FileTaskMessages,
+    /// Query or set routine file-operation capability-notice verbosity.
+    FileTaskNotices(Option<String>),
     /// Create a file in the current browse directory. Empty opens an inline prompt.
     NewFile(Option<String>),
     /// Create a folder in the current browse directory. Empty opens an inline prompt.
@@ -3229,6 +3236,8 @@ impl std::fmt::Debug for Command {
             Command::CtdbRepair => f.write_str("CtdbRepair"),
             Command::ViewFile(path) => f.debug_tuple("ViewFile").field(path).finish(),
             Command::EditFile(path) => f.debug_tuple("EditFile").field(path).finish(),
+            Command::FileTaskMessages => f.write_str("FileTaskMessages"),
+            Command::FileTaskNotices(value) => f.debug_tuple("FileTaskNotices").field(value).finish(),
             Command::Unknown(arg) => f.debug_tuple("Unknown").field(arg).finish(),
         }
     }
@@ -3400,6 +3409,10 @@ pub fn parse_command(input: &str) -> Command {
             Command::Filter(arg)
         }
         "refresh" => Command::Refresh,
+        "messages" | "task-messages" => Command::FileTaskMessages,
+        "file-notices" => Command::FileTaskNotices(
+            (!args.is_empty()).then(|| args.to_string()),
+        ),
         "new-file" => Command::NewFile((!args.is_empty()).then(|| args.to_string())),
         "new-folder" => Command::NewFolder((!args.is_empty()).then(|| args.to_string())),
         "del" | "delete" => Command::Delete,
@@ -3731,6 +3744,10 @@ fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
 pub(super) const CONVERSION_ACTIONS_GATED_STATUS: &str =
     "conversion actions are gated off — set show_conversion_actions = true under [ui] in config.toml";
 
+fn edit_source_path_is_admitted(path: &std::path::Path) -> bool {
+    path.is_dir() || crate::convert::source_admission::is_direct_queue_source_path(path)
+}
+
 pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMessage>) {
     match cmd {
         Command::Quit => {
@@ -3923,12 +3940,23 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status(format!("Path not found: {}", expanded));
                 return;
             }
+            if !edit_source_path_is_admitted(&p) {
+                app.set_status(format!(
+                    "Source activation refused for unsupported path: {}",
+                    p.display()
+                ));
+                return;
+            }
             // Install the source immediately and complete heavyweight source
             // discovery on a background worker. Archives use the Phase 3
             // extract+discover+probe preview path; ordinary audio/disc sources
             // use the existing async probe path.
             if is_nonprobeable_source_for_probe(&p) {
-                install_archive_preview_convert_source(app, p, tx.clone());
+                if let Err(error) =
+                    install_archive_preview_convert_source(app, p, tx.clone())
+                {
+                    app.set_status(error.to_string());
+                }
                 return;
             }
 
@@ -4143,6 +4171,43 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
         }
         Command::Filter(arg) => {
             execute_filter(app, arg.as_deref(), tx);
+        }
+        Command::FileTaskMessages => {
+            let Some((session_id, mut progress)) = app.last_file_task_progress.clone() else {
+                app.set_status("No completed file-task details are available");
+                return;
+            };
+            if !progress.is_terminal() {
+                app.set_status("The most recent file task is still running; its live progress overlay owns the details");
+                return;
+            }
+            progress.set_theme(super::keybindings::file_picker_theme_from_theme(&app.theme));
+            progress.open_details();
+            app.active_overlay = ActiveOverlay::FileTaskProgress(
+                FileTaskProgressSession::retained_viewer(session_id, progress),
+            );
+            app.set_status("Showing full details for the most recent file task");
+        }
+        Command::FileTaskNotices(value) => {
+            match value.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
+                None => {
+                    let mode = if app.file_task_verbose_degrade_notices {
+                        "verbose"
+                    } else {
+                        "quiet"
+                    };
+                    app.set_status(format!("file-operation capability notices: {mode}"));
+                }
+                Some(value) if value == "quiet" || value == "off" => {
+                    app.file_task_verbose_degrade_notices = false;
+                    app.set_status("file-operation capability notices: quiet");
+                }
+                Some(value) if value == "verbose" || value == "on" => {
+                    app.file_task_verbose_degrade_notices = true;
+                    app.set_status("file-operation capability notices: verbose");
+                }
+                Some(_) => app.set_status("usage: :file-notices [quiet|verbose]"),
+            }
         }
         Command::Refresh => {
             if app.current_screen == AppScreen::Browse {
@@ -7506,6 +7571,19 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
     };
     for path in paths {
         let is_synthetic_cue_artifact = synthetic_cue_artifacts.contains(&path);
+        if !crate::convert::source_admission::is_direct_queue_source_path(&path) {
+            if is_synthetic_cue_artifact {
+                crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(&path);
+            }
+            errors = errors.saturating_add(1);
+            let message = format!(
+                "queue admission refused unsupported expanded source: {}",
+                path.display()
+            );
+            first_error.get_or_insert_with(|| message.clone());
+            log::error!("{message}");
+            continue;
+        }
         let archive_password = if crate::is_encrypted_archive_ext(&path) {
             match super::app::archive_password_for_path(app, &path) {
                 Ok(password) => password,
@@ -7620,8 +7698,7 @@ pub(crate) fn install_browse_convert_source_paths(
     queue: QueueExpansionResult,
     expanded_folder_count: usize,
     from_folder_expansion: bool,
-) {
-    app.cancel_browse_convert_expansion();
+) -> bool {
     let QueueExpansionResult {
         paths,
         cue_artifact_audio,
@@ -7637,29 +7714,72 @@ pub(crate) fn install_browse_convert_source_paths(
         if paths.is_empty() {
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
             app.set_status(err.clone());
-            return;
+            return false;
         }
         log::warn!("browse expansion warning: {}", err);
         expansion_warning = Some(err.clone());
     }
-    let paths = normalized_path_snapshot(paths);
+    let normalized_paths = normalized_path_snapshot(paths);
+    let (paths, refused_paths): (Vec<_>, Vec<_>) = normalized_paths
+        .into_iter()
+        .partition(|path| crate::convert::source_admission::is_direct_queue_source_path(path));
+    if !refused_paths.is_empty() {
+        let message = format!(
+            "source admission refused {} unsupported expanded path{}",
+            refused_paths.len(),
+            if refused_paths.len() == 1 { "" } else { "s" }
+        );
+        log::error!("{message}: {refused_paths:?}");
+        expansion_warning = Some(match expansion_warning {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message,
+        });
+    }
     if paths.is_empty() {
         crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
         app.set_status("No supported sources selected");
-        return;
+        return false;
     }
 
     let first = paths[0].clone();
     let path_count = paths.len();
     let archive_preview_single = path_count == 1 && is_nonprobeable_source_for_probe(&first);
 
+    if archive_preview_single {
+        // Archive preview owns its own source transition. Route through the
+        // same failure-atomic preflight used by CLI, :e, Browse, and recent
+        // sources instead of partially duplicating its state mutation here.
+        crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+            &synthetic_cue_artifacts,
+        );
+        match install_archive_preview_convert_source(app, first.clone(), tx.clone()) {
+            Ok(_) => {
+                let batch_paths = app.convert.source.mode.all_paths();
+                let _ = app
+                    .db
+                    .save_batch_state(&batch_paths, None, None, None, None, None);
+                app.previous_screen = Some(AppScreen::Browse);
+                let mut status = format!(
+                    "Extracting archive: {} — review settings, then :commit or :Commit",
+                    first.file_name().unwrap_or_default().to_string_lossy()
+                );
+                if let Some(warning) = expansion_warning {
+                    status = format!("{} — note: {}", status, warning);
+                }
+                app.set_status(status);
+            }
+            Err(error) => {
+                app.set_status(error.to_string());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    app.cancel_browse_convert_expansion();
     app.probe_generation = app.probe_generation.saturating_add(1);
     let generation = app.probe_generation;
-    let probe_notice = if archive_preview_single {
-        Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE.to_string())
-    } else {
-        source_probe_initial_notice(&first)
-    };
+    let probe_notice = source_probe_initial_notice(&first);
 
     clear_source_metadata_in_convert(&mut app.convert);
     let mut mode = if path_count == 1 {
@@ -7702,31 +7822,7 @@ pub(crate) fn install_browse_convert_source_paths(
     let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
     app.recent.record_use_with_db(&first, &app.db);
 
-    if archive_preview_single {
-        let pending = create_pending_archive_preview(generation, first.clone());
-        let staging_dir = pending.staging_dir.clone();
-        let cancel = pending.cancel.clone();
-        app.convert.install_pending_archive_preview(pending);
-        let password = match archive_preview_password_for_path(app, &first) {
-            Ok(password) => password,
-            Err(error) => {
-                app.convert.clear_pending_archive_preview();
-                app.set_status(error);
-                return;
-            }
-        };
-        let tool_paths = app.manager.config.tool_paths.clone();
-        spawn_archive_preview(
-            generation,
-            first.clone(),
-            probe_baseline,
-            staging_dir,
-            cancel,
-            password,
-            tool_paths,
-            tx.clone(),
-        );
-    } else if probe_notice.is_some() {
+    if probe_notice.is_some() {
         spawn_convert_source_probe(generation, first.clone(), probe_baseline, tx.clone());
     }
 
@@ -7738,12 +7834,7 @@ pub(crate) fn install_browse_convert_source_paths(
     app.previous_screen = Some(AppScreen::Browse);
     app.current_screen = AppScreen::Convert;
 
-    let mut status = if archive_preview_single {
-        format!(
-            "Extracting archive: {} — review settings, then :commit or :Commit",
-            first.file_name().unwrap_or_default().to_string_lossy()
-        )
-    } else if probe_notice.is_some() {
+    let mut status = if probe_notice.is_some() {
         format!(
             "Probing: {} — review settings, then :commit or :Commit",
             first.file_name().unwrap_or_default().to_string_lossy()
@@ -7767,6 +7858,33 @@ pub(crate) fn install_browse_convert_source_paths(
         status = format!("{} — note: {}", status, warning);
     }
     app.set_status(status);
+    true
+}
+
+#[derive(Debug, Clone)]
+struct QueueReviewSettingsSnapshot {
+    format: super::app::FormatState,
+    output_options: super::app::OutputOptionsState,
+    metadata: super::app::MetadataState,
+    preset: super::app::PresetState,
+}
+
+impl QueueReviewSettingsSnapshot {
+    fn capture(app: &AppState) -> Self {
+        Self {
+            format: app.convert.format.clone(),
+            output_options: app.convert.output_options.clone(),
+            metadata: app.convert.metadata.clone(),
+            preset: app.preset.clone(),
+        }
+    }
+
+    fn restore(self, app: &mut AppState) {
+        app.convert.format = self.format;
+        app.convert.output_options = self.output_options;
+        app.convert.metadata = self.metadata;
+        app.preset = self.preset;
+    }
 }
 
 fn finish_browse_queue_review_after_expansion(
@@ -7804,12 +7922,18 @@ fn finish_browse_queue_review_after_expansion(
         crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
     });
 
+    // Queue review settings are part of the same user-visible operation as
+    // source installation. Preserve them until the source transition reports
+    // success so archive preflight failure cannot retarget the prior source.
+    let settings_before = QueueReviewSettingsSnapshot::capture(app);
+
     if let Some(name) = &preset {
         if let Err(msg) = load_queue_preset_into_pills(app, name) {
             if let Some(err) = expansion_errors.first() {
                 log::warn!("queue expansion warning dropped by preset failure: {}", err);
             }
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
+            settings_before.restore(app);
             app.set_status(msg);
             return false;
         }
@@ -7823,7 +7947,7 @@ fn finish_browse_queue_review_after_expansion(
         app.preset.clear_active_preset();
     }
 
-    install_browse_convert_source_paths(
+    let installed = install_browse_convert_source_paths(
         app,
         tx,
         QueueExpansionResult {
@@ -7836,6 +7960,11 @@ fn finish_browse_queue_review_after_expansion(
         expanded_folder_count,
         expanded_folder_count > 0,
     );
+    if !installed {
+        settings_before.restore(app);
+        return false;
+    }
+
     app.current_screen == AppScreen::Convert && !app.convert.source.mode.is_empty()
 }
 
@@ -8758,7 +8887,9 @@ pub(super) fn open_file_picker_for_copy_move(
         // the user has chosen to go through the interactive destination picker;
         // the user can still click "Overwrite" before starting the operation.
         conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Ask),
-        operation_policy: directory_destination_picker_policy(),
+        operation_policy: directory_destination_picker_policy(
+            app.file_task_verbose_degrade_notices,
+        ),
         ..tui_file_picker::FilePickerConfig::default()
     });
     let purpose = if is_move {
@@ -8774,7 +8905,9 @@ pub(super) fn open_file_picker_for_copy_move(
     ));
 }
 
-fn directory_destination_picker_policy() -> tui_file_picker::FileOperationPolicy {
+fn directory_destination_picker_policy(
+    verbose_degrade_notices: bool,
+) -> tui_file_picker::FileOperationPolicy {
     tui_file_picker::FileOperationPolicy {
         allow_new_file: false,
         allow_new_folder: true,
@@ -8785,6 +8918,7 @@ fn directory_destination_picker_policy() -> tui_file_picker::FileOperationPolicy
         symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
         cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
         delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+        verbose_degrade_notices,
     }
 }
 
@@ -8808,7 +8942,9 @@ pub(super) fn open_file_picker_for_convert_destination(app: &mut AppState) {
         title: "Select destination folder".to_string(),
         theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
         selection_mode: tui_file_picker::FilePickerSelectionMode::Directories,
-        operation_policy: directory_destination_picker_policy(),
+        operation_policy: directory_destination_picker_policy(
+            app.file_task_verbose_degrade_notices,
+        ),
         ..tui_file_picker::FilePickerConfig::default()
     });
     app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
@@ -8829,7 +8965,7 @@ pub(super) fn open_file_picker_for_preset_load(app: &mut AppState) {
         theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
         selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
         hide_extension: Some(".toml".to_string()),
-        operation_policy: preset_picker_policy(),
+        operation_policy: preset_picker_policy(app.file_task_verbose_degrade_notices),
         ..tui_file_picker::FilePickerConfig::default()
     });
     app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
@@ -8857,7 +8993,7 @@ pub(super) fn open_file_picker_for_preset_save_as(app: &mut AppState) {
             hide_extension: Some(".toml".to_string()),
             style: tui_file_picker::SaveModeStyle::Inline,
         }),
-        operation_policy: preset_picker_policy(),
+        operation_policy: preset_picker_policy(app.file_task_verbose_degrade_notices),
         ..tui_file_picker::FilePickerConfig::default()
     });
     app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
@@ -8867,7 +9003,9 @@ pub(super) fn open_file_picker_for_preset_save_as(app: &mut AppState) {
     app.set_status("enter a preset name and press Enter to save");
 }
 
-fn preset_picker_policy() -> tui_file_picker::FileOperationPolicy {
+fn preset_picker_policy(
+    verbose_degrade_notices: bool,
+) -> tui_file_picker::FileOperationPolicy {
     tui_file_picker::FileOperationPolicy {
         allow_new_file: false,
         allow_new_folder: false,
@@ -8878,6 +9016,7 @@ fn preset_picker_policy() -> tui_file_picker::FileOperationPolicy {
         symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
         cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
         delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+        verbose_degrade_notices,
     }
 }
 
@@ -14381,6 +14520,95 @@ mod completion_tests {
     }
 
     #[test]
+    fn edit_command_uses_authoritative_archive_source_policy() {
+        for name in [
+            "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.cab",
+            "album.dmg",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+        ] {
+            assert!(edit_source_path_is_admitted(std::path::Path::new(name)), "{name}");
+        }
+        for name in ["cover.jpg", "notes.txt", "disc.iso"] {
+            assert!(!edit_source_path_is_admitted(std::path::Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn file_task_diagnostic_commands_parse_and_toggle_notice_policy() {
+        assert!(matches!(parse_command("messages"), Command::FileTaskMessages));
+        assert!(matches!(parse_command("task-messages"), Command::FileTaskMessages));
+        assert!(matches!(
+            parse_command("file-notices verbose"),
+            Command::FileTaskNotices(Some(value)) if value == "verbose"
+        ));
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert!(!app.file_task_verbose_degrade_notices);
+        execute_command(
+            &mut app,
+            Command::FileTaskNotices(Some("verbose".to_string())),
+            &tx,
+        );
+        assert!(app.file_task_verbose_degrade_notices);
+        execute_command(
+            &mut app,
+            Command::FileTaskNotices(Some("quiet".to_string())),
+            &tx,
+        );
+        assert!(!app.file_task_verbose_degrade_notices);
+    }
+
+    #[test]
+    fn messages_command_reopens_retained_terminal_details() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let mut progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Move,
+            "Moving files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        progress.record_error(tui_file_picker::FileTaskErrorRecord::new(
+            "album",
+            "full retained warning",
+        ));
+        progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: "Move completed with warnings".to_string(),
+            totals: tui_file_picker::ProgressTotals::default(),
+        });
+        app.last_file_task_progress = Some((77, progress));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        execute_command(&mut app, Command::FileTaskMessages, &tx);
+
+        let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay else {
+            panic!("messages command must reopen file-task progress");
+        };
+        assert_eq!(session.session_id, 77);
+        assert!(session.is_retained_viewer());
+        assert!(session.progress.is_terminal());
+        assert_eq!(
+            session.progress.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            tui_file_picker::FileTaskUserAction::None,
+            "first Esc closes the details pane rather than dismissing the summary",
+        );
+    }
+
+    #[test]
     fn browse_create_commands_parse_prompt_and_direct_forms() {
         assert!(matches!(parse_command("new-file"), Command::NewFile(None)));
         assert!(matches!(
@@ -17248,6 +17476,79 @@ mod execute_queue_state_consistency_tests {
     use crate::convert::classify::EntryKind;
     use crate::tui::browse::BrowseEntry;
     use tokio::sync::mpsc;
+
+
+    #[test]
+    fn failed_archive_review_restores_existing_source_settings_and_preset_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let existing = temp.path().join("existing.flac");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&existing, b"existing source").expect("existing fixture");
+        std::fs::write(&archive, b"archive fixture").expect("archive fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Queue;
+        app.previous_screen = Some(AppScreen::Browse);
+        app.probe_generation = 91;
+        app.convert.set_source_mode(SourceMode::from_single_pending_probe(
+            existing.clone(),
+            Some("existing probe notice".to_string()),
+        ));
+        app.convert.metadata.title = Some("Existing title".to_string());
+        app.convert.metadata.artist = Some("Existing artist".to_string());
+        app.convert.format.sample_rate.select_value(&96_000);
+        app.convert.format.advanced_open = true;
+        app.convert.output_options.dest_path = Some(temp.path().join("existing-output"));
+        app.convert.output_options.filename_template =
+            "existing-%TRACKNN%-%TITLE%.%EXT%".to_string();
+        app.convert.output_options.advanced_open = true;
+        app.preset.set_active_preset_path(
+            "existing-preset".to_string(),
+            temp.path().join("existing-preset.toml"),
+        );
+        app.preset.modified = true;
+
+        let source_before = format!("{:?}", app.convert.source.mode);
+        let format_before = format!("{:?}", app.convert.format);
+        let output_before = format!("{:?}", app.convert.output_options);
+        let metadata_before = format!("{:?}", app.convert.metadata);
+        let preset_before = format!("{:?}", app.preset);
+        let screen_before = app.current_screen;
+        let previous_screen_before = app.previous_screen;
+        let generation_before = app.probe_generation;
+
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let installed = finish_browse_queue_review_after_expansion(
+            &mut app,
+            &tx,
+            None,
+            QueueExpansionResult {
+                paths: vec![archive],
+                ..QueueExpansionResult::default()
+            },
+            0,
+        );
+
+        assert!(!installed);
+        assert_eq!(format!("{:?}", app.convert.source.mode), source_before);
+        assert_eq!(app.convert.source.mode.current_path(), Some(&existing));
+        assert_eq!(format!("{:?}", app.convert.format), format_before);
+        assert_eq!(format!("{:?}", app.convert.output_options), output_before);
+        assert_eq!(format!("{:?}", app.convert.metadata), metadata_before);
+        assert_eq!(format!("{:?}", app.preset), preset_before);
+        assert_eq!(app.current_screen, screen_before);
+        assert_eq!(app.previous_screen, previous_screen_before);
+        assert_eq!(app.probe_generation, generation_before);
+        assert!(app.convert.pending_archive_preview.is_none());
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains("worker channel is closed"), "{status}");
+        assert!(status.contains("operation was not started"), "{status}");
+    }
 
     #[test]
     fn execute_queue_uses_async_folder_expansion_before_source_publication() {

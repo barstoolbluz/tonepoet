@@ -20,6 +20,7 @@ pub fn draw_footer(
     current_screen: AppScreen,
     buttons: &mut ButtonRenderMap,
     status_message: Option<&str>,
+    has_file_task_messages: bool,
     theme: super::theme::Theme,
 ) {
     if area.height < 2 {
@@ -32,7 +33,15 @@ pub fn draw_footer(
         .split(area);
 
     draw_tab_bar(f, chunks[0], current_screen, buttons, theme);
-    draw_context_bar(f, chunks[1], current_screen, status_message, theme);
+    draw_context_bar(
+        f,
+        chunks[1],
+        current_screen,
+        buttons,
+        status_message,
+        has_file_task_messages,
+        theme,
+    );
 }
 
 /// Draw the numbered tab bar: 1 convert | 2 browse | 3 library | 4 queue | 5 config
@@ -94,10 +103,27 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, current: AppScreen, buttons: &mut But
 
 /// Draw the context-sensitive keybinding bar.
 /// If `status_message` is Some, render the message in amber instead of keybinding hints.
-fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_message: Option<&str>, theme: super::theme::Theme) {
+fn draw_context_bar(
+    f: &mut Frame,
+    area: Rect,
+    current: AppScreen,
+    buttons: &mut ButtonRenderMap,
+    status_message: Option<&str>,
+    has_file_task_messages: bool,
+    theme: super::theme::Theme,
+) {
+    let details_label = file_task_details_label(area.width, has_file_task_messages);
+    let details_width = details_label.len() as u16;
+    let content_area = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(details_width),
+        area.height,
+    );
+
     // When a transient status message is set, it replaces the hints on this row.
     if let Some(msg) = status_message {
-        let max_chars = (area.width as usize).saturating_sub(2);
+        let max_chars = (content_area.width as usize).saturating_sub(2);
         let display: String = if msg.chars().count() > max_chars && max_chars >= 2 {
             let t: String = msg.chars().take(max_chars - 1).collect();
             format!(" {}…", t)
@@ -110,31 +136,66 @@ fn draw_context_bar(f: &mut Frame, area: Rect, current: AppScreen, status_messag
                 .fg(theme.amber)
                 .add_modifier(Modifier::BOLD),
         )));
-        f.render_widget(bar, area);
-        return;
-    }
+        f.render_widget(bar, content_area);
+    } else {
+        let groups = hint_groups_for(current, theme);
+        let visible = truncate_groups_to_width(&groups, content_area.width as usize);
 
-    let groups = hint_groups_for(current, theme);
-    let visible = truncate_groups_to_width(&groups, area.width as usize);
-
-    let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    for (gi, group) in visible.iter().enumerate() {
-        if gi > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(theme.border_dim)));
-        }
-        for hint in group {
-            spans.push(Span::styled(hint.key, Style::default().fg(hint.color)));
-            if !hint.label.is_empty() {
-                spans.push(Span::styled(
-                    format!(" {} ", hint.label),
-                    Style::default().fg(theme.text_muted),
-                ));
+        let mut spans: Vec<Span> = vec![Span::raw(" ")];
+        for (gi, group) in visible.iter().enumerate() {
+            if gi > 0 {
+                spans.push(Span::styled(" │ ", Style::default().fg(theme.border_dim)));
+            }
+            for hint in group {
+                spans.push(Span::styled(hint.key, Style::default().fg(hint.color)));
+                if !hint.label.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" {} ", hint.label),
+                        Style::default().fg(theme.text_muted),
+                    ));
+                }
             }
         }
+
+        f.render_widget(Paragraph::new(Line::from(spans)), content_area);
     }
 
-    let bar = Paragraph::new(Line::from(spans));
-    f.render_widget(bar, area);
+    if let Some(details_area) = file_task_details_rect(area, has_file_task_messages) {
+        buttons.record_button(TuiButton::FileTaskMessages, details_area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                details_label,
+                Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD),
+            ))),
+            details_area,
+        );
+    }
+}
+
+fn file_task_details_rect(area: Rect, has_file_task_messages: bool) -> Option<Rect> {
+    let width = file_task_details_label(area.width, has_file_task_messages).len() as u16;
+    (width > 0).then(|| {
+        Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(width)),
+            area.y,
+            width,
+            1,
+        )
+    })
+}
+
+fn file_task_details_label(width: u16, has_file_task_messages: bool) -> &'static str {
+    if !has_file_task_messages || width == 0 {
+        ""
+    } else if width >= 18 {
+        " details "
+    } else if width >= 7 {
+        " msgs "
+    } else {
+        // Preserve a one-cell mouse target even in extremely narrow layouts;
+        // keyboard access via :messages remains available as well.
+        "d"
+    }
 }
 
 /// A single keybinding hint shown in the context bar.
@@ -176,6 +237,7 @@ fn hint_groups_for(current: AppScreen, theme: super::theme::Theme) -> Vec<Vec<Hi
             h("↑↓", "navigate", theme.blue, 0),
             h("enter", "open", theme.green, 0),
             h("space", "select", theme.blue, 0),
+            h("Ctrl+P", "paste", theme.cyan, 1),
         ],
         AppScreen::Queue => vec![
             h("↑↓", "navigate", theme.blue, 0),
@@ -242,4 +304,31 @@ fn truncate_groups_to_width(groups: &[Vec<Hint>], available: usize) -> Vec<Vec<H
         working.retain(|g| !g.is_empty());
     }
     working
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_task_details_label, file_task_details_rect};
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn file_task_details_keeps_a_mouse_target_at_every_nonzero_width() {
+        assert_eq!(file_task_details_label(0, true), "");
+        for width in 1..7 {
+            assert_eq!(file_task_details_label(width, true), "d");
+        }
+        assert_eq!(file_task_details_label(7, true), " msgs ");
+        assert_eq!(file_task_details_label(17, true), " msgs ");
+        assert_eq!(file_task_details_label(18, true), " details ");
+        assert_eq!(file_task_details_label(80, false), "");
+
+        assert_eq!(
+            file_task_details_rect(Rect::new(9, 4, 1, 1), true),
+            Some(Rect::new(9, 4, 1, 1)),
+        );
+        assert_eq!(
+            file_task_details_rect(Rect::new(9, 4, 0, 1), true),
+            None,
+        );
+    }
 }

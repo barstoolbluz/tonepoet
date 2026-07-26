@@ -5,7 +5,7 @@ use crate::search::FileSearchState;
 use crate::type_ahead::TypeAheadState;
 use crate::theme::FilePickerTheme;
 use crate::text_input::TextInputState;
-use crate::tree::{filesystem_root, initial_tree_nodes, refresh_tree_children};
+use crate::tree::{filesystem_root, refresh_tree_children};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use std::cmp::Ordering;
@@ -349,6 +349,9 @@ pub struct FileOperationPolicy {
     /// Policy for explicit permanent deletion commands. Recursive deletion is
     /// opt-in. This does not restrict cleanup of a copied-and-verified move.
     pub delete: DeletePolicy,
+    /// Include routine reduced-filesystem capability notices in successful
+    /// operation results. Failures and data-affecting warnings remain visible.
+    pub verbose_degrade_notices: bool,
 }
 
 impl Default for FileOperationPolicy {
@@ -363,6 +366,7 @@ impl Default for FileOperationPolicy {
             symlink_copy: SymlinkCopyPolicy::Reject,
             cross_device_cut: CrossDeviceCutPolicy::Reject,
             delete: DeletePolicy::FilesAndEmptyDirectories,
+            verbose_degrade_notices: false,
         }
     }
 }
@@ -776,7 +780,7 @@ impl FilePickerState {
             history_forward: Vec::new(),
             address_editing: false,
             address_input: TextInputState::new(start_dir.display().to_string()),
-            tree_nodes: initial_tree_nodes(&start_dir),
+            tree_nodes: crate::tree::initial_tree_nodes_with_hidden(&start_dir, config.show_hidden),
             tree_cursor: 0,
             tree_scroll: 0,
             tree_focused: false,
@@ -873,6 +877,11 @@ impl FilePickerState {
         self.selected.as_deref()
     }
 
+    /// Whether a filesystem cut/copy payload is available for paste.
+    pub fn has_filesystem_clipboard(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
     /// Paths currently marked in the files pane. Tree rows never participate.
     pub fn multi_selected_paths(&self) -> &[PathBuf] {
         &self.multi_selected
@@ -919,6 +928,9 @@ impl FilePickerState {
     pub(crate) fn action_paths(&self) -> Vec<PathBuf> {
         if self.menu_open && self.context_menu_kind == FilePickerContextMenuKind::Tree {
             return self.context_menu_target.clone().into_iter().collect();
+        }
+        if self.focus == FilePickerFocus::Tree {
+            return self.tree_cursor_path().map(Path::to_path_buf).into_iter().collect();
         }
         let current = self.current_selection().map(|entry| entry.path.clone());
         if let Some(current) = current.as_ref() {
@@ -2181,11 +2193,15 @@ impl FilePickerState {
         } else {
             self.select_tree_node_for_current_dir();
         }
-        let mut committed_warnings = rename_mode
-            .degraded_warning()
-            .map(str::to_string)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut committed_warnings = if self.operation_policy.verbose_degrade_notices {
+            rename_mode
+                .degraded_warning()
+                .map(str::to_string)
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if let Err(err) = sync_directory(&parent) {
             committed_warnings.push(format!(
                 "parent-directory synchronization failed: {err}"
@@ -2403,8 +2419,25 @@ impl FilePickerState {
     }
 
     pub fn try_paste_clipboard(&mut self) -> Result<(), FilePickerError> {
-        let target = self.current_dir.clone();
+        let target = self.filesystem_paste_target();
         self.try_paste_clipboard_to(&target)
+    }
+
+    /// Resolve the filesystem-paste destination from the pane that owns focus.
+    ///
+    /// The files pane pastes into the directory being browsed. The tree pane
+    /// pastes into the selected tree directory, matching the Tree context-menu
+    /// route. Text-entry and modal surfaces fall back to `current_dir`; hosts
+    /// call this method only after focused text fields have declined a terminal
+    /// paste event.
+    #[must_use]
+    pub fn filesystem_paste_target(&self) -> PathBuf {
+        if self.focus == FilePickerFocus::Tree {
+            if let Some(path) = self.tree_cursor_path() {
+                return path.to_path_buf();
+            }
+        }
+        self.current_dir.clone()
     }
 
     pub(crate) fn try_paste_clipboard_to(
@@ -3736,9 +3769,11 @@ fn move_path_with_policy_progress_accounted_with_recovery(
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
     progress(source, destination, 0, false)?;
+    let source_capabilities = crate::filesystem_capabilities(source);
+    let initial_destination_capabilities = crate::filesystem_capabilities(destination);
     let route = initial_move_route(
-        crate::filesystem_capabilities(source),
-        crate::filesystem_capabilities(destination),
+        source_capabilities,
+        initial_destination_capabilities,
         take_test_force_copy_then_delete_move(),
     );
     if route == InitialMoveRoute::CopyThenDelete {
@@ -3763,10 +3798,11 @@ fn move_path_with_policy_progress_accounted_with_recovery(
                 io.rename_fallbacks = io.rename_fallbacks.saturating_add(1);
             }
             let destination_capabilities = crate::filesystem_capabilities(destination);
-            crate::verify_committed_rename(
+            let rename_verification = crate::verify_committed_rename(
                 source,
                 destination,
                 &rename_proof,
+                source_capabilities,
                 destination_capabilities,
             )
             .map_err(|message| {
@@ -3779,14 +3815,19 @@ fn move_path_with_policy_progress_accounted_with_recovery(
                 )
             })?;
 
-            let mut warnings = rename_mode
-                .degraded_warning()
-                .map(str::to_string)
-                .into_iter()
-                .collect::<Vec<_>>();
-            if destination_capabilities.identity_policy()
-                == crate::FilesystemIdentityPolicy::ContentVerifiedPortable
-            {
+            let mut warnings = if policy.verbose_degrade_notices {
+                rename_mode
+                    .degraded_warning()
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if let Some(warning) = rename_verification.warning {
+                warnings.push(warning);
+            }
+            if rename_verification.portable_evidence && policy.verbose_degrade_notices {
                 warnings.push(
                     "native rename was accepted using retained-handle/type/size/path-transition evidence because stable inode or nanosecond timestamp semantics are unavailable"
                         .to_string(),
@@ -3908,7 +3949,10 @@ fn copy_then_delete_progress_with_resume_accounted(
     recovery_out: &mut Option<MoveRecoveryProof>,
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
-    let identity_policy_warning = crate::filesystem_identity_policy_notice(source);
+    let identity_policy_warning = policy
+        .verbose_degrade_notices
+        .then(|| crate::filesystem_identity_policy_notice(source))
+        .flatten();
     let destination_preexisted = match fs::symlink_metadata(destination) {
         Ok(_) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -4203,7 +4247,9 @@ fn copy_then_delete_progress_with_resume_accounted(
             ));
         }
     }
-    completion_warnings.extend(quarantine_mode.degraded_warning().map(str::to_string));
+    if policy.verbose_degrade_notices {
+        completion_warnings.extend(quarantine_mode.degraded_warning().map(str::to_string));
+    }
     completion_warnings.extend(identity_policy_warning);
     if !completion_warnings.is_empty() {
         return Err(committed_operation_warning(
@@ -5041,8 +5087,10 @@ where
         if matches!(publication_mode, RenameNoReplaceMode::CheckedBestEffort) {
             io.rename_fallbacks = io.rename_fallbacks.saturating_add(1);
         }
-        if let Some(warning) = publication_mode.degraded_warning() {
-            metadata_warnings.push(warning.to_string());
+        if policy.verbose_degrade_notices {
+            if let Some(warning) = publication_mode.degraded_warning() {
+                metadata_warnings.push(warning.to_string());
+            }
         }
         io.destination_tree_walks = io.destination_tree_walks.saturating_add(1);
         io.destination_bytes_hashed = io

@@ -16,7 +16,10 @@ use super::browse::{BrowseColumn, BrowseDirectorySummaryColdWorkPolicy, BrowseEn
 use super::button_map::{ButtonRenderMap, ScrollbarSurface, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
-use super::inline_edit::{inline_cursor_col, render_inline_value_with_embedded_cursor};
+use super::inline_edit::{
+    inline_cursor_col, render_inline_value_with_embedded_cursor,
+    render_text_input_value_with_style,
+};
 use super::probe::MetadataField;
 use super::text_input::TextInputState;
 
@@ -236,6 +239,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         app.current_screen,
         &mut app.button_map,
         status_msg,
+        app.last_file_task_progress.is_some(),
         theme,
     );
 
@@ -2180,23 +2184,19 @@ fn draw_browse_list(
         // Row 1: full-width search input.
         // Layout: │ + " / "(3) + input(input_w) + │
         let input_w = inner_w.saturating_sub(3);
-        let (view, _cursor_col) = browse.search.input.view(input_w);
-        let view_len = super::display_width::width(&view);
-        let padded = if view.is_empty() {
-            " ".repeat(input_w.max(1))
-        } else {
-            let pad = input_w.saturating_sub(view_len);
-            format!("{}{}", view, " ".repeat(pad))
-        };
-        lines.push(Line::from(vec![
+        let mut search_spans = vec![
             Span::styled("│", theme.border(border_color)),
             Span::styled(" / ", Style::default().fg(theme.amber)),
-            Span::styled(
-                padded,
-                Style::default().fg(theme.text_bright).bg(theme.surface),
-            ),
-            Span::styled("│", theme.border(border_color)),
-        ]));
+        ];
+        search_spans.extend(render_text_input_value_with_style(
+            &browse.search.input,
+            input_w,
+            browse.search.focus == super::browse::SearchFocus::Input,
+            Style::default().fg(theme.text_bright).bg(theme.surface),
+            theme,
+        ));
+        search_spans.push(Span::styled("│", theme.border(border_color)));
+        lines.push(Line::from(search_spans));
 
         // Row 2: recursive + mode + sort + audio, all visibly clickable.
         // The shared layout helper progressively compacts labels and finally
@@ -2345,19 +2345,25 @@ fn draw_browse_list(
         // Inside row layout: │ + " / " + <input view> + padding + │
         // Reserve 1 (left border) + 3 (" / ") + 2 (right padding + border) = 6
         let input_width = inner_w.saturating_sub(4); // " / " prefix takes 3 + 1 trailing space
-        let (visible, cursor_col_in_view) = input.view(input_width);
+        let (_, cursor_col_in_view) = input.view(input_width);
         filter_cursor = Some(cursor_col_in_view);
 
-        let visible_w = super::display_width::width(&visible);
-        let pad = input_width.saturating_sub(visible_w);
-        lines.push(Line::from(vec![
+        let mut filter_spans = vec![
             Span::styled("│", theme.border(border_color)),
             Span::styled(" / ", Style::default().fg(theme.cyan)),
-            Span::styled(visible, Style::default().fg(theme.text_bright)),
-            Span::raw(" ".repeat(pad)),
-            Span::raw(" "),
-            Span::styled("│", theme.border(border_color)),
-        ]));
+        ];
+        filter_spans.extend(render_text_input_value_with_style(
+            input,
+            input_width,
+            true,
+            Style::default()
+                .fg(theme.text_bright)
+                .bg(theme.input_focused_bg),
+            theme,
+        ));
+        filter_spans.push(Span::raw(" "));
+        filter_spans.push(Span::styled("│", theme.border(border_color)));
+        lines.push(Line::from(filter_spans));
     }
 
     lines.push(bot_line);
@@ -2531,6 +2537,7 @@ fn render_entry_line(
 
     let cached = cached_info_for_entry(browse, entry);
     let mut spans = Vec::with_capacity(7 + columns.len().saturating_mul(2));
+    let mut inline_editor_span_range: Option<std::ops::Range<usize>> = None;
     spans.push(Span::styled("│", theme.border(border_color)));
     spans.push(Span::styled(cursor, cursor_style));
     spans.push(Span::styled(check, check_style));
@@ -2542,7 +2549,9 @@ fn render_entry_line(
         }
         if cell.column == BrowseColumn::Name {
             if let Some(input) = inline_rename_input {
+                let start = spans.len();
                 spans.extend(render_inline_value_with_embedded_cursor(input, cell.width, theme));
+                inline_editor_span_range = Some(start..spans.len());
             } else {
                 let name_display = pad_or_truncate(&entry.name, cell.width, false);
                 spans.push(Span::styled(name_display, entry_name_style(entry, is_selected, theme)));
@@ -2571,8 +2580,11 @@ fn render_entry_line(
         None
     };
     if let Some(bg_color) = bg {
-        for span in spans.iter_mut() {
-            if !matches!(span.content.as_ref(), "│") {
+        for (span_index, span) in spans.iter_mut().enumerate() {
+            let inline_editor_owns_style = inline_editor_span_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&span_index));
+            if !inline_editor_owns_style && !matches!(span.content.as_ref(), "│") {
                 span.style = span.style.bg(bg_color);
                 if is_selected {
                     span.style = span
@@ -4186,6 +4198,43 @@ mod browse_list_render_allocation_tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn selected_row_restyle_preserves_inline_editor_field_and_selection_styles() {
+        let browse = BrowseState::new();
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let width = 40usize;
+        let columns = [BrowseColumnCell {
+            column: BrowseColumn::Name,
+            width: width - 8,
+        }];
+        let entry = audio_entry();
+        let input = TextInputState::new_selected("track.flac".to_string());
+
+        let line = render_entry_line(
+            theme.border_dim,
+            width,
+            &columns,
+            &browse,
+            &entry,
+            Some(&input),
+            true,
+            false,
+            false,
+            false,
+            theme,
+        );
+
+        assert!(line.spans.iter().any(|span| {
+            span.style.bg == Some(theme.input_focused_bg)
+        }), "inline editor field background must survive selected-row styling");
+        assert!(line.spans.iter().any(|span| {
+            span.style.bg == Some(theme.text_bright)
+                && span.style.fg == Some(theme.bg)
+        }), "inline editor selection must retain inverse-video styling");
     }
 
     #[test]

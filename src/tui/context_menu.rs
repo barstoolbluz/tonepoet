@@ -1279,37 +1279,9 @@ pub fn execute_context_action(
             }
         }
         ContextAction::OpenEntry => {
-            // Simulate Enter on browse
             if app.current_screen == AppScreen::Browse {
-                if let Some(entry) = app.browse.selected_entry().cloned() {
-                    match entry.kind.clone() {
-                        EntryKind::Directory | EntryKind::ParentDir if app.browse.is_in_archive() => {
-                            if matches!(entry.kind.clone(), EntryKind::ParentDir) {
-                                if !app.browse.go_up_in_archive() {
-                                    super::keybindings::exit_browse_archive(app, tx);
-                                }
-                                app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
-                                app.browse.probe_current_with_db(tx, Some(&app.db));
-                            } else if let Some(inner) = app.browse.archive_inner_path_for_path(&entry.path) {
-                                app.browse.enter_archive_dir(&inner);
-                                app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
-                                app.browse.probe_current_with_db(tx, Some(&app.db));
-                            } else {
-                                app.set_status("archive: could not resolve directory entry");
-                            }
-                        }
-                        EntryKind::Directory | EntryKind::ParentDir => {
-                            app.browse.enter_selected();
-                            app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
-                            app.browse.probe_current_with_db(tx, Some(&app.db));
-                        }
-                        _ => {
-                            let path = entry.path.clone();
-                            let target = app.browse.return_target;
-                            super::keybindings::load_browse_selection_pub(app, path, target);
-                        }
-                    }
-                }
+                let index = app.browse.selected_index;
+                super::keybindings::activate_browse_entry(app, index, tx);
             }
         }
         ContextAction::NewFile => {

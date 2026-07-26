@@ -26,6 +26,8 @@ pub enum ScrollbarSurface {
 pub enum TuiButton {
     // Tab bar (footer)
     Tab(u8), // 1-5
+    /// Reopen the most recent completed file-task details.
+    FileTaskMessages,
 
     // Convert screen panes (click to focus)
     Pane(ConvertFocus),
@@ -387,6 +389,7 @@ impl TuiButton {
         use super::app::AppScreen;
         match self {
             Self::Tab(_)
+            | Self::FileTaskMessages
             | Self::OverlayConfirm
             | Self::OverlayCancel
             | Self::MetadataEditorTab(_)

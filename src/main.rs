@@ -211,10 +211,11 @@ enum Commands {
 
     /// Launch full interactive TUI
     Tui {
-        /// Optional audio files to load into the Convert screen on launch.
-        /// A single file opens in Single mode; multiple files open as a
-        /// Batch for review. If no files are given, the TUI starts on the
-        /// configured default screen (Browse by default).
+        /// Optional conversion sources to load on launch. Multiple ordinary
+        /// audio files form a Batch. Archives, CUE sheets, and supported disc
+        /// images are singleton workflows and cannot be mixed with another
+        /// supported source. Unsupported paths are skipped; if no supported
+        /// source remains, the configured default screen is preserved.
         ///
         /// Directory arguments are not supported in TUI mode; use
         /// `tonepoet convert <DIR>` for batch directory conversion, or
@@ -2499,17 +2500,19 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
         ));
     }
 
-    // Phase 6f: if the user launched with file args (`tonepoet tui foo.flac
-    // bar.flac`), seed the Convert screen with those files and land on
-    // Convert instead of the configured default screen. Invalid paths
-    // (missing, directories) are logged and skipped. Routes through
-    // Convert like any other enqueue source — no back door to the queue.
+    // Create the TUI message channel before CLI source seeding. Archive CLI
+    // arguments enter the same asynchronous extraction/preview workflow as
+    // :e, Browse activation, and recent sources, so startup seeding must have
+    // a live sender before it classifies and installs any source.
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    app.tui_tx = Some(tx.clone());
+
+    // If the user launched with file args (`tonepoet tui foo.flac bar.flac`),
+    // route every concrete path through the authoritative source-admission
+    // policy before any Convert state is installed.
     if !cli_paths.is_empty() {
         app.seed_from_cli_paths(cli_paths);
     }
-
-    // Create message channel
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
 
     // Run the event loop
     let result = run_app(&mut terminal, &mut app, tx, rx).await;

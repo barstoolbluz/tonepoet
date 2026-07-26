@@ -16,7 +16,6 @@ use std::sync::{Mutex, OnceLock};
 const MAX_MANIFEST_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_DEPTH: usize = 1_024;
 
-
 /// Deterministic per-operation filesystem I/O accounting.
 ///
 /// These counters are intentionally byte- and call-based rather than timing-
@@ -155,7 +154,8 @@ impl FilesystemCapabilities {
     }
 
     pub const fn identity_policy(self) -> FilesystemIdentityPolicy {
-        if matches!(self.stable_path_identity, CapabilitySupport::Supported)
+        if matches!(self.semantics, FilesystemSemantics::StableLocal)
+            && matches!(self.stable_path_identity, CapabilitySupport::Supported)
             && matches!(self.nanosecond_timestamps, CapabilitySupport::Supported)
         {
             FilesystemIdentityPolicy::Strict
@@ -844,25 +844,33 @@ impl RenameSourceProof {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenameVerification {
-    /// The destination mount lacks strict pathname identity or nanosecond
-    /// timestamp guarantees, so the committed rename was accepted using the
-    /// cheaper retained-handle/type/size/path-transition proof.
+    /// At least one side lacks strict pathname identity or nanosecond timestamp
+    /// guarantees, or a strict metadata/version check was inconclusive after
+    /// the portable retained-handle/path-transition proof succeeded.
     pub portable_evidence: bool,
+    /// A committed rename whose portable proof is complete but whose optional
+    /// strict metadata/version proof was inconclusive. Strict object-identity
+    /// contradictions remain hard failures. Callers must surface this as
+    /// completed-with-warning, never as a failed/retryable operation.
+    pub warning: Option<String>,
 }
 
 /// Verify a committed native rename without reading file contents.
 ///
-/// A successful same-filesystem rename is itself the primary ownership event.
-/// We additionally require disappearance of the source pathname, appearance
-/// of the expected destination kind/size/target, stability of any retained
-/// open handle, and strict path identity when the mount advertises it. Reduced-
-/// semantics mounts deliberately use the cheaper type/size/path-transition
-/// proof rather than forcing a recursive copy merely because inode or
-/// nanosecond timestamp evidence is weak.
+/// Source-owned evidence is always interpreted with source filesystem
+/// capabilities; destination-owned evidence is interpreted with destination
+/// capabilities. The cross-path transition can be strict only when both sides
+/// advertise strict identity semantics. Portable evidence (source pathname
+/// absent, destination present, kind/size/target consistent, and retained
+/// handle stable when available) is authoritative on reduced or unknown
+/// filesystems. A strict metadata/version mismatch after that proof succeeds is
+/// returned as a warning; a strict identity contradiction remains a hard
+/// failure because it can indicate destination replacement.
 pub fn verify_committed_rename(
     source: &Path,
     destination: &Path,
     proof: &RenameSourceProof,
+    source_capabilities: FilesystemCapabilities,
     destination_capabilities: FilesystemCapabilities,
 ) -> Result<RenameVerification, String> {
     match fs::symlink_metadata(source) {
@@ -882,64 +890,120 @@ pub fn verify_committed_rename(
 
     let destination_snapshot = snapshot_path(destination)
         .map_err(|error| format!("could not identify renamed destination: {error}"))?;
-    if destination_capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
+    let source_policy = source_capabilities.identity_policy();
+    let destination_policy = destination_capabilities.identity_policy();
+    let source_strict = source_capabilities.semantics == FilesystemSemantics::StableLocal
+        && source_policy == FilesystemIdentityPolicy::Strict;
+    let destination_strict =
+        destination_capabilities.semantics == FilesystemSemantics::StableLocal
+            && destination_policy == FilesystemIdentityPolicy::Strict;
+    let strict_transition = source_strict && destination_strict;
+    let mut strict_warnings = Vec::new();
+
+    // Establish the portable path-transition proof first. This is the
+    // authoritative floor on reduced/unknown mounts and the safe fallback when
+    // strict metadata changes despite a committed rename.
+    proof
+        .snapshot
+        .verify_same_identity_with_policy(
+            &destination_snapshot,
+            FilesystemIdentityPolicy::ContentVerifiedPortable,
+        )
+        .map_err(|error| format!("renamed destination does not match the source: {error}"))?;
+
+    if strict_transition {
         proof
+            .snapshot
+            .verify_same_identity(&destination_snapshot)
+            .map_err(|error| {
+                format!(
+                    "strict renamed-destination identity contradicts the portable transition proof: {error}"
+                )
+            })?;
+        if let Err(error) = proof
             .snapshot
             .verify_same_object_after_rename_with_capabilities(
                 &destination_snapshot,
                 destination_capabilities,
-            )?;
-    } else {
-        // Reduced-semantics mounts may round or synthesize timestamps during a
-        // successful rename. Require only the trustworthy pathname evidence
-        // here; any retained handle below supplies the stronger object proof.
-        // This avoids turning an otherwise successful O(1) rename into a
-        // recursive copy solely because timestamp fidelity is weak.
-        proof
-            .snapshot
-            .verify_same_identity_with_policy(
-                &destination_snapshot,
-                FilesystemIdentityPolicy::ContentVerifiedPortable,
-            )?;
+            )
+        {
+            // Identity is already proven above. A remaining mismatch is a
+            // metadata/version-token discrepancy and may be retained as a
+            // completed-with-warning result.
+            strict_warnings.push(format!(
+                "strict renamed-destination metadata could not be proven after the committed rename: {error}"
+            ));
+        }
     }
 
     if let (Some(handle), Some(open_before)) = (&proof.open_handle, &proof.open_snapshot) {
         let open_after = snapshot_open_handle(handle)
             .map_err(|error| format!("could not re-identify retained rename handle: {error}"))?;
-        if destination_capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
-            open_before
-                .verify_same_object_and_version(&open_after)
-                .map_err(|error| format!("source changed while native rename committed: {error}"))?;
-        } else {
-            open_before
-                .verify_same_identity_with_policy(
-                    &open_after,
-                    FilesystemIdentityPolicy::ContentVerifiedPortable,
+
+        // A retained source handle belongs to the source mount. Never apply a
+        // destination mount's identity policy to this comparison.
+        open_before
+            .verify_same_identity_with_policy(
+                &open_after,
+                FilesystemIdentityPolicy::ContentVerifiedPortable,
+            )
+            .map_err(|error| {
+                format!("retained source handle changed while native rename committed: {error}")
+            })?;
+        if source_strict {
+            open_before.verify_same_identity(&open_after).map_err(|error| {
+                format!(
+                    "strict retained-source identity changed while native rename committed: {error}"
                 )
-                .map_err(|error| {
-                    format!("retained source handle changed while native rename committed: {error}")
-                })?;
+            })?;
+            if let Err(error) = open_before.verify_same_object_after_rename_with_capabilities(
+                &open_after,
+                source_capabilities,
+            ) {
+                // The handle still names the same object; only its strict
+                // metadata/version token is uncertain.
+                strict_warnings.push(format!(
+                    "strict retained-source metadata could not be proven after the committed rename: {error}"
+                ));
+            }
         }
+
         open_after
             .verify_same_identity_with_policy(
                 &destination_snapshot,
-                destination_capabilities.identity_policy(),
+                FilesystemIdentityPolicy::ContentVerifiedPortable,
             )
             .map_err(|error| {
                 format!(
                     "renamed destination no longer corresponds to the retained source handle: {error}"
                 )
             })?;
-    } else if destination_capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
-        proof
-            .snapshot
-            .verify_same_identity(&destination_snapshot)
-            .map_err(|error| format!("renamed destination identity is unproven: {error}"))?;
+        if strict_transition {
+            open_after
+                .verify_same_identity(&destination_snapshot)
+                .map_err(|error| {
+                    format!(
+                        "strict destination identity does not match the retained source handle: {error}"
+                    )
+                })?;
+        }
     }
 
+    let warning = (!strict_warnings.is_empty()).then(|| {
+        format!(
+            "{} [source semantics={:?}, policy={:?}, fs-type={:?}; destination semantics={:?}, policy={:?}, fs-type={:?}]",
+            strict_warnings.join("; "),
+            source_capabilities.semantics,
+            source_policy,
+            source_capabilities.filesystem_type,
+            destination_capabilities.semantics,
+            destination_policy,
+            destination_capabilities.filesystem_type,
+        )
+    });
     Ok(RenameVerification {
-        portable_evidence: destination_capabilities.identity_policy()
-            == FilesystemIdentityPolicy::ContentVerifiedPortable,
+        portable_evidence: !strict_transition || warning.is_some(),
+        warning,
     })
 }
 
@@ -1683,6 +1747,269 @@ mod tests {
                 FilesystemIdentityPolicy::ContentVerifiedPortable,
             )
             .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_rename_reproof_uses_source_mount_policy_for_retained_handle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"original").expect("source");
+        let proof = RenameSourceProof::capture(&source).expect("capture proof");
+
+        fs::rename(&source, &destination).expect("rename");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))
+            .expect("change post-rename metadata");
+
+        let verification = verify_committed_rename(
+            &source,
+            &destination,
+            &proof,
+            FilesystemCapabilities::assumed_portable(),
+            FilesystemCapabilities::assumed_strict(),
+        )
+        .expect("source-owned handle must use source portable semantics");
+
+        assert!(verification.portable_evidence);
+        assert!(verification.warning.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_only_reproof_doubt_is_completed_with_warning_after_portable_proof() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"original").expect("source");
+        let proof = RenameSourceProof::capture(&source).expect("capture proof");
+
+        fs::rename(&source, &destination).expect("rename");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))
+            .expect("change post-rename metadata");
+
+        let verification = verify_committed_rename(
+            &source,
+            &destination,
+            &proof,
+            FilesystemCapabilities::assumed_strict(),
+            FilesystemCapabilities::assumed_strict(),
+        )
+        .expect("portable proof must preserve committed disposition");
+
+        assert!(verification.portable_evidence);
+        let warning = verification.warning.as_deref().expect("strict warning");
+        assert!(warning.contains("strict"));
+        assert!(warning.contains("source semantics="));
+        assert!(warning.contains("destination semantics="));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(irrefutable_let_patterns)] // other cfg targets add enum variants
+    fn reduced_mount_reproof_accepts_changed_pseudo_identity_with_portable_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"original").expect("source");
+        let mut proof = RenameSourceProof::capture(&source).expect("capture proof");
+
+        // Model a reduced/network filesystem that reports a different pseudo
+        // inode and coarser timestamp for the same retained object after the
+        // rename. Keep the real destination and retained handle intact: this
+        // tests capability attribution, not acceptance of a replacement file.
+        if let SourceIdentity::Unix { device, inode } = &mut proof.snapshot.identity {
+            *device = device.wrapping_add(1);
+            *inode = inode.wrapping_add(1);
+        }
+        if let SourceVersion::Unix { mtime_nsec, .. } = &mut proof.snapshot.version {
+            *mtime_nsec = 0;
+        }
+        if let Some(open_before) = proof.open_snapshot.as_mut() {
+            if let SourceIdentity::Unix { device, inode } = &mut open_before.identity {
+                *device = device.wrapping_add(1);
+                *inode = inode.wrapping_add(1);
+            }
+            if let SourceVersion::Unix { mtime_nsec, .. } = &mut open_before.version {
+                *mtime_nsec = 0;
+            }
+        }
+
+        fs::rename(&source, &destination).expect("rename");
+
+        let verification = verify_committed_rename(
+            &source,
+            &destination,
+            &proof,
+            FilesystemCapabilities::assumed_portable(),
+            FilesystemCapabilities::assumed_portable(),
+        )
+        .expect("reduced semantics use retained-handle/type/size/path-transition evidence");
+
+        assert!(verification.portable_evidence);
+        assert!(verification.warning.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(irrefutable_let_patterns)] // other cfg targets add enum variants
+    fn unknown_semantics_never_promote_committed_rename_to_strict_proof() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        fs::write(&source, b"original").expect("source");
+        let mut proof = RenameSourceProof::capture(&source).expect("capture proof");
+
+        if let SourceIdentity::Unix { device, inode } = &mut proof.snapshot.identity {
+            *device = device.wrapping_add(1);
+            *inode = inode.wrapping_add(1);
+        }
+        if let Some(open_before) = proof.open_snapshot.as_mut() {
+            if let SourceIdentity::Unix { device, inode } = &mut open_before.identity {
+                *device = device.wrapping_add(1);
+                *inode = inode.wrapping_add(1);
+            }
+        }
+        fs::rename(&source, &destination).expect("rename");
+
+        let unknown_observed_supported = FilesystemCapabilities {
+            semantics: FilesystemSemantics::Unknown,
+            stable_path_identity: CapabilitySupport::Supported,
+            nanosecond_timestamps: CapabilitySupport::Supported,
+            extended_attributes: CapabilitySupport::Unknown,
+            directory_sync: CapabilitySupport::Unknown,
+            atomic_no_replace_rename: CapabilitySupport::Unknown,
+            filesystem_type: Some(0xfeed_beef),
+        };
+        assert_eq!(
+            unknown_observed_supported.identity_policy(),
+            FilesystemIdentityPolicy::ContentVerifiedPortable,
+            "Unknown semantics must never be promoted to strict policy by favorable runtime observations",
+        );
+
+        let verification = verify_committed_rename(
+            &source,
+            &destination,
+            &proof,
+            unknown_observed_supported,
+            unknown_observed_supported,
+        )
+        .expect("Unknown semantics must retain portable proof regardless of observed identity");
+
+        assert!(verification.portable_evidence);
+        assert!(verification.warning.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires TONEPOET_REDUCED_FS_TEST_DIR on the user's CIFS/SMB or NTFS mount"]
+    fn live_reduced_mount_reports_the_actual_capability_route_and_committed_disposition() {
+        let mount = std::env::var_os("TONEPOET_REDUCED_FS_TEST_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set TONEPOET_REDUCED_FS_TEST_DIR to a writable directory on the affected mount");
+        let root = tempfile::Builder::new()
+            .prefix(".tonepoet-capability-probe-")
+            .tempdir_in(&mount)
+            .expect("create live capability probe directory");
+        let source = root.path().join("source.bin");
+        let destination = root.path().join("destination.bin");
+        fs::write(&source, b"tonepoet live reduced-filesystem proof")
+            .expect("write live source");
+
+        let (source_mount_key, source_probe_path) =
+            linux_mount_descriptor(&source).expect("resolve live source mount descriptor");
+        let source_filesystem_type = linux_filesystem_type(&source_probe_path)
+            .expect("read live source filesystem type");
+        let source_baseline = classify_linux_filesystem_type(source_filesystem_type);
+        let source_capabilities = filesystem_capabilities(&source);
+        assert_ne!(
+            source_capabilities.semantics,
+            FilesystemSemantics::StableLocal,
+            "the configured test directory resolved as stable-local rather than CIFS/SMB/NTFS: {source_capabilities:?}",
+        );
+        assert_eq!(
+            source_capabilities.identity_policy(),
+            FilesystemIdentityPolicy::ContentVerifiedPortable,
+            "reduced or unknown semantics must select portable proof: {source_capabilities:?}",
+        );
+        let proof = RenameSourceProof::capture(&source).expect("capture live source proof");
+        fs::rename(&source, &destination).expect("perform live native rename");
+        let (destination_mount_key, destination_probe_path) = linux_mount_descriptor(&destination)
+            .expect("resolve live destination mount descriptor");
+        let destination_filesystem_type = linux_filesystem_type(&destination_probe_path)
+            .expect("read live destination filesystem type");
+        let destination_baseline = classify_linux_filesystem_type(destination_filesystem_type);
+        let destination_capabilities = filesystem_capabilities(&destination);
+        eprintln!(
+            "live reduced-filesystem route: source_key={source_mount_key:?}, source_probe={}, source_fs_type={source_filesystem_type:#x}, source_baseline={source_baseline:?}, source_effective={source_capabilities:?}; destination_key={destination_mount_key:?}, destination_probe={}, destination_fs_type={destination_filesystem_type:#x}, destination_baseline={destination_baseline:?}, destination_effective={destination_capabilities:?}",
+            source_probe_path.display(),
+            destination_probe_path.display(),
+        );
+        assert_eq!(
+            source_mount_key, destination_mount_key,
+            "a same-directory rename resolved source and destination to different capability-cache keys"
+        );
+        assert_eq!(
+            source_filesystem_type, destination_filesystem_type,
+            "a same-directory rename resolved source and destination to different filesystem types"
+        );
+        assert_ne!(
+            destination_capabilities.semantics,
+            FilesystemSemantics::StableLocal,
+            "the renamed destination unexpectedly resolved as stable-local: {destination_capabilities:?}",
+        );
+        assert_eq!(
+            destination_capabilities.identity_policy(),
+            FilesystemIdentityPolicy::ContentVerifiedPortable,
+            "the renamed destination must retain portable proof: {destination_capabilities:?}",
+        );
+
+        let verification = verify_committed_rename(
+            &source,
+            &destination,
+            &proof,
+            source_capabilities,
+            destination_capabilities,
+        )
+        .expect("a committed live rename must satisfy the portable evidence floor");
+        assert!(verification.portable_evidence);
+        assert!(
+            !source.exists() && destination.exists(),
+            "live rename path transition must be committed"
+        );
+
+        fs::remove_file(&destination).expect("remove live destination fixture");
+        root.close().expect("remove live capability probe directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_identity_replacement_is_never_downgraded_to_warning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        let displaced = temp.path().join("displaced.bin");
+        fs::write(&source, b"original").expect("source");
+        let proof = RenameSourceProof::capture(&source).expect("capture proof");
+
+        fs::rename(&source, &destination).expect("rename");
+        fs::rename(&destination, &displaced).expect("displace renamed object");
+        fs::write(&destination, b"replaced").expect("same-length replacement");
+
+        let error = verify_committed_rename(
+            &source,
+            &destination,
+            &proof,
+            FilesystemCapabilities::assumed_strict(),
+            FilesystemCapabilities::assumed_strict(),
+        )
+        .expect_err("strict object replacement must remain a hard proof failure");
+
+        assert!(error.contains("identity"), "unexpected error: {error}");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use super::app::*;
@@ -1480,7 +1481,7 @@ fn activate_archive_browse_directory(
     }
 }
 
-fn activate_browse_entry(
+pub(crate) fn activate_browse_entry(
     app: &mut AppState,
     idx: usize,
     tx: &mpsc::Sender<AppMessage>,
@@ -1523,8 +1524,52 @@ fn activate_browse_entry(
         return;
     }
 
-    let target = app.browse.return_target;
-    load_browse_selection_pub(app, entry.path.clone(), target);
+    activate_browse_file_path(app, entry.path.clone(), app.browse.return_target, tx);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowseFileActivation {
+    DirectSource,
+    ViewText,
+    Reject,
+}
+
+fn browse_file_activation(path: &std::path::Path) -> BrowseFileActivation {
+    if crate::convert::source_admission::is_direct_queue_source_path(path) {
+        BrowseFileActivation::DirectSource
+    } else if super::browse::is_viewable_text_file(path) {
+        BrowseFileActivation::ViewText
+    } else {
+        BrowseFileActivation::Reject
+    }
+}
+
+fn activate_browse_file_path(
+    app: &mut AppState,
+    path: std::path::PathBuf,
+    target: super::browse::BrowseReturnTarget,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match browse_file_activation(&path) {
+        BrowseFileActivation::DirectSource => load_browse_selection_pub(app, path, target),
+        BrowseFileActivation::ViewText => {
+            #[cfg(test)]
+            if let Some(dispatches) = app.test_view_file_dispatches.as_mut() {
+                dispatches.push(path);
+                return;
+            }
+            super::command::execute_command(app, super::command::Command::ViewFile(path), tx);
+        }
+        BrowseFileActivation::Reject => {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            app.set_status(format!(
+                "Cannot open {name}: not a supported audio, CUE, archive, disc-image, or viewable text file"
+            ));
+        }
+    }
 }
 
 fn convert_metadata_inline_fields_visible(app: &AppState) -> bool {
@@ -2146,7 +2191,7 @@ fn handle_browse_inline_edit_key(
             browse_inline_tab_advance(app, false, tx);
         }
         _ => {
-            let attempted_paste = key.code == KeyCode::Char('v')
+            let attempted_paste = matches!(key.code, KeyCode::Char('v' | 'p'))
                 && key.modifiers == KeyModifiers::CONTROL;
             let handled = app
                 .browse_inline_edit
@@ -2419,6 +2464,271 @@ mod inline_edit_behavior_tests {
 
         assert_eq!(app.current_screen, AppScreen::Convert);
         assert!(app.browse.multi_selected.is_empty());
+    }
+
+    #[test]
+    fn browse_file_activation_uses_central_source_admission_and_text_view_policy() {
+        for path in [
+            std::path::Path::new("track.flac"),
+            std::path::Path::new("disc.cue"),
+        ] {
+            assert_eq!(
+                browse_file_activation(path),
+                BrowseFileActivation::DirectSource,
+                "{} must use centralized source admission",
+                path.display(),
+            );
+        }
+        assert_eq!(
+            browse_file_activation(std::path::Path::new("notes.txt")),
+            BrowseFileActivation::ViewText,
+        );
+        for path in [
+            std::path::Path::new("cover.jpg"),
+            std::path::Path::new("payload.unknown"),
+            // A plain ISO is not queueable until the existing explicit disc
+            // probe promotes its Browse entry; that Archive/disc path remains
+            // handled before this regular-file admission decision.
+            std::path::Path::new("generic.iso"),
+        ] {
+            assert_eq!(
+                browse_file_activation(path),
+                BrowseFileActivation::Reject,
+                "{} must not install a Convert source",
+                path.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn text_double_click_dispatches_view_without_installing_a_convert_source() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("notes.txt");
+        std::fs::write(&file, b"inspect me").expect("text fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(file.clone())];
+        app.test_view_file_dispatches = Some(Vec::new());
+        app.button_map
+            .record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, click(), &tx);
+        handle_mouse(&mut app, click(), &tx);
+
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(matches!(app.convert.source.mode, SourceMode::Empty));
+        assert_eq!(app.test_view_file_dispatches, Some(vec![file]));
+    }
+
+    #[test]
+    fn cue_double_click_preserves_direct_source_activation() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("album.cue");
+        std::fs::write(&file, b"FILE \"album.flac\" WAVE\n").expect("cue fixture");
+        std::fs::write(temp.path().join("album.flac"), b"audio fixture")
+            .expect("referenced audio fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(file)];
+        app.button_map
+            .record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, click(), &tx);
+        handle_mouse(&mut app, click(), &tx);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert!(!matches!(app.convert.source.mode, SourceMode::Empty));
+    }
+
+    #[tokio::test]
+    async fn promoted_sacd_iso_double_click_preserves_disc_source_activation() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("disc.iso");
+        let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1)
+            * crate::tui::sacd::SECTOR_SIZE;
+        let mut iso = std::fs::File::create(&file).expect("ISO fixture");
+        iso.set_len(total).expect("size ISO fixture");
+        iso.seek(SeekFrom::Start(
+            crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE,
+        ))
+        .expect("seek ISO fixture");
+        iso.write_all(crate::tui::sacd::MASTER_TOC_MAGIC)
+            .expect("write SACD magic");
+        drop(iso);
+
+        let metadata = std::fs::metadata(&file).expect("ISO metadata");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            file.clone(),
+            "disc.iso".to_string(),
+            crate::convert::classify::EntryKind::SacdIso,
+            metadata.len(),
+            metadata.modified().ok(),
+        )];
+        app.button_map
+            .record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, click(), &tx);
+        handle_mouse(&mut app, click(), &tx);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert!(!matches!(app.convert.source.mode, SourceMode::Empty));
+    }
+
+    #[test]
+    fn enter_on_regular_file_remains_selection_only() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"selection fixture").expect("file");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(file.clone())];
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(matches!(app.convert.source.mode, SourceMode::Empty));
+        assert_eq!(app.browse.multi_selected, vec![file]);
+    }
+
+    #[test]
+    fn browse_activation_accepts_every_supported_archive_preview_extension() {
+        for name in [
+            "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.cab",
+            "album.dmg",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+        ] {
+            assert_eq!(
+                browse_file_activation(std::path::Path::new(name)),
+                BrowseFileActivation::DirectSource,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_recent_and_file_input_boundary_accepts_every_archive_preview_extension() {
+        for name in [
+            "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.cab",
+            "album.dmg",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+        ] {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+
+            install_convert_source_with_async_probe(&mut app, name.into());
+
+            assert_eq!(app.current_screen, AppScreen::Browse, "{name}");
+            assert!(matches!(app.convert.source.mode, SourceMode::Empty), "{name}");
+            assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+                message.contains("Cannot open archive preview")
+                    && !message.contains("unsupported")
+            }), "{name}: {:?}", app.status_message);
+        }
+    }
+
+    #[test]
+    fn shared_convert_source_boundary_rejects_unsupported_recent_or_file_input_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("cover.jpg");
+        std::fs::write(&image, b"not audio").expect("image fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+
+        install_convert_source_with_async_probe(&mut app, image);
+
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(matches!(app.convert.source.mode, SourceMode::Empty));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("Source activation refused")
+        }));
+    }
+
+    #[test]
+    fn rejected_double_click_file_does_not_switch_screen_or_install_source() {
+        let (tx, _rx) = channel();
+        for name in ["cover.jpg", "payload.unknown"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let file = temp.path().join(name);
+            std::fs::write(&file, b"not audio").expect("file");
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![browse_file_entry(file)];
+            app.button_map
+                .record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+            let click = || MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            handle_mouse(&mut app, click(), &tx);
+            handle_mouse(&mut app, click(), &tx);
+
+            assert_eq!(app.current_screen, AppScreen::Browse, "{name}");
+            assert!(matches!(app.convert.source.mode, SourceMode::Empty), "{name}");
+            assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+                message.contains("not a supported audio")
+            }), "{name}");
+        }
     }
 
     #[test]
@@ -3845,13 +4155,13 @@ fn handle_browse_tree_navigation_key(
     true
 }
 
-fn handle_browse_filesystem_clipboard_key(
+pub(crate) fn handle_browse_filesystem_clipboard_key(
     app: &mut AppState,
     key: KeyEvent,
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
     if key.modifiers != KeyModifiers::CONTROL
-        || !matches!(key.code, KeyCode::Char('c' | 'x' | 'v'))
+        || !matches!(key.code, KeyCode::Char('c' | 'x' | 'v' | 'p'))
     {
         return false;
     }
@@ -3867,14 +4177,14 @@ fn handle_browse_filesystem_clipboard_key(
         match key.code {
             KeyCode::Char('c') => super::context_menu::ContextAction::TreeCopy(path),
             KeyCode::Char('x') => super::context_menu::ContextAction::TreeCut(path),
-            KeyCode::Char('v') => super::context_menu::ContextAction::TreePaste(path),
+            KeyCode::Char('v' | 'p') => super::context_menu::ContextAction::TreePaste(path),
             _ => unreachable!(),
         }
     } else {
         match key.code {
             KeyCode::Char('c') => super::context_menu::ContextAction::CopySelection,
             KeyCode::Char('x') => super::context_menu::ContextAction::CutSelection,
-            KeyCode::Char('v') => super::context_menu::ContextAction::PasteSelection,
+            KeyCode::Char('v' | 'p') => super::context_menu::ContextAction::PasteSelection,
             _ => unreachable!(),
         }
     };
@@ -3906,7 +4216,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
             return;
         }
-        (KeyCode::Char('c' | 'x' | 'v'), KeyModifiers::CONTROL) => {
+        (KeyCode::Char('c' | 'x' | 'v' | 'p'), KeyModifiers::CONTROL) => {
             let handled = handle_browse_filesystem_clipboard_key(app, key, tx);
             debug_assert!(handled, "matched clipboard key must be handled");
             return;
@@ -4348,19 +4658,18 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
         return;
     }
 
-    // Search owns Browse dispatch while its panel is active. Previously, its
-    // non-text control focuses silently discarded Ctrl+V before the file
-    // clipboard arm, which explains why the isolated Ctrl+X/Ctrl+V probe passed
-    // while a live session could appear to do nothing. Only the input focus
-    // owns text paste; every other search focus delegates Ctrl+V to file paste.
-    if key.code == KeyCode::Char('v')
+    // Search owns Browse dispatch while its panel is active. Its non-text
+    // control focuses must delegate both paste chords to the file
+    // clipboard arm. Only the input focus owns in-app text paste; every other
+    // search focus delegates Ctrl+V/Ctrl+P to filesystem paste.
+    if matches!(key.code, KeyCode::Char('v' | 'p'))
         && key.modifiers == KeyModifiers::CONTROL
         && app.browse.search.focus != SearchFocus::Input
     {
         app.browse
             .set_navigation_pane(super::browse::BrowseNavigationPane::Files);
         let handled = handle_browse_filesystem_clipboard_key(app, key, tx);
-        debug_assert!(handled, "Ctrl+V must be recognized as a filesystem clipboard key");
+        debug_assert!(handled, "paste chord must be recognized as a filesystem clipboard key");
         return;
     }
 
@@ -4382,7 +4691,7 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                     app.browse.search.focus = super::browse::SearchFocus::Results;
                 }
                 _ => {
-                    let attempted_paste = key.code == KeyCode::Char('v')
+                    let attempted_paste = matches!(key.code, KeyCode::Char('v' | 'p'))
                         && key.modifiers == KeyModifiers::CONTROL;
                     let handled = super::text_input::handle_text_input_key(
                         &mut app.browse.search.input,
@@ -4546,7 +4855,7 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
         }
         // Everything else: feed to the text input, then re-apply view
         _ => {
-            let attempted_paste = key.code == KeyCode::Char('v')
+            let attempted_paste = matches!(key.code, KeyCode::Char('v' | 'p'))
                 && key.modifiers == KeyModifiers::CONTROL;
             let handled = app
                 .browse
@@ -4590,7 +4899,7 @@ fn handle_browse_path_input_key(app: &mut AppState, key: KeyEvent) {
             }
         }
         _ => {
-            let attempted_paste = key.code == KeyCode::Char('v')
+            let attempted_paste = matches!(key.code, KeyCode::Char('v' | 'p'))
                 && key.modifiers == KeyModifiers::CONTROL;
             let handled = app
                 .browse
@@ -4622,6 +4931,13 @@ pub fn load_browse_selection_pub(
     path: std::path::PathBuf,
     target: super::browse::BrowseReturnTarget,
 ) {
+    if !crate::convert::source_admission::is_direct_queue_source_path(&path) {
+        app.set_status(format!(
+            "Source activation refused for unsupported path: {}",
+            path.display()
+        ));
+        return;
+    }
     load_browse_selection(app, path, target);
 }
 
@@ -4737,6 +5053,18 @@ pub(super) fn start_browse_archive_listing(
 }
 
 fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::PathBuf) {
+    // This is the final shared boundary for Browse activation, recent-source
+    // activation, and direct file-input completion. Directories retain their
+    // existing folder-expansion path; every concrete file must pass the single
+    // conversion-source admission policy before any screen/source mutation.
+    if !path.is_dir() && !crate::convert::source_admission::is_direct_queue_source_path(&path) {
+        app.set_status(format!(
+            "Source activation refused for unsupported path: {}",
+            path.display()
+        ));
+        return;
+    }
+
     if super::command::browse_selection_contains_regular_audio_folder_for_convert(
         app,
         std::slice::from_ref(&path),
@@ -4755,15 +5083,21 @@ fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::
         return;
     }
 
-    app.cancel_browse_convert_expansion();
-
     if is_nonprobeable_source_for_probe(&path) {
-        if let Some(tx) = app.tui_tx.clone() {
-            install_archive_preview_convert_source(app, path, tx);
-            return;
+        match app.tui_tx.clone() {
+            Some(tx) => {
+                if let Err(error) = install_archive_preview_convert_source(app, path, tx) {
+                    app.set_status(error.to_string());
+                }
+            }
+            None => app.set_status(
+                "Cannot open archive preview: TUI worker channel is unavailable",
+            ),
         }
+        return;
     }
 
+    app.cancel_browse_convert_expansion();
     app.probe_generation = app.probe_generation.saturating_add(1);
     let generation = app.probe_generation;
     let probe_notice = source_probe_initial_notice(&path);
@@ -4858,9 +5192,18 @@ fn load_browse_selection(
                 return;
             }
             let mut count = 0;
+            let mut refused = 0;
             let mut password_reference_warning: Option<String> = None;
             let options = conversion_options_from_current_convert_output(app);
             for p in paths_to_add {
+                if !crate::convert::source_admission::is_direct_queue_source_path(&p) {
+                    refused += 1;
+                    log::error!(
+                        "Browse queue-return refused unsupported source {}",
+                        p.display()
+                    );
+                    continue;
+                }
                 // Resolve archive password:
                 // session override → configured reference → keychain MRU → None.
                 let archive_pw = if crate::is_encrypted_archive_ext(&p) {
@@ -4915,9 +5258,14 @@ fn load_browse_selection(
                 }
             }
             app.browse.clear_multi_selection();
+            let queue_status = if refused == 0 {
+                format!("Queued {} files", count)
+            } else {
+                format!("Queued {} files; refused {} unsupported paths", count, refused)
+            };
             let mut status = super::command::status_with_stale_selection_notice(
                 dropped_stale_count,
-                format!("Queued {} files", count),
+                queue_status,
             );
             if let Some(warning) = password_reference_warning {
                 status.push_str("; ");
@@ -5212,7 +5560,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             app.active_overlay = ActiveOverlay::FilePicker(session);
         }
         ActiveOverlay::FileTaskProgress(mut session) => {
-            if key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::CONTROL {
+            if matches!(key.code, KeyCode::Char('v' | 'p')) && key.modifiers == KeyModifiers::CONTROL {
                 app.set_status(if session.progress.is_terminal() {
                     "file-task results are open; press Enter or Esc to close them before pasting files"
                 } else {
@@ -8629,7 +8977,9 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
         title: "Select artwork image".to_string(),
         theme: file_picker_theme_from_theme(&app.theme),
         selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
-        operation_policy: artwork_file_picker_policy(),
+        operation_policy: artwork_file_picker_policy(
+            app.file_task_verbose_degrade_notices,
+        ),
         ..tui_file_picker::FilePickerConfig::default()
     });
     state.file_picker = Some(crate::tui::app::MetadataFilePickerState::new(
@@ -8638,9 +8988,13 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
     ));
 }
 
-
-fn artwork_file_picker_policy() -> tui_file_picker::FileOperationPolicy {
-    tui_file_picker::FileOperationPolicy::default()
+fn artwork_file_picker_policy(
+    verbose_degrade_notices: bool,
+) -> tui_file_picker::FileOperationPolicy {
+    tui_file_picker::FileOperationPolicy {
+        verbose_degrade_notices,
+        ..tui_file_picker::FileOperationPolicy::default()
+    }
 }
 
 pub(crate) fn file_picker_theme_from_theme(theme: &super::theme::Theme) -> tui_file_picker::FilePickerTheme {
@@ -10019,6 +10373,16 @@ fn handle_file_task_user_action(
     action: tui_file_picker::FileTaskUserAction,
 ) {
     use super::app::FileTaskControl;
+    if session.is_retained_viewer()
+        && !matches!(
+            action,
+            tui_file_picker::FileTaskUserAction::None
+                | tui_file_picker::FileTaskUserAction::Acknowledge
+        )
+    {
+        app.set_status("retained file-task results are read-only");
+        return;
+    }
     match action {
         tui_file_picker::FileTaskUserAction::None => {}
         tui_file_picker::FileTaskUserAction::Pause => {
@@ -10050,6 +10414,10 @@ fn handle_file_task_user_action(
             app.set_status("abort requested");
         }
         tui_file_picker::FileTaskUserAction::Acknowledge => {
+            if session.is_live_task() && session.progress.is_terminal() {
+                app.last_file_task_progress =
+                    Some((session.session_id, session.progress.clone()));
+            }
             app.active_overlay = ActiveOverlay::None;
         }
         tui_file_picker::FileTaskUserAction::ChooseConflictResolution(resolution) => {
@@ -25917,45 +26285,71 @@ fn focus_metadata_editor_on_track(
 /// to 1 file, promotes to `SourceMode::Single` and spawns a background
 /// probe for the remaining file.
 fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    // Capture the current cursor file + its cached info BEFORE removing.
-    let old_cursor_path = match &app.convert.source.mode {
-        SourceMode::Batch { paths, cursor, .. } => paths.get(*cursor).cloned(),
-        _ => None,
-    };
-    let old_cursor_info = match &app.convert.source.mode {
+    remove_batch_at_cursor_with_archive_starter(app, tx, |app, path, tx| {
+        install_archive_preview_convert_source(app, path, tx)
+    });
+}
+
+fn remove_batch_at_cursor_with_archive_starter<F>(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    mut start_archive: F,
+) where
+    F: FnMut(
+        &mut AppState,
+        PathBuf,
+        mpsc::Sender<AppMessage>,
+    ) -> Result<ArchivePreviewStarted, ArchivePreviewStartError>,
+{
+    // Build the complete proposed state from an immutable snapshot. In
+    // particular, do not remove paths or transfer CUE/synthetic ownership
+    // before a remaining singleton archive has passed its fallible preflight.
+    let (paths, cursor, old_cursor_info) = match &app.convert.source.mode {
         SourceMode::Batch {
+            paths,
+            cursor,
             cursor_info,
             cursor_metadata,
             ..
-        } => cursor_info
-            .as_ref()
-            .map(|info| (info.clone(), cursor_metadata.clone())),
-        _ => None,
-    };
-
-    let (remaining_paths, new_cursor, _removed_path) = match &mut app.convert.source.mode {
-        SourceMode::Batch { paths, cursor, .. } if !paths.is_empty() => {
-            let idx = (*cursor).min(paths.len() - 1);
-            let removed_path = paths.remove(idx);
-            app.convert.source.cue_artifact_audio.remove(&removed_path);
-            if app.convert.source.synthetic_cue_artifacts.remove(&removed_path) {
-                crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(&removed_path);
-            }
-            let new_cursor = idx.min(paths.len().saturating_sub(1));
-            (paths.clone(), new_cursor, removed_path)
-        }
+        } if !paths.is_empty() => (
+            paths.clone(),
+            (*cursor).min(paths.len() - 1),
+            cursor_info
+                .as_ref()
+                .map(|info| (info.clone(), cursor_metadata.clone())),
+        ),
         _ => return,
     };
 
+    let old_cursor_path = paths.get(cursor).cloned();
+    let mut remaining_paths = paths;
+    remaining_paths.remove(cursor);
+    let new_cursor = cursor.min(remaining_paths.len().saturating_sub(1));
+
     if remaining_paths.is_empty() {
         app.convert.set_source_mode(SourceMode::Empty);
-        app.convert.source.cue_artifact_audio.clear();
         return;
     }
 
     if remaining_paths.len() == 1 {
-        let path = remaining_paths.into_iter().next().unwrap();
-        // If this is the same file we already had info for, carry it over.
+        let path = remaining_paths
+            .into_iter()
+            .next()
+            .expect("one remaining path");
+
+        // Archive transition owns the complete source replacement. Start it
+        // while the original batch is still authoritative; on any preflight
+        // error only the status changes and the batch remains byte-for-byte
+        // intact, including cursor/cache and owned artifact sets.
+        if is_nonprobeable_source_for_probe(&path) {
+            if let Err(error) = start_archive(app, path, tx.clone()) {
+                app.set_status(error.to_string());
+            }
+            return;
+        }
+
+        // If the remaining file is the same cursor object whose probe result
+        // was already cached, normalize directly to Single without reprobe.
         if old_cursor_path.as_ref() == Some(&path) {
             if let Some((info, metadata)) = old_cursor_info {
                 app.convert.set_source_mode(SourceMode::Single {
@@ -25967,16 +26361,14 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
                 return;
             }
         }
-        if is_nonprobeable_source_for_probe(&path) {
-            install_archive_preview_convert_source(app, path, tx.clone());
-            return;
-        }
 
         app.probe_generation = app.probe_generation.saturating_add(1);
         let generation = app.probe_generation;
         let probe_notice = source_probe_initial_notice(&path);
-        app.convert
-            .set_source_mode(SourceMode::from_single_pending_probe(path.clone(), probe_notice.clone()));
+        app.convert.set_source_mode(SourceMode::from_single_pending_probe(
+            path.clone(),
+            probe_notice.clone(),
+        ));
         app.convert.apply_source_defaults();
         let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
         if probe_notice.is_some() {
@@ -25985,11 +26377,12 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         return;
     }
 
-    // Stay in Batch — recompute summary and move cursor.
+    // Stay in Batch: construct the normalized replacement first, then publish
+    // it through set_source_mode(), which retires stale probe ownership and
+    // filters CUE/synthetic ownership to the retained path set atomically.
     let new_cursor_path = remaining_paths.get(new_cursor).cloned();
     let mut new_mode = SourceMode::from_paths(remaining_paths);
 
-    // If the cursor landed on the same file, carry over cached info.
     let need_probe = if let SourceMode::Batch {
         cursor,
         cursor_info,
@@ -25999,10 +26392,10 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     {
         *cursor = new_cursor;
         if new_cursor_path == old_cursor_path {
-            if let Some((info, meta)) = old_cursor_info {
+            if let Some((info, metadata)) = old_cursor_info {
                 *cursor_info = Some(info);
-                *cursor_metadata = meta;
-                false // No probe needed.
+                *cursor_metadata = metadata;
+                false
             } else {
                 true
             }
@@ -26016,14 +26409,270 @@ fn remove_batch_at_cursor(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     app.convert.set_source_mode(new_mode);
 
     if need_probe {
-        if let Some(p) = new_cursor_path {
-            if !is_nonprobeable_source_for_probe(&p) {
-                app.convert.source.batch_probe_pending = Some(p.clone());
+        if let Some(path) = new_cursor_path {
+            if !is_nonprobeable_source_for_probe(&path) {
+                app.convert.source.batch_probe_pending = Some(path.clone());
                 let generation = app.probe_generation;
                 let baseline = ConvertProbeBaseline::capture(&app.convert);
-                spawn_convert_batch_cursor_probe(generation, p, baseline, tx.clone());
+                spawn_convert_batch_cursor_probe(generation, path, baseline, tx.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_removal_archive_atomicity_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::probe::SourceMetadata;
+    use std::collections::HashSet;
+
+    #[derive(Debug)]
+    struct BatchSnapshot {
+        mode: String,
+        cue_artifact_audio: HashSet<PathBuf>,
+        synthetic_cue_artifacts: HashSet<PathBuf>,
+        generation: u64,
+        batch_probe_pending: Option<PathBuf>,
+        batch_probe_debounce: Option<(PathBuf, std::time::Instant)>,
+        metadata: String,
+        format: String,
+        output_options: String,
+        screen: AppScreen,
+        previous_screen: Option<AppScreen>,
+    }
+
+    fn install_batch_fixture(
+        app: &mut AppState,
+        paths: Vec<PathBuf>,
+        cursor: usize,
+    ) {
+        let mut cursor_metadata = SourceMetadata::default();
+        cursor_metadata.title = Some("retained cursor title".to_string());
+        app.convert.source.mode = SourceMode::Batch {
+            paths: paths.clone(),
+            cursor,
+            cursor_info: None,
+            cursor_metadata,
+            probe_notice: Some("retained batch notice".to_string()),
+            cursor_probe_notice: Some((
+                paths[cursor].clone(),
+                "retained cursor notice".to_string(),
+            )),
+            total_size: 1234,
+            album_count: 2,
+            format_histogram: Vec::new(),
+        };
+        app.convert.source.batch_probe_pending = Some(paths[cursor].clone());
+        app.convert.source.batch_probe_debounce = Some((
+            paths[cursor].clone(),
+            std::time::Instant::now(),
+        ));
+
+        let cue_artifact_audio = paths
+            .iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("flac"))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let synthetic_cue_artifacts = paths
+            .iter()
+            .map(|path| path.with_extension("synthetic.cue"))
+            .collect::<HashSet<_>>();
+        app.convert.source.cue_artifact_audio = cue_artifact_audio;
+        app.convert.source.synthetic_cue_artifacts = synthetic_cue_artifacts;
+    }
+
+    fn snapshot(app: &AppState) -> BatchSnapshot {
+        BatchSnapshot {
+            mode: format!("{:?}", app.convert.source.mode),
+            cue_artifact_audio: app.convert.source.cue_artifact_audio.clone(),
+            synthetic_cue_artifacts: app.convert.source.synthetic_cue_artifacts.clone(),
+            generation: app.probe_generation,
+            batch_probe_pending: app.convert.source.batch_probe_pending.clone(),
+            batch_probe_debounce: app.convert.source.batch_probe_debounce.clone(),
+            metadata: format!("{:?}", app.convert.metadata),
+            format: format!("{:?}", app.convert.format),
+            output_options: format!("{:?}", app.convert.output_options),
+            screen: app.current_screen,
+            previous_screen: app.previous_screen,
+        }
+    }
+
+    fn assert_failure_atomic(app: &AppState, before: &BatchSnapshot, status_fragment: &str) {
+        assert_eq!(format!("{:?}", app.convert.source.mode), before.mode);
+        assert_eq!(
+            app.convert.source.cue_artifact_audio,
+            before.cue_artifact_audio
+        );
+        assert_eq!(
+            app.convert.source.synthetic_cue_artifacts,
+            before.synthetic_cue_artifacts
+        );
+        assert_eq!(app.probe_generation, before.generation);
+        assert_eq!(
+            app.convert.source.batch_probe_pending,
+            before.batch_probe_pending
+        );
+        assert_eq!(
+            app.convert.source.batch_probe_debounce,
+            before.batch_probe_debounce
+        );
+        assert_eq!(format!("{:?}", app.convert.metadata), before.metadata);
+        assert_eq!(format!("{:?}", app.convert.format), before.format);
+        assert_eq!(
+            format!("{:?}", app.convert.output_options),
+            before.output_options
+        );
+        assert_eq!(app.current_screen, before.screen);
+        assert_eq!(app.previous_screen, before.previous_screen);
+        assert!(app.convert.pending_archive_preview.is_none());
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("");
+        assert!(status.contains(status_fragment), "{status}");
+    }
+
+    fn archive_remaining_fixture(
+        archive_first: bool,
+    ) -> (tempfile::TempDir, AppState, PathBuf, PathBuf, usize) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let audio = temp.path().join("track.flac");
+        std::fs::write(&archive, b"archive fixture").expect("archive fixture");
+        std::fs::write(&audio, b"audio fixture").expect("audio fixture");
+        let (paths, cursor) = if archive_first {
+            (vec![archive.clone(), audio.clone()], 1)
+        } else {
+            (vec![audio.clone(), archive.clone()], 0)
+        };
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.previous_screen = Some(AppScreen::Browse);
+        app.probe_generation = 19;
+        install_batch_fixture(&mut app, paths, cursor);
+        (temp, app, archive, audio, cursor)
+    }
+
+    fn commit_archive_start_for_test(
+        app: &mut AppState,
+        path: PathBuf,
+        _tx: mpsc::Sender<AppMessage>,
+    ) -> Result<ArchivePreviewStarted, ArchivePreviewStartError> {
+        assert!(matches!(
+            &app.convert.source.mode,
+            SourceMode::Batch { paths, .. } if paths.len() == 2
+        ));
+        let generation = app
+            .probe_generation
+            .checked_add(1)
+            .expect("fixture generation");
+        app.probe_generation = generation;
+        clear_source_metadata_in_convert(&mut app.convert);
+        app.convert.set_source_mode(SourceMode::from_single_pending_probe(
+            path.clone(),
+            Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE.to_string()),
+        ));
+        app.current_screen = AppScreen::Convert;
+        app.set_status(format!("Extracting archive: {}", path.display()));
+        Ok(ArchivePreviewStarted {
+            generation,
+            archive_path: path,
+        })
+    }
+
+    #[test]
+    fn removing_first_item_promotes_remaining_archive_transactionally() {
+        let (_temp, mut app, archive, _audio, _cursor) = archive_remaining_fixture(false);
+        let (tx, _rx) = mpsc::channel(8);
+
+        remove_batch_at_cursor_with_archive_starter(
+            &mut app,
+            &tx,
+            commit_archive_start_for_test,
+        );
+
+        assert_eq!(app.convert.source.mode.current_path(), Some(&archive));
+        assert!(!matches!(&app.convert.source.mode, SourceMode::Batch { .. }));
+        assert_eq!(app.probe_generation, 20);
+        assert!(app.convert.source.cue_artifact_audio.is_empty());
+        assert!(app.convert.source.synthetic_cue_artifacts.is_empty());
+        assert!(app.convert.source.batch_probe_pending.is_none());
+        assert!(app.convert.source.batch_probe_debounce.is_none());
+        assert!(app.convert.source.mode.current_metadata().title.is_none());
+        let status = app.status_message.as_ref().map(|(message, _)| message.as_str()).unwrap_or("");
+        assert!(status.contains("Extracting archive"), "{status}");
+    }
+
+    #[test]
+    fn removing_last_item_promotes_remaining_archive_transactionally() {
+        let (_temp, mut app, archive, _audio, _cursor) = archive_remaining_fixture(true);
+        let (tx, _rx) = mpsc::channel(8);
+
+        remove_batch_at_cursor_with_archive_starter(
+            &mut app,
+            &tx,
+            commit_archive_start_for_test,
+        );
+
+        assert_eq!(app.convert.source.mode.current_path(), Some(&archive));
+        assert!(!matches!(&app.convert.source.mode, SourceMode::Batch { .. }));
+        assert_eq!(app.probe_generation, 20);
+        assert!(app.convert.source.cue_artifact_audio.is_empty());
+        assert!(app.convert.source.synthetic_cue_artifacts.is_empty());
+        assert!(app.convert.source.batch_probe_pending.is_none());
+        assert!(app.convert.source.batch_probe_debounce.is_none());
+        assert!(app.convert.source.mode.current_metadata().title.is_none());
+        let status = app.status_message.as_ref().map(|(message, _)| message.as_str()).unwrap_or("");
+        assert!(status.contains("Extracting archive"), "{status}");
+    }
+
+    #[test]
+    fn password_failure_preserves_complete_batch_state() {
+        let (_temp, mut app, _archive, _audio, _cursor) = archive_remaining_fixture(false);
+        let before = snapshot(&app);
+        let (tx, _rx) = mpsc::channel(1);
+
+        remove_batch_at_cursor_with_archive_starter(&mut app, &tx, |_app, path, _tx| {
+            Err(ArchivePreviewStartError::PasswordResolution(format!(
+                "injected password failure for {}",
+                path.display()
+            )))
+        });
+
+        assert_failure_atomic(&app, &before, "injected password failure");
+    }
+
+    #[test]
+    fn closed_channel_preserves_complete_batch_state() {
+        let (_temp, mut app, _archive, _audio, _cursor) = archive_remaining_fixture(true);
+        let before = snapshot(&app);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        remove_batch_at_cursor(&mut app, &tx);
+
+        assert_failure_atomic(&app, &before, "worker channel is closed");
+    }
+
+    #[test]
+    fn staging_allocation_failure_preserves_complete_batch_state() {
+        let (_temp, mut app, _archive, _audio, _cursor) = archive_remaining_fixture(false);
+        let before = snapshot(&app);
+        let (tx, _rx) = mpsc::channel(1);
+
+        remove_batch_at_cursor_with_archive_starter(&mut app, &tx, |_app, path, _tx| {
+            Err(ArchivePreviewStartError::StagingAllocation {
+                path: path.with_extension("staging"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected staging failure",
+                ),
+            })
+        });
+
+        assert_failure_atomic(&app, &before, "injected staging failure");
     }
 }
 
@@ -26272,16 +26921,18 @@ fn apply_text_edit(
             if !trimmed.is_empty() {
                 let persistence_error =
                     store_archive_password_for_path(app, &archive_path, trimmed).err();
-                super::app::install_archive_preview_convert_source(
+                match super::app::install_archive_preview_convert_source(
                     app,
                     archive_path,
                     tx.clone(),
-                );
-                match persistence_error {
-                    None => app.set_status("Password set; retrying archive preview"),
-                    Some(error) => app.set_status(format!(
-                        "{error}; retrying the preview with the session-only password"
-                    )),
+                ) {
+                    Ok(_) => match persistence_error {
+                        None => app.set_status("Password set; retrying archive preview"),
+                        Some(error) => app.set_status(format!(
+                            "{error}; retrying the preview with the session-only password"
+                        )),
+                    },
+                    Err(error) => app.set_status(error.to_string()),
                 }
             }
         }
@@ -26396,7 +27047,7 @@ fn start_file_op(
     progress.set_scope(file_task_scope_for_job(sources, std::path::Path::new(dest.trim())));
     let session = super::app::FileTaskProgressSession::new(progress, control_tx);
     let session_id = session.session_id;
-    app.active_overlay = ActiveOverlay::FileTaskProgress(session);
+    app.install_file_task_progress(session);
     app.set_status(format!(
         "{} {} item(s)...",
         if is_move { "moving" } else { "copying" },
@@ -26414,6 +27065,7 @@ fn start_file_op(
         conflict_policy,
         root_targets,
         clipboard_retry_plan,
+        verbose_degrade_notices: app.file_task_verbose_degrade_notices,
     };
     spawn_file_task_worker(job, tx.clone(), control_rx);
     Some(session_id)
@@ -26500,6 +27152,7 @@ struct FileTaskJob {
     conflict_policy: Option<tui_file_picker::ConflictPolicyPreset>,
     root_targets: Option<Vec<std::path::PathBuf>>,
     clipboard_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
+    verbose_degrade_notices: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27800,11 +28453,15 @@ impl FileTaskWorker {
                     source,
                     target,
                     &rename_proof,
+                    source_capabilities,
                     target_capabilities,
                 ) {
                     Ok(verification) => {
+                        if let Some(warning) = verification.warning {
+                            self.record_active_root_notice(source, warning);
+                        }
                         if verification.portable_evidence {
-                            self.record_active_root_notice(
+                            self.record_active_root_degrade_notice(
                                 source,
                                 "native rename was accepted using retained-handle/type/size/path-transition evidence because stable inode or nanosecond timestamp semantics are unavailable"
                                     .to_string(),
@@ -27813,10 +28470,11 @@ impl FileTaskWorker {
                         true
                     }
                     Err(error) => {
-                        // The rename has committed. Never attempt pathname
-                        // rollback after proof loss: the destination may now be
-                        // an unrelated replacement. The root is failed and is
-                        // deliberately excluded from completed-work counters.
+                        // Portable evidence is inconsistent, so completion
+                        // cannot be established. Never attempt pathname rollback
+                        // after a committed rename: the destination may now be an
+                        // unrelated replacement. This data-affecting uncertainty
+                        // remains a failed root rather than a routine degradation.
                         self.record_committed_failure(
                             source,
                             target,
@@ -27829,7 +28487,7 @@ impl FileTaskWorker {
                     }
                 };
                 if let Some(warning) = rename_mode.degraded_warning() {
-                    self.record_active_root_notice(source, warning.to_string());
+                    self.record_active_root_degrade_notice(source, warning.to_string());
                 }
                 self.move_recovery_by_source.remove(source);
                 self.record_move_directory_sync_warnings(source, target);
@@ -27889,7 +28547,7 @@ impl FileTaskWorker {
         }
         let source = node.source.as_path();
         if let Some(warning) = tui_file_picker::filesystem_identity_policy_notice(source) {
-            self.record_active_root_notice(source, warning);
+            self.record_active_root_degrade_notice(source, warning);
         }
         let (resolved_target, applied, conflict_skipped) = match decision {
             FileTaskConflictDecision::UsePath { path, applied } => (path, applied, false),
@@ -28294,7 +28952,7 @@ impl FileTaskWorker {
                 self.io_counters.rename_fallbacks.saturating_add(1);
         }
         if let Some(warning) = quarantine_mode.degraded_warning() {
-            self.record_active_root_notice(source, warning.to_string());
+            self.record_active_root_degrade_notice(source, warning.to_string());
         }
         // Quarantine publication and final source removal are separate durable
         // transitions. Synchronize the source parent at each boundary. A mount
@@ -28820,7 +29478,7 @@ impl FileTaskWorker {
                         self.io_counters.rename_fallbacks.saturating_add(1);
                 }
                 if let Some(warning) = publication_mode.degraded_warning() {
-                    self.record_active_root_notice(&node.source, warning.to_string());
+                    self.record_active_root_degrade_notice(&node.source, warning.to_string());
                 }
                 // Child copy operations already own the source copy/hash proof.
                 // Renaming this exact private staging root preserves those
@@ -29231,6 +29889,7 @@ impl FileTaskWorker {
             &temp_target,
             target,
             self.job.force || matches!(applied, FileTaskConflictApplied::Overwrite),
+            self.job.verbose_degrade_notices,
         ) {
             Ok(warnings) => warnings,
             Err(e) => {
@@ -29427,6 +30086,16 @@ impl FileTaskWorker {
                     );
                 }
             }
+        }
+    }
+
+    fn record_active_root_degrade_notice(
+        &mut self,
+        fallback_source: &std::path::Path,
+        notice: String,
+    ) {
+        if self.job.verbose_degrade_notices {
+            self.record_active_root_notice(fallback_source, notice);
         }
     }
 
@@ -30166,12 +30835,13 @@ fn finalize_temp_file(
     temp_path: &std::path::Path,
     target: &std::path::Path,
     replace_existing: bool,
+    verbose_degrade_notices: bool,
 ) -> Result<Vec<String>, String> {
     if replace_existing {
         replace_temp_file(temp_path, target)?;
         return Ok(Vec::new());
     }
-    persist_temp_file_no_clobber(temp_path, target)
+    persist_temp_file_no_clobber(temp_path, target, verbose_degrade_notices)
 }
 
 /// Persist a completed temporary file to its final destination without ever
@@ -30181,6 +30851,7 @@ fn finalize_temp_file(
 fn persist_temp_file_no_clobber(
     temp_path: &std::path::Path,
     target: &std::path::Path,
+    verbose_degrade_notices: bool,
 ) -> Result<Vec<String>, String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
@@ -30189,7 +30860,9 @@ fn persist_temp_file_no_clobber(
     let identity_policy = tui_file_picker::filesystem_identity_policy(target);
     match std::fs::hard_link(temp_path, target) {
         Ok(()) => {
-            let warnings = tui_file_picker::filesystem_identity_policy_notice(target)
+            let warnings = verbose_degrade_notices
+                .then(|| tui_file_picker::filesystem_identity_policy_notice(target))
+                .flatten()
                 .into_iter()
                 .collect::<Vec<_>>();
             let temporary_identity = tui_file_picker::snapshot_path(temp_path)
@@ -30257,7 +30930,9 @@ fn persist_temp_file_no_clobber(
                 "final destination path no longer names the file reserved by this operation: {e}"
             ))?;
         let mut warnings = warnings;
-        warnings.extend(tui_file_picker::filesystem_identity_policy_notice(target));
+        if verbose_degrade_notices {
+            warnings.extend(tui_file_picker::filesystem_identity_policy_notice(target));
+        }
         Ok(warnings)
     })();
     drop(reserved);
@@ -31145,6 +31820,7 @@ mod file_operation_safety_tests {
                 conflict_policy,
                 root_targets: None,
                 clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
             },
             tx,
             controls,
@@ -31183,6 +31859,7 @@ mod file_operation_safety_tests {
                         .collect(),
                 ),
                 clipboard_retry_plan: retry_plan,
+                verbose_degrade_notices: false,
             },
             tx,
             controls,
@@ -31850,6 +32527,7 @@ mod file_operation_safety_tests {
                 conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
             },
             tx,
             control_rx,
@@ -31896,6 +32574,7 @@ mod file_operation_safety_tests {
                 conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
             },
             tx,
             control_rx,
@@ -31921,7 +32600,7 @@ mod file_operation_safety_tests {
         output.sync_all().expect("sync temp");
         drop(output);
 
-        let err = finalize_temp_file(&temp_path, &target, false)
+        let err = finalize_temp_file(&temp_path, &target, false, false)
             .expect_err("no-clobber finalization must fail");
 
         assert!(err.contains("destination exists"), "unexpected error: {err}");
@@ -31940,7 +32619,7 @@ mod file_operation_safety_tests {
         output.sync_all().expect("sync temp");
         drop(output);
 
-        finalize_temp_file(&temp_path, &target, true).expect("explicit overwrite");
+        finalize_temp_file(&temp_path, &target, true, false).expect("explicit overwrite");
 
         assert_eq!(fs::read(&target).expect("target replaced"), b"new");
     }
@@ -31957,7 +32636,7 @@ mod file_operation_safety_tests {
         assert!(fs::symlink_metadata(&target).is_err(), "target starts absent");
 
         fs::write(&target, b"late").expect("late destination");
-        let err = finalize_temp_file(&temp_path, &target, false)
+        let err = finalize_temp_file(&temp_path, &target, false, false)
             .expect_err("late destination must not be clobbered");
 
         assert!(err.contains("destination exists"), "unexpected error: {err}");
@@ -32622,11 +33301,15 @@ pub(super) fn commit_browse_rename(
             }
             app.browse.probe_current_with_db(tx, Some(&app.db));
             super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-            let mut committed_warnings = rename_mode
-                .degraded_warning()
-                .map(str::to_string)
-                .into_iter()
-                .collect::<Vec<_>>();
+            let mut committed_warnings = if app.file_task_verbose_degrade_notices {
+                rename_mode
+                    .degraded_warning()
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             if let Err(error) = sync_file_task_directory(&parent) {
                 committed_warnings.push(format!(
                     "parent-directory synchronization failed: {error}"
@@ -34414,18 +35097,27 @@ mod manual_file_input_source_admission_tests {
             "side.rf64",
             "disc.cue",
             "album.7z",
+            "album.zip",
+            "album.rar",
+            "album.tar",
+            "album.tar.gz",
+            "album.tar.bz2",
+            "album.tar.xz",
+            "album.tar.zst",
+            "album.tar.lz",
+            "album.tar.lzma",
+            "album.dmg",
+            "album.cab",
+            "album.tgz",
+            "album.tbz2",
+            "album.txz",
         ] {
             assert!(manual_file_input_admits_path(Path::new(name)), "{name}");
         }
 
         for name in [
             "booklet.txt",
-            "album.zip",
-            "album.rar",
-            "album.tar",
-            "album.tar.gz",
-            "album.dmg",
-            "album.cab",
+            "cover.jpg",
             // A generic ISO is an archive-looking file, but it is not a
             // conversion source until the disc-image probes identify it as
             // SACD/DVD-A/DVD-V/Blu-ray.
@@ -34474,6 +35166,13 @@ fn add_path_to_queue(app: &mut AppState, path: &std::path::Path) {
             app.set_status(format!("Added {} files from folder", count));
         }
     } else {
+        if !manual_file_input_admits_path(path) {
+            app.set_status(format!(
+                "Source admission refused for unsupported path: {}",
+                path.display()
+            ));
+            return;
+        }
         match app.manager.add_file_blocking(path.to_path_buf(), options) {
             Ok(_) => app.set_status(format!(
                 "Added: {}",
@@ -35540,6 +36239,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Convert screen: tab bar ──
+            TuiButton::FileTaskMessages => {
+                super::command::execute_command(app, super::command::Command::FileTaskMessages, tx);
+            }
+
             TuiButton::Tab(n) => {
                 clear_browse_info_focus(app);
                 match n {
@@ -50250,45 +50953,44 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[tokio::test]
-    async fn files_ctrl_x_then_ctrl_v_starts_paste_task() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let src_dir = temp.path().join("src");
-        let dst_dir = temp.path().join("dst");
-        std::fs::create_dir(&src_dir).expect("src");
-        std::fs::create_dir(&dst_dir).expect("dst");
-        let file = src_dir.join("track.flac");
-        std::fs::write(&file, b"audio").expect("fixture");
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
-        app.current_screen = AppScreen::Browse;
-        app.browse.current_dir = src_dir.clone();
-        app.browse.entries = vec![browse_file_entry(file.clone())];
-        app.browse
-            .set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
-        let (tx, _rx) = mpsc::channel(16);
+    async fn files_ctrl_x_then_ctrl_v_or_ctrl_p_starts_paste_task() {
+        for paste_chord in ['v', 'p'] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let src_dir = temp.path().join("src");
+            let dst_dir = temp.path().join("dst");
+            std::fs::create_dir(&src_dir).expect("src");
+            std::fs::create_dir(&dst_dir).expect("dst");
+            let file = src_dir.join("track.flac");
+            std::fs::write(&file, b"audio").expect("fixture");
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = src_dir.clone();
+            app.browse.entries = vec![browse_file_entry(file.clone())];
+            app.browse
+                .set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
+            let (tx, _rx) = mpsc::channel(16);
 
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-            &tx,
-        );
-        assert!(
-            app.browse.filesystem_clipboard.is_some(),
-            "cut must stage clipboard"
-        );
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                &tx,
+            );
+            assert!(app.browse.filesystem_clipboard.is_some(), "cut must stage clipboard");
 
-        app.browse.current_dir = dst_dir;
-        app.browse.entries.clear();
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
-            &tx,
-        );
+            app.browse.current_dir = dst_dir;
+            app.browse.entries.clear();
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(paste_chord), KeyModifiers::CONTROL),
+                &tx,
+            );
 
-        assert!(
-            app.browse.pending_clipboard_paste.is_some(),
-            "Ctrl+V must start a paste task; status={:?}",
-            app.status_message
-        );
+            assert!(
+                app.browse.pending_clipboard_paste.is_some(),
+                "Ctrl+{paste_chord} must start a paste task; status={:?}",
+                app.status_message
+            );
+        }
     }
 
     #[tokio::test]
@@ -50337,7 +51039,7 @@ mod file_picker_browse_parity_regression_tests {
 
             assert!(
                 app.browse.pending_clipboard_paste.is_some(),
-                "search focus {focus:?} must delegate Ctrl+V to file paste; status={:?}",
+                "search focus {focus:?} must delegate the paste chord to file paste; status={:?}",
                 app.status_message
             );
         }
@@ -50449,6 +51151,7 @@ mod file_picker_browse_parity_regression_tests {
                 conflict_policy: None,
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
             },
             tx,
             control_rx,
@@ -50499,6 +51202,7 @@ mod file_picker_browse_parity_regression_tests {
                 conflict_policy: None,
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
             },
             tx,
             control_rx,
@@ -50556,6 +51260,7 @@ mod file_picker_browse_parity_regression_tests {
                 conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
             },
             tx,
             control_rx,
@@ -50582,6 +51287,30 @@ mod file_picker_browse_parity_regression_tests {
             .as_deref()
             .is_some_and(|message| message.contains("partial move only")));
         assert!(worker.terminal_error.is_some());
+    }
+
+    #[test]
+    fn routine_degrade_notices_are_quiet_by_default_and_visible_in_verbose_mode() {
+        let source = std::path::PathBuf::from("/music/source.flac");
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test(false, control_rx);
+        worker.active_root_source = Some(source.clone());
+
+        worker.record_active_root_degrade_notice(
+            &source,
+            "routine reduced-filesystem notice".to_string(),
+        );
+        assert!(worker.pending_root_notices.is_empty());
+
+        worker.job.verbose_degrade_notices = true;
+        worker.record_active_root_degrade_notice(
+            &source,
+            "routine reduced-filesystem notice".to_string(),
+        );
+        assert!(worker
+            .pending_root_notices
+            .get(&source)
+            .is_some_and(|notice| notice.contains("routine reduced-filesystem")));
     }
 
     #[test]

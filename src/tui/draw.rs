@@ -80,6 +80,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
                 app.current_screen,
                 &mut app.button_map,
                 status_msg,
+                app.last_file_task_progress.is_some(),
                 theme,
             );
         }
@@ -455,6 +456,7 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
         app.current_screen,
         &mut app.button_map,
         status_msg,
+        app.last_file_task_progress.is_some(),
         theme,
     );
 }
@@ -481,6 +483,7 @@ fn draw_placeholder_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut
         app.current_screen,
         &mut app.button_map,
         status_msg,
+        app.last_file_task_progress.is_some(),
         theme,
     );
 }

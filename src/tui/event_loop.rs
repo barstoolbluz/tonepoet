@@ -197,7 +197,7 @@ pub async fn run_app(
             match event::read()? {
                 Event::Key(key) => handle_key(app, key, &tx),
                 Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),
-                Event::Paste(text) => handle_paste(app, &text),
+                Event::Paste(text) => handle_paste(app, &text, &tx),
                 Event::Resize(_, _) => app.refresh_image_picker_after_resize(),
                 _ => {}
             }
@@ -995,13 +995,13 @@ fn reduce_file_picker_complete(
     }
 }
 
-
 fn reduce_file_task_progress(
     app: &mut AppState,
     session_id: u64,
     update: tui_file_picker::FileTaskProgressUpdate,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    let retained_update = update.clone();
     let terminal = matches!(
         &update,
         tui_file_picker::FileTaskProgressUpdate::Finished { .. }
@@ -1024,24 +1024,94 @@ fn reduce_file_task_progress(
         }
     };
 
+    let authoritative_session_id = app
+        .last_file_task_progress
+        .as_ref()
+        .map(|(retained_session_id, _)| *retained_session_id);
+    let update_is_stale = authoritative_session_id.is_some_and(|id| id > session_id);
     let mut status_to_set: Option<String> = None;
     let mut refresh_after_terminal = false;
+    let mut live_progress_snapshot = None;
     match &mut app.active_overlay {
-        ActiveOverlay::FileTaskProgress(session) if session.session_id == session_id => {
-            session.progress.apply_update(update);
+        ActiveOverlay::FileTaskProgress(session)
+            if session.session_id == session_id && session.is_live_task() =>
+        {
+            session.progress.apply_update(update.clone());
+            live_progress_snapshot = Some(session.progress.clone());
             status_to_set = status;
             refresh_after_terminal = terminal;
         }
-        ActiveOverlay::FileTaskProgress(_) => {
-            status_to_set = Some(format!("file task: ignored stale progress for session {session_id}"));
+        ActiveOverlay::FileTaskProgress(session)
+            if session.session_id == session_id && session.is_retained_viewer() =>
+        {
+            // Keep an open read-only viewer current for the same underlying
+            // task, but never use its clone as ordering or retention authority.
+            session.progress.apply_update(update.clone());
+            if !update_is_stale {
+                status_to_set = status;
+                refresh_after_terminal = terminal;
+            }
         }
-        _ if terminal => {
+        ActiveOverlay::FileTaskProgress(session) if session.is_live_task() => {
+            if session.session_id > session_id {
+                status_to_set = Some(format!(
+                    "file task: ignored stale progress for session {session_id}"
+                ));
+            } else {
+                // The presentation layer still owns an older live overlay, but
+                // the newer task's session-owned retained state must progress.
+                status_to_set = status;
+                refresh_after_terminal = terminal;
+            }
+        }
+        ActiveOverlay::FileTaskProgress(_) => {
+            // A retained-results viewer is presentation-only and never
+            // participates in session ordering. Authoritative retained state
+            // below decides whether this update is current or stale.
+            if !update_is_stale {
+                status_to_set = status;
+                refresh_after_terminal = terminal;
+            }
+        }
+        _ if terminal && !update_is_stale => {
             status_to_set = status;
             refresh_after_terminal = true;
         }
         _ => {}
     }
 
+    if let Some(progress) = live_progress_snapshot {
+        app.last_file_task_progress = Some((session_id, progress));
+    } else {
+        let mut install_terminal_fallback = false;
+        match &mut app.last_file_task_progress {
+            Some((retained_session_id, retained)) if *retained_session_id == session_id => {
+                retained.apply_update(retained_update.clone());
+            }
+            Some((retained_session_id, _)) if *retained_session_id > session_id => {
+                // A late update from an older task must not displace the newer
+                // session's retained diagnostics.
+            }
+            Some(_) | None if terminal => {
+                install_terminal_fallback = true;
+            }
+            Some(_) | None => {}
+        }
+
+        if install_terminal_fallback {
+            // Defensive recovery for a task started by an older or external
+            // host path that did not seed retained state. Production launch
+            // sites use `AppState::install_file_task_progress`, so this is a
+            // last-resort guarantee rather than the normal lifecycle.
+            let mut retained = tui_file_picker::FileTaskProgressState::new(
+                tui_file_picker::FileTaskKind::Custom("File task".to_string()),
+                "File task",
+                super::keybindings::file_picker_theme_from_theme(&app.theme),
+            );
+            retained.apply_update(retained_update);
+            app.last_file_task_progress = Some((session_id, retained));
+        }
+    }
     if let Some(status) = status_to_set {
         app.set_status(status);
     }
@@ -1058,10 +1128,55 @@ fn reduce_file_task_progress(
     }
 }
 
-
-
 fn path_lexists(path: &std::path::Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
+}
+
+fn terminal_update_from_completion_report(
+    report: &tui_file_picker::FileTaskCompletionReport,
+) -> tui_file_picker::FileTaskProgressUpdate {
+    let mut totals = tui_file_picker::ProgressTotals {
+        items_total: Some(report.roots.len() as u64),
+        ..tui_file_picker::ProgressTotals::default()
+    };
+    let mut has_warning = false;
+    for root in &report.roots {
+        totals.items_done = totals.items_done.saturating_add(1);
+        match root.disposition {
+            tui_file_picker::FileTaskRootDisposition::Completed => {
+                totals.completed = totals.completed.saturating_add(1);
+            }
+            tui_file_picker::FileTaskRootDisposition::CompletedWithWarning => {
+                totals.completed = totals.completed.saturating_add(1);
+                has_warning = true;
+            }
+            tui_file_picker::FileTaskRootDisposition::Skipped => {
+                totals.skipped = totals.skipped.saturating_add(1);
+            }
+            tui_file_picker::FileTaskRootDisposition::Failed => {
+                totals.errors = totals.errors.saturating_add(1);
+            }
+            tui_file_picker::FileTaskRootDisposition::NotAttempted => {
+                totals.not_attempted = totals.not_attempted.saturating_add(1);
+            }
+        }
+    }
+
+    if totals.errors > 0 || totals.not_attempted > 0 {
+        tui_file_picker::FileTaskProgressUpdate::Failed {
+            status: "File task completed with incomplete roots".to_string(),
+            totals,
+        }
+    } else {
+        tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: if has_warning {
+                "File task completed with warnings".to_string()
+            } else {
+                "File task completed".to_string()
+            },
+            totals,
+        }
+    }
 }
 
 fn reduce_file_task_complete(
@@ -1071,6 +1186,61 @@ fn reduce_file_task_complete(
     worker_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    let terminal_update = terminal_update_from_completion_report(&report);
+    let mut active_progress_snapshot = None;
+    if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+        if session.session_id == session_id {
+            if !session.progress.is_terminal() {
+                session.progress.apply_update(terminal_update.clone());
+            }
+            session.progress.append_completion_report(&report);
+            if session.is_live_task() {
+                active_progress_snapshot = Some(session.progress.clone());
+            }
+        }
+    }
+    if let Some(progress) = active_progress_snapshot {
+        app.last_file_task_progress = Some((session_id, progress));
+    } else {
+        let mut install_completion_fallback = false;
+        match &mut app.last_file_task_progress {
+            Some((retained_session_id, retained)) if *retained_session_id == session_id => {
+                if !retained.is_terminal() {
+                    retained.apply_update(terminal_update.clone());
+                }
+                retained.append_completion_report(&report);
+            }
+            Some((retained_session_id, _)) if *retained_session_id > session_id => {
+                // A stale completion cannot replace diagnostics for a newer
+                // task. The report still feeds any matching clipboard reducer
+                // below, but it is not exposed as "most recent".
+            }
+            Some(_) | None => {
+                install_completion_fallback = true;
+            }
+        }
+
+        if install_completion_fallback {
+            // Preserve the authoritative root report even if presentation
+            // state was removed before both the terminal update and completion
+            // report, or if an older retained session was still installed.
+            let kind = if report.is_move {
+                tui_file_picker::FileTaskKind::Move
+            } else {
+                tui_file_picker::FileTaskKind::Copy
+            };
+            let title = if report.is_move { "Moving files" } else { "Copying files" };
+            let mut progress = tui_file_picker::FileTaskProgressState::new(
+                kind,
+                title,
+                super::keybindings::file_picker_theme_from_theme(&app.theme),
+            );
+            progress.apply_update(terminal_update);
+            progress.append_completion_report(&report);
+            app.last_file_task_progress = Some((session_id, progress));
+        }
+    }
+
     let matches_pending = app
         .browse
         .pending_clipboard_paste
@@ -1981,7 +2151,7 @@ fn start_browse_archive_repackage_inner(
     });
     let session = super::app::FileTaskProgressSession::new(progress, control_tx);
     let progress_session_id = session.session_id;
-    app.active_overlay = super::app::ActiveOverlay::FileTaskProgress(session);
+    app.install_file_task_progress(session);
     clear_preserved_editor_archive_repackage_context(app, &context);
     app.browse_archive_repackage = Some(context);
     app.browse_archive_repackage_progress_session_id = Some(progress_session_id);
@@ -3078,12 +3248,25 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             options.cue_generation_mode = app.config.conversion.cue_generation_mode.clone();
 
             let mut count = 0;
+            let mut refused = 0;
             for path in paths {
+                if !crate::convert::source_admission::is_direct_queue_source_path(&path) {
+                    refused += 1;
+                    log::error!(
+                        "directory scan produced unsupported source {}; refusing queue admission",
+                        path.display()
+                    );
+                    continue;
+                }
                 if app.manager.add_file_blocking(path, options.clone()).is_ok() {
                     count += 1;
                 }
             }
-            app.set_status(format!("Added {} files", count));
+            app.set_status(if refused == 0 {
+                format!("Added {} files", count)
+            } else {
+                format!("Added {} files; refused {} unsupported paths", count, refused)
+            });
             app.save_queue();
         }
         AppMessage::StatusMessage(msg) => {
@@ -5652,7 +5835,28 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
 /// Handle a bracketed paste event. When the BulkRename overlay is active,
 /// multi-line paste replaces the template-derived targets line-by-line.
 /// In text input overlays, the pasted text is inserted at the cursor.
-fn handle_paste(app: &mut AppState, text: &str) {
+fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
+    // The dedicated picker owns its focused text fields. When navigation owns
+    // focus, an intercepted Ctrl+V arrives as Event::Paste and is promoted to
+    // the same filesystem-paste command as Ctrl+V/Ctrl+P.
+    let mut picker_empty_clipboard = false;
+    if let ActiveOverlay::FilePicker(session) = &mut app.active_overlay {
+        if session.picker.handle_terminal_paste(text) {
+            return;
+        }
+        if session.picker.has_filesystem_clipboard() {
+            let _ = session.picker.paste_clipboard();
+            return;
+        }
+        picker_empty_clipboard = true;
+    }
+    if picker_empty_clipboard {
+        app.set_status(
+            "terminal paste found no focused text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field",
+        );
+        return;
+    }
+
     match &app.active_overlay {
         ActiveOverlay::BulkRename(_) => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
@@ -5754,6 +5958,21 @@ fn handle_paste(app: &mut AppState, text: &str) {
         ActiveOverlay::MetadataEditor(_) => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             if let ActiveOverlay::MetadataEditor(mut state) = overlay {
+                if let Some(file_picker) = state.file_picker.as_mut() {
+                    if file_picker.picker.handle_terminal_paste(text) {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        return;
+                    }
+                    if file_picker.picker.has_filesystem_clipboard() {
+                        let _ = file_picker.picker.paste_clipboard();
+                    } else {
+                        app.set_status(
+                            "terminal paste found no focused picker text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field",
+                        );
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
                 use super::app::MetadataEditorPhase;
                 if state.phase == MetadataEditorPhase::DetailEdit {
                     let field_idx = state.detail_field_idx;
@@ -5793,27 +6012,26 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 "terminal paste is unavailable while file-task progress is open; close it before editing text",
             );
         }
-        _ => {
+        ActiveOverlay::None => {
+            if app.current_screen != super::app::AppScreen::Browse {
+                app.set_status(
+                    "terminal paste has no focused text editor on this screen; return to Browse for filesystem paste",
+                );
+                return;
+            }
             // Browse-local editors are not ActiveOverlay variants. Route the
             // terminal clipboard through the same focus precedence as key
             // dispatch and replace any active selection at the cursor.
-            if app.current_screen != super::app::AppScreen::Browse {
-                return;
-            }
             let first_line = text.lines().next().unwrap_or("");
             if let Some(edit) = app.browse_inline_edit.as_mut() {
                 edit.input.insert_string(first_line);
                 return;
             }
-            if app.browse.search.active {
-                if app.browse.search.focus == super::browse::SearchFocus::Input {
-                    app.browse.search.input.insert_string(first_line);
-                    app.browse.search.last_keystroke = Some(std::time::Instant::now());
-                } else {
-                    app.set_status(
-                        "terminal paste has no focused text field; Tab to the search input first",
-                    );
-                }
+            if app.browse.search.active
+                && app.browse.search.focus == super::browse::SearchFocus::Input
+            {
+                app.browse.search.input.insert_string(first_line);
+                app.browse.search.last_keystroke = Some(std::time::Instant::now());
                 return;
             }
             if let Some(input) = app.browse.path_input.as_mut() {
@@ -5825,8 +6043,21 @@ fn handle_paste(app: &mut AppState, text: &str) {
                 app.browse.update_filter_from_input();
                 return;
             }
+            if app.browse.filesystem_clipboard.is_some() {
+                let paste_key = crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('p'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                );
+                super::keybindings::handle_browse_filesystem_clipboard_key(app, paste_key, tx);
+            } else {
+                app.set_status(
+                    "terminal paste found no focused text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field; Ctrl+P is the alternate paste chord",
+                );
+            }
+        }
+        _ => {
             app.set_status(
-                "terminal paste has no focused text editor; Ctrl+V is reserved for file paste",
+                "terminal paste is unavailable while this overlay is open; close it before pasting",
             );
         }
     }
@@ -5836,8 +6067,57 @@ fn handle_paste(app: &mut AppState, text: &str) {
 mod browse_bracketed_paste_tests {
     use super::*;
     use crate::config::TonepoetConfig;
-    use crate::tui::app::{BrowseInlineEditState, BrowseInlineEditTarget};
+    use crate::tui::app::{
+        BrowseInlineEditState, BrowseInlineEditTarget, FilePickerPurpose,
+        MetadataFilePickerState,
+    };
     use crate::tui::text_input::TextInputState;
+
+    fn test_tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(8);
+        tx
+    }
+
+    fn select_picker_tree_path(
+        picker: &mut tui_file_picker::FilePickerState,
+        target: &std::path::Path,
+    ) {
+        // The initial tree materializes only roots plus the start_dir ancestor
+        // chain; ancestors of `target` are (re)expanded on the way down via
+        // toggle_tree_node, which reads children live with the picker's own
+        // show_hidden policy. A collapse+expand double-toggle refreshes
+        // ancestors that were pre-expanded with stale or hidden-excluded
+        // children. tempdirs sit under dot-prefixed paths, so fixtures must
+        // enable show_hidden.
+        picker.set_focus(tui_file_picker::FilePickerFocus::Tree);
+        let mut index = 0usize;
+        for _ in 0..131072 {
+            picker.set_tree_cursor(index, usize::MAX);
+            let Some(current) = picker.tree_cursor_path().map(std::path::Path::to_path_buf)
+            else {
+                break;
+            };
+            if current == target {
+                return;
+            }
+            if target.starts_with(&current) {
+                if picker.tree_cursor_is_expanded() {
+                    picker.toggle_tree_node(index);
+                }
+                picker.toggle_tree_node(index);
+                index += 1;
+                continue;
+            }
+            let before = picker.tree_cursor_path().map(std::path::Path::to_path_buf);
+            picker.set_tree_cursor(index + 1, usize::MAX);
+            let after = picker.tree_cursor_path().map(std::path::Path::to_path_buf);
+            if before == after {
+                break;
+            }
+            index += 1;
+        }
+        panic!("picker tree path was not materialized: {}", target.display());
+    }
 
     #[test]
     fn bracketed_paste_replaces_browse_inline_selection() {
@@ -5850,7 +6130,7 @@ mod browse_bracketed_paste_tests {
             input: TextInputState::new_selected("track.flac".to_string()),
         });
 
-        handle_paste(&mut app, "renamed.flac\nignored");
+        handle_paste(&mut app, "renamed.flac\nignored", &test_tx());
 
         let input = &app.browse_inline_edit.as_ref().expect("inline edit").input;
         assert_eq!(input.text, "renamed.flac");
@@ -5867,7 +6147,7 @@ mod browse_bracketed_paste_tests {
         app.browse.path_input = Some(TextInputState::new_selected("/old/path".to_string()));
         app.browse.filter_input = Some(TextInputState::new_selected("old filter".to_string()));
 
-        handle_paste(&mut app, "new search");
+        handle_paste(&mut app, "new search", &test_tx());
 
         assert_eq!(app.browse.search.input.text, "new search");
         assert_eq!(
@@ -5880,11 +6160,272 @@ mod browse_bracketed_paste_tests {
         );
 
         app.browse.search.active = false;
-        handle_paste(&mut app, "/new/path");
+        handle_paste(&mut app, "/new/path", &test_tx());
         assert_eq!(
             app.browse.path_input.as_ref().expect("path input").text,
             "/new/path"
         );
+    }
+
+    #[tokio::test]
+    async fn bracketed_paste_without_text_focus_starts_filesystem_paste_when_available() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir(&source_dir).expect("source dir");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Browse;
+        app.browse.current_dir = destination_dir;
+        app.browse.filesystem_clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![source],
+        );
+
+        handle_paste(&mut app, "terminal clipboard payload is intentionally ignored", &test_tx());
+
+        assert!(
+            app.browse.pending_clipboard_paste.is_some(),
+            "intercepted Ctrl+V must become file paste when no editor owns focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn bracketed_paste_with_search_results_focus_starts_filesystem_paste() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir(&source_dir).expect("source dir");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Browse;
+        app.browse.current_dir = destination_dir;
+        app.browse.search.active = true;
+        app.browse.search.focus = super::super::browse::SearchFocus::Results;
+        app.browse.filesystem_clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![source],
+        );
+
+        handle_paste(&mut app, "ignored terminal payload", &test_tx());
+
+        assert!(app.browse.pending_clipboard_paste.is_some());
+    }
+
+    #[tokio::test]
+    async fn picker_files_bracketed_paste_uses_current_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir(&source_dir).expect("source dir");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+
+        let mut picker = tui_file_picker::FilePickerState::new(
+            tui_file_picker::FilePickerConfig {
+                start_dir: source_dir,
+                show_hidden: true,
+                ..tui_file_picker::FilePickerConfig::default()
+            },
+        );
+        let source_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source visible");
+        picker.set_file_cursor(source_index, 4);
+        picker.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(picker.navigate_to_dir(destination_dir.clone()));
+        picker.set_focus(tui_file_picker::FilePickerFocus::Files);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+            FilePickerPurpose::SelectFile,
+            picker,
+        ));
+
+        handle_paste(
+            &mut app,
+            "terminal clipboard payload is intentionally ignored",
+            &test_tx(),
+        );
+
+        let expected = destination_dir.join("track.flac");
+        for _ in 0..200 {
+            if expected.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            expected.exists(),
+            "intercepted Ctrl+V must use current_dir while Files owns focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn picker_tree_bracketed_paste_uses_the_selected_tree_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let current_dir = temp.path().join("current");
+        let tree_target = temp.path().join("tree-target");
+        std::fs::create_dir(&source_dir).expect("source dir");
+        std::fs::create_dir(&current_dir).expect("current dir");
+        std::fs::create_dir(&tree_target).expect("tree target");
+        let source = source_dir.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+
+        let mut picker = tui_file_picker::FilePickerState::new(
+            tui_file_picker::FilePickerConfig {
+                start_dir: source_dir,
+                show_hidden: true,
+                ..tui_file_picker::FilePickerConfig::default()
+            },
+        );
+        let source_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source visible");
+        picker.set_file_cursor(source_index, 4);
+        picker.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(picker.navigate_to_dir(current_dir.clone()));
+        select_picker_tree_path(&mut picker, &tree_target);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+            FilePickerPurpose::SelectFile,
+            picker,
+        ));
+
+        handle_paste(
+            &mut app,
+            "terminal clipboard payload is intentionally ignored",
+            &test_tx(),
+        );
+
+        let expected = tree_target.join("track.flac");
+        for _ in 0..200 {
+            if expected.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(expected.exists(), "intercepted Ctrl+V must use Tree target");
+        assert!(
+            !current_dir.join("track.flac").exists(),
+            "intercepted Ctrl+V must not paste into current_dir while Tree owns focus"
+        );
+    }
+
+    #[test]
+    fn picker_tree_bracketed_paste_with_empty_clipboard_reports_guidance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tree_target = temp.path().join("tree-target");
+        std::fs::create_dir(&tree_target).expect("tree target");
+        let mut picker = tui_file_picker::FilePickerState::new(
+            tui_file_picker::FilePickerConfig {
+                start_dir: temp.path().to_path_buf(),
+                show_hidden: true,
+                ..tui_file_picker::FilePickerConfig::default()
+            },
+        );
+        select_picker_tree_path(&mut picker, &tree_target);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+            FilePickerPurpose::SelectFile,
+            picker,
+        ));
+
+        handle_paste(&mut app, "ignored terminal payload", &test_tx());
+
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("filesystem clipboard is empty")
+                && message.contains("Ctrl+C/Ctrl+X")
+        }));
+    }
+
+    #[test]
+    fn picker_tree_bracketed_paste_respects_disabled_paste_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let tree_target = temp.path().join("tree-target");
+        std::fs::create_dir(&source_dir).expect("source dir");
+        std::fs::create_dir(&tree_target).expect("tree target");
+        let source = source_dir.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+
+        let mut picker = tui_file_picker::FilePickerState::new(
+            tui_file_picker::FilePickerConfig {
+                start_dir: source_dir,
+                show_hidden: true,
+                ..tui_file_picker::FilePickerConfig::default()
+            },
+        );
+        let source_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source visible");
+        picker.set_file_cursor(source_index, 4);
+        picker.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        select_picker_tree_path(&mut picker, &tree_target);
+        let mut policy = picker.file_operation_policy();
+        policy.allow_paste = false;
+        picker.set_file_operation_policy(policy);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+            FilePickerPurpose::SelectFile,
+            picker,
+        ));
+        handle_paste(&mut app, "ignored terminal payload", &test_tx());
+
+        let ActiveOverlay::FilePicker(session) = &app.active_overlay else {
+            panic!("picker overlay must remain open");
+        };
+        assert!(matches!(
+            session.picker.last_error(),
+            Some(tui_file_picker::FilePickerError::OperationDisabled("paste"))
+        ));
+        assert!(!tree_target.join("track.flac").exists());
+    }
+
+    #[test]
+    fn bracketed_paste_outside_browse_never_starts_a_stale_filesystem_paste() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Convert;
+        app.browse.filesystem_clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![source],
+        );
+
+        handle_paste(&mut app, "terminal text", &test_tx());
+
+        assert!(app.browse.pending_clipboard_paste.is_none());
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("return to Browse")
+        }));
     }
 
     #[test]
@@ -5892,10 +6433,10 @@ mod browse_bracketed_paste_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = super::super::app::AppScreen::Browse;
 
-        handle_paste(&mut app, "text");
+        handle_paste(&mut app, "text", &test_tx());
 
         assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
-            message.contains("Ctrl+V is reserved for file paste")
+            message.contains("filesystem clipboard is empty") && message.contains("Ctrl+P")
         }));
     }
 }
@@ -5936,7 +6477,8 @@ mod metadata_detail_paste_tests {
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
-        handle_paste(&mut app, "Solo\nDelta");
+        let (tx, _rx) = mpsc::channel(8);
+        handle_paste(&mut app, "Solo\nDelta", &tx);
 
         assert_eq!(
             app.status_message
@@ -12246,6 +12788,7 @@ mod artwork_file_picker_completion_tests {
                 symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
                 cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
                 delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+                verbose_degrade_notices: false,
             },
             ..tui_file_picker::FilePickerConfig::default()
         });
@@ -12733,6 +13276,238 @@ mod async_message_drain_tests {
 
     fn status(app: &AppState) -> Option<&str> {
         app.status_message.as_ref().map(|(message, _)| message.as_str())
+    }
+
+    fn completion_report(message: &str) -> tui_file_picker::FileTaskCompletionReport {
+        tui_file_picker::FileTaskCompletionReport {
+            is_move: false,
+            roots: vec![tui_file_picker::FileTaskRootResult {
+                source: std::path::PathBuf::from("source.bin"),
+                destination: std::path::PathBuf::from("destination.bin"),
+                disposition: tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                message: Some(message.to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn file_task_retention_is_session_owned_after_the_live_overlay_closes() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = super::super::app::FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.install_file_task_progress(session);
+        app.active_overlay = ActiveOverlay::None;
+        let (tx, _rx) = mpsc::channel(4);
+
+        reduce_file_task_progress(
+            &mut app,
+            session_id,
+            tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                phase: tui_file_picker::FileTaskPhase::Verifying,
+                status: "Verifying retained task".to_string(),
+                current_item: None,
+                totals: tui_file_picker::ProgressTotals::default(),
+                rate_bytes_per_sec: None,
+            },
+            &tx,
+        );
+        let report = completion_report("portable proof accepted");
+        reduce_file_task_complete(&mut app, session_id, report.clone(), None, &tx);
+
+        let (retained_session_id, retained) = app
+            .last_file_task_progress
+            .as_ref()
+            .expect("session-owned retained state");
+        assert_eq!(*retained_session_id, session_id);
+        assert!(retained.is_terminal());
+        assert_eq!(retained.status, "File task completed with warnings");
+        assert_eq!(retained.completion_report(), Some(&report));
+    }
+
+    #[test]
+    fn terminal_completion_reconstructs_missing_state_and_replaces_only_older_sessions() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let old = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Old task",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        app.last_file_task_progress = Some((7, old));
+        app.active_overlay = ActiveOverlay::None;
+        let (tx, _rx) = mpsc::channel(4);
+        let newest_report = completion_report("newest full diagnostic");
+
+        reduce_file_task_complete(&mut app, 8, newest_report.clone(), None, &tx);
+
+        let (session_id, retained) = app
+            .last_file_task_progress
+            .as_ref()
+            .expect("reconstructed terminal state");
+        assert_eq!(*session_id, 8);
+        assert!(retained.is_terminal());
+        assert_eq!(retained.completion_report(), Some(&newest_report));
+
+        let stale_report = completion_report("stale diagnostic");
+        reduce_file_task_complete(&mut app, 6, stale_report, None, &tx);
+        let (session_id, retained) = app.last_file_task_progress.as_ref().unwrap();
+        assert_eq!(*session_id, 8);
+        assert_eq!(retained.completion_report(), Some(&newest_report));
+    }
+
+    fn terminal_progress_state(app: &AppState, status: &str) -> tui_file_picker::FileTaskProgressState {
+        let mut progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Move,
+            "Moving files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: status.to_string(),
+            totals: tui_file_picker::ProgressTotals::default(),
+        });
+        progress
+    }
+
+    fn close_file_task_results_overlay(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+        super::super::keybindings::handle_key(
+            app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            tx,
+        );
+        super::super::keybindings::handle_key(
+            app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            tx,
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
+    #[test]
+    fn closing_retained_viewer_before_real_completion_cannot_advance_session_lineage() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let source_session_id = 77;
+        let retained_progress = terminal_progress_state(&app, "terminal update received");
+        app.last_file_task_progress = Some((source_session_id, retained_progress));
+        let (tx, _rx) = mpsc::channel(8);
+
+        super::super::command::execute_command(
+            &mut app,
+            super::super::command::Command::FileTaskMessages,
+            &tx,
+        );
+        let ActiveOverlay::FileTaskProgress(viewer) = &app.active_overlay else {
+            panic!("retained viewer must open");
+        };
+        assert_eq!(viewer.session_id, source_session_id);
+        assert!(viewer.is_retained_viewer());
+
+        close_file_task_results_overlay(&mut app, &tx);
+        assert_eq!(
+            app.last_file_task_progress.as_ref().map(|(id, _)| *id),
+            Some(source_session_id),
+            "dismissing a viewer must not synthesize a newer task session"
+        );
+
+        let report = completion_report("completion arrived after viewer closed");
+        reduce_file_task_complete(
+            &mut app,
+            source_session_id,
+            report.clone(),
+            None,
+            &tx,
+        );
+        let (retained_id, retained) = app.last_file_task_progress.as_ref().unwrap();
+        assert_eq!(*retained_id, source_session_id);
+        assert_eq!(retained.completion_report(), Some(&report));
+    }
+
+    #[test]
+    fn completion_while_retained_viewer_is_open_survives_later_viewer_close() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let source_session_id = 91;
+        let retained_progress = terminal_progress_state(&app, "terminal update received");
+        app.last_file_task_progress = Some((source_session_id, retained_progress));
+        let (tx, _rx) = mpsc::channel(8);
+
+        super::super::command::execute_command(
+            &mut app,
+            super::super::command::Command::FileTaskMessages,
+            &tx,
+        );
+        let report = completion_report("authoritative report while viewer open");
+        reduce_file_task_complete(
+            &mut app,
+            source_session_id,
+            report.clone(),
+            None,
+            &tx,
+        );
+
+        let ActiveOverlay::FileTaskProgress(viewer) = &app.active_overlay else {
+            panic!("retained viewer must remain open");
+        };
+        assert!(viewer.is_retained_viewer());
+        assert_eq!(viewer.session_id, source_session_id);
+        assert_eq!(viewer.progress.completion_report(), Some(&report));
+        assert_eq!(
+            app.last_file_task_progress
+                .as_ref()
+                .and_then(|(_, retained)| retained.completion_report()),
+            Some(&report)
+        );
+
+        close_file_task_results_overlay(&mut app, &tx);
+        let (retained_id, retained) = app.last_file_task_progress.as_ref().unwrap();
+        assert_eq!(*retained_id, source_session_id);
+        assert_eq!(
+            retained.completion_report(),
+            Some(&report),
+            "closing a stale viewer clone must never overwrite authoritative completion data"
+        );
+    }
+
+    #[test]
+    fn terminal_progress_without_any_overlay_or_seed_still_becomes_reopenable() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::None;
+        app.last_file_task_progress = None;
+        let (tx, _rx) = mpsc::channel(4);
+        let totals = tui_file_picker::ProgressTotals {
+            items_done: 1,
+            items_total: Some(1),
+            errors: 1,
+            ..tui_file_picker::ProgressTotals::default()
+        };
+
+        reduce_file_task_progress(
+            &mut app,
+            41,
+            tui_file_picker::FileTaskProgressUpdate::Failed {
+                status: "Full retained failure text".to_string(),
+                totals,
+            },
+            &tx,
+        );
+
+        let (session_id, retained) = app
+            .last_file_task_progress
+            .as_ref()
+            .expect("terminal fallback state");
+        assert_eq!(*session_id, 41);
+        assert!(retained.is_terminal());
+        assert_eq!(retained.status, "Full retained failure text");
+        assert!(retained.has_details());
     }
 
     fn test_cached_info(file_size: u64, title: &str) -> crate::tui::browse::CachedInfo {

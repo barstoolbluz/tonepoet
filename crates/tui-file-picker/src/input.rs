@@ -61,6 +61,28 @@ impl StableHitAction {
 }
 
 impl FilePickerState {
+    /// Route a terminal bracketed-paste event only to the picker text editor
+    /// that currently owns focus. Returns false when focus belongs to a
+    /// navigation surface, allowing the host to interpret the event as a
+    /// filesystem-paste command on terminals that intercept Ctrl+V.
+    pub fn handle_terminal_paste(&mut self, text: &str) -> bool {
+        let value = text.lines().next().unwrap_or("");
+        let input = match self.focus {
+            FilePickerFocus::Address if self.address_editing => Some(&mut self.address_input),
+            FilePickerFocus::Search => Some(&mut self.search.input),
+            FilePickerFocus::BookmarkName => Some(&mut self.bookmarks.name_input),
+            FilePickerFocus::CreateName => Some(&mut self.create_name_input),
+            FilePickerFocus::SaveName => Some(&mut self.save_name_input),
+            _ => None,
+        };
+        let Some(input) = input else { return false; };
+        input.insert_string(value);
+        if self.focus == FilePickerFocus::Search {
+            self.restart_search();
+        }
+        true
+    }
+
     /// Apply a keyboard event and return a terminal action for the host app.
     pub fn handle_key(&mut self, key: KeyEvent) -> FilePickerAction {
         if self.handle_paste_task_key(key) {
@@ -287,6 +309,18 @@ impl FilePickerState {
                 self.open_search();
                 FilePickerAction::None
             }
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                self.copy_current();
+                FilePickerAction::None
+            }
+            KeyCode::Char('x') if key.modifiers == KeyModifiers::CONTROL => {
+                self.cut_current();
+                FilePickerAction::None
+            }
+            KeyCode::Char('v' | 'p') if key.modifiers == KeyModifiers::CONTROL => {
+                self.paste_clipboard();
+                FilePickerAction::None
+            }
             KeyCode::Char(c)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
@@ -388,7 +422,7 @@ impl FilePickerState {
             KeyCode::Char('x') if key.modifiers == KeyModifiers::CONTROL => {
                 self.apply_menu_action_if_enabled(FilePickerMenuAction::Cut)
             }
-            KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL => {
+            KeyCode::Char('v' | 'p') if key.modifiers == KeyModifiers::CONTROL => {
                 self.apply_menu_action_if_enabled(FilePickerMenuAction::Paste)
             }
             KeyCode::Delete => self.apply_menu_action_if_enabled(FilePickerMenuAction::Delete),
@@ -1178,10 +1212,221 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FilePickerConfig, FilePickerFilter, FilePickerSelectionMode};
+    use crate::{
+        FilePickerConfig, FilePickerFilter, FilePickerSelectionMode, FilesystemClipboard,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
     use std::fs;
+
+    #[test]
+    fn terminal_paste_routes_only_to_the_focused_picker_editor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.focus = FilePickerFocus::Search;
+        picker.search.input = crate::text_input::TextInputState::new_selected("old".to_string());
+
+        assert!(picker.handle_terminal_paste("replacement\nignored"));
+        assert_eq!(picker.search.input.text, "replacement");
+
+        picker.focus = FilePickerFocus::Files;
+        assert!(!picker.handle_terminal_paste("must not enter a navigation surface"));
+        assert_eq!(picker.search.input.text, "replacement");
+    }
+
+    #[test]
+    fn ctrl_p_starts_the_same_filesystem_paste_as_ctrl_v() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: source_dir,
+            ..FilePickerConfig::default()
+        });
+        let source_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source visible");
+        picker.set_file_cursor(source_index, 4);
+        assert!(picker.copy_current());
+        picker.navigate_to_dir(destination_dir);
+        picker.focus = FilePickerFocus::Files;
+
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            FilePickerAction::None,
+        );
+        assert!(picker.paste_task.is_some());
+    }
+
+    fn select_tree_path(picker: &mut FilePickerState, target: &std::path::Path) {
+        // tempdirs sit under dot-prefixed paths, and pre-expanded ancestors may
+        // carry stale or hidden-excluded children; force hidden visibility and
+        // refresh each ancestor with a collapse+expand double toggle.
+        picker.show_hidden = true;
+        picker.set_focus(FilePickerFocus::Tree);
+        let mut index = 0usize;
+        for _ in 0..131072 {
+            picker.set_tree_cursor(index, usize::MAX);
+            let Some(current) = picker.tree_cursor_path().map(std::path::Path::to_path_buf)
+            else {
+                break;
+            };
+            if current == target {
+                return;
+            }
+            if target.starts_with(&current) {
+                if picker.tree_cursor_is_expanded() {
+                    picker.toggle_tree_node(index);
+                }
+                picker.toggle_tree_node(index);
+                index += 1;
+                continue;
+            }
+            let before = picker.tree_cursor_path().map(std::path::Path::to_path_buf);
+            picker.set_tree_cursor(index + 1, usize::MAX);
+            let after = picker.tree_cursor_path().map(std::path::Path::to_path_buf);
+            if before == after {
+                break;
+            }
+            index += 1;
+        }
+        panic!("tree path was not materialized: {}", target.display());
+    }
+
+    fn picker_with_tree_clipboard(
+    ) -> (
+        tempfile::TempDir,
+        FilePickerState,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let current_dir = temp.path().join("current");
+        let tree_target = temp.path().join("tree-target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&current_dir).expect("current dir");
+        fs::create_dir(&tree_target).expect("tree target");
+        let source = source_dir.join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: source_dir,
+            ..FilePickerConfig::default()
+        });
+        let source_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source visible");
+        picker.set_file_cursor(source_index, 4);
+        assert!(picker.copy_current());
+        assert!(picker.navigate_to_dir(current_dir.clone()));
+        select_tree_path(&mut picker, &tree_target);
+        (temp, picker, source, current_dir, tree_target)
+    }
+
+    fn wait_for_path(path: &std::path::Path) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[test]
+    fn tree_ctrl_p_and_ctrl_v_paste_into_the_selected_tree_directory() {
+        for code in ['p', 'v'] {
+            let (_temp, mut picker, source, current_dir, tree_target) =
+                picker_with_tree_clipboard();
+
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)),
+                FilePickerAction::None,
+            );
+
+            let expected = tree_target.join(source.file_name().expect("source name"));
+            wait_for_path(&expected);
+            assert!(expected.exists(), "Ctrl+{code} must target the selected tree row");
+            assert!(
+                !current_dir.join(source.file_name().expect("source name")).exists(),
+                "Ctrl+{code} must not fall back to current_dir while Tree owns focus"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_ctrl_c_and_ctrl_x_capture_the_selected_tree_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current_dir = temp.path().join("current");
+        let tree_target = temp.path().join("tree-target");
+        fs::create_dir(&current_dir).expect("current dir");
+        fs::create_dir(&tree_target).expect("tree target");
+
+        for (code, mode) in [
+            ('c', crate::FilePickerClipboardMode::Copy),
+            ('x', crate::FilePickerClipboardMode::Cut),
+        ] {
+            let mut picker = FilePickerState::new(FilePickerConfig {
+                start_dir: current_dir.clone(),
+                ..FilePickerConfig::default()
+            });
+            select_tree_path(&mut picker, &tree_target);
+
+            picker.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
+
+            let clipboard = picker.clipboard.as_ref().expect("tree clipboard");
+            assert_eq!(clipboard.mode(), mode);
+            assert_eq!(clipboard.paths(), &[tree_target.clone()]);
+        }
+    }
+
+    #[test]
+    fn tree_paste_reports_empty_and_disabled_policy_without_changing_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current_dir = temp.path().join("current");
+        let tree_target = temp.path().join("tree-target");
+        fs::create_dir(&current_dir).expect("current dir");
+        fs::create_dir(&tree_target).expect("tree target");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: current_dir,
+            ..FilePickerConfig::default()
+        });
+        select_tree_path(&mut picker, &tree_target);
+
+        picker.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(picker.last_error(), Some(FilePickerError::ClipboardEmpty)));
+        assert_eq!(picker.filesystem_paste_target(), tree_target);
+
+        let source = temp.path().join("source.flac");
+        fs::write(&source, b"audio").expect("source");
+        picker.clipboard = FilesystemClipboard::new(
+            crate::FilePickerClipboardMode::Copy,
+            vec![source],
+        );
+        let mut policy = picker.file_operation_policy();
+        policy.allow_paste = false;
+        picker.set_file_operation_policy(policy);
+
+        picker.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            picker.last_error(),
+            Some(FilePickerError::OperationDisabled("paste"))
+        ));
+        assert!(picker.paste_task.is_none());
+    }
 
     #[test]
     fn enter_selects_file() {

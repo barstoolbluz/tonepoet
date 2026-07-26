@@ -130,6 +130,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
         app.current_screen,
         &mut app.button_map,
         status_msg,
+        app.last_file_task_progress.is_some(),
         theme,
     );
 

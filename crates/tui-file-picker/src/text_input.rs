@@ -783,7 +783,9 @@ pub fn handle_text_input_key_with_boundaries(
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'x') => {
             input.cut_selection()
         }
-        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'v') => {
+        (true, false, _, KeyCode::Char(c))
+            if c.eq_ignore_ascii_case(&'v') || c.eq_ignore_ascii_case(&'p') =>
+        {
             input.paste_clipboard()
         }
 
@@ -1554,6 +1556,18 @@ mod tests {
 
         assert!(input.text.ends_with(&format!("AbsoluteCandidate{}", std::path::MAIN_SEPARATOR)));
         assert_eq!(input.cursor, input.text.len());
+    }
+
+    #[test]
+    fn ctrl_p_pastes_the_in_app_text_clipboard_like_ctrl_v() {
+        let mut input = TextInputState::new_selected("old".to_string());
+        input.clipboard = "replacement".to_string();
+
+        assert!(handle_text_input_key(
+            &mut input,
+            &key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ));
+        assert_eq!(input.text, "replacement");
     }
 
     #[test]
