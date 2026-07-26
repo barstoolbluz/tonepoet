@@ -39,6 +39,7 @@ lazy_static! {
         m.insert("la".to_string(), "LA");
         m.insert("dj".to_string(), "DJ");
         m.insert("mc".to_string(), "MC");
+        m.insert("mg".to_string(), "MG"); // Booker T & the MG's
         m.insert("tv".to_string(), "TV");
         m.insert("mtv".to_string(), "MTV");
         m.insert("bbc".to_string(), "BBC");
@@ -46,6 +47,8 @@ lazy_static! {
         m.insert("xrcd".to_string(), "XRCD");
         m.insert("xrcd2".to_string(), "XRCD2");
         m.insert("xrcd24".to_string(), "XRCD24");
+        m.insert("jp".to_string(), "JP");
+        m.insert("lp".to_string(), "LP");
 
         // Roman numerals
         m.insert("ii".to_string(), "II");
@@ -411,174 +414,216 @@ pub fn rename_audio_files(folder_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(renamed_files)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseTransform {
+    Title,
+    Upper,
+    Lower,
+}
+
+/// Apply a Unicode-preserving case-only transform. Title case delegates to the
+/// same punctuation-aware naming logic used by metadata fix-caps; upper/lower
+/// use Rust's full Unicode mappings and therefore never transliterate or drop
+/// non-ASCII characters.
+pub fn transform_case(value: &str, transform: CaseTransform) -> String {
+    match transform {
+        CaseTransform::Title => capitalize_title(value),
+        CaseTransform::Upper => value.to_uppercase(),
+        CaseTransform::Lower => value.to_lowercase(),
+    }
+}
+
 pub fn capitalize_title(title: &str) -> String {
-    log::info!("🔤 capitalize_title input: '{}'", title);
-    // If the entire input is all-caps, lowercase it first.
-    let title = if title.len() > 1
-        && title
-            .chars()
-            .all(|c| !c.is_alphabetic() || c.is_uppercase())
-    {
-        std::borrow::Cow::Owned(title.to_lowercase())
-    } else {
-        std::borrow::Cow::Borrowed(title)
-    };
-    // Use regex to split while keeping parentheses and their content separate
-    let re = Regex::new(r"(\([^)]*\))").unwrap();
-    let mut result = String::new();
+    log::info!("capitalize_title input: '{}'", title);
+
+    // Parenthetical sections are independent title-case sections, but the
+    // original punctuation and spacing are retained byte-for-byte. A case-only
+    // transform must never silently insert, remove, or reorder tokens.
+    let re = Regex::new(r"(\([^)]*\))").expect("parenthetical regex is valid");
+    let mut result = String::with_capacity(title.len());
     let mut last_end = 0;
-
-    for cap in re.find_iter(&title) {
-        // Process text before the parentheses
-        if cap.start() > last_end {
-            let before = &title[last_end..cap.start()];
-            let capitalized_before = capitalize_section(before);
-            result.push_str(&capitalized_before);
-            // Add space if the text before doesn't end with space and we have content
-            if !capitalized_before.is_empty() && !capitalized_before.ends_with(' ') {
-                result.push(' ');
-            }
-        }
-
-        // Process the parenthetical content
+    for cap in re.find_iter(title) {
+        result.push_str(&capitalize_section(&title[last_end..cap.start()]));
         let paren_content = cap.as_str();
         if paren_content.len() > 2 {
-            // Extract content between parentheses
-            let inner = &paren_content[1..paren_content.len() - 1];
-            result.push('(');
-            result.push_str(&capitalize_section(inner));
-            result.push(')');
+            // Pass the delimiters through with the content: the section
+            // normalizer's designator carve-outs (e.g. "(US") depend on
+            // seeing the opening punctuation on the first token.
+            result.push_str(&capitalize_section(paren_content));
         } else {
             result.push_str(paren_content);
         }
-
         last_end = cap.end();
     }
+    result.push_str(&capitalize_section(&title[last_end..]));
 
-    // Process any remaining text after the last parentheses
-    if last_end < title.len() {
-        let after = &title[last_end..];
-        let capitalized_after = capitalize_section(after);
-        // Add space if we just closed parentheses and have more content
-        if !capitalized_after.is_empty() && result.ends_with(')') {
-            result.push(' ');
-        }
-        result.push_str(&capitalized_after);
-    }
-
-    log::info!("🔤 capitalize_title output: '{}'", result);
+    log::info!("capitalize_title output: '{}'", result);
     result
 }
 
 pub fn capitalize_section(section: &str) -> String {
-    // If the entire input is all-caps, lowercase it first so that
-    // the acronym-preservation heuristic (2-5 char all-caps words)
-    // doesn't misfire on normal words like "THE", "BAND", etc.
-    let section = if section.len() > 1
+    // Normalize all-caps prose token-by-token so normal words such as THE and
+    // BAND do not masquerade as acronyms. Retain an explicit uppercase US
+    // parenthetical designator from the original token; lowercasing the whole
+    // section first would make `(US ...)` indistinguishable from the pronoun
+    // "us" and either corrupt the designator or over-capitalize normal prose.
+    let normalize_all_caps = section.len() > 1
         && section
             .chars()
-            .all(|c| !c.is_alphabetic() || c.is_uppercase())
-    {
-        std::borrow::Cow::Owned(section.to_lowercase())
-    } else {
-        std::borrow::Cow::Borrowed(section)
-    };
-    let words: Vec<&str> = section.split_whitespace().collect();
-    let mut capitalized_words = Vec::new();
-
-    for (i, word) in words.iter().enumerate() {
-        // Check if previous word was "&" - if so, always capitalize
-        let after_ampersand = i > 0 && words[i - 1] == "&";
-
-        // First and last words are always capitalized
-        // Words after "&" are always capitalized (e.g., "Bob Marley & The Wailers")
-        // Also capitalize if not in the non-capitalized list (prepositions, conjunctions, articles)
-        if i == 0
-            || i == words.len() - 1
-            || after_ampersand
-            || !NON_CAPITALIZED_WORDS.contains(&word.to_lowercase().as_str())
-        {
-            capitalized_words.push(capitalize_word(word));
-        } else {
-            capitalized_words.push(word.to_lowercase());
+            .all(|ch| !ch.is_alphabetic() || ch.is_uppercase());
+    let mut ranges = Vec::new();
+    let mut token_start = None;
+    for (index, ch) in section.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                ranges.push(start..index);
+            }
+        } else if token_start.is_none() {
+            token_start = Some(index);
         }
     }
+    if let Some(start) = token_start {
+        ranges.push(start..section.len());
+    }
 
-    capitalized_words.join(" ")
+    let mut result = String::with_capacity(section.len());
+    let mut copied_through = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        result.push_str(&section[copied_through..range.start]);
+        let original_word = &section[range.clone()];
+        let normalized_word;
+        let word = if normalize_all_caps
+            && !(word_has_opening_prefix(original_word) && word_core(original_word) == "US")
+        {
+            normalized_word = lowercase_word_core(original_word);
+            normalized_word.as_str()
+        } else {
+            original_word
+        };
+        let after_ampersand = index > 0
+            && section[ranges[index - 1].clone()]
+                .chars()
+                .any(|ch| ch == '&');
+        let first_in_delimited_section = word_has_opening_prefix(word);
+        let core_lower = word_core(word).to_lowercase();
+        let transformed = if index == 0
+            || index + 1 == ranges.len()
+            || after_ampersand
+            || first_in_delimited_section
+            || !NON_CAPITALIZED_WORDS.contains(&core_lower.as_str())
+        {
+            capitalize_word(word)
+        } else {
+            lowercase_word_core(word)
+        };
+        result.push_str(&transformed);
+        copied_through = range.end;
+    }
+    result.push_str(&section[copied_through..]);
+    result
+}
+
+fn word_affixes(word: &str) -> (&str, &str, &str) {
+    let Some(core_start) = word
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_alphanumeric().then_some(index))
+    else {
+        return (word, "", "");
+    };
+    let core_end = word
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| ch.is_alphanumeric().then_some(index + ch.len_utf8()))
+        .unwrap_or(core_start);
+    (&word[..core_start], &word[core_start..core_end], &word[core_end..])
+}
+
+fn word_core(word: &str) -> &str {
+    word_affixes(word).1
+}
+
+fn word_has_opening_prefix(word: &str) -> bool {
+    let prefix = word_affixes(word).0;
+    prefix
+        .chars()
+        .any(|ch| matches!(ch, '(' | '[' | '{' | '"' | '\'' | '“' | '‘'))
+}
+
+fn lowercase_word_core(word: &str) -> String {
+    let (prefix, core, suffix) = word_affixes(word);
+    if core.is_empty() {
+        return word.to_string();
+    }
+    format!("{prefix}{}{suffix}", core.to_lowercase())
 }
 
 fn capitalize_word(word: &str) -> String {
-    if word.is_empty() {
+    let (prefix, core, suffix) = word_affixes(word);
+    if core.is_empty() {
         return word.to_string();
     }
+    format!("{prefix}{}{suffix}", capitalize_word_core(core))
+}
 
-    // Check for special cases first (band names, acronyms, etc.)
+fn capitalize_word_core(word: &str) -> String {
+    if word.is_empty() {
+        return String::new();
+    }
+
     let word_lower = word.to_lowercase();
     if let Some(special) = SPECIAL_CASES.get(&word_lower) {
         return special.to_string();
     }
 
-    // Preserve acronyms with periods (e.g., "D.O.A.", "N.W.A.", "R.E.M.")
-    // Pattern: single letter followed by period, repeated (with optional final letter without period)
     let has_letter_dot_pattern = word
         .chars()
         .collect::<Vec<_>>()
         .windows(2)
-        .any(|w| w[0].is_alphabetic() && w[1] == '.');
-    if has_letter_dot_pattern && word.chars().filter(|c| c.is_alphabetic()).count() >= 2 {
+        .any(|pair| pair[0].is_alphabetic() && pair[1] == '.');
+    if has_letter_dot_pattern && word.chars().filter(|ch| ch.is_alphabetic()).count() >= 2 {
         return word.to_uppercase();
     }
 
-    // Preserve words that are already all caps and look like acronyms
-    if word.len() >= 2
-        && word.len() <= 5
-        && word.chars().all(|c| c.is_uppercase() || !c.is_alphabetic())
+    if word.chars().count() >= 2
+        && word.chars().count() <= 5
+        && word
+            .chars()
+            .all(|ch| ch.is_uppercase() || !ch.is_alphabetic())
     {
         return word.to_string();
     }
 
-    // Check if it's a roman numeral (case insensitive check)
     if ROMAN_NUMERAL_PATTERN.is_match(&word.to_uppercase()) {
         return word.to_uppercase();
     }
 
-    // Handle words with apostrophes (e.g., "don't", "it's")
     if let Some(pos) = word.find('\'') {
         let (first, rest) = word.split_at(pos);
-        return format!("{}{}", capitalize_word(first), rest);
+        return format!("{}{}", capitalize_word_core(first), rest);
     }
 
-    // Handle hyphenated words
     if let Some(pos) = word.find('-') {
-        let (first, _rest) = word.split_at(pos);
-        let rest_with_hyphen = &word[pos..];
-        if rest_with_hyphen.len() > 1 {
-            let after_hyphen = &rest_with_hyphen[1..];
+        let (first, rest_with_hyphen) = word.split_at(pos);
+        if let Some(after_hyphen) = rest_with_hyphen.strip_prefix('-') {
             return format!(
                 "{}-{}",
-                capitalize_word(first),
-                capitalize_word(after_hyphen)
+                capitalize_word_core(first),
+                capitalize_word_core(after_hyphen)
             );
         }
-        return format!("{}{}", capitalize_word(first), rest_with_hyphen);
     }
 
-    // Handle words with slashes (like AC/DC)
     if let Some(pos) = word.find('/') {
-        let (first, _rest) = word.split_at(pos);
-        let rest_with_slash = &word[pos..];
-        if rest_with_slash.len() > 1 {
-            let after_slash = &rest_with_slash[1..];
+        let (first, rest_with_slash) = word.split_at(pos);
+        if let Some(after_slash) = rest_with_slash.strip_prefix('/') {
             return format!(
                 "{}/{}",
-                capitalize_word(first),
-                capitalize_word(after_slash)
+                capitalize_word_core(first),
+                capitalize_word_core(after_slash)
             );
         }
-        return format!("{}{}", capitalize_word(first), rest_with_slash);
     }
 
-    // Default capitalization
     let mut chars = word.chars();
     match chars.next() {
         None => String::new(),
@@ -968,4 +1013,64 @@ mod tests {
         assert_eq!(capitalize_word("rock-and-roll"), "Rock-And-Roll");
         assert_eq!(capitalize_word(""), "");
     }
+
+    #[test]
+    fn capitalize_after_ampersand_across_entry_points() {
+        for input in ["Booker T & the MG's", "Neil Young & the Shocking Pinks"] {
+            let expected = input.replace("& the", "& The");
+            assert_eq!(capitalize_section(input), expected);
+            assert_eq!(capitalize_title(input), expected);
+        }
+        assert_eq!(
+            capitalize_section("Booker T & (the MG's)"),
+            "Booker T & (The MG's)"
+        );
+        assert_eq!(
+            capitalize_section("Booker T &(the MG's)"),
+            "Booker T &(The MG's)"
+        );
+    }
+
+    #[test]
+    fn all_caps_us_pronoun_does_not_become_a_country_designator() {
+        assert_eq!(capitalize_section("TELL US WHY"), "Tell Us Why");
+        assert_eq!(capitalize_title("TELL US WHY"), "Tell Us Why");
+        assert_eq!(capitalize_section("(US LP)"), "(US LP)");
+        assert_eq!(capitalize_title("(US LP)"), "(US LP)");
+    }
+
+    #[test]
+    fn parenthetical_designators_and_prefixed_words_are_case_only() {
+        let exact = "(Japan P-11356 Promo LP / 32-192)";
+        assert_eq!(capitalize_title(exact), exact);
+        assert_eq!(capitalize_section(exact), exact);
+        assert_eq!(
+            capitalize_title("(Foo Foo LP / 24-96)"),
+            "(Foo Foo LP / 24-96)"
+        );
+        assert_eq!(
+            capitalize_section("[japan] \"promo\" '(foo)'"),
+            "[Japan] \"Promo\" '(Foo)'"
+        );
+        assert_eq!(capitalize_title("(US LP)"), "(US LP)");
+        assert_eq!(capitalize_section("(JP LP)"), "(JP LP)");
+    }
+
+    #[test]
+    fn capitalization_preserves_unicode_and_every_noncase_character() {
+        let input = "(japan  P-11356\tpromo LP / 32-192) — blue öyster cult";
+        let output = capitalize_section(input);
+        let strip_case = |value: &str| {
+            value
+                .chars()
+                .filter(|ch| !ch.is_alphabetic())
+                .collect::<String>()
+        };
+        assert_eq!(strip_case(&output), strip_case(input));
+        assert!(output.contains("Öyster"));
+        assert!(output.contains("P-11356"));
+        assert!(output.contains("32-192"));
+        assert!(output.contains("Japan  P-11356\tPromo"));
+    }
+
 }

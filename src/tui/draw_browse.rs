@@ -1919,6 +1919,15 @@ fn register_browse_buttons(
     // controls grouped together on the second row. The helper is shared with
     // drawing so click targets cannot drift from the rendered geometry.
     if browse.search.active {
+        buttons.record_button(
+            TuiButton::BrowseSearchInput,
+            Rect::new(
+                area.x.saturating_add(4),
+                browse_search_input_y(area),
+                inner_w.saturating_sub(3) as u16,
+                1,
+            ),
+        );
         let controls_y = browse_search_controls_y(area);
         for item in search_control_row_layout(
             inner_w,
@@ -1932,6 +1941,18 @@ fn register_browse_buttons(
                 buttons.record_button(search_control_button(item.kind), rect);
             }
         }
+    }
+
+    if browse.filter_input.is_some() {
+        buttons.record_button(
+            TuiButton::BrowseFilterInput,
+            Rect::new(
+                area.x.saturating_add(4),
+                area.y.saturating_add(area.height.saturating_sub(2)),
+                inner_w.saturating_sub(4) as u16,
+                1,
+            ),
+        );
     }
 
     // Entry rows: below header (and search panel if active), above bottom border.

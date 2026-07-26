@@ -1205,33 +1205,13 @@ impl BookmarksState {
 mod tests {
     use super::*;
 
-    static BOOKMARK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct TestConfigHome {
-        old_xdg: Option<std::ffi::OsString>,
-    }
-
-    impl TestConfigHome {
-        fn install(path: &std::path::Path) -> Self {
-            let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-            std::env::set_var("XDG_CONFIG_HOME", path);
-            Self { old_xdg }
-        }
-    }
-
-    impl Drop for TestConfigHome {
-        fn drop(&mut self) {
-            match self.old_xdg.take() {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-    }
+    use crate::tui::test_support::XdgConfigHomeGuard;
 
     fn with_isolated_bookmark_store(test: impl FnOnce()) {
-        let _guard = BOOKMARK_ENV_LOCK.lock().expect("bookmark env lock");
-        let temp = tempfile::tempdir().expect("config tempdir");
-        let _home = TestConfigHome::install(temp.path());
+        // XDG_CONFIG_HOME is process-global. Use the suite-wide guard rather
+        // than a bookmark-local mutex so theme, config, and bookmark tests
+        // cannot race one another by installing unrelated temporary homes.
+        let _home = XdgConfigHomeGuard::new("tonepoet-bookmark-store-test");
         test();
     }
 

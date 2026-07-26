@@ -280,6 +280,49 @@ impl FileTaskRootDisposition {
     }
 }
 
+
+/// Whether a completed root is eligible for delete-based copy undo.
+///
+/// Only a destination root that was demonstrably absent before publication may
+/// be removed to undo a copy. Overwrite and merge operations modified
+/// pre-existing user state and require a retained preimage, so they are never
+/// represented as artifact-deletion undo entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTaskUndoDisposition {
+    /// The operation published a new top-level destination root.
+    CreatedDestination,
+    /// The operation overwrote or merged into a root that already existed.
+    ModifiedExistingDestination,
+    /// The root did not complete or no reversible provenance was established.
+    NotReversible,
+}
+
+/// Authoritative operation-time proof for one completed copy or move root.
+///
+/// `source_manifest` is built from bytes read by the worker before
+/// publication (including the pre-rename source tree for native moves).
+/// `destination_manifest` identifies the exact published objects
+/// that passed verification. Keeping both in the completion report prevents a
+/// UI-thread post-hoc recapture from redefining what the operation produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTaskRootProof {
+    pub source_manifest: crate::SourceManifest,
+    pub destination_manifest: crate::DestinationManifest,
+}
+
+impl FileTaskRootProof {
+    /// Revalidate the retained published tree at its current root. Strict
+    /// filesystems reuse object/version identity; reduced-semantics filesystems
+    /// perform the minimum content rehash needed to remain authoritative.
+    pub fn verify_at(&self, root: &Path) -> Result<u64, String> {
+        self.destination_manifest.verify_reused_copy_at_with_cancel(
+            &self.source_manifest,
+            root,
+            |_| true,
+        )
+    }
+}
+
 /// Terminal accounting for one top-level source and its resolved destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTaskRootResult {
@@ -287,6 +330,10 @@ pub struct FileTaskRootResult {
     pub destination: std::path::PathBuf,
     pub disposition: FileTaskRootDisposition,
     pub message: Option<String>,
+    pub undo_disposition: FileTaskUndoDisposition,
+    /// Present only when the worker established operation-time authority for a
+    /// completed root. Incomplete roots must not carry a proof.
+    pub proof: Option<FileTaskRootProof>,
 }
 
 /// Structured terminal report emitted separately from the presentation-oriented
@@ -775,7 +822,26 @@ impl FileTaskProgressState {
     /// inspection. The live progress error list remains bounded, while this
     /// report preserves every terminal warning/failure message exactly once.
     pub fn append_completion_report(&mut self, report: &FileTaskCompletionReport) {
-        self.completion_report = Some(report.clone());
+        // Operation-time manifests are authority for the undo reducer, not
+        // presentation data. Retaining them in every progress snapshot would
+        // clone potentially large tree proofs into the overlay and again into
+        // `last_file_task_progress`. Preserve the complete diagnostic surface
+        // while deliberately dropping proof payloads here.
+        self.completion_report = Some(FileTaskCompletionReport {
+            is_move: report.is_move,
+            roots: report
+                .roots
+                .iter()
+                .map(|root| FileTaskRootResult {
+                    source: root.source.clone(),
+                    destination: root.destination.clone(),
+                    disposition: root.disposition,
+                    message: root.message.clone(),
+                    undo_disposition: root.undo_disposition,
+                    proof: None,
+                })
+                .collect(),
+        });
         self.updated_at = Instant::now();
     }
 
@@ -2566,6 +2632,11 @@ mod tests {
                     destination: PathBuf::from(format!("/destination/album-{index}")),
                     disposition: FileTaskRootDisposition::CompletedWithWarning,
                     message: Some(format!("full retained warning text {index}")),
+                    undo_disposition: FileTaskUndoDisposition::CreatedDestination,
+                    proof: Some(FileTaskRootProof {
+                        source_manifest: crate::SourceManifest::default(),
+                        destination_manifest: crate::DestinationManifest::default(),
+                    }),
                 })
                 .collect(),
         };
@@ -2578,6 +2649,13 @@ mod tests {
         assert!(details.contains("Source: /source/album-1"));
         assert!(details.contains("Destination: /destination/album-3"));
         assert_eq!(details.matches("Result: CompletedWithWarning").count(), 3);
+        assert!(state
+            .completion_report()
+            .expect("completion report")
+            .roots
+            .iter()
+            .all(|root| root.proof.is_none()));
+        assert!(report.roots.iter().all(|root| root.proof.is_some()));
     }
 
 }

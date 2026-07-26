@@ -767,6 +767,9 @@ pub fn derived_element_spec(key: &str) -> Option<&'static DerivedElementSpec> {
 }
 
 fn config_base_dir() -> PathBuf {
+    // Tests must consult the process-wide explicit seam before `dirs` or any
+    // environment-derived cache. This keeps a concurrently running TUI from
+    // redirecting theme persistence back into the live configuration tree.
     #[cfg(test)]
     if let Some(path) = crate::tui::test_support::test_config_home_override() {
         return path;

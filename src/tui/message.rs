@@ -104,6 +104,24 @@ pub struct TagsMbContext {
     pub editor_session: Option<MetadataEditorSessionGuard>,
 }
 
+
+#[derive(Debug)]
+pub struct FileOperationReplayCompletion {
+    pub index: usize,
+    pub proof: Option<tui_file_picker::FileTaskRootProof>,
+}
+
+#[derive(Debug)]
+pub struct FileOperationReplayResult {
+    pub completed: Vec<FileOperationReplayCompletion>,
+    /// Namespace mutations that committed, but for which the worker could not
+    /// return authoritative operation-time proof. These mappings are terminal:
+    /// they must be removed from undo/redo history rather than retried against
+    /// a filesystem state that has already changed.
+    pub committed_without_proof: Vec<(usize, String)>,
+    pub failed: Vec<(usize, String)>,
+}
+
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
@@ -509,6 +527,19 @@ pub enum AppMessage {
         session_id: u64,
         report: tui_file_picker::FileTaskCompletionReport,
         retry_plan: Option<crate::tui::browse::BrowsePasteRetryPlan>,
+    },
+    /// Completion of a background transactional rename initiated from Browse.
+    RenamePlanComplete {
+        description: String,
+        base_dir: std::path::PathBuf,
+        result: Result<crate::tui::rename_plan::RenameExecutionReport, String>,
+    },
+    /// Completion of background undo/redo execution. Recursive proof capture,
+    /// replay verification, and quarantine deletion never run in the reducer.
+    FileOperationReplayComplete {
+        entry: crate::tui::app::FileOperationUndoEntry,
+        undo: bool,
+        result: FileOperationReplayResult,
     },
     /// Result of add/replace/remove artwork launched from the Artwork tab.
     MetadataEditorArtworkWriteComplete {

@@ -65,6 +65,8 @@ pub mod template_builder;
 pub mod text_input;
 pub mod theme;
 pub mod theme_builder;
+// Shared test-only process-global isolation for every TUI config resolver.
 #[cfg(test)]
+#[path = "test_support.rs"]
 pub(crate) mod test_support;
 pub mod verify;

@@ -1171,7 +1171,7 @@ fn clear_browse_info_focus(app: &mut AppState) {
     app.browse_info_focus = None;
 }
 
-fn persist_browse_config(app: &mut AppState) -> bool {
+pub(crate) fn persist_browse_config(app: &mut AppState) -> bool {
     app.config.browsing = app.browse.capture_browsing_config();
     if let Err(err) = app.config.save() {
         app.set_status(format!("browse settings changed, but config save failed: {err}"));
@@ -1179,6 +1179,1076 @@ fn persist_browse_config(app: &mut AppState) -> bool {
     } else {
         true
     }
+}
+
+
+pub(crate) fn file_picker_config_with_browse_sort(
+    app: &AppState,
+    mut config: tui_file_picker::FilePickerConfig,
+) -> tui_file_picker::FilePickerConfig {
+    use super::browse::{SortBy, SortDir};
+    config.title_case = crate::convert::renaming::capitalize_title;
+    config.sort_key = match app.browse.default_sort_by {
+        SortBy::Name => tui_file_picker::FilePickerSortKey::Name,
+        SortBy::Size => tui_file_picker::FilePickerSortKey::Size,
+        SortBy::Type => tui_file_picker::FilePickerSortKey::Type,
+        SortBy::Date => tui_file_picker::FilePickerSortKey::Modified,
+        // Picker rows do not carry probe-backed media fields. Falling back to
+        // Name here does not mutate the Browse default unless the user makes a
+        // deliberate picker sort choice.
+        _ => tui_file_picker::FilePickerSortKey::Name,
+    };
+    config.sort_reverse = app.browse.default_sort_dir == SortDir::Desc;
+    config
+}
+
+pub(crate) fn persist_file_picker_sort_if_changed(
+    app: &mut AppState,
+    picker: &tui_file_picker::FilePickerState,
+) {
+    use super::browse::{SortBy, SortDir};
+    if !picker.sort_changed() {
+        return;
+    }
+    let sort_by = match picker.sort_key() {
+        tui_file_picker::FilePickerSortKey::Name => SortBy::Name,
+        tui_file_picker::FilePickerSortKey::Size => SortBy::Size,
+        tui_file_picker::FilePickerSortKey::Type => SortBy::Type,
+        tui_file_picker::FilePickerSortKey::Modified => SortBy::Date,
+    };
+    let sort_dir = if picker.sort_reverse() {
+        SortDir::Desc
+    } else {
+        SortDir::Asc
+    };
+    app.browse.set_default_sort(sort_by, sort_dir, false);
+    let _ = persist_browse_config(app);
+}
+
+pub(crate) fn record_completed_file_task_for_undo(
+    app: &mut AppState,
+    session_id: u64,
+    report: &mut tui_file_picker::FileTaskCompletionReport,
+) -> Option<String> {
+    if app.file_operation_undo.has_recorded_task_session(session_id) {
+        return None;
+    }
+
+    let kind = if report.is_move {
+        FileOperationUndoKind::Move
+    } else {
+        FileOperationUndoKind::Copy
+    };
+    let completed_count = report
+        .roots
+        .iter()
+        .filter(|root| root.disposition.is_completed())
+        .count();
+    if completed_count == 0 {
+        return None;
+    }
+
+    let mut mappings = Vec::with_capacity(completed_count);
+    let mut missing = Vec::new();
+    let mut excluded_modified_roots = Vec::new();
+    let mut excluded_non_reversible_roots = Vec::new();
+    for root in report
+        .roots
+        .iter_mut()
+        .filter(|root| root.disposition.is_completed())
+    {
+        match root.undo_disposition {
+            tui_file_picker::FileTaskUndoDisposition::CreatedDestination => {}
+            tui_file_picker::FileTaskUndoDisposition::ModifiedExistingDestination => {
+                root.proof.take();
+                excluded_modified_roots.push(root.destination.display().to_string());
+                continue;
+            }
+            tui_file_picker::FileTaskUndoDisposition::NotReversible => {
+                root.proof.take();
+                excluded_non_reversible_roots.push(root.destination.display().to_string());
+                continue;
+            }
+        }
+        let Some(destination_proof) = root.proof.take() else {
+            missing.push(root.destination.display().to_string());
+            continue;
+        };
+        let source_proof = if kind == FileOperationUndoKind::Copy {
+            let source_manifest = destination_proof.source_manifest.clone();
+            Some(tui_file_picker::FileTaskRootProof {
+                destination_manifest: source_manifest.destination_identity_for_same_tree(),
+                source_manifest,
+            })
+        } else {
+            None
+        };
+        mappings.push(FileOperationUndoMapping {
+            source: root.source.clone(),
+            destination: root.destination.clone(),
+            source_proof,
+            destination_proof: Some(destination_proof),
+        });
+    }
+
+    if !missing.is_empty() {
+        return Some(format!(
+            "{} newly created completed root{} lacked operation-time undo proof ({}); no undo entry was recorded",
+            missing.len(),
+            if missing.len() == 1 { "" } else { "s" },
+            missing.join(", "),
+        ));
+    }
+
+    let mut warning_parts = Vec::new();
+    if !excluded_modified_roots.is_empty() {
+        warning_parts.push(format!(
+            "{} overwrite/merge root{} cannot be delete-undone without retained destination preimages ({})",
+            excluded_modified_roots.len(),
+            if excluded_modified_roots.len() == 1 { "" } else { "s" },
+            excluded_modified_roots.join(", "),
+        ));
+    }
+    if !excluded_non_reversible_roots.is_empty() {
+        warning_parts.push(format!(
+            "{} completed root{} did not establish reversible provenance ({})",
+            excluded_non_reversible_roots.len(),
+            if excluded_non_reversible_roots.len() == 1 { "" } else { "s" },
+            excluded_non_reversible_roots.join(", "),
+        ));
+    }
+
+    if mappings.is_empty() {
+        return (!warning_parts.is_empty()).then(|| format!(
+            "Undo was not recorded: {}",
+            warning_parts.join("; "),
+        ));
+    }
+
+    let id = app.file_operation_undo.allocate_id();
+    app.file_operation_undo.record_task_once(
+        session_id,
+        FileOperationUndoEntry {
+            id,
+            kind,
+            rename_base_dir: None,
+            mappings,
+        },
+    );
+    (!warning_parts.is_empty()).then(|| format!(
+        "Undo was recorded only for roots with authoritative reversible provenance; {}",
+        warning_parts.join("; "),
+    ))
+}
+
+fn record_rename_report_for_undo(
+    app: &mut AppState,
+    base_dir: std::path::PathBuf,
+    report: crate::tui::rename_plan::RenameExecutionReport,
+) -> Option<String> {
+    if report.roots.is_empty() {
+        return report.warning;
+    }
+    let mut retained = Vec::with_capacity(report.roots.len());
+    let mut proof_failures = Vec::new();
+    for root in report.roots {
+        match root.proof {
+            Ok(destination_proof) => retained.push(FileOperationUndoMapping {
+                source: root.source,
+                destination: root.destination,
+                source_proof: None,
+                destination_proof: Some(destination_proof),
+            }),
+            Err(error) => proof_failures.push(error),
+        }
+    }
+    if !proof_failures.is_empty() {
+        return Some(format!(
+            "rename committed, but no partial undo entry was recorded because {} root proof{} failed: {}",
+            proof_failures.len(),
+            if proof_failures.len() == 1 { "" } else { "s" },
+            proof_failures.join("; "),
+        ));
+    }
+    let id = app.file_operation_undo.allocate_id();
+    app.file_operation_undo.record(FileOperationUndoEntry {
+        id,
+        kind: FileOperationUndoKind::Rename,
+        rename_base_dir: Some(base_dir),
+        mappings: retained,
+    });
+    report.warning
+}
+
+fn spawn_rename_plan(
+    plan: crate::tui::rename_plan::RenamePlan,
+    description: String,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let base_dir = plan.base_dir.clone();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut plan = plan;
+        let result = crate::tui::rename_plan::execute_plan_with_proofs(&mut plan);
+        let _ = tx.blocking_send(AppMessage::RenamePlanComplete {
+            description,
+            base_dir,
+            result,
+        });
+    });
+}
+
+pub(crate) fn complete_rename_plan(
+    app: &mut AppState,
+    description: String,
+    base_dir: std::path::PathBuf,
+    result: Result<crate::tui::rename_plan::RenameExecutionReport, String>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    match result {
+        Ok(report) if report.succeeded_count == 0 => {
+            app.pending_inline_rename_resume = None;
+            app.set_status(format!("{description}: names already match"));
+        }
+        Ok(report) => {
+            let succeeded_count = report.succeeded_count;
+            for root in &report.roots {
+                app.browse
+                    .remap_navigation_after_rename(&root.source, &root.destination);
+            }
+            let warning = record_rename_report_for_undo(app, base_dir, report);
+            refresh_browse_after_undo_redo(app, tx);
+            if let Some((directory, target_path)) = app.pending_inline_rename_resume.take() {
+                if crate::tui::browse::same_path(&directory, &app.browse.current_dir) {
+                    if let Some(scan_generation) = app.browse.pending_scan_generation() {
+                        app.browse.schedule_inline_rename_after_scan(
+                            scan_generation,
+                            directory,
+                            target_path,
+                        );
+                    } else {
+                        let _ = begin_browse_inline_rename_for_path(app, &target_path);
+                    }
+                }
+            }
+            if let Some(warning) = warning {
+                app.set_status(format!(
+                    "{description}: renamed {} item{}; committed with warning: {warning}",
+                    succeeded_count,
+                    if succeeded_count == 1 { "" } else { "s" },
+                ));
+            } else {
+                app.set_status(format!(
+                    "{description}: renamed {} item{}",
+                    succeeded_count,
+                    if succeeded_count == 1 { "" } else { "s" },
+                ));
+            }
+        }
+        Err(error) => {
+            app.pending_inline_rename_resume = None;
+            app.set_status(format!("{description} failed: {error}"));
+        }
+    }
+}
+
+
+pub(crate) fn rename_paths_with_case_transform(
+    app: &mut AppState,
+    paths: Vec<std::path::PathBuf>,
+    transform: crate::convert::renaming::CaseTransform,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if paths.is_empty() {
+        app.set_status("Nothing to rename");
+        return;
+    }
+    let base_dir = app.browse.current_dir.clone();
+    let mut items = Vec::with_capacity(paths.len());
+    for source in paths {
+        if source.parent() != Some(base_dir.as_path()) {
+            app.set_status(format!(
+                "case rename refused outside the displayed directory: {}",
+                source.display(),
+            ));
+            return;
+        }
+        let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+            app.set_status(format!(
+                "case rename requires a Unicode filename: {}",
+                source.display(),
+            ));
+            return;
+        };
+        let transformed = crate::convert::renaming::transform_case(name, transform);
+        items.push((source, transformed));
+    }
+
+    let mut plan = crate::tui::rename_plan::RenamePlan::new(base_dir, items);
+    if crate::tui::rename_plan::validate_plan(&mut plan) > 0 {
+        app.set_status("case rename refused: target conflict or invalid end state");
+        return;
+    }
+    app.set_status("Applying capitalization rename...");
+    spawn_rename_plan(plan, "capitalization rename".to_string(), tx);
+}
+
+#[cfg(test)]
+fn verify_proof_at_root(
+    proof: &tui_file_picker::FileTaskRootProof,
+    root: &std::path::Path,
+) -> Result<(), String> {
+    proof
+        .verify_at(root)
+        .map(|_| ())
+        .map_err(|error| format!("{} changed since the operation completed: {error}", root.display()))
+}
+
+fn rename_relative_path(
+    base_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<String, String> {
+    let relative = target.strip_prefix(base_dir).map_err(|_| {
+        format!(
+            "rename target escapes retained transaction root {}: {}",
+            base_dir.display(),
+            target.display(),
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err("rename replay may not replace its transaction root".to_string());
+    }
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!("unstable rename replay path: {}", target.display()));
+        };
+        let part = part.to_str().ok_or_else(|| {
+            format!(
+                "rename replay requires a Unicode target component: {}",
+                target.display(),
+            )
+        })?;
+        parts.push(part);
+    }
+    Ok(parts.join("/"))
+}
+
+fn execute_transactional_rename_replay(
+    entry: &FileOperationUndoEntry,
+    undo: bool,
+) -> Result<crate::tui::rename_plan::RenameExecutionReport, String> {
+    let base_dir = entry
+        .rename_base_dir
+        .as_ref()
+        .ok_or_else(|| "rename undo entry is missing its transaction root".to_string())?;
+    let mut items = Vec::with_capacity(entry.mappings.len());
+    for mapping in &entry.mappings {
+        let (source, target) = if undo {
+            (&mapping.destination, &mapping.source)
+        } else {
+            (&mapping.source, &mapping.destination)
+        };
+        items.push((source.clone(), rename_relative_path(base_dir, target)?));
+    }
+    let expected_sources = entry
+        .mappings
+        .iter()
+        .map(|mapping| {
+            if undo {
+                mapping.destination_proof.clone()
+            } else {
+                mapping.source_proof.clone()
+            }
+            .ok_or_else(|| {
+                format!(
+                    "rename replay is missing operation-time source authority for {}",
+                    if undo {
+                        mapping.destination.display()
+                    } else {
+                        mapping.source.display()
+                    },
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut plan = crate::tui::rename_plan::RenamePlan::new(base_dir.clone(), items);
+    if crate::tui::rename_plan::validate_plan(&mut plan) > 0 {
+        return Err(
+            "transactional rename replay was refused by end-state collision or staleness validation"
+                .to_string(),
+        );
+    }
+    let report = crate::tui::rename_plan::execute_plan_with_proofs_and_expected_sources(
+        &mut plan,
+        &expected_sources,
+    )?;
+    if report.succeeded_count != entry.mappings.len() {
+        return Err(format!(
+            "transactional rename replay completed {} of {} mappings",
+            report.succeeded_count,
+            entry.mappings.len(),
+        ));
+    }
+    Ok(report)
+}
+
+fn undo_redo_policy(app: &AppState) -> tui_file_picker::FileOperationPolicy {
+    tui_file_picker::FileOperationPolicy {
+        allow_new_file: false,
+        allow_new_folder: false,
+        allow_cut: true,
+        allow_copy: true,
+        allow_paste: true,
+        allow_delete: false,
+        symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
+        cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::CopyThenDelete,
+        delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+        verbose_degrade_notices: app.file_task_verbose_degrade_notices,
+    }
+}
+
+fn refresh_browse_after_undo_redo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    app.browse.repair_navigation_after_delete();
+    app.browse.rebuild_tree_preserving_expansion();
+    app.browse.refresh_with_search(Some(tx));
+    app.browse.probe_current_with_db(tx, Some(&app.db));
+    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+}
+
+fn retain_undo_redo_report(
+    app: &mut AppState,
+    entry: &FileOperationUndoEntry,
+    undo: bool,
+    succeeded: &[usize],
+    committed_without_proof: &[(usize, String)],
+    failed: &[(usize, String)],
+) {
+    let is_move = entry.kind != FileOperationUndoKind::Copy;
+    let roots = entry
+        .mappings
+        .iter()
+        .enumerate()
+        .map(|(index, mapping)| {
+            let (source, destination) = if undo {
+                (mapping.destination.clone(), mapping.source.clone())
+            } else {
+                (mapping.source.clone(), mapping.destination.clone())
+            };
+            let committed_warning = committed_without_proof
+                .iter()
+                .find(|(committed_index, _)| *committed_index == index);
+            let failure = failed
+                .iter()
+                .find(|(failed_index, _)| *failed_index == index);
+            tui_file_picker::FileTaskRootResult {
+                source,
+                destination,
+                disposition: if succeeded.contains(&index) {
+                    tui_file_picker::FileTaskRootDisposition::Completed
+                } else if committed_warning.is_some() {
+                    tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+                } else if failure.is_some() {
+                    tui_file_picker::FileTaskRootDisposition::Failed
+                } else {
+                    tui_file_picker::FileTaskRootDisposition::NotAttempted
+                },
+                message: committed_warning
+                    .or(failure)
+                    .map(|(_, message)| message.clone()),
+                undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                proof: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let report = tui_file_picker::FileTaskCompletionReport { is_move, roots };
+    let action = if undo { "Undo" } else { "Redo" };
+    let mut progress = tui_file_picker::FileTaskProgressState::new(
+        if is_move {
+            tui_file_picker::FileTaskKind::Move
+        } else {
+            tui_file_picker::FileTaskKind::Copy
+        },
+        format!("{action} {}", entry.kind.label()),
+        file_picker_theme_from_theme(&app.theme),
+    );
+    let mut totals = tui_file_picker::ProgressTotals::default();
+    totals.items_done = succeeded
+        .len()
+        .saturating_add(committed_without_proof.len()) as u64;
+    totals.items_total = Some(entry.mappings.len() as u64);
+    for (index, message) in failed.iter().chain(committed_without_proof.iter()) {
+        progress.apply_update(tui_file_picker::FileTaskProgressUpdate::RecordError {
+            error: tui_file_picker::FileTaskErrorRecord {
+                item_label: entry.mappings[*index]
+                    .source
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.mappings[*index].source.display().to_string()),
+                source: Some(entry.mappings[*index].source.clone()),
+                destination: Some(entry.mappings[*index].destination.clone()),
+                message: message.clone(),
+            },
+            totals,
+        });
+    }
+    progress.apply_update(if failed.is_empty() {
+        tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: if committed_without_proof.is_empty() {
+                format!("{action} completed")
+            } else {
+                format!(
+                    "{action} committed with {} replay-authority warning{}",
+                    committed_without_proof.len(),
+                    if committed_without_proof.len() == 1 { "" } else { "s" },
+                )
+            },
+            totals,
+        }
+    } else {
+        tui_file_picker::FileTaskProgressUpdate::Failed {
+            status: format!("{action} incomplete"),
+            totals,
+        }
+    });
+    progress.append_completion_report(&report);
+    app.last_file_task_progress = Some((entry.id, progress));
+}
+
+fn split_entry_by_indices(
+    app: &mut AppState,
+    entry: &FileOperationUndoEntry,
+    selected: &[usize],
+) -> FileOperationUndoEntry {
+    FileOperationUndoEntry {
+        id: app.file_operation_undo.allocate_id(),
+        kind: entry.kind,
+        rename_base_dir: entry.rename_base_dir.clone(),
+        mappings: selected
+            .iter()
+            .map(|index| entry.mappings[*index].clone())
+            .collect(),
+    }
+}
+
+fn replay_failure_for_all(
+    entry: &FileOperationUndoEntry,
+    message: String,
+) -> super::message::FileOperationReplayResult {
+    super::message::FileOperationReplayResult {
+        completed: Vec::new(),
+        committed_without_proof: Vec::new(),
+        failed: (0..entry.mappings.len())
+            .map(|index| (index, message.clone()))
+            .collect(),
+    }
+}
+
+fn execute_file_operation_replay_worker(
+    entry: &FileOperationUndoEntry,
+    undo: bool,
+    policy: tui_file_picker::FileOperationPolicy,
+) -> super::message::FileOperationReplayResult {
+    if entry.kind == FileOperationUndoKind::Copy && undo {
+        // Phase 1: detach every root without deleting anything. A failure
+        // restores every previously detached root.
+        let mut detached = Vec::with_capacity(entry.mappings.len());
+        for (index, mapping) in entry.mappings.iter().enumerate() {
+            let Some(proof) = mapping.destination_proof.as_ref() else {
+                return replay_failure_for_all(
+                    entry,
+                    format!("missing operation-time destination proof for {}", mapping.destination.display()),
+                );
+            };
+            match tui_file_picker::prepare_verified_removal(
+                &proof.source_manifest,
+                &proof.destination_manifest,
+                &mapping.destination,
+            ) {
+                Ok(removal) => detached.push((index, removal)),
+                Err(error) => {
+                    let mut restore_errors = Vec::new();
+                    for (prepared_index, removal) in detached.into_iter().rev() {
+                        if let Err(restore_error) = removal.restore() {
+                            restore_errors.push(format!(
+                                "mapping {prepared_index} restore failed: {restore_error}"
+                            ));
+                        }
+                    }
+                    let mut message = error;
+                    if !restore_errors.is_empty() {
+                        message.push_str("; ");
+                        message.push_str(&restore_errors.join("; "));
+                    }
+                    return replay_failure_for_all(entry, message);
+                }
+            }
+        }
+
+        // Phase 2: complete every expensive and predictably fallible cleanup
+        // preflight across all roots before deleting the first entry. Prepared
+        // guards retain no per-entry handle vector, so this remains bounded by
+        // tree depth rather than manifest cardinality.
+        let mut prepared = Vec::with_capacity(detached.len());
+        let mut remaining_detached = detached.into_iter();
+        while let Some((index, removal)) = remaining_detached.next() {
+            match removal.prepare_for_commit() {
+                Ok(removal) => prepared.push((index, removal)),
+                Err(error) => {
+                    let mut restore_errors = Vec::new();
+                    for (prepared_index, removal) in prepared.into_iter().rev() {
+                        if let Err(restore_error) = removal.restore() {
+                            restore_errors.push(format!(
+                                "mapping {prepared_index} prepared-root restore failed: {restore_error}"
+                            ));
+                        }
+                    }
+                    for (detached_index, removal) in remaining_detached {
+                        if let Err(restore_error) = removal.restore() {
+                            restore_errors.push(format!(
+                                "mapping {detached_index} detached-root restore failed: {restore_error}"
+                            ));
+                        }
+                    }
+                    let mut message = format!(
+                        "copy undo preflight failed before any root was deleted: {error}"
+                    );
+                    if !restore_errors.is_empty() {
+                        message.push_str("; ");
+                        message.push_str(&restore_errors.join("; "));
+                    }
+                    return replay_failure_for_all(entry, message);
+                }
+            }
+        }
+
+        // Phase 3: commit already-prepared roots. Only concurrent mutation,
+        // I/O failure, or a real crash can now produce partial completion.
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+        let mut remaining = prepared.into_iter();
+        while let Some((index, removal)) = remaining.next() {
+            match removal.commit() {
+                Ok(()) => completed.push(super::message::FileOperationReplayCompletion {
+                    index,
+                    proof: None,
+                }),
+                Err(error) => {
+                    failed.push((index, error));
+                    for (remaining_index, remaining_removal) in remaining {
+                        match remaining_removal.restore() {
+                            Ok(()) => failed.push((
+                                remaining_index,
+                                "copy undo stopped after an earlier cleanup failure; prepared root was restored"
+                                    .to_string(),
+                            )),
+                            Err(restore_error) => failed.push((remaining_index, restore_error)),
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        return super::message::FileOperationReplayResult {
+            completed,
+            committed_without_proof: Vec::new(),
+            failed,
+        };
+    }
+
+    if entry.kind == FileOperationUndoKind::Rename {
+        return match execute_transactional_rename_replay(entry, undo) {
+            Ok(report) => {
+                let mut completed = Vec::with_capacity(report.roots.len());
+                let mut proof_failures = Vec::new();
+                for root in report.roots {
+                    let index = entry.mappings.iter().position(|mapping| {
+                        if undo {
+                            mapping.destination == root.source
+                                && mapping.source == root.destination
+                        } else {
+                            mapping.source == root.source
+                                && mapping.destination == root.destination
+                        }
+                    });
+                    let Some(index) = index else {
+                        let message =
+                            "rename replay committed, but returned an unknown mapping; all replay authority was discarded"
+                                .to_string();
+                        return super::message::FileOperationReplayResult {
+                            completed: Vec::new(),
+                            committed_without_proof: (0..entry.mappings.len())
+                                .map(|index| (index, message.clone()))
+                                .collect(),
+                            failed: Vec::new(),
+                        };
+                    };
+                    match root.proof {
+                        Ok(proof) => completed.push(
+                            super::message::FileOperationReplayCompletion {
+                                index,
+                                proof: Some(proof),
+                            },
+                        ),
+                        Err(error) => proof_failures.push(format!(
+                            "{} -> {}: {error}",
+                            root.source.display(),
+                            root.destination.display(),
+                        )),
+                    }
+                }
+                if proof_failures.is_empty() && completed.len() == entry.mappings.len() {
+                    super::message::FileOperationReplayResult {
+                        completed,
+                        committed_without_proof: Vec::new(),
+                        failed: Vec::new(),
+                    }
+                } else {
+                    let message = format!(
+                        "transactional rename replay committed, but authoritative proof was incomplete; the entire transaction was removed from undo/redo history: {}",
+                        if proof_failures.is_empty() {
+                            "one or more committed mappings were absent from the worker report".to_string()
+                        } else {
+                            proof_failures.join("; ")
+                        },
+                    );
+                    super::message::FileOperationReplayResult {
+                        completed: Vec::new(),
+                        committed_without_proof: (0..entry.mappings.len())
+                            .map(|index| (index, message.clone()))
+                            .collect(),
+                        failed: Vec::new(),
+                    }
+                }
+            }
+            Err(error) => replay_failure_for_all(entry, error),
+        };
+    }
+
+    let plan = tui_file_picker::PastePlan {
+        mode: if entry.kind == FileOperationUndoKind::Copy {
+            tui_file_picker::FilePickerClipboardMode::Copy
+        } else {
+            tui_file_picker::FilePickerClipboardMode::Cut
+        },
+        mappings: entry
+            .mappings
+            .iter()
+            .map(|mapping| {
+                let (source, destination) = if undo {
+                    (&mapping.destination, &mapping.source)
+                } else {
+                    (&mapping.source, &mapping.destination)
+                };
+                tui_file_picker::PasteMapping {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                }
+            })
+            .collect(),
+    };
+
+    let expected_sources = match entry
+        .mappings
+        .iter()
+        .map(|mapping| {
+            if undo {
+                mapping.destination_proof.clone()
+            } else {
+                mapping.source_proof.clone()
+            }
+            .ok_or_else(|| {
+                format!(
+                    "replay is missing operation-time source authority for {}",
+                    if undo {
+                        mapping.destination.display()
+                    } else {
+                        mapping.source.display()
+                    },
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(expected) => expected,
+        Err(error) => return replay_failure_for_all(entry, error),
+    };
+
+    let (completed_mappings, completed_proofs, committed_unverified, operation_error) =
+        match tui_file_picker::execute_exact_paste_plan_with_proofs_and_expected_sources(
+            &plan,
+            policy,
+            &expected_sources,
+        ) {
+            Ok(success) => (success.mappings, success.proofs, Vec::new(), None),
+            Err(failure) => {
+                let error = failure.to_string();
+                (
+                    failure.completed,
+                    failure.completed_proofs,
+                    failure.committed_unverified,
+                    Some(error),
+                )
+            }
+        };
+    let mut completed = Vec::new();
+    for root in completed_proofs {
+        if let Some(index) = plan.mappings.iter().position(|mapping| *mapping == root.mapping) {
+            completed.push(super::message::FileOperationReplayCompletion {
+                index,
+                proof: Some(root.proof),
+            });
+        }
+    }
+    let mut committed_without_proof = Vec::new();
+    let committed_message = operation_error
+        .clone()
+        .unwrap_or_else(|| "operation committed without authoritative replay proof".to_string());
+    for mapping in committed_unverified {
+        if let Some(index) = plan.mappings.iter().position(|candidate| *candidate == mapping) {
+            committed_without_proof.push((index, committed_message.clone()));
+        }
+    }
+    let mut failed = Vec::new();
+    if let Some(error) = operation_error {
+        for index in 0..entry.mappings.len() {
+            if !completed.iter().any(|completion| completion.index == index)
+                && !committed_without_proof
+                    .iter()
+                    .any(|(committed_index, _)| *committed_index == index)
+            {
+                failed.push((index, error.clone()));
+            }
+        }
+    }
+    if completed.len() != completed_mappings.len() {
+        let message = "replay reported a committed root without authoritative proof; its history entry was discarded".to_string();
+        for mapping in completed_mappings {
+            let Some(index) = plan
+                .mappings
+                .iter()
+                .position(|candidate| *candidate == mapping)
+            else {
+                continue;
+            };
+            if !completed.iter().any(|completion| completion.index == index)
+                && !committed_without_proof
+                    .iter()
+                    .any(|(committed_index, _)| *committed_index == index)
+            {
+                committed_without_proof.push((index, message.clone()));
+                failed.retain(|(failed_index, _)| *failed_index != index);
+            }
+        }
+    }
+    super::message::FileOperationReplayResult {
+        completed,
+        committed_without_proof,
+        failed,
+    }
+}
+
+fn spawn_file_operation_replay(
+    entry: FileOperationUndoEntry,
+    undo: bool,
+    policy: tui_file_picker::FileOperationPolicy,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let result = execute_file_operation_replay_worker(&entry, undo, policy);
+        let _ = tx.blocking_send(AppMessage::FileOperationReplayComplete {
+            entry,
+            undo,
+            result,
+        });
+    });
+}
+
+pub(crate) fn complete_file_operation_replay(
+    app: &mut AppState,
+    mut entry: FileOperationUndoEntry,
+    undo: bool,
+    result: super::message::FileOperationReplayResult,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let super::message::FileOperationReplayResult {
+        completed,
+        mut committed_without_proof,
+        mut failed,
+    } = result;
+    let mut succeeded = Vec::new();
+    for completion in completed {
+        let index = completion.index;
+        let Some(mapping) = entry.mappings.get_mut(index) else {
+            continue;
+        };
+        if undo {
+            mapping.destination_proof = None;
+            if entry.kind != FileOperationUndoKind::Copy {
+                match completion.proof {
+                    Some(proof) => mapping.source_proof = Some(proof),
+                    None => {
+                        committed_without_proof.push((
+                            index,
+                            "undo committed without authoritative redo proof; this mapping was removed from history"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                }
+            }
+        } else {
+            if entry.kind != FileOperationUndoKind::Copy {
+                mapping.source_proof = None;
+            }
+            match completion.proof {
+                Some(proof) => mapping.destination_proof = Some(proof),
+                None => {
+                    committed_without_proof.push((
+                        index,
+                        "redo committed without authoritative undo proof; this mapping was removed from history"
+                            .to_string(),
+                    ));
+                    continue;
+                }
+            }
+        }
+        succeeded.push(index);
+    }
+
+    committed_without_proof.sort_by_key(|(index, _)| *index);
+    committed_without_proof.dedup_by(|left, right| left.0 == right.0);
+    failed.retain(|(index, _)| {
+        !committed_without_proof
+            .iter()
+            .any(|(committed_index, _)| committed_index == index)
+    });
+    failed.sort_by_key(|(index, _)| *index);
+    failed.dedup_by(|left, right| left.0 == right.0);
+    succeeded.retain(|index| {
+        !failed.iter().any(|(failed_index, _)| failed_index == index)
+            && !committed_without_proof
+                .iter()
+                .any(|(committed_index, _)| committed_index == index)
+    });
+    succeeded.sort_unstable();
+    succeeded.dedup();
+
+    retain_undo_redo_report(
+        app,
+        &entry,
+        undo,
+        &succeeded,
+        &committed_without_proof,
+        &failed,
+    );
+
+    let complete = failed.is_empty()
+        && committed_without_proof.is_empty()
+        && succeeded.len() == entry.mappings.len();
+    if complete {
+        if undo {
+            app.file_operation_undo.finish_undo(entry.clone());
+        } else {
+            app.file_operation_undo.finish_redo(entry.clone());
+        }
+        app.set_status(format!(
+            "{} {} of {} item{}",
+            if undo { "Undid" } else { "Redid" },
+            entry.kind.label(),
+            succeeded.len(),
+            if succeeded.len() == 1 { "" } else { "s" },
+        ));
+    } else {
+        let failed_indices = failed.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        if !succeeded.is_empty() {
+            let completed_entry = split_entry_by_indices(app, &entry, &succeeded);
+            if undo {
+                app.file_operation_undo.finish_undo(completed_entry);
+            } else {
+                app.file_operation_undo.finish_redo(completed_entry);
+            }
+        }
+        if !failed_indices.is_empty() {
+            let residual = split_entry_by_indices(app, &entry, &failed_indices);
+            if undo {
+                app.file_operation_undo.restore_undo(residual);
+            } else {
+                app.file_operation_undo.restore_redo(residual);
+            }
+        }
+        if failed.is_empty() {
+            app.set_status(format!(
+                "{} committed, but replay authority was lost for {} item{}; affected history was discarded; see :messages",
+                if undo { "Undo" } else { "Redo" },
+                committed_without_proof.len(),
+                if committed_without_proof.len() == 1 { "" } else { "s" },
+            ));
+        } else {
+            app.set_status(format!(
+                "{} partially completed: {} succeeded, {} committed without replay authority, {} failed; see :messages",
+                if undo { "Undo" } else { "Redo" },
+                succeeded.len(),
+                committed_without_proof.len(),
+                failed.len(),
+            ));
+        }
+    }
+    refresh_browse_after_undo_redo(app, tx);
+}
+
+fn execute_file_operation_undo(
+    app: &mut AppState,
+    expected_id: u64,
+    copy_confirmed: bool,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let Some(entry) = app.file_operation_undo.take_undo(expected_id) else {
+        app.set_status("undo: operation changed; request ignored");
+        return;
+    };
+    if entry.kind == FileOperationUndoKind::Copy && !copy_confirmed {
+        app.file_operation_undo.restore_undo(entry);
+        app.set_status("undo: copy removal requires confirmation");
+        return;
+    }
+    let policy = undo_redo_policy(app);
+    app.set_status(format!("Undoing {}...", entry.kind.label()));
+    spawn_file_operation_replay(entry, true, policy, tx);
+}
+
+fn request_file_operation_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let Some(entry) = app.file_operation_undo.undo_entry().cloned() else {
+        app.set_status("Nothing to undo");
+        return;
+    };
+    if entry.kind == FileOperationUndoKind::Copy {
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: format!(
+                "Undo this copy?\n\nThis atomically quarantines and verifies {} artifact{} created at previously absent destination roots before deleting anything. Overwrite and merge operations are never recorded as delete-based undo.",
+                entry.mappings.len(),
+                if entry.mappings.len() == 1 { "" } else { "s" },
+            ),
+            action: ConfirmAction::UndoCopy { entry_id: entry.id },
+        };
+    } else {
+        execute_file_operation_undo(app, entry.id, true, tx);
+    }
+}
+
+fn execute_file_operation_redo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let Some(entry_snapshot) = app.file_operation_undo.redo_entry().cloned() else {
+        app.set_status("Nothing to redo");
+        return;
+    };
+    let Some(entry) = app.file_operation_undo.take_redo(entry_snapshot.id) else {
+        app.set_status("redo: operation changed; request ignored");
+        return;
+    };
+    let policy = undo_redo_policy(app);
+    app.set_status(format!("Redoing {}...", entry.kind.label()));
+    spawn_file_operation_replay(entry, false, policy, tx);
 }
 
 fn save_browse_layout(app: &mut AppState) {
@@ -2144,6 +3214,20 @@ fn browse_inline_tab_advance(app: &mut AppState, forward: bool, tx: &mpsc::Sende
     } else {
         None
     };
+    // A filesystem rename commit with a changed name hands the work to a
+    // rename-plan worker; an unchanged name is a synchronous no-op and archive
+    // renames refresh through their own listing flow.
+    let spawns_rename_worker = !app.browse.is_in_archive()
+        && app
+            .browse_inline_edit
+            .as_ref()
+            .is_some_and(|state| match &state.target {
+                BrowseInlineEditTarget::Rename { path } => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|old_name| old_name != state.input.text.trim()),
+                _ => false,
+            });
 
     let committed = commit_browse_inline_edit(app, tx);
     if !was_rename || !committed {
@@ -2155,9 +3239,10 @@ fn browse_inline_tab_advance(app: &mut AppState, forward: bool, tx: &mpsc::Sende
         return;
     };
 
-    // Normal runtime refreshes filesystem renames asynchronously and clears
-    // entries immediately. Defer the continuation until DirScanComplete
-    // repopulates the same directory. In synchronous/no-op paths, continue now.
+    // A committed rename executes on its worker; the directory refresh (and
+    // entry repopulation) happens when RenamePlanComplete arrives. Park the
+    // continuation so complete_rename_plan can bind it to that refresh scan.
+    // No-op commits (unchanged name) refresh nothing, so continue in place.
     if app.browse.entries.is_empty() {
         if let Some(scan_generation) = app.browse.pending_scan_generation() {
             app.browse.schedule_inline_rename_after_scan(
@@ -2166,6 +3251,10 @@ fn browse_inline_tab_advance(app: &mut AppState, forward: bool, tx: &mpsc::Sende
                 target_path,
             );
         }
+        return;
+    }
+    if committed && spawns_rename_worker {
+        app.pending_inline_rename_resume = Some((resume_directory, target_path));
         return;
     }
 
@@ -3058,7 +4147,7 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
-    fn convert_metadata_field_double_click_commits_inline_edit_then_opens_overlay_path() {
+    fn convert_metadata_field_double_click_selects_all_inside_active_inline_edit() {
         let (tx, _rx) = channel();
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
@@ -3087,15 +4176,25 @@ mod inline_edit_behavior_tests {
         app.convert.metadata.edit_input.set_text_and_cursor("After".to_string(), "After".len());
         click(&mut app);
 
+        // The standardized text-mouse contract routes clicks on the active
+        // editor into the editor itself: the first routed click places the
+        // cursor, and a second routed click inside the double-click window
+        // selects all. It must not commit the edit or fall through to the
+        // full-editor overlay path (Ctrl+E and the file-row double-click
+        // remain the full-editor entrances).
         assert_eq!(app.convert.focus, ConvertFocus::Metadata);
-        assert_eq!(app.convert.metadata.editing, None);
-        assert_eq!(app.convert.metadata.title.as_deref(), Some("After"));
+        assert_eq!(app.convert.metadata.editing, Some(ConvertMetadataField::Title));
+        assert_eq!(app.convert.metadata.edit_input.text, "After");
+        assert_eq!(app.convert.metadata.edit_input.selection_range(), None);
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
-        assert!(app
-            .status_message
-            .as_ref()
-            .map(|(message, _)| message.contains("no source file selected"))
-            .unwrap_or(false));
+
+        click(&mut app);
+        assert_eq!(app.convert.metadata.editing, Some(ConvertMetadataField::Title));
+        assert_eq!(
+            app.convert.metadata.edit_input.selection_range(),
+            Some(0.."After".len()),
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
     }
 
     #[test]
@@ -3184,7 +4283,7 @@ mod inline_edit_behavior_tests {
 
     #[test]
     fn browse_inline_tab_with_no_next_entry_commits_rename_without_resuming() {
-        let (tx, _rx) = channel();
+        let (tx, mut rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("old.flac");
         let renamed = temp.path().join("new.flac");
@@ -3202,8 +4301,18 @@ mod inline_edit_behavior_tests {
 
         handle_browse_inline_edit_key(&mut app, key(KeyCode::Tab), &tx);
 
+        loop {
+            match rx.blocking_recv().expect("rename completion") {
+                AppMessage::RenamePlanComplete { result, .. } => {
+                    result.expect("rename plan succeeds");
+                    break;
+                }
+                _ => continue,
+            }
+        }
         assert!(renamed.exists());
         assert!(app.browse_inline_edit.is_none());
+        assert!(app.pending_inline_rename_resume.is_none());
         assert!(app.browse.pending_inline_rename_after_scan.is_none());
     }
 
@@ -3491,7 +4600,7 @@ mod inline_edit_behavior_tests {
 
     #[tokio::test]
     async fn browse_inline_tab_rename_resumes_next_entry_after_async_scan() {
-        let (tx, _rx) = channel();
+        let (tx, mut rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("a.txt");
         let renamed = temp.path().join("aa.txt");
@@ -3517,6 +4626,14 @@ mod inline_edit_behavior_tests {
         });
 
         browse_inline_tab_advance(&mut app, true, &tx);
+
+        let completion = loop {
+            match rx.recv().await.expect("rename completion") {
+                message @ AppMessage::RenamePlanComplete { .. } => break message,
+                _ => continue,
+            }
+        };
+        super::super::event_loop::handle_message(&mut app, completion, &tx);
 
         assert!(app.browse.entries.is_empty(), "async refresh should clear visible entries");
         assert!(app.browse.pending_inline_rename_after_scan.is_some());
@@ -3550,7 +4667,7 @@ mod inline_edit_behavior_tests {
 
     #[tokio::test]
     async fn browse_inline_shift_tab_rename_resumes_previous_entry_after_async_scan() {
-        let (tx, _rx) = channel();
+        let (tx, mut rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
         let first = temp.path().join("a.txt");
         let previous = temp.path().join("b.txt");
@@ -3576,6 +4693,14 @@ mod inline_edit_behavior_tests {
         });
 
         browse_inline_tab_advance(&mut app, false, &tx);
+
+        let completion = loop {
+            match rx.recv().await.expect("rename completion") {
+                message @ AppMessage::RenamePlanComplete { .. } => break message,
+                _ => continue,
+            }
+        };
+        super::super::event_loop::handle_message(&mut app, completion, &tx);
 
         assert!(app.browse.entries.is_empty(), "async refresh should clear visible entries");
         assert!(app.browse.pending_inline_rename_after_scan.is_some());
@@ -4214,6 +5339,21 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                 app.browse.close_options_menu();
                 request_bookmark_target_statuses(app, tx);
             }
+            return;
+        }
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+            request_file_operation_undo(app, tx);
+            return;
+        }
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+            execute_file_operation_redo(app, tx);
+            return;
+        }
+        (KeyCode::Char('/'), KeyModifiers::CONTROL)
+        | (KeyCode::Char('_'), KeyModifiers::CONTROL) => {
+            app.browse.clear_multi_selection();
+            app.browse.cancel_range_selection();
+            app.set_status("Selection cleared");
             return;
         }
         (KeyCode::Char('c' | 'x' | 'v' | 'p'), KeyModifiers::CONTROL) => {
@@ -7189,6 +8329,320 @@ fn handle_metadata_autonumber_mouse(app: &mut AppState, mouse: MouseEvent) {
     app.active_overlay = ActiveOverlay::MetadataAutoNumber(state);
 }
 
+fn editor_owner_overlay(app: &AppState) -> &ActiveOverlay {
+    app.pending_editor_context_overlay
+        .as_deref()
+        .unwrap_or(&app.active_overlay)
+}
+
+fn editor_owner_overlay_mut(app: &mut AppState) -> &mut ActiveOverlay {
+    if app.pending_editor_context_overlay.is_some() {
+        app.pending_editor_context_overlay
+            .as_deref_mut()
+            .expect("checked pending editor overlay")
+    } else {
+        &mut app.active_overlay
+    }
+}
+
+fn editor_text_input(app: &AppState, target: EditorTextTarget) -> Option<&super::text_input::TextInputState> {
+    match target {
+        EditorTextTarget::BrowseFileInlineEdit
+        | EditorTextTarget::BrowseTreeInlineEdit => app.browse_inline_edit.as_ref().map(|edit| &edit.input),
+        EditorTextTarget::BrowsePath => app.browse.path_input.as_ref(),
+        EditorTextTarget::BrowseSearch => {
+            if app.browse.search.active {
+                Some(&app.browse.search.input)
+            } else {
+                None
+            }
+        },
+        EditorTextTarget::BrowseFilter => app.browse.filter_input.as_ref(),
+        EditorTextTarget::ConvertMetadata => {
+            if app.convert.metadata.editing.is_some() {
+                Some(&app.convert.metadata.edit_input)
+            } else {
+                None
+            }
+        },
+        EditorTextTarget::ConvertOutputOptions => {
+            if app.convert.output_options.editing.is_some() {
+                Some(&app.convert.output_options.edit_input)
+            } else {
+                None
+            }
+        },
+        EditorTextTarget::MetadataInline => match editor_owner_overlay(app) {
+            ActiveOverlay::MetadataEditor(state) => state.edit_input.as_ref(),
+            _ => None,
+        },
+        EditorTextTarget::MetadataAddKey => match editor_owner_overlay(app) {
+            ActiveOverlay::MetadataEditor(state) => state.add_key_input.as_ref(),
+            _ => None,
+        },
+        EditorTextTarget::MetadataDetail => match editor_owner_overlay(app) {
+            ActiveOverlay::MetadataEditor(state) => state.detail_edit.as_ref(),
+            _ => None,
+        },
+        EditorTextTarget::MetadataAutoNumberPrefix => match editor_owner_overlay(app) {
+            ActiveOverlay::MetadataAutoNumber(state) => state.prefix_input.as_ref(),
+            _ => None,
+        },
+        EditorTextTarget::GnudbInline => match editor_owner_overlay(app) {
+            ActiveOverlay::GnudbReview(state) => state.edit_input.as_ref(),
+            _ => None,
+        },
+        EditorTextTarget::ThemeHex => match editor_owner_overlay(app) {
+            ActiveOverlay::ThemeBuilder(state) if state.tab == super::theme_builder::BuilderTab::Derived => {
+                Some(&state.derived_hex_input)
+            }
+            ActiveOverlay::ThemeBuilder(state) => Some(&state.hex_input),
+            _ => None,
+        },
+        EditorTextTarget::ThemeSwatchName => match editor_owner_overlay(app) {
+            ActiveOverlay::ThemeBuilder(state) if state.swatch_naming_active => Some(&state.swatch_name_input),
+            _ => None,
+        },
+        EditorTextTarget::ThemeGalleryFilter => match editor_owner_overlay(app) {
+            ActiveOverlay::ThemeBuilder(state) if state.gallery_filter_active => Some(&state.gallery_filter_input),
+            _ => None,
+        },
+        EditorTextTarget::ThemeFilePath => match editor_owner_overlay(app) {
+            ActiveOverlay::ThemeBuilder(state)
+                if state.overlay == super::theme_builder::BuilderOverlay::ExportDialog =>
+            {
+                Some(&state.export_path_input)
+            }
+            ActiveOverlay::ThemeBuilder(state)
+                if state.overlay == super::theme_builder::BuilderOverlay::ImportDialog =>
+            {
+                Some(&state.import_path_input)
+            }
+            _ => None,
+        },
+        EditorTextTarget::BulkRenameTemplate => match editor_owner_overlay(app) {
+            ActiveOverlay::BulkRename(state) => Some(&state.template_input),
+            _ => None,
+        },
+        EditorTextTarget::TemplateBuilder => match editor_owner_overlay(app) {
+            ActiveOverlay::TemplateBuilder(state) => Some(&state.template_input),
+            _ => None,
+        },
+        EditorTextTarget::OverlayFileInput => match editor_owner_overlay(app) {
+            ActiveOverlay::FileInput { input } => Some(input),
+            _ => None,
+        },
+        EditorTextTarget::OverlayCommandInput => match editor_owner_overlay(app) {
+            ActiveOverlay::CommandInput { input, .. } => Some(input),
+            _ => None,
+        },
+        EditorTextTarget::OverlayTextEdit => match editor_owner_overlay(app) {
+            ActiveOverlay::TextEdit { input, .. } => Some(input),
+            _ => None,
+        },
+    }
+}
+
+fn editor_text_input_mut(
+    app: &mut AppState,
+    target: EditorTextTarget,
+) -> Option<&mut super::text_input::TextInputState> {
+    match target {
+        EditorTextTarget::BrowseFileInlineEdit
+        | EditorTextTarget::BrowseTreeInlineEdit => app.browse_inline_edit.as_mut().map(|edit| &mut edit.input),
+        EditorTextTarget::BrowsePath => app.browse.path_input.as_mut(),
+        EditorTextTarget::BrowseSearch => {
+            if app.browse.search.active {
+                Some(&mut app.browse.search.input)
+            } else {
+                None
+            }
+        },
+        EditorTextTarget::BrowseFilter => app.browse.filter_input.as_mut(),
+        EditorTextTarget::ConvertMetadata => {
+            if app.convert.metadata.editing.is_some() {
+                Some(&mut app.convert.metadata.edit_input)
+            } else {
+                None
+            }
+        },
+        EditorTextTarget::ConvertOutputOptions => {
+            if app.convert.output_options.editing.is_some() {
+                Some(&mut app.convert.output_options.edit_input)
+            } else {
+                None
+            }
+        },
+        EditorTextTarget::MetadataInline => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::MetadataEditor(state) => state.edit_input.as_mut(),
+            _ => None,
+        },
+        EditorTextTarget::MetadataAddKey => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::MetadataEditor(state) => state.add_key_input.as_mut(),
+            _ => None,
+        },
+        EditorTextTarget::MetadataDetail => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::MetadataEditor(state) => state.detail_edit.as_mut(),
+            _ => None,
+        },
+        EditorTextTarget::MetadataAutoNumberPrefix => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::MetadataAutoNumber(state) => state.prefix_input.as_mut(),
+            _ => None,
+        },
+        EditorTextTarget::GnudbInline => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::GnudbReview(state) => state.edit_input.as_mut(),
+            _ => None,
+        },
+        EditorTextTarget::ThemeHex => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::ThemeBuilder(state) => {
+                if state.tab == super::theme_builder::BuilderTab::Derived {
+                    Some(&mut state.derived_hex_input)
+                } else {
+                    Some(&mut state.hex_input)
+                }
+            }
+            _ => None,
+        },
+        EditorTextTarget::ThemeSwatchName => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::ThemeBuilder(state) if state.swatch_naming_active => Some(&mut state.swatch_name_input),
+            _ => None,
+        },
+        EditorTextTarget::ThemeGalleryFilter => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::ThemeBuilder(state) if state.gallery_filter_active => Some(&mut state.gallery_filter_input),
+            _ => None,
+        },
+        EditorTextTarget::ThemeFilePath => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::ThemeBuilder(state) => match state.overlay {
+                super::theme_builder::BuilderOverlay::ExportDialog => {
+                    Some(&mut state.export_path_input)
+                }
+                super::theme_builder::BuilderOverlay::ImportDialog => {
+                    Some(&mut state.import_path_input)
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        EditorTextTarget::BulkRenameTemplate => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::BulkRename(state) => Some(&mut state.template_input),
+            _ => None,
+        },
+        EditorTextTarget::TemplateBuilder => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::TemplateBuilder(state) => Some(&mut state.template_input),
+            _ => None,
+        },
+        EditorTextTarget::OverlayFileInput => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::FileInput { input } => Some(input),
+            _ => None,
+        },
+        EditorTextTarget::OverlayCommandInput => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::CommandInput { input, .. } => Some(input),
+            _ => None,
+        },
+        EditorTextTarget::OverlayTextEdit => match editor_owner_overlay_mut(app) {
+            ActiveOverlay::TextEdit { input, .. } => Some(input),
+            _ => None,
+        },
+    }
+}
+
+fn focus_editor_target(app: &mut AppState, target: EditorTextTarget) {
+    match target {
+        EditorTextTarget::BrowseSearch => {
+            app.browse.search.focus = super::browse::SearchFocus::Input;
+        }
+        EditorTextTarget::ThemeHex => {
+            if let ActiveOverlay::ThemeBuilder(state) = editor_owner_overlay_mut(app) {
+                state.editor_focus = super::theme_builder::BuilderEditorFocus::Hex;
+            }
+        }
+        EditorTextTarget::BulkRenameTemplate => {
+            if let ActiveOverlay::BulkRename(state) = editor_owner_overlay_mut(app) {
+                state.focus = BulkRenameFocus::Template;
+            }
+        }
+        EditorTextTarget::TemplateBuilder => {
+            if let ActiveOverlay::TemplateBuilder(state) = editor_owner_overlay_mut(app) {
+                state.focus = TemplateBuilderFocus::TemplateInput;
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn editor_context_capabilities(app: &AppState) -> (bool, bool) {
+    app.editor_context_target
+        .and_then(|target| editor_text_input(app, target))
+        .map(|input| (input.has_selection(), input.can_paste()))
+        .unwrap_or((false, false))
+}
+
+pub(crate) fn execute_editor_context_action(
+    app: &mut AppState,
+    action: super::context_menu::ContextAction,
+) -> bool {
+    let Some(target) = app.editor_context_target else {
+        return false;
+    };
+    let Some(input) = editor_text_input_mut(app, target) else {
+        app.set_status("editor context target is no longer active");
+        return true;
+    };
+    match action {
+        super::context_menu::ContextAction::EditorPaste => {
+            input.paste_clipboard();
+        }
+        super::context_menu::ContextAction::EditorCopy => {
+            input.copy_selection();
+        }
+        super::context_menu::ContextAction::EditorCut => {
+            input.cut_selection();
+        }
+        super::context_menu::ContextAction::EditorDelete => input.delete(),
+        super::context_menu::ContextAction::EditorSelectAll => input.select_all_text(),
+        super::context_menu::ContextAction::EditorFixCapitalization(transform) => {
+            input.transform_selection_or_all(|value| {
+                crate::convert::renaming::transform_case(value, transform)
+            });
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn open_editor_context_menu(
+    app: &mut AppState,
+    target: EditorTextTarget,
+    x: u16,
+    y: u16,
+    park_active_overlay: bool,
+) -> bool {
+    if park_active_overlay {
+        if app.pending_editor_context_overlay.is_some() {
+            return false;
+        }
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        if matches!(overlay, ActiveOverlay::None) {
+            return false;
+        }
+        app.pending_editor_context_overlay = Some(Box::new(overlay));
+    }
+    app.editor_context_target = Some(target);
+    if editor_text_input(app, target).is_none() {
+        if let Some(overlay) = app.pending_editor_context_overlay.take() {
+            app.active_overlay = *overlay;
+        }
+        app.editor_context_target = None;
+        return false;
+    }
+    let entries = super::context_menu::build_editor_context_menu(app);
+    app.active_overlay = ActiveOverlay::ContextMenu {
+        levels: vec![super::context_menu::MenuLevel::new(entries)],
+        origin: (x, y),
+    };
+    true
+}
+
 ///
 /// Called from every ContextMenu close path (Esc / Left / outside-click /
 /// post-action) so right-click → context menu → Esc round-trips back to
@@ -7196,6 +8650,11 @@ fn handle_metadata_autonumber_mouse(app: &mut AppState, mouse: MouseEvent) {
 /// by the CommandInput Enter/Esc handlers.
 fn close_context_menu_restoring_parked(app: &mut AppState) {
     app.browse_context_action_paths = None;
+    app.editor_context_target = None;
+    if let Some(parked) = app.pending_editor_context_overlay.take() {
+        app.active_overlay = *parked;
+        return;
+    }
     // Restoration order is innermost-parked-first: when SACD
     // `:tags-mb` parks the editor and a subsequent right-click on
     // MbSelect parks the picker, both slots are `Some` at once.
@@ -7242,7 +8701,12 @@ fn run_context_action_restoring_parked(
     app.active_overlay = ActiveOverlay::None;
     super::context_menu::execute_context_action(app, action, tx, invert);
     app.browse_context_action_paths = None;
+    app.editor_context_target = None;
     if matches!(app.active_overlay, ActiveOverlay::None) {
+        if let Some(parked) = app.pending_editor_context_overlay.take() {
+            app.active_overlay = *parked;
+            return;
+        }
         // An editor-originated GNUDB operation owns the parked editor until
         // its guarded completion, explicit cancellation, or error retirement.
         // Restoring it here would let the eventual completion overwrite a live
@@ -7269,6 +8733,10 @@ fn run_context_action_restoring_parked(
             app.active_overlay = ActiveOverlay::MetadataEditor(parked);
         }
     } else {
+        // An action that deliberately opened a different overlay owns the
+        // transition. The parked editor is retained only for editor-menu
+        // actions, all of which leave `active_overlay` as None above.
+        app.pending_editor_context_overlay = None;
         // Action set its own overlay. A MusicBrainz accept now transitions to
         // a non-interactive verifying picker while the source editor remains
         // parked; dropping that editor here would make both cancellation and
@@ -8971,7 +10439,9 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     state.pending_artwork_type = None;
-    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+    let picker = tui_file_picker::FilePickerState::new(file_picker_config_with_browse_sort(
+        app,
+        tui_file_picker::FilePickerConfig {
         start_dir: dir,
         filter: tui_file_picker::FilePickerFilter::Images,
         title: "Select artwork image".to_string(),
@@ -8981,7 +10451,8 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
             app.file_task_verbose_degrade_notices,
         ),
         ..tui_file_picker::FilePickerConfig::default()
-    });
+        },
+    ));
     state.file_picker = Some(crate::tui::app::MetadataFilePickerState::new(
         crate::tui::app::FilePickerPurpose::SelectArtwork { picture_type },
         picker,
@@ -25723,26 +27194,14 @@ fn handle_bulk_rename_key(
 fn execute_bulk_rename(
     app: &mut AppState,
     state: &mut BulkRenameState,
-    _tx: &mpsc::Sender<AppMessage>,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
-    match crate::tui::rename_plan::execute_plan(&mut state.plan) {
-        Ok(count) => {
-            app.set_status(&format!(
-                "Renamed {} file{}",
-                count,
-                if count == 1 { "" } else { "s" }
-            ));
-            app.active_overlay = ActiveOverlay::None;
-            // Refresh browse to reflect the renames.
-            app.browse.refresh_with_search(Some(_tx));
-        }
-        Err(e) => {
-            app.set_status(&format!("Rename failed: {}", e));
-            // Keep overlay open so user can see what happened.
-            app.active_overlay = ActiveOverlay::BulkRename(Box::new(state.clone()));
-        }
-    }
+    let plan = state.plan.clone();
+    app.active_overlay = ActiveOverlay::None;
+    app.set_status("Applying transactional bulk rename...");
+    spawn_rename_plan(plan, "bulk rename".to_string(), tx);
 }
+
 
 /// Open the bulk rename overlay with the given file paths. Pulls metadata
 /// from the browse probe cache where available, falling back to defaults.
@@ -27328,6 +28787,19 @@ struct FileTaskWorker {
         std::path::PathBuf,
         super::browse::BrowseMoveRecoveryProof,
     >,
+    /// Operation-time proofs for roots that have completed. These are attached
+    /// to the terminal report before it crosses back to the UI thread.
+    completed_proofs_by_source: std::collections::BTreeMap<
+        std::path::PathBuf,
+        (std::path::PathBuf, tui_file_picker::FileTaskRootProof),
+    >,
+    /// Whether the worker created an absent destination root or modified a
+    /// pre-existing one. Delete-based copy undo is authorized only for the
+    /// former; overwrite/merge roots require preimages and are excluded.
+    undo_disposition_by_source: std::collections::BTreeMap<
+        std::path::PathBuf,
+        tui_file_picker::FileTaskUndoDisposition,
+    >,
     /// Deterministic byte/call accounting used by regressions and diagnostic
     /// reporting to prevent accidental whole-file/tree-walk amplification.
     io_counters: tui_file_picker::FileOperationIoCounters,
@@ -27382,6 +28854,8 @@ impl FileTaskWorker {
                     destination,
                     disposition: tui_file_picker::FileTaskRootDisposition::NotAttempted,
                     message: None,
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
                 }
             })
             .collect();
@@ -27417,6 +28891,8 @@ impl FileTaskWorker {
             active_root_source: None,
             copied_source_digests: std::collections::HashMap::new(),
             move_recovery_by_source,
+            completed_proofs_by_source: std::collections::BTreeMap::new(),
+            undo_disposition_by_source: std::collections::BTreeMap::new(),
             io_counters: tui_file_picker::FileOperationIoCounters::default(),
             copy_error_paths: Vec::new(),
             user_skipped_paths: Vec::new(),
@@ -28438,6 +29914,8 @@ impl FileTaskWorker {
         // no-replace and then the brief-approved checked best-effort fallback.
         // Reduced identity semantics change the post-rename proof, not the
         // decision to try rename.
+        let source_manifest = tui_file_picker::capture_manifest(source)
+            .map_err(|error| format!("capture native-rename undo authority: {error}"))?;
         let rename_proof = tui_file_picker::RenameSourceProof::capture(source)
             .map_err(|error| format!("capture native-rename source proof: {error}"))?;
         self.io_counters.rename_attempts =
@@ -28449,7 +29927,7 @@ impl FileTaskWorker {
                         self.io_counters.rename_fallbacks.saturating_add(1);
                 }
                 let target_capabilities = tui_file_picker::filesystem_capabilities(target);
-                let rename_verified = match tui_file_picker::verify_committed_rename(
+                let rename_destination_snapshot = match tui_file_picker::verify_committed_rename(
                     source,
                     target,
                     &rename_proof,
@@ -28467,7 +29945,7 @@ impl FileTaskWorker {
                                     .to_string(),
                             );
                         }
-                        true
+                        Some(verification.destination_snapshot)
                     }
                     Err(error) => {
                         // Portable evidence is inconsistent, so completion
@@ -28483,7 +29961,7 @@ impl FileTaskWorker {
                                 target.display()
                             ),
                         );
-                        false
+                        None
                     }
                 };
                 if let Some(warning) = rename_mode.degraded_warning() {
@@ -28491,7 +29969,34 @@ impl FileTaskWorker {
                 }
                 self.move_recovery_by_source.remove(source);
                 self.record_move_directory_sync_warnings(source, target);
-                if rename_verified {
+                if let Some(destination_snapshot) = rename_destination_snapshot {
+                    self.undo_disposition_by_source.insert(
+                        source.to_path_buf(),
+                        tui_file_picker::FileTaskUndoDisposition::CreatedDestination,
+                    );
+                    match source_manifest
+                        .destination_identity_after_root_rename(destination_snapshot)
+                    {
+                        Ok(destination_manifest) => {
+                            self.completed_proofs_by_source.insert(
+                                source.to_path_buf(),
+                                (
+                                    target.to_path_buf(),
+                                    tui_file_picker::FileTaskRootProof {
+                                        source_manifest,
+                                        destination_manifest,
+                                    },
+                                ),
+                            );
+                        }
+                        Err(error) => self.record_active_root_notice(
+                            source,
+                            format!(
+                                "move completed, but its retained pre-operation manifest could not be rebound to {}: {error}",
+                                target.display()
+                            ),
+                        ),
+                    }
                     self.mark_completed_stats(stats);
                     let item = progress_item_for_paths(source, target, stats.bytes, Some(stats.bytes));
                     self.snapshot(
@@ -29025,6 +30530,16 @@ impl FileTaskWorker {
                         );
                     }
                 }
+                self.completed_proofs_by_source.insert(
+                    source.to_path_buf(),
+                    (
+                        resolved_target.clone(),
+                        tui_file_picker::FileTaskRootProof {
+                            source_manifest: manifest.clone(),
+                            destination_manifest: destination_manifest.clone(),
+                        },
+                    ),
+                );
                 self.move_recovery_by_source.remove(source);
                 Ok(FileTaskStep::Completed)
             }
@@ -29326,6 +30841,19 @@ impl FileTaskWorker {
         } else {
             self.copy_path_progress_resolved_node(node, applied)
         }?;
+        if result == FileTaskStep::Completed {
+            self.undo_disposition_by_source.insert(
+                node.source.clone(),
+                match applied {
+                    FileTaskConflictApplied::None | FileTaskConflictApplied::Rename => {
+                        tui_file_picker::FileTaskUndoDisposition::CreatedDestination
+                    }
+                    FileTaskConflictApplied::Overwrite | FileTaskConflictApplied::Merge => {
+                        tui_file_picker::FileTaskUndoDisposition::ModifiedExistingDestination
+                    }
+                },
+            );
+        }
         if result != FileTaskStep::Completed || self.job.is_move {
             return Ok(result);
         }
@@ -29365,23 +30893,56 @@ impl FileTaskWorker {
             {
                 match self.forced_post_publication_verification_failure.take() {
                     Some(error) => Err(error),
-                    None => manifest.verify_copy_at(&node.target),
+                    None => manifest.capture_verified_copy_at(&node.target),
                 }
             }
             #[cfg(not(test))]
             {
-                manifest.verify_copy_at(&node.target)
+                manifest.capture_verified_copy_at(&node.target)
             }
         };
-        if let Err(error) = verification {
-            self.record_committed_failure(
-                &node.source,
-                &node.target,
-                format!(
-                    "copy committed at {}, but final content/tree verification failed; destination preserved for inspection: {error}",
-                    node.target.display()
-                ),
-            );
+        match verification {
+            Ok(destination_manifest) => {
+                match destination_manifest.validate_copy_undo_metadata_contract() {
+                    Ok(()) => {
+                        self.completed_proofs_by_source.insert(
+                            node.source.clone(),
+                            (
+                                node.target.clone(),
+                                tui_file_picker::FileTaskRootProof {
+                                    source_manifest: manifest,
+                                    destination_manifest,
+                                },
+                            ),
+                        );
+                    }
+                    Err(reason) => {
+                        self.undo_disposition_by_source.insert(
+                            node.source.clone(),
+                            tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                        );
+                        self.completed_proofs_by_source.remove(&node.source);
+                        self.record_active_root_notice(
+                            &node.source,
+                            format!(
+                                "copy completed at {}, but delete-based undo is unavailable for the preserved metadata: {reason}",
+                                node.target.display(),
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                self.completed_proofs_by_source.remove(&node.source);
+                self.record_committed_failure(
+                    &node.source,
+                    &node.target,
+                    format!(
+                        "copy committed at {}, but final content/tree verification failed; destination preserved for inspection: {error}",
+                        node.target.display()
+                    ),
+                );
+            }
         }
         if let Some(parent) = node.target.parent() {
             self.io_counters.directory_sync_calls =
@@ -29454,31 +31015,29 @@ impl FileTaskWorker {
                 }
                 self.io_counters.rename_attempts =
                     self.io_counters.rename_attempts.saturating_add(1);
-                let publication_mode = match try_no_clobber_rename(&staging_payload, &node.target) {
-                    Ok(mode) => mode,
-                    Err(error) => {
-                        self.rollback_unpublished_staging_progress(totals_before);
-                        cleanup_file_task_staging_directory(&staging_container);
-                        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                            format!(
-                                "destination appeared before directory publication: {}",
-                                node.target.display()
-                            )
-                        } else {
-                            format!(
-                                "publish staged directory {} -> {} without replacement: {error}",
-                                staging_payload.display(),
-                                node.target.display()
-                            )
-                        });
-                    }
-                };
-                if matches!(publication_mode, NoClobberRenameMode::CheckedBestEffort) {
-                    self.io_counters.rename_fallbacks =
-                        self.io_counters.rename_fallbacks.saturating_add(1);
-                }
-                if let Some(warning) = publication_mode.degraded_warning() {
-                    self.record_active_root_degrade_notice(&node.source, warning.to_string());
+                if let Err(error) = tui_file_picker::rename_path_no_replace(
+                    &staging_payload,
+                    &node.target,
+                ) {
+                    self.rollback_unpublished_staging_progress(totals_before);
+                    cleanup_file_task_staging_directory(&staging_container);
+                    return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!(
+                            "destination appeared before directory publication: {}",
+                            node.target.display()
+                        )
+                    } else if error.kind() == std::io::ErrorKind::Unsupported {
+                        format!(
+                            "copy refused because {} cannot atomically publish a new directory without replacement; no undoable destination was created",
+                            node.target.display()
+                        )
+                    } else {
+                        format!(
+                            "publish staged directory {} -> {} atomically without replacement: {error}",
+                            staging_payload.display(),
+                            node.target.display()
+                        )
+                    });
                 }
                 // Child copy operations already own the source copy/hash proof.
                 // Renaming this exact private staging root preserves those
@@ -30120,10 +31679,28 @@ impl FileTaskWorker {
         disposition: tui_file_picker::FileTaskRootDisposition,
         message: Option<String>,
     ) {
+        let completed = self.completed_proofs_by_source.remove(source);
+        let undo_disposition = if disposition.is_completed() {
+            self.undo_disposition_by_source
+                .remove(source)
+                .unwrap_or(tui_file_picker::FileTaskUndoDisposition::NotReversible)
+        } else {
+            self.undo_disposition_by_source.remove(source);
+            tui_file_picker::FileTaskUndoDisposition::NotReversible
+        };
+        let (authoritative_destination, proof) = if disposition.is_completed() {
+            completed
+                .map(|(destination, proof)| (destination, Some(proof)))
+                .unwrap_or_else(|| (destination.to_path_buf(), None))
+        } else {
+            (destination.to_path_buf(), None)
+        };
         if let Some(result) = self.root_results.iter_mut().find(|result| result.source == source) {
-            result.destination = destination.to_path_buf();
+            result.destination = authoritative_destination;
             result.disposition = disposition;
             result.message = message;
+            result.undo_disposition = undo_disposition;
+            result.proof = proof;
         }
     }
 
@@ -30150,14 +31727,15 @@ impl FileTaskWorker {
         Some(retry)
     }
 
-    fn send_completion_report(&self) {
+    fn send_completion_report(mut self) {
         let retry_plan = self.clipboard_retry_plan_for_report();
+        let report = tui_file_picker::FileTaskCompletionReport {
+            is_move: self.job.is_move,
+            roots: std::mem::take(&mut self.root_results),
+        };
         let _ = self.tx.blocking_send(AppMessage::FileTaskComplete {
             session_id: self.job.session_id,
-            report: tui_file_picker::FileTaskCompletionReport {
-                is_move: self.job.is_move,
-                roots: self.root_results.clone(),
-            },
+            report,
             retry_plan,
         });
     }
@@ -33283,59 +34861,17 @@ pub(super) fn commit_browse_rename(
             return false;
         }
     };
-    let target = parent.join(new_name);
-
-    match try_no_clobber_rename(&original_path, &target) {
-        Ok(rename_mode) => {
-            // If a tree rename moved the displayed directory (or one of its
-            // ancestors), remap both the current location and navigation
-            // history before refreshing. Back/Forward must never revisit the
-            // old path after the rename has committed.
-            app.browse
-                .remap_navigation_after_rename(&original_path, &target);
-            app.browse.rebuild_tree_preserving_expansion();
-            app.browse.refresh_with_search(Some(tx));
-            if let Some(idx) = app.browse.entries.iter().position(|e| e.path == target) {
-                app.browse.selected_index = idx;
-                app.browse.ensure_visible();
-            }
-            app.browse.probe_current_with_db(tx, Some(&app.db));
-            super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-            let mut committed_warnings = if app.file_task_verbose_degrade_notices {
-                rename_mode
-                    .degraded_warning()
-                    .map(str::to_string)
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            if let Err(error) = sync_file_task_directory(&parent) {
-                committed_warnings.push(format!(
-                    "parent-directory synchronization failed: {error}"
-                ));
-            }
-            if committed_warnings.is_empty() {
-                app.set_status(format!("renamed: {} → {}", old_name, new_name));
-            } else {
-                app.set_status(format!(
-                    "renamed: {} → {}; committed with warning: {}",
-                    old_name,
-                    new_name,
-                    committed_warnings.join("; ")
-                ));
-            }
-            true
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            app.set_status(format!("rename: target already exists: {}", new_name));
-            false
-        }
-        Err(e) => {
-            app.set_status(format!("rename failed: {}", e));
-            false
-        }
+    let mut plan = crate::tui::rename_plan::RenamePlan::new(
+        parent,
+        vec![(original_path, new_name.to_string())],
+    );
+    if crate::tui::rename_plan::validate_plan(&mut plan) > 0 {
+        app.set_status(format!("rename: target already exists or is invalid: {new_name}"));
+        return false;
     }
+    app.set_status(format!("renaming {old_name}..."));
+    spawn_rename_plan(plan, "rename".to_string(), tx);
+    true
 }
 
 /// Handle key events while the recent-files overlay is open.
@@ -34854,6 +36390,10 @@ fn execute_confirm_action(
                 }
             }
         }
+        ConfirmAction::UndoCopy { entry_id } => {
+            app.active_overlay = ActiveOverlay::None;
+            execute_file_operation_undo(app, *entry_id, true, tx);
+        }
         ConfirmAction::DeleteSelection(paths) => {
             let summary = permanently_delete_paths(paths);
 
@@ -35427,86 +36967,202 @@ fn handle_browse_scrollbar_mouse(app: &mut AppState, mouse: MouseEvent) -> bool 
     true
 }
 
-fn browse_text_mouse_geometry(
-    app: &AppState,
-    target: BrowseTextMouseTarget,
-) -> Option<(Rect, usize)> {
-    let button = match target {
-        BrowseTextMouseTarget::FileInlineEdit => TuiButton::BrowseFileInlineEdit,
-        BrowseTextMouseTarget::TreeInlineEdit => TuiButton::BrowseTreeInlineEdit,
-        BrowseTextMouseTarget::PathInput => TuiButton::BrowsePathInlineEdit,
+fn editor_target_for_button(app: &AppState, button: TuiButton) -> Option<EditorTextTarget> {
+    use super::app::MetadataEditorPhase;
+
+    let target = match button {
+        TuiButton::BrowseFileInlineEdit => EditorTextTarget::BrowseFileInlineEdit,
+        TuiButton::BrowseInfoMeta(_)
+            if active_inline_edit_matches_button(app, Some(&button)) =>
+        {
+            EditorTextTarget::BrowseFileInlineEdit
+        }
+        TuiButton::BrowseTreeInlineEdit => EditorTextTarget::BrowseTreeInlineEdit,
+        TuiButton::BrowsePathInlineEdit => EditorTextTarget::BrowsePath,
+        TuiButton::BrowseSearchInput => EditorTextTarget::BrowseSearch,
+        TuiButton::BrowseFilterInput => EditorTextTarget::BrowseFilter,
+        TuiButton::MetadataField(kind)
+            if app.convert.metadata.editing
+                == Some(ConvertMetadataField::from_button_kind(kind)) =>
+        {
+            EditorTextTarget::ConvertMetadata
+        }
+        TuiButton::DestPathField
+        | TuiButton::FolderTemplateField
+        | TuiButton::FilenameTemplateField
+        | TuiButton::CompanionExtensionsField
+        | TuiButton::CompanionFoldersField
+        | TuiButton::ExcludeFilesField
+            if active_inline_edit_matches_button(app, Some(&button)) =>
+        {
+            EditorTextTarget::ConvertOutputOptions
+        }
+        TuiButton::MetadataEditorInput => match editor_owner_overlay(app) {
+            ActiveOverlay::MetadataEditor(state) => match state.phase {
+                MetadataEditorPhase::InlineEdit => EditorTextTarget::MetadataInline,
+                MetadataEditorPhase::AddingKey => EditorTextTarget::MetadataAddKey,
+                MetadataEditorPhase::DetailEdit => EditorTextTarget::MetadataDetail,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        TuiButton::MetadataAutoNumberPrefix => EditorTextTarget::MetadataAutoNumberPrefix,
+        TuiButton::GnudbEditorInput => EditorTextTarget::GnudbInline,
+        TuiButton::ThemeBuilderHexField => EditorTextTarget::ThemeHex,
+        TuiButton::ThemeBuilderInlineSwatchName => EditorTextTarget::ThemeSwatchName,
+        TuiButton::ThemeBuilderGalleryFilter => EditorTextTarget::ThemeGalleryFilter,
+        TuiButton::ThemeBuilderFilePath => EditorTextTarget::ThemeFilePath,
+        TuiButton::BulkRenameTemplateInput => EditorTextTarget::BulkRenameTemplate,
+        TuiButton::TemplateBuilderInput => EditorTextTarget::TemplateBuilder,
+        TuiButton::OverlayTextInput => match editor_owner_overlay(app) {
+            ActiveOverlay::FileInput { .. } => EditorTextTarget::OverlayFileInput,
+            ActiveOverlay::CommandInput { .. } => EditorTextTarget::OverlayCommandInput,
+            ActiveOverlay::TextEdit { .. } => EditorTextTarget::OverlayTextEdit,
+            _ => return None,
+        },
+        _ => return None,
     };
-    let rect = app.button_map.button_rect(button)?;
-    Some((rect, rect.width.max(1) as usize))
+
+    editor_text_input(app, target).map(|_| target)
 }
 
-fn browse_text_input_mut(
-    app: &mut AppState,
-    target: BrowseTextMouseTarget,
-) -> Option<&mut tui_file_picker::TextInputState> {
+fn convert_metadata_button(field: ConvertMetadataField) -> TuiButton {
+    use super::button_map::MetadataFieldKind;
+    TuiButton::MetadataField(match field {
+        ConvertMetadataField::Title => MetadataFieldKind::Title,
+        ConvertMetadataField::Artist => MetadataFieldKind::Artist,
+        ConvertMetadataField::Album => MetadataFieldKind::Album,
+        ConvertMetadataField::AlbumArtist => MetadataFieldKind::AlbumArtist,
+        ConvertMetadataField::Genre => MetadataFieldKind::Genre,
+        ConvertMetadataField::Year => MetadataFieldKind::Year,
+    })
+}
+
+fn output_options_button(field: OutputOptionsField) -> Option<TuiButton> {
+    Some(match field {
+        OutputOptionsField::DestPath => TuiButton::DestPathField,
+        OutputOptionsField::FolderTemplate => TuiButton::FolderTemplateField,
+        OutputOptionsField::FilenameTemplate => TuiButton::FilenameTemplateField,
+        OutputOptionsField::CompanionExtensions => TuiButton::CompanionExtensionsField,
+        OutputOptionsField::CompanionFolders => TuiButton::CompanionFoldersField,
+        OutputOptionsField::ExcludeFiles => TuiButton::ExcludeFilesField,
+        _ => return None,
+    })
+}
+
+fn editor_button_for_target(app: &AppState, target: EditorTextTarget) -> Option<TuiButton> {
     match target {
-        BrowseTextMouseTarget::FileInlineEdit | BrowseTextMouseTarget::TreeInlineEdit => app
-            .browse_inline_edit
-            .as_mut()
-            .map(|state| &mut state.input),
-        BrowseTextMouseTarget::PathInput => app.browse.path_input.as_mut(),
+        EditorTextTarget::BrowseFileInlineEdit => {
+            if app
+                .button_map
+                .button_rect(TuiButton::BrowseFileInlineEdit)
+                .is_some()
+            {
+                return Some(TuiButton::BrowseFileInlineEdit);
+            }
+            let metadata_button = app.browse_inline_edit.as_ref().and_then(|edit| {
+                if let BrowseInlineEditTarget::Metadata { field, .. } = &edit.target {
+                    Some(TuiButton::BrowseInfoMeta(*field))
+                } else {
+                    None
+                }
+            });
+            metadata_button.filter(|button| app.button_map.button_rect(*button).is_some())
+        }
+        EditorTextTarget::BrowseTreeInlineEdit => Some(TuiButton::BrowseTreeInlineEdit),
+        EditorTextTarget::BrowsePath => Some(TuiButton::BrowsePathInlineEdit),
+        EditorTextTarget::BrowseSearch => Some(TuiButton::BrowseSearchInput),
+        EditorTextTarget::BrowseFilter => Some(TuiButton::BrowseFilterInput),
+        EditorTextTarget::ConvertMetadata => app
+            .convert
+            .metadata
+            .editing
+            .map(convert_metadata_button),
+        EditorTextTarget::ConvertOutputOptions => app
+            .convert
+            .output_options
+            .editing
+            .and_then(output_options_button),
+        EditorTextTarget::MetadataInline
+        | EditorTextTarget::MetadataAddKey
+        | EditorTextTarget::MetadataDetail => Some(TuiButton::MetadataEditorInput),
+        EditorTextTarget::MetadataAutoNumberPrefix => Some(TuiButton::MetadataAutoNumberPrefix),
+        EditorTextTarget::GnudbInline => Some(TuiButton::GnudbEditorInput),
+        EditorTextTarget::ThemeHex => Some(TuiButton::ThemeBuilderHexField),
+        EditorTextTarget::ThemeSwatchName => Some(TuiButton::ThemeBuilderInlineSwatchName),
+        EditorTextTarget::ThemeGalleryFilter => Some(TuiButton::ThemeBuilderGalleryFilter),
+        EditorTextTarget::ThemeFilePath => Some(TuiButton::ThemeBuilderFilePath),
+        EditorTextTarget::BulkRenameTemplate => Some(TuiButton::BulkRenameTemplateInput),
+        EditorTextTarget::TemplateBuilder => Some(TuiButton::TemplateBuilderInput),
+        EditorTextTarget::OverlayFileInput
+        | EditorTextTarget::OverlayCommandInput
+        | EditorTextTarget::OverlayTextEdit => Some(TuiButton::OverlayTextInput),
     }
 }
 
-/// Handle direct mouse editing for Browse text fields before list drag
-/// selection. Returning true means the event belongs exclusively to the text
-/// editor and must not mutate list selection underneath it.
-fn handle_browse_text_editor_mouse(app: &mut AppState, mouse: MouseEvent) -> bool {
-    let hit_target = match app.button_map.find_button_at(mouse.column, mouse.row) {
-        Some(TuiButton::BrowseFileInlineEdit) => Some(BrowseTextMouseTarget::FileInlineEdit),
-        Some(TuiButton::BrowseTreeInlineEdit) => Some(BrowseTextMouseTarget::TreeInlineEdit),
-        Some(TuiButton::BrowsePathInlineEdit) => Some(BrowseTextMouseTarget::PathInput),
-        _ => None,
-    };
+fn editor_mouse_geometry(app: &AppState, target: EditorTextTarget) -> Option<(TuiButton, Rect, usize)> {
+    let button = editor_button_for_target(app, target)?;
+    let rect = app.button_map.button_rect(button)?;
+    Some((button, rect, rect.width.max(1) as usize))
+}
+
+/// Apply the same cursor-placement, double-click, drag-selection, and editor
+/// context-menu contract to every rendered `TextInputState`.
+fn handle_editor_text_mouse(app: &mut AppState, mouse: MouseEvent) -> bool {
+    if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
+        return false;
+    }
+
+    let hit = app.button_map.find_button_at(mouse.column, mouse.row);
+    let hit_target = hit.and_then(|button| editor_target_for_button(app, button));
 
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Right) => {
+            let Some(target) = hit_target else {
+                return false;
+            };
+            app.browse_text_mouse_target = None;
+            focus_editor_target(app, target);
+            let park = !matches!(app.active_overlay, ActiveOverlay::None);
+            open_editor_context_menu(app, target, mouse.column, mouse.row, park)
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(target) = hit_target else {
                 return false;
             };
-            let Some((rect, width)) = browse_text_mouse_geometry(app, target) else {
+            focus_editor_target(app, target);
+            let Some((button, rect, width)) = editor_mouse_geometry(app, target) else {
                 return false;
             };
             let column = mouse.column.saturating_sub(rect.x).min(rect.width) as usize;
-            let button = match target {
-                BrowseTextMouseTarget::FileInlineEdit => TuiButton::BrowseFileInlineEdit,
-                BrowseTextMouseTarget::TreeInlineEdit => TuiButton::BrowseTreeInlineEdit,
-                BrowseTextMouseTarget::PathInput => TuiButton::BrowsePathInlineEdit,
-            };
             let is_double = app.double_click.register_click(
                 button,
                 mouse.column,
                 mouse.row,
                 std::time::Duration::from_millis(500),
             );
-            let handled = if let Some(input) = browse_text_input_mut(app, target) {
-                if is_double {
-                    input.select_all_text();
-                } else {
-                    input.begin_mouse_selection(width, column);
-                }
-                true
-            } else {
-                false
-            };
+            let handled = editor_text_input_mut(app, target)
+                .map(|input| {
+                    if is_double {
+                        input.select_all_text();
+                    } else {
+                        input.begin_mouse_selection(width, column);
+                    }
+                })
+                .is_some();
             app.browse_text_mouse_target = if handled && !is_double {
                 Some(target)
             } else {
                 None
             };
-            true
+            handled
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             let Some(target) = app.browse_text_mouse_target else {
                 return false;
             };
             app.double_click.clear();
-            let Some((rect, width)) = browse_text_mouse_geometry(app, target) else {
+            let Some((_, rect, width)) = editor_mouse_geometry(app, target) else {
                 app.browse_text_mouse_target = None;
                 return true;
             };
@@ -35517,7 +37173,7 @@ fn handle_browse_text_editor_mouse(app: &mut AppState, mouse: MouseEvent) -> boo
             } else {
                 mouse.column.saturating_sub(rect.x) as usize
             };
-            if let Some(input) = browse_text_input_mut(app, target) {
+            if let Some(input) = editor_text_input_mut(app, target) {
                 input.drag_mouse_selection(width, column);
             }
             true
@@ -35526,7 +37182,7 @@ fn handle_browse_text_editor_mouse(app: &mut AppState, mouse: MouseEvent) -> boo
             let Some(target) = app.browse_text_mouse_target.take() else {
                 return false;
             };
-            if let Some(input) = browse_text_input_mut(app, target) {
+            if let Some(input) = editor_text_input_mut(app, target) {
                 input.end_mouse_selection();
             }
             true
@@ -35536,6 +37192,10 @@ fn handle_browse_text_editor_mouse(app: &mut AppState, mouse: MouseEvent) -> boo
 }
 
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    if handle_editor_text_mouse(app, mouse) {
+        return;
+    }
+
     // Metadata editor mouse: intercept all events when the editor is open.
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
         // Mouse movement can damage terminal graphics layers without changing
@@ -35662,14 +37322,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             context_menu_mouse_hover(app, mouse.column, mouse.row);
             return;
         }
-    }
-
-    if app.current_screen == AppScreen::Browse
-        && matches!(app.active_overlay, ActiveOverlay::None)
-        && !app.bookmarks.dropdown_open
-        && handle_browse_text_editor_mouse(app, mouse)
-    {
-        return;
     }
 
     if app.current_screen == AppScreen::Browse
@@ -37058,12 +38710,23 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.browse.open_path_input();
             }
             TuiButton::BrowseFileInlineEdit
-            | TuiButton::BrowsePathInlineEdit => {}
+            | TuiButton::BrowsePathInlineEdit
+            | TuiButton::BrowseSearchInput
+            | TuiButton::BrowseFilterInput => {}
             // A click on the inline create-name row is focus-preserving: the
             // blur gate (active_inline_edit_matches_button) already consumed
             // it; reaching here without an active create editor is a stale
             // rect and deliberately does nothing.
             TuiButton::BrowseCreateRow => {}
+
+            // Overlay-owned editor input fields: clicks are consumed by the
+            // editor mouse dispatcher before screen dispatch; reaching here is
+            // a stale rect and deliberately does nothing.
+            TuiButton::OverlayTextInput
+            | TuiButton::MetadataEditorInput
+            | TuiButton::GnudbEditorInput
+            | TuiButton::TemplateBuilderInput
+            | TuiButton::BulkRenameTemplateInput => {}
 
             // ── Overlay buttons ──
             TuiButton::OverlayConfirm => {
@@ -42103,6 +43766,86 @@ mod phase4_tests {
             result.changed_values >= 4,
             "ALBUM + 3 TITLE values capitalized"
         );
+    }
+
+    #[test]
+    fn fix_caps_metadata_editor_preserves_ampersand_and_parenthetical_designators() {
+        let mut state = single_image_state(vec![
+            entry(
+                "ARTIST",
+                ItemKey::TrackArtist,
+                &["Booker T & the MG's", "Neil Young & the Shocking Pinks"],
+                &["Booker T & the MG's", "Neil Young & the Shocking Pinks"],
+            ),
+            entry(
+                "ALBUM",
+                ItemKey::AlbumTitle,
+                &["(Japan P-11356 Promo LP / 32-192)", "(Foo Foo LP / 24-96)"],
+                &["(Japan P-11356 Promo LP / 32-192)", "(Foo Foo LP / 24-96)"],
+            ),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["booker t & the mg's", "neil young & the shocking pinks"],
+                &["booker t & the mg's", "neil young & the shocking pinks"],
+            ),
+        ]);
+
+        let result = fix_caps_for_state(&mut state, None);
+
+        let artist = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ARTIST")
+            .expect("ARTIST entry");
+        assert_eq!(
+            artist.per_file_values,
+            vec!["Booker T & The MG's", "Neil Young & The Shocking Pinks"],
+            "the metadata-editor section path must treat '&' as a capitalization boundary",
+        );
+
+        let album = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ALBUM")
+            .expect("ALBUM entry");
+        assert_eq!(
+            album.per_file_values,
+            vec!["(Japan P-11356 Promo LP / 32-192)", "(Foo Foo LP / 24-96)"],
+            "fix-caps is a case transform: it must not blank, remove, or reorder parenthetical tokens",
+        );
+
+        let title = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("TITLE entry");
+        assert_eq!(
+            title.per_file_values,
+            vec!["Booker T & The MG's", "Neil Young & The Shocking Pinks"],
+            "the metadata-editor title path must preserve the same ampersand rule",
+        );
+        assert_eq!(result.changed_values, 4);
+    }
+
+    #[test]
+    fn fix_caps_detail_overlay_preserves_exact_parenthetical_text() {
+        let original = "(Japan P-11356 Promo LP / 32-192)";
+        let mut state = single_image_state(vec![entry(
+            "ALBUM",
+            ItemKey::AlbumTitle,
+            &[original],
+            &[original],
+        )]);
+
+        let result = fix_caps_for_state(&mut state, Some(0));
+
+        assert_eq!(result.changed_values, 0);
+        assert_eq!(state.active_surface().entries[0].per_file_values, vec![original]);
+        assert_eq!(state.active_surface().entries[0].value, original);
     }
 
     #[test]
@@ -50375,7 +52118,7 @@ mod file_picker_browse_parity_regression_tests {
                 "renamed.flac".to_string(),
             ),
         });
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
 
         let consumed = finish_inline_edit_before_focus_change(
             &mut app,
@@ -50385,6 +52128,17 @@ mod file_picker_browse_parity_regression_tests {
 
         assert!(!consumed, "a successful blur commit must release the click");
         assert!(app.browse_inline_edit.is_none());
+        // The commit hands the rename to a worker; its completion message is
+        // the durable signal that the filesystem mutation happened.
+        loop {
+            match rx.blocking_recv().expect("rename completion") {
+                AppMessage::RenamePlanComplete { result, .. } => {
+                    result.expect("rename plan succeeds");
+                    break;
+                }
+                _ => continue,
+            }
+        }
         assert!(renamed.exists());
     }
 
@@ -52192,4 +53946,338 @@ mod file_picker_browse_parity_regression_tests {
             .is_some_and(|message| message.contains("after deleting 1 quarantined entry")));
     }
 
+}
+
+#[cfg(test)]
+mod round4_undo_replay_tests {
+    use super::*;
+
+    fn rename_entry(
+        base_dir: &std::path::Path,
+        mappings: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> FileOperationUndoEntry {
+        // For a committed rename the op-time source object IS the object now
+        // at the destination, so one capture provides both authorities; the
+        // rename-aware comparators tolerate the later path transitions.
+        FileOperationUndoEntry {
+            id: 1,
+            kind: FileOperationUndoKind::Rename,
+            rename_base_dir: Some(base_dir.to_path_buf()),
+            mappings: mappings
+                .into_iter()
+                .map(|(source, destination)| {
+                    let source_manifest = tui_file_picker::capture_manifest(&destination)
+                        .expect("rename fixture proof");
+                    let proof = tui_file_picker::FileTaskRootProof {
+                        destination_manifest: source_manifest
+                            .destination_identity_for_same_tree(),
+                        source_manifest,
+                    };
+                    FileOperationUndoMapping {
+                        source,
+                        destination,
+                        source_proof: Some(proof.clone()),
+                        destination_proof: Some(proof),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Mirror `complete_file_operation_replay`: a committed replay consumes the
+    /// proof for the direction just executed and installs the fresh proof the
+    /// replay engine captured after commit, so the opposite direction replays
+    /// against operation-time authority rather than a stale snapshot.
+    fn refresh_entry_after_replay(
+        entry: &mut FileOperationUndoEntry,
+        undo: bool,
+        report: &crate::tui::rename_plan::RenameExecutionReport,
+    ) {
+        for mapping in &mut entry.mappings {
+            let replay_destination = if undo { &mapping.source } else { &mapping.destination };
+            let root = report
+                .roots
+                .iter()
+                .find(|root| &root.destination == replay_destination)
+                .expect("replay report covers mapping");
+            let proof = root.proof.clone().expect("replay proof retained");
+            if undo {
+                mapping.destination_proof = None;
+                mapping.source_proof = Some(proof);
+            } else {
+                mapping.source_proof = None;
+                mapping.destination_proof = Some(proof);
+            }
+        }
+    }
+
+    #[test]
+    fn rename_undo_and_redo_use_transactional_case_only_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lower = temp.path().join("foo.flac");
+        let upper = temp.path().join("Foo.flac");
+        std::fs::write(&lower, b"audio").expect("lowercase fixture");
+        std::fs::rename(&lower, &upper).expect("simulate forward case-only rename");
+        let mut entry = rename_entry(temp.path(), vec![(lower.clone(), upper.clone())]);
+
+        let undo_report =
+            execute_transactional_rename_replay(&entry, true).expect("undo case-only rename");
+        assert_eq!(undo_report.succeeded_count, 1);
+        assert_eq!(std::fs::read(&lower).expect("lowercase restored"), b"audio");
+        refresh_entry_after_replay(&mut entry, true, &undo_report);
+
+        assert_eq!(
+            execute_transactional_rename_replay(&entry, false)
+                .expect("redo case-only rename")
+                .succeeded_count,
+            1,
+        );
+        assert_eq!(std::fs::read(&upper).expect("uppercase restored"), b"audio");
+    }
+
+    #[test]
+    fn completion_reducer_retains_worker_proof_instead_of_recapturing_live_destination() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-round4-operation-proof",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("copy.flac");
+        std::fs::write(&source, b"bytes produced by operation").expect("source");
+        let source_manifest = tui_file_picker::capture_manifest(&source)
+            .expect("operation-time source proof");
+        std::fs::copy(&source, &destination).expect("copy fixture");
+        let destination_manifest = source_manifest
+            .capture_verified_copy_at(&destination)
+            .expect("operation-time destination proof");
+        let mut report = tui_file_picker::FileTaskCompletionReport {
+            is_move: false,
+            roots: vec![tui_file_picker::FileTaskRootResult {
+                source: source.clone(),
+                destination: destination.clone(),
+                disposition: tui_file_picker::FileTaskRootDisposition::Completed,
+                message: None,
+                undo_disposition: tui_file_picker::FileTaskUndoDisposition::CreatedDestination,
+                proof: Some(tui_file_picker::FileTaskRootProof {
+                    source_manifest,
+                    destination_manifest,
+                }),
+            }],
+        };
+
+        // Simulate the exact race from the review: the worker has completed
+        // and emitted its proof, then another actor changes the destination
+        // before the UI consumes the event.
+        std::fs::write(&destination, b"post-completion replacement")
+            .expect("replace before reducer");
+        // A same-length in-place rewrite inside one kernel timestamp tick is
+        // metadata-invisible to the strict no-content-read revalidation
+        // (documented residual); move the version token the way any real
+        // replacement eventually does.
+        std::fs::File::options()
+            .write(true)
+            .open(&destination)
+            .expect("reopen replacement")
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .expect("advance replacement mtime");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert_eq!(record_completed_file_task_for_undo(&mut app, 77, &mut report), None);
+        let entry = app
+            .file_operation_undo
+            .undo_entry()
+            .expect("undo entry retained");
+        let retained = entry.mappings[0]
+            .destination_proof
+            .as_ref()
+            .expect("destination proof");
+        assert!(
+            verify_proof_at_root(retained, &destination).is_err(),
+            "the reducer must retain the worker's original proof, not bless the later replacement",
+        );
+    }
+
+    #[test]
+    fn overwrite_and_merge_roots_are_never_journaled_as_delete_based_copy_undo() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-round4-overwrite-undo",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("existing.flac");
+        std::fs::write(&source, b"new bytes").expect("source");
+        std::fs::write(&destination, b"old bytes").expect("pre-existing destination");
+        let mut report = tui_file_picker::FileTaskCompletionReport {
+            is_move: false,
+            roots: vec![tui_file_picker::FileTaskRootResult {
+                source,
+                destination,
+                disposition: tui_file_picker::FileTaskRootDisposition::Completed,
+                message: None,
+                undo_disposition:
+                    tui_file_picker::FileTaskUndoDisposition::ModifiedExistingDestination,
+                proof: None,
+            }],
+        };
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let warning = record_completed_file_task_for_undo(&mut app, 88, &mut report)
+            .expect("overwrite exclusion warning");
+
+        assert!(warning.contains("overwrite/merge"));
+        assert!(app.file_operation_undo.undo_entry().is_none());
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_root_copy_undo_preflights_every_root_before_deleting_any_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn copy_proof(
+            source: &std::path::Path,
+            destination: &std::path::Path,
+            destination_mode: u32,
+        ) -> tui_file_picker::FileTaskRootProof {
+            std::fs::write(source, b"operation bytes").expect("source fixture");
+            let source_manifest =
+                tui_file_picker::capture_manifest(source).expect("source manifest");
+            std::fs::copy(source, destination).expect("copy fixture");
+            std::fs::set_permissions(
+                destination,
+                std::fs::Permissions::from_mode(destination_mode),
+            )
+            .expect("destination mode");
+            let mut destination_manifest = tui_file_picker::DestinationManifest::default();
+            destination_manifest
+                .insert(
+                    std::path::PathBuf::new(),
+                    tui_file_picker::snapshot_path(destination)
+                        .expect("destination snapshot"),
+                )
+                .expect("destination proof root");
+            tui_file_picker::FileTaskRootProof {
+                source_manifest,
+                destination_manifest,
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_a = temp.path().join("source-a.flac");
+        let destination_a = temp.path().join("copy-a.flac");
+        let source_b = temp.path().join("source-b.flac");
+        let destination_b = temp.path().join("copy-b.flac");
+        let proof_a = copy_proof(&source_a, &destination_a, 0o600);
+        let proof_b = copy_proof(&source_b, &destination_b, 0o660);
+        let entry = FileOperationUndoEntry {
+            id: 901,
+            kind: FileOperationUndoKind::Copy,
+            rename_base_dir: None,
+            mappings: vec![
+                FileOperationUndoMapping {
+                    source: source_a,
+                    destination: destination_a.clone(),
+                    source_proof: None,
+                    destination_proof: Some(proof_a),
+                },
+                FileOperationUndoMapping {
+                    source: source_b,
+                    destination: destination_b.clone(),
+                    source_proof: None,
+                    destination_proof: Some(proof_b),
+                },
+            ],
+        };
+
+        let result = execute_file_operation_replay_worker(
+            &entry,
+            true,
+            tui_file_picker::FileOperationPolicy::default(),
+        );
+
+        assert!(result.completed.is_empty());
+        assert_eq!(result.failed.len(), 2);
+        assert!(destination_a.exists(), "earlier prepared root must be restored");
+        assert!(destination_b.exists(), "failing root must be restored");
+    }
+
+    #[test]
+    fn committed_without_proof_is_terminal_and_is_not_requeued() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-round4-terminal-replay-authority",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("before.flac");
+        let destination = temp.path().join("after.flac");
+        std::fs::write(&destination, b"committed replay state").expect("destination");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let id = app.file_operation_undo.allocate_id();
+        app.file_operation_undo.record(FileOperationUndoEntry {
+            id,
+            kind: FileOperationUndoKind::Rename,
+            rename_base_dir: Some(temp.path().to_path_buf()),
+            mappings: vec![FileOperationUndoMapping {
+                source,
+                destination,
+                source_proof: None,
+                destination_proof: None,
+            }],
+        });
+        let entry = app
+            .file_operation_undo
+            .take_undo(id)
+            .expect("simulate dispatched undo");
+        let (tx, _rx) = mpsc::channel(8);
+
+        complete_file_operation_replay(
+            &mut app,
+            entry,
+            true,
+            super::super::message::FileOperationReplayResult {
+                completed: Vec::new(),
+                committed_without_proof: vec![(
+                    0,
+                    "transaction committed but proof was unavailable".to_string(),
+                )],
+                failed: Vec::new(),
+            },
+            &tx,
+        );
+
+        assert_eq!(app.file_operation_undo.depths(), (0, 0));
+        assert!(app
+            .last_file_task_progress
+            .as_ref()
+            .is_some_and(|(_, progress)| progress.status.contains("replay-authority")));
+    }
+
+    #[test]
+    fn rename_undo_and_redo_preserve_swap_permutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("A.flac");
+        let b = temp.path().join("B.flac");
+        // State after the original A->B, B->A transaction.
+        std::fs::write(&a, b"original B").expect("A forward state");
+        std::fs::write(&b, b"original A").expect("B forward state");
+        let mut entry = rename_entry(
+            temp.path(),
+            vec![(a.clone(), b.clone()), (b.clone(), a.clone())],
+        );
+
+        let undo_report = execute_transactional_rename_replay(&entry, true).expect("undo swap");
+        assert_eq!(undo_report.succeeded_count, 2);
+        assert_eq!(std::fs::read(&a).expect("A restored"), b"original A");
+        assert_eq!(std::fs::read(&b).expect("B restored"), b"original B");
+        refresh_entry_after_replay(&mut entry, true, &undo_report);
+
+        assert_eq!(
+            execute_transactional_rename_replay(&entry, false)
+                .expect("redo swap")
+                .succeeded_count,
+            2,
+        );
+        assert_eq!(std::fs::read(&a).expect("A swapped"), b"original B");
+        assert_eq!(std::fs::read(&b).expect("B swapped"), b"original A");
+    }
 }

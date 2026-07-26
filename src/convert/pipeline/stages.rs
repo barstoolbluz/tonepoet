@@ -4333,12 +4333,15 @@ fn cue_extra_tag_key(scope: &str, key: &str) -> String {
 const PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY: &str = "tonepoet_preserved_source_album_tag";
 const PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY: &str =
     "tonepoet_preserved_source_album_artist_tag";
+const PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY: &str =
+    "tonepoet_preserved_source_naming_artist";
 const LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY: &str = "album_tag_override";
 const LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY: &str = "album_artist_tag_override";
 
 fn is_internal_metadata_extra_key(key: &str) -> bool {
     key == PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY
         || key == PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY
+        || key == PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY
         || key == LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY
         || key == LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY
         || key == CUE_ARTWORK_PATH_EXTRA_KEY
@@ -21961,12 +21964,15 @@ fn remove_preserved_source_album_artist_tag(album: &mut AlbumMetadata) {
         .remove(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY);
     album
         .extra
+        .remove(PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY);
+    album
+        .extra
         .remove(LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY);
 }
 
 fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &PipelineRequest) {
     if let Some(identity) = request_batch_resolved_identity(req) {
-        preserve_source_tags_for_organizational_identity(&mut source.album_metadata);
+        preserve_source_tags_for_organizational_identity(source);
         if let Some(album) = identity.album.as_ref() {
             source.album_metadata.album = Some(album.clone());
         }
@@ -22016,7 +22022,8 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
     }
 }
 
-fn preserve_source_tags_for_organizational_identity(album: &mut AlbumMetadata) {
+fn preserve_source_tags_for_organizational_identity(source: &mut PreparedSource) {
+    let album = &mut source.album_metadata;
     if !album.extra.contains_key(PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY) {
         if let Some(original) = album
             .extra
@@ -22044,6 +22051,33 @@ fn preserve_source_tags_for_organizational_identity(album: &mut AlbumMetadata) {
             album.extra.insert(
                 PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
                 original,
+            );
+        }
+    }
+
+    // A common source layout has no ALBUMARTIST tag at all: the album-level
+    // naming identity falls back to the first track ARTIST. Batch resolution
+    // subsequently fills album_artist with an organizational spelling, which
+    // otherwise shadows that fallback. Preserve the pre-mutation naming value
+    // separately from tag-writing authority so folder tokens retain the exact
+    // source spelling without inventing an ALBUMARTIST metadata tag.
+    if !album
+        .extra
+        .contains_key(PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY)
+        && !album
+            .extra
+            .contains_key(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
+    {
+        if let Some(original) = source
+            .tracks
+            .iter()
+            .find_map(|track| track.metadata.artist.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            album.extra.insert(
+                PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY.to_string(),
+                original.to_string(),
             );
         }
     }
@@ -33174,6 +33208,32 @@ impl TemplateRenderTarget for tonepoet_pipeline::PipelineSettings {
     }
 }
 
+/// Canonicalize an artist after selecting the authoritative source value.
+///
+/// The legacy dictionary is intentionally restricted to all-ASCII values. A
+/// Unicode source spelling is already the authoritative user-visible identity;
+/// passing it through an out-of-band alias table would make transliteration or
+/// normalization loss implicit. Unicode casing/transliteration therefore
+/// requires an explicit future option rather than occurring in the default
+/// naming path.
+fn canonicalize_artist_for_template(artist: &str) -> String {
+    if artist.is_ascii() {
+        super::label_resolver::canonicalize_artist(artist)
+    } else {
+        artist.to_string()
+    }
+}
+
+fn template_album_artist(source: &PreparedSource) -> Option<&str> {
+    source
+        .album_metadata
+        .extra
+        .get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
+        .or_else(|| source.album_metadata.extra.get(PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY))
+        .map(String::as_str)
+        .or(source.album_metadata.album_artist.as_deref())
+}
+
 fn render_track_template<T: TemplateRenderTarget + ?Sized>(
     template: &str,
     source: &PreparedSource,
@@ -33192,14 +33252,11 @@ fn render_track_template<T: TemplateRenderTarget + ?Sized>(
         .metadata
         .artist
         .as_deref()
-        .or(source.album_metadata.album_artist.as_deref())
-        .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
+        .or_else(|| template_album_artist(source))
+        .map(|artist| sanitize_component(&canonicalize_artist_for_template(artist)))
         .unwrap_or_else(|| "Unknown Artist".to_string());
-    let album_artist = source
-        .album_metadata
-        .album_artist
-        .as_deref()
-        .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
+    let album_artist = template_album_artist(source)
+        .map(|artist| sanitize_component(&canonicalize_artist_for_template(artist)))
         .unwrap_or_else(|| artist.clone());
     let disc = template_disc_number(source, track);
     let n = template_track_number(source, track);
@@ -33331,17 +33388,14 @@ fn folder_template_token_map<T: TemplateRenderTarget + ?Sized>(
     track: Option<&PreparedTrack>,
     target: &T,
 ) -> BTreeMap<String, String> {
-    let artist = source
-        .album_metadata
-        .album_artist
-        .as_deref()
+    let artist = template_album_artist(source)
         .or_else(|| {
             source
                 .tracks
                 .iter()
                 .find_map(|track| track.metadata.artist.as_deref())
         })
-        .map(|artist| sanitize_component(&super::label_resolver::canonicalize_artist(artist)))
+        .map(|artist| sanitize_component(&canonicalize_artist_for_template(artist)))
         .unwrap_or_else(|| "Unknown Artist".to_string());
     let raw_album = source
         .album_metadata
@@ -41214,6 +41268,199 @@ mod naming_template_tests {
             render_folder_template("%PRESSING%/%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("MFSL/Miles Davis/A Tribute to Jack Johnson")
         );
+    }
+
+    #[test]
+    fn real_naming_paths_prefer_preserved_source_artist_over_batch_identity() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = Some("Blue Öyster Cult".to_string());
+        source.album_metadata.album = Some("Fire of Unknown Origin".to_string());
+        source.tracks[0].metadata.artist = None;
+        source.tracks[0].metadata.title = Some("Burnin' for You".to_string());
+
+        // Reproduce through the real mutation entry point. Batch identity is
+        // allowed to replace the organizational field, but the original tag
+        // is retained for metadata writing and user-facing naming templates.
+        let mut identity_request = template_request(Some(
+            "%ALBUM_ARTIST%/%ALBUM%".to_string(),
+        ));
+        identity_request.batch_resolved_identity = Some(BatchResolvedAlbumIdentity {
+            album: Some("Fire of Unknown Origin".to_string()),
+            album_artist: Some("Blue Oyster Cult".to_string()),
+            date: None,
+            total_discs: None,
+            source_disc_numbers: BTreeMap::new(),
+        });
+        apply_batch_identity_and_request_metadata(&mut source, &identity_request);
+
+        assert_eq!(
+            source.album_metadata.album_artist.as_deref(),
+            Some("Blue Oyster Cult"),
+            "the organizational identity reproduces the ASCII field seen by the old naming path",
+        );
+        assert_eq!(
+            source
+                .album_metadata
+                .extra
+                .get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
+                .map(String::as_str),
+            Some("Blue Öyster Cult"),
+            "the original source tag remains authoritative for naming and tag writing",
+        );
+
+        assert_eq!(
+            render_folder_template(
+                "%ALBUM_ARTIST%/%ALBUM%",
+                &source,
+                &tonepoet_pipeline::AudioFormat::Flac,
+            ),
+            PathBuf::from("Blue Öyster Cult/Fire of Unknown Origin"),
+        );
+        assert_eq!(
+            render_track_template(
+                "%ALBUM_ARTIST% - %TITLE%",
+                &source,
+                &source.tracks[0],
+                &tonepoet_pipeline::AudioFormat::Flac,
+            )
+            .expect("track template"),
+            PathBuf::from("Blue Öyster Cult - Burnin' for You"),
+        );
+
+        let mut request = template_request(Some("%ALBUM_ARTIST%/%ALBUM%".to_string()));
+        request.naming.template = "%ALBUM_ARTIST% - %TITLE%".to_string();
+        let plan = plan_outputs(&source, &request).expect("real output planner");
+        assert_eq!(
+            plan.album_dir,
+            PathBuf::from("/out/Blue Öyster Cult/Fire of Unknown Origin"),
+        );
+        assert_eq!(
+            plan.entries[0].final_path,
+            PathBuf::from(
+                "/out/Blue Öyster Cult/Fire of Unknown Origin/Blue Öyster Cult - Burnin' for You.flac",
+            ),
+        );
+    }
+
+    #[test]
+    fn track_artist_only_source_survives_batch_identity_in_folder_and_file_paths() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = None;
+        source.album_metadata.album = Some("Fire of Unknown Origin".to_string());
+        source.tracks[0].metadata.artist = Some("Blue Öyster Cult".to_string());
+        source.tracks[0].metadata.album_artist = None;
+        source.tracks[0].metadata.title = Some("Burnin' for You".to_string());
+
+        let mut request = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
+        request.naming.template = "%ALBUM_ARTIST% - %TITLE%".to_string();
+        request.batch_resolved_identity = Some(BatchResolvedAlbumIdentity {
+            album: Some("Fire of Unknown Origin".to_string()),
+            album_artist: Some("Blue Oyster Cult".to_string()),
+            date: None,
+            total_discs: None,
+            source_disc_numbers: BTreeMap::new(),
+        });
+        apply_batch_identity_and_request_metadata(&mut source, &request);
+
+        assert_eq!(
+            source.album_metadata.album_artist.as_deref(),
+            Some("Blue Oyster Cult"),
+            "batch organization still owns the mutable album identity",
+        );
+        assert_eq!(
+            source
+                .album_metadata
+                .extra
+                .get(PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY)
+                .map(String::as_str),
+            Some("Blue Öyster Cult"),
+            "the original track ARTIST must be retained before batch mutation",
+        );
+        assert!(
+            source
+                .album_metadata
+                .extra
+                .get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
+                .is_none(),
+            "a naming fallback must not fabricate an ALBUMARTIST tag",
+        );
+
+        let plan = plan_outputs(&source, &request).expect("real output planner");
+        assert_eq!(
+            plan.album_dir,
+            PathBuf::from("/out/Blue Öyster Cult/Fire of Unknown Origin"),
+        );
+        assert_eq!(
+            plan.entries[0].final_path,
+            PathBuf::from(
+                "/out/Blue Öyster Cult/Fire of Unknown Origin/Blue Öyster Cult - Burnin' for You.flac",
+            ),
+        );
+    }
+
+    #[test]
+    fn preserved_source_artist_keeps_combining_marks_symbols_and_cjk() {
+        for value in ["Beyoncé", "München", "宇多田ヒカル", "Ångström № 1"] {
+            let mut source = template_source();
+            source.album_metadata.album_artist = Some("Resolved ASCII Identity".to_string());
+            source.album_metadata.extra.insert(
+                PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
+                value.to_string(),
+            );
+            source.tracks[0].metadata.artist = None;
+            assert_eq!(
+                folder_template_token_map(
+                    "%ALBUM_ARTIST%",
+                    &source,
+                    None,
+                    &tonepoet_pipeline::AudioFormat::Flac,
+                )
+                .get("ALBUM_ARTIST")
+                .map(String::as_str),
+                Some(value),
+            );
+        }
+    }
+
+    #[test]
+    fn flat_single_file_and_album_batch_plans_keep_preserved_unicode_artist() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = Some("Blue Oyster Cult".to_string());
+        source.album_metadata.extra.insert(
+            PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
+            "Blue Öyster Cult".to_string(),
+        );
+        source.tracks[0].metadata.artist = None;
+
+        let mut flat = template_request(None);
+        flat.naming.per_album_subdir = false;
+        flat.naming.template = "%ALBUM_ARTIST% - %TITLE%".to_string();
+        let flat_plan = plan_outputs(&source, &flat).expect("flat single-file plan");
+        assert_eq!(
+            flat_plan.entries[0].final_path,
+            PathBuf::from("/out/Blue Öyster Cult - Right Off.flac"),
+        );
+
+        let mut batch = template_request(Some("%ALBUM_ARTIST%/%ALBUM%".to_string()));
+        batch.naming.template = "%ALBUM_ARTIST% - %TITLE%".to_string();
+        batch.album_batch = Some(AlbumBatchContext::new(
+            "unicode-batch".to_string(),
+            1,
+            PathBuf::from("/out/Blue Öyster Cult/A Tribute to Jack Johnson"),
+            PathBuf::from("/music/Blue Öyster Cult"),
+        ));
+        batch.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let batch_plan = plan_outputs(&source, &batch).expect("album-batch plan");
+        assert!(batch_plan.album_dir.to_string_lossy().contains("Blue Öyster Cult"));
+        assert!(batch_plan.entries[0]
+            .final_path
+            .to_string_lossy()
+            .contains("Blue Öyster Cult"));
+    }
+
+    #[test]
+    fn ascii_artist_values_still_use_dictionary_canonicalization() {
+        assert_eq!(canonicalize_artist_for_template("miles davis"), "Miles Davis");
     }
 
     #[test]

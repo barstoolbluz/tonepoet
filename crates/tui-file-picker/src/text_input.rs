@@ -198,6 +198,28 @@ impl TextInputState {
         true
     }
 
+    /// Transform the current selection, or the entire value when no selection
+    /// is active. The transformed range remains selected so repeated case
+    /// commands are deterministic even when Unicode case mapping changes the
+    /// byte length (for example, `ß` -> `SS`).
+    pub fn transform_selection_or_all(
+        &mut self,
+        transform: impl FnOnce(&str) -> String,
+    ) -> bool {
+        let had_selection = self.has_selection();
+        let range = self.selection_range().unwrap_or(0..self.text.len());
+        if !self.text.is_char_boundary(range.start) || !self.text.is_char_boundary(range.end) {
+            return false;
+        }
+        let replacement = transform(&self.text[range.clone()]);
+        let start = range.start;
+        self.text.replace_range(range, &replacement);
+        self.selection_anchor = Some(start);
+        self.cursor = start + replacement.len();
+        self.select_all = !had_selection && start == 0 && self.cursor == self.text.len();
+        true
+    }
+
     /// Insert a character at the cursor and advance the cursor.
     pub fn insert_char(&mut self, c: char) {
         self.delete_selection();
@@ -722,7 +744,8 @@ fn next_boundary_after(text: &str, pos: usize) -> Option<usize> {
 ///
 /// Plain keys: Char, Backspace, Delete, Left, Right, Home, End.
 /// Standard selection plus readline-style Ctrl bindings (case-insensitive):
-///   Ctrl+A=select all, Ctrl+E=end, Ctrl+B=left, Ctrl+F=right,
+///   Ctrl+A or Alt+A=select all; Ctrl+/ or Ctrl+_=deselect;
+///   Ctrl+E=end, Ctrl+B=left, Ctrl+F=right,
 ///   Ctrl+H=backspace, Ctrl+D=delete-fwd,
 ///   Ctrl+W=delete-prev-word, Ctrl+U=kill-to-start, Ctrl+K=kill-to-end.
 /// Word-deletion alternatives: Ctrl+Backspace and Alt+Backspace also delete
@@ -770,9 +793,22 @@ pub fn handle_text_input_key_with_boundaries(
     }
 
     match (ctrl, alt, shift, key.code) {
-        // Standard text-editor select all. Home remains available for cursor movement.
+        // Standard text-editor select all plus an Alt+A alternative for
+        // terminal multiplexers that reserve Ctrl+A.
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'a') => {
             input.select_all_text();
+            true
+        }
+        (false, true, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'a') => {
+            input.select_all_text();
+            true
+        }
+
+        // Ctrl+/ is transmitted as 0x1F. Crossterm reports that byte as either
+        // Ctrl+'/' or Ctrl+'_' depending on the terminal; both clear selection
+        // without moving the cursor.
+        (true, false, _, KeyCode::Char('/')) | (true, false, _, KeyCode::Char('_')) => {
+            input.clear_selection();
             true
         }
 
@@ -1594,6 +1630,56 @@ mod tests {
             TextBoundaryMode::PathSegment,
         );
         assert_eq!(s.selection_range().map(|range| &s.text[range]), Some("user/Music"));
+    }
+
+
+    #[test]
+    fn alt_a_is_a_terminal_safe_select_all_alias() {
+        let mut input = TextInputState::new("Blue Öyster Cult".to_string());
+        input.cursor = 4;
+        assert!(handle_text_input_key(
+            &mut input,
+            &key(KeyCode::Char('a'), KeyModifiers::ALT),
+        ));
+        assert_eq!(input.selection_range(), Some(0..input.text.len()));
+    }
+
+    #[test]
+    fn ctrl_slash_and_ctrl_underscore_both_deselect_without_moving_cursor() {
+        for reported in ['/', '_'] {
+            let mut input = TextInputState::new_selected("selected".to_string());
+            input.cursor = 3;
+            assert!(handle_text_input_key(
+                &mut input,
+                &key(KeyCode::Char(reported), KeyModifiers::CONTROL),
+            ));
+            assert_eq!(input.selection_range(), None);
+            assert_eq!(input.cursor, 3);
+        }
+    }
+
+    #[test]
+    fn transform_selection_or_all_is_unicode_safe_and_keeps_range_selected() {
+        let mut input = TextInputState::new("Blue Öyster straße".to_string());
+        input.selection_anchor = Some("Blue ".len());
+        input.cursor = input.text.len();
+
+        assert!(input.transform_selection_or_all(str::to_uppercase));
+        assert_eq!(input.text, "Blue ÖYSTER STRASSE");
+        assert_eq!(
+            input.selection_range().map(|range| &input.text[range]),
+            Some("ÖYSTER STRASSE"),
+        );
+    }
+
+    #[test]
+    fn transform_without_selection_targets_the_whole_value() {
+        let mut input = TextInputState::new("Mixed Case".to_string());
+        input.cursor = 2;
+
+        assert!(input.transform_selection_or_all(str::to_lowercase));
+        assert_eq!(input.text, "mixed case");
+        assert_eq!(input.selection_range(), Some(0..input.text.len()));
     }
 
 }

@@ -8876,7 +8876,8 @@ pub(super) fn open_file_picker_for_copy_move(
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
     let title = if is_move { "Move to..." } else { "Copy to..." }.to_string();
-    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+    let picker = tui_file_picker::FilePickerState::new(
+        super::keybindings::file_picker_config_with_browse_sort(app, tui_file_picker::FilePickerConfig {
         start_dir,
         filter: tui_file_picker::FilePickerFilter::All,
         title: title.clone(),
@@ -8891,7 +8892,8 @@ pub(super) fn open_file_picker_for_copy_move(
             app.file_task_verbose_degrade_notices,
         ),
         ..tui_file_picker::FilePickerConfig::default()
-    });
+    }),
+    );
     let purpose = if is_move {
         FilePickerPurpose::MoveTo { sources, force }
     } else {
@@ -8936,7 +8938,8 @@ pub(super) fn open_file_picker_for_convert_destination(app: &mut AppState) {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+    let picker = tui_file_picker::FilePickerState::new(
+        super::keybindings::file_picker_config_with_browse_sort(app, tui_file_picker::FilePickerConfig {
         start_dir,
         filter: tui_file_picker::FilePickerFilter::All,
         title: "Select destination folder".to_string(),
@@ -8946,7 +8949,8 @@ pub(super) fn open_file_picker_for_convert_destination(app: &mut AppState) {
             app.file_task_verbose_degrade_notices,
         ),
         ..tui_file_picker::FilePickerConfig::default()
-    });
+    }),
+    );
     app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
         FilePickerPurpose::SelectDestination,
         picker,
@@ -8958,7 +8962,8 @@ pub(super) fn open_file_picker_for_convert_destination(app: &mut AppState) {
 pub(super) fn open_file_picker_for_preset_load(app: &mut AppState) {
     let start_dir = super::presets::presets_dir();
     let _ = fs::create_dir_all(&start_dir);
-    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+    let picker = tui_file_picker::FilePickerState::new(
+        super::keybindings::file_picker_config_with_browse_sort(app, tui_file_picker::FilePickerConfig {
         start_dir,
         filter: tui_file_picker::FilePickerFilter::Custom { label: "Presets".to_string(), extensions: vec!["toml".to_string()] },
         title: "Load preset".to_string(),
@@ -8967,7 +8972,8 @@ pub(super) fn open_file_picker_for_preset_load(app: &mut AppState) {
         hide_extension: Some(".toml".to_string()),
         operation_policy: preset_picker_policy(app.file_task_verbose_degrade_notices),
         ..tui_file_picker::FilePickerConfig::default()
-    });
+    }),
+    );
     app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
         FilePickerPurpose::SelectPreset,
         picker,
@@ -8980,7 +8986,8 @@ pub(super) fn open_file_picker_for_preset_save_as(app: &mut AppState) {
     let start_dir = super::presets::presets_dir();
     let _ = fs::create_dir_all(&start_dir);
     let default_name = app.preset.active_preset.clone().unwrap_or_default();
-    let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+    let picker = tui_file_picker::FilePickerState::new(
+        super::keybindings::file_picker_config_with_browse_sort(app, tui_file_picker::FilePickerConfig {
         start_dir,
         filter: tui_file_picker::FilePickerFilter::Custom { label: "Presets".to_string(), extensions: vec!["toml".to_string()] },
         title: "Save preset".to_string(),
@@ -8995,7 +9002,8 @@ pub(super) fn open_file_picker_for_preset_save_as(app: &mut AppState) {
         }),
         operation_policy: preset_picker_policy(app.file_task_verbose_degrade_notices),
         ..tui_file_picker::FilePickerConfig::default()
-    });
+    }),
+    );
     app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
         FilePickerPurpose::SavePreset,
         picker,

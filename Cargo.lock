@@ -2917,6 +2917,7 @@ dependencies = [
  "dirs",
  "image",
  "libc",
+ "log",
  "ratatui",
  "ratatui-image",
  "serde",

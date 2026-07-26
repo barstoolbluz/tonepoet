@@ -301,7 +301,9 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
                 | tui_file_picker::FileTaskProgressUpdate::Failed { .. }
                 | tui_file_picker::FileTaskProgressUpdate::Aborted { .. }
         ),
-        AppMessage::FileTaskComplete { .. } => true,
+        AppMessage::FileTaskComplete { .. }
+        | AppMessage::RenamePlanComplete { .. }
+        | AppMessage::FileOperationReplayComplete { .. } => true,
         _ => false,
     }
 }
@@ -826,12 +828,13 @@ fn reduce_file_picker_complete(
                         .map(|picker| picker.session_id == session_id && picker.purpose == purpose)
                         .unwrap_or(false);
                     if matches_open_picker {
-                        if let Some(current_dir) = state
-                            .file_picker
-                            .as_ref()
-                            .map(|picker| picker.current_dir().to_path_buf())
-                        {
-                            app.last_artwork_picker_dir = Some(current_dir);
+                        if let Some(open_picker) = state.file_picker.as_ref() {
+                            super::keybindings::persist_file_picker_sort_if_changed(
+                                app,
+                                &open_picker.picker,
+                            );
+                            app.last_artwork_picker_dir =
+                                Some(open_picker.current_dir().to_path_buf());
                         }
                         state.file_picker = None;
                         state.pending_artwork_type = None;
@@ -1182,7 +1185,7 @@ fn terminal_update_from_completion_report(
 fn reduce_file_task_complete(
     app: &mut AppState,
     session_id: u64,
-    report: tui_file_picker::FileTaskCompletionReport,
+    mut report: tui_file_picker::FileTaskCompletionReport,
     worker_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
@@ -1241,12 +1244,20 @@ fn reduce_file_task_complete(
         }
     }
 
+    let undo_record_warning =
+        super::keybindings::record_completed_file_task_for_undo(app, session_id, &mut report);
+
     let matches_pending = app
         .browse
         .pending_clipboard_paste
         .as_ref()
         .is_some_and(|pending| pending.session_id == session_id);
     if !matches_pending {
+        if let Some(warning) = undo_record_warning {
+            app.set_status(format!(
+                "file task completed, but undo was not retained: {warning}"
+            ));
+        }
         return;
     }
     let pending = app
@@ -1439,6 +1450,9 @@ fn reduce_file_task_complete(
             ));
         }
     }
+    if let Some(warning) = undo_record_warning {
+        status.push_str(&format!("; undo was not retained: {warning}"));
+    }
     app.set_status(status);
 }
 
@@ -1472,7 +1486,9 @@ fn close_matching_file_picker(
     match overlay {
         ActiveOverlay::FilePicker(session) => {
             matched = session.session_id == session_id && &session.purpose == purpose;
-            if !matched {
+            if matched {
+                super::keybindings::persist_file_picker_sort_if_changed(app, &session.picker);
+            } else {
                 app.active_overlay = ActiveOverlay::FilePicker(session);
             }
         }
@@ -1483,6 +1499,12 @@ fn close_matching_file_picker(
                 .map(|picker| picker.session_id == session_id && &picker.purpose == purpose)
                 .unwrap_or(false);
             if matches_open_picker {
+                if let Some(open_picker) = state.file_picker.as_ref() {
+                    super::keybindings::persist_file_picker_sort_if_changed(
+                        app,
+                        &open_picker.picker,
+                    );
+                }
                 if matches!(purpose, super::app::FilePickerPurpose::SelectArtwork { .. }) {
                     if let Some(current_dir) = state
                         .file_picker
@@ -4611,6 +4633,32 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             retry_plan,
         } => {
             reduce_file_task_complete(app, session_id, report, retry_plan, tx);
+        }
+        AppMessage::RenamePlanComplete {
+            description,
+            base_dir,
+            result,
+        } => {
+            super::keybindings::complete_rename_plan(
+                app,
+                description,
+                base_dir,
+                result,
+                tx,
+            );
+        }
+        AppMessage::FileOperationReplayComplete {
+            entry,
+            undo,
+            result,
+        } => {
+            super::keybindings::complete_file_operation_replay(
+                app,
+                entry,
+                undo,
+                result,
+                tx,
+            );
         }
         AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
             if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
@@ -13286,6 +13334,8 @@ mod async_message_drain_tests {
                 destination: std::path::PathBuf::from("destination.bin"),
                 disposition: tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
                 message: Some(message.to_string()),
+                undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                proof: None,
             }],
         }
     }
@@ -14132,6 +14182,8 @@ mod async_message_drain_tests {
                     destination: destination_a.clone(),
                     disposition: tui_file_picker::FileTaskRootDisposition::Completed,
                     message: None,
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
                 },
                 tui_file_picker::FileTaskRootResult {
                     source: source_b.clone(),
@@ -14141,6 +14193,8 @@ mod async_message_drain_tests {
                         "destination complete; source partially removed from quarantine"
                             .to_string(),
                     ),
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
                 },
             ],
         };

@@ -1,7 +1,8 @@
 use crate::state::{
     intersect_rect, ConflictPolicyPreset, DeleteConfirmButton, FilePickerContextMenuKind,
-    FilePickerCreateKind, FilePickerFocus, FilePickerHitAction, FilePickerMenuEntry,
-    FilePickerSelectionMode, FilePickerState, HitRegion, SaveModeStyle, ToolbarAction,
+    FilePickerCreateKind, FilePickerFocus, FilePickerHitAction,
+    FilePickerMenuEntry, FilePickerSelectionMode, FilePickerSubmenuEntry, FilePickerSortKey, FilePickerState, HitRegion, SaveModeStyle,
+    ToolbarAction,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -729,9 +730,22 @@ impl FilePickerState {
         let body_capacity = inner.height.saturating_sub(1) as usize;
         self.set_file_visible_rows(body_capacity);
         self.ensure_file_cursor_visible(body_capacity);
-        let header = Row::new(vec!["Name", "Size", "Type", "Modified"])
-            .style(self.theme.header)
-            .bottom_margin(0);
+        let sort_arrow = if self.sort_reverse { "▼" } else { "▲" };
+        let header_label = |key: FilePickerSortKey, label: &str| {
+            if self.sort_key == key {
+                format!("{label} {sort_arrow}")
+            } else {
+                label.to_string()
+            }
+        };
+        let header = Row::new(vec![
+            header_label(FilePickerSortKey::Name, "Name"),
+            header_label(FilePickerSortKey::Size, "Size"),
+            header_label(FilePickerSortKey::Type, "Type"),
+            header_label(FilePickerSortKey::Modified, "Modified"),
+        ])
+        .style(self.theme.header)
+        .bottom_margin(0);
         let mut rows = Vec::new();
         let mut hits = vec![HitRegion {
             rect: Rect::new(
@@ -831,14 +845,31 @@ impl FilePickerState {
                 },
             });
         }
-        self.hit_regions.extend(hits);
-
         let widths = [
             Constraint::Percentage(42),
             Constraint::Percentage(14),
             Constraint::Percentage(22),
             Constraint::Percentage(22),
         ];
+        let header_columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(widths)
+            .split(Rect::new(inner.x, inner.y, inner.width, 1));
+        for (rect, sort_key) in header_columns.iter().zip([
+            FilePickerSortKey::Name,
+            FilePickerSortKey::Size,
+            FilePickerSortKey::Type,
+            FilePickerSortKey::Modified,
+        ]) {
+            if rect.width > 0 {
+                hits.push(HitRegion {
+                    rect: *rect,
+                    action: FilePickerHitAction::SortColumn(sort_key),
+                });
+            }
+        }
+        self.hit_regions.extend(hits);
+
         let selected = if body_capacity > 0 && self.file_cursor >= self.file_scroll {
             Some(self.file_cursor - self.file_scroll + inline_row_count)
         } else {
@@ -887,7 +918,7 @@ impl FilePickerState {
         let _ = self.record_hit_region_clipped(
             Rect::new(input_x, area.y, input_width as u16, 1),
             area,
-            FilePickerHitAction::SaveName,
+            FilePickerHitAction::SaveNameEditor,
         );
     }
 
@@ -1030,7 +1061,10 @@ impl FilePickerState {
             let selected = self.focus == FilePickerFocus::Menu && self.menu_cursor == idx;
             let disabled = match entry {
                 FilePickerMenuEntry::NewSubmenu => !self.is_new_menu_enabled(),
-                FilePickerMenuEntry::SelectionSubmenu => false,
+                FilePickerMenuEntry::SelectionSubmenu
+                | FilePickerMenuEntry::SortSubmenu
+                | FilePickerMenuEntry::RenameSubmenu
+                | FilePickerMenuEntry::CaseSubmenu => false,
                 FilePickerMenuEntry::Action(action) => !self.is_menu_action_enabled(*action),
             };
             let style = if disabled {
@@ -1051,6 +1085,9 @@ impl FilePickerState {
             let hit_action = match entry {
                 FilePickerMenuEntry::NewSubmenu => FilePickerHitAction::MenuNew,
                 FilePickerMenuEntry::SelectionSubmenu => FilePickerHitAction::MenuSelection,
+                FilePickerMenuEntry::SortSubmenu => FilePickerHitAction::MenuSort,
+                FilePickerMenuEntry::RenameSubmenu => FilePickerHitAction::MenuRename,
+                FilePickerMenuEntry::CaseSubmenu => FilePickerHitAction::MenuCase,
                 FilePickerMenuEntry::Action(action) => FilePickerHitAction::Menu(*action),
             };
             if !disabled {
@@ -1063,65 +1100,134 @@ impl FilePickerState {
         self.hit_regions.extend(hits);
         frame.render_widget(Paragraph::new(lines), inner);
 
-        if self.submenu_open {
-            let submenu_items = self.submenu_entries();
-            let submenu_width = submenu_items
-                .iter()
-                .map(|(label, _)| crate::display_width::width(label))
-                .max()
-                .unwrap_or(1)
-                .saturating_add(4)
-                .min(bounds.width.saturating_sub(2) as usize)
-                .max(8) as u16;
-            let submenu_height = (submenu_items.len() as u16).saturating_add(2).min(bounds.height);
-            let bounds_right = bounds.x.saturating_add(bounds.width);
-            let submenu_right_x = menu_area.x.saturating_add(menu_area.width);
-            let submenu_x = if submenu_right_x.saturating_add(submenu_width) <= bounds_right {
-                submenu_right_x
-            } else {
-                menu_area.x.saturating_sub(submenu_width).max(bounds.x)
-            };
-            let selected_parent_row = self.menu_cursor as u16;
-            let submenu_y = menu_area
-                .y
-                .saturating_add(1)
-                .saturating_add(selected_parent_row)
-                .min(bounds.y.saturating_add(bounds.height).saturating_sub(submenu_height));
-            let submenu_area = Rect::new(submenu_x, submenu_y, submenu_width, submenu_height);
-            frame.render_widget(Clear, submenu_area);
-            let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
-            let inner = block.inner(submenu_area);
-            frame.render_widget(block, submenu_area);
-            let mut lines = Vec::new();
-            let mut hits = Vec::new();
-            for (idx, (label, action)) in submenu_items.iter().enumerate() {
-                let selected = self.focus == FilePickerFocus::Submenu && self.submenu_cursor == idx;
-                let disabled = !self.is_menu_action_enabled(*action);
-                let style = if disabled {
-                    self.theme.menu_disabled
-                } else if selected {
-                    self.theme.menu_selected
-                } else {
-                    self.theme.menu
-                };
-                let hot_style = if disabled {
-                    self.theme.menu_disabled
-                } else if selected {
-                    self.theme.menu_selected
-                } else {
-                    self.theme.accelerator
-                };
-                lines.push(menu_line(label, inner.width as usize, style, hot_style));
-                if !disabled {
-                    hits.push(HitRegion {
-                        rect: Rect::new(inner.x, inner.y.saturating_add(idx as u16), inner.width, 1),
-                        action: FilePickerHitAction::Submenu(*action),
-                    });
-                }
-            }
-            self.hit_regions.extend(hits);
-            frame.render_widget(Paragraph::new(lines), inner);
+        if !self.submenu_open {
+            return;
         }
+
+        let submenu_items = self.submenu_entries();
+        let submenu_width = submenu_items
+            .iter()
+            .map(|(label, _)| crate::display_width::width(label))
+            .max()
+            .unwrap_or(1)
+            .saturating_add(4)
+            .min(bounds.width.saturating_sub(2) as usize)
+            .max(8) as u16;
+        let submenu_height = (submenu_items.len() as u16).saturating_add(2).min(bounds.height);
+        let bounds_right = bounds.x.saturating_add(bounds.width);
+        let submenu_right_x = menu_area.x.saturating_add(menu_area.width);
+        let submenu_x = if submenu_right_x.saturating_add(submenu_width) <= bounds_right {
+            submenu_right_x
+        } else {
+            menu_area.x.saturating_sub(submenu_width).max(bounds.x)
+        };
+        let selected_parent_row = self.menu_cursor as u16;
+        let submenu_y = menu_area
+            .y
+            .saturating_add(1)
+            .saturating_add(selected_parent_row)
+            .min(bounds.y.saturating_add(bounds.height).saturating_sub(submenu_height));
+        let submenu_area = Rect::new(submenu_x, submenu_y, submenu_width, submenu_height);
+        frame.render_widget(Clear, submenu_area);
+        let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
+        let inner = block.inner(submenu_area);
+        frame.render_widget(block, submenu_area);
+        let mut lines = Vec::new();
+        let mut hits = Vec::new();
+        for (idx, (label, entry)) in submenu_items.iter().enumerate() {
+            let selected = self.focus == FilePickerFocus::Submenu && self.submenu_cursor == idx;
+            let disabled = match entry {
+                FilePickerSubmenuEntry::CaseSubmenu => false,
+                FilePickerSubmenuEntry::Action(action) => !self.is_menu_action_enabled(*action),
+            };
+            let style = if disabled {
+                self.theme.menu_disabled
+            } else if selected {
+                self.theme.menu_selected
+            } else {
+                self.theme.menu
+            };
+            let hot_style = if disabled {
+                self.theme.menu_disabled
+            } else if selected {
+                self.theme.menu_selected
+            } else {
+                self.theme.accelerator
+            };
+            lines.push(menu_line(label, inner.width as usize, style, hot_style));
+            if !disabled {
+                let action = match entry {
+                    FilePickerSubmenuEntry::CaseSubmenu => FilePickerHitAction::SubmenuCase,
+                    FilePickerSubmenuEntry::Action(action) => FilePickerHitAction::Submenu(*action),
+                };
+                hits.push(HitRegion {
+                    rect: Rect::new(inner.x, inner.y.saturating_add(idx as u16), inner.width, 1),
+                    action,
+                });
+            }
+        }
+        self.hit_regions.extend(hits);
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        if !self.case_submenu_open {
+            return;
+        }
+
+        let nested_items = self.nested_case_entries();
+        let nested_width = nested_items
+            .iter()
+            .map(|(label, _)| crate::display_width::width(label))
+            .max()
+            .unwrap_or(1)
+            .saturating_add(4)
+            .min(bounds.width.saturating_sub(2) as usize)
+            .max(8) as u16;
+        let nested_height = (nested_items.len() as u16).saturating_add(2).min(bounds.height);
+        let nested_right_x = submenu_area.x.saturating_add(submenu_area.width);
+        let nested_x = if nested_right_x.saturating_add(nested_width) <= bounds_right {
+            nested_right_x
+        } else {
+            submenu_area.x.saturating_sub(nested_width).max(bounds.x)
+        };
+        let nested_y = submenu_area
+            .y
+            .saturating_add(1)
+            .saturating_add(self.submenu_cursor as u16)
+            .min(bounds.y.saturating_add(bounds.height).saturating_sub(nested_height));
+        let nested_area = Rect::new(nested_x, nested_y, nested_width, nested_height);
+        frame.render_widget(Clear, nested_area);
+        let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
+        let inner = block.inner(nested_area);
+        frame.render_widget(block, nested_area);
+        let mut lines = Vec::new();
+        let mut hits = Vec::new();
+        for (idx, (label, action)) in nested_items.iter().enumerate() {
+            let selected = self.case_submenu_cursor == idx;
+            let disabled = !self.is_menu_action_enabled(*action);
+            let style = if disabled {
+                self.theme.menu_disabled
+            } else if selected {
+                self.theme.menu_selected
+            } else {
+                self.theme.menu
+            };
+            let hot_style = if disabled {
+                self.theme.menu_disabled
+            } else if selected {
+                self.theme.menu_selected
+            } else {
+                self.theme.accelerator
+            };
+            lines.push(menu_line(label, inner.width as usize, style, hot_style));
+            if !disabled {
+                hits.push(HitRegion {
+                    rect: Rect::new(inner.x, inner.y.saturating_add(idx as u16), inner.width, 1),
+                    action: FilePickerHitAction::NestedSubmenu(*action),
+                });
+            }
+        }
+        self.hit_regions.extend(hits);
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_properties_popup(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1361,6 +1467,16 @@ impl FilePickerState {
                 true,
             ));
             frame.render_widget(Paragraph::new(Line::from(spans)), rows[next_row]);
+            let label_width = crate::display_width::width(label) as u16;
+            self.record_hit_region(
+                Rect::new(
+                    rows[next_row].x.saturating_add(label_width),
+                    rows[next_row].y,
+                    rows[next_row].width.saturating_sub(label_width),
+                    1,
+                ),
+                FilePickerHitAction::BookmarkNameEditor,
+            );
             next_row += 1;
         }
         let error = self.bookmarks.error.as_deref().unwrap_or("");
@@ -1808,7 +1924,7 @@ fn same_display_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConflictPolicyPreset, FilePickerConfig, FilePickerFilter};
+    use crate::{ConflictPolicyPreset, FilePickerConfig, FilePickerFilter, FilePickerMenuAction};
 
     #[test]
     fn fit_text_start_keeps_name_prefix_and_marks_overflow_at_the_end() {
@@ -1900,6 +2016,37 @@ mod tests {
         assert!(picker.hit_regions().iter().any(|hit| matches!(hit.action, FilePickerHitAction::FileRow(_))));
     }
 
+
+    #[test]
+    fn file_header_renders_active_direction_and_registers_each_sort_column() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("track.flac"), b"audio").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            sort_key: FilePickerSortKey::Modified,
+            sort_reverse: true,
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(1, 1, 90, 24)))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Modified ▼"));
+        assert!(!rendered.contains("Name ▲"));
+
+        for expected in [
+            FilePickerSortKey::Name,
+            FilePickerSortKey::Size,
+            FilePickerSortKey::Type,
+            FilePickerSortKey::Modified,
+        ] {
+            assert!(picker.hit_regions().iter().any(|hit| {
+                matches!(hit.action, FilePickerHitAction::SortColumn(actual) if actual == expected)
+            }), "missing hit region for {expected:?}");
+        }
+    }
 
     #[test]
     fn conflict_policy_row_renders_and_registers_hit_regions() {
@@ -2193,6 +2340,79 @@ mod tests {
 
         assert_eq!(menu_new.rect.x, file_ops.x.saturating_add(1));
         assert_eq!(menu_new.rect.y, file_ops.y.saturating_add(2));
+    }
+
+    #[test]
+    fn rename_case_menu_renders_all_three_levels_with_distinct_hit_regions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        fs::write(&file, b"audio").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.selected = Some(file.clone());
+        picker.multi_selected = vec![file];
+        picker.context_menu_kind = FilePickerContextMenuKind::File;
+        picker.context_menu_anchor = Some((30, 8));
+        picker.menu_open = true;
+        picker.menu_cursor = 3;
+        picker.submenu_open = true;
+        picker.submenu_kind = crate::state::FilePickerSubmenuKind::Rename;
+        picker.submenu_cursor = 1;
+        picker.case_submenu_open = true;
+        picker.case_submenu_cursor = 0;
+        picker.focus = FilePickerFocus::Submenu;
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 116, 26)))
+            .expect("draw");
+        let actions = picker
+            .hit_regions()
+            .iter()
+            .map(|hit| hit.action)
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&FilePickerHitAction::MenuRename));
+        assert!(actions.contains(&FilePickerHitAction::SubmenuCase));
+        assert!(actions.contains(&FilePickerHitAction::NestedSubmenu(
+            FilePickerMenuAction::RenameTitleCase,
+        )));
+        assert!(actions.contains(&FilePickerHitAction::NestedSubmenu(
+            FilePickerMenuAction::RenameUppercase,
+        )));
+        assert!(actions.contains(&FilePickerHitAction::NestedSubmenu(
+            FilePickerMenuAction::RenameLowercase,
+        )));
+    }
+
+    #[test]
+    fn save_name_editor_and_save_button_have_distinct_pointer_actions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            save_mode: Some(crate::SaveModeConfig {
+                default_name: "album".to_string(),
+                confirm_overwrite: true,
+                hide_extension: Some("flac".to_string()),
+                style: crate::SaveModeStyle::Inline,
+            }),
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 116, 26)))
+            .expect("draw");
+        assert!(picker
+            .hit_regions()
+            .iter()
+            .any(|hit| hit.action == FilePickerHitAction::SaveNameEditor));
+        assert!(picker
+            .hit_regions()
+            .iter()
+            .any(|hit| hit.action == FilePickerHitAction::SaveName));
     }
 
     #[test]

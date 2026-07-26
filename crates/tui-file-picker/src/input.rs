@@ -1,7 +1,9 @@
 use crate::state::{
     DeleteConfirmButton, FilePickerAction, FilePickerContextMenuKind, FilePickerCreateKind,
     FilePickerError, FilePickerFocus, FilePickerHitAction, FilePickerMenuAction,
-    FilePickerMenuEntry, FilePickerState, FilePickerSubmenuKind, LastClick, ToolbarAction,
+    FilePickerMenuEntry, FilePickerSortKey, FilePickerState, FilePickerSubmenuEntry,
+    FilePickerSubmenuKind, LastClick, LastTextClick, PickerTextTarget,
+    TextPointerSession, ToolbarAction,
 };
 use crate::text_input::{
     handle_text_input_key, handle_text_input_key_with_boundaries, TextBoundaryMode,
@@ -90,6 +92,8 @@ impl FilePickerState {
         }
         self.last_click = None;
         self.tree_last_click = None;
+        self.text_pointer = None;
+        self.text_last_click = None;
         match self.focus {
             FilePickerFocus::Address => self.handle_address_key(key),
             FilePickerFocus::Search => self.handle_search_key(key),
@@ -104,6 +108,138 @@ impl FilePickerState {
             FilePickerFocus::CreateName => self.handle_create_name_key(key),
             FilePickerFocus::SaveName => self.handle_save_name_key(key),
             FilePickerFocus::SaveOverwriteConfirm => self.handle_save_overwrite_confirm_key(key),
+        }
+    }
+
+    fn picker_text_target(action: FilePickerHitAction) -> Option<PickerTextTarget> {
+        match action {
+            FilePickerHitAction::Address => Some(PickerTextTarget::Address),
+            FilePickerHitAction::CreateNameEditor => Some(PickerTextTarget::CreateName),
+            FilePickerHitAction::SaveNameEditor => Some(PickerTextTarget::SaveName),
+            FilePickerHitAction::SearchInput => Some(PickerTextTarget::Search),
+            FilePickerHitAction::BookmarkNameEditor => Some(PickerTextTarget::BookmarkName),
+            _ => None,
+        }
+    }
+
+    fn text_input_mut_for_target(
+        &mut self,
+        target: PickerTextTarget,
+    ) -> &mut crate::text_input::TextInputState {
+        match target {
+            PickerTextTarget::Address => &mut self.address_input,
+            PickerTextTarget::CreateName => &mut self.create_name_input,
+            PickerTextTarget::SaveName => &mut self.save_name_input,
+            PickerTextTarget::Search => &mut self.search.input,
+            PickerTextTarget::BookmarkName => &mut self.bookmarks.name_input,
+        }
+    }
+
+    fn focus_picker_text_target(&mut self, target: PickerTextTarget) -> bool {
+        match target {
+            PickerTextTarget::Address => {
+                if !self.address_editing {
+                    self.begin_address_edit();
+                } else {
+                    self.focus = FilePickerFocus::Address;
+                }
+                true
+            }
+            PickerTextTarget::CreateName => {
+                if self.pending_name_action.is_none() {
+                    return false;
+                }
+                self.focus = FilePickerFocus::CreateName;
+                true
+            }
+            PickerTextTarget::SaveName => {
+                if self.save_mode.is_none() {
+                    return false;
+                }
+                self.focus = FilePickerFocus::SaveName;
+                true
+            }
+            PickerTextTarget::Search => {
+                self.focus = FilePickerFocus::Search;
+                true
+            }
+            PickerTextTarget::BookmarkName => {
+                if self.bookmarks.naming.is_none() {
+                    return false;
+                }
+                self.focus = FilePickerFocus::BookmarkName;
+                true
+            }
+        }
+    }
+
+    fn text_target_at(&self, column: u16, row: u16) -> Option<(PickerTextTarget, Rect)> {
+        self.hit_regions.iter().rev().find_map(|region| {
+            if !point_in_rect(column, row, region.rect) {
+                return None;
+            }
+            Self::picker_text_target(region.action).map(|target| (target, region.rect))
+        })
+    }
+
+    /// Shared pointer contract for every picker text field: a single click
+    /// clears any selection and places the cursor, drag extends a selection,
+    /// and a double-click selects the complete value. This runs before the
+    /// ordinary file/tree click dispatcher so inline editors never commit just
+    /// because the pointer is used inside their own rendered field.
+    fn handle_picker_text_pointer(&mut self, mouse: &MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some((target, rect)) = self.text_target_at(mouse.column, mouse.row) else {
+                    self.text_pointer = None;
+                    self.text_last_click = None;
+                    return false;
+                };
+                self.close_menu();
+                if !self.focus_picker_text_target(target) {
+                    return true;
+                }
+                let now = Instant::now();
+                let double_click = self.text_last_click.is_some_and(|last| {
+                    last.target == target
+                        && now.saturating_duration_since(last.at) <= self.double_click_window
+                });
+                let width = rect.width as usize;
+                let column = mouse.column.saturating_sub(rect.x) as usize;
+                if double_click {
+                    self.text_input_mut_for_target(target).select_all_text();
+                    self.text_pointer = None;
+                    self.text_last_click = None;
+                } else {
+                    self.text_input_mut_for_target(target)
+                        .begin_mouse_selection(width, column);
+                    self.text_pointer = Some(TextPointerSession { target, rect });
+                    self.text_last_click = Some(LastTextClick { target, at: now });
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(session) = self.text_pointer else {
+                    return false;
+                };
+                let width = session.rect.width as usize;
+                let column = mouse.column.saturating_sub(session.rect.x) as usize;
+                self.text_input_mut_for_target(session.target)
+                    .drag_mouse_selection(width, column);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(session) = self.text_pointer.take() else {
+                    return false;
+                };
+                let width = session.rect.width as usize;
+                let column = mouse.column.saturating_sub(session.rect.x) as usize;
+                let input = self.text_input_mut_for_target(session.target);
+                input.drag_mouse_selection(width, column);
+                input.end_mouse_selection();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -144,10 +280,16 @@ impl FilePickerState {
             }
         }
 
+        if self.handle_picker_text_pointer(&mouse) {
+            return FilePickerAction::None;
+        }
+
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.last_click = None;
                 self.tree_last_click = None;
+                self.text_pointer = None;
+                self.text_last_click = None;
                 if self.tree_focused {
                     self.move_tree_cursor(-3, self.tree_visible_rows());
                 } else {
@@ -158,6 +300,8 @@ impl FilePickerState {
             MouseEventKind::ScrollDown => {
                 self.last_click = None;
                 self.tree_last_click = None;
+                self.text_pointer = None;
+                self.text_last_click = None;
                 if self.tree_focused {
                     self.move_tree_cursor(3, self.tree_visible_rows());
                 } else {
@@ -186,9 +330,15 @@ impl FilePickerState {
                 let action = self.hit_regions.iter().rev().find_map(|region| {
                     point_in_rect(mouse.column, mouse.row, region.rect).then_some(region.action)
                 });
-                let action = match self.resolve_name_edit_before_pointer_action(action) {
-                    Ok(action) => action,
-                    Err(()) => return FilePickerAction::None,
+                let action = if self.focus == FilePickerFocus::CreateName
+                    && action == Some(FilePickerHitAction::CreateNameEditor)
+                {
+                    action
+                } else {
+                    match self.resolve_name_edit_before_pointer_action(action) {
+                        Ok(action) => action,
+                        Err(()) => return FilePickerAction::None,
+                    }
                 };
                 self.last_click = None;
                 self.tree_last_click = None;
@@ -545,6 +695,33 @@ impl FilePickerState {
     }
 
     fn handle_submenu_key(&mut self, key: KeyEvent) -> FilePickerAction {
+        if self.case_submenu_open {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Left => {
+                    self.case_submenu_open = false;
+                    self.case_submenu_cursor = 0;
+                    FilePickerAction::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.case_submenu_cursor = self.case_submenu_cursor.saturating_sub(1);
+                    FilePickerAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.case_submenu_cursor = self
+                        .case_submenu_cursor
+                        .saturating_add(1)
+                        .min(self.nested_case_entries().len().saturating_sub(1));
+                    FilePickerAction::None
+                }
+                KeyCode::Enter => self
+                    .nested_case_entries()
+                    .get(self.case_submenu_cursor)
+                    .map(|(_, action)| self.apply_menu_action_if_enabled(*action))
+                    .unwrap_or(FilePickerAction::None),
+                _ => FilePickerAction::None,
+            };
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Left => {
                 self.focus = FilePickerFocus::Menu;
@@ -560,14 +737,20 @@ impl FilePickerState {
                 self.submenu_cursor = self.submenu_cursor.saturating_add(1).min(last);
                 FilePickerAction::None
             }
-            KeyCode::Enter => {
-                let action = self
+            KeyCode::Right | KeyCode::Enter => {
+                let entry = self
                     .submenu_entries()
                     .get(self.submenu_cursor)
-                    .map(|(_, action)| *action);
-                action
-                    .map(|action| self.apply_menu_action_if_enabled(action))
-                    .unwrap_or(FilePickerAction::None)
+                    .map(|(_, entry)| *entry);
+                match entry {
+                    Some(FilePickerSubmenuEntry::CaseSubmenu) => {
+                        self.open_nested_case_submenu()
+                    }
+                    Some(FilePickerSubmenuEntry::Action(action)) => {
+                        self.apply_menu_action_if_enabled(action)
+                    }
+                    None => FilePickerAction::None,
+                }
             }
             _ => FilePickerAction::None,
         }
@@ -736,6 +919,10 @@ impl FilePickerState {
                     FilePickerAction::None
                 }
             }
+            FilePickerHitAction::BookmarkNameEditor => {
+                self.focus = FilePickerFocus::BookmarkName;
+                FilePickerAction::None
+            }
             FilePickerHitAction::BookmarkRow(index) => {
                 self.focus = FilePickerFocus::Bookmarks;
                 self.bookmarks.cursor = index.min(self.bookmarks.entries.len().saturating_sub(1));
@@ -789,7 +976,20 @@ impl FilePickerState {
                 self.tree_focused = false;
                 FilePickerAction::None
             }
-            FilePickerHitAction::CreateNameEditor => FilePickerAction::None,
+            FilePickerHitAction::SortColumn(sort_key) => {
+                self.focus = FilePickerFocus::Files;
+                self.tree_focused = false;
+                self.set_sort(sort_key);
+                FilePickerAction::None
+            }
+            FilePickerHitAction::CreateNameEditor => {
+                self.focus = FilePickerFocus::CreateName;
+                FilePickerAction::None
+            }
+            FilePickerHitAction::SaveNameEditor => {
+                self.focus = FilePickerFocus::SaveName;
+                FilePickerAction::None
+            }
             FilePickerHitAction::SearchInput => {
                 self.focus = FilePickerFocus::Search;
                 FilePickerAction::None
@@ -801,6 +1001,10 @@ impl FilePickerState {
             FilePickerHitAction::SearchRow(index) => {
                 self.focus = FilePickerFocus::Search;
                 self.search.cursor = index.min(self.search.results.len().saturating_sub(1));
+                FilePickerAction::None
+            }
+            FilePickerHitAction::BookmarkNameEditor => {
+                self.focus = FilePickerFocus::BookmarkName;
                 FilePickerAction::None
             }
             FilePickerHitAction::BookmarkRow(index) => {
@@ -832,7 +1036,13 @@ impl FilePickerState {
             FilePickerHitAction::MenuSelection => {
                 self.open_submenu(FilePickerSubmenuKind::Selection)
             }
-            FilePickerHitAction::Menu(action) | FilePickerHitAction::Submenu(action) => {
+            FilePickerHitAction::MenuSort => self.open_submenu(FilePickerSubmenuKind::Sort),
+            FilePickerHitAction::MenuRename => self.open_submenu(FilePickerSubmenuKind::Rename),
+            FilePickerHitAction::MenuCase => self.open_submenu(FilePickerSubmenuKind::TextCase),
+            FilePickerHitAction::SubmenuCase => self.open_nested_case_submenu(),
+            FilePickerHitAction::Menu(action)
+            | FilePickerHitAction::Submenu(action)
+            | FilePickerHitAction::NestedSubmenu(action) => {
                 self.apply_menu_action_if_enabled(action)
             }
             FilePickerHitAction::PropertiesClose => {
@@ -923,6 +1133,15 @@ impl FilePickerState {
             Some(FilePickerMenuEntry::SelectionSubmenu) => {
                 self.open_submenu(FilePickerSubmenuKind::Selection)
             }
+            Some(FilePickerMenuEntry::SortSubmenu) => {
+                self.open_submenu(FilePickerSubmenuKind::Sort)
+            }
+            Some(FilePickerMenuEntry::RenameSubmenu) => {
+                self.open_submenu(FilePickerSubmenuKind::Rename)
+            }
+            Some(FilePickerMenuEntry::CaseSubmenu) => {
+                self.open_submenu(FilePickerSubmenuKind::TextCase)
+            }
             Some(FilePickerMenuEntry::Action(action)) => {
                 self.apply_menu_action_if_enabled(action)
             }
@@ -939,7 +1158,18 @@ impl FilePickerState {
         self.submenu_open = true;
         self.submenu_kind = kind;
         self.submenu_cursor = 0;
+        self.case_submenu_open = false;
+        self.case_submenu_cursor = 0;
         self.focus = FilePickerFocus::Submenu;
+        FilePickerAction::None
+    }
+
+    fn open_nested_case_submenu(&mut self) -> FilePickerAction {
+        if self.submenu_kind != FilePickerSubmenuKind::Rename {
+            return FilePickerAction::None;
+        }
+        self.case_submenu_open = true;
+        self.case_submenu_cursor = 0;
         FilePickerAction::None
     }
 
@@ -1016,6 +1246,10 @@ impl FilePickerState {
                 } else {
                     self.current_selection().map(|entry| entry.path.clone())
                 };
+                let prior_focus = self.previous_focus;
+                self.close_menu();
+                self.focus = prior_focus;
+                self.tree_focused = prior_focus == FilePickerFocus::Tree;
                 if let Some(target) = target {
                     self.begin_rename_path(target);
                 }
@@ -1050,18 +1284,99 @@ impl FilePickerState {
                 self.close_menu();
                 FilePickerAction::None
             }
+            FilePickerMenuAction::SortName
+            | FilePickerMenuAction::SortSize
+            | FilePickerMenuAction::SortType
+            | FilePickerMenuAction::SortModified => {
+                let sort_key = match action {
+                    FilePickerMenuAction::SortName => FilePickerSortKey::Name,
+                    FilePickerMenuAction::SortSize => FilePickerSortKey::Size,
+                    FilePickerMenuAction::SortType => FilePickerSortKey::Type,
+                    FilePickerMenuAction::SortModified => FilePickerSortKey::Modified,
+                    _ => unreachable!("sort action match is exhaustive"),
+                };
+                self.set_sort(sort_key);
+                self.close_menu();
+                FilePickerAction::None
+            }
             FilePickerMenuAction::TextCut => {
-                self.address_input.cut_selection();
+                let refresh_search = self.context_menu_kind == FilePickerContextMenuKind::SearchEditor;
+                if let Some(input) = self.context_text_input_mut() {
+                    input.cut_selection();
+                }
+                if refresh_search {
+                    self.restart_search();
+                }
                 self.close_menu();
                 FilePickerAction::None
             }
             FilePickerMenuAction::TextCopy => {
-                self.address_input.copy_selection();
+                if let Some(input) = self.context_text_input_mut() {
+                    input.copy_selection();
+                }
                 self.close_menu();
                 FilePickerAction::None
             }
             FilePickerMenuAction::TextPaste => {
-                self.address_input.paste_clipboard();
+                let refresh_search = self.context_menu_kind == FilePickerContextMenuKind::SearchEditor;
+                if let Some(input) = self.context_text_input_mut() {
+                    input.paste_clipboard();
+                }
+                if refresh_search {
+                    self.restart_search();
+                }
+                self.close_menu();
+                FilePickerAction::None
+            }
+            FilePickerMenuAction::TextDelete => {
+                let refresh_search = self.context_menu_kind == FilePickerContextMenuKind::SearchEditor;
+                if let Some(input) = self.context_text_input_mut() {
+                    input.delete();
+                }
+                if refresh_search {
+                    self.restart_search();
+                }
+                self.close_menu();
+                FilePickerAction::None
+            }
+            FilePickerMenuAction::TextSelectAll => {
+                if let Some(input) = self.context_text_input_mut() {
+                    input.select_all_text();
+                }
+                self.close_menu();
+                FilePickerAction::None
+            }
+            FilePickerMenuAction::TextTitleCase
+            | FilePickerMenuAction::TextUppercase
+            | FilePickerMenuAction::TextLowercase => {
+                let refresh_search = self.context_menu_kind == FilePickerContextMenuKind::SearchEditor;
+                let title_case = self.title_case;
+                if let Some(input) = self.context_text_input_mut() {
+                    match action {
+                        FilePickerMenuAction::TextTitleCase => {
+                            input.transform_selection_or_all(title_case);
+                        }
+                        FilePickerMenuAction::TextUppercase => {
+                            input.transform_selection_or_all(str::to_uppercase);
+                        }
+                        FilePickerMenuAction::TextLowercase => {
+                            input.transform_selection_or_all(str::to_lowercase);
+                        }
+                        _ => unreachable!("text case action match is exhaustive"),
+                    }
+                }
+                if refresh_search {
+                    self.restart_search();
+                }
+                self.close_menu();
+                FilePickerAction::None
+            }
+            FilePickerMenuAction::RenameTitleCase
+            | FilePickerMenuAction::RenameUppercase
+            | FilePickerMenuAction::RenameLowercase => {
+                if let Err(error) = self.apply_path_case_transform(action) {
+                    self.set_error(error);
+                }
                 self.close_menu();
                 FilePickerAction::None
             }
@@ -1097,8 +1412,10 @@ impl FilePickerState {
         self.context_menu_anchor = None;
         self.menu_open = true;
         self.submenu_open = false;
+        self.case_submenu_open = false;
         self.menu_cursor = 0;
         self.submenu_cursor = 0;
+        self.case_submenu_cursor = 0;
         self.previous_focus = self.focus;
         self.focus = FilePickerFocus::Menu;
     }
@@ -1115,6 +1432,25 @@ impl FilePickerState {
                     self.begin_address_edit();
                 }
                 FilePickerContextMenuKind::Address
+            }
+            Some(FilePickerHitAction::CreateNameEditor)
+                if self.focus == FilePickerFocus::CreateName =>
+            {
+                FilePickerContextMenuKind::NameEditor
+            }
+            Some(FilePickerHitAction::SaveNameEditor)
+                if self.focus == FilePickerFocus::SaveName =>
+            {
+                FilePickerContextMenuKind::SaveNameEditor
+            }
+            Some(FilePickerHitAction::SearchInput) => {
+                self.focus = FilePickerFocus::Search;
+                FilePickerContextMenuKind::SearchEditor
+            }
+            Some(FilePickerHitAction::BookmarkNameEditor)
+                if self.focus == FilePickerFocus::BookmarkName =>
+            {
+                FilePickerContextMenuKind::BookmarkNameEditor
             }
             Some(FilePickerHitAction::TreeRow(index))
             | Some(FilePickerHitAction::TreeDisclosure(index)) => {
@@ -1144,8 +1480,10 @@ impl FilePickerState {
         self.context_menu_anchor = Some((column, row));
         self.menu_open = true;
         self.submenu_open = false;
+        self.case_submenu_open = false;
         self.menu_cursor = 0;
         self.submenu_cursor = 0;
+        self.case_submenu_cursor = 0;
         self.focus = FilePickerFocus::Menu;
         FilePickerAction::None
     }
@@ -1157,6 +1495,7 @@ impl FilePickerState {
         }
         self.menu_open = false;
         self.submenu_open = false;
+        self.case_submenu_open = false;
         self.context_menu_anchor = None;
         self.focus = self.previous_focus;
         self.tree_focused = self.focus == FilePickerFocus::Tree;
@@ -1165,6 +1504,7 @@ impl FilePickerState {
     fn close_menu_but_keep_focus(&mut self) {
         self.menu_open = false;
         self.submenu_open = false;
+        self.case_submenu_open = false;
         self.context_menu_anchor = None;
     }
 
@@ -1218,6 +1558,230 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
     use std::fs;
+
+    #[test]
+    fn right_click_name_editor_opens_full_text_menu_without_committing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.begin_create_name_in(FilePickerCreateKind::File, temp.path().to_path_buf());
+        picker.create_name_input.insert_string("Blue Öyster Cult");
+        picker.record_hit_region(Rect::new(4, 4, 30, 1), FilePickerHitAction::CreateNameEditor);
+
+        assert_eq!(
+            picker.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    column: 8,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::default(),
+            ),
+            FilePickerAction::None,
+        );
+        assert_eq!(picker.focus, FilePickerFocus::Menu);
+        assert_eq!(picker.previous_focus, FilePickerFocus::CreateName);
+        assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::NameEditor);
+        assert_eq!(picker.create_name_input.text, "Blue Öyster Cult");
+        assert!(!temp.path().join("Blue Öyster Cult").exists());
+
+        let entries = picker.menu_entries();
+        assert_eq!(
+            entries.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+            vec![
+                "Paste",
+                "Copy",
+                "Cut",
+                "Delete",
+                "Select All",
+                "Fix capitalization ▸",
+            ],
+        );
+        picker.close_menu();
+        assert_eq!(picker.focus, FilePickerFocus::CreateName);
+        assert_eq!(picker.create_name_input.text, "Blue Öyster Cult");
+    }
+
+    #[test]
+    fn editor_case_menu_transforms_selection_or_whole_unicode_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.begin_address_edit();
+        // set_text_and_cursor clears the select-all flag begin_address_edit
+        // set; poking .text directly would leave it latched and turn the
+        // partial-selection transform into a whole-value transform.
+        picker
+            .address_input
+            .set_text_and_cursor("straße and 東京".to_string(), "straße".len());
+        picker.address_input.selection_anchor = Some(0);
+        picker.open_context_menu(Some(FilePickerHitAction::Address), 2, 2);
+        picker.apply_menu_action(FilePickerMenuAction::TextUppercase);
+        assert_eq!(picker.address_input.text, "STRASSE and 東京");
+        assert_eq!(picker.focus, FilePickerFocus::Address);
+
+        picker.address_input.clear_selection();
+        picker.open_context_menu(Some(FilePickerHitAction::Address), 2, 2);
+        picker.apply_menu_action(FilePickerMenuAction::TextLowercase);
+        assert_eq!(picker.address_input.text, "strasse and 東京");
+        assert!(picker.address_input.has_selection(), "whole-value transform remains selected");
+    }
+
+    #[test]
+    fn file_menu_exposes_rename_and_nested_case_submenus() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        fs::write(&file, b"audio").expect("fixture");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        let index = picker
+            .entries
+            .iter()
+            .position(|entry| entry.path == file)
+            .expect("file row");
+        picker.open_context_menu(Some(FilePickerHitAction::FileRow(index)), 3, 3);
+        assert!(picker
+            .menu_entries()
+            .iter()
+            .any(|(_, entry)| matches!(entry, FilePickerMenuEntry::RenameSubmenu)));
+        picker.open_submenu(FilePickerSubmenuKind::Rename);
+        assert!(matches!(
+            picker.submenu_entries().get(1),
+            Some((_, FilePickerSubmenuEntry::CaseSubmenu)),
+        ));
+        picker.open_nested_case_submenu();
+        assert_eq!(
+            picker
+                .nested_case_entries()
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>(),
+            vec!["Title Case", "UPPERCASE", "lowercase"],
+        );
+    }
+
+    #[test]
+    fn alt_o_exposes_sort_submenu_and_header_actions_share_set_sort_semantics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("a.flac"), b"longer").expect("a");
+        fs::write(temp.path().join("b.flac"), b"x").expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT)),
+            FilePickerAction::None,
+        );
+        assert_eq!(picker.focus(), FilePickerFocus::Menu);
+        assert!(picker
+            .menu_entries()
+            .iter()
+            .any(|(_, entry)| matches!(entry, FilePickerMenuEntry::SortSubmenu)));
+
+        picker.close_menu();
+        assert_eq!(
+            picker.apply_hit_action(FilePickerHitAction::SortColumn(FilePickerSortKey::Name)),
+            FilePickerAction::None,
+        );
+        assert_eq!(picker.sort_key(), FilePickerSortKey::Name);
+        assert!(picker.sort_reverse(), "the active Name header toggles descending");
+
+        assert_eq!(
+            picker.apply_hit_action(FilePickerHitAction::SortColumn(FilePickerSortKey::Size)),
+            FilePickerAction::None,
+        );
+        assert_eq!(picker.sort_key(), FilePickerSortKey::Size);
+        assert!(!picker.sort_reverse(), "a different header starts ascending");
+        let names = picker.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["b.flac", "a.flac"]);
+    }
+
+    #[test]
+    fn picker_text_pointer_contract_places_drags_and_double_clicks_unicode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.begin_address_edit();
+        picker.address_input.text = "A Ö 東京 Z".to_string();
+        picker.address_input.select_all_text();
+        let field = Rect::new(10, 4, 20, 1);
+        picker.record_hit_region(field, FilePickerHitAction::Address);
+
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: field.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12), Rect::default()),
+            FilePickerAction::None,
+        );
+        assert_eq!(
+            picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12), Rect::default()),
+            FilePickerAction::None,
+        );
+        assert!(!picker.address_input.has_selection());
+        assert_eq!(picker.address_input.cursor, 2);
+
+        // Double-click detection is target+time; the next phase must not read
+        // as a double-click just because the test runs faster than the window.
+        picker.text_last_click = None;
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10), Rect::default());
+        picker.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 14), Rect::default());
+        picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 14), Rect::default());
+        assert_eq!(
+            picker.address_input.selection_range().map(|range| &picker.address_input.text[range]),
+            Some("A Ö "),
+        );
+
+        // Retire the drag phase's click so the pair below forms the double.
+        picker.text_last_click = None;
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 18), Rect::default());
+        picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 18), Rect::default());
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 18), Rect::default());
+        assert_eq!(picker.address_input.selection_range(), Some(0..picker.address_input.text.len()));
+    }
+
+    #[test]
+    fn picker_search_and_save_name_editors_use_text_context_menu_without_action_buttons() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            save_mode: Some(crate::SaveModeConfig {
+                default_name: "album".to_string(),
+                confirm_overwrite: true,
+                hide_extension: None,
+                style: crate::SaveModeStyle::Inline,
+            }),
+            ..FilePickerConfig::default()
+        });
+        picker.focus = FilePickerFocus::Search;
+        picker.search.input = crate::text_input::TextInputState::new("needle".to_string());
+        picker.open_context_menu(Some(FilePickerHitAction::SearchInput), 1, 1);
+        assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::SearchEditor);
+        assert_eq!(picker.previous_focus, FilePickerFocus::Search);
+        picker.close_menu();
+
+        picker.focus = FilePickerFocus::SaveName;
+        picker.save_name_input = crate::text_input::TextInputState::new("album".to_string());
+        picker.open_context_menu(Some(FilePickerHitAction::SaveNameEditor), 1, 1);
+        assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::SaveNameEditor);
+        assert_eq!(picker.previous_focus, FilePickerFocus::SaveName);
+        picker.close_menu();
+        assert_eq!(picker.save_name_input.text, "album");
+    }
 
     #[test]
     fn terminal_paste_routes_only_to_the_focused_picker_editor() {
@@ -1691,7 +2255,11 @@ mod tests {
         });
         picker.menu_open = true;
         picker.focus = FilePickerFocus::Menu;
-        picker.menu_cursor = 4;
+        picker.menu_cursor = picker
+            .menu_entries()
+            .iter()
+            .position(|(label, _)| *label == "Paste")
+            .expect("toolbar menu exposes Paste");
         let _ = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(picker.last_error(), Some(FilePickerError::ClipboardEmpty)));
     }

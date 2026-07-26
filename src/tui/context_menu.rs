@@ -138,6 +138,17 @@ pub enum ContextAction {
     PathTextCut,
     PathTextCopy,
     PathTextPaste,
+    /// Shared active-editor operations. The concrete `TextInputState` is
+    /// resolved from `AppState::editor_context_target`, so context menus never
+    /// copy or reconstruct editor state.
+    EditorPaste,
+    EditorCopy,
+    EditorCut,
+    EditorDelete,
+    EditorSelectAll,
+    EditorFixCapitalization(crate::convert::renaming::CaseTransform),
+    /// Apply a case-only rename through the existing no-clobber rename plan.
+    RenameFixCapitalization(crate::convert::renaming::CaseTransform),
     /// Refresh the browse listing.
     Refresh,
     /// Open the bulk rename wizard for selected audio files.
@@ -408,9 +419,39 @@ fn build_file_ops_submenu(
         item("Cut", ContextAction::CutSelection),
         item("Copy", ContextAction::CopySelection),
     ];
-    if allow_single_item_actions {
-        children.push(item("Rename", ContextAction::RenameEntry));
-    }
+    children.push(ContextMenuEntry::Submenu {
+        label: "Rename".to_string(),
+        children: vec![
+            item_enabled(
+                "Rename",
+                ContextAction::RenameEntry,
+                allow_single_item_actions,
+            ),
+            ContextMenuEntry::Submenu {
+                label: "Fix capitalization".to_string(),
+                children: vec![
+                    item(
+                        "Title Case",
+                        ContextAction::RenameFixCapitalization(
+                            crate::convert::renaming::CaseTransform::Title,
+                        ),
+                    ),
+                    item(
+                        "UPPERCASE",
+                        ContextAction::RenameFixCapitalization(
+                            crate::convert::renaming::CaseTransform::Upper,
+                        ),
+                    ),
+                    item(
+                        "lowercase",
+                        ContextAction::RenameFixCapitalization(
+                            crate::convert::renaming::CaseTransform::Lower,
+                        ),
+                    ),
+                ],
+            },
+        ],
+    });
     if include_bulk_rename {
         children.push(item("Bulk Rename", ContextAction::BulkRename));
     }
@@ -914,6 +955,44 @@ pub fn build_browse_path_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     ]
 }
 
+/// Build the common context menu for every active text editor. The editor
+/// remains live while this menu is open; actions operate on the exact parked
+/// `TextInputState` and closing the menu restores that state unchanged.
+pub fn build_editor_context_menu(app: &AppState) -> Vec<ContextMenuEntry> {
+    let (has_selection, can_paste) = super::keybindings::editor_context_capabilities(app);
+    vec![
+        item_enabled("Paste", ContextAction::EditorPaste, can_paste),
+        item_enabled("Copy", ContextAction::EditorCopy, has_selection),
+        item_enabled("Cut", ContextAction::EditorCut, has_selection),
+        item("Delete", ContextAction::EditorDelete),
+        item("Select All", ContextAction::EditorSelectAll),
+        separator(),
+        ContextMenuEntry::Submenu {
+            label: "Fix capitalization".to_string(),
+            children: vec![
+                item(
+                    "Title Case",
+                    ContextAction::EditorFixCapitalization(
+                        crate::convert::renaming::CaseTransform::Title,
+                    ),
+                ),
+                item(
+                    "UPPERCASE",
+                    ContextAction::EditorFixCapitalization(
+                        crate::convert::renaming::CaseTransform::Upper,
+                    ),
+                ),
+                item(
+                    "lowercase",
+                    ContextAction::EditorFixCapitalization(
+                        crate::convert::renaming::CaseTransform::Lower,
+                    ),
+                ),
+            ],
+        },
+    ]
+}
+
 /// Build the context menu for a right-click on empty space in the browse list.
 pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     vec![
@@ -1079,7 +1158,8 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         | ContextAction::PasteSelection
         | ContextAction::DuplicateSelection => Some("filesystem clipboard operation"),
         ContextAction::OpenSystemDefault(_) => Some("system-default editing"),
-        ContextAction::BulkRename => Some("bulk rename"),
+        ContextAction::BulkRename
+        | ContextAction::RenameFixCapitalization(_) => Some("rename"),
         ContextAction::Analyze => Some("analysis"),
         ContextAction::SetArchivePassword => Some("archive password editing"),
         ContextAction::Verify
@@ -1362,6 +1442,39 @@ pub fn execute_context_action(
             if let Some(input) = app.browse.path_input.as_mut() {
                 input.paste_clipboard();
             }
+        }
+        ContextAction::EditorPaste => {
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorPaste);
+        }
+        ContextAction::EditorCopy => {
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorCopy);
+        }
+        ContextAction::EditorCut => {
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorCut);
+        }
+        ContextAction::EditorDelete => {
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorDelete);
+        }
+        ContextAction::EditorSelectAll => {
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorSelectAll);
+        }
+        ContextAction::EditorFixCapitalization(transform) => {
+            super::keybindings::execute_editor_context_action(
+                app,
+                ContextAction::EditorFixCapitalization(transform),
+            );
+        }
+        ContextAction::RenameFixCapitalization(transform) => {
+            let paths = app.browse_context_action_paths.clone().or_else(|| {
+                app.browse
+                    .selected_entry()
+                    .map(|entry| vec![entry.path.clone()])
+            });
+            let Some(paths) = paths else {
+                app.set_status("Nothing to rename");
+                return;
+            };
+            super::keybindings::rename_paths_with_case_transform(app, paths, transform, tx);
         }
         ContextAction::RenameEntry => {
             if app.browse.is_in_archive() {

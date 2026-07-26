@@ -168,6 +168,29 @@ pub fn child_directories(dir: &Path, depth: usize, show_hidden: bool) -> Vec<Tre
     children
 }
 
+const MAX_STABLE_DIRECTORY_SCANS: usize = 3;
+
+fn stable_directory_verdict<F, S>(mut read_fingerprint: F, mut scan: S) -> (bool, Option<DirectoryFingerprint>)
+where
+    F: FnMut() -> Option<DirectoryFingerprint>,
+    S: FnMut() -> bool,
+{
+    for _ in 0..MAX_STABLE_DIRECTORY_SCANS {
+        let before = read_fingerprint();
+        let verdict = scan();
+        let after = read_fingerprint();
+        if before == after {
+            return (verdict, after);
+        }
+    }
+
+    // The directory remained unstable across every bounded attempt. Return one
+    // final current observation, but deliberately do not cache it: pairing a
+    // verdict with a fingerprint from a different instant is worse than the
+    // extra scan on the next tree expansion.
+    (scan(), None)
+}
+
 fn has_child_directories(dir: &Path, show_hidden: bool) -> bool {
     let fingerprint = DirectoryFingerprint::read(dir);
     let key = (dir.to_path_buf(), show_hidden);
@@ -186,7 +209,14 @@ fn has_child_directories(dir: &Path, show_hidden: bool) -> bool {
         }
     }
 
-    let verdict = has_child_directories_uncached(dir, show_hidden);
+    let (verdict, stable_fingerprint) = stable_directory_verdict(
+        || DirectoryFingerprint::read(dir),
+        || has_child_directories_uncached(dir, show_hidden),
+    );
+
+    let Some(fingerprint) = stable_fingerprint else {
+        return verdict;
+    };
 
     if let Ok(mut cache) = cache.lock() {
         cache.tick = cache.tick.wrapping_add(1);
@@ -194,14 +224,10 @@ fn has_child_directories(dir: &Path, show_hidden: bool) -> bool {
         if cache.entries.len() >= MAX_HAS_CHILD_CACHE_ENTRIES {
             evict_old_has_child_cache_entries(&mut cache);
         }
-        // `false` is safe to memoize only for this directory identity. Permission
-        // or child changes alter the fingerprint on supported platforms; the
-        // cache is in-memory only, so transient filesystem states cannot poison
-        // persistent Browse behavior.
         cache.entries.insert(
             key,
             HasChildCacheEntry {
-                fingerprint,
+                fingerprint: Some(fingerprint),
                 verdict,
                 last_used: tick,
             },
@@ -443,4 +469,65 @@ mod tests {
             assert!(children.is_empty());
         }
     }
+    #[test]
+    fn cache_pairs_verdict_only_with_post_scan_stable_fingerprint() {
+        let first = DirectoryFingerprint {
+            modified: None,
+            len: 1,
+            readonly: false,
+            #[cfg(unix)]
+            dev: 1,
+            #[cfg(unix)]
+            ino: 1,
+            #[cfg(unix)]
+            ctime_sec: 1,
+            #[cfg(unix)]
+            ctime_nsec: 1,
+        };
+        let second = DirectoryFingerprint { len: 2, ..first };
+        let mut fingerprints = vec![first, second, second, second].into_iter();
+        let mut verdicts = vec![false, true].into_iter();
+
+        let (verdict, fingerprint) = stable_directory_verdict(
+            || fingerprints.next(),
+            || verdicts.next().expect("one scan per attempt"),
+        );
+
+        assert!(verdict);
+        assert_eq!(fingerprint, Some(second));
+    }
+
+    #[test]
+    fn unstable_directory_verdict_is_not_marked_cacheable() {
+        let base = DirectoryFingerprint {
+            modified: None,
+            len: 0,
+            readonly: false,
+            #[cfg(unix)]
+            dev: 1,
+            #[cfg(unix)]
+            ino: 1,
+            #[cfg(unix)]
+            ctime_sec: 1,
+            #[cfg(unix)]
+            ctime_nsec: 1,
+        };
+        let mut tick = 0u64;
+        let mut scans = 0usize;
+        let (verdict, fingerprint) = stable_directory_verdict(
+            || {
+                tick += 1;
+                Some(DirectoryFingerprint { len: tick, ..base })
+            },
+            || {
+                scans += 1;
+                scans % 2 == 0
+            },
+        );
+
+        assert_eq!(scans, MAX_STABLE_DIRECTORY_SCANS + 1);
+        assert_eq!(verdict, scans % 2 == 0);
+        assert_eq!(fingerprint, None);
+    }
+
 }

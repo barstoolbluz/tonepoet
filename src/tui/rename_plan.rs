@@ -177,6 +177,38 @@ pub fn validate_plan(plan: &mut RenamePlan) -> usize {
 
 // ── Execution ───────────────────────────────────────────────────────
 
+/// Return the exact old-to-new mappings whose plan rows completed. This is
+/// deliberately derived from status after execution so skipped/conflicted/
+/// rolled-back rows can never leak into the undo journal.
+pub fn succeeded_mappings(plan: &RenamePlan) -> Vec<(PathBuf, PathBuf)> {
+    plan.ops
+        .iter()
+        .filter(|op| op.status == OpStatus::Succeeded)
+        .map(|op| {
+            (
+                op.source.clone(),
+                plan.base_dir.join(&op.target_relative),
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct RenameExecutionRoot {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    /// Authoritative proof assembled from the pre-operation source manifest
+    /// and the retained-handle-verified post-rename root binding.
+    pub proof: Result<tui_file_picker::FileTaskRootProof, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenameExecutionReport {
+    pub succeeded_count: usize,
+    pub roots: Vec<RenameExecutionRoot>,
+    pub warning: Option<String>,
+}
+
 /// Execute a validated rename plan. Creates target directories, then
 /// moves files one at a time. On the first failure, rolls back ALL
 /// previously-succeeded moves and returns an error.
@@ -187,10 +219,39 @@ pub fn validate_plan(plan: &mut RenamePlan) -> usize {
 /// Returns `Ok(succeeded_count)` on full success, or `Err(message)` on
 /// failure (with rollback already performed).
 pub fn execute_plan(plan: &mut RenamePlan) -> Result<usize, String> {
+    execute_plan_with_proofs(plan).map(|report| report.succeeded_count)
+}
+
+/// Execute a rename transaction and return operation-time authority for every
+/// committed mapping. Recursive source manifests are captured before any
+/// namespace mutation; after the shared staging transaction commits, retained
+/// source handles bind each original object to its final destination. No
+/// published path is recursively recaptured after completion.
+pub fn execute_plan_with_proofs(
+    plan: &mut RenamePlan,
+) -> Result<RenameExecutionReport, String> {
+    execute_plan_with_proofs_internal(plan, None)
+}
+
+/// Execute a replay transaction only if each pre-mutation source manifest
+/// matches the operation-time authority retained by the undo journal. The
+/// comparison uses the same manifest pass required to produce the next undo
+/// proof; it does not re-open or re-hash the tree after publication.
+pub fn execute_plan_with_proofs_and_expected_sources(
+    plan: &mut RenamePlan,
+    expected_sources: &[tui_file_picker::FileTaskRootProof],
+) -> Result<RenameExecutionReport, String> {
+    execute_plan_with_proofs_internal(plan, Some(expected_sources))
+}
+
+fn execute_plan_with_proofs_internal(
+    plan: &mut RenamePlan,
+    expected_sources: Option<&[tui_file_picker::FileTaskRootProof]>,
+) -> Result<RenameExecutionReport, String> {
     assert_eq!(
         plan.conflict_count(),
         0,
-        "execute_plan called with unresolved conflicts"
+        "execute_plan_with_proofs called with unresolved conflicts"
     );
 
     let pending_indices = plan
@@ -200,7 +261,79 @@ pub fn execute_plan(plan: &mut RenamePlan) -> Result<usize, String> {
         .filter_map(|(index, op)| (op.status == OpStatus::Pending).then_some(index))
         .collect::<Vec<_>>();
     if pending_indices.is_empty() {
-        return Ok(0);
+        return Ok(RenameExecutionReport {
+            succeeded_count: 0,
+            roots: Vec::new(),
+            warning: None,
+        });
+    }
+    if let Some(expected) = expected_sources {
+        if expected.len() != pending_indices.len() {
+            return Err(format!(
+                "rename replay supplied {} source proofs for {} pending mappings",
+                expected.len(),
+                pending_indices.len(),
+            ));
+        }
+    }
+
+    struct PreimageAuthority {
+        index: usize,
+        source: PathBuf,
+        destination: PathBuf,
+        manifest: tui_file_picker::SourceManifest,
+        rename_proof: tui_file_picker::RenameSourceProof,
+        source_capabilities: tui_file_picker::FilesystemCapabilities,
+    }
+
+    let mut authorities = Vec::with_capacity(pending_indices.len());
+    for (proof_index, &index) in pending_indices.iter().enumerate() {
+        let source = plan.ops[index].source.clone();
+        let destination = plan.base_dir.join(&plan.ops[index].target_relative);
+        let manifest = tui_file_picker::capture_manifest(&source).map_err(|error| {
+            format!(
+                "could not capture authoritative rename preimage for {}: {error}",
+                source.display(),
+            )
+        })?;
+        let source_capabilities = tui_file_picker::filesystem_capabilities(&source);
+        if let Some(expected) = expected_sources {
+            expected[proof_index]
+                .destination_manifest
+                .verify_captured_replay_source(
+                    &expected[proof_index].source_manifest,
+                    &manifest,
+                    source_capabilities,
+                )
+                .map_err(|error| {
+                    format!(
+                        "rename replay source {} no longer matches operation-time authority: {error}",
+                        source.display(),
+                    )
+                })?;
+        }
+        let rename_proof = tui_file_picker::RenameSourceProof::capture(&source).map_err(|error| {
+            format!(
+                "could not retain rename source authority for {}: {error}",
+                source.display(),
+            )
+        })?;
+        rename_proof
+            .verify_manifest_root(&manifest, source_capabilities)
+            .map_err(|error| {
+                format!(
+                    "rename source {} changed while authority was established: {error}",
+                    source.display(),
+                )
+            })?;
+        authorities.push(PreimageAuthority {
+            index,
+            source: source.clone(),
+            destination,
+            manifest,
+            rename_proof,
+            source_capabilities,
+        });
     }
 
     let transaction = plan_rename_transaction(
@@ -211,28 +344,71 @@ pub fn execute_plan(plan: &mut RenamePlan) -> Result<usize, String> {
         }),
     )?;
 
-    let workspace = unique_rename_workspace(&plan.base_dir)?;
-    std::fs::create_dir(&workspace).map_err(|error| {
-        format!(
-            "failed to create rename transaction workspace {}: {error}",
-            workspace.display()
-        )
-    })?;
-
+    let workspace = create_unique_rename_workspace(&plan.base_dir)?;
     let result = execute_shared_transaction(&transaction, &workspace);
     let cleanup_result = std::fs::remove_dir(&workspace);
-    match (result, cleanup_result) {
-        (Ok(count), Ok(())) => {
+    match result {
+        Ok(count) => {
             for &index in &pending_indices {
                 plan.ops[index].status = OpStatus::Succeeded;
             }
-            Ok(count)
+            let cleanup_warning = cleanup_result.err().map(|error| {
+                format!(
+                    "rename completed but empty transaction workspace cleanup failed at {}: {error}",
+                    workspace.display(),
+                )
+            });
+            if let Some(warning) = cleanup_warning.as_deref() {
+                log::warn!("{warning}");
+            }
+
+            let roots = authorities
+                .into_iter()
+                .map(|authority| {
+                    let destination_capabilities =
+                        tui_file_picker::filesystem_capabilities(&authority.destination);
+                    let verification = tui_file_picker::verify_renamed_destination(
+                        &authority.destination,
+                        &authority.rename_proof,
+                        authority.source_capabilities,
+                        destination_capabilities,
+                    );
+                    let proof = match verification {
+                        Ok(verification) => authority
+                            .manifest
+                            .destination_identity_after_root_rename(
+                                verification.destination_snapshot,
+                            )
+                            .map(|destination_manifest| {
+                                tui_file_picker::FileTaskRootProof {
+                                    source_manifest: authority.manifest,
+                                    destination_manifest,
+                                }
+                            }),
+                        Err(error) => Err(error),
+                    }
+                    .map_err(|error| {
+                        format!(
+                            "rename committed from {} to {}, but operation-time undo authority could not be established: {error}",
+                            authority.source.display(),
+                            authority.destination.display(),
+                        )
+                    });
+                    debug_assert_eq!(plan.ops[authority.index].status, OpStatus::Succeeded);
+                    RenameExecutionRoot {
+                        source: authority.source,
+                        destination: authority.destination,
+                        proof,
+                    }
+                })
+                .collect();
+            Ok(RenameExecutionReport {
+                succeeded_count: count,
+                roots,
+                warning: cleanup_warning,
+            })
         }
-        (Ok(_), Err(error)) => Err(format!(
-            "rename completed but transaction workspace cleanup failed at {}: {error}",
-            workspace.display()
-        )),
-        (Err(error), _) => {
+        Err(error) => {
             for &index in &pending_indices {
                 if plan.ops[index].status == OpStatus::Pending {
                     plan.ops[index].status = OpStatus::Failed(error.clone());
@@ -243,8 +419,10 @@ pub fn execute_plan(plan: &mut RenamePlan) -> Result<usize, String> {
     }
 }
 
-fn unique_rename_workspace(base_dir: &Path) -> Result<PathBuf, String> {
+fn create_unique_rename_workspace(base_dir: &Path) -> Result<PathBuf, String> {
+    use std::io;
     use std::sync::atomic::{AtomicU64, Ordering};
+
     static NEXT: AtomicU64 = AtomicU64::new(0);
     for _ in 0..1024 {
         let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -252,8 +430,24 @@ fn unique_rename_workspace(base_dir: &Path) -> Result<PathBuf, String> {
             ".tonepoet-browse-rename-{}-{sequence}",
             std::process::id()
         ));
-        if !candidate.exists() {
-            return Ok(candidate);
+        #[cfg(unix)]
+        let create = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&candidate)
+        };
+        #[cfg(not(unix))]
+        let create = std::fs::create_dir(&candidate);
+        match create {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create rename transaction workspace {}: {error}",
+                    candidate.display(),
+                ))
+            }
         }
     }
     Err(format!(
@@ -284,13 +478,22 @@ fn execute_shared_transaction(
                 &staging_paths,
                 &staged,
             );
-            if !source.exists() {
-                return Err(format!(
-                    "rename source changed after validation: {}",
-                    source.display()
-                ));
+            match std::fs::symlink_metadata(&source) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!(
+                        "rename source changed after validation: {}",
+                        source.display()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "inspect rename source after validation {}: {error}",
+                        source.display()
+                    ));
+                }
             }
-            std::fs::rename(&source, &staging_paths[index]).map_err(|error| {
+            tui_file_picker::rename_path_no_replace(&source, &staging_paths[index]).map_err(|error| {
                 format!(
                     "rename staging failed: {} -> {}: {error}",
                     source.display(),
@@ -302,12 +505,6 @@ fn execute_shared_transaction(
 
         for index in transaction.installation_order() {
             let entry = &transaction.entries[index];
-            if entry.destination.exists() {
-                return Err(format!(
-                    "rename destination appeared after staging: {}",
-                    entry.destination.display()
-                ));
-            }
             if let Some(parent) = entry.destination.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| {
                     format!(
@@ -316,7 +513,7 @@ fn execute_shared_transaction(
                     )
                 })?;
             }
-            std::fs::rename(&staging_paths[index], &entry.destination).map_err(|error| {
+            tui_file_picker::rename_path_no_replace(&staging_paths[index], &entry.destination).map_err(|error| {
                 format!(
                     "rename publish failed: {} -> {}: {error}",
                     staging_paths[index].display(),
@@ -334,19 +531,37 @@ fn execute_shared_transaction(
             let mut rollback_errors = Vec::new();
             for &index in installed.iter().rev() {
                 let entry = &transaction.entries[index];
-                if entry.destination.exists() {
-                    if let Err(error) = std::fs::rename(&entry.destination, &staging_paths[index]) {
-                        rollback_errors.push(format!(
-                            "{} -> {}: {error}",
-                            entry.destination.display(),
-                            staging_paths[index].display()
-                        ));
+                match std::fs::symlink_metadata(&entry.destination) {
+                    Ok(_) => {
+                        if let Err(error) = tui_file_picker::rename_path_no_replace(
+                            &entry.destination,
+                            &staging_paths[index],
+                        ) {
+                            rollback_errors.push(format!(
+                                "{} -> {}: {error}",
+                                entry.destination.display(),
+                                staging_paths[index].display()
+                            ));
+                        }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => rollback_errors.push(format!(
+                        "inspect rollback destination {}: {error}",
+                        entry.destination.display(),
+                    )),
                 }
             }
             for &index in staged.iter().rev() {
-                if !staging_paths[index].exists() {
-                    continue;
+                match std::fs::symlink_metadata(&staging_paths[index]) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        rollback_errors.push(format!(
+                            "inspect staged rollback object {}: {error}",
+                            staging_paths[index].display(),
+                        ));
+                        continue;
+                    }
                 }
                 let restore_target = effective_restore_target(
                     index,
@@ -363,14 +578,10 @@ fn execute_shared_transaction(
                         continue;
                     }
                 }
-                if restore_target.exists() {
-                    rollback_errors.push(format!(
-                        "rollback target unexpectedly exists: {}",
-                        restore_target.display()
-                    ));
-                    continue;
-                }
-                if let Err(error) = std::fs::rename(&staging_paths[index], &restore_target) {
+                if let Err(error) = tui_file_picker::rename_path_no_replace(
+                    &staging_paths[index],
+                    &restore_target,
+                ) {
                     rollback_errors.push(format!(
                         "{} -> {}: {error}",
                         staging_paths[index].display(),
@@ -616,6 +827,38 @@ mod tests {
             // a.flac should be back at its original location (rolled back).
             assert!(a.exists(), "a.flac should have been rolled back");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_authority_rejects_changed_source_before_staging() {
+        let dir = tmp_dir();
+        let source = dir.join("source.flac");
+        let destination = dir.join("destination.flac");
+        fs::write(&source, b"authorized bytes").expect("source");
+        let source_manifest = tui_file_picker::capture_manifest(&source)
+            .expect("capture retained source");
+        let expected = tui_file_picker::FileTaskRootProof {
+            destination_manifest: source_manifest.destination_identity_for_same_tree(),
+            source_manifest,
+        };
+        fs::write(&source, b"replacement bytes").expect("replace source");
+
+        let mut plan = RenamePlan::new(
+            dir.clone(),
+            vec![(source.clone(), "destination.flac".to_string())],
+        );
+        assert_eq!(validate_plan(&mut plan), 0);
+        let error = execute_plan_with_proofs_and_expected_sources(
+            &mut plan,
+            &[expected],
+        )
+        .expect_err("changed replay source must be refused");
+
+        assert!(error.contains("operation-time authority"));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&source).expect("source retained"), b"replacement bytes");
 
         let _ = fs::remove_dir_all(&dir);
     }

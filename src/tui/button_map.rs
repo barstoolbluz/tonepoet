@@ -148,6 +148,8 @@ pub enum TuiButton {
     // Overlay buttons
     OverlayConfirm,
     OverlayCancel,
+    /// Active single-line input in FileInput, CommandInput, or TextEdit.
+    OverlayTextInput,
 
     /// MetadataEditor presentation-tab selector. Argument is the
     /// 0-based index into `MetadataEditorState.presentation_tabs`.
@@ -161,6 +163,10 @@ pub enum TuiButton {
     /// 0-based index into `MetadataEditorState.presentation_tabs`.
     MetadataPresentationSelectorRow(usize),
 
+    /// Active MetadataEditor inline/add/detail input field.
+    MetadataEditorInput,
+    /// Active GNUDB/CUE-review inline input field.
+    GnudbEditorInput,
     /// MetadataEditor per-row revert/use-MB pill. Argument is the
     /// 0-based index into `MetadataEditorState.entries`.
     MetadataEntryRevert(usize),
@@ -285,7 +291,9 @@ pub enum TuiButton {
     BrowseInfoAudioStreams,
     // Browse list: "search" label in border (click → toggle search panel).
     BrowseSearchToggle,
-    // Browse search panel: toggle pills.
+    // Browse search panel: input + toggle pills.
+    BrowseSearchInput,
+    BrowseFilterInput,
     BrowseSearchRecursive,
     BrowseSearchMode,
     BrowseSearchSort,
@@ -328,12 +336,16 @@ pub enum TuiButton {
     TemplateLoadFolderButton,
     TemplateLoadFilenameButton,
     // Template builder overlay: clickable elements.
+    TemplateBuilderInput,
     TemplateBuilderToken(usize),
     TemplateBuilderSavedItem(usize),
     TemplateBuilderApply,
     TemplateBuilderSave,
     TemplateBuilderClear,
     TemplateBuilderDelete,
+
+    /// Bulk rename template input.
+    BulkRenameTemplateInput,
 
     // Template picker overlay: clickable elements.
     TemplatePickerRow(usize),
@@ -392,6 +404,9 @@ impl TuiButton {
             | Self::FileTaskMessages
             | Self::OverlayConfirm
             | Self::OverlayCancel
+            | Self::OverlayTextInput
+            | Self::MetadataEditorInput
+            | Self::GnudbEditorInput
             | Self::MetadataEditorTab(_)
             | Self::MetadataEditorContentTab(_)
             | Self::MetadataPresentationSelectorToggle
@@ -448,7 +463,9 @@ impl TuiButton {
             | Self::ActionsConfigCancel
             | Self::ActionsConfigPreview
             | Self::ActionsConfigModal
+            | Self::TemplateBuilderInput
             | Self::TemplateBuilderToken(_)
+            | Self::BulkRenameTemplateInput
             | Self::TemplateBuilderSavedItem(_)
             | Self::TemplateBuilderApply
             | Self::TemplateBuilderSave
@@ -617,6 +634,8 @@ impl TuiButton {
             | Self::BrowseInfoEditTags
             | Self::BrowseInfoAudioStreams
             | Self::BrowseSearchToggle
+            | Self::BrowseSearchInput
+            | Self::BrowseFilterInput
             | Self::BrowseSearchRecursive
             | Self::BrowseSearchMode
             | Self::BrowseSearchSort

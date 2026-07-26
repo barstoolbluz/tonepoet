@@ -9754,13 +9754,40 @@ pub struct BrowseInlineEditState {
     pub input: crate::tui::text_input::TextInputState,
 }
 
-/// Browse text field that currently owns a left-button drag selection.
+/// Text editor surface targeted by the shared mouse/context-menu contract.
+///
+/// The target is semantic rather than coordinate-based: renderers register a
+/// `TuiButton`, the dispatcher resolves that button to one of these variants,
+/// and every operation then reaches the authoritative `TextInputState`. This
+/// keeps selection, clipboard, case transforms, and drag behavior identical
+/// across base-screen and overlay editors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrowseTextMouseTarget {
-    FileInlineEdit,
-    TreeInlineEdit,
-    PathInput,
+pub enum EditorTextTarget {
+    BrowseFileInlineEdit,
+    BrowseTreeInlineEdit,
+    BrowsePath,
+    BrowseSearch,
+    BrowseFilter,
+    ConvertMetadata,
+    ConvertOutputOptions,
+    MetadataInline,
+    MetadataAddKey,
+    MetadataDetail,
+    MetadataAutoNumberPrefix,
+    GnudbInline,
+    ThemeHex,
+    ThemeSwatchName,
+    ThemeGalleryFilter,
+    ThemeFilePath,
+    BulkRenameTemplate,
+    TemplateBuilder,
+    OverlayFileInput,
+    OverlayCommandInput,
+    OverlayTextEdit,
 }
+
+/// Text field that currently owns a left-button drag selection.
+pub type BrowseTextMouseTarget = EditorTextTarget;
 
 /// Keyboard focus inside the Browse info pane.
 ///
@@ -10133,6 +10160,10 @@ pub enum ConfirmAction {
     },
     /// Overwrite the currently active preset after user confirmation.
     SavePresetOverwrite { name: String, path: PathBuf },
+    /// Confirm removal of artifacts created by the most recent copy operation.
+    /// The entry id prevents a stale confirmation from acting on a newer top
+    /// journal entry.
+    UndoCopy { entry_id: u64 },
     /// Permanently delete the given filesystem paths after explicit confirmation.
     DeleteSelection(Vec<PathBuf>),
     /// Apply AccurateRip offset correction to a set of tracks.
@@ -10323,6 +10354,141 @@ pub struct PendingCtdbRepair {
     pub single_image: Option<Box<crate::tui::cue_parser::SingleImageInfo>>,
 }
 
+// ── Reversible Browse file operations ───────────────────────────────
+
+/// Bounded in-session undo depth. Entries retain whole-tree manifests, so an
+/// intentionally modest cap prevents a long session from retaining unbounded
+/// metadata while still covering normal interactive use.
+pub const FILE_OPERATION_UNDO_LIMIT: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOperationUndoKind {
+    Copy,
+    Move,
+    Rename,
+}
+
+impl FileOperationUndoKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Move => "move",
+            Self::Rename => "rename",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileOperationUndoMapping {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    /// Authoritative proof for the object currently at `source`, when one is
+    /// expected. For copy entries this is retained from the worker's copy-time
+    /// source manifest; replayed move/rename entries refresh it after commit.
+    pub source_proof: Option<tui_file_picker::FileTaskRootProof>,
+    /// Authoritative proof for the object currently at `destination`, when one
+    /// is expected. Initial copy/move entries receive this directly from the
+    /// worker completion report, never from a UI-thread recapture.
+    pub destination_proof: Option<tui_file_picker::FileTaskRootProof>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileOperationUndoEntry {
+    pub id: u64,
+    pub kind: FileOperationUndoKind,
+    /// Transaction root used by the authoritative rename planner. Present only
+    /// for `Rename` entries so undo/redo can replay case-only names, swaps,
+    /// cycles, and nested target paths through the same staged transaction.
+    pub rename_base_dir: Option<PathBuf>,
+    pub mappings: Vec<FileOperationUndoMapping>,
+}
+
+#[derive(Debug, Default)]
+pub struct FileOperationUndoJournal {
+    undo: std::collections::VecDeque<FileOperationUndoEntry>,
+    redo: std::collections::VecDeque<FileOperationUndoEntry>,
+    recorded_task_sessions: std::collections::VecDeque<u64>,
+    next_id: u64,
+}
+
+impl FileOperationUndoJournal {
+    pub fn allocate_id(&mut self) -> u64 {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.next_id
+    }
+
+    pub fn record(&mut self, entry: FileOperationUndoEntry) {
+        self.redo.clear();
+        self.undo.push_back(entry);
+        while self.undo.len() > FILE_OPERATION_UNDO_LIMIT {
+            self.undo.pop_front();
+        }
+    }
+
+    pub fn has_recorded_task_session(&self, session_id: u64) -> bool {
+        self.recorded_task_sessions.contains(&session_id)
+    }
+
+    pub fn record_task_once(&mut self, session_id: u64, entry: FileOperationUndoEntry) -> bool {
+        if self.recorded_task_sessions.contains(&session_id) {
+            return false;
+        }
+        self.recorded_task_sessions.push_back(session_id);
+        while self.recorded_task_sessions.len() > FILE_OPERATION_UNDO_LIMIT * 2 {
+            self.recorded_task_sessions.pop_front();
+        }
+        self.record(entry);
+        true
+    }
+
+    pub fn undo_entry(&self) -> Option<&FileOperationUndoEntry> {
+        self.undo.back()
+    }
+
+    pub fn redo_entry(&self) -> Option<&FileOperationUndoEntry> {
+        self.redo.back()
+    }
+
+    pub fn take_undo(&mut self, expected_id: u64) -> Option<FileOperationUndoEntry> {
+        (self.undo.back().is_some_and(|entry| entry.id == expected_id))
+            .then(|| self.undo.pop_back())
+            .flatten()
+    }
+
+    pub fn take_redo(&mut self, expected_id: u64) -> Option<FileOperationUndoEntry> {
+        (self.redo.back().is_some_and(|entry| entry.id == expected_id))
+            .then(|| self.redo.pop_back())
+            .flatten()
+    }
+
+    pub fn restore_undo(&mut self, entry: FileOperationUndoEntry) {
+        self.undo.push_back(entry);
+    }
+
+    pub fn restore_redo(&mut self, entry: FileOperationUndoEntry) {
+        self.redo.push_back(entry);
+    }
+
+    pub fn finish_undo(&mut self, entry: FileOperationUndoEntry) {
+        self.redo.push_back(entry);
+        while self.redo.len() > FILE_OPERATION_UNDO_LIMIT {
+            self.redo.pop_front();
+        }
+    }
+
+    pub fn finish_redo(&mut self, entry: FileOperationUndoEntry) {
+        self.undo.push_back(entry);
+        while self.undo.len() > FILE_OPERATION_UNDO_LIMIT {
+            self.undo.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn depths(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
+    }
+}
+
 // ── Main application state ───────────────────────────────────────────
 
 /// Main application state
@@ -10410,9 +10576,21 @@ pub struct AppState {
     // Overlays
     pub active_overlay: ActiveOverlay,
 
+    /// Overlay temporarily replaced by a text-editor context menu. Unlike the
+    /// older feature-specific parking slots, this owns the complete overlay so
+    /// right-click cannot commit, cancel, or reconstruct an edit session.
+    pub pending_editor_context_overlay: Option<Box<ActiveOverlay>>,
+
+    /// Authoritative text field under an open editor context menu.
+    pub editor_context_target: Option<EditorTextTarget>,
+
     /// Most recent terminal file-task state, retained after its live overlay is
     /// dismissed so full warnings/failures remain inspectable via `:messages`.
     pub last_file_task_progress: Option<(u64, tui_file_picker::FileTaskProgressState)>,
+
+    /// Bounded, in-session undo/redo journal for completed copy, move, and
+    /// rename operations. Delete operations are intentionally never recorded.
+    pub file_operation_undo: FileOperationUndoJournal,
 
     /// Test-only capture seam for proving that Browse activation selected the
     /// semantic View flow without launching an external pager.
@@ -10602,6 +10780,10 @@ pub struct AppState {
     /// Mouse-selection ownership for Browse text fields. This prevents a drag
     /// inside an editor from leaking through to list range selection.
     pub browse_text_mouse_target: Option<BrowseTextMouseTarget>,
+    /// Sequential inline rename (Tab/Shift+Tab) continuation parked while the
+    /// committed rename executes on its worker. `complete_rename_plan` binds it
+    /// to the post-commit refresh scan; `(directory, next target path)`.
+    pub pending_inline_rename_resume: Option<(std::path::PathBuf, std::path::PathBuf)>,
 
     /// Keyboard focus in the Browse info pane. This is deliberately separate
     /// from `browse_inline_edit`: focus may sit on a metadata row before the
@@ -11298,7 +11480,10 @@ impl AppState {
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
             active_overlay,
+            pending_editor_context_overlay: None,
+            editor_context_target: None,
             last_file_task_progress: None,
+            file_operation_undo: FileOperationUndoJournal::default(),
             #[cfg(test)]
             test_view_file_dispatches: None,
             file_task_verbose_degrade_notices: false,
@@ -11342,6 +11527,7 @@ impl AppState {
             pending_browse_rename: None,
             browse_inline_edit: None,
             browse_text_mouse_target: None,
+            pending_inline_rename_resume: None,
             browse_info_focus: None,
             recent,
             bookmarks,

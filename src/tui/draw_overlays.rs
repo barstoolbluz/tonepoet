@@ -15,6 +15,38 @@ use super::app::{
 use super::button_map::TuiButton;
 use crate::convert::ConversionStatus;
 
+
+fn template_builder_input_hit_rect(
+    area: Rect,
+    state: &super::app::TemplateBuilderState,
+) -> Option<Rect> {
+    let width = (area.width.saturating_mul(80) / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let categories = state.token_categories();
+    let saved_visible = state.saved_templates.len().min(4).max(1);
+    let category_rows: u16 = categories.iter().map(|_| 2).sum();
+    let content_height =
+        1 + 2 + 1 + 1 + saved_visible as u16 + 1 + category_rows + 2 + 1 + 1;
+    let height = (content_height + 2).min(area.height.saturating_sub(2));
+    if width < 60 || height < 12 {
+        return None;
+    }
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    // `draw_template_builder` lays out the editable template directly under
+    // the popup title: one label row followed by one single-line field. Keep
+    // the hit region on that field only. Registering the whole popup as an
+    // editor (the earlier fallback) made clicks on saved templates, token
+    // whitespace, and footer gaps reposition the text cursor.
+    Some(Rect::new(
+        x.saturating_add(2),
+        y.saturating_add(2),
+        width.saturating_sub(4),
+        1,
+    ))
+}
+
 /// Render a pill-style footer button: ` label ` with colored background.
 /// Public alias for use from other modules (help.rs, etc.).
 pub fn footer_pill_pub(label: &str, bg: Color, theme: super::theme::Theme) -> Span<'static> {
@@ -347,11 +379,26 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         return;
     }
 
-    // Editor-owned child overlays must preserve visual context.  Draw the
-    // parked editor first, then dim its cells before rendering the foreground
-    // menu/preview.  Taking and restoring the Box avoids overlapping mutable
-    // borrows of AppState's renderer-owned fields.
+    // Editor-owned child overlays must preserve visual context. Draw the
+    // exact parked editor first, then render the context menu over it. The
+    // temporary swap avoids cloning mutable editor state and also refreshes the
+    // authoritative input hit region behind the menu.
     let context_menu_active = matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. });
+    if context_menu_active && app.pending_editor_context_overlay.is_some() {
+        let menu = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let parked = app
+            .pending_editor_context_overlay
+            .take()
+            .expect("checked parked editor context overlay");
+        app.active_overlay = *parked;
+        draw_overlay(f, app, theme);
+        let rendered_parked = std::mem::replace(&mut app.active_overlay, menu);
+        app.pending_editor_context_overlay = Some(Box::new(rendered_parked));
+    }
+
+    // Other editor-owned child overlays use their established feature-specific
+    // parking slots. Taking and restoring the Box avoids overlapping mutable
+    // borrows of AppState's renderer-owned fields.
     if context_menu_active && app.pending_mb_select.is_some() {
         if let Some(parked) = app.pending_mb_select.take() {
             draw_mb_select(f, &parked, &mut app.button_map, theme);
@@ -442,7 +489,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         }
         ActiveOverlay::FileInput { ref input } => {
             let input = input.clone();
-            draw_file_input(f, &input, theme);
+            draw_file_input(f, &input, &mut app.button_map, theme);
         }
         ActiveOverlay::CommandInput {
             ref input,
@@ -450,7 +497,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         } => {
             let input = input.clone();
             let completion = completion.clone();
-            draw_command_input(f, &input, completion.as_ref(), theme);
+            draw_command_input(f, &input, completion.as_ref(), &mut app.button_map, theme);
         }
         ActiveOverlay::TextEdit {
             ref input,
@@ -459,7 +506,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         } => {
             let input = input.clone();
             let label = label.clone();
-            draw_text_edit(f, &label, &input, theme);
+            draw_text_edit(f, &label, &input, &mut app.button_map, theme);
         }
         ActiveOverlay::BatchList { scroll } => {
             draw_batch_list(f, app, scroll, theme);
@@ -469,7 +516,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         }
         ActiveOverlay::BulkRename(ref state) => {
             let state = state.clone();
-            draw_bulk_rename(f, &state, theme);
+            draw_bulk_rename(f, &state, &mut app.button_map, theme);
         }
         ActiveOverlay::ConversionActionsWizard(ref state) => {
             super::conversion_actions_ui::draw_wizard(f, state, &mut app.button_map, theme);
@@ -520,7 +567,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             draw_gnudb_select(f, matches, selected, scroll, theme);
         }
         ActiveOverlay::GnudbReview(ref state) => {
-            draw_gnudb_review(f, state, theme);
+            draw_gnudb_review(f, state, &mut app.button_map, theme);
         }
         ActiveOverlay::AccurateRipVerify(ref state) => {
             draw_accuraterip_verify(f, state, theme);
@@ -532,6 +579,15 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             draw_ar_batch_report(f, result, scroll, theme);
         }
         ActiveOverlay::TemplateBuilder(ref state) => {
+            // The template renderer lives outside the round-4 source bundle,
+            // but its layout contract is mirrored by the existing mouse handler
+            // below. Register only the actual editable line with the shared
+            // text dispatcher; the renderer then records token, saved-row, and
+            // footer regions normally.
+            if let Some(rect) = template_builder_input_hit_rect(f.size(), state) {
+                app.button_map
+                    .record_button(TuiButton::TemplateBuilderInput, rect);
+            }
             super::template_builder::draw_template_builder(f, state, &mut app.button_map, theme);
         }
         ActiveOverlay::TemplatePicker {
@@ -1485,7 +1541,12 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: s
 }
 
 /// Draw file input overlay for adding files
-fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState, theme: super::theme::Theme) {
+fn draw_file_input(
+    f: &mut Frame,
+    input: &super::text_input::TextInputState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
     let area = f.size();
     let popup = centered_rect(60, 7, area);
 
@@ -1515,6 +1576,10 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState, the
         super::inline_edit::render_text_input_value(input, visible_width, true, theme),
     ));
     f.render_widget(input_widget, chunks[1]);
+    button_map.record_button(
+        super::button_map::TuiButton::OverlayTextInput,
+        chunks[1],
+    );
 
     f.set_cursor(
         chunks[1].x + super::inline_edit::inline_cursor_col(input, visible_width),
@@ -1531,7 +1596,13 @@ fn draw_file_input(f: &mut Frame, input: &super::text_input::TextInputState, the
 }
 
 /// Draw a generic text edit overlay (for editing a single field)
-fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInputState, theme: super::theme::Theme) {
+fn draw_text_edit(
+    f: &mut Frame,
+    label: &str,
+    input: &super::text_input::TextInputState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
     let area = f.size();
     // Dynamic popup width: 80 if terminal allows it, otherwise shrink to fit.
     // Reserve 4 cols of margin (2 each side) when room allows.
@@ -1563,6 +1634,10 @@ fn draw_text_edit(f: &mut Frame, label: &str, input: &super::text_input::TextInp
         super::inline_edit::render_text_input_value(input, visible_width, true, theme),
     ));
     f.render_widget(input_widget, chunks[1]);
+    button_map.record_button(
+        super::button_map::TuiButton::OverlayTextInput,
+        chunks[1],
+    );
 
     f.set_cursor(
         chunks[1].x + super::inline_edit::inline_cursor_col(input, visible_width),
@@ -3335,6 +3410,7 @@ fn draw_command_input(
     f: &mut Frame,
     input: &super::text_input::TextInputState,
     completion: Option<&super::app::CompletionState>,
+    button_map: &mut super::button_map::ButtonRenderMap,
     theme: super::theme::Theme,
 ) {
     let area = f.size();
@@ -3396,6 +3472,11 @@ fn draw_command_input(
         f.render_widget(hint, hint_area);
     }
 
+    button_map.record_button(
+        super::button_map::TuiButton::OverlayTextInput,
+        Rect::new(cmd_area.x.saturating_add(1), cmd_area.y, cmd_area.width.saturating_sub(1), 1),
+    );
+
     // Position cursor after the ':'
     f.set_cursor(
         cmd_area.x + 1 + super::inline_edit::inline_cursor_col(input, visible_width),
@@ -3404,7 +3485,12 @@ fn draw_command_input(
 }
 
 /// Draw the bulk rename wizard overlay.
-fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState, theme: super::theme::Theme) {
+fn draw_bulk_rename(
+    f: &mut Frame,
+    state: &BulkRenameState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
     use super::rename_plan::OpStatus;
 
     let area = f.size();
@@ -3467,6 +3553,15 @@ fn draw_bulk_rename(f: &mut Frame, state: &BulkRenameState, theme: super::theme:
         theme,
     ));
     f.render_widget(Paragraph::new(Line::from(template_spans)), chunks[0]);
+    button_map.record_button(
+        super::button_map::TuiButton::BulkRenameTemplateInput,
+        Rect::new(
+            chunks[0].x.saturating_add(10),
+            chunks[0].y,
+            chunks[0].width.saturating_sub(10),
+            1,
+        ),
+    );
 
     if template_focused {
         f.set_cursor(
@@ -4887,6 +4982,19 @@ fn draw_metadata_editor(
                             ]));
                         }
                     }
+                    let visible_row = i.saturating_sub(scroll);
+                    if i >= scroll && visible_row < content_h {
+                        button_map.record_button(
+                            super::button_map::TuiButton::MetadataEditorInput,
+                            Rect::new(
+                                content_area.x.saturating_add(key_chars as u16),
+                                content_area.y.saturating_add(visible_row as u16),
+                                val_max as u16,
+                                (visible_end - drop_scroll)
+                                    .min(content_h.saturating_sub(visible_row)) as u16,
+                            ),
+                        );
+                    }
                     continue;
                 }
 
@@ -4902,6 +5010,17 @@ fn draw_metadata_editor(
                     val_max,
                     theme,
                 ));
+                if i >= scroll && i < scroll + content_h {
+                    button_map.record_button(
+                        super::button_map::TuiButton::MetadataEditorInput,
+                        Rect::new(
+                            content_area.x.saturating_add(key_chars as u16),
+                            content_area.y.saturating_add((i - scroll) as u16),
+                            val_max as u16,
+                            1,
+                        ),
+                    );
+                }
                 continue;
             }
             entry.value.replace('\n', "↵").replace('\r', "")
@@ -5045,6 +5164,17 @@ fn draw_metadata_editor(
                 inner_w.saturating_sub(4),
                 theme,
             ));
+            if add_row >= scroll && add_row < scroll + content_h {
+                button_map.record_button(
+                    super::button_map::TuiButton::MetadataEditorInput,
+                    Rect::new(
+                        content_area.x.saturating_add(3),
+                        content_area.y.saturating_add((add_row - scroll) as u16),
+                        content_area.width.saturating_sub(4),
+                        1,
+                    ),
+                );
+            }
         }
     } else {
         let add_style = if is_cursor_add {
@@ -6056,6 +6186,20 @@ fn draw_metadata_detail(
     let total = lines.len();
     let scroll = state.detail_scroll.min(total.saturating_sub(content_h));
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
+    if state.detail_edit.is_some() {
+        let line_index = 2usize.saturating_add(state.detail_cursor);
+        if line_index >= scroll && line_index < scroll + content_h {
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataEditorInput,
+                Rect::new(
+                    content_area.x.saturating_add(label_col_w as u16),
+                    content_area.y.saturating_add((line_index - scroll) as u16),
+                    content_area.width.saturating_sub(label_col_w as u16),
+                    1,
+                ),
+            );
+        }
+    }
     f.render_widget(Paragraph::new(visible_lines), content_area);
 
     // Footer.
@@ -6676,7 +6820,12 @@ fn draw_gnudb_select(
 }
 
 /// Draw the GNUDB review overlay — editable preview of GNUDB tags.
-fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme: super::theme::Theme) {
+fn draw_gnudb_review(
+    f: &mut Frame,
+    state: &super::app::GnudbReviewState,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
     use super::app::GnudbRowKind;
 
     let page = &state.pages[state.active_page];
@@ -6723,6 +6872,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
     let label_w = 12usize;
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut active_edit_line: Option<usize> = None;
 
     // Disc page indicator for multi-disc (first content line).
     if state.pages.len() > 1 {
@@ -6776,6 +6926,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
                 if is_editing {
                     if let Some(ref input) = state.edit_input {
                         let val_max = inner_w.saturating_sub(label_w + 1);
+                        active_edit_line = Some(lines.len());
                         lines.push(super::inline_edit::render_inline_text_line_with_embedded_cursor(
                             format!("    {:<w$}", field, w = label_w - 4),
                             label_style,
@@ -6821,6 +6972,7 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
                 if is_editing {
                     if let Some(ref input) = state.edit_input {
                         let val_max = inner_w.saturating_sub(label_w + 1);
+                        active_edit_line = Some(lines.len());
                         lines.push(super::inline_edit::render_inline_text_line_with_embedded_cursor(
                             format!("    {:<w$}", field, w = label_w - 4),
                             label_style,
@@ -6842,6 +6994,19 @@ fn draw_gnudb_review(f: &mut Frame, state: &super::app::GnudbReviewState, theme:
 
     let total = lines.len();
     let scroll = state.scroll.min(total.saturating_sub(content_h));
+    if let Some(line_index) = active_edit_line {
+        if line_index >= scroll && line_index < scroll + content_h {
+            button_map.record_button(
+                super::button_map::TuiButton::GnudbEditorInput,
+                Rect::new(
+                    chunks[0].x.saturating_add(label_w as u16),
+                    chunks[0].y.saturating_add((line_index - scroll) as u16),
+                    chunks[0].width.saturating_sub(label_w as u16),
+                    1,
+                ),
+            );
+        }
+    }
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(content_h).collect();
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
@@ -8071,6 +8236,26 @@ mod tests {
     }
 
     #[test]
+    fn template_builder_hit_region_is_only_the_editable_line() {
+        let state = super::super::app::TemplateBuilderState {
+            template_input: super::super::text_input::TextInputState::new(
+                "%ARTIST% - %TITLE%".to_string(),
+            ),
+            target: super::super::app::TemplateTarget::Filename,
+            focus: super::super::app::TemplateBuilderFocus::TemplateInput,
+            grid_cursor: 0,
+            saved_templates: vec!["%NN% - %TITLE%".to_string()],
+            saved_selected: 0,
+            saved_scroll: 0,
+        };
+        let rect = template_builder_input_hit_rect(Rect::new(0, 0, 100, 40), &state)
+            .expect("template input hit region");
+        assert_eq!(rect.height, 1);
+        assert!(rect.width < 80, "popup borders must not be editor-active");
+        assert!(rect.y > 0);
+    }
+
+    #[test]
     fn metadata_autonumber_border_tracks_owner_dirty_state() {
         let theme = crate::tui::theme::theme_by_slug_or_default(
             crate::tui::theme::default_theme_slug(),
@@ -8109,8 +8294,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 12);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut buttons = super::super::button_map::ButtonRenderMap::new();
         terminal
-            .draw(|frame| draw_text_edit(frame, "value", &input, theme))
+            .draw(|frame| draw_text_edit(frame, "value", &input, &mut buttons, theme))
             .expect("draw generic text prompt");
         let selected_prompt_cells = terminal
             .backend()
@@ -8127,8 +8313,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 12);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut buttons = super::super::button_map::ButtonRenderMap::new();
         terminal
-            .draw(|frame| draw_file_input(frame, &input, theme))
+            .draw(|frame| draw_file_input(frame, &input, &mut buttons, theme))
             .expect("draw generic file prompt");
         let selected_file_cells = terminal
             .backend()
@@ -8145,8 +8332,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(20, 3);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut buttons = super::super::button_map::ButtonRenderMap::new();
         terminal
-            .draw(|frame| draw_command_input(frame, &input, None, theme))
+            .draw(|frame| draw_command_input(frame, &input, None, &mut buttons, theme))
             .expect("draw vi command line");
         let buffer = terminal.backend().buffer();
         for x in 2..=4 {

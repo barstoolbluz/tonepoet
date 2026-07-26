@@ -11481,7 +11481,7 @@ fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }

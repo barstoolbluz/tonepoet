@@ -36,6 +36,7 @@ pub use type_ahead::{
 };
 pub use bookmarks::{
     bookmark_storage_path, initialize_bookmarks_if_absent, load_bookmarks,
+    replace_bookmark_config_home_override_for_tests,
     mutate_bookmarks_atomic, mutate_bookmarks_atomic_with_reconcile,
     reconcile_bookmarks_locked, save_bookmarks_atomic, BookmarkCommit,
     BookmarkInitialization, BookmarkMoveDirection, BookmarkMutation,
@@ -45,18 +46,22 @@ pub use name_validation::{validate_file_name, NameValidationError};
 pub use source_guard::{
     capture_manifest, capture_manifest_with_cancel, digest_open_file,
     filesystem_capabilities, filesystem_identity_policy, filesystem_identity_policy_notice,
-    preserve_open_file_metadata, record_filesystem_capability, snapshot_open_file,
+    preserve_open_file_metadata, record_filesystem_capability, rename_path_no_replace, snapshot_open_file,
     snapshot_open_handle, snapshot_path, verify_path, verify_path_with_capabilities,
     CapabilitySupport, ContentDigest, DestinationManifest, FileOperationIoCounters,
     FilesystemCapabilities, FilesystemCapabilityKind, FilesystemIdentityPolicy,
     FilesystemSemantics, RenameSourceProof, RenameVerification, Sha256, SourceEntryProof,
-    SourceIdentity, SourceKind, SourceManifest, SourceSnapshot, verify_committed_rename,
+    SourceIdentity, SourceKind, SourceManifest, SourceSnapshot, VerifiedRemoval,
+    PreparedVerifiedRemoval, InterruptedRemovalRecovery, prepare_verified_removal,
+    recover_interrupted_verified_removals, recover_interrupted_verified_removals_once,
+    verify_committed_rename, verify_renamed_destination,
 };
 pub use search::FileSearchResult;
 pub use progress::{
     ConflictAction, ConflictItemKind, ConflictPromptState, ConflictResolution, FileTaskKind, FileTaskPhase,
     FileTaskCompletionReport, FileTaskErrorRecord, FileTaskProgressState, FileTaskProgressUpdate,
-    FileTaskRootDisposition, FileTaskRootResult, FileTaskScope, FileTaskUserAction, ProgressItem,
+    FileTaskRootDisposition, FileTaskRootProof, FileTaskRootResult, FileTaskScope,
+    FileTaskUndoDisposition, FileTaskUserAction, ProgressItem,
     ProgressTotals, ProgressUnit,
 };
 pub use state::{
@@ -64,9 +69,13 @@ pub use state::{
     FilePickerClipboard, FilePickerClipboardMode, FilePickerConfig, FilePickerCreateKind,
     FilePickerEntry, FilePickerError, FilePickerFocus, FilePickerHitAction,
     FilePickerMenuAction, FilePickerSelectionMode, FilePickerSortKey, FilePickerState,
-    duplicate_files_in_place, paste_filesystem_clipboard,
+    duplicate_files_in_place, execute_exact_paste_plan,
+    execute_exact_paste_plan_with_proofs,
+    execute_exact_paste_plan_with_proofs_and_expected_sources,
+    paste_filesystem_clipboard,
     paste_filesystem_clipboard_with_retry, plan_filesystem_paste, HitRegion,
-    PasteFailure, PasteMapping, PastePlan, PasteRetryPlan, PasteSuccess, PasteWarning, SaveModeConfig,
+    ExactPasteProofFailure, ExactPasteProofSuccess, ExactPasteRootProof, PasteFailure,
+    PasteMapping, PastePlan, PasteRetryPlan, PasteSuccess, PasteWarning, SaveModeConfig,
     SaveModeStyle, SymlinkCopyPolicy, SymlinkPolicy, ToolbarAction, TreeNode,
 };
 pub use theme::FilePickerTheme;

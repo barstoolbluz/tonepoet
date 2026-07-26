@@ -15,7 +15,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -179,9 +179,21 @@ pub enum FilePickerMenuAction {
     SelectAll,
     InvertSelection,
     DeselectAll,
+    SortName,
+    SortSize,
+    SortType,
+    SortModified,
     TextCut,
     TextCopy,
     TextPaste,
+    TextDelete,
+    TextSelectAll,
+    TextTitleCase,
+    TextUppercase,
+    TextLowercase,
+    RenameTitleCase,
+    RenameUppercase,
+    RenameLowercase,
     OpenSystemDefault,
     AddBookmark,
     OpenBookmarks,
@@ -192,6 +204,10 @@ pub enum FilePickerMenuAction {
 pub enum FilePickerContextMenuKind {
     Toolbar,
     Address,
+    NameEditor,
+    SaveNameEditor,
+    SearchEditor,
+    BookmarkNameEditor,
     Tree,
     File,
     Background,
@@ -201,12 +217,24 @@ pub enum FilePickerContextMenuKind {
 pub(crate) enum FilePickerSubmenuKind {
     New,
     Selection,
+    Sort,
+    Rename,
+    TextCase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilePickerMenuEntry {
     NewSubmenu,
     SelectionSubmenu,
+    SortSubmenu,
+    RenameSubmenu,
+    CaseSubmenu,
+    Action(FilePickerMenuAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilePickerSubmenuEntry {
+    CaseSubmenu,
     Action(FilePickerMenuAction),
 }
 
@@ -219,8 +247,11 @@ pub enum FilePickerHitAction {
     TreeRow(usize),
     FileRow(usize),
     FilesBackground,
+    SortColumn(FilePickerSortKey),
     CreateNameEditor,
+    SaveNameEditor,
     SearchInput,
+    BookmarkNameEditor,
     SearchRow(usize),
     SearchClose,
     BookmarkRow(usize),
@@ -232,7 +263,12 @@ pub enum FilePickerHitAction {
     Menu(FilePickerMenuAction),
     MenuNew,
     MenuSelection,
+    MenuSort,
+    MenuRename,
+    MenuCase,
+    SubmenuCase,
     Submenu(FilePickerMenuAction),
+    NestedSubmenu(FilePickerMenuAction),
     PropertiesClose,
     DeleteConfirm,
     DeleteCancel,
@@ -500,7 +536,177 @@ impl fmt::Display for FilePickerError {
 
 impl std::error::Error for FilePickerError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn default_picker_title_case(value: &str) -> String {
+    const SMALL_WORDS: &[&str] = &[
+        "a", "an", "the", "and", "but", "or", "for", "nor", "on", "at", "to",
+        "from", "by", "of", "as", "about", "in", "up", "with",
+    ];
+
+    fn affixes(word: &str) -> (&str, &str, &str) {
+        let Some(start) = word
+            .char_indices()
+            .find_map(|(index, ch)| ch.is_alphanumeric().then_some(index))
+        else {
+            return (word, "", "");
+        };
+        let end = word
+            .char_indices()
+            .rev()
+            .find_map(|(index, ch)| ch.is_alphanumeric().then_some(index + ch.len_utf8()))
+            .unwrap_or(start);
+        (&word[..start], &word[start..end], &word[end..])
+    }
+
+    fn special(core: &str) -> Option<&'static str> {
+        match core.to_lowercase().as_str() {
+            "ac/dc" | "acdc" | "ac-dc" => Some("AC/DC"),
+            "esg" => Some("ESG"),
+            "rem" | "r.e.m." => Some("R.E.M."),
+            "csny" => Some("CSNY"),
+            "elo" => Some("ELO"),
+            "abba" => Some("ABBA"),
+            "inxs" => Some("INXS"),
+            "nwa" | "n.w.a" => Some("N.W.A"),
+            "omg" => Some("OMG"),
+            "uk" => Some("UK"),
+            "usa" => Some("USA"),
+            "ussr" => Some("USSR"),
+            "nyc" => Some("NYC"),
+            "la" => Some("LA"),
+            "dj" => Some("DJ"),
+            "mc" => Some("MC"),
+            "tv" => Some("TV"),
+            "mtv" => Some("MTV"),
+            "bbc" => Some("BBC"),
+            "zz" => Some("ZZ"),
+            "xrcd" => Some("XRCD"),
+            "xrcd2" => Some("XRCD2"),
+            "xrcd24" => Some("XRCD24"),
+            "jp" => Some("JP"),
+            "lp" => Some("LP"),
+            "ii" => Some("II"),
+            "iii" => Some("III"),
+            "iv" => Some("IV"),
+            "v" => Some("V"),
+            "vi" => Some("VI"),
+            "vii" => Some("VII"),
+            "viii" => Some("VIII"),
+            "ix" => Some("IX"),
+            "x" => Some("X"),
+            "xi" => Some("XI"),
+            "xii" => Some("XII"),
+            "xiii" => Some("XIII"),
+            "xiv" => Some("XIV"),
+            "xv" => Some("XV"),
+            _ => None,
+        }
+    }
+
+    fn capitalize_core(core: &str) -> String {
+        if let Some(value) = special(core) {
+            return value.to_string();
+        }
+        let character_count = core.chars().count();
+        if (2..=5).contains(&character_count)
+            && core
+                .chars()
+                .all(|ch| ch.is_uppercase() || !ch.is_alphabetic())
+        {
+            return core.to_string();
+        }
+        if let Some(index) = core.find('\'') {
+            let (left, right) = core.split_at(index);
+            return format!("{}{}", capitalize_core(left), right);
+        }
+        if let Some(index) = core.find('-') {
+            let (left, right) = core.split_at(index);
+            return format!("{}-{}", capitalize_core(left), capitalize_core(&right[1..]));
+        }
+        if let Some(index) = core.find('/') {
+            let (left, right) = core.split_at(index);
+            return format!("{}/{}", capitalize_core(left), capitalize_core(&right[1..]));
+        }
+        let mut chars = core.chars();
+        match chars.next() {
+            Some(first) => first
+                .to_uppercase()
+                .chain(chars.as_str().to_lowercase().chars())
+                .collect(),
+            None => String::new(),
+        }
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, ch) in value.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(begin) = start.take() {
+                ranges.push(begin..index);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(begin) = start {
+        ranges.push(begin..value.len());
+    }
+
+    let normalize_all_caps = value.len() > 1
+        && value
+            .chars()
+            .all(|ch| !ch.is_alphabetic() || ch.is_uppercase());
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        output.push_str(&value[copied..range.start]);
+        let original_word = &value[range.clone()];
+        let (original_prefix, original_core, original_suffix) = affixes(original_word);
+        let normalized_word;
+        let word = if normalize_all_caps
+            && !(original_prefix
+                .chars()
+                .any(|ch| matches!(ch, '(' | '[' | '{' | '"' | '\'' | '“' | '‘'))
+                && original_core == "US")
+        {
+            normalized_word = format!(
+                "{original_prefix}{}{original_suffix}",
+                original_core.to_lowercase(),
+            );
+            normalized_word.as_str()
+        } else {
+            original_word
+        };
+        let (prefix, core, suffix) = affixes(word);
+        if core.is_empty() {
+            output.push_str(word);
+            copied = range.end;
+            continue;
+        }
+        let after_ampersand = index > 0 && value[ranges[index - 1].clone()].contains('&');
+        let starts_section = prefix
+            .chars()
+            .any(|ch| matches!(ch, '(' | '[' | '{' | '"' | '\'' | '“' | '‘'));
+        let lower = core.to_lowercase();
+        let transformed = if index == 0
+            || index + 1 == ranges.len()
+            || after_ampersand
+            || starts_section
+            || !SMALL_WORDS.contains(&lower.as_str())
+        {
+            capitalize_core(core)
+        } else {
+            lower
+        };
+        output.push_str(prefix);
+        output.push_str(&transformed);
+        output.push_str(suffix);
+        copied = range.end;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+#[derive(Debug, Clone)]
 pub struct FilePickerConfig {
     pub start_dir: PathBuf,
     pub filter: FilePickerFilter,
@@ -508,6 +714,11 @@ pub struct FilePickerConfig {
     pub theme: FilePickerTheme,
     pub selection_mode: FilePickerSelectionMode,
     pub show_hidden: bool,
+    /// Initial sort field. Hosts may persist this alongside their browsing
+    /// preferences and pass it back when opening the next picker.
+    pub sort_key: FilePickerSortKey,
+    /// Initial direction for `sort_key`; false is ascending, true descending.
+    pub sort_reverse: bool,
     /// Show a right-side preview pane when the optional image-preview feature is enabled.
     /// Image-filter pickers enable this automatically; callers may set it for custom image filters.
     pub show_preview: bool,
@@ -520,7 +731,34 @@ pub struct FilePickerConfig {
     pub hide_extension: Option<String>,
     /// Optional reusable save-as mode.
     pub save_mode: Option<SaveModeConfig>,
+    /// Host-provided title-case policy used by editor and filename case menus.
+    /// The default is a Unicode-preserving standalone implementation; hosts
+    /// with an established naming policy should inject that exact function.
+    pub title_case: fn(&str) -> String,
 }
+
+/// Equality deliberately ignores `title_case`: comparing function pointers is
+/// unpredictable across codegen units, and the host-injected policy is not
+/// part of the picker's observable configuration state.
+impl PartialEq for FilePickerConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.start_dir == other.start_dir
+            && self.filter == other.filter
+            && self.title == other.title
+            && self.theme == other.theme
+            && self.selection_mode == other.selection_mode
+            && self.show_hidden == other.show_hidden
+            && self.sort_key == other.sort_key
+            && self.sort_reverse == other.sort_reverse
+            && self.show_preview == other.show_preview
+            && self.conflict_policy == other.conflict_policy
+            && self.operation_policy == other.operation_policy
+            && self.hide_extension == other.hide_extension
+            && self.save_mode == other.save_mode
+    }
+}
+
+impl Eq for FilePickerConfig {}
 
 impl Default for FilePickerConfig {
     fn default() -> Self {
@@ -531,11 +769,14 @@ impl Default for FilePickerConfig {
             theme: FilePickerTheme::default(),
             selection_mode: FilePickerSelectionMode::Files,
             show_hidden: false,
+            sort_key: FilePickerSortKey::Name,
+            sort_reverse: false,
             show_preview: false,
             conflict_policy: None,
             operation_policy: FileOperationPolicy::default(),
             hide_extension: None,
             save_mode: None,
+            title_case: default_picker_title_case,
         }
     }
 }
@@ -550,6 +791,27 @@ pub(crate) struct FilePickerLayoutMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LastClick {
     pub action: FilePickerHitAction,
+    pub at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerTextTarget {
+    Address,
+    CreateName,
+    SaveName,
+    Search,
+    BookmarkName,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextPointerSession {
+    pub target: PickerTextTarget,
+    pub rect: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LastTextClick {
+    pub target: PickerTextTarget,
     pub at: Instant,
 }
 
@@ -721,6 +983,8 @@ pub struct FilePickerState {
     pub(crate) submenu_open: bool,
     pub(crate) submenu_cursor: usize,
     pub(crate) submenu_kind: FilePickerSubmenuKind,
+    pub(crate) case_submenu_open: bool,
+    pub(crate) case_submenu_cursor: usize,
     pub(crate) context_menu_kind: FilePickerContextMenuKind,
     pub(crate) context_menu_target: Option<PathBuf>,
     pub(crate) context_menu_anchor: Option<(u16, u16)>,
@@ -738,6 +1002,7 @@ pub struct FilePickerState {
     pub(crate) image_preview_cache: ImagePreviewCache,
     pub(crate) sort_key: FilePickerSortKey,
     pub(crate) sort_reverse: bool,
+    pub(crate) sort_changed: bool,
     pub(crate) clipboard: Option<FilesystemClipboard>,
     pub(crate) paste_task: Option<PickerPasteTask>,
     /// Exact source-to-destination mappings retained after an incomplete cut.
@@ -752,6 +1017,8 @@ pub struct FilePickerState {
     pub(crate) last_layout: Option<FilePickerLayoutMetrics>,
     pub(crate) last_click: Option<LastClick>,
     pub(crate) tree_last_click: Option<(PathBuf, Instant)>,
+    pub(crate) text_pointer: Option<TextPointerSession>,
+    pub(crate) text_last_click: Option<LastTextClick>,
     pub(crate) double_click_window: Duration,
     pub(crate) type_ahead: TypeAheadState,
     pub(crate) search: FileSearchState,
@@ -768,6 +1035,7 @@ pub struct FilePickerState {
     pub(crate) save_mode: Option<SaveModeConfig>,
     pub(crate) save_name_input: TextInputState,
     pub(crate) pending_save_path: Option<PathBuf>,
+    pub(crate) title_case: fn(&str) -> String,
 }
 
 impl FilePickerState {
@@ -794,6 +1062,8 @@ impl FilePickerState {
             submenu_open: false,
             submenu_cursor: 0,
             submenu_kind: FilePickerSubmenuKind::New,
+            case_submenu_open: false,
+            case_submenu_cursor: 0,
             context_menu_kind: FilePickerContextMenuKind::Toolbar,
             context_menu_target: None,
             context_menu_anchor: None,
@@ -809,8 +1079,9 @@ impl FilePickerState {
             conflict_policy: config.conflict_policy,
             #[cfg(feature = "image-preview")]
             image_preview_cache: ImagePreviewCache::default(),
-            sort_key: FilePickerSortKey::Name,
-            sort_reverse: false,
+            sort_key: config.sort_key,
+            sort_reverse: config.sort_reverse,
+            sort_changed: false,
             clipboard: None,
             paste_task: None,
             paste_retry_plan: None,
@@ -823,6 +1094,8 @@ impl FilePickerState {
             last_layout: None,
             last_click: None,
             tree_last_click: None,
+            text_pointer: None,
+            text_last_click: None,
             double_click_window: crate::click_timing::DOUBLE_CLICK_WINDOW,
             type_ahead: TypeAheadState::default(),
             search: FileSearchState::default(),
@@ -852,6 +1125,7 @@ impl FilePickerState {
                     .unwrap_or_default(),
             ),
             pending_save_path: None,
+            title_case: config.title_case,
         };
         state.refresh();
         state.select_tree_node_for_current_dir();
@@ -1141,6 +1415,15 @@ impl FilePickerState {
 
     pub fn sort_key(&self) -> FilePickerSortKey {
         self.sort_key
+    }
+
+    pub fn sort_reverse(&self) -> bool {
+        self.sort_reverse
+    }
+
+    /// True only after the user changes sorting in this picker session.
+    pub fn sort_changed(&self) -> bool {
+        self.sort_changed
     }
 
     pub fn show_hidden(&self) -> bool {
@@ -1537,6 +1820,35 @@ impl FilePickerState {
     pub fn refresh(&mut self) {
         self.clear_error();
         self.entries.clear();
+        match crate::source_guard::recover_interrupted_verified_removals_once(&self.current_dir) {
+            Ok(report) => {
+                for restored in report.restored {
+                    log::warn!(
+                        "restored copy-undo removal interrupted before deletion: {}",
+                        restored.display(),
+                    );
+                }
+                let mut retained_messages = Vec::new();
+                for (retained, reason) in report.retained {
+                    log::error!(
+                        "retained interrupted copy-undo recovery state at {}: {reason}",
+                        retained.display(),
+                    );
+                    retained_messages.push(format!("{}: {reason}", retained.display()));
+                }
+                if !retained_messages.is_empty() {
+                    self.set_error(FilePickerError::Io {
+                        op: "recover interrupted copy undo",
+                        path: self.current_dir.clone(),
+                        message: retained_messages.join("; "),
+                    });
+                }
+            }
+            Err(error) => log::error!(
+                "could not scan {} for interrupted copy-undo recovery state: {error}",
+                self.current_dir.display(),
+            ),
+        }
         let read_dir = match fs::read_dir(&self.current_dir) {
             Ok(read_dir) => read_dir,
             Err(err) => {
@@ -1958,6 +2270,7 @@ impl FilePickerState {
             self.sort_key = sort_key;
             self.sort_reverse = false;
         }
+        self.sort_changed = true;
         self.refresh();
     }
 
@@ -2933,6 +3246,57 @@ impl FilePickerState {
         }
     }
 
+    pub(crate) fn context_text_input(&self) -> Option<&TextInputState> {
+        match self.context_menu_kind {
+            FilePickerContextMenuKind::Address => Some(&self.address_input),
+            FilePickerContextMenuKind::NameEditor => Some(&self.create_name_input),
+            FilePickerContextMenuKind::SaveNameEditor => Some(&self.save_name_input),
+            FilePickerContextMenuKind::SearchEditor => Some(&self.search.input),
+            FilePickerContextMenuKind::BookmarkNameEditor => Some(&self.bookmarks.name_input),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn context_text_input_mut(&mut self) -> Option<&mut TextInputState> {
+        match self.context_menu_kind {
+            FilePickerContextMenuKind::Address => Some(&mut self.address_input),
+            FilePickerContextMenuKind::NameEditor => Some(&mut self.create_name_input),
+            FilePickerContextMenuKind::SaveNameEditor => Some(&mut self.save_name_input),
+            FilePickerContextMenuKind::SearchEditor => Some(&mut self.search.input),
+            FilePickerContextMenuKind::BookmarkNameEditor => Some(&mut self.bookmarks.name_input),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_path_case_transform(
+        &mut self,
+        action: FilePickerMenuAction,
+    ) -> Result<usize, FilePickerError> {
+        let paths = self.action_paths();
+        if paths.is_empty() {
+            return Err(FilePickerError::NoSelection);
+        }
+        let title_case = self.title_case;
+        let transform = |name: &str| match action {
+            FilePickerMenuAction::RenameTitleCase => title_case(name),
+            FilePickerMenuAction::RenameUppercase => name.to_uppercase(),
+            FilePickerMenuAction::RenameLowercase => name.to_lowercase(),
+            _ => name.to_string(),
+        };
+        let destinations = execute_picker_case_rename_transaction(&paths, transform)?;
+        if destinations.is_empty() {
+            return Ok(0);
+        }
+        self.multi_selected = destinations.clone();
+        self.selected = destinations.last().cloned();
+        self.refresh();
+        if let Some(path) = self.selected.clone() {
+            self.select_path_in_entries(&path);
+        }
+        self.select_tree_node_for_current_dir();
+        Ok(destinations.len())
+    }
+
     pub fn visible_total_size(&self) -> u64 {
         self.entries.iter().filter_map(|entry| entry.size).sum()
     }
@@ -2944,16 +3308,24 @@ impl FilePickerState {
         match self.context_menu_kind {
             Kind::Toolbar => vec![
                 ("New      ▸", Entry::NewSubmenu),
+                ("Sort     ▸", Entry::SortSubmenu),
                 ("Bookmarks", Entry::Action(Action::OpenBookmarks)),
                 ("Cut", Entry::Action(Action::Cut)),
                 ("Copy", Entry::Action(Action::Copy)),
                 ("Paste", Entry::Action(Action::Paste)),
                 ("Delete", Entry::Action(Action::Delete)),
             ],
-            Kind::Address => vec![
-                ("Cut", Entry::Action(Action::TextCut)),
-                ("Copy", Entry::Action(Action::TextCopy)),
+            Kind::Address
+            | Kind::NameEditor
+            | Kind::SaveNameEditor
+            | Kind::SearchEditor
+            | Kind::BookmarkNameEditor => vec![
                 ("Paste", Entry::Action(Action::TextPaste)),
+                ("Copy", Entry::Action(Action::TextCopy)),
+                ("Cut", Entry::Action(Action::TextCut)),
+                ("Delete", Entry::Action(Action::TextDelete)),
+                ("Select All", Entry::Action(Action::TextSelectAll)),
+                ("Fix capitalization ▸", Entry::CaseSubmenu),
             ],
             Kind::Tree => vec![
                 ("New      ▸", Entry::NewSubmenu),
@@ -2961,14 +3333,14 @@ impl FilePickerState {
                 ("Cut", Entry::Action(Action::Cut)),
                 ("Copy", Entry::Action(Action::Copy)),
                 ("Paste", Entry::Action(Action::Paste)),
-                ("Rename", Entry::Action(Action::Rename)),
+                ("Rename   ▸", Entry::RenameSubmenu),
                 ("Delete", Entry::Action(Action::Delete)),
             ],
             Kind::File => vec![
                 ("Cut", Entry::Action(Action::Cut)),
                 ("Copy", Entry::Action(Action::Copy)),
                 ("Paste", Entry::Action(Action::Paste)),
-                ("Rename", Entry::Action(Action::Rename)),
+                ("Rename   ▸", Entry::RenameSubmenu),
                 ("Duplicate", Entry::Action(Action::Duplicate)),
                 ("Delete", Entry::Action(Action::Delete)),
                 ("Selection ▸", Entry::SelectionSubmenu),
@@ -2984,18 +3356,45 @@ impl FilePickerState {
         }
     }
 
-    pub(crate) fn submenu_entries(&self) -> Vec<(&'static str, FilePickerMenuAction)> {
+    pub(crate) fn submenu_entries(&self) -> Vec<(&'static str, FilePickerSubmenuEntry)> {
+        use FilePickerMenuAction as Action;
+        use FilePickerSubmenuEntry as Entry;
         match self.submenu_kind {
             FilePickerSubmenuKind::New => vec![
-                ("File", FilePickerMenuAction::NewFile),
-                ("Folder", FilePickerMenuAction::NewFolder),
+                ("File", Entry::Action(Action::NewFile)),
+                ("Folder", Entry::Action(Action::NewFolder)),
             ],
             FilePickerSubmenuKind::Selection => vec![
-                ("Select All", FilePickerMenuAction::SelectAll),
-                ("Invert", FilePickerMenuAction::InvertSelection),
-                ("Deselect All", FilePickerMenuAction::DeselectAll),
+                ("Select All", Entry::Action(Action::SelectAll)),
+                ("Invert", Entry::Action(Action::InvertSelection)),
+                ("Deselect All", Entry::Action(Action::DeselectAll)),
+            ],
+            FilePickerSubmenuKind::Sort => vec![
+                ("Name", Entry::Action(Action::SortName)),
+                ("Size", Entry::Action(Action::SortSize)),
+                ("Type", Entry::Action(Action::SortType)),
+                ("Modified", Entry::Action(Action::SortModified)),
+            ],
+            FilePickerSubmenuKind::Rename => vec![
+                ("Rename", Entry::Action(Action::Rename)),
+                ("Fix capitalization ▸", Entry::CaseSubmenu),
+            ],
+            FilePickerSubmenuKind::TextCase => vec![
+                ("Title Case", Entry::Action(Action::TextTitleCase)),
+                ("UPPERCASE", Entry::Action(Action::TextUppercase)),
+                ("lowercase", Entry::Action(Action::TextLowercase)),
             ],
         }
+    }
+
+    pub(crate) fn nested_case_entries(
+        &self,
+    ) -> [(&'static str, FilePickerMenuAction); 3] {
+        [
+            ("Title Case", FilePickerMenuAction::RenameTitleCase),
+            ("UPPERCASE", FilePickerMenuAction::RenameUppercase),
+            ("lowercase", FilePickerMenuAction::RenameLowercase),
+        ]
     }
 
     pub(crate) fn is_new_menu_enabled(&self) -> bool {
@@ -3027,9 +3426,31 @@ impl FilePickerState {
             FilePickerMenuAction::SelectAll => !self.entries.is_empty(),
             FilePickerMenuAction::InvertSelection => !self.entries.is_empty(),
             FilePickerMenuAction::DeselectAll => !self.multi_selected.is_empty(),
-            FilePickerMenuAction::TextCut => self.address_input.has_selection(),
-            FilePickerMenuAction::TextCopy => self.address_input.has_selection(),
-            FilePickerMenuAction::TextPaste => self.address_input.can_paste(),
+            FilePickerMenuAction::SortName
+            | FilePickerMenuAction::SortSize
+            | FilePickerMenuAction::SortType
+            | FilePickerMenuAction::SortModified => true,
+            FilePickerMenuAction::TextCut => self
+                .context_text_input()
+                .is_some_and(TextInputState::has_selection),
+            FilePickerMenuAction::TextCopy => self
+                .context_text_input()
+                .is_some_and(TextInputState::has_selection),
+            FilePickerMenuAction::TextPaste => self
+                .context_text_input()
+                .is_some_and(TextInputState::can_paste),
+            FilePickerMenuAction::TextDelete => self.context_text_input().is_some_and(|input| {
+                input.has_selection() || input.cursor < input.text.len()
+            }),
+            FilePickerMenuAction::TextSelectAll
+            | FilePickerMenuAction::TextTitleCase
+            | FilePickerMenuAction::TextUppercase
+            | FilePickerMenuAction::TextLowercase => self
+                .context_text_input()
+                .is_some_and(|input| !input.text.is_empty()),
+            FilePickerMenuAction::RenameTitleCase
+            | FilePickerMenuAction::RenameUppercase
+            | FilePickerMenuAction::RenameLowercase => !action_paths.is_empty(),
             FilePickerMenuAction::OpenSystemDefault => single
                 && action_paths.first().is_some_and(|path| path.is_file()),
             FilePickerMenuAction::AddBookmark => {
@@ -3244,6 +3665,335 @@ pub fn plan_filesystem_paste(
 /// `retry_plan`, pass that plan to `paste_filesystem_clipboard_with_retry` on
 /// the next attempt so an already-published destination is verified and reused
 /// rather than renamed to a duplicate destination.
+/// Execute caller-supplied source-to-destination mappings exactly.
+///
+/// Unlike [`plan_filesystem_paste`], this never suffixes or otherwise rewrites
+/// a destination. It is intended for replaying a previously completed file
+/// operation (undo/redo) after the caller has revalidated its retained
+/// manifests. The normal rename-first/copy-verify-delete engine remains the
+/// sole mutation path, including cross-device move recovery.
+pub fn execute_exact_paste_plan(
+    plan: &PastePlan,
+    policy: FileOperationPolicy,
+) -> Result<PasteSuccess, PasteFailure> {
+    if plan.mappings.is_empty() {
+        return Ok(PasteSuccess {
+            mappings: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+    for mapping in &plan.mappings {
+        if fs::symlink_metadata(&mapping.source).is_err() {
+            return Err(PasteFailure {
+                completed: Vec::new(),
+                remaining_sources: plan
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect(),
+                retry_plan: None,
+                warnings: Vec::new(),
+                error: FilePickerError::ClipboardSourceMissing(mapping.source.clone()),
+            });
+        }
+        let Some(parent) = mapping.destination.parent() else {
+            return Err(PasteFailure {
+                completed: Vec::new(),
+                remaining_sources: plan
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect(),
+                retry_plan: None,
+                warnings: Vec::new(),
+                error: FilePickerError::NotADirectory(mapping.destination.clone()),
+            });
+        };
+        if !parent.is_dir() {
+            return Err(PasteFailure {
+                completed: Vec::new(),
+                remaining_sources: plan
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect(),
+                retry_plan: None,
+                warnings: Vec::new(),
+                error: FilePickerError::NotADirectory(parent.to_path_buf()),
+            });
+        }
+        if fs::symlink_metadata(&mapping.destination).is_ok() {
+            return Err(PasteFailure {
+                completed: Vec::new(),
+                remaining_sources: plan
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect(),
+                retry_plan: None,
+                warnings: Vec::new(),
+                error: FilePickerError::DestinationExists(mapping.destination.clone()),
+            });
+        }
+    }
+
+    let mut progress =
+        |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+    execute_paste_plan_progress_with_resume(plan, policy, None, &mut progress)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactPasteRootProof {
+    pub mapping: PasteMapping,
+    pub proof: crate::FileTaskRootProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactPasteProofSuccess {
+    pub mappings: Vec<PasteMapping>,
+    pub proofs: Vec<ExactPasteRootProof>,
+    pub warnings: Vec<PasteWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactPasteProofFailure {
+    pub completed: Vec<PasteMapping>,
+    pub completed_proofs: Vec<ExactPasteRootProof>,
+    /// Mappings whose destination publication committed but whose
+    /// operation-time proof could not be returned. Callers must treat these as
+    /// terminal and must not retry them from stale undo/redo history.
+    pub committed_unverified: Vec<PasteMapping>,
+    pub remaining_sources: Vec<PathBuf>,
+    pub warnings: Vec<PasteWarning>,
+    pub error: FilePickerError,
+}
+
+impl fmt::Display for ExactPasteProofFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ExactPasteProofFailure {}
+
+/// Execute an exact replay plan and return worker-owned operation-time proofs.
+///
+/// Unlike the compatibility API, every successful root carries the authority
+/// produced inside the mutation engine: copy proofs come from the streaming
+/// copy/publication verifier, copy-then-delete moves reuse that same recovery
+/// proof, and native moves combine a pre-rename manifest with retained-handle
+/// destination verification. Callers must run this potentially recursive work
+/// off their interactive reducer thread.
+pub fn execute_exact_paste_plan_with_proofs(
+    plan: &PastePlan,
+    policy: FileOperationPolicy,
+) -> Result<ExactPasteProofSuccess, ExactPasteProofFailure> {
+    execute_exact_paste_plan_with_proofs_internal(plan, policy, None)
+}
+
+/// Execute an exact replay plan while requiring each source to match the
+/// operation-time proof supplied by the undo journal. The worker verifies the
+/// source manifest it is already producing before publication or source
+/// cleanup, avoiding both a pathname verification race and a duplicate hash
+/// pass.
+pub fn execute_exact_paste_plan_with_proofs_and_expected_sources(
+    plan: &PastePlan,
+    policy: FileOperationPolicy,
+    expected_sources: &[crate::FileTaskRootProof],
+) -> Result<ExactPasteProofSuccess, ExactPasteProofFailure> {
+    if expected_sources.len() != plan.mappings.len() {
+        return Err(ExactPasteProofFailure {
+            completed: Vec::new(),
+            completed_proofs: Vec::new(),
+            committed_unverified: Vec::new(),
+            remaining_sources: plan
+                .mappings
+                .iter()
+                .map(|mapping| mapping.source.clone())
+                .collect(),
+            warnings: Vec::new(),
+            error: FilePickerError::Io {
+                op: "validate exact replay authority",
+                path: PathBuf::new(),
+                message: format!(
+                    "expected {} source proofs for {} mappings",
+                    expected_sources.len(),
+                    plan.mappings.len(),
+                ),
+            },
+        });
+    }
+    execute_exact_paste_plan_with_proofs_internal(plan, policy, Some(expected_sources))
+}
+
+fn execute_exact_paste_plan_with_proofs_internal(
+    plan: &PastePlan,
+    policy: FileOperationPolicy,
+    expected_sources: Option<&[crate::FileTaskRootProof]>,
+) -> Result<ExactPasteProofSuccess, ExactPasteProofFailure> {
+    if let Err(failure) = preflight_exact_paste_plan(plan) {
+        return Err(failure);
+    }
+    let mut progress =
+        |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+    let mut completed = Vec::new();
+    let mut proofs = Vec::new();
+    let mut warnings = Vec::new();
+    let mut io = crate::FileOperationIoCounters::default();
+
+    for (index, mapping) in plan.mappings.iter().enumerate() {
+        let expected_source = expected_sources.map(|proofs| &proofs[index]);
+        let mut root_proof = None;
+        let result = match plan.mode {
+            FilePickerClipboardMode::Copy => {
+                match safe_copy_path_progress_with_notices_accounted_with_expected(
+                    &mapping.source,
+                    &mapping.destination,
+                    policy,
+                    &mut progress,
+                    &mut io,
+                    expected_source,
+                ) {
+                    Ok(outcome) => {
+                        root_proof = Some(crate::FileTaskRootProof {
+                            source_manifest: outcome.source_manifest,
+                            destination_manifest: outcome.destination_manifest,
+                        });
+                        if outcome.notices.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(committed_operation_warning(
+                                &mapping.source,
+                                &mapping.destination,
+                                outcome.notices.join("; "),
+                            ))
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            FilePickerClipboardMode::Cut => {
+                let mut recovery = None;
+                let result = move_path_with_policy_progress_accounted_with_recovery_and_expected(
+                    &mapping.source,
+                    &mapping.destination,
+                    policy,
+                    &mut progress,
+                    &mut recovery,
+                    expected_source,
+                    &mut io,
+                );
+                if let Some(recovery) = recovery {
+                    root_proof = Some(crate::FileTaskRootProof {
+                        source_manifest: recovery.source_manifest,
+                        destination_manifest: recovery.destination_manifest,
+                    });
+                }
+                result
+            }
+        };
+
+        match classify_paste_root_result(result) {
+            Ok(warning) => {
+                let Some(proof) = root_proof else {
+                    let remaining_sources = plan.mappings[index..]
+                        .iter()
+                        .map(|mapping| mapping.source.clone())
+                        .collect();
+                    return Err(ExactPasteProofFailure {
+                        completed,
+                        completed_proofs: proofs,
+                        committed_unverified: vec![mapping.clone()],
+                        remaining_sources,
+                        warnings,
+                        error: FilePickerError::OperationCommittedButUnverified {
+                            source: mapping.source.clone(),
+                            destination: mapping.destination.clone(),
+                            message: "operation committed without returning authoritative replay proof".to_string(),
+                        },
+                    });
+                };
+                completed.push(mapping.clone());
+                proofs.push(ExactPasteRootProof {
+                    mapping: mapping.clone(),
+                    proof,
+                });
+                if let Some(message) = warning {
+                    warnings.push(PasteWarning {
+                        mapping: mapping.clone(),
+                        message,
+                    });
+                }
+            }
+            Err(error) => {
+                let remaining_sources = plan.mappings[index..]
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .filter(|source| fs::symlink_metadata(source).is_ok())
+                    .collect();
+                let committed_unverified = if matches!(
+                    &error,
+                    FilePickerError::OperationCommittedButUnverified { .. }
+                        | FilePickerError::DestinationCommittedMoveIncomplete { .. }
+                ) {
+                    vec![mapping.clone()]
+                } else {
+                    Vec::new()
+                };
+                return Err(ExactPasteProofFailure {
+                    completed,
+                    completed_proofs: proofs,
+                    committed_unverified,
+                    remaining_sources,
+                    warnings,
+                    error,
+                });
+            }
+        }
+    }
+
+    Ok(ExactPasteProofSuccess {
+        mappings: completed,
+        proofs,
+        warnings,
+    })
+}
+
+fn preflight_exact_paste_plan(
+    plan: &PastePlan,
+) -> Result<(), ExactPasteProofFailure> {
+    for mapping in &plan.mappings {
+        let failure = if fs::symlink_metadata(&mapping.source).is_err() {
+            Some(FilePickerError::ClipboardSourceMissing(mapping.source.clone()))
+        } else if mapping.destination.parent().is_none() {
+            Some(FilePickerError::NotADirectory(mapping.destination.clone()))
+        } else if !mapping.destination.parent().expect("checked parent").is_dir() {
+            Some(FilePickerError::NotADirectory(
+                mapping.destination.parent().expect("checked parent").to_path_buf(),
+            ))
+        } else if fs::symlink_metadata(&mapping.destination).is_ok() {
+            Some(FilePickerError::DestinationExists(mapping.destination.clone()))
+        } else {
+            None
+        };
+        if let Some(error) = failure {
+            return Err(ExactPasteProofFailure {
+                completed: Vec::new(),
+                completed_proofs: Vec::new(),
+                committed_unverified: Vec::new(),
+                remaining_sources: plan
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect(),
+                warnings: Vec::new(),
+                error,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn paste_filesystem_clipboard(
     clipboard: &FilesystemClipboard,
     destination_dir: &Path,
@@ -3768,6 +4518,26 @@ fn move_path_with_policy_progress_accounted_with_recovery(
     recovery_out: &mut Option<MoveRecoveryProof>,
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
+    move_path_with_policy_progress_accounted_with_recovery_and_expected(
+        source,
+        destination,
+        policy,
+        progress,
+        recovery_out,
+        None,
+        io,
+    )
+}
+
+fn move_path_with_policy_progress_accounted_with_recovery_and_expected(
+    source: &Path,
+    destination: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    recovery_out: &mut Option<MoveRecoveryProof>,
+    expected_source: Option<&crate::FileTaskRootProof>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
     progress(source, destination, 0, false)?;
     let source_capabilities = crate::filesystem_capabilities(source);
     let initial_destination_capabilities = crate::filesystem_capabilities(destination);
@@ -3777,7 +4547,7 @@ fn move_path_with_policy_progress_accounted_with_recovery(
         take_test_force_copy_then_delete_move(),
     );
     if route == InitialMoveRoute::CopyThenDelete {
-        return copy_then_delete_progress_with_resume_accounted(
+        return copy_then_delete_progress_with_resume_accounted_expected(
             source,
             destination,
             policy,
@@ -3785,14 +4555,45 @@ fn move_path_with_policy_progress_accounted_with_recovery(
             false,
             None,
             recovery_out,
+            expected_source,
             io,
         );
     }
 
+    let source_manifest = crate::capture_manifest(source).map_err(|error| FilePickerError::Io {
+        op: "capture native-rename source manifest",
+        path: source.to_path_buf(),
+        message: error,
+    })?;
+    if let Some(expected) = expected_source {
+        expected
+            .destination_manifest
+            .verify_captured_replay_source(
+                &expected.source_manifest,
+                &source_manifest,
+                source_capabilities,
+            )
+            .map_err(|message| FilePickerError::Io {
+                op: "verify native-move replay authority",
+                path: source.to_path_buf(),
+                message,
+            })?;
+    }
     let rename_proof = crate::RenameSourceProof::capture(source)
         .map_err(|error| io_error("capture native-rename source proof", source, error))?;
+    rename_proof
+        .verify_manifest_root(&source_manifest, source_capabilities)
+        .map_err(|message| FilePickerError::Io {
+            op: "bind native-rename source authority",
+            path: source.to_path_buf(),
+            message,
+        })?;
     io.rename_attempts = io.rename_attempts.saturating_add(1);
-    match rename_no_replace(source, destination) {
+    match rename_no_replace_for_operation(
+        source,
+        destination,
+        expected_source.is_some(),
+    ) {
         Ok(rename_mode) => {
             if matches!(rename_mode, RenameNoReplaceMode::CheckedBestEffort) {
                 io.rename_fallbacks = io.rename_fallbacks.saturating_add(1);
@@ -3814,6 +4615,22 @@ fn move_path_with_policy_progress_accounted_with_recovery(
                     ),
                 )
             })?;
+
+            let destination_manifest = source_manifest
+                .destination_identity_after_root_rename(
+                    rename_verification.destination_snapshot.clone(),
+                )
+                .map_err(|message| {
+                    committed_operation_unverified(
+                        source,
+                        destination,
+                        format!("native rename committed, but undo proof could not be assembled: {message}"),
+                    )
+                })?;
+            *recovery_out = Some(MoveRecoveryProof {
+                source_manifest,
+                destination_manifest,
+            });
 
             let mut warnings = if policy.verbose_degrade_notices {
                 rename_mode
@@ -3874,7 +4691,7 @@ fn move_path_with_policy_progress_accounted_with_recovery(
                 destination: destination.to_path_buf(),
             }),
             CrossDeviceCutPolicy::CopyThenDelete => {
-                copy_then_delete_progress_with_resume_accounted(
+                copy_then_delete_progress_with_resume_accounted_expected(
                     source,
                     destination,
                     policy,
@@ -3882,6 +4699,7 @@ fn move_path_with_policy_progress_accounted_with_recovery(
                     false,
                     None,
                     recovery_out,
+                    expected_source,
                     io,
                 )
             }
@@ -3892,7 +4710,7 @@ fn move_path_with_policy_progress_accounted_with_recovery(
             // explicit-delete request, so the verified copy/quarantine path is
             // the safe functional fallback even when cross-device moves are
             // otherwise disabled.
-            copy_then_delete_progress_with_resume_accounted(
+            copy_then_delete_progress_with_resume_accounted_expected(
                 source,
                 destination,
                 policy,
@@ -3900,6 +4718,7 @@ fn move_path_with_policy_progress_accounted_with_recovery(
                 false,
                 None,
                 recovery_out,
+                expected_source,
                 io,
             )
         }
@@ -3947,6 +4766,30 @@ fn copy_then_delete_progress_with_resume_accounted(
     resume_existing_destination: bool,
     retained_recovery: Option<&MoveRecoveryProof>,
     recovery_out: &mut Option<MoveRecoveryProof>,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
+    copy_then_delete_progress_with_resume_accounted_expected(
+        source,
+        destination,
+        policy,
+        progress,
+        resume_existing_destination,
+        retained_recovery,
+        recovery_out,
+        None,
+        io,
+    )
+}
+
+fn copy_then_delete_progress_with_resume_accounted_expected(
+    source: &Path,
+    destination: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    resume_existing_destination: bool,
+    retained_recovery: Option<&MoveRecoveryProof>,
+    recovery_out: &mut Option<MoveRecoveryProof>,
+    expected_source: Option<&crate::FileTaskRootProof>,
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
     let identity_policy_warning = policy
@@ -4089,14 +4932,30 @@ fn copy_then_delete_progress_with_resume_accounted(
             }
         }
     } else {
-        safe_copy_path_progress_with_notices_accounted(
+        safe_copy_path_progress_with_notices_accounted_with_expected(
             source,
             destination,
             policy,
             progress,
             io,
+            expected_source,
         )?
     };
+
+    if let Some(expected) = expected_source {
+        expected
+            .destination_manifest
+            .verify_captured_replay_source(
+                &expected.source_manifest,
+                &copy_outcome.source_manifest,
+                crate::filesystem_capabilities(source),
+            )
+            .map_err(|message| FilePickerError::Io {
+                op: "verify copy-then-delete replay authority",
+                path: source.to_path_buf(),
+                message,
+            })?;
+    }
 
     let authoritative_recovery = MoveRecoveryProof {
         source_manifest: copy_outcome.source_manifest.clone(),
@@ -4251,6 +5110,7 @@ fn copy_then_delete_progress_with_resume_accounted(
         completion_warnings.extend(quarantine_mode.degraded_warning().map(str::to_string));
     }
     completion_warnings.extend(identity_policy_warning);
+    *recovery_out = Some(authoritative_recovery);
     if !completion_warnings.is_empty() {
         return Err(committed_operation_warning(
             source,
@@ -4762,6 +5622,203 @@ fn file_type_label(path: PathBuf, is_dir: bool, is_symlink: bool) -> String {
     }
 }
 
+fn verify_case_rename_identity(
+    expected: &crate::SourceSnapshot,
+    path: &Path,
+) -> Result<(), String> {
+    let current = crate::snapshot_path(path)
+        .map_err(|error| format!("capture renamed object identity at {}: {error}", path.display()))?;
+    expected.verify_same_object_after_rename_with_capabilities(
+        &current,
+        crate::filesystem_capabilities(path),
+    )
+}
+
+fn execute_picker_case_rename_transaction(
+    paths: &[PathBuf],
+    transform: impl Fn(&str) -> String,
+) -> Result<Vec<PathBuf>, FilePickerError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parent = paths[0]
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| FilePickerError::InvalidNewItemName(paths[0].display().to_string()))?;
+    let mut mappings = Vec::new();
+    for source in paths {
+        if source.parent() != Some(parent.as_path()) {
+            return Err(FilePickerError::Io {
+                op: "case rename planning",
+                path: source.clone(),
+                message: "all selected paths must share one parent directory".to_string(),
+            });
+        }
+        let name = source.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+            FilePickerError::InvalidNewItemName(source.display().to_string())
+        })?;
+        let destination = parent.join(transform(name));
+        if destination.as_path() != source.as_path() {
+            mappings.push((source.clone(), destination));
+        }
+    }
+    if mappings.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let case_key = |path: &Path| path.to_string_lossy().to_lowercase();
+    let source_keys = mappings
+        .iter()
+        .map(|(source, _)| case_key(source))
+        .collect::<HashSet<_>>();
+    let mut destination_keys = HashSet::new();
+    for (_, destination) in &mappings {
+        if !destination_keys.insert(case_key(destination)) {
+            return Err(FilePickerError::DestinationExists(destination.clone()));
+        }
+        if destination.exists() && !source_keys.contains(&case_key(destination)) {
+            return Err(FilePickerError::DestinationExists(destination.clone()));
+        }
+    }
+
+    let source_snapshots = mappings
+        .iter()
+        .map(|(source, _)| {
+            crate::snapshot_path(source)
+                .map_err(|error| io_error("capture case-rename source identity", source, error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    static NEXT_CASE_RENAME: AtomicU64 = AtomicU64::new(0);
+    let workspace = (0..1024)
+        .find_map(|_| {
+            let sequence = NEXT_CASE_RENAME.fetch_add(1, AtomicOrdering::Relaxed);
+            let candidate = parent.join(format!(
+                ".tui-file-picker-case-rename-{}-{sequence}",
+                std::process::id(),
+            ));
+            match create_private_directory(&candidate) {
+                Ok(()) => Some(Ok(candidate)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()
+        .map_err(|error| io_error("create case-rename transaction", &parent, error))?
+        .ok_or_else(|| FilePickerError::Io {
+            op: "create case-rename transaction",
+            path: parent.clone(),
+            message: "could not allocate a private transaction workspace".to_string(),
+        })?;
+    let staging = (0..mappings.len())
+        .map(|index| workspace.join(format!("entry-{index:06}")))
+        .collect::<Vec<_>>();
+    let mut staged = Vec::new();
+    let mut installed = Vec::new();
+
+    let operation = (|| -> Result<(), FilePickerError> {
+        for (index, (source, _)) in mappings.iter().enumerate() {
+            fs::rename(source, &staging[index])
+                .map_err(|error| io_error("stage case rename", source, error))?;
+            staged.push(index);
+            verify_case_rename_identity(&source_snapshots[index], &staging[index])
+                .map_err(|message| FilePickerError::Io {
+                    op: "verify staged case rename",
+                    path: staging[index].clone(),
+                    message,
+                })?;
+        }
+        for (index, (_, destination)) in mappings.iter().enumerate() {
+            rename_no_replace(&staging[index], destination).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    FilePickerError::DestinationExists(destination.clone())
+                } else {
+                    io_error("install case rename", destination, error)
+                }
+            })?;
+            installed.push(index);
+            verify_case_rename_identity(&source_snapshots[index], destination)
+                .map_err(|message| FilePickerError::Io {
+                    op: "verify installed case rename",
+                    path: destination.clone(),
+                    message,
+                })?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = operation {
+        let mut rollback_errors = Vec::new();
+        for &index in installed.iter().rev() {
+            let destination = &mappings[index].1;
+            if let Err(message) = verify_case_rename_identity(
+                &source_snapshots[index],
+                destination,
+            ) {
+                rollback_errors.push(format!(
+                    "refused to roll back replaced destination {}: {message}",
+                    destination.display(),
+                ));
+                continue;
+            }
+            if let Err(rollback) = rename_no_replace(destination, &staging[index]) {
+                rollback_errors.push(format!(
+                    "restore installed destination {} to staging: {rollback}",
+                    destination.display(),
+                ));
+            }
+        }
+        for &index in staged.iter().rev() {
+            if fs::symlink_metadata(&staging[index]).is_err() {
+                continue;
+            }
+            if let Err(message) = verify_case_rename_identity(
+                &source_snapshots[index],
+                &staging[index],
+            ) {
+                rollback_errors.push(format!(
+                    "refused to restore changed staged object {}: {message}",
+                    staging[index].display(),
+                ));
+                continue;
+            }
+            if let Err(rollback) = rename_no_replace(&staging[index], &mappings[index].0) {
+                rollback_errors.push(format!(
+                    "restore original pathname {}: {rollback}",
+                    mappings[index].0.display(),
+                ));
+            }
+        }
+        if rollback_errors.is_empty() {
+            if let Err(cleanup) = fs::remove_dir(&workspace) {
+                rollback_errors.push(format!(
+                    "remove empty transaction workspace {}: {cleanup}",
+                    workspace.display(),
+                ));
+            }
+        }
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+        return Err(FilePickerError::Io {
+            op: "roll back case-rename transaction",
+            path: workspace,
+            message: format!(
+                "{error}; rollback was incomplete and retained recoverable objects in the transaction workspace: {}",
+                rollback_errors.join("; "),
+            ),
+        });
+    }
+
+    // The namespace transaction is already committed. Failure to remove an
+    // empty private workspace must not misreport a successful rename as a
+    // failed operation (which could prompt an unsafe retry). Best-effort
+    // cleanup is safe because every staged object was installed and verified.
+    let _ = fs::remove_dir(&workspace);
+    let _ = sync_directory(&parent);
+    Ok(mappings.into_iter().map(|(_, destination)| destination).collect())
+}
+
 fn unique_path(path: &Path) -> PathBuf {
     if !path.exists() {
         return path.to_path_buf();
@@ -4914,6 +5971,18 @@ where
     }
 }
 
+fn rename_no_replace_for_operation(
+    source: &Path,
+    destination: &Path,
+    require_atomic_authority: bool,
+) -> io::Result<RenameNoReplaceMode> {
+    if require_atomic_authority {
+        return crate::rename_path_no_replace(source, destination)
+            .map(|()| RenameNoReplaceMode::Atomic);
+    }
+    rename_no_replace(source, destination)
+}
+
 fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<RenameNoReplaceMode> {
     if crate::filesystem_capabilities(destination).atomic_no_replace_rename
         == crate::CapabilitySupport::Unsupported
@@ -5021,6 +6090,7 @@ where
         policy,
         progress,
         &mut io,
+        None,
         verify_published,
     )
 }
@@ -5032,12 +6102,31 @@ fn safe_copy_path_progress_with_notices_accounted(
     progress: &mut FileOperationProgress<'_>,
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<VerifiedCopyOutcome, FilePickerError> {
+    safe_copy_path_progress_with_notices_accounted_with_expected(
+        src,
+        dst,
+        policy,
+        progress,
+        io,
+        None,
+    )
+}
+
+fn safe_copy_path_progress_with_notices_accounted_with_expected(
+    src: &Path,
+    dst: &Path,
+    policy: FileOperationPolicy,
+    progress: &mut FileOperationProgress<'_>,
+    io: &mut crate::FileOperationIoCounters,
+    expected_source: Option<&crate::FileTaskRootProof>,
+) -> Result<VerifiedCopyOutcome, FilePickerError> {
     safe_copy_path_progress_with_notices_and_verifier_accounted(
         src,
         dst,
         policy,
         progress,
         io,
+        expected_source,
         |manifest, published| manifest.capture_verified_copy_at(published),
     )
 }
@@ -5048,6 +6137,7 @@ fn safe_copy_path_progress_with_notices_and_verifier_accounted<F>(
     policy: FileOperationPolicy,
     progress: &mut FileOperationProgress<'_>,
     io: &mut crate::FileOperationIoCounters,
+    expected_source: Option<&crate::FileTaskRootProof>,
     verify_published: F,
 ) -> Result<VerifiedCopyOutcome, FilePickerError>
 where
@@ -5075,9 +6165,28 @@ where
         io,
     )
     .and_then(|()| {
+        if let Some(expected) = expected_source {
+            expected
+                .destination_manifest
+                .verify_captured_replay_source(
+                    &expected.source_manifest,
+                    &source_manifest,
+                    crate::filesystem_capabilities(src),
+                )
+                .map_err(|message| FilePickerError::Io {
+                    op: "verify replay source authority",
+                    path: src.to_path_buf(),
+                    message,
+                })?;
+        }
         progress(src, dst, 0, false)?;
         io.rename_attempts = io.rename_attempts.saturating_add(1);
-        let publication_mode = rename_no_replace(&staging, dst).map_err(|err| {
+        let publication_mode = rename_no_replace_for_operation(
+            &staging,
+            dst,
+            expected_source.is_some(),
+        )
+        .map_err(|err| {
             if err.kind() == io::ErrorKind::AlreadyExists {
                 FilePickerError::DestinationExists(dst.to_path_buf())
             } else {
@@ -5657,6 +6766,23 @@ pub(crate) fn root_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn standalone_title_case_matches_ampersand_and_parenthetical_contract() {
+        assert_eq!(
+            default_picker_title_case("Booker T & the MG's"),
+            "Booker T & The MG's",
+        );
+        assert_eq!(
+            default_picker_title_case("Neil Young & the Shocking Pinks"),
+            "Neil Young & The Shocking Pinks",
+        );
+        assert_eq!(
+            default_picker_title_case("(Japan P-11356 Promo LP / 32-192)"),
+            "(Japan P-11356 Promo LP / 32-192)",
+        );
+        assert_eq!(default_picker_title_case("TELL US WHY"), "Tell Us Why");
+        assert_eq!(default_picker_title_case("(US PROMO LP)"), "(US Promo LP)");
+    }
 
     #[test]
     fn delete_io_errors_have_status_bar_copy_without_full_path() {
@@ -5689,6 +6815,89 @@ mod tests {
         assert!(same_path(picker.current_dir(), &one));
         assert!(picker.navigate_to_dir(two));
         assert!(picker.history_forward.is_empty());
+    }
+
+    #[test]
+    fn exact_paste_plan_preserves_destinations_and_preflights_the_whole_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let first_source = source_dir.join("first.flac");
+        let second_source = source_dir.join("second.flac");
+        fs::write(&first_source, b"first").expect("first source");
+        fs::write(&second_source, b"second").expect("second source");
+
+        let exact_destination = destination_dir.join("kept-name.flac");
+        let success = execute_exact_paste_plan(
+            &PastePlan {
+                mode: FilePickerClipboardMode::Copy,
+                mappings: vec![PasteMapping {
+                    source: first_source.clone(),
+                    destination: exact_destination.clone(),
+                }],
+            },
+            FileOperationPolicy::default(),
+        )
+        .expect("exact copy");
+        assert_eq!(success.mappings[0].destination, exact_destination);
+        assert_eq!(fs::read(&exact_destination).expect("copied bytes"), b"first");
+
+        let blocked_destination = destination_dir.join("blocked.flac");
+        fs::write(&blocked_destination, b"existing").expect("blocker");
+        let never_created = destination_dir.join("never-created.flac");
+        let failure = execute_exact_paste_plan(
+            &PastePlan {
+                mode: FilePickerClipboardMode::Copy,
+                mappings: vec![
+                    PasteMapping {
+                        source: second_source.clone(),
+                        destination: never_created.clone(),
+                    },
+                    PasteMapping {
+                        source: first_source,
+                        destination: blocked_destination.clone(),
+                    },
+                ],
+            },
+            FileOperationPolicy::default(),
+        )
+        .expect_err("destination conflict must fail preflight");
+        assert!(matches!(failure.error, FilePickerError::DestinationExists(path) if path == blocked_destination));
+        assert!(!never_created.exists(), "preflight must prevent partial mutation");
+        assert_eq!(fs::read(blocked_destination).expect("blocker intact"), b"existing");
+    }
+
+    #[test]
+    fn configured_sort_is_applied_and_same_column_click_toggles_direction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("a.flac"), b"longer").expect("a");
+        fs::write(temp.path().join("b.flac"), b"x").expect("b");
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            sort_key: FilePickerSortKey::Size,
+            sort_reverse: false,
+            ..FilePickerConfig::default()
+        });
+        let names = picker.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["b.flac", "a.flac"]);
+        assert_eq!(picker.sort_key(), FilePickerSortKey::Size);
+        assert!(!picker.sort_reverse());
+        assert!(!picker.sort_changed());
+
+        picker.set_sort(FilePickerSortKey::Size);
+        let names = picker.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.flac", "b.flac"]);
+        assert!(picker.sort_reverse());
+        assert!(picker.sort_changed());
+
+        picker.set_sort(FilePickerSortKey::Name);
+        let names = picker.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["a.flac", "b.flac"]);
+        assert_eq!(picker.sort_key(), FilePickerSortKey::Name);
+        assert!(!picker.sort_reverse(), "a newly selected column starts ascending");
     }
 
     #[test]
@@ -7445,4 +8654,142 @@ mod tests {
         assert!(!source.exists());
     }
 
+}
+
+#[cfg(test)]
+mod case_rename_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn picker_case_rename_transaction_supports_case_only_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("foo.flac");
+        let destination = temp.path().join("Foo.flac");
+        fs::write(&source, b"audio").expect("fixture");
+
+        let result = execute_picker_case_rename_transaction(
+            std::slice::from_ref(&source),
+            |name| {
+                if name == "foo.flac" {
+                    "Foo.flac".to_string()
+                } else {
+                    name.to_string()
+                }
+            },
+        )
+        .expect("case-only rename");
+
+        assert_eq!(result, vec![destination.clone()]);
+        assert_eq!(fs::read(&destination).expect("renamed file"), b"audio");
+    }
+
+    #[test]
+    fn picker_case_rename_transaction_stages_swaps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("A.flac");
+        let b = temp.path().join("B.flac");
+        fs::write(&a, b"A bytes").expect("A");
+        fs::write(&b, b"B bytes").expect("B");
+
+        let result = execute_picker_case_rename_transaction(&[a.clone(), b.clone()], |name| {
+            match name {
+                "A.flac" => "B.flac".to_string(),
+                "B.flac" => "A.flac".to_string(),
+                other => other.to_string(),
+            }
+        })
+        .expect("swap");
+
+        assert_eq!(result, vec![b.clone(), a.clone()]);
+        assert_eq!(fs::read(&a).expect("A after swap"), b"B bytes");
+        assert_eq!(fs::read(&b).expect("B after swap"), b"A bytes");
+    }
+
+    #[test]
+    fn picker_case_rename_collision_is_rejected_before_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("A.flac");
+        let b = temp.path().join("B.flac");
+        fs::write(&a, b"A bytes").expect("A");
+        fs::write(&b, b"B bytes").expect("B");
+
+        let error = execute_picker_case_rename_transaction(&[a.clone(), b.clone()], |_| {
+            "same.flac".to_string()
+        })
+        .expect_err("duplicate destination");
+
+        assert!(matches!(error, FilePickerError::DestinationExists(_)));
+        assert_eq!(fs::read(&a).expect("A unchanged"), b"A bytes");
+        assert_eq!(fs::read(&b).expect("B unchanged"), b"B bytes");
+    }
+}
+
+#[cfg(test)]
+mod exact_replay_authority_tests {
+    use super::*;
+
+    fn retained_same_path_proof(path: &Path) -> crate::FileTaskRootProof {
+        let source_manifest = crate::capture_manifest(path).expect("capture retained source");
+        let destination_manifest = source_manifest.destination_identity_for_same_tree();
+        crate::FileTaskRootProof {
+            source_manifest,
+            destination_manifest,
+        }
+    }
+
+    #[test]
+    fn copy_replay_rejects_changed_source_before_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        fs::write(&source, b"authorized bytes").expect("source");
+        let expected = retained_same_path_proof(&source);
+        fs::write(&source, b"replacement bytes").expect("replace source");
+
+        let plan = PastePlan {
+            mode: FilePickerClipboardMode::Copy,
+            mappings: vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        };
+        let failure = execute_exact_paste_plan_with_proofs_and_expected_sources(
+            &plan,
+            FileOperationPolicy::default(),
+            &[expected],
+        )
+        .expect_err("changed replay source must be refused");
+
+        assert!(failure.to_string().contains("replay source"));
+        assert!(!destination.exists(), "unauthorized bytes must never be published");
+        assert_eq!(fs::read(&source).expect("source retained"), b"replacement bytes");
+    }
+
+    #[test]
+    fn move_replay_rejects_changed_source_before_namespace_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        fs::write(&source, b"authorized bytes").expect("source");
+        let expected = retained_same_path_proof(&source);
+        fs::write(&source, b"replacement bytes").expect("replace source");
+
+        let plan = PastePlan {
+            mode: FilePickerClipboardMode::Cut,
+            mappings: vec![PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        };
+        let failure = execute_exact_paste_plan_with_proofs_and_expected_sources(
+            &plan,
+            FileOperationPolicy::default(),
+            &[expected],
+        )
+        .expect_err("changed replay source must be refused");
+
+        assert!(failure.to_string().contains("replay authority"));
+        assert!(!destination.exists(), "unauthorized object must not be moved");
+        assert_eq!(fs::read(&source).expect("source retained"), b"replacement bytes");
+    }
 }

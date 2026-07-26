@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{OnceLock, RwLock};
 use std::thread;
 #[cfg(not(unix))]
 use std::time::Duration;
@@ -318,9 +319,40 @@ impl FilePickerBookmarks {
     }
 }
 
+fn bookmark_config_home_override_cell() -> &'static RwLock<Option<PathBuf>> {
+    static OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+/// Replace the explicit configuration-home override used by host test suites.
+///
+/// This is intentionally hidden from normal application APIs. It exists so a
+/// host can isolate the reusable picker even when `dirs` or the platform has
+/// cached environment-derived locations. The previous override is returned so
+/// a panic-safe guard can restore nested ownership exactly.
+#[doc(hidden)]
+pub fn replace_bookmark_config_home_override_for_tests(
+    next: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let mut override_path = bookmark_config_home_override_cell()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::replace(&mut *override_path, next)
+}
+
+fn bookmark_config_home() -> PathBuf {
+    if let Some(path) = bookmark_config_home_override_cell()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return path;
+    }
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub fn bookmark_storage_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+    bookmark_config_home()
         .join("tonepoet")
         .join("bookmarks.toml")
 }
