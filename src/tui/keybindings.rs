@@ -1363,12 +1363,16 @@ fn record_rename_report_for_undo(
         }
     }
     if !proof_failures.is_empty() {
-        return Some(format!(
+        let proof_message = format!(
             "rename committed, but no partial undo entry was recorded because {} root proof{} failed: {}",
             proof_failures.len(),
             if proof_failures.len() == 1 { "" } else { "s" },
             proof_failures.join("; "),
-        ));
+        );
+        return Some(match report.warning {
+            Some(warning) => format!("{warning}; {proof_message}"),
+            None => proof_message,
+        });
     }
     let id = app.file_operation_undo.allocate_id();
     app.file_operation_undo.record(FileOperationUndoEntry {
@@ -1396,6 +1400,47 @@ fn spawn_rename_plan(
             result,
         });
     });
+}
+
+/// Retain a terminal diagnostics record for a rename outcome so the full text
+/// is reviewable via `:messages` — the status line truncates at the screen
+/// edge and long paths made failures unreadable there.
+fn retain_rename_outcome_report(
+    app: &mut AppState,
+    description: &str,
+    detail: &str,
+    failed: bool,
+) {
+    let id = app.file_operation_undo.allocate_id();
+    let mut progress = tui_file_picker::FileTaskProgressState::new(
+        tui_file_picker::FileTaskKind::Move,
+        description.to_string(),
+        file_picker_theme_from_theme(&app.theme),
+    );
+    let mut totals = tui_file_picker::ProgressTotals::default();
+    totals.items_total = Some(1);
+    totals.items_done = if failed { 0 } else { 1 };
+    progress.apply_update(tui_file_picker::FileTaskProgressUpdate::RecordError {
+        error: tui_file_picker::FileTaskErrorRecord {
+            item_label: description.to_string(),
+            source: None,
+            destination: None,
+            message: detail.to_string(),
+        },
+        totals,
+    });
+    progress.apply_update(if failed {
+        tui_file_picker::FileTaskProgressUpdate::Failed {
+            status: format!("{description} failed"),
+            totals,
+        }
+    } else {
+        tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: format!("{description} committed with warning"),
+            totals,
+        }
+    });
+    app.last_file_task_progress = Some((id, progress));
 }
 
 pub(crate) fn complete_rename_plan(
@@ -1432,8 +1477,9 @@ pub(crate) fn complete_rename_plan(
                 }
             }
             if let Some(warning) = warning {
+                retain_rename_outcome_report(app, &description, &warning, false);
                 app.set_status(format!(
-                    "{description}: renamed {} item{}; committed with warning: {warning}",
+                    "{description}: renamed {} item{}; committed with warning ({warning}) — :messages for full text",
                     succeeded_count,
                     if succeeded_count == 1 { "" } else { "s" },
                 ));
@@ -1447,7 +1493,10 @@ pub(crate) fn complete_rename_plan(
         }
         Err(error) => {
             app.pending_inline_rename_resume = None;
-            app.set_status(format!("{description} failed: {error}"));
+            retain_rename_outcome_report(app, &description, &error, true);
+            app.set_status(format!(
+                "{description} failed ({error}) — :messages for full text"
+            ));
         }
     }
 }
@@ -53946,6 +53995,45 @@ mod file_picker_browse_parity_regression_tests {
             .is_some_and(|message| message.contains("after deleting 1 quarantined entry")));
     }
 
+}
+
+#[cfg(test)]
+mod rename_outcome_diagnostics_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    #[test]
+    fn rename_failure_is_retained_for_messages_review_with_full_text() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(4);
+        let long_error = format!(
+            "rename staging failed: /mnt/share/Air Supply - Lost in Love (1980) [VINYL] {{24-192}}/{}: atomic no-replace rename is unavailable on this kernel or filesystem",
+            "x".repeat(120),
+        );
+
+        complete_rename_plan(
+            &mut app,
+            "rename".to_string(),
+            std::path::PathBuf::from("/mnt/share"),
+            Err(long_error.clone()),
+            &tx,
+        );
+
+        let (_, progress) = app
+            .last_file_task_progress
+            .as_ref()
+            .expect("failed rename must retain a reviewable report");
+        assert!(progress.is_terminal());
+        assert!(progress
+            .error_records
+            .iter()
+            .any(|record| record.message == long_error));
+        let status = app.status_message.as_ref().map(|(message, _)| message.as_str());
+        assert!(
+            status.is_some_and(|message| message.contains(":messages")),
+            "status must point at the full-text review surface, got {status:?}",
+        );
+    }
 }
 
 #[cfg(test)]

@@ -348,7 +348,7 @@ fn execute_plan_with_proofs_internal(
     let result = execute_shared_transaction(&transaction, &workspace);
     let cleanup_result = std::fs::remove_dir(&workspace);
     match result {
-        Ok(count) => {
+        Ok((count, degraded_warning)) => {
             for &index in &pending_indices {
                 plan.ops[index].status = OpStatus::Succeeded;
             }
@@ -361,6 +361,11 @@ fn execute_plan_with_proofs_internal(
             if let Some(warning) = cleanup_warning.as_deref() {
                 log::warn!("{warning}");
             }
+            let cleanup_warning = match (degraded_warning, cleanup_warning) {
+                (Some(degraded), Some(cleanup)) => Some(format!("{degraded}; {cleanup}")),
+                (Some(degraded), None) => Some(degraded.to_string()),
+                (None, cleanup) => cleanup,
+            };
 
             let roots = authorities
                 .into_iter()
@@ -459,7 +464,11 @@ fn create_unique_rename_workspace(base_dir: &Path) -> Result<PathBuf, String> {
 fn execute_shared_transaction(
     transaction: &RenameTransactionPlan,
     workspace: &Path,
-) -> Result<usize, String> {
+) -> Result<(usize, Option<&'static str>), String> {
+    // Default-path posture: use the degrading no-replace ladder so renames work
+    // on mounts without renameat2 authority (cifs, ntfs-3g); the first degraded
+    // hop yields a single post-commit warning instead of a hard failure.
+    let mut degraded: Option<&'static str> = None;
     let staging_paths = transaction
         .entries
         .iter()
@@ -493,13 +502,15 @@ fn execute_shared_transaction(
                     ));
                 }
             }
-            tui_file_picker::rename_path_no_replace(&source, &staging_paths[index]).map_err(|error| {
-                format!(
-                    "rename staging failed: {} -> {}: {error}",
-                    source.display(),
-                    staging_paths[index].display()
-                )
-            })?;
+            let mode = tui_file_picker::rename_no_replace(&source, &staging_paths[index])
+                .map_err(|error| {
+                    format!(
+                        "rename staging failed: {} -> {}: {error}",
+                        source.display(),
+                        staging_paths[index].display()
+                    )
+                })?;
+            degraded = degraded.or(mode.degraded_warning());
             staged.push(index);
         }
 
@@ -513,27 +524,29 @@ fn execute_shared_transaction(
                     )
                 })?;
             }
-            tui_file_picker::rename_path_no_replace(&staging_paths[index], &entry.destination).map_err(|error| {
-                format!(
-                    "rename publish failed: {} -> {}: {error}",
-                    staging_paths[index].display(),
-                    entry.destination.display()
-                )
-            })?;
+            let mode = tui_file_picker::rename_no_replace(&staging_paths[index], &entry.destination)
+                .map_err(|error| {
+                    format!(
+                        "rename publish failed: {} -> {}: {error}",
+                        staging_paths[index].display(),
+                        entry.destination.display()
+                    )
+                })?;
+            degraded = degraded.or(mode.degraded_warning());
             installed.push(index);
         }
         Ok(transaction.entries.len())
     })();
 
     match operation {
-        Ok(count) => Ok(count),
+        Ok(count) => Ok((count, degraded)),
         Err(primary) => {
             let mut rollback_errors = Vec::new();
             for &index in installed.iter().rev() {
                 let entry = &transaction.entries[index];
                 match std::fs::symlink_metadata(&entry.destination) {
                     Ok(_) => {
-                        if let Err(error) = tui_file_picker::rename_path_no_replace(
+                        if let Err(error) = tui_file_picker::rename_no_replace(
                             &entry.destination,
                             &staging_paths[index],
                         ) {
@@ -578,7 +591,7 @@ fn execute_shared_transaction(
                         continue;
                     }
                 }
-                if let Err(error) = tui_file_picker::rename_path_no_replace(
+                if let Err(error) = tui_file_picker::rename_no_replace(
                     &staging_paths[index],
                     &restore_target,
                 ) {
@@ -648,6 +661,51 @@ fn effective_restore_target(
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod live_mount_repro {
+    use super::*;
+
+    /// Field-repro harness: drives the real rename engine against a live mount.
+    /// Run manually:
+    ///   TONEPOET_REPRO_DIR=/path/on/mount cargo test -p tonepoet --lib --     ///     live_mount_repro --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn directory_rename_on_live_mount() {
+        let Some(base) = std::env::var_os("TONEPOET_REPRO_DIR") else {
+            eprintln!("TONEPOET_REPRO_DIR not set; skipping");
+            return;
+        };
+        let base = PathBuf::from(base);
+        let scratch = base
+            .join(format!(".tonepoet-repro-{}", std::process::id()))
+            .join("Air Supply - Lost in Love (1980) [VINYL] {24-192}");
+        std::fs::create_dir_all(scratch.join("Artworks-old")).expect("scratch dir");
+        std::fs::write(scratch.join("Artworks-old/cover.jpg"), b"jpg").expect("file");
+
+        let mut plan = RenamePlan::new(
+            scratch.clone(),
+            vec![(scratch.join("Artworks-old"), "Artworks-new".to_string())],
+        );
+        let conflicts = validate_plan(&mut plan);
+        eprintln!("validate_plan conflicts: {conflicts}");
+        for op in &plan.ops {
+            eprintln!("op status: {:?}", op.status);
+        }
+        if conflicts == 0 {
+            match execute_plan_with_proofs(&mut plan) {
+                Ok(report) => {
+                    eprintln!("SUCCEEDED: {} (warning: {:?})", report.succeeded_count, report.warning);
+                    for root in &report.roots {
+                        eprintln!("root proof: {:?}", root.proof.as_ref().map(|_| "ok").map_err(|e| e.clone()));
+                    }
+                }
+                Err(error) => eprintln!("FAILED: {error}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(scratch.parent().unwrap_or(&scratch));
+    }
+}
 
 #[cfg(test)]
 mod tests {

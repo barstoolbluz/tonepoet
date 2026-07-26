@@ -5918,7 +5918,7 @@ fn rename_no_replace_fast(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenameNoReplaceMode {
+pub enum RenameNoReplaceMode {
     Atomic,
     /// The filesystem rejected the atomic no-replace primitive. We checked
     /// that the destination was absent immediately before a plain rename.
@@ -5928,7 +5928,7 @@ enum RenameNoReplaceMode {
 }
 
 impl RenameNoReplaceMode {
-    fn degraded_warning(self) -> Option<&'static str> {
+    pub fn degraded_warning(self) -> Option<&'static str> {
         matches!(self, Self::CheckedBestEffort).then_some(
             "filesystem lacks atomic no-clobber rename; used a checked best-effort rename",
         )
@@ -5983,7 +5983,11 @@ fn rename_no_replace_for_operation(
     rename_no_replace(source, destination)
 }
 
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<RenameNoReplaceMode> {
+/// Rename without replacing an existing destination, degrading from the atomic
+/// no-replace primitive to a checked best-effort rename on mounts that lack it
+/// (cifs, ntfs-3g/FUSE). This is the default-path primitive: casual usage must
+/// work on real-world mounts; callers surface the degraded-mode warning once.
+pub fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<RenameNoReplaceMode> {
     if crate::filesystem_capabilities(destination).atomic_no_replace_rename
         == crate::CapabilitySupport::Unsupported
     {

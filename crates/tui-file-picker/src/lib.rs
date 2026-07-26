@@ -43,6 +43,7 @@ pub use bookmarks::{
     BookmarkReconciledCommit, BookmarkRecord, BookmarkSaveStatus,
 };
 pub use name_validation::{validate_file_name, NameValidationError};
+pub use state::{rename_no_replace, RenameNoReplaceMode};
 pub use source_guard::{
     capture_manifest, capture_manifest_with_cancel, digest_open_file,
     filesystem_capabilities, filesystem_identity_policy, filesystem_identity_policy_notice,
