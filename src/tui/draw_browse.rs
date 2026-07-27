@@ -369,7 +369,12 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     let row_area = Rect::new(area.x + 1, area.y + 3, area.width.saturating_sub(2), 1);
     const GO_WIDTH: u16 = 5;
     const BOOKMARK_WIDTH: u16 = 13;
-    let action_width = GO_WIDTH.saturating_add(BOOKMARK_WIDTH);
+    // One blank cell between Go and bookmarks so the two buttons read as
+    // separate controls instead of one fused pill (user-requested spacer).
+    const ACTION_GAP: u16 = 1;
+    let action_width = GO_WIDTH
+        .saturating_add(ACTION_GAP)
+        .saturating_add(BOOKMARK_WIDTH);
     let path_area = Rect::new(
         row_area.x,
         row_area.y,
@@ -398,7 +403,12 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     }
     if row_area.width >= action_width {
         let go = Rect::new(row_area.right().saturating_sub(action_width), row_area.y, GO_WIDTH, 1);
-        let bookmarks = Rect::new(go.right(), row_area.y, BOOKMARK_WIDTH, 1);
+        let bookmarks = Rect::new(
+            go.right().saturating_add(ACTION_GAP),
+            row_area.y,
+            BOOKMARK_WIDTH,
+            1,
+        );
         f.render_widget(Paragraph::new(" Go ").style(browse_toolbar_button_style(theme)), go);
         f.render_widget(
             Paragraph::new(" bookmarks ▾ ").style(browse_toolbar_button_style(theme)),

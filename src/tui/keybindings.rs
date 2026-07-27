@@ -53998,6 +53998,88 @@ mod file_picker_browse_parity_regression_tests {
 }
 
 #[cfg(test)]
+mod live_mount_perf_harness {
+    use super::*;
+
+    /// Field-perf harness: times a real copy/move through FileTaskWorker vs a
+    /// plain std::fs baseline on any mount. Run manually:
+    ///   TONEPOET_PERF_DIR=/path/on/mount [TONEPOET_PERF_FILES=24]     ///   [TONEPOET_PERF_MB=8] cargo test -p tonepoet --lib --     ///     live_mount_perf --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_mount_perf() {
+        let Some(base) = std::env::var_os("TONEPOET_PERF_DIR") else {
+            eprintln!("TONEPOET_PERF_DIR not set; skipping");
+            return;
+        };
+        let files: usize = std::env::var("TONEPOET_PERF_FILES")
+            .ok().and_then(|value| value.parse().ok()).unwrap_or(24);
+        let mb: usize = std::env::var("TONEPOET_PERF_MB")
+            .ok().and_then(|value| value.parse().ok()).unwrap_or(8);
+        let base = std::path::PathBuf::from(base);
+        let scratch = base.join(format!(".tonepoet-perf-{}", std::process::id()));
+        let album = scratch.join("album");
+        std::fs::create_dir_all(&album).expect("scratch");
+        let payload = vec![0xA5u8; mb * 1024 * 1024];
+        for index in 0..files {
+            std::fs::write(album.join(format!("{index:02}.flac")), &payload).expect("fixture");
+        }
+        let total_mb = files * mb;
+
+        let run_worker = |sources: Vec<std::path::PathBuf>, dest: &std::path::Path, is_move: bool| {
+            let (tx, mut rx) = mpsc::channel::<AppMessage>(1024);
+            let drain = std::thread::spawn(move || while rx.blocking_recv().is_some() {});
+            let (_control_tx, control_rx) = std::sync::mpsc::channel();
+            let start = std::time::Instant::now();
+            FileTaskWorker::new(
+                FileTaskJob {
+                    session_id: 1,
+                    sources,
+                    dest: dest.display().to_string(),
+                    force: false,
+                    is_move,
+                    conflict_policy: None,
+                    root_targets: None,
+                    clipboard_retry_plan: None,
+                    verbose_degrade_notices: false,
+                },
+                tx,
+                control_rx,
+            )
+            .run();
+            let elapsed = start.elapsed();
+            drain.join().expect("drain");
+            elapsed
+        };
+
+        // Baseline: plain read+write copy of the same tree.
+        let baseline_dest = scratch.join("baseline");
+        std::fs::create_dir_all(&baseline_dest).expect("baseline dir");
+        let start = std::time::Instant::now();
+        for entry in std::fs::read_dir(&album).expect("read album") {
+            let entry = entry.expect("entry");
+            std::fs::copy(entry.path(), baseline_dest.join(entry.file_name())).expect("copy");
+        }
+        let baseline = start.elapsed();
+        std::fs::remove_dir_all(&baseline_dest).expect("baseline cleanup");
+
+        let copy_dest = scratch.join("copied");
+        std::fs::create_dir_all(&copy_dest).expect("copy dest");
+        let engine_copy = run_worker(vec![album.clone()], &copy_dest, false);
+
+        let move_dest = scratch.join("moved");
+        std::fs::create_dir_all(&move_dest).expect("move dest");
+        let engine_move = run_worker(vec![copy_dest.join("album")], &move_dest, true);
+
+        eprintln!("PERF {total_mb} MiB across {files} files at {}:", base.display());
+        eprintln!("  baseline plain copy : {baseline:?}");
+        eprintln!("  engine copy         : {engine_copy:?}  ({:.1}x baseline)",
+            engine_copy.as_secs_f64() / baseline.as_secs_f64().max(1e-9));
+        eprintln!("  engine move (same mount): {engine_move:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+#[cfg(test)]
 mod rename_outcome_diagnostics_tests {
     use super::*;
     use crate::config::TonepoetConfig;
