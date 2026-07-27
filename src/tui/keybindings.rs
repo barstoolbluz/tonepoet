@@ -542,6 +542,14 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
             adjust_archive_listing_timeout(app, 5);
             return;
         }
+        (KeyCode::Enter | KeyCode::Char('v') | KeyCode::Char('f'), KeyModifiers::NONE)
+            if app.config_focus == ConfigFocus::Performance =>
+        {
+            app.active_overlay = ActiveOverlay::FileOperationSettings(
+                FileOperationSettingsState::from_config(&app.config.file_operations),
+            );
+            return;
+        }
         (KeyCode::Char('0'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
             app.config.performance.browsing.archive_listing_timeout = 0;
             if let Err(error) = app.config.save() {
@@ -1199,6 +1207,13 @@ pub(crate) fn file_picker_config_with_browse_sort(
         _ => tui_file_picker::FilePickerSortKey::Name,
     };
     config.sort_reverse = app.browse.default_sort_dir == SortDir::Desc;
+    // The dedicated picker and Browse-hosted picker surfaces share the same
+    // persisted file-operation authority and presentation policy. Individual
+    // picker purposes may disable operations, but enabled operations must not
+    // silently fall back to a different verification level.
+    config.operation_policy.verification = app.config.file_operations.verification;
+    config.operation_policy.verbose_degrade_notices =
+        app.file_task_verbose_degrade_notices;
     config
 }
 
@@ -1387,13 +1402,17 @@ fn record_rename_report_for_undo(
 fn spawn_rename_plan(
     plan: crate::tui::rename_plan::RenamePlan,
     description: String,
+    verification: tui_file_picker::VerificationMode,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let base_dir = plan.base_dir.clone();
     let tx = tx.clone();
     std::thread::spawn(move || {
         let mut plan = plan;
-        let result = crate::tui::rename_plan::execute_plan_with_proofs(&mut plan);
+        let result = crate::tui::rename_plan::execute_plan_with_proofs_at_verification(
+            &mut plan,
+            verification,
+        );
         let _ = tx.blocking_send(AppMessage::RenamePlanComplete {
             description,
             base_dir,
@@ -1453,7 +1472,7 @@ pub(crate) fn complete_rename_plan(
     match result {
         Ok(report) if report.succeeded_count == 0 => {
             app.pending_inline_rename_resume = None;
-            app.set_status(format!("{description}: names already match"));
+            app.set_routine_file_operation_status(format!("{description}: names already match"));
         }
         Ok(report) => {
             let succeeded_count = report.succeeded_count;
@@ -1484,7 +1503,7 @@ pub(crate) fn complete_rename_plan(
                     if succeeded_count == 1 { "" } else { "s" },
                 ));
             } else {
-                app.set_status(format!(
+                app.set_routine_file_operation_status(format!(
                     "{description}: renamed {} item{}",
                     succeeded_count,
                     if succeeded_count == 1 { "" } else { "s" },
@@ -1538,8 +1557,13 @@ pub(crate) fn rename_paths_with_case_transform(
         app.set_status("case rename refused: target conflict or invalid end state");
         return;
     }
-    app.set_status("Applying capitalization rename...");
-    spawn_rename_plan(plan, "capitalization rename".to_string(), tx);
+    app.set_routine_file_operation_status("Applying capitalization rename...");
+    spawn_rename_plan(
+        plan,
+        "capitalization rename".to_string(),
+        app.config.file_operations.verification,
+        tx,
+    );
 }
 
 #[cfg(test)]
@@ -1628,9 +1652,20 @@ fn execute_transactional_rename_replay(
                 .to_string(),
         );
     }
-    let report = crate::tui::rename_plan::execute_plan_with_proofs_and_expected_sources(
+    let verification = expected_sources
+        .first()
+        .map(|proof| proof.source_manifest.verification())
+        .ok_or_else(|| "rename replay has no retained source authority".to_string())?;
+    if expected_sources.iter().any(|proof| {
+        proof.source_manifest.verification() != verification
+            || proof.destination_manifest.verification() != verification
+    }) {
+        return Err("rename replay supplied mixed verification authorities".to_string());
+    }
+    let report = crate::tui::rename_plan::execute_plan_with_proofs_and_expected_sources_at_verification(
         &mut plan,
         &expected_sources,
+        verification,
     )?;
     if report.succeeded_count != entry.mappings.len() {
         return Err(format!(
@@ -1642,8 +1677,48 @@ fn execute_transactional_rename_replay(
     Ok(report)
 }
 
-fn undo_redo_policy(app: &AppState) -> tui_file_picker::FileOperationPolicy {
-    tui_file_picker::FileOperationPolicy {
+fn retained_file_operation_verification(
+    entry: &FileOperationUndoEntry,
+) -> Result<tui_file_picker::VerificationMode, String> {
+    let mut retained = None;
+    for mapping in &entry.mappings {
+        for proof in [mapping.source_proof.as_ref(), mapping.destination_proof.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let source = proof.source_manifest.verification();
+            let destination = proof.destination_manifest.verification();
+            if source != destination {
+                return Err(format!(
+                    "{} proof contains mixed verification authorities",
+                    entry.kind.label()
+                ));
+            }
+            if let Some(expected) = retained {
+                if expected != source {
+                    return Err(format!(
+                        "{} history contains mixed verification authorities",
+                        entry.kind.label()
+                    ));
+                }
+            } else {
+                retained = Some(source);
+            }
+        }
+    }
+    retained.ok_or_else(|| {
+        format!(
+            "{} history has no retained verification authority",
+            entry.kind.label()
+        )
+    })
+}
+
+fn undo_redo_policy(
+    app: &AppState,
+    entry: &FileOperationUndoEntry,
+) -> Result<tui_file_picker::FileOperationPolicy, String> {
+    Ok(tui_file_picker::FileOperationPolicy {
         allow_new_file: false,
         allow_new_folder: false,
         allow_cut: true,
@@ -1654,7 +1729,11 @@ fn undo_redo_policy(app: &AppState) -> tui_file_picker::FileOperationPolicy {
         cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::CopyThenDelete,
         delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
         verbose_degrade_notices: app.file_task_verbose_degrade_notices,
-    }
+        // Replay is governed by the authority retained when the original
+        // operation committed, not by a setting the user may have changed
+        // afterward. This prevents both silent downgrade and false mismatch.
+        verification: retained_file_operation_verification(entry)?,
+    })
 }
 
 fn refresh_browse_after_undo_redo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
@@ -1667,12 +1746,13 @@ fn refresh_browse_after_undo_redo(app: &mut AppState, tx: &mpsc::Sender<AppMessa
 
 fn retain_undo_redo_report(
     app: &mut AppState,
+    session_id: u64,
     entry: &FileOperationUndoEntry,
     undo: bool,
     succeeded: &[usize],
     committed_without_proof: &[(usize, String)],
     failed: &[(usize, String)],
-) {
+) -> bool {
     let is_move = entry.kind != FileOperationUndoKind::Copy;
     let roots = entry
         .mappings
@@ -1721,6 +1801,14 @@ fn retain_undo_redo_report(
         format!("{action} {}", entry.kind.label()),
         file_picker_theme_from_theme(&app.theme),
     );
+    let retained_auto_close = match &app.active_overlay {
+        ActiveOverlay::FileTaskProgress(session) if session.session_id == session_id => {
+            session.progress.auto_close()
+        }
+        _ => app.config.file_operations.auto_close_progress,
+    };
+    progress.set_auto_close(retained_auto_close);
+    progress.set_task_controls_available(false);
     let mut totals = tui_file_picker::ProgressTotals::default();
     totals.items_done = succeeded
         .len()
@@ -1761,7 +1849,20 @@ fn retain_undo_redo_report(
         }
     });
     progress.append_completion_report(&report);
-    app.last_file_task_progress = Some((entry.id, progress));
+    let finished_cleanly = !entry.mappings.is_empty()
+        && failed.is_empty()
+        && committed_without_proof.is_empty()
+        && succeeded.len() == entry.mappings.len();
+    let should_auto_close = finished_cleanly
+        && progress.auto_close_available()
+        && progress.auto_close();
+    app.last_file_task_progress = Some((session_id, progress.clone()));
+    if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+        if session.session_id == session_id && session.is_live_task() {
+            session.progress = progress;
+        }
+    }
+    should_auto_close
 }
 
 fn split_entry_by_indices(
@@ -2098,6 +2199,7 @@ fn execute_file_operation_replay_worker(
 }
 
 fn spawn_file_operation_replay(
+    session_id: u64,
     entry: FileOperationUndoEntry,
     undo: bool,
     policy: tui_file_picker::FileOperationPolicy,
@@ -2107,6 +2209,7 @@ fn spawn_file_operation_replay(
     std::thread::spawn(move || {
         let result = execute_file_operation_replay_worker(&entry, undo, policy);
         let _ = tx.blocking_send(AppMessage::FileOperationReplayComplete {
+            session_id,
             entry,
             undo,
             result,
@@ -2116,6 +2219,7 @@ fn spawn_file_operation_replay(
 
 pub(crate) fn complete_file_operation_replay(
     app: &mut AppState,
+    session_id: u64,
     mut entry: FileOperationUndoEntry,
     undo: bool,
     result: super::message::FileOperationReplayResult,
@@ -2184,8 +2288,9 @@ pub(crate) fn complete_file_operation_replay(
     succeeded.sort_unstable();
     succeeded.dedup();
 
-    retain_undo_redo_report(
+    let should_auto_close = retain_undo_redo_report(
         app,
+        session_id,
         &entry,
         undo,
         &succeeded,
@@ -2202,7 +2307,7 @@ pub(crate) fn complete_file_operation_replay(
         } else {
             app.file_operation_undo.finish_redo(entry.clone());
         }
-        app.set_status(format!(
+        app.set_routine_file_operation_status(format!(
             "{} {} of {} item{}",
             if undo { "Undid" } else { "Redid" },
             entry.kind.label(),
@@ -2245,6 +2350,77 @@ pub(crate) fn complete_file_operation_replay(
         }
     }
     refresh_browse_after_undo_redo(app, tx);
+    if should_auto_close
+        && matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == session_id && session.is_live_task()
+        )
+    {
+        app.active_overlay = ActiveOverlay::None;
+    }
+}
+
+fn install_file_operation_replay_progress(
+    app: &mut AppState,
+    entry: &FileOperationUndoEntry,
+    undo: bool,
+) -> u64 {
+    let is_move = entry.kind != FileOperationUndoKind::Copy;
+    let action = if undo { "Undo" } else { "Redo" };
+    let mut progress = tui_file_picker::FileTaskProgressState::new(
+        if is_move {
+            tui_file_picker::FileTaskKind::Move
+        } else {
+            tui_file_picker::FileTaskKind::Copy
+        },
+        format!("{action} {}", entry.kind.label()),
+        file_picker_theme_from_theme(&app.theme),
+    );
+    progress.set_auto_close(app.config.file_operations.auto_close_progress);
+    progress.set_task_controls_available(false);
+
+    let sources = entry
+        .mappings
+        .iter()
+        .map(|mapping| {
+            if undo {
+                mapping.destination.clone()
+            } else {
+                mapping.source.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let destinations = entry
+        .mappings
+        .iter()
+        .map(|mapping| {
+            if undo {
+                mapping.source.clone()
+            } else {
+                mapping.destination.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let source_summary = match sources.as_slice() {
+        [] => "no replay items".to_string(),
+        [single] => single.display().to_string(),
+        many => format!("{} replay items", many.len()),
+    };
+    let destination = common_source_root(&destinations);
+    progress.set_scope(tui_file_picker::FileTaskScope {
+        source_root: common_source_root(&sources),
+        source_summary,
+        destination: destination.clone(),
+        destination_summary: destination.map(|path| path.display().to_string()),
+    });
+
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    drop(control_rx);
+    let session = super::app::FileTaskProgressSession::new(progress, control_tx);
+    let session_id = session.session_id;
+    app.install_file_task_progress(session);
+    session_id
 }
 
 fn execute_file_operation_undo(
@@ -2262,9 +2438,17 @@ fn execute_file_operation_undo(
         app.set_status("undo: copy removal requires confirmation");
         return;
     }
-    let policy = undo_redo_policy(app);
-    app.set_status(format!("Undoing {}...", entry.kind.label()));
-    spawn_file_operation_replay(entry, true, policy, tx);
+    let policy = match undo_redo_policy(app, &entry) {
+        Ok(policy) => policy,
+        Err(error) => {
+            app.file_operation_undo.restore_undo(entry);
+            app.set_status(format!("undo refused: {error}"));
+            return;
+        }
+    };
+    app.set_routine_file_operation_status(format!("Undoing {}...", entry.kind.label()));
+    let session_id = install_file_operation_replay_progress(app, &entry, true);
+    spawn_file_operation_replay(session_id, entry, true, policy, tx);
 }
 
 fn request_file_operation_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
@@ -2295,9 +2479,17 @@ fn execute_file_operation_redo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>
         app.set_status("redo: operation changed; request ignored");
         return;
     };
-    let policy = undo_redo_policy(app);
-    app.set_status(format!("Redoing {}...", entry.kind.label()));
-    spawn_file_operation_replay(entry, false, policy, tx);
+    let policy = match undo_redo_policy(app, &entry) {
+        Ok(policy) => policy,
+        Err(error) => {
+            app.file_operation_undo.restore_redo(entry);
+            app.set_status(format!("redo refused: {error}"));
+            return;
+        }
+    };
+    app.set_routine_file_operation_status(format!("Redoing {}...", entry.kind.label()));
+    let session_id = install_file_operation_replay_progress(app, &entry, false);
+    spawn_file_operation_replay(session_id, entry, false, policy, tx);
 }
 
 fn save_browse_layout(app: &mut AppState) {
@@ -7005,6 +7197,59 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
             }
         }
+        ActiveOverlay::FileOperationSettings(mut state) => {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    app.active_overlay = ActiveOverlay::None;
+                    app.set_status("File-operation settings unchanged");
+                }
+                (KeyCode::Enter, KeyModifiers::NONE) => {
+                    let previous = app.config.file_operations.clone();
+                    app.config.file_operations.verification = state.verification;
+                    app.config.file_operations.status_verbosity = state.status_verbosity;
+                    app.config.file_operations.auto_close_progress = state.auto_close_progress;
+                    match app.config.save() {
+                        Ok(()) => {
+                            app.file_task_verbose_degrade_notices = matches!(
+                                state.status_verbosity,
+                                crate::config::FileOperationStatusVerbosity::Verbose,
+                            );
+                            app.active_overlay = ActiveOverlay::None;
+                            app.set_status("File-operation settings saved");
+                        }
+                        Err(error) => {
+                            app.config.file_operations = previous;
+                            app.active_overlay = ActiveOverlay::FileOperationSettings(state);
+                            app.set_status(format!(
+                                "File-operation settings unchanged because config save failed: {error}"
+                            ));
+                        }
+                    }
+                }
+                (KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab, _) => {
+                    state.focus = state.focus.previous();
+                    app.active_overlay = ActiveOverlay::FileOperationSettings(state);
+                }
+                (KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab, _) => {
+                    state.focus = state.focus.next();
+                    app.active_overlay = ActiveOverlay::FileOperationSettings(state);
+                }
+                (
+                    KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Char('h')
+                    | KeyCode::Char('l')
+                    | KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                ) => {
+                    state.cycle_focused_value();
+                    app.active_overlay = ActiveOverlay::FileOperationSettings(state);
+                }
+                _ => {
+                    app.active_overlay = ActiveOverlay::FileOperationSettings(state);
+                }
+            }
+        }
         ActiveOverlay::FormatSettings { mut kind, mut focus, help_scroll } => {
             if let Some(mut scroll) = help_scroll {
                 // Help mode: scroll keys, Esc/Enter/? close help.
@@ -9715,6 +9960,7 @@ pub(super) fn metadata_editor_save(
     let forced_deletes = forced_deletes_for_save;
     let reread_after_embedded_cuesheet_delete =
         state.active_surface().pending_embedded_cuesheet_delete;
+    let verification = app.config.file_operations.verification;
 
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -9753,7 +9999,7 @@ pub(super) fn metadata_editor_save(
                     )));
                 },
             );
-            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
+            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
                 &paths,
                 &entries_snap,
                 &deleted,
@@ -9762,6 +10008,7 @@ pub(super) fn metadata_editor_save(
                 Some(byte_progress),
                 Some(cancel.clone()),
                 &forced_deletes,
+                verification,
             );
             if let Some(plan) = cue_sidecar_writeback {
                 if let Some(sidecar_result) =
@@ -10839,6 +11086,224 @@ mod progress_dialog_theme_tests {
     }
 
     #[test]
+    fn performance_config_opens_advanced_file_operation_control() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{
+            ActiveOverlay, AppScreen, AppState, ConfigFocus, FileOperationSettingsFocus,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home =
+            XdgConfigHomeGuard::new("tonepoet-file-operation-settings-open");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.set_config_focus(ConfigFocus::Performance);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match &app.active_overlay {
+            ActiveOverlay::FileOperationSettings(state) => {
+                assert_eq!(state.focus, FileOperationSettingsFocus::Verification);
+                assert_eq!(
+                    state.verification,
+                    tui_file_picker::VerificationMode::Standard,
+                );
+                assert_eq!(
+                    state.status_verbosity,
+                    crate::config::FileOperationStatusVerbosity::Quiet,
+                );
+                assert!(!state.auto_close_progress);
+            }
+            other => panic!("expected advanced file-operation settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn advanced_file_operation_control_persists_all_values_atomically() {
+        use crate::config::{FileOperationStatusVerbosity, TonepoetConfig};
+        use crate::tui::app::{ActiveOverlay, AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home =
+            XdgConfigHomeGuard::new("tonepoet-file-operation-settings-save");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.set_config_focus(ConfigFocus::Performance);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            app.config.file_operations.verification,
+            tui_file_picker::VerificationMode::Strong,
+        );
+        assert_eq!(
+            app.config.file_operations.status_verbosity,
+            FileOperationStatusVerbosity::Verbose,
+        );
+        assert!(app.config.file_operations.auto_close_progress);
+        assert!(
+            app.file_task_verbose_degrade_notices,
+            "the visual control must update the runtime degraded-notice mirror immediately",
+        );
+
+        let reloaded = TonepoetConfig::load().expect("reload persisted file-operation settings");
+        assert_eq!(
+            reloaded.file_operations.verification,
+            tui_file_picker::VerificationMode::Strong,
+        );
+        assert_eq!(
+            reloaded.file_operations.status_verbosity,
+            FileOperationStatusVerbosity::Verbose,
+        );
+        assert!(reloaded.file_operations.auto_close_progress);
+    }
+
+    #[test]
+    fn advanced_file_operation_control_cancel_discards_draft() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{ActiveOverlay, AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home =
+            XdgConfigHomeGuard::new("tonepoet-file-operation-settings-cancel");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.set_config_focus(ConfigFocus::Performance);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            app.config.file_operations.verification,
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(
+            TonepoetConfig::load()
+                .expect("reload config after cancel")
+                .file_operations
+                .verification,
+            tui_file_picker::VerificationMode::Standard,
+        );
+    }
+
+    #[test]
+    fn advanced_file_operation_control_rolls_back_on_save_failure() {
+        use crate::config::TonepoetConfig;
+        use crate::tui::app::{ActiveOverlay, AppScreen, AppState, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _config_home =
+            XdgConfigHomeGuard::new("tonepoet-file-operation-settings-save-failure");
+        let config_path = TonepoetConfig::config_path();
+        let parent = config_path.parent().expect("config parent");
+        std::fs::create_dir_all(parent).expect("create config parent");
+        let lock_path = crate::config::store_lock_authority_path(&config_path)
+            .expect("derive store-lock authority path");
+        std::fs::write(&lock_path, b"not a tonepoet lock marker")
+            .expect("install invalid lock marker");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Config;
+        app.set_config_focus(ConfigFocus::Performance);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_config_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &tx,
+        );
+        handle_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        );
+
+        assert_eq!(
+            app.config.file_operations.verification,
+            tui_file_picker::VerificationMode::Standard,
+            "failed persistence must restore the complete prior configuration",
+        );
+        assert!(
+            !app.file_task_verbose_degrade_notices,
+            "failed persistence must not change the runtime degraded-notice mirror",
+        );
+        match &app.active_overlay {
+            ActiveOverlay::FileOperationSettings(state) => {
+                assert_eq!(
+                    state.verification,
+                    tui_file_picker::VerificationMode::Strong,
+                    "the user's verification draft must remain available for retry",
+                );
+                assert_eq!(
+                    state.status_verbosity,
+                    crate::config::FileOperationStatusVerbosity::Verbose,
+                    "the user's status draft must remain available for retry",
+                );
+            }
+            other => panic!("failed save must keep the editor open, got {other:?}"),
+        }
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(message, _)| message.contains("unchanged because config save failed")),
+        );
+    }
+
+    #[test]
     fn performance_config_zero_surfaces_exact_config_save_failure() {
         use crate::config::TonepoetConfig;
         use crate::tui::app::{AppScreen, AppState, ConfigFocus};
@@ -11252,8 +11717,18 @@ mod progress_dialog_theme_tests {
         assert_cell(29, 5, tonepoet_theme.progress_dialog_bar_unfilled, tonepoet_theme.progress_dialog_bg);
         assert_cell(47, 5, tonepoet_theme.progress_dialog_percent, tonepoet_theme.progress_dialog_bg);
         assert_cell(3, 8, tonepoet_theme.progress_dialog_dim, tonepoet_theme.progress_dialog_bg);
-        assert_cell(10, 10, tonepoet_theme.progress_dialog_button_fg, tonepoet_theme.progress_dialog_button_bg);
-        assert_cell(33, 10, tonepoet_theme.progress_dialog_abort_fg, tonepoet_theme.progress_dialog_abort_bg);
+        // The close-on-success checkbox prepends to the button row for
+        // copy/move tasks, so locate buttons by their rendered text rather
+        // than pinning columns.
+        let button_row: String = (0..52)
+            .map(|x| buffer.get(x, 10).symbol().to_string())
+            .collect();
+        let close_x = button_row
+            .find("] Close when done")
+            .expect("auto-close checkbox rendered") as u16;
+        assert_cell(close_x, 10, tonepoet_theme.progress_dialog_button_fg, tonepoet_theme.progress_dialog_button_bg);
+        let abort_x = button_row.find("Esc Abort").expect("abort rendered") as u16;
+        assert_cell(abort_x, 10, tonepoet_theme.progress_dialog_abort_fg, tonepoet_theme.progress_dialog_abort_bg);
         assert_cell(1, 3, tonepoet_theme.progress_dialog_text, tonepoet_theme.progress_dialog_bg);
     }
 }
@@ -11939,6 +12414,26 @@ fn handle_file_task_user_action(
                     Some((session.session_id, session.progress.clone()));
             }
             app.active_overlay = ActiveOverlay::None;
+        }
+        tui_file_picker::FileTaskUserAction::ToggleAutoClose(enabled) => {
+            if !session.is_live_task() || !session.progress.auto_close_available() {
+                app.set_status("auto-close is unavailable for this progress view");
+                return;
+            }
+            let previous = app.config.file_operations.auto_close_progress;
+            app.config.file_operations.auto_close_progress = enabled;
+            if let Err(error) = app.config.save() {
+                app.config.file_operations.auto_close_progress = previous;
+                session.progress.set_auto_close(previous);
+                app.set_status(format!(
+                    "close-when-done unchanged because config save failed: {error}"
+                ));
+            } else {
+                app.set_status(format!(
+                    "close when done: {}",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
         }
         tui_file_picker::FileTaskUserAction::ChooseConflictResolution(resolution) => {
             if let Some(conflict) = session.progress.conflict.as_ref() {
@@ -27247,8 +27742,13 @@ fn execute_bulk_rename(
 ) {
     let plan = state.plan.clone();
     app.active_overlay = ActiveOverlay::None;
-    app.set_status("Applying transactional bulk rename...");
-    spawn_rename_plan(plan, "bulk rename".to_string(), tx);
+    app.set_routine_file_operation_status("Applying transactional bulk rename...");
+    spawn_rename_plan(
+        plan,
+        "bulk rename".to_string(),
+        app.config.file_operations.verification,
+        tx,
+    );
 }
 
 
@@ -28304,6 +28804,7 @@ fn apply_text_edit(
             let path = write_path.clone();
             let write_field = field;
             let write_value = trimmed.to_string();
+            let verification = app.config.file_operations.verification;
             let tx = tx.clone();
             tokio::spawn(async move {
                 let value_for_write = write_value.clone();
@@ -28317,12 +28818,13 @@ fn apply_text_edit(
                             detail: metadata_save_progress_detail(1, 1, path, update),
                         });
                     };
-                    crate::tui::probe::write_metadata_field_transactional_with_control(
+                    crate::tui::probe::write_metadata_field_transactional_with_control_at_verification(
                         &write_path,
                         write_field,
                         &value_for_write,
                         Some(&cancel),
                         Some(&report_progress),
+                        verification,
                     )
                 })
                 .await
@@ -28552,11 +29054,12 @@ fn start_file_op(
         title,
         file_picker_theme_from_theme(&app.theme),
     );
+    progress.set_auto_close(app.config.file_operations.auto_close_progress);
     progress.set_scope(file_task_scope_for_job(sources, std::path::Path::new(dest.trim())));
     let session = super::app::FileTaskProgressSession::new(progress, control_tx);
     let session_id = session.session_id;
     app.install_file_task_progress(session);
-    app.set_status(format!(
+    app.set_routine_file_operation_status(format!(
         "{} {} item(s)...",
         if is_move { "moving" } else { "copying" },
         sources.len()
@@ -28574,6 +29077,7 @@ fn start_file_op(
         root_targets,
         clipboard_retry_plan,
         verbose_degrade_notices: app.file_task_verbose_degrade_notices,
+        verification: app.config.file_operations.verification,
     };
     spawn_file_task_worker(job, tx.clone(), control_rx);
     Some(session_id)
@@ -28661,6 +29165,7 @@ struct FileTaskJob {
     root_targets: Option<Vec<std::path::PathBuf>>,
     clipboard_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
     verbose_degrade_notices: bool,
+    verification: tui_file_picker::VerificationMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29963,8 +30468,19 @@ impl FileTaskWorker {
         // no-replace and then the brief-approved checked best-effort fallback.
         // Reduced identity semantics change the post-rename proof, not the
         // decision to try rename.
-        let source_manifest = tui_file_picker::capture_manifest(source)
-            .map_err(|error| format!("capture native-rename undo authority: {error}"))?;
+        self.io_counters.source_tree_walks =
+            self.io_counters.source_tree_walks.saturating_add(1);
+        let source_manifest = tui_file_picker::capture_manifest_with_mode(
+            source,
+            self.job.verification,
+        )
+        .map_err(|error| format!("capture native-rename undo authority: {error}"))?;
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            self.io_counters.source_bytes_hashed = self
+                .io_counters
+                .source_bytes_hashed
+                .saturating_add(source_manifest.total_file_bytes());
+        }
         let rename_proof = tui_file_picker::RenameSourceProof::capture(source)
             .map_err(|error| format!("capture native-rename source proof: {error}"))?;
         self.io_counters.rename_attempts =
@@ -30024,7 +30540,10 @@ impl FileTaskWorker {
                         tui_file_picker::FileTaskUndoDisposition::CreatedDestination,
                     );
                     match source_manifest
-                        .destination_identity_after_root_rename(destination_snapshot)
+                        .destination_identity_after_root_rename(
+                            destination_snapshot,
+                            target_capabilities,
+                        )
                     {
                         Ok(destination_manifest) => {
                             self.completed_proofs_by_source.insert(
@@ -30199,10 +30718,11 @@ impl FileTaskWorker {
                 source,
                 format!(
                     "existing destination reused from the original move plan without recopying{}",
-                    if destination_bytes_rehashed == 0 {
-                        "; strict mount evidence avoided a destination rehash"
-                    } else {
-                        "; weak mount identity required one destination verification rehash"
+                    match (self.job.verification, destination_bytes_rehashed) {
+                        (tui_file_picker::VerificationMode::Standard, 0) =>
+                            "; identity-level authority required no destination content read",
+                        (_, 0) => "; strict mount evidence avoided a destination rehash",
+                        _ => "; reduced mount identity required one destination verification rehash",
                     }
                 ),
             );
@@ -30210,7 +30730,7 @@ impl FileTaskWorker {
         } else if conflict_skipped {
             // A retry can encounter an already-complete destination. A conflict
             // skip is therefore not proof of an incomplete move: capture the
-            // current source and let full tree/content verification decide.
+            // current source and let the selected proof authority decide.
             self.snapshot(
                 tui_file_picker::FileTaskPhase::Verifying,
                 format!("Checking existing destination for {}", display_name(source)),
@@ -30220,7 +30740,10 @@ impl FileTaskWorker {
             let mut capture_control = None;
             self.io_counters.source_tree_walks =
                 self.io_counters.source_tree_walks.saturating_add(1);
-            let captured = tui_file_picker::capture_manifest_with_cancel(source, |path| {
+            let captured = tui_file_picker::capture_manifest_with_mode_and_cancel(
+                source,
+                self.job.verification,
+                |path| {
                 if capture_control.is_some() {
                     return false;
                 }
@@ -30240,7 +30763,8 @@ impl FileTaskWorker {
                         false
                     }
                 }
-            });
+                },
+            );
             if let Some(control) = capture_control {
                 match control? {
                     FileTaskStep::Aborted => {
@@ -30266,10 +30790,12 @@ impl FileTaskWorker {
             }
             match captured {
                 Ok(manifest) => {
-                    self.io_counters.source_bytes_hashed = self
-                        .io_counters
-                        .source_bytes_hashed
-                        .saturating_add(manifest.total_file_bytes());
+                    if self.job.verification == tui_file_picker::VerificationMode::Strong {
+                        self.io_counters.source_bytes_hashed = self
+                            .io_counters
+                            .source_bytes_hashed
+                            .saturating_add(manifest.total_file_bytes());
+                    }
                     manifest
                 }
                 Err(error) => {
@@ -30317,26 +30843,31 @@ impl FileTaskWorker {
                 }
             }
 
-            match build_source_manifest(node, &self.copied_source_digests) {
+            match build_source_manifest(node, &self.copied_source_digests, self.job.verification) {
                 Ok(manifest) => manifest,
                 Err(_) => {
                     // A merge/conflict route can contain entries not streamed
                     // by this copy worker. Escalate only that exceptional path
                     // to a complete source capture; the normal no-conflict
-                    // route keeps the fused copy/hash proof.
+                    // route keeps the proof captured during the copy.
                     self.io_counters.source_tree_walks =
                         self.io_counters.source_tree_walks.saturating_add(1);
-                    match tui_file_picker::capture_manifest(source) {
+                    match tui_file_picker::capture_manifest_with_mode(
+                        source,
+                        self.job.verification,
+                    ) {
                         Ok(manifest) => {
-                            let bytes = manifest.total_file_bytes();
-                            self.io_counters.source_bytes_hashed = self
-                                .io_counters
-                                .source_bytes_hashed
-                                .saturating_add(bytes);
-                            self.io_counters.bytes_redundantly_rehashed = self
-                                .io_counters
-                                .bytes_redundantly_rehashed
-                                .saturating_add(bytes);
+                            if self.job.verification == tui_file_picker::VerificationMode::Strong {
+                                let bytes = manifest.total_file_bytes();
+                                self.io_counters.source_bytes_hashed = self
+                                    .io_counters
+                                    .source_bytes_hashed
+                                    .saturating_add(bytes);
+                                self.io_counters.bytes_redundantly_rehashed = self
+                                    .io_counters
+                                    .bytes_redundantly_rehashed
+                                    .saturating_add(bytes);
+                            }
                             manifest
                         }
                         Err(error) => {
@@ -30363,13 +30894,18 @@ impl FileTaskWorker {
             let mut destination_verification_control = None;
             self.io_counters.destination_tree_walks =
                 self.io_counters.destination_tree_walks.saturating_add(1);
-            self.io_counters.destination_bytes_hashed = self
-                .io_counters
-                .destination_bytes_hashed
-                .saturating_add(manifest.total_file_bytes());
+            if self.job.verification == tui_file_picker::VerificationMode::Strong {
+                self.io_counters.destination_bytes_hashed = self
+                    .io_counters
+                    .destination_bytes_hashed
+                    .saturating_add(manifest.total_file_bytes());
+            }
             #[cfg_attr(not(test), allow(unused_mut))] // reassigned by a cfg(test) injection seam
-            let mut destination_verification = manifest.capture_verified_copy_at_with_cancel(
-                &resolved_target,
+            let mut destination_verification = if self.job.verification
+                == tui_file_picker::VerificationMode::Strong
+            {
+                manifest.capture_verified_copy_at_with_cancel(
+                    &resolved_target,
                 |path| {
                     if destination_verification_control.is_some() {
                         return false;
@@ -30391,7 +30927,33 @@ impl FileTaskWorker {
                         }
                     }
                 },
-            );
+                )
+            } else {
+                manifest.capture_identity_copy_at_with_cancel(
+                    &resolved_target,
+                    |path| {
+                        if destination_verification_control.is_some() {
+                            return false;
+                        }
+                        let item = progress_item_for_paths(source, path, 0, None);
+                        match self.poll_controls_for_phase(
+                            Some(item),
+                            false,
+                            tui_file_picker::FileTaskPhase::Verifying,
+                        ) {
+                            Ok(FileTaskStep::Completed) => true,
+                            Ok(step) => {
+                                destination_verification_control = Some(Ok(step));
+                                false
+                            }
+                            Err(error) => {
+                                destination_verification_control = Some(Err(error));
+                                false
+                            }
+                        }
+                    },
+                )
+            };
             #[cfg(test)]
             if let Some(error) = self.forced_post_publication_verification_failure.take() {
                 destination_verification = Err(error);
@@ -30508,20 +31070,22 @@ impl FileTaskWorker {
         if let Some(warning) = quarantine_mode.degraded_warning() {
             self.record_active_root_degrade_notice(source, warning.to_string());
         }
-        // Quarantine publication and final source removal are separate durable
-        // transitions. Synchronize the source parent at each boundary. A mount
-        // that cannot sync directories degrades with an explicit notice rather
-        // than turning a verified move into a functional refusal.
-        if let Some(parent) = source.parent() {
-            self.io_counters.directory_sync_calls =
-                self.io_counters.directory_sync_calls.saturating_add(1);
-            if let Err(error) = sync_file_task_directory(parent) {
-                self.record_active_root_notice(
-                    source,
-                    format!(
-                        "source was quarantined, but source-parent synchronization failed; cleanup continued in degraded durability mode: {error}"
-                    ),
-                );
+        // Strong mode preserves the historical two-boundary durability proof:
+        // quarantine publication and final removal each synchronize the source
+        // parent. Standard mode intentionally uses the cp-like budget and syncs
+        // the source parent only after final removal.
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            if let Some(parent) = source.parent() {
+                self.io_counters.directory_sync_calls =
+                    self.io_counters.directory_sync_calls.saturating_add(1);
+                if let Err(error) = sync_file_task_directory(parent) {
+                    self.record_active_root_notice(
+                        source,
+                        format!(
+                            "source was quarantined, but source-parent synchronization failed; cleanup continued in degraded durability mode: {error}"
+                        ),
+                    );
+                }
             }
         }
         // Do not perform a separate whole-tree source verification pass here.
@@ -30672,10 +31236,9 @@ impl FileTaskWorker {
         manifest: &tui_file_picker::SourceManifest,
         destination_manifest: &tui_file_picker::DestinationManifest,
     ) -> Result<FileTaskStep, String> {
-        // Strict mounts use the exact post-content-verification version token,
-        // including ctime. Reduced-semantics mounts perform the irreducible final
-        // destination digest read here, after source verification and immediately
-        // before unlinking the corresponding source entry.
+        // Standard authority uses retained identity and tree-membership evidence
+        // on every mount. Strong authority reuses exact version evidence on strict
+        // mounts and performs the historical final digest read on reduced mounts.
         let mut control = None;
         let verification = destination_manifest.verify_entry_at_with_cancel_counted(
             manifest,
@@ -30903,6 +31466,22 @@ impl FileTaskWorker {
                 },
             );
         }
+        if result == FileTaskStep::Completed
+            && self.job.verification == tui_file_picker::VerificationMode::Standard
+        {
+            if let Err(error) = sync_standard_file_task_root(
+                &node.target,
+                &mut self.io_counters,
+            ) {
+                self.record_active_root_notice(
+                    &node.source,
+                    format!(
+                        "copy published at {}, but root synchronization failed: {error}",
+                        node.target.display()
+                    ),
+                );
+            }
+        }
         if result != FileTaskStep::Completed || self.job.is_move {
             return Ok(result);
         }
@@ -30911,7 +31490,7 @@ impl FileTaskWorker {
         // verification. Move roots defer the same single pass to
         // move_via_copy_verify_remove_node so it can carry the proof into
         // source cleanup rather than recomputing it in both layers.
-        let manifest = match build_source_manifest(node, &self.copied_source_digests) {
+        let manifest = match build_source_manifest(node, &self.copied_source_digests, self.job.verification) {
             Ok(manifest) => manifest,
             Err(_) => {
                 // Conflict/merge paths can include entries that were not
@@ -30920,34 +31499,48 @@ impl FileTaskWorker {
                 // still verified without weakening correctness.
                 self.io_counters.source_tree_walks =
                     self.io_counters.source_tree_walks.saturating_add(1);
-                let manifest = tui_file_picker::capture_manifest(&node.source)?;
-                let bytes = manifest.total_file_bytes();
-                self.io_counters.source_bytes_hashed =
-                    self.io_counters.source_bytes_hashed.saturating_add(bytes);
-                self.io_counters.bytes_redundantly_rehashed = self
-                    .io_counters
-                    .bytes_redundantly_rehashed
-                    .saturating_add(bytes);
+                let manifest = tui_file_picker::capture_manifest_with_mode(
+                    &node.source,
+                    self.job.verification,
+                )?;
+                if self.job.verification == tui_file_picker::VerificationMode::Strong {
+                    let bytes = manifest.total_file_bytes();
+                    self.io_counters.source_bytes_hashed =
+                        self.io_counters.source_bytes_hashed.saturating_add(bytes);
+                    self.io_counters.bytes_redundantly_rehashed = self
+                        .io_counters
+                        .bytes_redundantly_rehashed
+                        .saturating_add(bytes);
+                }
                 manifest
             }
         };
         self.io_counters.destination_tree_walks =
             self.io_counters.destination_tree_walks.saturating_add(1);
-        self.io_counters.destination_bytes_hashed = self
-            .io_counters
-            .destination_bytes_hashed
-            .saturating_add(manifest.total_file_bytes());
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            self.io_counters.destination_bytes_hashed = self
+                .io_counters
+                .destination_bytes_hashed
+                .saturating_add(manifest.total_file_bytes());
+        }
         let verification = {
             #[cfg(test)]
             {
                 match self.forced_post_publication_verification_failure.take() {
                     Some(error) => Err(error),
-                    None => manifest.capture_verified_copy_at(&node.target),
+                    None if self.job.verification == tui_file_picker::VerificationMode::Strong => {
+                        manifest.capture_verified_copy_at(&node.target)
+                    }
+                    None => manifest.capture_identity_copy_at(&node.target),
                 }
             }
             #[cfg(not(test))]
             {
-                manifest.capture_verified_copy_at(&node.target)
+                if self.job.verification == tui_file_picker::VerificationMode::Strong {
+                    manifest.capture_verified_copy_at(&node.target)
+                } else {
+                    manifest.capture_identity_copy_at(&node.target)
+                }
             }
         };
         match verification {
@@ -30987,8 +31580,12 @@ impl FileTaskWorker {
                     &node.source,
                     &node.target,
                     format!(
-                        "copy committed at {}, but final content/tree verification failed; destination preserved for inspection: {error}",
-                        node.target.display()
+                        "copy committed at {}, but final {} verification failed; destination preserved for inspection: {error}",
+                        node.target.display(),
+                        match self.job.verification {
+                            tui_file_picker::VerificationMode::Standard => "identity/tree",
+                            tui_file_picker::VerificationMode::Strong => "content/tree",
+                        },
                     ),
                 );
             }
@@ -31088,7 +31685,7 @@ impl FileTaskWorker {
                         )
                     });
                 }
-                // Child copy operations already own the source copy/hash proof.
+                // Child copy operations already own the source proof.
                 // Renaming this exact private staging root preserves those
                 // objects; the root-level copy or move phase performs one
                 // authoritative verification at the published pathname.
@@ -31325,16 +31922,18 @@ impl FileTaskWorker {
                 ),
             ),
         }
-        self.io_counters.directory_sync_calls =
-            self.io_counters.directory_sync_calls.saturating_add(1);
-        if let Err(error) = sync_file_task_directory(target) {
-            self.record_active_root_notice(
-                source,
-                format!(
-                    "directory copied to {}, but directory synchronization failed: {error}",
-                    target.display()
-                ),
-            );
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            self.io_counters.directory_sync_calls =
+                self.io_counters.directory_sync_calls.saturating_add(1);
+            if let Err(error) = sync_file_task_directory(target) {
+                self.record_active_root_notice(
+                    source,
+                    format!(
+                        "directory copied to {}, but directory synchronization failed: {error}",
+                        target.display()
+                    ),
+                );
+            }
         }
         Ok(FileTaskStep::Completed)
     }
@@ -31391,7 +31990,8 @@ impl FileTaskWorker {
             .metadata()
             .map_err(|error| format!("read opened source metadata: {error}"))?;
         let (temp_target, mut output) = create_temp_output_file(target)?;
-        let mut digest = tui_file_picker::Sha256::new();
+        let mut digest = (self.job.verification == tui_file_picker::VerificationMode::Strong)
+            .then(tui_file_picker::Sha256::new);
         let mut buffer = vec![0u8; 1024 * 1024];
         let mut item_done = 0u64;
 
@@ -31431,7 +32031,9 @@ impl FileTaskWorker {
             if read == 0 {
                 break;
             }
-            digest.update(&buffer[..read]);
+            if let Some(digest) = digest.as_mut() {
+                digest.update(&buffer[..read]);
+            }
             if let Err(e) = std::io::Write::write_all(&mut output, &buffer[..read]) {
                 finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
                 return Err(format!("write: {e}"));
@@ -31439,10 +32041,12 @@ impl FileTaskWorker {
             item_done = item_done.saturating_add(read as u64);
             self.io_counters.bytes_copied =
                 self.io_counters.bytes_copied.saturating_add(read as u64);
-            self.io_counters.source_bytes_hashed = self
-                .io_counters
-                .source_bytes_hashed
-                .saturating_add(read as u64);
+            if self.job.verification == tui_file_picker::VerificationMode::Strong {
+                self.io_counters.source_bytes_hashed = self
+                    .io_counters
+                    .source_bytes_hashed
+                    .saturating_add(read as u64);
+            }
             self.totals.bytes_done = self.totals.bytes_done.saturating_add(read as u64);
             self.snapshot(
                 if self.paused { tui_file_picker::FileTaskPhase::Paused } else { tui_file_picker::FileTaskPhase::Running },
@@ -31475,7 +32079,7 @@ impl FileTaskWorker {
                 source_metadata.len(), item_done
             ));
         }
-        let digest = digest.finalize();
+        let digest = digest.map(tui_file_picker::Sha256::finalize);
         if let Err(e) = std::io::Write::flush(&mut output) {
             finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
             return Err(format!("flush: {e}"));
@@ -31486,11 +32090,13 @@ impl FileTaskWorker {
                 format!("file metadata preservation was incomplete: {warning}"),
             );
         }
-        self.io_counters.file_sync_calls =
-            self.io_counters.file_sync_calls.saturating_add(1);
-        if let Err(e) = output.sync_all() {
-            finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
-            return Err(format!("sync: {e}"));
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            self.io_counters.file_sync_calls =
+                self.io_counters.file_sync_calls.saturating_add(1);
+            if let Err(e) = output.sync_all() {
+                finish_incomplete(&mut self.totals, output, &temp_target, progress_bytes_start);
+                return Err(format!("sync: {e}"));
+            }
         }
         drop(output);
         let publication_warnings = match finalize_temp_file(
@@ -31515,10 +32121,12 @@ impl FileTaskWorker {
                 ),
             );
         }
-        // Destination content verification is owned by the root publication
-        // phase. Deferring it avoids hashing each staged file here and then
+        // Destination proof capture is owned by the root publication phase.
+        // Strong mode therefore avoids hashing each staged file here and then
         // hashing the same published tree again in the next helper layer.
-        self.copied_source_digests.insert(source.to_path_buf(), digest);
+        if let Some(digest) = digest {
+            self.copied_source_digests.insert(source.to_path_buf(), digest);
+        }
         self.mark_completed_file_with(applied);
         Ok(FileTaskStep::Completed)
     }
@@ -31957,6 +32565,22 @@ fn common_source_root(sources: &[std::path::PathBuf]) -> Option<std::path::PathB
 }
 
 static FILE_TASK_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sync_standard_file_task_root(
+    path: &std::path::Path,
+    counters: &mut tui_file_picker::FileOperationIoCounters,
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_file() {
+        counters.file_sync_calls = counters.file_sync_calls.saturating_add(1);
+        std::fs::File::open(path)?.sync_all()
+    } else if metadata.file_type().is_dir() {
+        counters.directory_sync_calls = counters.directory_sync_calls.saturating_add(1);
+        sync_file_task_directory(path)
+    } else {
+        Ok(())
+    }
+}
 
 fn sync_file_task_directory(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -32937,6 +33561,7 @@ fn build_file_task_plan_node(
 fn build_source_manifest(
     root: &FileTaskPlanNode,
     digests: &std::collections::HashMap<std::path::PathBuf, tui_file_picker::ContentDigest>,
+    verification: tui_file_picker::VerificationMode,
 ) -> Result<tui_file_picker::SourceManifest, String> {
     if matches!(root.kind, FileTaskPlanKind::Directory) && !root.tree_fully_planned {
         return Err(
@@ -32948,13 +33573,16 @@ fn build_source_manifest(
         root_path: &std::path::Path,
         node: &FileTaskPlanNode,
         digests: &std::collections::HashMap<std::path::PathBuf, tui_file_picker::ContentDigest>,
+        verification: tui_file_picker::VerificationMode,
     ) -> Result<(), String> {
         let relative = node
             .source
             .strip_prefix(root_path)
             .map_err(|_| format!("source plan escaped root: {}", node.source.display()))?
             .to_path_buf();
-        let digest = if matches!(node.kind, FileTaskPlanKind::File) {
+        let digest = if verification == tui_file_picker::VerificationMode::Strong
+            && matches!(node.kind, FileTaskPlanKind::File)
+        {
             Some(*digests.get(&node.source).ok_or_else(|| {
                 format!("missing copied-content digest for {}", node.source.display())
             })?)
@@ -32963,13 +33591,13 @@ fn build_source_manifest(
         };
         manifest.insert(relative, node.source_snapshot.clone(), digest)?;
         for child in &node.children {
-            add_node(manifest, root_path, child, digests)?;
+            add_node(manifest, root_path, child, digests, verification)?;
         }
         Ok(())
     }
 
-    let mut manifest = tui_file_picker::SourceManifest::default();
-    add_node(&mut manifest, &root.source, root, digests)?;
+    let mut manifest = tui_file_picker::SourceManifest::new(verification);
+    add_node(&mut manifest, &root.source, root, digests, verification)?;
     Ok(manifest)
 }
 
@@ -33448,6 +34076,7 @@ mod file_operation_safety_tests {
                 root_targets: None,
                 clipboard_retry_plan: None,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Strong,
             },
             tx,
             controls,
@@ -33487,6 +34116,7 @@ mod file_operation_safety_tests {
                 ),
                 clipboard_retry_plan: retry_plan,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Strong,
             },
             tx,
             controls,
@@ -34155,6 +34785,7 @@ mod file_operation_safety_tests {
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Strong,
             },
             tx,
             control_rx,
@@ -34202,6 +34833,7 @@ mod file_operation_safety_tests {
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Strong,
             },
             tx,
             control_rx,
@@ -34918,8 +35550,13 @@ pub(super) fn commit_browse_rename(
         app.set_status(format!("rename: target already exists or is invalid: {new_name}"));
         return false;
     }
-    app.set_status(format!("renaming {old_name}..."));
-    spawn_rename_plan(plan, "rename".to_string(), tx);
+    app.set_routine_file_operation_status(format!("renaming {old_name}..."));
+    spawn_rename_plan(
+        plan,
+        "rename".to_string(),
+        app.config.file_operations.verification,
+        tx,
+    );
     true
 }
 
@@ -36460,7 +37097,12 @@ fn execute_confirm_action(
             if summary.errors > 0 {
                 parts.push(format!("{} errors", summary.errors));
             }
-            app.set_status(parts.join(", "));
+            let status = parts.join(", ");
+            if summary.errors > 0 {
+                app.set_status(status);
+            } else {
+                app.set_routine_file_operation_status(status);
+            }
         }
         ConfirmAction::OffsetCorrection { paths, offset } => {
             let operation_id = match super::event_loop::begin_completion_operation(
@@ -52955,6 +53597,7 @@ mod file_picker_browse_parity_regression_tests {
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Strong,
             },
             tx,
             control_rx,
@@ -53006,6 +53649,7 @@ mod file_picker_browse_parity_regression_tests {
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Strong,
             },
             tx,
             control_rx,
@@ -53064,6 +53708,7 @@ mod file_picker_browse_parity_regression_tests {
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Strong,
             },
             tx,
             control_rx,
@@ -53576,6 +54221,9 @@ mod file_picker_browse_parity_regression_tests {
         assert!(node.children.is_empty());
         let (_control_tx, control_rx) = std::sync::mpsc::channel();
         let mut worker = worker_for_test(false, control_rx);
+        // Pins assert the STANDARD budget; the shared helper stays Strong
+        // for the legacy proof tests.
+        worker.job.verification = tui_file_picker::VerificationMode::Standard;
         worker.job.is_move = true;
         worker.active_root_source = Some(source.clone());
 
@@ -53588,7 +54236,9 @@ mod file_picker_browse_parity_regression_tests {
         assert_eq!(worker.io_counters.bytes_copied, 0);
         assert_eq!(worker.io_counters.source_bytes_hashed, 0);
         assert_eq!(worker.io_counters.destination_bytes_hashed, 0);
-        assert_eq!(worker.io_counters.source_tree_walks, 0);
+        // Report finding 1: standard native move = one stat-only
+        // source-manifest walk (undo authority), zero content reads.
+        assert_eq!(worker.io_counters.source_tree_walks, 1);
         assert_eq!(worker.io_counters.destination_tree_walks, 0);
         assert_eq!(worker.io_counters.destination_entry_verification_passes, 0);
         assert!(!source.exists());
@@ -53625,6 +54275,9 @@ mod file_picker_browse_parity_regression_tests {
             })
             .expect("queue rename conflict");
         let mut worker = worker_for_test(false, control_rx);
+        // Pins assert the STANDARD budget; the shared helper stays Strong
+        // for the legacy proof tests.
+        worker.job.verification = tui_file_picker::VerificationMode::Standard;
         worker.job.is_move = true;
         worker.active_root_source = Some(source.clone());
 
@@ -53639,7 +54292,10 @@ mod file_picker_browse_parity_regression_tests {
         assert_eq!(worker.io_counters.bytes_copied, 0);
         assert_eq!(worker.io_counters.source_bytes_hashed, 0);
         assert_eq!(worker.io_counters.destination_bytes_hashed, 0);
-        assert_eq!(worker.io_counters.source_tree_walks, 0);
+        // Report finding 1: each rename attempt captures fresh stat-only
+        // undo authority (two attempts here, matching rename_attempts);
+        // content reads stay zero.
+        assert_eq!(worker.io_counters.source_tree_walks, 2);
         assert_eq!(worker.io_counters.destination_tree_walks, 0);
         assert_eq!(worker.io_counters.destination_entry_verification_passes, 0);
         assert_eq!(worker.totals.renamed, 1);
@@ -53681,6 +54337,9 @@ mod file_picker_browse_parity_regression_tests {
                 })
                 .expect("queue conflict resolution");
             let mut worker = worker_for_test(false, control_rx);
+            // Pins assert the STANDARD budget; the shared helper stays Strong
+            // for the legacy proof tests.
+            worker.job.verification = tui_file_picker::VerificationMode::Standard;
             worker.job.is_move = true;
             worker.active_root_source = Some(source.clone());
 
@@ -53690,7 +54349,9 @@ mod file_picker_browse_parity_regression_tests {
                     .expect("conflict control"),
                 expected
             );
-            assert_eq!(worker.io_counters.source_tree_walks, 0);
+            // The stat-only undo-authority walk precedes conflict
+            // resolution (report finding 1); content reads stay zero.
+            assert_eq!(worker.io_counters.source_tree_walks, 1);
             assert_eq!(worker.io_counters.destination_tree_walks, 0);
             assert_eq!(worker.io_counters.destination_entry_verification_passes, 0);
             assert_eq!(worker.io_counters.bytes_copied, 0);
@@ -54001,9 +54662,16 @@ mod file_picker_browse_parity_regression_tests {
 mod live_mount_perf_harness {
     use super::*;
 
-    /// Field-perf harness: times a real copy/move through FileTaskWorker vs a
-    /// plain std::fs baseline on any mount. Run manually:
-    ///   TONEPOET_PERF_DIR=/path/on/mount [TONEPOET_PERF_FILES=24]     ///   [TONEPOET_PERF_MB=8] cargo test -p tonepoet --lib --     ///     live_mount_perf --ignored --nocapture
+    /// Field-perf harness: times both verification modes through the real
+    /// `FileTaskWorker` and compares copy throughput with a plain `std::fs`
+    /// baseline on the selected mount. Run with a release build:
+    ///
+    /// ```text
+    /// TONEPOET_PERF_DIR=/path/on/mount \
+    /// TONEPOET_PERF_CASE=ext4 TONEPOET_PERF_EXPECT_POLICY=Strict \
+    /// TONEPOET_PERF_FILES=24 TONEPOET_PERF_MB=8 \
+    /// cargo test --release -p tonepoet --lib -- live_mount_perf --ignored --nocapture
+    /// ```
     #[test]
     #[ignore]
     fn live_mount_perf() {
@@ -54012,22 +54680,83 @@ mod live_mount_perf_harness {
             return;
         };
         let files: usize = std::env::var("TONEPOET_PERF_FILES")
-            .ok().and_then(|value| value.parse().ok()).unwrap_or(24);
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(24);
         let mb: usize = std::env::var("TONEPOET_PERF_MB")
-            .ok().and_then(|value| value.parse().ok()).unwrap_or(8);
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
         let base = std::path::PathBuf::from(base);
+        assert!(files >= 16, "acceptance harness requires at least 16 files");
+        assert!(
+            files.saturating_mul(mb) >= 128,
+            "acceptance harness requires at least 128 MiB total",
+        );
+        let case_label = std::env::var("TONEPOET_PERF_CASE")
+            .expect("set TONEPOET_PERF_CASE=ext4 or reduced");
+        assert!(
+            matches!(case_label.as_str(), "ext4" | "reduced"),
+            "unsupported TONEPOET_PERF_CASE '{case_label}'; expected ext4 or reduced",
+        );
+        let expected_policy = std::env::var("TONEPOET_PERF_EXPECT_POLICY")
+            .expect("set TONEPOET_PERF_EXPECT_POLICY=Strict or ContentVerifiedPortable");
+        let expected_policy = match expected_policy.as_str() {
+            "Strict" => tui_file_picker::FilesystemIdentityPolicy::Strict,
+            "ContentVerifiedPortable" => {
+                tui_file_picker::FilesystemIdentityPolicy::ContentVerifiedPortable
+            }
+            other => panic!(
+                "unsupported TONEPOET_PERF_EXPECT_POLICY '{other}'; expected Strict or ContentVerifiedPortable"
+            ),
+        };
+        let mount_policy = tui_file_picker::filesystem_identity_policy(&base);
+        assert_eq!(
+            mount_policy, expected_policy,
+            "performance path '{}' has Tonepoet policy {mount_policy:?}, expected {expected_policy:?}",
+            base.display(),
+        );
+        #[cfg(unix)]
+        let mount_device = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&base)
+                .unwrap_or_else(|error| panic!("stat performance path '{}': {error}", base.display()))
+                .dev()
+                .to_string()
+        };
+        #[cfg(not(unix))]
+        let mount_device = "unavailable".to_string();
+        eprintln!(
+            "PERF_MOUNT case={case_label} path={} device={} policy={mount_policy:?}",
+            base.display(),
+            mount_device,
+        );
         let scratch = base.join(format!(".tonepoet-perf-{}", std::process::id()));
         let album = scratch.join("album");
         std::fs::create_dir_all(&album).expect("scratch");
         let payload = vec![0xA5u8; mb * 1024 * 1024];
         for index in 0..files {
-            std::fs::write(album.join(format!("{index:02}.flac")), &payload).expect("fixture");
+            std::fs::write(album.join(format!("{index:02}.flac")), &payload)
+                .expect("fixture");
         }
         let total_mb = files * mb;
 
-        let run_worker = |sources: Vec<std::path::PathBuf>, dest: &std::path::Path, is_move: bool| {
+        let run_worker = |
+            sources: Vec<std::path::PathBuf>,
+            dest: &std::path::Path,
+            is_move: bool,
+            verification: tui_file_picker::VerificationMode,
+        | {
             let (tx, mut rx) = mpsc::channel::<AppMessage>(1024);
-            let drain = std::thread::spawn(move || while rx.blocking_recv().is_some() {});
+            let drain = std::thread::spawn(move || {
+                let mut completion = None;
+                while let Some(message) = rx.blocking_recv() {
+                    if let AppMessage::FileTaskComplete { report, .. } = message {
+                        completion = Some(report);
+                    }
+                }
+                completion
+            });
             let (_control_tx, control_rx) = std::sync::mpsc::channel();
             let start = std::time::Instant::now();
             FileTaskWorker::new(
@@ -54041,40 +54770,103 @@ mod live_mount_perf_harness {
                     root_targets: None,
                     clipboard_retry_plan: None,
                     verbose_degrade_notices: false,
+                    verification,
                 },
                 tx,
                 control_rx,
             )
             .run();
             let elapsed = start.elapsed();
-            drain.join().expect("drain");
-            elapsed
+            let report = drain
+                .join()
+                .expect("drain")
+                .expect("worker must emit an authoritative completion report");
+            assert!(
+                report.is_complete(),
+                "performance run did not complete every root: {report:?}",
+            );
+            (elapsed, report)
         };
 
-        // Baseline: plain read+write copy of the same tree.
         let baseline_dest = scratch.join("baseline");
         std::fs::create_dir_all(&baseline_dest).expect("baseline dir");
         let start = std::time::Instant::now();
         for entry in std::fs::read_dir(&album).expect("read album") {
             let entry = entry.expect("entry");
-            std::fs::copy(entry.path(), baseline_dest.join(entry.file_name())).expect("copy");
+            std::fs::copy(entry.path(), baseline_dest.join(entry.file_name()))
+                .expect("copy");
         }
         let baseline = start.elapsed();
         std::fs::remove_dir_all(&baseline_dest).expect("baseline cleanup");
 
-        let copy_dest = scratch.join("copied");
-        std::fs::create_dir_all(&copy_dest).expect("copy dest");
-        let engine_copy = run_worker(vec![album.clone()], &copy_dest, false);
+        eprintln!(
+            "PERF {total_mb} MiB across {files} files at {} ({mount_policy:?}):",
+            base.display()
+        );
+        eprintln!("  baseline plain copy: {baseline:?}");
+        for verification in [
+            tui_file_picker::VerificationMode::Standard,
+            tui_file_picker::VerificationMode::Strong,
+        ] {
+            let label = match verification {
+                tui_file_picker::VerificationMode::Standard => "standard",
+                tui_file_picker::VerificationMode::Strong => "strong",
+            };
+            let copy_dest = scratch.join(format!("copied-{label}"));
+            std::fs::create_dir_all(&copy_dest).expect("copy dest");
+            let (engine_copy, copy_report) = run_worker(
+                vec![album.clone()],
+                &copy_dest,
+                false,
+                verification,
+            );
 
-        let move_dest = scratch.join("moved");
-        std::fs::create_dir_all(&move_dest).expect("move dest");
-        let engine_move = run_worker(vec![copy_dest.join("album")], &move_dest, true);
+            let move_dest = scratch.join(format!("moved-{label}"));
+            std::fs::create_dir_all(&move_dest).expect("move dest");
+            let (engine_move, move_report) = run_worker(
+                vec![copy_dest.join("album")],
+                &move_dest,
+                true,
+                verification,
+            );
 
-        eprintln!("PERF {total_mb} MiB across {files} files at {}:", base.display());
-        eprintln!("  baseline plain copy : {baseline:?}");
-        eprintln!("  engine copy         : {engine_copy:?}  ({:.1}x baseline)",
-            engine_copy.as_secs_f64() / baseline.as_secs_f64().max(1e-9));
-        eprintln!("  engine move (same mount): {engine_move:?}");
+            let copy_warnings = copy_report
+                .roots
+                .iter()
+                .filter(|root| {
+                    root.disposition
+                        == tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+                })
+                .count();
+            let move_warnings = move_report
+                .roots
+                .iter()
+                .filter(|root| {
+                    root.disposition
+                        == tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+                })
+                .count();
+            let ratio = engine_copy.as_secs_f64() / baseline.as_secs_f64().max(1e-9);
+            eprintln!(
+                "  {label:8} copy: {engine_copy:?} ({ratio:.3}x baseline)"
+            );
+            eprintln!("  {label:8} move (same mount): {engine_move:?}");
+            eprintln!(
+                "PERF_RESULT case={case_label} policy={mount_policy:?} mode={label} bytes={} files={files} baseline_copy_ms={:.3} engine_copy_ms={:.3} copy_ratio={ratio:.6} same_mount_move_ms={:.3} copy_warnings={copy_warnings} move_warnings={move_warnings}",
+                total_mb * 1024 * 1024,
+                baseline.as_secs_f64() * 1000.0,
+                engine_copy.as_secs_f64() * 1000.0,
+                engine_move.as_secs_f64() * 1000.0,
+            );
+            if verification == tui_file_picker::VerificationMode::Standard
+                && mount_policy == tui_file_picker::FilesystemIdentityPolicy::Strict
+            {
+                assert!(
+                    ratio <= 1.5,
+                    "standard strict-mount copy exceeded the 1.5x acceptance objective: {ratio:.3}x",
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
@@ -54121,6 +54913,7 @@ mod rename_outcome_diagnostics_tests {
 #[cfg(test)]
 mod round4_undo_replay_tests {
     use super::*;
+    use crate::config::TonepoetConfig;
 
     fn rename_entry(
         base_dir: &std::path::Path,
@@ -54152,6 +54945,76 @@ mod round4_undo_replay_tests {
                 })
                 .collect(),
         }
+    }
+
+    fn proof_at_verification(
+        path: &std::path::Path,
+        verification: tui_file_picker::VerificationMode,
+    ) -> tui_file_picker::FileTaskRootProof {
+        let source_manifest =
+            tui_file_picker::capture_manifest_with_mode(path, verification)
+                .expect("fixture proof");
+        let destination_manifest = source_manifest.destination_identity_for_same_tree();
+        tui_file_picker::FileTaskRootProof {
+            source_manifest,
+            destination_manifest,
+        }
+    }
+
+    #[test]
+    fn replay_policy_uses_retained_authority_and_rejects_mixed_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let standard_path = temp.path().join("standard.flac");
+        let strong_path = temp.path().join("strong.flac");
+        std::fs::write(&standard_path, b"standard").expect("standard fixture");
+        std::fs::write(&strong_path, b"strong").expect("strong fixture");
+        let standard = proof_at_verification(
+            &standard_path,
+            tui_file_picker::VerificationMode::Standard,
+        );
+        let strong = proof_at_verification(
+            &strong_path,
+            tui_file_picker::VerificationMode::Strong,
+        );
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.config.file_operations.verification = tui_file_picker::VerificationMode::Strong;
+        let retained_standard = FileOperationUndoEntry {
+            id: 1,
+            kind: FileOperationUndoKind::Move,
+            rename_base_dir: None,
+            mappings: vec![FileOperationUndoMapping {
+                source: standard_path.clone(),
+                destination: temp.path().join("standard-destination.flac"),
+                source_proof: Some(standard.clone()),
+                destination_proof: None,
+            }],
+        };
+
+        assert_eq!(
+            undo_redo_policy(&app, &retained_standard)
+                .expect("retained standard policy")
+                .verification,
+            tui_file_picker::VerificationMode::Standard,
+            "changing the current setting must not upgrade replay authority",
+        );
+
+        let mixed = FileOperationUndoEntry {
+            id: 2,
+            kind: FileOperationUndoKind::Move,
+            rename_base_dir: None,
+            mappings: vec![
+                retained_standard.mappings[0].clone(),
+                FileOperationUndoMapping {
+                    source: strong_path,
+                    destination: temp.path().join("strong-destination.flac"),
+                    source_proof: Some(strong),
+                    destination_proof: None,
+                },
+            ],
+        };
+        let error = undo_redo_policy(&app, &mixed)
+            .expect_err("mixed retained authority must be rejected");
+        assert!(error.contains("mixed verification authorities"));
     }
 
     /// Mirror `complete_file_operation_replay`: a committed replay consumes the
@@ -54402,6 +55265,7 @@ mod round4_undo_replay_tests {
 
         complete_file_operation_replay(
             &mut app,
+            id,
             entry,
             true,
             super::super::message::FileOperationReplayResult {

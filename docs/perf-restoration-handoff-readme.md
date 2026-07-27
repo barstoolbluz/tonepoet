@@ -8,6 +8,9 @@ in-place constraint, the cyan==info accent slot).
 
 **Baseline:** branch `hardening` @ 83fe80e; `cargo test --workspace` =
 5,162 passed / 0 failed across 56 targets. Version stays **0.4.4**.
+The governing brief's `839baab` identifier is the earlier feature-lineage commit for
+the degraded-rename ladder, not this overlay's apply target. Verify that ancestry
+in the complete repository and require every supplied preimage hash to match.
 
 ## Scope, in priority order
 
@@ -35,18 +38,23 @@ in-place constraint, the cyan==info accent slot).
   gate, and level checks run BEFORE digest comparison (see §2.1/§3.3).
 - Standard-mode metadata writes keep the armed-journal/stale-bak refusal
   READ (see §2.5) or startup recovery destroys them.
+- On Windows, journal-free generic metadata commit uses `ReplaceFileW` with
+  `dwReplaceFlags = 0` as the sole replacement primitive. Do not add a
+  `MoveFileExW` fallback: documented failure states can already have changed
+  the namespace, and a rename fallback does not preserve the destination's
+  DACL and other Windows file properties.
 
 ## Deliverables
 
 - Overlay bundle (tar.gz, nested dir) with a preimage manifest covering every
   modified file (SHA-256 of the exact base revisions you received).
-- Engineering report including: before/after `live_mount_perf` tables (both
-  modes, ext4 + one reduced mount, `--release` only — debug numbers are
-  inflated 20-50x by unoptimized SHA-256 and must not be quoted), the
-  `FileOperationIoCounters` budget evidence, every §4 criterion's pinning
-  test named, all disclosed residuals (identity-level undo authority, xattr
-  drop on temp+rename, degraded-mode windows), and any deliberate deviation
-  from the brief with rationale.
+- Immutable engineering report plus source- and bundle-bound generated acceptance evidence stored outside the tested repository.
+  The source report records the design, before measurements, counter evidence,
+  named pinning tests, residuals, and deviations. `RUN_ACCEPTANCE.sh` writes the
+  completed release tables plus the exact tested diff/tree authority outside the
+  overlay, checksums every tested source file, and supports a read-only `--verify`
+  rerun. Do not edit a source postimage after acceptance. Release numbers only —
+  debug SHA-256 is inflated 20-50x and must not be quoted.
 - New/updated tests keep `cargo test --workspace` green; tests you add for
   the budget must FAIL if a content-read regression is introduced later.
 

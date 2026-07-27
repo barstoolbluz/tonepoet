@@ -70,6 +70,51 @@ const METADATA_STATE_PREPARED: &str = "prepared";
 const METADATA_STATE_COMMITTED: &str = "committed";
 const METADATA_STATE_ROLLED_BACK: &str = "rolled_back";
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TestMetadataMutationAudit {
+    pub journal_write_transactions: u64,
+    pub backup_bytes_copied: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_METADATA_MUTATION_AUDIT: std::cell::RefCell<TestMetadataMutationAudit> =
+        std::cell::RefCell::new(TestMetadataMutationAudit::default());
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_metadata_mutation_audit() {
+    TEST_METADATA_MUTATION_AUDIT.with(|audit| {
+        *audit.borrow_mut() = TestMetadataMutationAudit::default();
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_metadata_mutation_audit() -> TestMetadataMutationAudit {
+    TEST_METADATA_MUTATION_AUDIT.with(|audit| *audit.borrow())
+}
+
+#[cfg(test)]
+fn record_test_metadata_journal_write() {
+    TEST_METADATA_MUTATION_AUDIT.with(|audit| {
+        audit.borrow_mut().journal_write_transactions += 1;
+    });
+}
+
+#[cfg(not(test))]
+fn record_test_metadata_journal_write() {}
+
+#[cfg(test)]
+fn record_test_metadata_backup_copy(bytes: u64) {
+    TEST_METADATA_MUTATION_AUDIT.with(|audit| {
+        audit.borrow_mut().backup_bytes_copied += bytes;
+    });
+}
+
+#[cfg(not(test))]
+fn record_test_metadata_backup_copy(_bytes: u64) {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabasePragmaProfile {
     FileBacked,
@@ -2043,6 +2088,7 @@ impl Database {
                     "journal insert refused for '{file_path}': an unresolved metadata write already owns this path or the journal is unavailable: {e}"
                 )
             })?;
+        record_test_metadata_journal_write();
         Ok(())
     }
 
@@ -2059,6 +2105,7 @@ impl Database {
                 "journal state update for '{file_path}' to '{state}' changed {changed} rows; expected exactly one"
             ));
         }
+        record_test_metadata_journal_write();
         Ok(())
     }
 
@@ -2076,6 +2123,7 @@ impl Database {
                 "journal delete for '{file_path}' removed {changed} rows; expected exactly one"
             ));
         }
+        record_test_metadata_journal_write();
         Ok(())
     }
 
@@ -2369,6 +2417,34 @@ impl Database {
 
     // ── Atomic metadata write ──────────────────────────────────
 
+    /// Refuse a journal-free metadata replacement when any earlier recovery
+    /// authority is still present. This is intentionally read-only: standard
+    /// mode must neither allocate nor retire journal state, but it must not
+    /// write bytes that startup recovery could later overwrite.
+    pub fn assert_metadata_write_unarmed(
+        &self,
+        file_path: &std::path::Path,
+    ) -> Result<(), String> {
+        let path_str = file_path.display().to_string();
+        if let Some(entry) = self.metadata_journal_entry(&path_str)? {
+            return Err(format!(
+                "metadata write refused for '{}': unresolved {} journal still owns rollback marker '{}' from {}; run startup recovery before retrying",
+                file_path.display(),
+                entry.state,
+                entry.backup_path,
+                entry.started_at,
+            ));
+        }
+        let legacy_backup = Self::backup_path(file_path);
+        if legacy_backup.exists() {
+            return Err(format!(
+                "metadata write refused: stale rollback marker '{}' already exists and will not be overwritten; run startup recovery before retrying",
+                legacy_backup.display(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Perform an atomic metadata write with an independent copy backup + journal.
     ///
     /// 1. Exclusively reserves an empty, non-authoritative unique marker
@@ -2475,17 +2551,28 @@ impl Database {
             };
         }
 
-        if let Err(error) = std::io::copy(&mut source, &mut destination)
-            .and_then(|_| destination.sync_all())
-        {
+        let copied = match std::io::copy(&mut source, &mut destination) {
+            Ok(copied) => copied,
+            Err(error) => {
+                drop(destination);
+                let reason = format!(
+                    "backup allocation failed for '{}': copy to rollback marker '{}': {error}",
+                    file_path.display(),
+                    backup.display()
+                );
+                return Err(self.abort_allocating_metadata_write(&path_str, &backup, reason));
+            }
+        };
+        if let Err(error) = destination.sync_all() {
             drop(destination);
             let reason = format!(
-                "backup allocation failed for '{}': copy to rollback marker '{}': {error}",
+                "backup allocation failed for '{}': sync rollback marker '{}': {error}",
                 file_path.display(),
                 backup.display()
             );
             return Err(self.abort_allocating_metadata_write(&path_str, &backup, reason));
         }
+        record_test_metadata_backup_copy(copied);
         drop(destination);
         if let Err(error) = Self::sync_parent_directory(&backup) {
             let reason = format!(
@@ -2978,15 +3065,36 @@ impl Database {
                     )
                 }
             })?;
-        if let Err(error) = std::io::copy(&mut source, &mut destination)
-            .and_then(|_| destination.sync_all())
-        {
+        let copied = match std::io::copy(&mut source, &mut destination) {
+            Ok(copied) => copied,
+            Err(error) => {
+                drop(destination);
+                let cleanup = std::fs::remove_file(backup);
+                let copy_error = format!(
+                    "copy '{}' to rollback marker '{}': {error}",
+                    original.display(),
+                    backup.display()
+                );
+                return match cleanup {
+                    Ok(()) => Err(copy_error),
+                    Err(cleanup_error)
+                        if cleanup_error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Err(copy_error)
+                    }
+                    Err(cleanup_error) => Err(format!(
+                        "{copy_error}; additionally could not remove the incomplete marker: {cleanup_error}"
+                    )),
+                };
+            }
+        };
+        if let Err(error) = destination.sync_all() {
             drop(destination);
             let cleanup = std::fs::remove_file(backup);
             let copy_error = format!(
-                "copy '{}' to rollback marker '{}': {error}",
-                original.display(),
-                backup.display()
+                "sync rollback marker '{}' for '{}': {error}",
+                backup.display(),
+                original.display()
             );
             return match cleanup {
                 Ok(()) => Err(copy_error),
@@ -3000,6 +3108,7 @@ impl Database {
                 )),
             };
         }
+        record_test_metadata_backup_copy(copied);
         drop(destination);
         if let Err(error) = Self::sync_parent_directory(backup) {
             let cleanup = std::fs::remove_file(backup);
@@ -4372,6 +4481,38 @@ mod tests {
         db.complete_metadata_write("/music/song.mp3").unwrap();
         let stale = db.stale_metadata_writes().unwrap();
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn journal_free_metadata_guard_is_read_only_and_refuses_both_authorities() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("song.mp3");
+        std::fs::write(&target, b"carrier").expect("write target");
+        let backup = Database::backup_path_for(&target);
+        let target_string = target.display().to_string();
+        let backup_string = backup.display().to_string();
+        let db = Database::open_memory().expect("database");
+
+        db.begin_metadata_write(&target_string, &backup_string)
+            .expect("seed journal authority");
+        let journal_error = db
+            .assert_metadata_write_unarmed(&target)
+            .expect_err("armed journal must refuse standard replacement");
+        assert!(journal_error.contains("unresolved prepared journal"));
+        assert_eq!(db.stale_metadata_writes().expect("read journal").len(), 1);
+
+        db.complete_metadata_write(&target_string)
+            .expect("retire journal authority");
+        std::fs::write(&backup, b"stale rollback authority").expect("write stale backup");
+        let backup_error = db
+            .assert_metadata_write_unarmed(&target)
+            .expect_err("stale legacy backup must refuse standard replacement");
+        assert!(backup_error.contains("stale rollback marker"));
+        assert_eq!(
+            std::fs::read(&backup).expect("marker retained"),
+            b"stale rollback authority",
+            "read-only guard must not retire recovery authority",
+        );
     }
 
     #[test]

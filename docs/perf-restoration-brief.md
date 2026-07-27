@@ -1,7 +1,8 @@
 # Performance Restoration Brief — File Operations (copy / move / rename / undo)
 
-**Branch:** `hardening` @ 839baab. **Baseline suite:** 5,162 passed / 0 failed (56 targets).
-**Version stays 0.4.4.**
+**Feature-lineage commit:** `hardening` @ 839baab (the degraded-rename ladder introduced there remains load-bearing).
+**Delivery/apply baseline:** `hardening` @ 83fe80e, as identified by the later handoff document; exact preimage hashes remain the fail-closed application authority.
+**Baseline suite:** 5,162 passed / 0 failed (56 targets). **Version stays 0.4.4.**
 
 ## 0. The governing directive (from the user, verbatim intent)
 
@@ -337,9 +338,12 @@ it, no new shim needed.
    re-implementing. Pipeline/conversion tagging out of scope. Strong mode:
    today's journaled backup paths unchanged.
 
-The `live_mount_perf` harness output for both modes and both mounts goes in
-the engineering report (before/after table). Extend the harness (or add a
-sibling) to time a single-field metadata edit on a ≥50 MB file, both modes.
+The `live_mount_perf` harness output for both modes and both mounts must be
+retained as completed handoff evidence. To keep the source overlay immutable
+and rerunnable, the acceptance runner may place the after tables and raw logs
+in a separate atomically generated, independently checksummed results artifact
+referenced by the engineering report. Extend the harness (or add a sibling) to
+time a single-field metadata edit on a ≥50 MB file, both modes.
 
 ## 5. Secondary items (same bundle, small, fully specified)
 

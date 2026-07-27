@@ -358,6 +358,33 @@ pub enum DeletePolicy {
     Recursive,
 }
 
+/// Verification depth for file operations and their retained undo proofs.
+///
+/// `Standard` is intentionally identity- and metadata-based: it keeps
+/// no-clobber, bounded tree-membership, size/version, and stale-object checks
+/// without adding content reads after the bytes have already been copied.
+/// `Strong` preserves the historical full-content proof machinery.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum VerificationMode {
+    Standard,
+    Strong,
+}
+
+impl Default for VerificationMode {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
 impl Default for DeletePolicy {
     fn default() -> Self {
         Self::FilesAndEmptyDirectories
@@ -388,6 +415,9 @@ pub struct FileOperationPolicy {
     /// Include routine reduced-filesystem capability notices in successful
     /// operation results. Failures and data-affecting warnings remain visible.
     pub verbose_degrade_notices: bool,
+    /// Select identity-level default verification or the historical full
+    /// content-authority path.
+    pub verification: VerificationMode,
 }
 
 impl Default for FileOperationPolicy {
@@ -403,6 +433,7 @@ impl Default for FileOperationPolicy {
             cross_device_cut: CrossDeviceCutPolicy::Reject,
             delete: DeletePolicy::FilesAndEmptyDirectories,
             verbose_degrade_notices: false,
+            verification: VerificationMode::Standard,
         }
     }
 }
@@ -2794,6 +2825,9 @@ impl FilePickerState {
             },
             self.theme.clone(),
         );
+        // This standalone picker path has no authoritative completion report.
+        // Keep the report-dependent close-on-success control host-only.
+        progress.set_auto_close_available(false);
         progress.set_scope(crate::FileTaskScope {
             source_root: None,
             source_summary: format!("{} clipboard item(s)", clipboard.paths().len()),
@@ -3103,6 +3137,10 @@ impl FilePickerState {
             }
             crate::FileTaskUserAction::Abort => {
                 task.control.store(PASTE_CONTROL_ABORT, AtomicOrdering::Release);
+            }
+            crate::FileTaskUserAction::ToggleAutoClose(_) => {
+                // The standalone picker has no persisted host setting. The
+                // progress state has already applied the local toggle.
             }
             crate::FileTaskUserAction::ChooseConflictResolution(_) => {}
         }
@@ -4560,11 +4598,17 @@ fn move_path_with_policy_progress_accounted_with_recovery_and_expected(
         );
     }
 
-    let source_manifest = crate::capture_manifest(source).map_err(|error| FilePickerError::Io {
+    io.source_tree_walks = io.source_tree_walks.saturating_add(1);
+    let source_manifest = crate::capture_manifest_with_mode(source, policy.verification).map_err(|error| FilePickerError::Io {
         op: "capture native-rename source manifest",
         path: source.to_path_buf(),
         message: error,
     })?;
+    if policy.verification == VerificationMode::Strong {
+        io.source_bytes_hashed = io
+            .source_bytes_hashed
+            .saturating_add(source_manifest.total_file_bytes());
+    }
     if let Some(expected) = expected_source {
         expected
             .destination_manifest
@@ -4619,6 +4663,7 @@ fn move_path_with_policy_progress_accounted_with_recovery_and_expected(
             let destination_manifest = source_manifest
                 .destination_identity_after_root_rename(
                     rename_verification.destination_snapshot.clone(),
+                    destination_capabilities,
                 )
                 .map_err(|message| {
                     committed_operation_unverified(
@@ -4851,10 +4896,11 @@ fn copy_then_delete_progress_with_resume_accounted_expected(
                 notices: vec![format!(
                     "retry reused the original verified publication proof for {}; no data was recopied{}",
                     destination.display(),
-                    if destination_bytes_rehashed == 0 {
-                        " and strict mount evidence avoided a destination rehash"
-                    } else {
-                        "; weak mount identity required one destination verification rehash"
+                    match (policy.verification, destination_bytes_rehashed) {
+                        (VerificationMode::Standard, 0) =>
+                            "; identity-level authority required no destination content read",
+                        (_, 0) => " and strict mount evidence avoided a destination rehash",
+                        _ => "; reduced mount identity required one destination verification rehash",
                     }
                 )],
                 post_publication_control: None,
@@ -4864,7 +4910,10 @@ fn copy_then_delete_progress_with_resume_accounted_expected(
             // In that case, establish fresh authority once without recopying.
             let mut manifest_control_error = None;
             io.source_tree_walks = io.source_tree_walks.saturating_add(1);
-            let manifest_result = crate::capture_manifest_with_cancel(source, |path| {
+            let manifest_result = crate::capture_manifest_with_mode_and_cancel(
+                source,
+                policy.verification,
+                |path| {
                 if manifest_control_error.is_some() {
                     return false;
                 }
@@ -4875,7 +4924,8 @@ fn copy_then_delete_progress_with_resume_accounted_expected(
                         false
                     }
                 }
-            });
+                },
+            );
             if let Some(error) = manifest_control_error {
                 return Err(error);
             }
@@ -4884,20 +4934,17 @@ fn copy_then_delete_progress_with_resume_accounted_expected(
                 path: source.to_path_buf(),
                 message,
             })?;
-            let compatibility_rehash_bytes = source_manifest.total_file_bytes();
-            io.source_bytes_hashed = io
-                .source_bytes_hashed
-                .saturating_add(compatibility_rehash_bytes);
-            io.bytes_redundantly_rehashed = io
-                .bytes_redundantly_rehashed
-                .saturating_add(compatibility_rehash_bytes);
+            if policy.verification == VerificationMode::Strong {
+                io.source_bytes_hashed = io
+                    .source_bytes_hashed
+                    .saturating_add(source_manifest.total_file_bytes());
+                io.bytes_redundantly_rehashed = io
+                    .bytes_redundantly_rehashed
+                    .saturating_add(source_manifest.total_file_bytes());
+            }
             io.destination_tree_walks = io.destination_tree_walks.saturating_add(1);
-            io.destination_bytes_hashed = io
-                .destination_bytes_hashed
-                .saturating_add(source_manifest.total_file_bytes());
             let mut destination_control_error = None;
-            let destination_manifest_result = source_manifest
-                .capture_verified_copy_at_with_cancel(destination, |path| {
+            let mut capture = |path: &Path| {
                     if destination_control_error.is_some() {
                         return false;
                     }
@@ -4908,7 +4955,15 @@ fn copy_then_delete_progress_with_resume_accounted_expected(
                             false
                         }
                     }
-                });
+                };
+            let destination_manifest_result = if policy.verification == VerificationMode::Strong {
+                io.destination_bytes_hashed = io
+                    .destination_bytes_hashed
+                    .saturating_add(source_manifest.total_file_bytes());
+                source_manifest.capture_verified_copy_at_with_cancel(destination, &mut capture)
+            } else {
+                source_manifest.capture_identity_copy_at_with_cancel(destination, &mut capture)
+            };
             if let Some(error) = destination_control_error {
                 return Err(error);
             }
@@ -5015,15 +5070,18 @@ fn copy_then_delete_progress_with_resume_accounted_expected(
             }
         };
 
-    // Quarantine publication and final source removal are separate durable
-    // transitions. Synchronize the source parent at each boundary, but retain
-    // pragmatic degraded operation on filesystems that cannot sync directories.
+    // Strong mode preserves the two-boundary durability proof: quarantine
+    // publication and final source removal are synchronized separately.
+    // Standard mode intentionally matches ordinary copy/move expectations and
+    // synchronizes the source parent only after final removal.
     let mut quarantine_durability_warning = None;
-    if let Some(parent) = source.parent() {
-        if let Err(error) = sync_directory_accounted(parent, io) {
-            quarantine_durability_warning = Some(format!(
-                "source was quarantined, but source-parent synchronization failed; cleanup continued in degraded durability mode: {error}"
-            ));
+    if policy.verification == VerificationMode::Strong {
+        if let Some(parent) = source.parent() {
+            if let Err(error) = sync_directory_accounted(parent, io) {
+                quarantine_durability_warning = Some(format!(
+                    "source was quarantined, but source-parent synchronization failed; cleanup continued in degraded durability mode: {error}"
+                ));
+            }
         }
     }
 
@@ -5407,10 +5465,9 @@ fn verify_destination_entry_before_source_deletion(
     progress: &mut FileOperationProgress<'_>,
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
-    // Strict mounts use the exact post-content-verification version token,
-    // including ctime. Reduced-semantics mounts perform the irreducible final
-    // destination digest read here, after source verification and immediately
-    // before unlinking the corresponding source entry.
+    // Standard authority uses retained identity and tree-membership evidence
+    // on every mount. Strong authority reuses exact version evidence on strict
+    // mounts and performs the historical final digest read on reduced mounts.
     let mut verification_interruption = None;
     let verification = destination_manifest.verify_entry_at_with_cancel_counted(
         manifest,
@@ -6155,7 +6212,8 @@ where
     let staging = staging_container.join("payload");
     let mut visited = HashSet::new();
     let mut metadata_warnings = Vec::new();
-    let mut source_manifest = crate::SourceManifest::default();
+    let mut source_manifest = crate::SourceManifest::new(policy.verification);
+    let mut staged_destination_manifest = crate::DestinationManifest::new(policy.verification);
     io.source_tree_walks = io.source_tree_walks.saturating_add(1);
     let result = copy_path_to_staging(
         src,
@@ -6166,6 +6224,7 @@ where
         progress,
         &mut metadata_warnings,
         &mut source_manifest,
+        &mut staged_destination_manifest,
         io,
     )
     .and_then(|()| {
@@ -6205,19 +6264,38 @@ where
                 metadata_warnings.push(warning.to_string());
             }
         }
-        io.destination_tree_walks = io.destination_tree_walks.saturating_add(1);
-        io.destination_bytes_hashed = io
-            .destination_bytes_hashed
-            .saturating_add(source_manifest.total_file_bytes());
-        let destination_manifest = verify_published(&source_manifest, dst).map_err(|message| {
-            committed_operation_unverified(
-                src,
-                dst,
-                format!(
-                    "post-publication content verification failed; source retained: {message}"
-                ),
-            )
-        })?;
+        let destination_manifest = if policy.verification == VerificationMode::Strong {
+            io.destination_tree_walks = io.destination_tree_walks.saturating_add(1);
+            io.destination_bytes_hashed = io
+                .destination_bytes_hashed
+                .saturating_add(source_manifest.total_file_bytes());
+            verify_published(&source_manifest, dst).map_err(|message| {
+                committed_operation_unverified(
+                    src,
+                    dst,
+                    format!(
+                        "post-publication content verification failed; source retained: {message}"
+                    ),
+                )
+            })?
+        } else {
+            let published_root = crate::snapshot_path(dst)
+                .map_err(|error| io_error("identify published copy root", dst, error))?;
+            staged_destination_manifest
+                .identity_after_root_rename(
+                    published_root,
+                    crate::filesystem_capabilities(dst),
+                )
+                .map_err(|message| {
+                    committed_operation_unverified(
+                        src,
+                        dst,
+                        format!(
+                            "post-publication identity verification failed; source retained: {message}"
+                        ),
+                    )
+                })?
+        };
         Ok(destination_manifest)
     });
     match result {
@@ -6229,6 +6307,11 @@ where
                         "could not remove empty staging directory {}: {err}",
                         staging_container.display()
                     ));
+                }
+            }
+            if policy.verification == VerificationMode::Standard {
+                if let Err(error) = sync_published_root_standard(dst, io) {
+                    notices.push(error.message().to_string());
                 }
             }
             if let Err(err) = sync_directory_accounted(parent, io) {
@@ -6261,6 +6344,7 @@ fn copy_path_to_staging(
     progress: &mut FileOperationProgress<'_>,
     metadata_warnings: &mut Vec<String>,
     source_manifest: &mut crate::SourceManifest,
+    destination_manifest: &mut crate::DestinationManifest,
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
     progress(src, dst, 0, false)?;
@@ -6298,7 +6382,7 @@ fn copy_path_to_staging(
             });
         }
         source_manifest
-            .insert(relative, source_snapshot.clone(), None)
+            .insert(relative.clone(), source_snapshot.clone(), None)
             .map_err(|message| FilePickerError::Io {
                 op: "record copy-time directory proof",
                 path: src.to_path_buf(),
@@ -6314,6 +6398,7 @@ fn copy_path_to_staging(
             progress,
             metadata_warnings,
             source_manifest,
+            destination_manifest,
             io,
         )
         .and_then(|()| {
@@ -6332,18 +6417,29 @@ fn copy_path_to_staging(
                     src.display()
                 )),
             }
-            if let Err(err) = sync_directory_accounted(dst, io) {
-                if crate::filesystem_identity_policy(dst)
-                    == crate::FilesystemIdentityPolicy::ContentVerifiedPortable
-                {
-                    metadata_warnings.push(format!(
-                        "{}: directory synchronization is unavailable on this filesystem: {err}",
-                        dst.display()
-                    ));
-                } else {
-                    return Err(io_error("sync copied directory", dst, err));
+            if policy.verification == VerificationMode::Strong {
+                if let Err(err) = sync_directory_accounted(dst, io) {
+                    if crate::filesystem_identity_policy(dst)
+                        == crate::FilesystemIdentityPolicy::ContentVerifiedPortable
+                    {
+                        metadata_warnings.push(format!(
+                            "{}: directory synchronization is unavailable on this filesystem: {err}",
+                            dst.display()
+                        ));
+                    } else {
+                        return Err(io_error("sync copied directory", dst, err));
+                    }
                 }
             }
+            let destination_snapshot = crate::snapshot_path(dst)
+                .map_err(|err| io_error("capture staged directory identity", dst, err))?;
+            destination_manifest
+                .insert(relative.clone(), destination_snapshot)
+                .map_err(|message| FilePickerError::Io {
+                    op: "record staged directory identity",
+                    path: dst.to_path_buf(),
+                    message,
+                })?;
             Ok(())
         });
         visited.remove(&src_canon);
@@ -6355,20 +6451,29 @@ fn copy_path_to_staging(
         } else {
             None
         };
-        let (proof_snapshot, digest) = copy_regular_file(
+        let (proof_snapshot, digest, destination_snapshot) = copy_regular_file(
             src,
             dst,
             &metadata,
             expected_snapshot,
+            policy.verification,
+            src == root_src,
             progress,
             metadata_warnings,
             io,
         )?;
         source_manifest
-            .insert(relative, proof_snapshot, Some(digest))
+            .insert(relative.clone(), proof_snapshot, digest)
             .map_err(|message| FilePickerError::Io {
                 op: "record copy-time file proof",
                 path: src.to_path_buf(),
+                message,
+            })?;
+        destination_manifest
+            .insert(relative, destination_snapshot)
+            .map_err(|message| FilePickerError::Io {
+                op: "record staged file identity",
+                path: dst.to_path_buf(),
                 message,
             })?;
         progress(src, dst, 0, true)
@@ -6391,6 +6496,7 @@ fn copy_dir_contents(
     progress: &mut FileOperationProgress<'_>,
     metadata_warnings: &mut Vec<String>,
     source_manifest: &mut crate::SourceManifest,
+    destination_manifest: &mut crate::DestinationManifest,
     io: &mut crate::FileOperationIoCounters,
 ) -> Result<(), FilePickerError> {
     let mut entries = fs::read_dir(src)
@@ -6411,6 +6517,7 @@ fn copy_dir_contents(
             progress,
             metadata_warnings,
             source_manifest,
+            destination_manifest,
             io,
         )?;
     }
@@ -6422,10 +6529,19 @@ fn copy_regular_file(
     dst: &Path,
     _metadata: &fs::Metadata,
     expected_snapshot: Option<&crate::SourceSnapshot>,
+    verification: VerificationMode,
+    sync_standard_root_file: bool,
     progress: &mut FileOperationProgress<'_>,
     metadata_warnings: &mut Vec<String>,
     io: &mut crate::FileOperationIoCounters,
-) -> Result<(crate::SourceSnapshot, crate::ContentDigest), FilePickerError> {
+) -> Result<
+    (
+        crate::SourceSnapshot,
+        Option<crate::ContentDigest>,
+        crate::SourceSnapshot,
+    ),
+    FilePickerError,
+> {
     let mut source = fs::File::open(src).map_err(|err| io_error("open source file", src, err))?;
     let opened_snapshot = crate::snapshot_open_file(&source)
         .map_err(|err| io_error("capture opened source identity", src, err))?;
@@ -6451,7 +6567,7 @@ fn copy_regular_file(
         .map_err(|err| io_error("create staged file", dst, err))?;
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut copied = 0u64;
-    let mut sha = crate::Sha256::new();
+    let mut sha = (verification == VerificationMode::Strong).then(crate::Sha256::new);
     loop {
         progress(src, dst, 0, false)?;
         let read = source
@@ -6463,10 +6579,14 @@ fn copy_regular_file(
         destination
             .write_all(&buffer[..read])
             .map_err(|err| io_error("write staged file", dst, err))?;
-        sha.update(&buffer[..read]);
+        if let Some(sha) = sha.as_mut() {
+            sha.update(&buffer[..read]);
+        }
         copied = copied.saturating_add(read as u64);
         io.bytes_copied = io.bytes_copied.saturating_add(read as u64);
-        io.source_bytes_hashed = io.source_bytes_hashed.saturating_add(read as u64);
+        if verification == VerificationMode::Strong {
+            io.source_bytes_hashed = io.source_bytes_hashed.saturating_add(read as u64);
+        }
         progress(src, dst, read as u64, false)?;
     }
     let final_snapshot = crate::snapshot_open_file(&source)
@@ -6493,11 +6613,35 @@ fn copy_regular_file(
             .into_iter()
             .map(|warning| format!("{}: {warning}", src.display())),
     );
-    io.file_sync_calls = io.file_sync_calls.saturating_add(1);
-    destination
-        .sync_all()
-        .map_err(|err| io_error("sync staged file and metadata", dst, err))?;
-    Ok((opened_snapshot, sha.finalize()))
+    if verification == VerificationMode::Strong || sync_standard_root_file {
+        io.file_sync_calls = io.file_sync_calls.saturating_add(1);
+        destination
+            .sync_all()
+            .map_err(|err| io_error("sync staged file and metadata", dst, err))?;
+    }
+    let destination_snapshot = crate::snapshot_open_file(&destination)
+        .map_err(|err| io_error("capture staged file identity", dst, err))?;
+    let digest = sha.map(crate::Sha256::finalize);
+    Ok((opened_snapshot, digest, destination_snapshot))
+}
+
+fn sync_published_root_standard(
+    path: &Path,
+    io: &mut crate::FileOperationIoCounters,
+) -> Result<(), FilePickerError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error("inspect published root for synchronization", path, error))?;
+    if metadata.file_type().is_dir() {
+        sync_directory_accounted(path, io)
+            .map_err(|error| io_error("sync published root directory", path, error))?;
+    } else if !metadata.file_type().is_file() {
+        return Err(FilePickerError::Io {
+            op: "sync published root",
+            path: path.to_path_buf(),
+            message: "published root is neither a regular file nor a directory".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn preserve_copied_metadata(
@@ -7134,10 +7278,16 @@ mod tests {
         let mut progress =
             |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
 
+        // The injected post-publication verifier only runs under Strong;
+        // Standard skips destination re-verification by design.
+        let policy = FileOperationPolicy {
+            verification: VerificationMode::Strong,
+            ..FileOperationPolicy::default()
+        };
         let error = safe_copy_path_progress_with_notices_and_verifier(
             &source,
             &destination,
-            FileOperationPolicy::default(),
+            policy,
             &mut progress,
             |_manifest, _published| Err("fixture verification failure".to_string()),
         )
@@ -8328,8 +8478,15 @@ mod tests {
         }
     }
 
+    fn strong_policy() -> FileOperationPolicy {
+        FileOperationPolicy {
+            verification: VerificationMode::Strong,
+            ..FileOperationPolicy::default()
+        }
+    }
+
     #[test]
-    fn same_filesystem_native_rename_has_zero_full_content_reads() {
+    fn same_filesystem_native_rename_has_one_stat_only_walk_and_zero_content_reads() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -8351,7 +8508,11 @@ mod tests {
         assert_eq!(io.bytes_copied, 0);
         assert_eq!(io.source_bytes_hashed, 0);
         assert_eq!(io.destination_bytes_hashed, 0);
-        assert_eq!(io.source_tree_walks, 0);
+        assert_eq!(
+            io.source_tree_walks,
+            1,
+            "standard native move performs one stat-only manifest walk",
+        );
         assert_eq!(io.destination_tree_walks, 0);
         assert_eq!(io.destination_entry_verification_passes, 0);
         assert!(!source.exists());
@@ -8377,6 +8538,163 @@ mod tests {
     }
 
     #[test]
+    fn standard_copy_performs_one_payload_read_without_content_verification_passes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let destination = temp.path().join("copy.flac");
+        let bytes = b"deterministic audio payload";
+        fs::write(&source, bytes).expect("source");
+        let mut io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+
+        let outcome = safe_copy_path_progress_with_notices_accounted(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut io,
+        )
+        .expect("standard copy");
+
+        assert_eq!(io.bytes_copied, bytes.len() as u64);
+        assert_eq!(io.source_bytes_hashed, 0);
+        assert_eq!(io.destination_bytes_hashed, 0);
+        assert_eq!(io.bytes_redundantly_rehashed, 0);
+        assert_eq!(io.source_tree_walks, 1);
+        assert_eq!(io.destination_tree_walks, 0);
+        assert_eq!(io.destination_entry_verification_passes, 0);
+        assert_eq!(io.file_sync_calls, 1, "the writable staged root file is synchronized before publication");
+        assert_eq!(io.directory_sync_calls, 1, "only the destination parent is synchronized");
+        assert_eq!(outcome.source_manifest.verification(), VerificationMode::Standard);
+        assert!(!outcome.source_manifest.has_content_digests());
+        assert_eq!(outcome.destination_manifest.verification(), VerificationMode::Standard);
+        assert_eq!(fs::read(&destination).expect("destination"), bytes);
+    }
+
+    #[test]
+    #[ignore = "acceptance-scale 128 MiB release gate; run explicitly to avoid burdening the ordinary suite"]
+    fn acceptance_scale_standard_native_move_and_copy_pin_16_files_128_mib() {
+        const FILE_COUNT: usize = 16;
+        const FILE_BYTES: u64 = 8 * 1024 * 1024;
+        const TOTAL_BYTES: u64 = FILE_COUNT as u64 * FILE_BYTES;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            crate::filesystem_identity_policy(temp.path()),
+            crate::FilesystemIdentityPolicy::Strict,
+            "acceptance-scale fixture must run on a strict local mount",
+        );
+        let source = temp.path().join("source-album");
+        let moved = temp.path().join("moved-album");
+        let copied = temp.path().join("copied-album");
+        fs::create_dir(&source).expect("source album");
+        for index in 0..FILE_COUNT {
+            let path = source.join(format!("track-{index:02}.bin"));
+            let payload = vec![index as u8; FILE_BYTES as usize];
+            fs::write(&path, payload).expect("write acceptance-scale track bytes");
+        }
+
+        let mut move_io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+        assert_completed_operation(move_path_with_policy_progress_accounted(
+            &source,
+            &moved,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut move_io,
+        ));
+        assert_eq!(move_io.rename_attempts, 1);
+        assert_eq!(move_io.source_tree_walks, 1);
+        assert_eq!(move_io.bytes_copied, 0);
+        assert_eq!(move_io.source_bytes_hashed, 0);
+        assert_eq!(move_io.destination_bytes_hashed, 0);
+
+        let mut copy_io = crate::FileOperationIoCounters::default();
+        let outcome = safe_copy_path_progress_with_notices_accounted(
+            &moved,
+            &copied,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut copy_io,
+        )
+        .expect("acceptance-scale standard copy");
+        assert_eq!(copy_io.bytes_copied, TOTAL_BYTES);
+        assert_eq!(copy_io.source_bytes_hashed, 0);
+        assert_eq!(copy_io.destination_bytes_hashed, 0);
+        assert_eq!(copy_io.bytes_redundantly_rehashed, 0);
+        assert_eq!(copy_io.source_tree_walks, 1);
+        assert_eq!(copy_io.destination_tree_walks, 0);
+        assert_eq!(copy_io.destination_entry_verification_passes, 0);
+        assert_eq!(
+            copy_io.file_sync_calls,
+            0,
+            "directory publication must not sync each of {FILE_COUNT} files: {copy_io:?}",
+        );
+        assert!(
+            copy_io.directory_sync_calls <= 2,
+            "standard directory copy syncs only the published root and its parent: {copy_io:?}",
+        );
+        assert_eq!(outcome.source_manifest.verification(), VerificationMode::Standard);
+        assert!(!outcome.source_manifest.has_content_digests());
+        assert_eq!(outcome.destination_manifest.verification(), VerificationMode::Standard);
+        for index in 0..FILE_COUNT {
+            assert_eq!(
+                fs::metadata(copied.join(format!("track-{index:02}.bin")))
+                    .expect("stat copied acceptance track")
+                    .len(),
+                FILE_BYTES,
+            );
+        }
+    }
+
+    #[test]
+    fn standard_copy_then_delete_remains_zero_content_read_on_portable_mounts() {
+        let _portable = crate::source_guard::test_override_filesystem_capabilities(
+            crate::FilesystemCapabilities {
+                semantics: crate::FilesystemSemantics::NetworkOrReduced,
+                stable_path_identity: crate::CapabilitySupport::Unsupported,
+                nanosecond_timestamps: crate::CapabilitySupport::Unsupported,
+                extended_attributes: crate::CapabilitySupport::Unknown,
+                directory_sync: crate::CapabilitySupport::Supported,
+                atomic_no_replace_rename: crate::CapabilitySupport::Supported,
+                filesystem_type: Some(0x6573_5546),
+            },
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let destination = temp.path().join("moved.flac");
+        let bytes = b"deterministic audio payload";
+        fs::write(&source, bytes).expect("source");
+        TEST_FORCE_COPY_THEN_DELETE_MOVE.with(|flag| flag.set(true));
+        let mut io = crate::FileOperationIoCounters::default();
+        let mut progress =
+            |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
+
+        assert_completed_operation(move_path_with_policy_progress_accounted(
+            &source,
+            &destination,
+            FileOperationPolicy::default(),
+            &mut progress,
+            &mut io,
+        ));
+
+        assert_eq!(io.bytes_copied, bytes.len() as u64);
+        assert_eq!(io.source_bytes_hashed, 0);
+        assert_eq!(io.destination_bytes_hashed, 0);
+        assert_eq!(io.bytes_redundantly_rehashed, 0);
+        assert_eq!(io.destination_tree_walks, 0);
+        assert_eq!(io.file_sync_calls, 1, "the writable staged root file is synchronized before publication");
+        assert_eq!(
+            io.directory_sync_calls, 2,
+            "standard mode synchronizes the destination parent and the source parent once each"
+        );
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).expect("destination"), bytes);
+    }
+
+    #[test]
     fn unavoidable_file_move_fuses_copy_hash_and_uses_one_destination_tree_pass() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("track.flac");
@@ -8393,7 +8711,7 @@ mod tests {
         assert_completed_operation(move_path_with_policy_progress_accounted(
             &source,
             &destination,
-            FileOperationPolicy::default(),
+            strong_policy(),
             &mut progress,
             &mut io,
         ));
@@ -8479,7 +8797,7 @@ mod tests {
         let error = move_path_with_policy_progress_accounted(
             &source,
             &destination,
-            FileOperationPolicy::default(),
+            strong_policy(),
             &mut progress,
             &mut io,
         )
@@ -8565,7 +8883,7 @@ mod tests {
             |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
         let failure = execute_paste_plan_progress_with_resume_accounted(
             &plan,
-            FileOperationPolicy::default(),
+            strong_policy(),
             None,
             &mut progress,
             &mut first_io,
@@ -8577,7 +8895,7 @@ mod tests {
             |_source: &Path, _destination: &Path, _bytes: u64, _completed: bool| Ok(());
         let recovered = execute_paste_plan_progress_with_resume_accounted(
             retry.plan(),
-            FileOperationPolicy::default(),
+            strong_policy(),
             Some(&retry),
             &mut retry_progress,
             &mut retry_io,
@@ -8628,7 +8946,7 @@ mod tests {
         assert_completed_operation(move_path_with_policy_progress_accounted(
             &source,
             &destination,
-            FileOperationPolicy::default(),
+            strong_policy(),
             &mut progress,
             &mut io,
         ));
@@ -8732,8 +9050,31 @@ mod case_rename_transaction_tests {
 mod exact_replay_authority_tests {
     use super::*;
 
-    fn retained_same_path_proof(path: &Path) -> crate::FileTaskRootProof {
-        let source_manifest = crate::capture_manifest(path).expect("capture retained source");
+    fn strong_policy() -> FileOperationPolicy {
+        FileOperationPolicy {
+            verification: VerificationMode::Strong,
+            ..FileOperationPolicy::default()
+        }
+    }
+
+    fn portable_replay_capabilities() -> crate::FilesystemCapabilities {
+        crate::FilesystemCapabilities {
+            semantics: crate::FilesystemSemantics::NetworkOrReduced,
+            stable_path_identity: crate::CapabilitySupport::Supported,
+            nanosecond_timestamps: crate::CapabilitySupport::Unsupported,
+            extended_attributes: crate::CapabilitySupport::Unknown,
+            directory_sync: crate::CapabilitySupport::Supported,
+            atomic_no_replace_rename: crate::CapabilitySupport::Supported,
+            filesystem_type: Some(0x6573_5546),
+        }
+    }
+
+    fn retained_same_path_proof(
+        path: &Path,
+        verification: VerificationMode,
+    ) -> crate::FileTaskRootProof {
+        let source_manifest = crate::capture_manifest_with_mode(path, verification)
+            .expect("capture retained source");
         let destination_manifest = source_manifest.destination_identity_for_same_tree();
         crate::FileTaskRootProof {
             source_manifest,
@@ -8743,12 +9084,15 @@ mod exact_replay_authority_tests {
 
     #[test]
     fn copy_replay_rejects_changed_source_before_publication() {
+        let _portable = crate::source_guard::test_override_filesystem_capabilities(
+            portable_replay_capabilities(),
+        );
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source.flac");
         let destination = temp.path().join("destination.flac");
         fs::write(&source, b"authorized bytes").expect("source");
-        let expected = retained_same_path_proof(&source);
-        fs::write(&source, b"replacement bytes").expect("replace source");
+        let expected = retained_same_path_proof(&source, VerificationMode::Strong);
+        fs::write(&source, b"altered content!").expect("replace source");
 
         let plan = PastePlan {
             mode: FilePickerClipboardMode::Copy,
@@ -8759,24 +9103,35 @@ mod exact_replay_authority_tests {
         };
         let failure = execute_exact_paste_plan_with_proofs_and_expected_sources(
             &plan,
-            FileOperationPolicy::default(),
+            strong_policy(),
             &[expected],
         )
         .expect_err("changed replay source must be refused");
 
-        assert!(failure.to_string().contains("replay source"));
+        let failure = failure.to_string();
+        assert!(
+            failure.contains("replay source content changed"),
+            "matching strong authority must reach the digest comparison: {failure}",
+        );
+        assert!(
+            !failure.contains("verification authority mismatch"),
+            "test must reach the matching-strong replay checks: {failure}",
+        );
         assert!(!destination.exists(), "unauthorized bytes must never be published");
-        assert_eq!(fs::read(&source).expect("source retained"), b"replacement bytes");
+        assert_eq!(fs::read(&source).expect("source retained"), b"altered content!");
     }
 
     #[test]
     fn move_replay_rejects_changed_source_before_namespace_mutation() {
+        let _portable = crate::source_guard::test_override_filesystem_capabilities(
+            portable_replay_capabilities(),
+        );
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source.flac");
         let destination = temp.path().join("destination.flac");
         fs::write(&source, b"authorized bytes").expect("source");
-        let expected = retained_same_path_proof(&source);
-        fs::write(&source, b"replacement bytes").expect("replace source");
+        let expected = retained_same_path_proof(&source, VerificationMode::Strong);
+        fs::write(&source, b"altered content!").expect("replace source");
 
         let plan = PastePlan {
             mode: FilePickerClipboardMode::Cut,
@@ -8787,13 +9142,21 @@ mod exact_replay_authority_tests {
         };
         let failure = execute_exact_paste_plan_with_proofs_and_expected_sources(
             &plan,
-            FileOperationPolicy::default(),
+            strong_policy(),
             &[expected],
         )
         .expect_err("changed replay source must be refused");
 
-        assert!(failure.to_string().contains("replay authority"));
+        let failure = failure.to_string();
+        assert!(
+            failure.contains("replay source content changed"),
+            "matching strong authority must reach the digest comparison: {failure}",
+        );
+        assert!(
+            !failure.contains("verification authority mismatch"),
+            "test must reach the matching-strong replay checks: {failure}",
+        );
         assert!(!destination.exists(), "unauthorized object must not be moved");
-        assert_eq!(fs::read(&source).expect("source retained"), b"replacement bytes");
+        assert_eq!(fs::read(&source).expect("source retained"), b"altered content!");
     }
 }

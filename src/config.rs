@@ -29,8 +29,42 @@ pub struct TonepoetConfig {
     pub performance: PerformanceConfig,
     #[serde(default)]
     pub browsing: BrowsingConfig,
+    #[serde(default)]
+    pub file_operations: FileOperationsConfig,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileOperationStatusVerbosity {
+    Quiet,
+    Verbose,
+}
+
+impl Default for FileOperationStatusVerbosity {
+    fn default() -> Self {
+        Self::Quiet
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileOperationsConfig {
+    #[serde(default)]
+    pub verification: tui_file_picker::VerificationMode,
+    #[serde(default)]
+    pub status_verbosity: FileOperationStatusVerbosity,
+    #[serde(default)]
+    pub auto_close_progress: bool,
+}
+
+impl Default for FileOperationsConfig {
+    fn default() -> Self {
+        Self {
+            verification: tui_file_picker::VerificationMode::Standard,
+            status_verbosity: FileOperationStatusVerbosity::Quiet,
+            auto_close_progress: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceConfig {
@@ -389,6 +423,7 @@ impl Default for TonepoetConfig {
             ui: UiConfig::default(),
             performance: PerformanceConfig::default(),
             browsing: BrowsingConfig::default(),
+            file_operations: FileOperationsConfig::default(),
         }
     }
 }
@@ -2136,6 +2171,26 @@ show_conversion_actions = false
 
         assert_eq!(config.performance.browsing.archive_listing, "auto");
         assert_eq!(config.performance.browsing.archive_listing_timeout, 30);
+        assert_eq!(config.file_operations, FileOperationsConfig::default());
+    }
+
+    #[test]
+    fn file_operation_preferences_round_trip_with_stable_lowercase_values() {
+        let mut config = TonepoetConfig::default();
+        config.file_operations = FileOperationsConfig {
+            verification: tui_file_picker::VerificationMode::Strong,
+            status_verbosity: FileOperationStatusVerbosity::Verbose,
+            auto_close_progress: true,
+        };
+
+        let rendered = toml::to_string(&config).expect("serialize config");
+        assert!(rendered.contains("[file_operations]"));
+        assert!(rendered.contains("verification = \"strong\""));
+        assert!(rendered.contains("status_verbosity = \"verbose\""));
+        assert!(rendered.contains("auto_close_progress = true"));
+
+        let reparsed: TonepoetConfig = toml::from_str(&rendered).expect("reparse config");
+        assert_eq!(reparsed.file_operations, config.file_operations);
     }
 
 

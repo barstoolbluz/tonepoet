@@ -230,7 +230,17 @@ pub fn execute_plan(plan: &mut RenamePlan) -> Result<usize, String> {
 pub fn execute_plan_with_proofs(
     plan: &mut RenamePlan,
 ) -> Result<RenameExecutionReport, String> {
-    execute_plan_with_proofs_internal(plan, None)
+    execute_plan_with_proofs_at_verification(
+        plan,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+pub fn execute_plan_with_proofs_at_verification(
+    plan: &mut RenamePlan,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<RenameExecutionReport, String> {
+    execute_plan_with_proofs_internal(plan, None, verification)
 }
 
 /// Execute a replay transaction only if each pre-mutation source manifest
@@ -241,12 +251,25 @@ pub fn execute_plan_with_proofs_and_expected_sources(
     plan: &mut RenamePlan,
     expected_sources: &[tui_file_picker::FileTaskRootProof],
 ) -> Result<RenameExecutionReport, String> {
-    execute_plan_with_proofs_internal(plan, Some(expected_sources))
+    execute_plan_with_proofs_and_expected_sources_at_verification(
+        plan,
+        expected_sources,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+pub fn execute_plan_with_proofs_and_expected_sources_at_verification(
+    plan: &mut RenamePlan,
+    expected_sources: &[tui_file_picker::FileTaskRootProof],
+    verification: tui_file_picker::VerificationMode,
+) -> Result<RenameExecutionReport, String> {
+    execute_plan_with_proofs_internal(plan, Some(expected_sources), verification)
 }
 
 fn execute_plan_with_proofs_internal(
     plan: &mut RenamePlan,
     expected_sources: Option<&[tui_file_picker::FileTaskRootProof]>,
+    verification: tui_file_picker::VerificationMode,
 ) -> Result<RenameExecutionReport, String> {
     assert_eq!(
         plan.conflict_count(),
@@ -290,7 +313,7 @@ fn execute_plan_with_proofs_internal(
     for (proof_index, &index) in pending_indices.iter().enumerate() {
         let source = plan.ops[index].source.clone();
         let destination = plan.base_dir.join(&plan.ops[index].target_relative);
-        let manifest = tui_file_picker::capture_manifest(&source).map_err(|error| {
+        let manifest = tui_file_picker::capture_manifest_with_mode(&source, verification).map_err(|error| {
             format!(
                 "could not capture authoritative rename preimage for {}: {error}",
                 source.display(),
@@ -383,6 +406,7 @@ fn execute_plan_with_proofs_internal(
                             .manifest
                             .destination_identity_after_root_rename(
                                 verification.destination_snapshot,
+                                destination_capabilities,
                             )
                             .map(|destination_manifest| {
                                 tui_file_picker::FileTaskRootProof {
@@ -885,6 +909,58 @@ mod tests {
             // a.flac should be back at its original location (rolled back).
             assert!(a.exists(), "a.flac should have been rolled back");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_directory_rename_and_replay_proofs_remain_digest_free() {
+        let dir = tmp_dir();
+        let source = dir.join("album");
+        fs::create_dir(&source).expect("album");
+        fs::write(source.join("track.flac"), b"audio payload").expect("track");
+
+        let mut plan = RenamePlan::new(
+            dir.clone(),
+            vec![(source.clone(), "renamed-album".to_string())],
+        );
+        assert_eq!(validate_plan(&mut plan), 0);
+        let report = execute_plan_with_proofs_at_verification(
+            &mut plan,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("standard rename");
+        assert_eq!(report.succeeded_count, 1);
+        let proof = report.roots[0].proof.as_ref().expect("rename proof");
+        assert_eq!(
+            proof.source_manifest.verification(),
+            tui_file_picker::VerificationMode::Standard
+        );
+        assert!(!proof.source_manifest.has_content_digests());
+        assert_eq!(
+            proof.destination_manifest.verification(),
+            tui_file_picker::VerificationMode::Standard
+        );
+
+        let renamed = dir.join("renamed-album");
+        let mut replay = RenamePlan::new(
+            dir.clone(),
+            vec![(renamed.clone(), "album".to_string())],
+        );
+        assert_eq!(validate_plan(&mut replay), 0);
+        let replay_report = execute_plan_with_proofs_and_expected_sources_at_verification(
+            &mut replay,
+            std::slice::from_ref(proof),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("standard undo replay");
+        let replay_proof = replay_report.roots[0]
+            .proof
+            .as_ref()
+            .expect("redo proof");
+        assert!(!replay_proof.source_manifest.has_content_digests());
+        assert!(source.exists());
+        assert!(!renamed.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

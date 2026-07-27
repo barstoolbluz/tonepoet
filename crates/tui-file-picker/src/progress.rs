@@ -439,6 +439,7 @@ pub enum FileTaskUserAction {
     SkipCurrent,
     Abort,
     Acknowledge,
+    ToggleAutoClose(bool),
     ChooseConflictResolution(ConflictResolution),
 }
 
@@ -585,6 +586,7 @@ enum ProgressHitAction {
     Abort,
     Acknowledge,
     ToggleDetails,
+    ToggleAutoClose,
     Conflict(ConflictAction),
     ToggleApplyAll,
 }
@@ -623,11 +625,15 @@ pub struct FileTaskProgressState {
     last_area: Option<Rect>,
     details_open: bool,
     details_scroll: u16,
+    task_controls_available: bool,
+    auto_close_available: bool,
+    auto_close_progress: bool,
 }
 
 impl FileTaskProgressState {
     pub fn new(kind: FileTaskKind, title: impl Into<String>, theme: FilePickerTheme) -> Self {
         let now = Instant::now();
+        let auto_close_available = matches!(kind, FileTaskKind::Copy | FileTaskKind::Move);
         Self {
             title: title.into(),
             kind,
@@ -650,12 +656,53 @@ impl FileTaskProgressState {
             last_area: None,
             details_open: false,
             details_scroll: 0,
+            task_controls_available: true,
+            auto_close_available,
+            auto_close_progress: false,
         }
     }
 
     pub fn set_scope(&mut self, scope: FileTaskScope) {
         self.scope = Some(scope);
         self.updated_at = Instant::now();
+    }
+
+    /// Enable or suppress pause/skip/abort controls for the live task.
+    ///
+    /// Hosts must disable these controls when a worker cannot honor them. The
+    /// progress surface then remains informative and may still expose the
+    /// close-on-success preference without advertising ineffective actions.
+    pub fn set_task_controls_available(&mut self, available: bool) {
+        self.task_controls_available = available;
+        self.updated_at = Instant::now();
+    }
+
+    #[must_use]
+    pub const fn task_controls_available(&self) -> bool {
+        self.task_controls_available
+    }
+
+    pub fn set_auto_close(&mut self, enabled: bool) {
+        self.auto_close_progress = enabled;
+        self.updated_at = Instant::now();
+    }
+
+    #[must_use]
+    pub const fn auto_close(&self) -> bool {
+        self.auto_close_progress
+    }
+
+    pub fn set_auto_close_available(&mut self, available: bool) {
+        self.auto_close_available = available;
+        if !available {
+            self.auto_close_progress = false;
+        }
+        self.updated_at = Instant::now();
+    }
+
+    #[must_use]
+    pub const fn auto_close_available(&self) -> bool {
+        self.auto_close_available
     }
 
     /// Return the concrete theme currently used by this progress overlay.
@@ -892,6 +939,10 @@ impl FileTaskProgressState {
             };
         }
 
+        if !self.task_controls_available {
+            return FileTaskUserAction::None;
+        }
+
         match key.code {
             KeyCode::Esc => FileTaskUserAction::Abort,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => FileTaskUserAction::Abort,
@@ -920,20 +971,33 @@ impl FileTaskProgressState {
             return FileTaskUserAction::None;
         };
         match hit.action {
-            ProgressHitAction::PauseResume => {
+            ProgressHitAction::PauseResume if self.task_controls_available => {
                 if matches!(self.phase, FileTaskPhase::Paused) {
                     FileTaskUserAction::Resume
                 } else {
                     FileTaskUserAction::Pause
                 }
             }
-            ProgressHitAction::SkipCurrent => FileTaskUserAction::SkipCurrent,
-            ProgressHitAction::Abort => FileTaskUserAction::Abort,
+            ProgressHitAction::PauseResume => FileTaskUserAction::None,
+            ProgressHitAction::SkipCurrent if self.task_controls_available => {
+                FileTaskUserAction::SkipCurrent
+            }
+            ProgressHitAction::SkipCurrent => FileTaskUserAction::None,
+            ProgressHitAction::Abort if self.task_controls_available => FileTaskUserAction::Abort,
+            ProgressHitAction::Abort => FileTaskUserAction::None,
             ProgressHitAction::Acknowledge => FileTaskUserAction::Acknowledge,
             ProgressHitAction::ToggleDetails => {
                 self.details_open = !self.details_open;
                 self.details_scroll = 0;
                 FileTaskUserAction::None
+            }
+            ProgressHitAction::ToggleAutoClose => {
+                if !self.auto_close_available {
+                    return FileTaskUserAction::None;
+                }
+                self.auto_close_progress = !self.auto_close_progress;
+                self.updated_at = Instant::now();
+                FileTaskUserAction::ToggleAutoClose(self.auto_close_progress)
             }
             ProgressHitAction::Conflict(action) => self.choose_conflict_action(action),
             ProgressHitAction::ToggleApplyAll => {
@@ -1417,26 +1481,64 @@ impl FileTaskProgressState {
             return buttons;
         }
         if matches!(&self.kind, FileTaskKind::Archive) {
-            return vec![(
-                " Esc Abort ".to_string(),
-                ProgressHitAction::Abort,
-                self.theme.progress_destructive,
-            )];
+            return self
+                .task_controls_available
+                .then(|| {
+                    vec![(
+                        " Esc Abort ".to_string(),
+                        ProgressHitAction::Abort,
+                        self.theme.progress_destructive,
+                    )]
+                })
+                .unwrap_or_default();
         }
         let pause_label = if matches!(self.phase, FileTaskPhase::Paused) {
             " p Resume "
         } else {
             " p Pause "
         };
-        vec![
-            (pause_label.to_string(), ProgressHitAction::PauseResume, self.theme.progress_button),
-            (" s Skip ".to_string(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
-            (" Esc Abort ".to_string(), ProgressHitAction::Abort, self.theme.progress_destructive),
-        ]
+        let mut buttons = Vec::new();
+        if self.auto_close_available {
+            buttons.push((
+                format!(
+                    "[{}] Close when done",
+                    if self.auto_close_progress { "x" } else { " " }
+                ),
+                ProgressHitAction::ToggleAutoClose,
+                self.theme.progress_button,
+            ));
+        }
+        if self.task_controls_available {
+            if self.auto_close_available {
+                buttons.extend([
+                    (pause_label.trim().to_string(), ProgressHitAction::PauseResume, self.theme.progress_button),
+                    ("s Skip".to_string(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
+                    ("Esc Abort".to_string(), ProgressHitAction::Abort, self.theme.progress_destructive),
+                ]);
+            } else {
+                buttons.extend([
+                    (pause_label.to_string(), ProgressHitAction::PauseResume, self.theme.progress_button),
+                    (" s Skip ".to_string(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
+                    (" Esc Abort ".to_string(), ProgressHitAction::Abort, self.theme.progress_destructive),
+                ]);
+            }
+        }
+        buttons
     }
 
     fn detail_buttons(&self) -> Vec<(String, ProgressHitAction, Style)> {
-        vec![
+        let mut buttons = Vec::new();
+        if self.auto_close_available && !self.is_terminal() {
+            buttons.push((
+                format!(
+                    "[{}] Close when done",
+                    if self.auto_close_progress { "x" } else { " " }
+                ),
+                ProgressHitAction::ToggleAutoClose,
+                self.theme.progress_button,
+            ));
+        }
+        buttons.extend([
             (
                 " d Summary ".to_string(),
                 ProgressHitAction::ToggleDetails,
@@ -1447,7 +1549,8 @@ impl FileTaskProgressState {
                 ProgressHitAction::Acknowledge,
                 self.theme.progress_button,
             ),
-        ]
+        ]);
+        buttons
     }
 
     fn conflict_buttons(&self) -> Vec<(String, ProgressHitAction, Style)> {
@@ -1969,7 +2072,7 @@ mod tests {
         );
         assert_eq!(
             buffer_row(buffer, 10, 52),
-            "│         p Pause     s Skip     Esc Abort         │"
+            "│[ ] Close when done   p Pause   s Skip   Esc Abort│"
         );
         assert_eq!(
             buffer_row(buffer, 11, 52),
@@ -1984,15 +2087,27 @@ mod tests {
         assert_eq!(buffer.get(4, 5).fg, Color::Cyan);
         assert_eq!(buffer.get(29, 5).fg, Color::DarkGray);
         assert_eq!(buffer.get(47, 5).fg, Color::White);
-        assert_eq!(buffer.get(10, 10).fg, Color::Black);
-        assert_eq!(buffer.get(10, 10).bg, Color::Cyan);
-        assert_eq!(buffer.get(33, 10).fg, Color::Black);
-        assert_eq!(buffer.get(33, 10).bg, Color::Red);
+        assert_eq!(buffer.get(1, 10).fg, Color::Black);
+        assert_eq!(buffer.get(1, 10).bg, Color::Cyan);
+        assert_eq!(buffer.get(42, 10).fg, Color::Black);
+        assert_eq!(buffer.get(42, 10).bg, Color::Red);
+
+        let toggle = state.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 52, 12),
+        );
+        assert_eq!(toggle, FileTaskUserAction::ToggleAutoClose(true));
+        assert!(state.auto_close());
 
         let pause = state.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 10,
+                column: 23,
                 row: 10,
                 modifiers: KeyModifiers::NONE,
             },
@@ -2003,7 +2118,7 @@ mod tests {
         let skip = state.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 22,
+                column: 33,
                 row: 10,
                 modifiers: KeyModifiers::NONE,
             },
@@ -2014,7 +2129,7 @@ mod tests {
         let abort = state.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 34,
+                column: 42,
                 row: 10,
                 modifiers: KeyModifiers::NONE,
             },

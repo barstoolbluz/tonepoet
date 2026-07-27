@@ -12,6 +12,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use crate::state::VerificationMode;
+
 const MAX_MANIFEST_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_DEPTH: usize = 1_024;
 
@@ -191,6 +193,39 @@ struct LinuxMountKey {
 #[cfg(target_os = "linux")]
 static FILESYSTEM_CAPABILITY_CACHE: OnceLock<Mutex<HashMap<LinuxMountKey, FilesystemCapabilities>>> =
     OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FILESYSTEM_CAPABILITY_OVERRIDE: std::cell::Cell<Option<FilesystemCapabilities>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestFilesystemCapabilityOverrideGuard {
+    previous: Option<FilesystemCapabilities>,
+}
+
+#[cfg(test)]
+impl Drop for TestFilesystemCapabilityOverrideGuard {
+    fn drop(&mut self) {
+        TEST_FILESYSTEM_CAPABILITY_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Install a thread-local capability classification for deterministic tests.
+/// The scoped guard restores the prior value, so parallel tests cannot leak a
+/// synthetic mount policy into one another.
+#[cfg(test)]
+pub(crate) fn test_override_filesystem_capabilities(
+    capabilities: FilesystemCapabilities,
+) -> TestFilesystemCapabilityOverrideGuard {
+    let previous = TEST_FILESYSTEM_CAPABILITY_OVERRIDE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(capabilities));
+        previous
+    });
+    TestFilesystemCapabilityOverrideGuard { previous }
+}
 
 #[cfg(target_os = "linux")]
 fn capability_cache() -> &'static Mutex<HashMap<LinuxMountKey, FilesystemCapabilities>> {
@@ -399,6 +434,11 @@ fn probe_linux_capabilities(path: &Path) -> FilesystemCapabilities {
 }
 
 pub fn filesystem_capabilities(path: &Path) -> FilesystemCapabilities {
+    #[cfg(test)]
+    if let Some(capabilities) = TEST_FILESYSTEM_CAPABILITY_OVERRIDE.with(|slot| slot.get()) {
+        let _ = path;
+        return capabilities;
+    }
     #[cfg(target_os = "linux")]
     {
         return probe_linux_capabilities(path);
@@ -484,7 +524,7 @@ pub fn filesystem_identity_policy_notice(path: &Path) -> Option<String> {
     let capabilities = filesystem_capabilities(path);
     (capabilities.identity_policy() == FilesystemIdentityPolicy::ContentVerifiedPortable).then(|| {
         format!(
-            "filesystem guarantees are reduced or unproven ({:?}; identity={:?}, timestamp-ns={:?}, xattrs={:?}, directory-sync={:?}, atomic-no-replace={:?}); native renames use retained-handle/type/size/path-transition evidence, while unavoidable copy/delete cleanup uses content hashes and tree membership",
+            "filesystem guarantees are reduced or unproven ({:?}; identity={:?}, timestamp-ns={:?}, xattrs={:?}, directory-sync={:?}, atomic-no-replace={:?}); native renames use retained-handle/type/size/path-transition evidence, while unavoidable copy/delete cleanup uses identity/tree evidence in standard mode and content hashes in strong mode",
             capabilities.semantics,
             capabilities.stable_path_identity,
             capabilities.nanosecond_timestamps,
@@ -1577,6 +1617,46 @@ mod tests {
     }
 
     #[test]
+    fn standard_manifest_is_digest_free_and_strong_manifest_retains_content_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album.flac");
+        fs::write(&source, b"audio payload").expect("fixture");
+
+        let standard = capture_manifest_with_mode(&source, VerificationMode::Standard)
+            .expect("standard manifest");
+        let strong = capture_manifest_with_mode(&source, VerificationMode::Strong)
+            .expect("strong manifest");
+
+        assert_eq!(standard.verification(), VerificationMode::Standard);
+        assert!(!standard.has_content_digests());
+        assert_eq!(strong.verification(), VerificationMode::Strong);
+        assert!(strong.has_content_digests());
+    }
+
+    #[test]
+    fn mixed_manifest_authority_is_rejected_before_digest_comparison() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album.flac");
+        fs::write(&source, b"audio payload").expect("fixture");
+
+        let strong = capture_manifest_with_mode(&source, VerificationMode::Strong)
+            .expect("strong manifest");
+        let standard = capture_manifest_with_mode(&source, VerificationMode::Standard)
+            .expect("standard manifest");
+        let destination = strong.destination_identity_for_same_tree();
+
+        let error = destination
+            .verify_captured_replay_source(
+                &strong,
+                &standard,
+                filesystem_capabilities(&source),
+            )
+            .expect_err("mixed authority must fail closed");
+        assert!(error.contains("verification authority mismatch"), "{error}");
+        assert!(!error.contains("content changed"), "authority must gate first: {error}");
+    }
+
+    #[test]
     fn pathname_replacement_is_not_the_captured_source() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source.bin");
@@ -2274,6 +2354,7 @@ mod tests {
             &quarantine.join("track.bin"),
             proof,
             false,
+            VerificationMode::Strong,
             FilesystemCapabilities::assumed_strict(),
             &mut keep_going,
         )
@@ -2395,21 +2476,69 @@ pub struct SourceEntryProof {
     pub digest: Option<ContentDigest>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceManifest {
+    verification: VerificationMode,
     entries: std::collections::BTreeMap<PathBuf, SourceEntryProof>,
 }
 
-/// Identity/version snapshots for the exact destination objects that passed
-/// whole-tree content verification. A later source cleanup step must satisfy
-/// both this destination-ownership proof and the source manifest's content
-/// proof before it may remove the corresponding quarantined source object.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+impl Default for SourceManifest {
+    fn default() -> Self {
+        Self::new(VerificationMode::Strong)
+    }
+}
+
+/// Identity/version snapshots for the exact destination objects accepted at
+/// the manifest's verification authority. A later source cleanup step must
+/// satisfy both this destination-ownership proof and the source manifest at
+/// the same authority before it may remove the corresponding quarantined
+/// source object.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestinationManifest {
+    verification: VerificationMode,
     entries: std::collections::BTreeMap<PathBuf, SourceSnapshot>,
 }
 
+impl Default for DestinationManifest {
+    fn default() -> Self {
+        Self::new(VerificationMode::Strong)
+    }
+}
+
 impl DestinationManifest {
+    pub fn new(verification: VerificationMode) -> Self {
+        Self {
+            verification,
+            entries: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub const fn verification(&self) -> VerificationMode {
+        self.verification
+    }
+
+    /// Update only the root snapshot after a staging tree is atomically
+    /// renamed into its public destination. Descendant objects are unchanged
+    /// by the root namespace transition.
+    pub fn identity_after_root_rename(
+        &self,
+        destination_root: SourceSnapshot,
+        capabilities: FilesystemCapabilities,
+    ) -> Result<Self, String> {
+        let expected_root = self
+            .entries
+            .get(Path::new(""))
+            .ok_or_else(|| "destination manifest has no root entry".to_string())?;
+        expected_root
+            .verify_same_identity_with_policy(&destination_root, capabilities.identity_policy())
+            .map_err(|error| format!("published root does not match staged identity: {error}"))?;
+        let mut published = self.clone();
+        published
+            .entries
+            .insert(PathBuf::new(), destination_root);
+        Ok(published)
+    }
+
     /// Reject operation proofs whose captured metadata already makes
     /// delete-based copy undo unsupported. This is a zero-I/O classification
     /// used by the worker before offering undo; destructive cleanup repeats a
@@ -2471,12 +2600,13 @@ impl DestinationManifest {
         &self,
         source_manifest: &SourceManifest,
     ) -> Result<SourceManifest, String> {
+        self.require_matching_verification(source_manifest.verification())?;
         if !self.entries.keys().eq(source_manifest.entries.keys()) {
             return Err(
                 "destination proof no longer corresponds to the source manifest".to_string(),
             );
         }
-        let mut cleanup = SourceManifest::default();
+        let mut cleanup = SourceManifest::new(self.verification);
         for (relative, snapshot) in &self.entries {
             let source = source_manifest.entries.get(relative).ok_or_else(|| {
                 format!("missing source proof for {}", relative.display())
@@ -2497,6 +2627,8 @@ impl DestinationManifest {
         captured_source: &SourceManifest,
         capabilities: FilesystemCapabilities,
     ) -> Result<(), String> {
+        self.require_matching_verification(operation_source.verification())?;
+        self.require_matching_verification(captured_source.verification())?;
         if !self.entries.keys().eq(operation_source.entries.keys())
             || !self.entries.keys().eq(captured_source.entries.keys())
         {
@@ -2525,12 +2657,27 @@ impl DestinationManifest {
                         relative.display(),
                     )
                 })?;
-            if operation_entry.digest != captured_entry.digest {
+            if self.verification == VerificationMode::Strong
+                && operation_entry.digest != captured_entry.digest
+            {
                 return Err(format!(
                     "replay source content changed at {}",
                     relative.display(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn require_matching_verification(
+        &self,
+        verification: VerificationMode,
+    ) -> Result<(), String> {
+        if self.verification != verification {
+            return Err(format!(
+                "verification authority mismatch: retained proof is {:?}, replay proof is {:?}",
+                self.verification, verification
+            ));
         }
         Ok(())
     }
@@ -2549,8 +2696,9 @@ impl DestinationManifest {
         Ok(())
     }
 
-    /// Reconfirm that an entry which passed authoritative content verification
-    /// still authorizes destructive source cleanup.
+    /// Reconfirm that an entry which passed authoritative verification,
+    /// checked against the manifest's retained authority level, still
+    /// authorizes destructive source cleanup.
     pub fn verify_entry_at(
         &self,
         source_manifest: &SourceManifest,
@@ -2626,6 +2774,7 @@ impl DestinationManifest {
     where
         F: FnMut(&Path) -> bool,
     {
+        self.require_matching_verification(source_manifest.verification())?;
         if !keep_going(path) {
             return Err("destination ownership verification was interrupted".to_string());
         }
@@ -2637,10 +2786,21 @@ impl DestinationManifest {
         })?;
         let source_proof = source_manifest.entries.get(relative_path).ok_or_else(|| {
             format!(
-                "destination entry has no source content proof: {}",
+                "destination entry has no source proof: {}",
                 relative_path.display()
             )
         })?;
+
+        if self.verification == VerificationMode::Standard {
+            if source_proof.snapshot.kind() == SourceKind::Directory {
+                verify_portable_destination_directory_membership(
+                    path,
+                    source_manifest.expected_direct_children(relative_path),
+                )?;
+            }
+            verify_identity_destination_entry(path, expected_destination, capabilities)?;
+            return Ok(0);
+        }
 
         if capabilities.identity_policy() == FilesystemIdentityPolicy::Strict {
             verify_exact_destination_entry(path, expected_destination)?;
@@ -2689,6 +2849,7 @@ impl DestinationManifest {
     where
         F: FnMut(&Path) -> bool,
     {
+        self.require_matching_verification(source_manifest.verification())?;
         if !self.entries.keys().eq(source_manifest.entries.keys()) {
             return Err(
                 "retry destination proof no longer corresponds to the source manifest"
@@ -2737,7 +2898,7 @@ fn verify_portable_destination_directory_membership(
         Ok(())
     } else {
         Err(format!(
-            "destination directory membership changed after content verification at {}",
+            "destination directory membership changed after proof capture at {}",
             path.display()
         ))
     }
@@ -2783,6 +2944,58 @@ fn verify_exact_destination_entry(
                 path.display()
             )
         })
+}
+
+fn verify_identity_destination_entry(
+    path: &Path,
+    expected: &SourceSnapshot,
+    capabilities: FilesystemCapabilities,
+) -> Result<(), String> {
+    let policy = capabilities.identity_policy();
+    if expected.kind() == SourceKind::File {
+        let file = File::open(path)
+            .map_err(|error| format!("open destination {}: {error}", path.display()))?;
+        let opened = snapshot_open_file(&file)
+            .map_err(|error| format!("identify destination {}: {error}", path.display()))?;
+        let compare_expected = if policy == FilesystemIdentityPolicy::Strict {
+            expected.verify_same_object_and_version(&opened)
+        } else {
+            expected.verify_same_identity_with_policy(&opened, policy)
+        };
+        compare_expected.map_err(|error| {
+            format!(
+                "destination identity/version changed at {}: {error}",
+                path.display()
+            )
+        })?;
+        let pathname = snapshot_path(path)
+            .map_err(|error| format!("re-identify destination {}: {error}", path.display()))?;
+        let bind_path = if policy == FilesystemIdentityPolicy::Strict {
+            opened.verify_same_object_and_version(&pathname)
+        } else {
+            opened.verify_same_identity_with_policy(&pathname, policy)
+        };
+        return bind_path.map_err(|error| {
+            format!(
+                "destination pathname changed while identity was checked at {}: {error}",
+                path.display()
+            )
+        });
+    }
+
+    let current = snapshot_path(path)
+        .map_err(|error| format!("identify destination {}: {error}", path.display()))?;
+    let comparison = if policy == FilesystemIdentityPolicy::Strict {
+        expected.verify_same_object_and_version(&current)
+    } else {
+        expected.verify_same_identity_with_policy(&current, policy)
+    };
+    comparison.map_err(|error| {
+        format!(
+            "destination identity/version changed at {}: {error}",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -2858,6 +3071,74 @@ where
         for entry in sorted_directory_entries(path)? {
             let child_relative = relative.join(entry.file_name());
             capture_verified_destination_node(
+                source_manifest,
+                &entry.path(),
+                &child_relative,
+                depth + 1,
+                visited,
+                destination_manifest,
+                keep_going,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_identity_destination_node<F>(
+    source_manifest: &SourceManifest,
+    path: &Path,
+    relative: &Path,
+    depth: usize,
+    visited: &mut std::collections::BTreeSet<PathBuf>,
+    destination_manifest: &mut DestinationManifest,
+    keep_going: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    if !keep_going(path) {
+        return Err("destination identity capture was interrupted".to_string());
+    }
+    if depth > MAX_MANIFEST_DEPTH {
+        return Err(format!(
+            "destination tree exceeds the maximum supported nesting depth of {MAX_MANIFEST_DEPTH}: {}",
+            path.display()
+        ));
+    }
+    if !visited.insert(relative.to_path_buf()) {
+        return Err(format!(
+            "duplicate destination entry while capturing identity: {}",
+            relative.display()
+        ));
+    }
+    if visited.len() > source_manifest.entries.len() {
+        return Err(format!(
+            "destination tree contains an unexpected entry: {}",
+            relative.display()
+        ));
+    }
+    let source = source_manifest.entries.get(relative).ok_or_else(|| {
+        format!(
+            "destination tree contains an unexpected entry: {}",
+            relative.display()
+        )
+    })?;
+    let snapshot = snapshot_path(path)
+        .map_err(|error| format!("identify destination {}: {error}", path.display()))?;
+    source
+        .snapshot
+        .verify_same_identity_with_policy(
+            &snapshot,
+            FilesystemIdentityPolicy::ContentVerifiedPortable,
+        )
+        .map_err(|error| format!("destination shape mismatch at {}: {error}", path.display()))?;
+    destination_manifest.insert(relative.to_path_buf(), snapshot)?;
+
+    if source.snapshot.kind() == SourceKind::Directory {
+        for entry in sorted_directory_entries(path)? {
+            let child_relative = relative.join(entry.file_name());
+            capture_identity_destination_node(
                 source_manifest,
                 &entry.path(),
                 &child_relative,
@@ -2968,12 +3249,28 @@ where
 }
 
 impl SourceManifest {
+    pub fn new(verification: VerificationMode) -> Self {
+        Self {
+            verification,
+            entries: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub const fn verification(&self) -> VerificationMode {
+        self.verification
+    }
+
+    pub fn has_content_digests(&self) -> bool {
+        self.entries.values().any(|entry| entry.digest.is_some())
+    }
+
     /// Convert a manifest captured from a tree in place into the destination
     /// identity half of an operation proof without another filesystem pass.
     /// Every snapshot already names the exact object/version observed during
     /// the authoritative capture; file digests remain in `self`.
     pub fn destination_identity_for_same_tree(&self) -> DestinationManifest {
         DestinationManifest {
+            verification: self.verification,
             entries: self
                 .entries
                 .iter()
@@ -2990,6 +3287,7 @@ impl SourceManifest {
     pub fn destination_identity_after_root_rename(
         &self,
         destination_root: SourceSnapshot,
+        capabilities: FilesystemCapabilities,
     ) -> Result<DestinationManifest, String> {
         let expected_root = self
             .entries
@@ -2999,7 +3297,7 @@ impl SourceManifest {
             .snapshot
             .verify_same_identity_with_policy(
                 &destination_root,
-                FilesystemIdentityPolicy::ContentVerifiedPortable,
+                capabilities.identity_policy(),
             )
             .map_err(|error| format!("renamed root does not match source manifest: {error}"))?;
         let mut destination = self.destination_identity_for_same_tree();
@@ -3075,12 +3373,11 @@ impl SourceManifest {
             .map(|_| ())
     }
 
-    /// Counted cleanup form. For strict mounts, non-root entries retain an
-    /// exact copy-time version token: renaming the source root does not rename
-    /// descendants, so ctime remains authoritative and no content read is
-    /// needed. A regular file that is itself the moved root is rehashed because
-    /// the quarantine rename changes that file's ctime. Reduced-semantics mounts
-    /// likewise rehash regular files.
+    /// Counted cleanup form. Standard authority uses identity/version and tree
+    /// membership only on every mount. Strong authority preserves the historical
+    /// content fallback: a regular-file root is rehashed after quarantine changes
+    /// its rename-sensitive version token, and reduced-semantics mounts rehash
+    /// regular files whose identity token cannot carry the strong proof alone.
     pub fn verify_cleanup_entry_at(
         &self,
         relative_path: &Path,
@@ -3109,6 +3406,7 @@ impl SourceManifest {
             path,
             proof,
             relative_path.as_os_str().is_empty(),
+            self.verification,
             keep_going,
         )
     }
@@ -3164,9 +3462,9 @@ impl SourceManifest {
         Ok(rehashed)
     }
 
-    /// Revalidate one destination entry against the source proof used to copy it.
-    /// This supports a final destination-presence/content gate immediately before
-    /// the corresponding source object is removed.
+    /// Revalidate one destination entry against a strong source proof used to
+    /// copy it. Standard authority deliberately has no content digest and must
+    /// use the destination-identity cleanup gate instead.
     pub fn verify_copy_entry_at(
         &self,
         relative_path: &Path,
@@ -3185,6 +3483,11 @@ impl SourceManifest {
     where
         F: FnMut(&Path) -> bool,
     {
+        if self.verification != VerificationMode::Strong {
+            return Err(
+                "content copy verification requires a strong source manifest".to_string(),
+            );
+        }
         let proof = self.entries.get(relative_path).ok_or_else(|| {
             format!(
                 "destination entry has no source proof: {}",
@@ -3200,11 +3503,22 @@ impl SourceManifest {
         snapshot: SourceSnapshot,
         digest: Option<ContentDigest>,
     ) -> Result<(), String> {
-        if snapshot.kind() == SourceKind::File && digest.is_none() {
-            return Err(format!(
-                "regular-file proof is missing a content digest: {}",
-                relative_path.display()
-            ));
+        if snapshot.kind() == SourceKind::File {
+            match (self.verification, digest.is_some()) {
+                (VerificationMode::Strong, false) => {
+                    return Err(format!(
+                        "strong regular-file proof is missing a content digest: {}",
+                        relative_path.display()
+                    ));
+                }
+                (VerificationMode::Standard, true) => {
+                    return Err(format!(
+                        "standard regular-file proof unexpectedly contains a content digest: {}",
+                        relative_path.display()
+                    ));
+                }
+                _ => {}
+            }
         }
         if !snapshot.supports_identity_proof() {
             return Err(format!(
@@ -3259,7 +3573,7 @@ impl SourceManifest {
         if !self.entries.contains_key(Path::new("")) {
             return Err("source manifest has no root entry".to_string());
         }
-        let mut destination_manifest = DestinationManifest::default();
+        let mut destination_manifest = DestinationManifest::new(self.verification);
         let mut visited = std::collections::BTreeSet::new();
         capture_verified_destination_node(
             self,
@@ -3272,6 +3586,59 @@ impl SourceManifest {
         )?;
         let expected: std::collections::BTreeSet<PathBuf> =
             self.entries.keys().cloned().collect();
+        if visited != expected {
+            let missing = expected
+                .difference(&visited)
+                .take(8)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            return Err(format!(
+                "destination tree is missing expected entries: [{}]",
+                missing.join(", ")
+            ));
+        }
+        Ok(destination_manifest)
+    }
+
+    /// Capture destination object identities and tree membership without
+    /// reading file contents. This is valid only for a standard manifest.
+    pub fn capture_identity_copy_at(
+        &self,
+        root: &Path,
+    ) -> Result<DestinationManifest, String> {
+        self.capture_identity_copy_at_with_cancel(root, |_: &Path| true)
+    }
+
+    /// Capture destination object identities and tree membership without
+    /// reading file contents. This is valid only for a standard manifest.
+    pub fn capture_identity_copy_at_with_cancel<F>(
+        &self,
+        root: &Path,
+        mut keep_going: F,
+    ) -> Result<DestinationManifest, String>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        if self.verification != VerificationMode::Standard {
+            return Err(
+                "identity-only destination capture cannot satisfy a strong manifest".to_string(),
+            );
+        }
+        if !self.entries.contains_key(Path::new("")) {
+            return Err("source manifest has no root entry".to_string());
+        }
+        let mut destination_manifest = DestinationManifest::new(self.verification);
+        let mut visited = std::collections::BTreeSet::new();
+        capture_identity_destination_node(
+            self,
+            root,
+            Path::new(""),
+            0,
+            &mut visited,
+            &mut destination_manifest,
+            &mut keep_going,
+        )?;
+        let expected: std::collections::BTreeSet<PathBuf> = self.entries.keys().cloned().collect();
         if visited != expected {
             let missing = expected
                 .difference(&visited)
@@ -3465,6 +3832,7 @@ fn verify_source_entry_after_root_rename<F>(
     path: &Path,
     proof: &SourceEntryProof,
     moved_root: bool,
+    verification: VerificationMode,
     keep_going: &mut F,
 ) -> Result<u64, String>
 where
@@ -3474,6 +3842,7 @@ where
         path,
         proof,
         moved_root,
+        verification,
         filesystem_capabilities(path),
         keep_going,
     )
@@ -3483,6 +3852,7 @@ fn verify_source_entry_after_root_rename_with_capabilities<F>(
     path: &Path,
     proof: &SourceEntryProof,
     moved_root: bool,
+    verification: VerificationMode,
     capabilities: FilesystemCapabilities,
     keep_going: &mut F,
 ) -> Result<u64, String>
@@ -3535,6 +3905,27 @@ where
                 .map_err(|error| {
                     format!("{} changed before cleanup: {error}", path.display())
                 })?;
+            if verification == VerificationMode::Standard {
+                let pathname = snapshot_path(path)
+                    .map_err(|error| format!("re-identify path {}: {error}", path.display()))?;
+                let pathname_binding = if capabilities.identity_policy()
+                    == FilesystemIdentityPolicy::Strict
+                {
+                    before.verify_same_object_and_version(&pathname)
+                } else {
+                    before.verify_same_identity_with_policy(
+                        &pathname,
+                        FilesystemIdentityPolicy::ContentVerifiedPortable,
+                    )
+                };
+                pathname_binding.map_err(|error| {
+                    format!(
+                        "{} pathname changed while its opened object was being checked: {error}",
+                        path.display()
+                    )
+                })?;
+                return Ok(0);
+            }
             let digest = digest_open_file_with_cancel(&mut file, path, keep_going)
                 .map_err(|error| format!("digest {}: {error}", path.display()))?;
             let after = snapshot_open_file(&file)
@@ -3857,12 +4248,17 @@ fn recovery_commitment_update_snapshot(
 impl SourceManifest {
     /// Stable commitment used by crash-recovery journals. It binds the journal
     /// to the complete operation-time tree, including filesystem identities,
-    /// descendant version tokens, symlink targets, and file digests. The root
+    /// descendant version tokens, symlink targets, and content digests when the
+    /// manifest carries strong authority. The root
     /// ctime is deliberately excluded because the quarantine rename itself
     /// changes it on Unix; every other root attribute and identity remains
     /// committed.
     fn recovery_commitment(&self) -> ContentDigest {
         let mut hasher = Sha256::new();
+        // Preserve the historical strong commitment byte-for-byte so v4
+        // recovery journals remain valid. V5 journals bind verification
+        // authority separately; standard file entries also carry explicit
+        // digest-absence markers in this commitment.
         hasher.update(b"tonepoet-copy-undo-recovery-commitment-v1\0");
         hasher.update(&(self.entries.len() as u64).to_be_bytes());
         for (relative, proof) in &self.entries {
@@ -3899,10 +4295,9 @@ fn decode_content_digest(value: &str) -> Result<ContentDigest, String> {
 }
 
 
-
-
 const REMOVAL_JOURNAL_PREFIX: &str = ".tui-file-picker-copy-undo-";
-const REMOVAL_JOURNAL_VERSION: &str = "tonepoet-copy-undo-v4";
+const REMOVAL_JOURNAL_VERSION: &str = "tonepoet-copy-undo-v5";
+const LEGACY_REMOVAL_JOURNAL_VERSION: &str = "tonepoet-copy-undo-v4";
 
 fn active_removal_journals() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
     static ACTIVE: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
@@ -4143,6 +4538,7 @@ struct RecoveryJournalRecord {
     owner_token: String,
     original_name: std::ffi::OsString,
     quarantine_name: std::ffi::OsString,
+    verification: VerificationMode,
     commitment: ContentDigest,
 }
 
@@ -4323,7 +4719,7 @@ fn owner_token_is_live(token: &str) -> bool {
     process_owner_token(pid).is_some_and(|current| current == token)
 }
 
-fn recovery_journal_binding(
+fn legacy_recovery_journal_binding(
     owner_token: &str,
     original_name: &std::ffi::OsStr,
     quarantine_name: &std::ffi::OsStr,
@@ -4344,9 +4740,36 @@ fn recovery_journal_binding(
     hasher.finalize()
 }
 
+fn recovery_journal_binding(
+    owner_token: &str,
+    original_name: &std::ffi::OsStr,
+    quarantine_name: &std::ffi::OsStr,
+    verification: VerificationMode,
+    commitment: ContentDigest,
+) -> ContentDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-copy-undo-journal-binding-v2\0");
+    recovery_commitment_update_bytes(&mut hasher, owner_token.as_bytes());
+    recovery_commitment_update_bytes(
+        &mut hasher,
+        &recovery_commitment_os_bytes(original_name),
+    );
+    recovery_commitment_update_bytes(
+        &mut hasher,
+        &recovery_commitment_os_bytes(quarantine_name),
+    );
+    hasher.update(&[match verification {
+        VerificationMode::Standard => 0,
+        VerificationMode::Strong => 1,
+    }]);
+    hasher.update(&commitment.0);
+    hasher.finalize()
+}
+
 fn journal_payload(
     original_name: &std::ffi::OsStr,
     quarantine_name: &std::ffi::OsStr,
+    verification: VerificationMode,
     commitment: ContentDigest,
 ) -> String {
     let owner_token = current_process_owner_token();
@@ -4354,10 +4777,15 @@ fn journal_payload(
         &owner_token,
         original_name,
         quarantine_name,
+        verification,
         commitment,
     );
+    let verification = match verification {
+        VerificationMode::Standard => "standard",
+        VerificationMode::Strong => "strong",
+    };
     format!(
-        "{REMOVAL_JOURNAL_VERSION}\nowner={}\noriginal={}\nquarantine={}\ncommitment={}\nbinding={}\n",
+        "{REMOVAL_JOURNAL_VERSION}\nowner={}\noriginal={}\nquarantine={}\nverification={verification}\ncommitment={}\nbinding={}\n",
         encode_hex(owner_token.as_bytes()),
         encode_os_component(original_name),
         encode_os_component(quarantine_name),
@@ -4373,9 +4801,14 @@ fn parse_journal_payload(bytes: &[u8]) -> Result<RecoveryJournalRecord, String> 
     let text = std::str::from_utf8(bytes)
         .map_err(|error| format!("recovery journal is not UTF-8: {error}"))?;
     let mut lines = text.lines();
-    if lines.next() != Some(REMOVAL_JOURNAL_VERSION) {
-        return Err("unsupported copy-undo recovery journal version".to_string());
-    }
+    let version = lines
+        .next()
+        .ok_or_else(|| "recovery journal is empty".to_string())?;
+    let legacy = match version {
+        REMOVAL_JOURNAL_VERSION => false,
+        LEGACY_REMOVAL_JOURNAL_VERSION => true,
+        _ => return Err("unsupported copy-undo recovery journal version".to_string()),
+    };
     let owner = lines
         .next()
         .and_then(|line| line.strip_prefix("owner="))
@@ -4393,6 +4826,19 @@ fn parse_journal_payload(bytes: &[u8]) -> Result<RecoveryJournalRecord, String> 
         .next()
         .and_then(|line| line.strip_prefix("quarantine="))
         .ok_or_else(|| "recovery journal is missing quarantine component".to_string())?;
+    let verification = if legacy {
+        VerificationMode::Strong
+    } else {
+        match lines
+            .next()
+            .and_then(|line| line.strip_prefix("verification="))
+            .ok_or_else(|| "recovery journal is missing verification authority".to_string())?
+        {
+            "standard" => VerificationMode::Standard,
+            "strong" => VerificationMode::Strong,
+            _ => return Err("recovery journal has an invalid verification authority".to_string()),
+        }
+    };
     let commitment = lines
         .next()
         .and_then(|line| line.strip_prefix("commitment="))
@@ -4410,15 +4856,25 @@ fn parse_journal_payload(bytes: &[u8]) -> Result<RecoveryJournalRecord, String> 
     validate_single_component(&quarantine_name)?;
     let commitment = decode_content_digest(commitment)?;
     let actual_binding = decode_content_digest(binding)?;
-    let expected_binding = recovery_journal_binding(
-        &owner_token,
-        &original_name,
-        &quarantine_name,
-        commitment,
-    );
+    let expected_binding = if legacy {
+        legacy_recovery_journal_binding(
+            &owner_token,
+            &original_name,
+            &quarantine_name,
+            commitment,
+        )
+    } else {
+        recovery_journal_binding(
+            &owner_token,
+            &original_name,
+            &quarantine_name,
+            verification,
+            commitment,
+        )
+    };
     if actual_binding != expected_binding {
         return Err(
-            "recovery journal authority binding does not match its owner, names, and operation-time proof"
+            "recovery journal authority binding does not match its owner, names, verification level, and operation-time proof"
                 .to_string(),
         );
     }
@@ -4426,6 +4882,7 @@ fn parse_journal_payload(bytes: &[u8]) -> Result<RecoveryJournalRecord, String> 
         owner_token,
         original_name,
         quarantine_name,
+        verification,
         commitment,
     })
 }
@@ -4562,6 +5019,7 @@ fn create_removal_journal(
     nonce: u128,
     original_name: &std::ffi::OsStr,
     quarantine_name: &std::ffi::OsStr,
+    verification: VerificationMode,
     commitment: ContentDigest,
 ) -> io::Result<RemovalJournal> {
     use std::io::Write;
@@ -4584,7 +5042,7 @@ fn create_removal_journal(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut file = options.open(&path)?;
     if let Err(error) = file
-        .write_all(journal_payload(original_name, quarantine_name, commitment).as_bytes())
+        .write_all(journal_payload(original_name, quarantine_name, verification, commitment).as_bytes())
         .and_then(|()| file.sync_all())
     {
         drop(file);
@@ -4641,9 +5099,10 @@ fn journal_identity_from_path(
 
 fn verify_recovery_commitment_at(
     path: &Path,
+    verification: VerificationMode,
     expected: ContentDigest,
 ) -> Result<(), String> {
-    let current = capture_manifest(path)
+    let current = capture_manifest_with_mode(path, verification)
         .map_err(|error| format!("capture quarantined recovery proof: {error}"))?;
     let actual = current.recovery_commitment();
     if actual != expected {
@@ -4735,7 +5194,11 @@ fn recover_interrupted_verified_removals_internal(
         match (original_exists, quarantine_exists) {
             (false, true) => {
                 if let Err(error) =
-                    verify_recovery_commitment_at(&quarantine, record.commitment)
+                    verify_recovery_commitment_at(
+                        &quarantine,
+                        record.verification,
+                        record.commitment,
+                    )
                 {
                     let state = match phase {
                         VerifiedRemovalPhase::DeletionStarted => {
@@ -5524,6 +5987,7 @@ fn unix_verify_opened_entry(
     parent: &File,
     name: &std::ffi::OsStr,
     mut opened: File,
+    verification: VerificationMode,
     capabilities: FilesystemCapabilities,
 ) -> Result<SourceSnapshot, String> {
     let moved_root = relative.as_os_str().is_empty();
@@ -5548,6 +6012,9 @@ fn unix_verify_opened_entry(
                     .snapshot
                     .verify_same_object_after_rename_with_capabilities(&before, capabilities)
                     .map_err(|error| format!("opened file changed before cleanup: {error}"))?;
+                if verification == VerificationMode::Standard {
+                    return Ok(before);
+                }
                 let digest = digest_open_file(&mut opened)
                     .map_err(|error| format!("digest opened quarantined file: {error}"))?;
                 let after = unix_snapshot_open_component(
@@ -5872,6 +6339,7 @@ fn preflight_verified_removal_unix(removal: &mut VerifiedRemoval) -> Result<(), 
             &parent,
             &name,
             verifier,
+            removal.cleanup_manifest.verification(),
             capabilities,
         )?;
         let displayed = if relative.as_os_str().is_empty() {
@@ -5987,6 +6455,7 @@ fn commit_prepared_verified_removal_unix(removal: &mut VerifiedRemoval) -> Resul
                 &parent,
                 &name,
                 verifier,
+                removal.cleanup_manifest.verification(),
                 capabilities,
             )?
         };
@@ -6078,6 +6547,7 @@ fn windows_verify_opened_cleanup_entry(
     path: &Path,
     handle: &File,
     capabilities: FilesystemCapabilities,
+    verification: VerificationMode,
 ) -> Result<SourceSnapshot, String> {
     let before = windows_snapshot_opened_component(handle, path, proof.snapshot.kind())?;
     let moved_root = relative.as_os_str().is_empty();
@@ -6097,6 +6567,15 @@ fn windows_verify_opened_cleanup_entry(
         format!("opened quarantined object {} changed: {error}", path.display())
     })?;
     if proof.snapshot.kind() == SourceKind::File {
+        if verification == VerificationMode::Standard {
+            if proof.digest.is_some() {
+                return Err(format!(
+                    "standard cleanup proof unexpectedly carries a content digest: {}",
+                    path.display(),
+                ));
+            }
+            return Ok(before);
+        }
         let mut verifier = handle
             .try_clone()
             .map_err(|error| format!("clone cleanup handle {}: {error}", path.display()))?;
@@ -6203,6 +6682,7 @@ fn preflight_verified_removal_windows(removal: &mut VerifiedRemoval) -> Result<(
         })?;
 
     let capabilities = filesystem_capabilities(&removal.quarantine_root);
+    let verification = removal.cleanup_manifest.verification();
     for relative in removal.cleanup_manifest.relative_paths() {
         let proof = removal
             .cleanup_manifest
@@ -6222,6 +6702,7 @@ fn preflight_verified_removal_windows(removal: &mut VerifiedRemoval) -> Result<(
             &path,
             &handle,
             capabilities,
+            verification,
         )?;
     }
     Ok(())
@@ -6232,6 +6713,7 @@ fn commit_prepared_verified_removal_windows(
     removal: &mut VerifiedRemoval,
 ) -> Result<(), String> {
     let capabilities = filesystem_capabilities(&removal.quarantine_root);
+    let verification = removal.cleanup_manifest.verification();
     let mut relative_paths = removal
         .cleanup_manifest
         .relative_paths()
@@ -6271,6 +6753,7 @@ fn commit_prepared_verified_removal_windows(
                 &path,
                 &handle,
                 capabilities,
+                verification,
             )?
         };
         if proof.snapshot.kind() == SourceKind::Directory {
@@ -6418,6 +6901,7 @@ fn prepare_verified_removal_unix(
             nonce,
             original_name,
             &name,
+            cleanup_manifest.verification(),
             recovery_commitment,
         ) {
             Ok(journal) => journal,
@@ -6570,6 +7054,7 @@ fn prepare_verified_removal_windows(
             nonce,
             original_name,
             &quarantine_name,
+            cleanup_manifest.verification(),
             recovery_commitment,
         ) {
             Ok(journal) => journal,
@@ -6646,11 +7131,29 @@ fn prepare_verified_removal_windows(
 }
 
 pub fn capture_manifest(root: &Path) -> Result<SourceManifest, String> {
-    capture_manifest_with_cancel(root, |_: &Path| true)
+    capture_manifest_with_mode(root, VerificationMode::Strong)
 }
 
 pub fn capture_manifest_with_cancel<F>(
     root: &Path,
+    keep_going: F,
+) -> Result<SourceManifest, String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    capture_manifest_with_mode_and_cancel(root, VerificationMode::Strong, keep_going)
+}
+
+pub fn capture_manifest_with_mode(
+    root: &Path,
+    verification: VerificationMode,
+) -> Result<SourceManifest, String> {
+    capture_manifest_with_mode_and_cancel(root, verification, |_: &Path| true)
+}
+
+pub fn capture_manifest_with_mode_and_cancel<F>(
+    root: &Path,
+    verification: VerificationMode,
     mut keep_going: F,
 ) -> Result<SourceManifest, String>
 where
@@ -6659,6 +7162,7 @@ where
     fn capture_node<F>(
         root: &Path,
         path: &Path,
+        verification: VerificationMode,
         manifest: &mut SourceManifest,
         entries: &mut usize,
         depth: usize,
@@ -6690,7 +7194,6 @@ where
             .to_path_buf();
         match before.kind() {
             SourceKind::File => {
-                use std::io::Read;
                 let mut file = File::open(path)
                     .map_err(|error| format!("open source {}: {error}", path.display()))?;
                 let opened = snapshot_open_file(&file)
@@ -6698,27 +7201,22 @@ where
                 before.verify_same_object_and_version(&opened).map_err(|error| {
                     format!("source changed before manifest capture {}: {error}", path.display())
                 })?;
-                let mut sha = Sha256::new();
-                let mut buffer = vec![0u8; 1024 * 1024];
-                loop {
-                    if !keep_going(path) {
-                        return Err("source manifest capture was interrupted".to_string());
-                    }
-                    let read = file
-                        .read(&mut buffer)
-                        .map_err(|error| format!("read source {}: {error}", path.display()))?;
-                    if read == 0 {
-                        break;
-                    }
-                    sha.update(&buffer[..read]);
-                }
-                let digest = sha.finalize();
+                let digest = if verification == VerificationMode::Strong {
+                    Some(
+                        digest_open_file_with_cancel(&mut file, path, keep_going)
+                            .map_err(|error| {
+                                format!("read source {}: {error}", path.display())
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 let after = snapshot_open_file(&file)
                     .map_err(|error| format!("re-identify source {}: {error}", path.display()))?;
                 opened.verify_same_object_and_version(&after).map_err(|error| {
                     format!("source changed during manifest capture {}: {error}", path.display())
                 })?;
-                manifest.insert(relative, before, Some(digest))?;
+                manifest.insert(relative, before, digest)?;
             }
             SourceKind::Symlink => {
                 manifest.insert(relative, before, None)?;
@@ -6733,6 +7231,7 @@ where
                     capture_node(
                         root,
                         &entry.path(),
+                        verification,
                         manifest,
                         entries,
                         depth + 1,
@@ -6749,9 +7248,17 @@ where
         Ok(())
     }
 
-    let mut manifest = SourceManifest::default();
+    let mut manifest = SourceManifest::new(verification);
     let mut entries = 0usize;
-    capture_node(root, root, &mut manifest, &mut entries, 0, &mut keep_going)?;
+    capture_node(
+        root,
+        root,
+        verification,
+        &mut manifest,
+        &mut entries,
+        0,
+        &mut keep_going,
+    )?;
     Ok(manifest)
 }
 
@@ -6766,6 +7273,68 @@ mod verified_removal_tests {
             .capture_verified_copy_at(destination)
             .expect("destination proof");
         (source_manifest, destination_manifest)
+    }
+
+    #[test]
+    fn standard_recovery_journal_reconstructs_identity_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("copy.flac");
+        fs::write(&source, b"operation bytes").expect("source");
+        let source_manifest = capture_manifest_with_mode(
+            &source,
+            VerificationMode::Standard,
+        )
+        .expect("standard source manifest");
+        fs::copy(&source, &destination).expect("copy fixture");
+        let destination_manifest = source_manifest
+            .capture_identity_copy_at(&destination)
+            .expect("standard destination proof");
+
+        let removal = prepare_verified_removal(
+            &source_manifest,
+            &destination_manifest,
+            &destination,
+        )
+        .expect("prepare standard verified removal");
+        let journal = removal.journal.as_ref().expect("journal").path.clone();
+        removal.journal.as_ref().expect("journal").deactivate();
+        std::mem::forget(removal);
+
+        let report = recover_interrupted_verified_removals_internal(temp.path(), true)
+            .expect("recover standard journal");
+        assert_eq!(report.restored, vec![destination.clone()]);
+        assert!(report.retained.is_empty(), "unexpected retained state: {:?}", report.retained);
+        assert!(destination.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn legacy_v4_recovery_journal_is_parsed_as_strong_authority() {
+        let owner_token = current_process_owner_token();
+        let original_name = std::ffi::OsStr::new("copy.flac");
+        let quarantine_name = std::ffi::OsStr::new(
+            ".tui-file-picker-undo-quarantine-00000000000000000000000000001234",
+        );
+        let commitment = ContentDigest([0x5a; 32]);
+        let binding = legacy_recovery_journal_binding(
+            &owner_token,
+            original_name,
+            quarantine_name,
+            commitment,
+        );
+        let payload = format!(
+            "{LEGACY_REMOVAL_JOURNAL_VERSION}\nowner={}\noriginal={}\nquarantine={}\ncommitment={}\nbinding={}\n",
+            encode_hex(owner_token.as_bytes()),
+            encode_os_component(original_name),
+            encode_os_component(quarantine_name),
+            commitment.to_hex(),
+            binding.to_hex(),
+        );
+
+        let parsed = parse_journal_payload(payload.as_bytes()).expect("parse legacy journal");
+        assert_eq!(parsed.verification, VerificationMode::Strong);
+        assert_eq!(parsed.commitment, commitment);
     }
 
     #[test]
@@ -7081,6 +7650,7 @@ mod verified_removal_tests {
             &stale_token,
             original_name,
             quarantine_name,
+            removal.cleanup_manifest.verification(),
             commitment,
         );
         let stale_owner = encode_hex(stale_token.as_bytes());
@@ -7606,6 +8176,7 @@ mod verified_removal_tests {
                 std::ffi::OsStr::new(
                     ".tui-file-picker-undo-quarantine-00000000000000000000000000001234",
                 ),
+                VerificationMode::Strong,
                 commitment,
             )
             .expect("create recovery journal")

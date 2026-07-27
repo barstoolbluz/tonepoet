@@ -4275,7 +4275,7 @@ mod flac_metadata_writer {
         }
     }
 
-    fn post_commit_parent_sync_warning(path: &Path, context: &str) -> Option<String> {
+    pub(super) fn post_commit_parent_sync_warning(path: &Path, context: &str) -> Option<String> {
         match sync_parent_dir(path, context) {
             Ok(status) => parent_sync_durability_warning(status, path, context),
             Err(err) => Some(format!(
@@ -5215,25 +5215,60 @@ pub fn write_metadata_field_transactional_with_control(
         &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
     >,
 ) -> Result<MetadataWriteCommitReport, String> {
+    write_metadata_field_transactional_with_control_at_verification(
+        path,
+        field,
+        value,
+        cancel,
+        byte_progress,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+pub fn write_metadata_field_transactional_with_control_at_verification(
+    path: &Path,
+    field: MetadataField,
+    value: &str,
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, String> {
     let change = metadata_field_change(field, value)
         .map_err(|error| format!("write failed before mutation: {error}"))?;
     reject_unsupported_dff_metadata_write(path, "writing")?;
     if uses_native_flac_metadata_journal(path) || crate::dsf_tags::is_dsf(path) {
-        return write_all_tags_with_cancel_report_classified(
+        return write_all_tags_with_cancel_report_classified_at_verification(
             path,
             &[change],
             cancel,
             byte_progress,
+            verification,
         )
         .map_err(MetadataWriteFailure::into_message);
     }
 
     check_metadata_write_cancel(cancel, "before starting inline metadata transaction")?;
 
-    let db = crate::db::Database::open()
-        .map_err(|error| format!("write failed before mutation: metadata journal unavailable: {error}"))?;
-    write_metadata_field_with_database(&db, path, change)?;
-    Ok(MetadataWriteCommitReport::clean())
+    if verification == tui_file_picker::VerificationMode::Standard {
+        write_all_tags_with_cancel_report_classified_at_verification(
+            path,
+            &[change],
+            cancel,
+            byte_progress,
+            verification,
+        )
+        .map_err(MetadataWriteFailure::into_message)
+    } else {
+        let db = crate::db::Database::open().map_err(|error| {
+            format!(
+                "write failed before mutation: metadata journal unavailable: {error}"
+            )
+        })?;
+        write_metadata_field_with_database(&db, path, change)?;
+        Ok(MetadataWriteCommitReport::clean())
+    }
 }
 
 fn write_metadata_field_with_database(
@@ -7524,6 +7559,30 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
     cancel: Option<MetadataWriteCancelFlag>,
     forced_deletes: &[(usize, lofty::tag::ItemKey)],
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+        paths,
+        entries_snap,
+        deleted,
+        save_block_reasons,
+        progress,
+        byte_progress,
+        cancel,
+        forced_deletes,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[(lofty::tag::ItemKey, RowScope, Vec<String>, Vec<String>)],
+    deleted: &[usize],
+    save_block_reasons: &[Option<String>],
+    progress: Option<MetadataWriteProgressCallback>,
+    byte_progress: Option<MetadataWriteByteProgressCallback>,
+    cancel: Option<MetadataWriteCancelFlag>,
+    forced_deletes: &[(usize, lofty::tag::ItemKey)],
+    verification: tui_file_picker::VerificationMode,
+) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
     #[derive(Debug)]
     struct PlannedWrite {
         original_index: usize,
@@ -7628,11 +7687,12 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
                                 progress(write.write_ordinal, total, path, update);
                             }
                         };
-                    match write_all_tags_with_cancel_report_classified(
+                    match write_all_tags_with_cancel_report_classified_at_verification(
                         &write.path,
                         &write.changes,
                         cancel.as_ref().as_ref(),
                         Some(&report_byte_progress),
+                        verification,
                     ) {
                         Ok(report) => crate::tui::app::MetadataEditorWriteResult::saved_with_warnings(
                             write.path.clone(),
@@ -7794,9 +7854,33 @@ fn write_all_tags_with_cancel_report_classified(
         &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
     >,
 ) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
+    write_all_tags_with_cancel_report_classified_at_verification(
+        path,
+        changes,
+        cancel,
+        byte_progress,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+fn write_all_tags_with_cancel_report_classified_at_verification(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
     let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
-    write_all_tags_with_cancel_report(path, changes, operation_cancel.as_ref(), byte_progress)
-        .map_err(|message| {
+    write_all_tags_with_cancel_report_at_verification(
+        path,
+        changes,
+        operation_cancel.as_ref(),
+        byte_progress,
+        verification,
+    )
+    .map_err(|message| {
             if operation_cancel
                 .as_ref()
                 .is_some_and(|flag| flag.observation_count() > 0)
@@ -7808,6 +7892,7 @@ fn write_all_tags_with_cancel_report_classified(
         })
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // strong-mode compatibility seam; production routes through the _at_verification variant
 fn write_all_tags_with_cancel_report(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
@@ -7815,6 +7900,24 @@ fn write_all_tags_with_cancel_report(
     byte_progress: Option<
         &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
     >,
+) -> Result<MetadataWriteCommitReport, String> {
+    write_all_tags_with_cancel_report_at_verification(
+        path,
+        changes,
+        cancel,
+        byte_progress,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+fn write_all_tags_with_cancel_report_at_verification(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, String> {
     if changes.is_empty() {
         return Ok(MetadataWriteCommitReport::clean());
@@ -7920,8 +8023,14 @@ fn write_all_tags_with_cancel_report(
         crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {}
     }
     check_metadata_write_cancel(cancel, "before starting full-file fallback rewrite")?;
-    let cleanup_warning = write_all_tags_lofty_with_backup(path, changes)?;
-    Ok(MetadataWriteCommitReport::from_warnings(cleanup_warning.into_iter().collect()))
+    if verification == tui_file_picker::VerificationMode::Standard {
+        write_all_tags_lofty_standard_atomic(path, changes, cancel)
+    } else {
+        let cleanup_warning = write_all_tags_lofty_with_backup(path, changes)?;
+        Ok(MetadataWriteCommitReport::from_warnings(
+            cleanup_warning.into_iter().collect(),
+        ))
+    }
 }
 
 fn write_all_tags_without_full_file_backup(
@@ -8277,10 +8386,16 @@ fn prepare_all_tags_lofty(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
 ) -> Result<Option<lofty::file::TaggedFile>, String> {
-    use lofty::file::TaggedFileExt;
-
-    let mut tagged = lofty::read_from_path(path)
+    let tagged = lofty::read_from_path(path)
         .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+    prepare_all_tags_lofty_from_tagged(tagged, changes)
+}
+
+fn prepare_all_tags_lofty_from_tagged(
+    mut tagged: lofty::file::TaggedFile,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<Option<lofty::file::TaggedFile>, String> {
+    use lofty::file::TaggedFileExt;
 
     if tagged.primary_tag().is_none() {
         let tag_type = tagged.primary_tag_type();
@@ -8385,6 +8500,1125 @@ fn write_all_tags_lofty_in_place(
     };
     save_prepared_lofty_tags(path, &tagged)?;
     Ok(true)
+}
+
+const STANDARD_METADATA_IN_MEMORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardMetadataWriteStrategy {
+    InMemory,
+    BoundedMemory,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STANDARD_METADATA_IN_MEMORY_MAX_BYTES: std::cell::Cell<Option<u64>> =
+        std::cell::Cell::new(None);
+}
+
+fn standard_metadata_in_memory_max_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_STANDARD_METADATA_IN_MEMORY_MAX_BYTES.with(std::cell::Cell::get) {
+        return limit;
+    }
+    STANDARD_METADATA_IN_MEMORY_MAX_BYTES
+}
+
+fn standard_metadata_write_strategy(file_len: u64) -> StandardMetadataWriteStrategy {
+    if file_len <= standard_metadata_in_memory_max_bytes() {
+        StandardMetadataWriteStrategy::InMemory
+    } else {
+        StandardMetadataWriteStrategy::BoundedMemory
+    }
+}
+
+#[cfg(test)]
+struct TestStandardMetadataInMemoryLimitGuard {
+    previous: Option<u64>,
+}
+
+#[cfg(test)]
+impl TestStandardMetadataInMemoryLimitGuard {
+    fn force_bounded_memory() -> Self {
+        let previous = TEST_STANDARD_METADATA_IN_MEMORY_MAX_BYTES
+            .with(|limit| limit.replace(Some(0)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStandardMetadataInMemoryLimitGuard {
+    fn drop(&mut self) {
+        TEST_STANDARD_METADATA_IN_MEMORY_MAX_BYTES.with(|limit| limit.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetadataWriteIoCounters {
+    strategy: Option<StandardMetadataWriteStrategy>,
+    source_read_passes: u64,
+    source_bytes_read: u64,
+    source_parse_passes: u64,
+    source_parse_bytes_read: u64,
+    source_copy_passes: u64,
+    source_copy_bytes_read: u64,
+    replacement_write_passes: u64,
+    replacement_bytes_written: u64,
+    replacement_copy_passes: u64,
+    replacement_copy_bytes_written: u64,
+    replacement_rewrite_passes: u64,
+    replacement_rewrite_bytes_written: u64,
+    file_sync_calls: u64,
+    directory_sync_calls: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_METADATA_WRITE_IO: std::cell::RefCell<MetadataWriteIoCounters> =
+        std::cell::RefCell::new(MetadataWriteIoCounters::default());
+}
+
+#[cfg(test)]
+fn reset_test_metadata_write_io() {
+    TEST_METADATA_WRITE_IO.with(|counters| {
+        *counters.borrow_mut() = MetadataWriteIoCounters::default();
+    });
+}
+
+#[cfg(test)]
+fn test_metadata_write_io() -> MetadataWriteIoCounters {
+    TEST_METADATA_WRITE_IO.with(|counters| *counters.borrow())
+}
+
+#[cfg(test)]
+fn record_standard_metadata_write_strategy(strategy: StandardMetadataWriteStrategy) {
+    TEST_METADATA_WRITE_IO.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        assert!(
+            counters.strategy.replace(strategy).is_none(),
+            "standard metadata strategy must be selected exactly once",
+        );
+    });
+}
+
+#[cfg(not(test))]
+fn record_standard_metadata_write_strategy(_strategy: StandardMetadataWriteStrategy) {}
+
+#[cfg(test)]
+fn record_metadata_source_parse(bytes: u64) {
+    TEST_METADATA_WRITE_IO.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.source_read_passes += 1;
+        counters.source_bytes_read += bytes;
+        counters.source_parse_passes += 1;
+        counters.source_parse_bytes_read += bytes;
+    });
+}
+
+#[cfg(not(test))]
+fn record_metadata_source_parse(_bytes: u64) {}
+
+#[cfg(test)]
+fn record_metadata_source_copy(bytes: u64) {
+    TEST_METADATA_WRITE_IO.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.source_read_passes += 1;
+        counters.source_bytes_read += bytes;
+        counters.source_copy_passes += 1;
+        counters.source_copy_bytes_read += bytes;
+    });
+}
+
+#[cfg(not(test))]
+fn record_metadata_source_copy(_bytes: u64) {}
+
+#[cfg(test)]
+fn record_metadata_replacement_copy(bytes: u64) {
+    TEST_METADATA_WRITE_IO.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.replacement_write_passes += 1;
+        counters.replacement_bytes_written += bytes;
+        counters.replacement_copy_passes += 1;
+        counters.replacement_copy_bytes_written += bytes;
+    });
+}
+
+#[cfg(not(test))]
+fn record_metadata_replacement_copy(_bytes: u64) {}
+
+#[cfg(test)]
+fn record_metadata_replacement_rewrite(bytes: u64) {
+    TEST_METADATA_WRITE_IO.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.replacement_write_passes += 1;
+        counters.replacement_bytes_written += bytes;
+        counters.replacement_rewrite_passes += 1;
+        counters.replacement_rewrite_bytes_written += bytes;
+    });
+}
+
+#[cfg(not(test))]
+fn record_metadata_replacement_rewrite(_bytes: u64) {}
+
+#[cfg(test)]
+fn record_metadata_file_sync() {
+    TEST_METADATA_WRITE_IO.with(|counters| counters.borrow_mut().file_sync_calls += 1);
+}
+
+#[cfg(not(test))]
+fn record_metadata_file_sync() {}
+
+#[cfg(test)]
+fn record_metadata_directory_sync() {
+    TEST_METADATA_WRITE_IO.with(|counters| counters.borrow_mut().directory_sync_calls += 1);
+}
+
+#[cfg(not(test))]
+fn record_metadata_directory_sync() {}
+
+#[cfg(unix)]
+fn replace_generic_metadata_file(
+    source: tempfile::TempPath,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    let source_path = source.to_path_buf();
+    std::fs::rename(&source_path, destination).map_err(|error| {
+        format!(
+            "rename metadata replacement '{}' over '{}': {error}",
+            source_path.display(),
+            destination.display(),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn windows_verbatim_wide_path(
+    path: &std::path::Path,
+    operation: &str,
+) -> Result<Vec<u16>, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const BACKSLASH: u16 = b'\\' as u16;
+    const QUESTION_MARK: u16 = b'?' as u16;
+    const UPPER_U: u16 = b'U' as u16;
+    const UPPER_N: u16 = b'N' as u16;
+    const UPPER_C: u16 = b'C' as u16;
+
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "{operation} Windows metadata path '{}': canonicalization failed: {error}",
+            path.display(),
+        )
+    })?;
+    let encoded: Vec<u16> = canonical.as_os_str().encode_wide().collect();
+    if encoded.iter().any(|unit| *unit == 0) {
+        return Err(format!(
+            "{operation} Windows metadata path '{}' contains an embedded NUL",
+            path.display(),
+        ));
+    }
+
+    let mut result = if encoded.starts_with(&[
+        BACKSLASH,
+        BACKSLASH,
+        QUESTION_MARK,
+        BACKSLASH,
+    ]) {
+        encoded
+    } else if encoded.starts_with(&[BACKSLASH, BACKSLASH]) {
+        let mut verbatim = vec![
+            BACKSLASH,
+            BACKSLASH,
+            QUESTION_MARK,
+            BACKSLASH,
+            UPPER_U,
+            UPPER_N,
+            UPPER_C,
+            BACKSLASH,
+        ];
+        verbatim.extend_from_slice(&encoded[2..]);
+        verbatim
+    } else {
+        let mut verbatim = vec![BACKSLASH, BACKSLASH, QUESTION_MARK, BACKSLASH];
+        verbatim.extend_from_slice(&encoded);
+        verbatim
+    };
+    result.push(0);
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn retain_windows_metadata_replacement(
+    source: tempfile::TempPath,
+    source_path: &std::path::Path,
+) -> String {
+    // ReplaceFileW's 1176/1177 failures leave the replacement under its
+    // temporary name. Suppress TempPath's destructor cleanup unconditionally.
+    // TempPath::keep can itself fail on Windows while clearing the temporary
+    // attribute, and dropping that error would delete the only recoverable
+    // replacement carrier. This deliberately leaks only the tiny path guard
+    // in an already exceptional manual-recovery state; the carrier itself is
+    // retained by design.
+    std::mem::forget(source);
+    format!(
+        "the replacement carrier has been retained at '{}' for manual recovery",
+        source_path.display(),
+    )
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsReplaceFailureClass {
+    UnableToRemoveReplaced,
+    UnableToMoveReplacement,
+    UnableToMoveReplacementAfterMerge,
+    Other,
+}
+
+#[cfg(windows)]
+fn classify_windows_replace_failure(code: Option<i32>) -> WindowsReplaceFailureClass {
+    const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
+    const ERROR_UNABLE_TO_MOVE_REPLACEMENT: i32 = 1176;
+    const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+
+    match code {
+        Some(ERROR_UNABLE_TO_REMOVE_REPLACED) => {
+            WindowsReplaceFailureClass::UnableToRemoveReplaced
+        }
+        Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT) => {
+            WindowsReplaceFailureClass::UnableToMoveReplacement
+        }
+        Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) => {
+            WindowsReplaceFailureClass::UnableToMoveReplacementAfterMerge
+        }
+        _ => WindowsReplaceFailureClass::Other,
+    }
+}
+
+#[cfg(windows)]
+fn replace_generic_metadata_file(
+    source: tempfile::TempPath,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let source_path = source.to_path_buf();
+    let source_wide = windows_verbatim_wide_path(&source_path, "prepare replacement")?;
+    let destination_wide = windows_verbatim_wide_path(destination, "prepare destination")?;
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            source_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if replaced != 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    match classify_windows_replace_failure(error.raw_os_error()) {
+        WindowsReplaceFailureClass::UnableToRemoveReplaced => Err(format!(
+            "ReplaceFileW failed with ERROR_UNABLE_TO_REMOVE_REPLACED (1175) while committing '{}': Windows reports that both the destination and replacement retain their original names. No fallback was attempted; the uncommitted temporary replacement will be removed. Original error: {error}",
+            destination.display(),
+        )),
+        WindowsReplaceFailureClass::UnableToMoveReplacement => {
+            let recovery = retain_windows_metadata_replacement(source, &source_path);
+            Err(format!(
+                "ReplaceFileW failed with ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176) while committing '{}': because no backup name was supplied, Windows reports that the original destination no longer exists and the replacement was not renamed. {recovery}. No fallback was attempted because the namespace is already in a recovery-sensitive state. Original error: {error}",
+                destination.display(),
+            ))
+        }
+        WindowsReplaceFailureClass::UnableToMoveReplacementAfterMerge => {
+            let recovery = retain_windows_metadata_replacement(source, &source_path);
+            Err(format!(
+                "ReplaceFileW failed with ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177) while committing '{}': Windows reports that the replacement remains under its temporary name after inheriting streams and attributes, while the original destination remains under a different name not supplied by this operation. {recovery}. Do not retry automatically; inspect the directory and recover the intended file manually. Original error: {error}",
+                destination.display(),
+            ))
+        }
+        WindowsReplaceFailureClass::Other => Err(format!(
+            "ReplaceFileW failed while committing '{}': Windows reports that both paths retain their original names for this error class, although the replacement may already have inherited some destination attributes or streams. No fallback was attempted; the uncommitted temporary replacement will be removed. Original error: {error}",
+            destination.display(),
+        )),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_generic_metadata_file(
+    source: tempfile::TempPath,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    let source_path = source.to_path_buf();
+    std::fs::rename(&source_path, destination).map_err(|error| {
+        format!(
+            "rename metadata replacement '{}' over '{}': {error}",
+            source_path.display(),
+            destination.display(),
+        )
+    })
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenericMetadataReplacementSnapshot {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    nlink: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    atime_sec: i64,
+    atime_nsec: i64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+impl GenericMetadataReplacementSnapshot {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let link_metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("stat metadata target '{}': {error}", path.display()))?;
+        if link_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing journal-free metadata replacement for '{}': the path is a symlink; edit the canonical target path instead",
+                path.display(),
+            ));
+        }
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("stat metadata target '{}': {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "refusing journal-free metadata replacement for '{}': target is not a regular file",
+                path.display(),
+            ));
+        }
+        if metadata.nlink() > 1 {
+            return Err(format!(
+                "refusing journal-free metadata replacement for '{}': replacing the inode would break {} hardlinks",
+                path.display(),
+                metadata.nlink(),
+            ));
+        }
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            nlink: metadata.nlink(),
+            mode: metadata.mode() & 0o7777,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            atime_sec: metadata.atime(),
+            atime_nsec: metadata.atime_nsec(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        })
+    }
+
+    fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let link_metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("revalidate metadata target '{}': {error}", path.display()))?;
+        if link_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing metadata replacement for '{}': target became a symlink during rewrite",
+                path.display(),
+            ));
+        }
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("revalidate metadata target '{}': {error}", path.display()))?;
+        let current = Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            nlink: metadata.nlink(),
+            mode: metadata.mode() & 0o7777,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            atime_sec: metadata.atime(),
+            atime_nsec: metadata.atime_nsec(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        };
+        // Reads may legitimately advance atime. Every property that can signal
+        // replacement or mutation remains authority-bearing.
+        if current.dev == self.dev
+            && current.ino == self.ino
+            && current.len == self.len
+            && current.nlink == self.nlink
+            && current.mode == self.mode
+            && current.uid == self.uid
+            && current.gid == self.gid
+            && current.mtime_sec == self.mtime_sec
+            && current.mtime_nsec == self.mtime_nsec
+            && current.ctime_sec == self.ctime_sec
+            && current.ctime_nsec == self.ctime_nsec
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "refusing metadata replacement for '{}': source identity or version changed during rewrite",
+            path.display(),
+        ))
+    }
+
+    fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("metadata temp path contains a NUL byte: '{}'", path.display()))?;
+        if unsafe { libc::chown(c_path.as_ptr(), self.uid, self.gid) } != 0 {
+            let error = std::io::Error::last_os_error();
+            let current = std::fs::metadata(path)
+                .map_err(|stat_error| format!("stat metadata temp '{}': {stat_error}", path.display()))?;
+            if current.uid() != self.uid || current.gid() != self.gid {
+                return Err(format!(
+                    "preserve owner/group on metadata temp '{}': {error}",
+                    path.display(),
+                ));
+            }
+        }
+        if unsafe { libc::chmod(c_path.as_ptr(), self.mode as libc::mode_t) } != 0 {
+            return Err(format!(
+                "preserve permissions on metadata temp '{}': {}",
+                path.display(),
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let times = [
+            libc::timespec {
+                tv_sec: self.atime_sec as libc::time_t,
+                tv_nsec: self.atime_nsec as libc::c_long,
+            },
+            libc::timespec {
+                tv_sec: self.mtime_sec as libc::time_t,
+                tv_nsec: self.mtime_nsec as libc::c_long,
+            },
+        ];
+        if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) } != 0 {
+            return Err(format!(
+                "preserve timestamps on metadata temp '{}': {}",
+                path.display(),
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsMetadataFileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(windows)]
+impl WindowsMetadataFileTime {
+    fn as_u64(self) -> u64 {
+        ((self.high as u64) << 32) | self.low as u64
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct WindowsByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: WindowsMetadataFileTime,
+    _last_access_time: WindowsMetadataFileTime,
+    last_write_time: WindowsMetadataFileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct WindowsFileIdInfo {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsMetadataIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+    legacy_volume_serial_number: u32,
+    legacy_file_index: u64,
+    number_of_links: u32,
+    len: u64,
+    creation_time: u64,
+    last_write_time: u64,
+    file_attributes: u32,
+}
+
+#[cfg(windows)]
+impl WindowsMetadataIdentity {
+    fn same_object_and_version(&self, other: &Self) -> bool {
+        self.volume_serial_number == other.volume_serial_number
+            && self.file_id == other.file_id
+            && self.legacy_volume_serial_number == other.legacy_volume_serial_number
+            && self.legacy_file_index == other.legacy_file_index
+            && self.number_of_links == other.number_of_links
+            && self.len == other.len
+            && self.creation_time == other.creation_time
+            && self.last_write_time == other.last_write_time
+            && self.file_attributes == other.file_attributes
+    }
+}
+
+#[cfg(windows)]
+fn windows_metadata_identity(
+    path: &std::path::Path,
+    operation: &str,
+) -> Result<WindowsMetadataIdentity, String> {
+    use std::os::windows::io::AsRawHandle;
+
+    const FILE_ID_INFO_CLASS: i32 = 0x12;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information: *mut WindowsByHandleFileInformation,
+        ) -> i32;
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            information_class: i32,
+            information: *mut std::ffi::c_void,
+            information_size: u32,
+        ) -> i32;
+    }
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("{operation} metadata target '{}': {error}", path.display()))?;
+    let handle = file.as_raw_handle();
+    let mut basic: WindowsByHandleFileInformation = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut basic) } == 0 {
+        return Err(format!(
+            "{operation} metadata target '{}': GetFileInformationByHandle failed: {}",
+            path.display(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let mut identity: WindowsFileIdInfo = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FILE_ID_INFO_CLASS,
+            std::ptr::addr_of_mut!(identity).cast(),
+            std::mem::size_of::<WindowsFileIdInfo>() as u32,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "{operation} metadata target '{}': stable 128-bit file identity is unavailable: {}. Use Strong verification on this filesystem",
+            path.display(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if identity.file_id.iter().all(|byte| *byte == 0) {
+        return Err(format!(
+            "{operation} metadata target '{}': the filesystem returned no stable 128-bit file identity. Use Strong verification on this filesystem",
+            path.display(),
+        ));
+    }
+    if basic.number_of_links == 0 {
+        return Err(format!(
+            "{operation} metadata target '{}': the filesystem returned an invalid zero link count",
+            path.display(),
+        ));
+    }
+
+    Ok(WindowsMetadataIdentity {
+        volume_serial_number: identity.volume_serial_number,
+        file_id: identity.file_id,
+        legacy_volume_serial_number: basic.volume_serial_number,
+        legacy_file_index: ((basic.file_index_high as u64) << 32) | basic.file_index_low as u64,
+        number_of_links: basic.number_of_links,
+        len: ((basic.file_size_high as u64) << 32) | basic.file_size_low as u64,
+        creation_time: basic.creation_time.as_u64(),
+        last_write_time: basic.last_write_time.as_u64(),
+        file_attributes: basic.file_attributes,
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenericMetadataReplacementSnapshot {
+    identity: WindowsMetadataIdentity,
+    permissions: std::fs::Permissions,
+}
+
+#[cfg(windows)]
+impl GenericMetadataReplacementSnapshot {
+    fn len(&self) -> u64 {
+        self.identity.len
+    }
+
+    fn capture(path: &std::path::Path) -> Result<Self, String> {
+        let link_metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("stat metadata target '{}': {error}", path.display()))?;
+        if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+            return Err(format!(
+                "refusing journal-free metadata replacement for '{}': target must be a regular non-symlink file",
+                path.display(),
+            ));
+        }
+        let identity = windows_metadata_identity(path, "inspect")?;
+        if identity.number_of_links > 1 {
+            return Err(format!(
+                "refusing journal-free metadata replacement for '{}': replacing the file would break {} hardlinks",
+                path.display(),
+                identity.number_of_links,
+            ));
+        }
+        Ok(Self {
+            identity,
+            permissions: link_metadata.permissions(),
+        })
+    }
+
+    fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
+        let link_metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("revalidate metadata target '{}': {error}", path.display()))?;
+        if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+            return Err(format!(
+                "refusing metadata replacement for '{}': target is no longer a regular non-symlink file",
+                path.display(),
+            ));
+        }
+        let current = windows_metadata_identity(path, "revalidate")?;
+        if current.number_of_links != 1
+            || !self.identity.same_object_and_version(&current)
+            || link_metadata.permissions().readonly() != self.permissions.readonly()
+        {
+            return Err(format!(
+                "refusing metadata replacement for '{}': source identity or version changed during rewrite",
+                path.display(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
+        std::fs::set_permissions(path, self.permissions.clone()).map_err(|error| {
+            format!(
+                "preserve permissions on metadata temp '{}': {error}",
+                path.display(),
+            )
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenericMetadataReplacementSnapshot;
+
+#[cfg(not(any(unix, windows)))]
+impl GenericMetadataReplacementSnapshot {
+    fn len(&self) -> u64 {
+        0
+    }
+
+    fn capture(path: &std::path::Path) -> Result<Self, String> {
+        Err(format!(
+            "refusing journal-free metadata replacement for '{}': this platform has no supported stable file-identity and hardlink-count implementation; use Strong verification",
+            path.display(),
+        ))
+    }
+
+    fn validate_unchanged(&self, path: &std::path::Path) -> Result<(), String> {
+        Err(format!(
+            "refusing metadata replacement for '{}': stable file identity is unsupported on this platform",
+            path.display(),
+        ))
+    }
+
+    fn apply_to_temp(&self, path: &std::path::Path) -> Result<(), String> {
+        Err(format!(
+            "refusing metadata replacement for '{}': attribute-preserving atomic replacement is unsupported on this platform",
+            path.display(),
+        ))
+    }
+}
+
+struct MetadataSourceReadCounter {
+    inner: std::fs::File,
+    bytes_read: u64,
+}
+
+impl MetadataSourceReadCounter {
+    fn new(inner: std::fs::File) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+impl std::io::Read for MetadataSourceReadCounter {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = std::io::Read::read(&mut self.inner, buffer)?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(read as u64)
+            .expect("metadata source-read counter overflow");
+        Ok(read)
+    }
+
+    fn read_vectored(
+        &mut self,
+        buffers: &mut [std::io::IoSliceMut<'_>],
+    ) -> std::io::Result<usize> {
+        let read = std::io::Read::read_vectored(&mut self.inner, buffers)?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(read as u64)
+            .expect("metadata source-read counter overflow");
+        Ok(read)
+    }
+}
+
+impl std::io::Seek for MetadataSourceReadCounter {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.inner, position)
+    }
+}
+
+struct MetadataReplacementWriteCounter<'a> {
+    inner: &'a mut std::fs::File,
+    bytes_written: u64,
+}
+
+impl<'a> MetadataReplacementWriteCounter<'a> {
+    fn new(inner: &'a mut std::fs::File) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl std::io::Read for MetadataReplacementWriteCounter<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.inner, buffer)
+    }
+
+    fn read_vectored(
+        &mut self,
+        buffers: &mut [std::io::IoSliceMut<'_>],
+    ) -> std::io::Result<usize> {
+        std::io::Read::read_vectored(&mut self.inner, buffers)
+    }
+}
+
+impl std::io::Write for MetadataReplacementWriteCounter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = std::io::Write::write(&mut self.inner, buffer)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .expect("metadata replacement-write counter overflow");
+        Ok(written)
+    }
+
+    fn write_vectored(&mut self, buffers: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        let written = std::io::Write::write_vectored(&mut self.inner, buffers)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .expect("metadata replacement-write counter overflow");
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.inner)
+    }
+}
+
+impl std::io::Seek for MetadataReplacementWriteCounter<'_> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.inner, position)
+    }
+}
+
+impl lofty::io::Truncate for MetadataReplacementWriteCounter<'_> {
+    type Error = std::io::Error;
+
+    fn truncate(&mut self, new_len: u64) -> Result<(), Self::Error> {
+        self.inner.set_len(new_len)
+    }
+}
+
+impl lofty::io::Length for MetadataReplacementWriteCounter<'_> {
+    type Error = std::io::Error;
+
+    fn len(&self) -> Result<u64, Self::Error> {
+        self.inner.metadata().map(|metadata| metadata.len())
+    }
+}
+
+fn create_standard_metadata_temp(
+    parent: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<tempfile::NamedTempFile, String> {
+    let temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "create metadata replacement temp beside '{}': {error}",
+            target.display(),
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                format!(
+                    "set restrictive permissions on metadata replacement temp beside '{}': {error}",
+                    target.display(),
+                )
+            })?;
+    }
+
+    Ok(temp)
+}
+
+fn copy_large_metadata_carrier_into_temp(
+    source_path: &std::path::Path,
+    temp: &mut tempfile::NamedTempFile,
+) -> Result<(u64, u64), String> {
+    use std::io::{Seek, Write};
+
+    let source_file = std::fs::File::open(source_path).map_err(|error| {
+        format!(
+            "open large metadata carrier '{}' for replacement copy: {error}",
+            source_path.display(),
+        )
+    })?;
+    let mut source = MetadataSourceReadCounter::new(source_file);
+    let replacement_file = temp.as_file_mut();
+    replacement_file.set_len(0).map_err(|error| {
+        format!(
+            "truncate metadata replacement temp for '{}': {error}",
+            source_path.display(),
+        )
+    })?;
+    replacement_file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| {
+            format!(
+                "rewind metadata replacement temp for '{}': {error}",
+                source_path.display(),
+            )
+        })?;
+
+    let mut replacement = MetadataReplacementWriteCounter::new(replacement_file);
+    let copied = std::io::copy(&mut source, &mut replacement).map_err(|error| {
+        format!(
+            "copy large metadata carrier '{}' to restrictive replacement temp: {error}",
+            source_path.display(),
+        )
+    })?;
+    replacement.flush().map_err(|error| {
+        format!(
+            "flush copied metadata carrier for '{}': {error}",
+            source_path.display(),
+        )
+    })?;
+    let source_bytes = source.bytes_read();
+    let replacement_bytes = replacement.bytes_written();
+    if source_bytes != copied || replacement_bytes != copied {
+        return Err(format!(
+            "metadata replacement accounting mismatch for '{}': io::copy={copied}, source={source_bytes}, replacement={replacement_bytes}",
+            source_path.display(),
+        ));
+    }
+    Ok((source_bytes, replacement_bytes))
+}
+
+fn write_all_tags_lofty_standard_atomic(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> Result<MetadataWriteCommitReport, String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::AudioFile;
+    use std::io::Write;
+
+    enum PreparedReplacement {
+        InMemory(Vec<u8>),
+        Large(lofty::file::TaggedFile),
+    }
+
+    let snapshot = GenericMetadataReplacementSnapshot::capture(path)?;
+    check_metadata_write_cancel(cancel, "before checking generic metadata recovery authority")?;
+
+    // Recovery authority must be checked before every successful return,
+    // including semantic no-ops. An armed journal or stale legacy backup can
+    // still overwrite the carrier during startup recovery, so reporting a
+    // no-op as successful while either exists would be false assurance.
+    {
+        let db = crate::db::Database::open().map_err(|error| {
+            format!("write failed before mutation: metadata journal unavailable: {error}")
+        })?;
+        db.assert_metadata_write_unarmed(path)?;
+    }
+
+    check_metadata_write_cancel(cancel, "before reading generic metadata carrier")?;
+    let strategy = standard_metadata_write_strategy(snapshot.len());
+    let prepared = if strategy == StandardMetadataWriteStrategy::InMemory {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("read metadata carrier '{}': {error}", path.display()))?;
+        record_metadata_source_parse(bytes.len() as u64);
+        let probe = lofty::probe::Probe::new(std::io::Cursor::new(bytes.as_slice()))
+            .guess_file_type()
+            .map_err(|error| format!("failed to identify '{}': {error}", path.display()))?;
+        let tagged = probe
+            .read()
+            .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+        let Some(tagged) = prepare_all_tags_lofty_from_tagged(tagged, changes)? else {
+            return Ok(MetadataWriteCommitReport::clean());
+        };
+        let mut carrier = std::io::Cursor::new(bytes);
+        tagged
+            .save_to(&mut carrier, WriteOptions::default())
+            .map_err(|error| {
+                format!("failed to serialize metadata for '{}': {error}", path.display())
+            })?;
+        record_standard_metadata_write_strategy(strategy);
+        PreparedReplacement::InMemory(carrier.into_inner())
+    } else {
+        let source_file = std::fs::File::open(path)
+            .map_err(|error| format!("open metadata carrier '{}': {error}", path.display()))?;
+        let mut source = MetadataSourceReadCounter::new(source_file);
+        let probe = lofty::probe::Probe::new(&mut source)
+            .guess_file_type()
+            .map_err(|error| format!("failed to identify '{}': {error}", path.display()))?;
+        let tagged = probe
+            .read()
+            .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+        record_metadata_source_parse(source.bytes_read());
+        let Some(tagged) = prepare_all_tags_lofty_from_tagged(tagged, changes)? else {
+            return Ok(MetadataWriteCommitReport::clean());
+        };
+        record_standard_metadata_write_strategy(strategy);
+        PreparedReplacement::Large(tagged)
+    };
+
+    check_metadata_write_cancel(cancel, "before arming generic metadata replacement")?;
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut temp = create_standard_metadata_temp(parent, path)?;
+
+    match prepared {
+        PreparedReplacement::InMemory(bytes) => {
+            check_metadata_write_cancel(cancel, "before writing metadata replacement temp")?;
+            temp.as_file_mut()
+                .write_all(&bytes)
+                .map_err(|error| format!("write metadata temp for '{}': {error}", path.display()))?;
+            record_metadata_replacement_rewrite(bytes.len() as u64);
+        }
+        PreparedReplacement::Large(tagged) => {
+            // Above the RAM guard, preserve bounded memory at the accepted ~2xS
+            // floor: parse once, copy once, then rewrite the temp in place.
+            check_metadata_write_cancel(cancel, "before copying large metadata carrier")?;
+            let (source_bytes, replacement_bytes) =
+                copy_large_metadata_carrier_into_temp(path, &mut temp)?;
+            record_metadata_source_copy(source_bytes);
+            record_metadata_replacement_copy(replacement_bytes);
+            let rewritten_bytes = {
+                let mut replacement =
+                    MetadataReplacementWriteCounter::new(temp.as_file_mut());
+                tagged
+                    .save_to(&mut replacement, WriteOptions::default())
+                    .map_err(|error| {
+                        format!(
+                            "failed to serialize metadata for '{}': {error}",
+                            path.display(),
+                        )
+                    })?;
+                replacement.bytes_written()
+            };
+            // Count the bytes Lofty actually writes through the temporary
+            // carrier, not its final length. This remains correct if a format
+            // performs multiple writes, seeks, or in-place shifts internally.
+            record_metadata_replacement_rewrite(rewritten_bytes);
+        }
+    }
+
+    temp.as_file_mut()
+        .flush()
+        .map_err(|error| format!("flush metadata temp for '{}': {error}", path.display()))?;
+    snapshot.apply_to_temp(temp.path())?;
+    record_metadata_file_sync();
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| format!("sync metadata temp for '{}': {error}", path.display()))?;
+
+    check_metadata_write_cancel(cancel, "before committing metadata replacement")?;
+    snapshot.validate_unchanged(path)?;
+    let temp_path = temp.into_temp_path();
+    replace_generic_metadata_file(temp_path, path).map_err(|error| {
+        format!(
+            "commit metadata replacement for '{}': {error}",
+            path.display(),
+        )
+    })?;
+    record_metadata_directory_sync();
+    Ok(MetadataWriteCommitReport::from_warnings(
+        flac_metadata_writer::post_commit_parent_sync_warning(
+            path,
+            "generic metadata replacement commit",
+        )
+        .into_iter()
+        .collect(),
+    ))
 }
 
 fn write_all_tags_lofty_with_backup(
@@ -9226,7 +10460,7 @@ mod tests {
         }
     }
 
-    fn editor_value(path: &std::path::Path, display_key: &str) -> Option<String> {
+    pub(super) fn editor_value(path: &std::path::Path, display_key: &str) -> Option<String> {
         let merged = read_all_tags_merged_with_metadata(&[path.to_path_buf()])
             .expect("reopen metadata through production editor reader");
         merged
@@ -11895,6 +13129,795 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path).expect("stat fixture");
         (meta.mtime(), meta.mtime_nsec())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standard_generic_metadata_snapshot_refuses_aliasing_and_detects_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.mp3");
+        let alias = temp.path().join("alias.mp3");
+        let link = temp.path().join("linked.mp3");
+        std::fs::write(&target, b"original carrier").expect("write target");
+
+        symlink(&target, &link).expect("create symlink");
+        let symlink_error = GenericMetadataReplacementSnapshot::capture(&link)
+            .expect_err("symlink replacement must be refused");
+        assert!(symlink_error.contains("symlink"));
+
+        std::fs::hard_link(&target, &alias).expect("create hardlink");
+        let hardlink_error = GenericMetadataReplacementSnapshot::capture(&target)
+            .expect_err("hardlink replacement must be refused");
+        assert!(hardlink_error.contains("hardlinks"));
+        std::fs::remove_file(&alias).expect("remove hardlink");
+
+        let snapshot = GenericMetadataReplacementSnapshot::capture(&target)
+            .expect("capture unaliased target");
+        let replacement = temp.path().join("replacement.mp3");
+        std::fs::write(&replacement, b"replacement data").expect("write replacement");
+        std::fs::rename(&replacement, &target).expect("replace target");
+        let replacement_error = snapshot
+            .validate_unchanged(&target)
+            .expect_err("replacement must invalidate snapshot");
+        assert!(replacement_error.contains("identity or version changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standard_generic_metadata_snapshot_applies_owned_file_attributes_to_temp() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.mp3");
+        let replacement = temp.path().join("replacement.tmp");
+        std::fs::write(&target, b"carrier").expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("set target mode");
+        let snapshot = GenericMetadataReplacementSnapshot::capture(&target)
+            .expect("capture target attributes");
+
+        std::fs::write(&replacement, b"rewritten carrier").expect("write temp");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+            .expect("set restrictive temp mode");
+        snapshot
+            .apply_to_temp(&replacement)
+            .expect("apply target attributes");
+
+        let metadata = std::fs::metadata(&replacement).expect("stat replacement");
+        assert_eq!(metadata.mode() & 0o7777, snapshot.mode);
+        assert_eq!(metadata.uid(), snapshot.uid);
+        assert_eq!(metadata.gid(), snapshot.gid);
+        assert_eq!((metadata.mtime(), metadata.mtime_nsec()), unix_mtime(&target));
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_metadata_copy_keeps_temp_restrictive_until_final_attribute_application() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("ordinary-mode.mp3");
+        std::fs::write(&source, b"bounded metadata carrier bytes").expect("write source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o664))
+            .expect("set ordinary source permissions");
+
+        let mut replacement = create_standard_metadata_temp(tempdir.path(), &source)
+            .expect("create restrictive metadata temp");
+        assert_eq!(
+            unix_mode(replacement.path()),
+            0o600,
+            "the replacement must begin restrictive",
+        );
+        let (source_bytes, replacement_bytes) =
+            copy_large_metadata_carrier_into_temp(&source, &mut replacement)
+                .expect("stream source through restrictive temp handle");
+        assert_eq!(source_bytes, 30);
+        assert_eq!(replacement_bytes, source_bytes);
+        assert_eq!(
+            unix_mode(replacement.path()),
+            0o600,
+            "streaming the source bytes must not copy its broader mode onto the temp",
+        );
+        assert_eq!(
+            std::fs::read(replacement.path()).expect("read copied temp"),
+            std::fs::read(&source).expect("read source"),
+        );
+    }
+
+    #[cfg(windows)]
+    struct WindowsTestSecurityDescriptor {
+        storage: Vec<u32>,
+        len: usize,
+    }
+
+    #[cfg(windows)]
+    impl WindowsTestSecurityDescriptor {
+        fn as_ptr(&self) -> *const std::ffi::c_void {
+            self.storage.as_ptr().cast()
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+            self.storage.as_mut_ptr().cast()
+        }
+
+        fn as_bytes(&self) -> &[u8] {
+            // SECURITY_DESCRIPTOR buffers must be DWORD-aligned. The u32
+            // backing allocation supplies that alignment, and this view is
+            // bounded to the exact byte count reported by GetFileSecurityW.
+            unsafe { std::slice::from_raw_parts(self.storage.as_ptr().cast(), self.len) }
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_test_security_descriptor(
+        path: &std::path::Path,
+    ) -> WindowsTestSecurityDescriptor {
+        const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+        const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
+        const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn GetFileSecurityW(
+                file_name: *const u16,
+                requested_information: u32,
+                security_descriptor: *mut std::ffi::c_void,
+                length: u32,
+                length_needed: *mut u32,
+            ) -> i32;
+        }
+
+        let wide = windows_verbatim_wide_path(path, "read test security descriptor")
+            .expect("encode Windows test path");
+        let information = OWNER_SECURITY_INFORMATION
+            | GROUP_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION;
+        let mut needed = 0u32;
+        let _ = unsafe {
+            GetFileSecurityW(
+                wide.as_ptr(),
+                information,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        assert!(needed > 0, "GetFileSecurityW did not report a buffer size");
+
+        let word_size = std::mem::size_of::<u32>();
+        let word_count = (needed as usize)
+            .checked_add(word_size - 1)
+            .expect("security descriptor size overflow")
+            / word_size;
+        let mut descriptor = WindowsTestSecurityDescriptor {
+            storage: vec![0u32; word_count],
+            len: needed as usize,
+        };
+        let capacity_bytes = descriptor
+            .storage
+            .len()
+            .checked_mul(word_size)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .expect("security descriptor buffer exceeds Win32 length range");
+        let read = unsafe {
+            GetFileSecurityW(
+                wide.as_ptr(),
+                information,
+                descriptor.as_mut_ptr(),
+                capacity_bytes,
+                &mut needed,
+            )
+        };
+        assert_ne!(
+            read,
+            0,
+            "GetFileSecurityW failed for '{}': {}",
+            path.display(),
+            std::io::Error::last_os_error(),
+        );
+        assert!(
+            needed as usize <= descriptor.storage.len() * word_size,
+            "GetFileSecurityW reported a descriptor larger than its buffer",
+        );
+        descriptor.len = needed as usize;
+        descriptor
+    }
+
+    #[cfg(windows)]
+    fn windows_test_protect_existing_dacl(path: &std::path::Path) {
+        const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+        const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+        const SE_FILE_OBJECT: u32 = 1;
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn GetSecurityDescriptorDacl(
+                security_descriptor: *const std::ffi::c_void,
+                dacl_present: *mut i32,
+                dacl: *mut *mut std::ffi::c_void,
+                dacl_defaulted: *mut i32,
+            ) -> i32;
+            fn SetNamedSecurityInfoW(
+                object_name: *mut u16,
+                object_type: u32,
+                security_information: u32,
+                owner: *mut std::ffi::c_void,
+                group: *mut std::ffi::c_void,
+                dacl: *mut std::ffi::c_void,
+                sacl: *mut std::ffi::c_void,
+            ) -> u32;
+        }
+
+        let descriptor = windows_test_security_descriptor(path);
+        let mut present = 0i32;
+        let mut defaulted = 0i32;
+        let mut dacl = std::ptr::null_mut();
+        let found = unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.as_ptr(),
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            )
+        };
+        assert_ne!(found, 0, "GetSecurityDescriptorDacl failed");
+        assert_ne!(present, 0, "test target has no DACL to protect");
+        assert!(!dacl.is_null(), "test target unexpectedly has a null DACL");
+
+        let mut wide = windows_verbatim_wide_path(path, "protect test DACL")
+            .expect("encode Windows test path");
+        let error = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            error,
+            0,
+            "SetNamedSecurityInfoW failed for '{}': {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(error as i32),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_failure_codes_follow_documented_namespace_classes() {
+        assert_eq!(
+            classify_windows_replace_failure(Some(1175)),
+            WindowsReplaceFailureClass::UnableToRemoveReplaced,
+        );
+        assert_eq!(
+            classify_windows_replace_failure(Some(1176)),
+            WindowsReplaceFailureClass::UnableToMoveReplacement,
+        );
+        assert_eq!(
+            classify_windows_replace_failure(Some(1177)),
+            WindowsReplaceFailureClass::UnableToMoveReplacementAfterMerge,
+        );
+        assert_eq!(
+            classify_windows_replace_failure(Some(87)),
+            WindowsReplaceFailureClass::Other,
+        );
+        assert_eq!(
+            classify_windows_replace_failure(None),
+            WindowsReplaceFailureClass::Other,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_standard_metadata_snapshot_refuses_hardlinks_and_detects_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.mp3");
+        let alias = temp.path().join("alias.mp3");
+        std::fs::write(&target, b"original").expect("write target");
+
+        std::fs::hard_link(&target, &alias).expect("create Windows hardlink");
+        let hardlink_error = GenericMetadataReplacementSnapshot::capture(&target)
+            .expect_err("Windows hardlink replacement must be refused");
+        assert!(hardlink_error.contains("hardlinks"), "{hardlink_error}");
+        std::fs::remove_file(&alias).expect("remove hardlink");
+
+        let snapshot = GenericMetadataReplacementSnapshot::capture(&target)
+            .expect("capture stable Windows file identity");
+        let replacement = temp.path().join("replacement.mp3");
+        std::fs::write(&replacement, b"replaced").expect("write equal-length replacement");
+        std::fs::remove_file(&target).expect("remove original target");
+        std::fs::rename(&replacement, &target).expect("install replacement target");
+        let replacement_error = snapshot
+            .validate_unchanged(&target)
+            .expect_err("a different Windows file object must invalidate the snapshot");
+        assert!(
+            replacement_error.contains("identity or version changed"),
+            "{replacement_error}",
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_standard_metadata_production_route_refuses_hardlinks() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-standard-metadata-windows-hardlink",
+        );
+        let (_temp, path) =
+            copy_numbering_fixture("windows-hardlink.mp3", ID3V2_NUMBERING_FIXTURE);
+        let alias = path.with_file_name("windows-hardlink-alias.mp3");
+        std::fs::hard_link(&path, &alias).expect("create Windows hardlink");
+        let before = std::fs::read(&path).expect("read hardlinked carrier");
+
+        let error = write_metadata_field_transactional_with_control_at_verification(
+            &path,
+            MetadataField::Title,
+            "must not commit",
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("Standard Windows metadata replacement must refuse hardlinks");
+        assert!(error.contains("hardlinks"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).expect("read refused carrier"),
+            before,
+            "hardlink refusal must leave the target unchanged",
+        );
+        assert_eq!(
+            std::fs::read(&alias).expect("read refused hardlink alias"),
+            before,
+            "hardlink refusal must leave every alias unchanged",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_standard_metadata_commit_preserves_security_and_replacement_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.mp3");
+        std::fs::write(&target, b"original carrier").expect("write target");
+        let target_wide = windows_verbatim_wide_path(&target, "test commit path")
+            .expect("encode long-path-safe target");
+        assert_eq!(
+            &target_wide[..4],
+            &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16],
+            "direct Win32 replacement paths must use the verbatim prefix",
+        );
+        windows_test_protect_existing_dacl(&target);
+
+        let target_security = windows_test_security_descriptor(&target);
+        let target_identity = windows_metadata_identity(&target, "capture target")
+            .expect("capture target identity");
+
+        let mut replacement =
+            tempfile::NamedTempFile::new_in(temp.path()).expect("create replacement temp");
+        std::io::Write::write_all(replacement.as_file_mut(), b"replacement carrier")
+            .expect("write replacement temp");
+        replacement.as_file().sync_all().expect("sync replacement temp");
+        let replacement_path = replacement.path().to_path_buf();
+        let replacement_security = windows_test_security_descriptor(&replacement_path);
+        assert_ne!(
+            target_security.as_bytes(),
+            replacement_security.as_bytes(),
+            "the fixture must give the target a distinct protected DACL",
+        );
+        let replacement_identity =
+            windows_metadata_identity(&replacement_path, "capture replacement")
+                .expect("capture replacement identity");
+
+        replace_generic_metadata_file(replacement.into_temp_path(), &target)
+            .expect("commit with ReplaceFileW");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read committed target"),
+            b"replacement carrier",
+        );
+        assert!(
+            !replacement_path.exists(),
+            "successful ReplaceFileW must consume the replacement name",
+        );
+        let committed_identity = windows_metadata_identity(&target, "capture committed target")
+            .expect("capture committed identity");
+        assert_eq!(
+            committed_identity.volume_serial_number,
+            replacement_identity.volume_serial_number,
+        );
+        assert_eq!(committed_identity.file_id, replacement_identity.file_id);
+        assert_eq!(
+            committed_identity.legacy_volume_serial_number,
+            replacement_identity.legacy_volume_serial_number,
+        );
+        assert_eq!(
+            committed_identity.legacy_file_index,
+            replacement_identity.legacy_file_index,
+        );
+        assert_ne!(
+            committed_identity.file_id, target_identity.file_id,
+            "the committed file must retain the replacement file identity",
+        );
+        let committed_security = windows_test_security_descriptor(&target);
+        assert_eq!(
+            committed_security.as_bytes(),
+            target_security.as_bytes(),
+            "ReplaceFileW must preserve the target owner, group, and DACL",
+        );
+        assert_eq!(
+            committed_identity.creation_time,
+            target_identity.creation_time,
+            "ReplaceFileW must preserve the original creation time",
+        );
+    }
+
+    #[test]
+    fn standard_metadata_strategy_selects_bounded_memory_immediately_above_limit() {
+        assert_eq!(
+            standard_metadata_write_strategy(STANDARD_METADATA_IN_MEMORY_MAX_BYTES),
+            StandardMetadataWriteStrategy::InMemory,
+            "the documented limit remains eligible for the one-pass in-memory route",
+        );
+        assert_eq!(
+            standard_metadata_write_strategy(
+                STANDARD_METADATA_IN_MEMORY_MAX_BYTES
+                    .checked_add(1)
+                    .expect("metadata strategy boundary overflow"),
+            ),
+            StandardMetadataWriteStrategy::BoundedMemory,
+            "the first over-threshold byte must select the measured bounded-memory route",
+        );
+    }
+
+    #[test]
+    fn metadata_io_wrappers_count_transferred_bytes_not_final_lengths() {
+        use std::io::{Read, Seek, Write};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("counter.bin");
+        std::fs::write(&path, b"0123456789").expect("write counter fixture");
+
+        let mut source = MetadataSourceReadCounter::new(
+            std::fs::File::open(&path).expect("open counter source"),
+        );
+        let mut first = [0u8; 3];
+        source.read_exact(&mut first).expect("read first slice");
+        source
+            .seek(std::io::SeekFrom::Start(7))
+            .expect("seek counter source");
+        let mut second = [0u8; 2];
+        source.read_exact(&mut second).expect("read second slice");
+        assert_eq!(source.bytes_read(), 5);
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open counter replacement");
+        let mut replacement = MetadataReplacementWriteCounter::new(&mut file);
+        replacement
+            .seek(std::io::SeekFrom::Start(1))
+            .expect("seek replacement");
+        replacement.write_all(b"abc").expect("write first replacement slice");
+        replacement
+            .seek(std::io::SeekFrom::Start(8))
+            .expect("seek replacement again");
+        replacement.write_all(b"de").expect("write second replacement slice");
+        assert_eq!(replacement.bytes_written(), 5);
+        assert_eq!(lofty::io::Length::len(&replacement).expect("replacement length"), 10);
+    }
+
+    #[test]
+    fn standard_generic_metadata_write_is_end_to_end_semantic_and_budget_pinned() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-standard-metadata-e2e",
+        );
+        let (_temp, path) =
+            copy_numbering_fixture("standard-e2e.mp3", ID3V2_NUMBERING_FIXTURE);
+        let source_len = std::fs::metadata(&path).expect("stat source fixture").len();
+        let backup = crate::db::Database::backup_path_for(&path);
+
+        reset_test_metadata_write_io();
+        crate::db::reset_test_metadata_mutation_audit();
+        let report = write_metadata_field_transactional_with_control_at_verification(
+            &path,
+            MetadataField::Title,
+            "Standard atomic title",
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("complete standard generic metadata route");
+
+        #[cfg(unix)]
+        assert!(
+            report.durability_warnings.is_empty(),
+            "Unix temporary directories should confirm commit durability: {:?}",
+            report.durability_warnings,
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            report.durability_warnings.len(),
+            1,
+            "platforms without parent-directory fsync support must report the post-commit limitation: {:?}",
+            report.durability_warnings,
+        );
+        #[cfg(not(unix))]
+        assert!(
+            report.durability_warnings[0].contains("parent-directory fsync is unsupported"),
+            "unexpected durability warning: {:?}",
+            report.durability_warnings,
+        );
+        assert_eq!(
+            editor_value(&path, "TITLE").as_deref(),
+            Some("Standard atomic title"),
+            "the production editor reader must observe the committed field",
+        );
+
+        let io = test_metadata_write_io();
+        let final_len = std::fs::metadata(&path).expect("stat committed fixture").len();
+        assert_eq!(
+            io.strategy,
+            Some(StandardMetadataWriteStrategy::InMemory),
+        );
+        assert_eq!(io.source_read_passes, 1, "standard in-memory route reads once");
+        assert_eq!(io.source_bytes_read, source_len);
+        assert_eq!(io.source_parse_passes, 1);
+        assert_eq!(io.source_parse_bytes_read, source_len);
+        assert_eq!(io.source_copy_passes, 0);
+        assert_eq!(io.source_copy_bytes_read, 0);
+        assert_eq!(
+            io.replacement_write_passes,
+            1,
+            "standard in-memory route writes one complete replacement",
+        );
+        assert_eq!(io.replacement_bytes_written, final_len);
+        assert_eq!(io.replacement_copy_passes, 0);
+        assert_eq!(io.replacement_copy_bytes_written, 0);
+        assert_eq!(io.replacement_rewrite_passes, 1);
+        assert_eq!(io.replacement_rewrite_bytes_written, final_len);
+        assert_eq!(io.file_sync_calls, 1);
+        assert_eq!(io.directory_sync_calls, 1);
+        assert!(
+            io.file_sync_calls + io.directory_sync_calls <= 2,
+            "standard metadata commit must stay within the two-sync budget: {io:?}",
+        );
+
+        let mutation = crate::db::test_metadata_mutation_audit();
+        assert_eq!(
+            mutation.backup_bytes_copied,
+            0,
+            "standard generic writes must not create a full-file rollback copy",
+        );
+        assert_eq!(
+            mutation.journal_write_transactions,
+            0,
+            "the standard path may read recovery authority but must not mutate the journal",
+        );
+        assert!(!backup.exists(), "standard metadata path left a backup marker");
+        let db = crate::db::Database::open().expect("reopen metadata journal");
+        let stale = db.stale_metadata_writes().expect("read metadata journal");
+        assert!(
+            stale.is_empty(),
+            "standard metadata path left a recovery journal entry: {stale:?}",
+        );
+    }
+
+    #[test]
+    fn standard_generic_metadata_bounded_memory_route_is_semantic_and_budget_pinned() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-standard-metadata-bounded-e2e",
+        );
+        let _limit = TestStandardMetadataInMemoryLimitGuard::force_bounded_memory();
+        let (_temp, path) =
+            copy_numbering_fixture("standard-bounded-e2e.mp3", ID3V2_NUMBERING_FIXTURE);
+        let source_len = std::fs::metadata(&path).expect("stat source fixture").len();
+        let backup = crate::db::Database::backup_path_for(&path);
+
+        reset_test_metadata_write_io();
+        crate::db::reset_test_metadata_mutation_audit();
+        let report = write_metadata_field_transactional_with_control_at_verification(
+            &path,
+            MetadataField::Title,
+            "Standard bounded-memory title",
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("complete bounded-memory standard generic metadata route");
+
+        #[cfg(unix)]
+        assert!(
+            report.durability_warnings.is_empty(),
+            "Unix temporary directories should confirm commit durability: {:?}",
+            report.durability_warnings,
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            report.durability_warnings.len(),
+            1,
+            "unsupported parent-directory fsync must remain an honest warning: {:?}",
+            report.durability_warnings,
+        );
+        assert_eq!(
+            editor_value(&path, "TITLE").as_deref(),
+            Some("Standard bounded-memory title"),
+            "the committed bounded-memory result must survive production read-back",
+        );
+
+        let io = test_metadata_write_io();
+        let final_len = std::fs::metadata(&path).expect("stat committed fixture").len();
+        assert_eq!(
+            io.strategy,
+            Some(StandardMetadataWriteStrategy::BoundedMemory),
+        );
+        assert_eq!(
+            io.source_read_passes, 2,
+            "bounded-memory writes parse the source and copy it to the temp",
+        );
+        assert_eq!(io.source_parse_passes, 1);
+        assert!(
+            io.source_parse_bytes_read > 0,
+            "Lofty parsing must perform observable source I/O: {io:?}",
+        );
+        assert_eq!(io.source_copy_passes, 1);
+        assert_eq!(io.source_copy_bytes_read, source_len);
+        assert_eq!(
+            io.source_bytes_read,
+            io.source_parse_bytes_read
+                .checked_add(io.source_copy_bytes_read)
+                .expect("source byte count overflow"),
+        );
+        assert_eq!(
+            io.replacement_write_passes, 2,
+            "bounded-memory writes copy the carrier and then rewrite the temp",
+        );
+        assert_eq!(io.replacement_copy_passes, 1);
+        assert_eq!(io.replacement_copy_bytes_written, source_len);
+        assert_eq!(io.replacement_rewrite_passes, 1);
+        assert!(
+            io.replacement_rewrite_bytes_written > 0,
+            "Lofty must write the changed metadata to the temporary carrier: {io:?}",
+        );
+        assert_eq!(
+            io.replacement_bytes_written,
+            io.replacement_copy_bytes_written
+                .checked_add(io.replacement_rewrite_bytes_written)
+                .expect("replacement byte count overflow"),
+        );
+        assert!(final_len > 0, "committed carrier must remain nonempty");
+        assert_eq!(io.file_sync_calls, 1);
+        assert_eq!(io.directory_sync_calls, 1);
+        assert!(
+            io.file_sync_calls + io.directory_sync_calls <= 2,
+            "bounded-memory metadata commit must stay within the two-sync budget: {io:?}",
+        );
+
+        let mutation = crate::db::test_metadata_mutation_audit();
+        assert_eq!(mutation.backup_bytes_copied, 0);
+        assert_eq!(mutation.journal_write_transactions, 0);
+        assert!(!backup.exists(), "bounded-memory standard path left a backup marker");
+        let db = crate::db::Database::open().expect("reopen metadata journal");
+        assert!(
+            db.stale_metadata_writes()
+                .expect("read metadata journal")
+                .is_empty(),
+            "bounded-memory standard path left recovery journal authority",
+        );
+    }
+
+    #[test]
+    fn standard_generic_metadata_noop_refuses_armed_journal_before_success() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-standard-metadata-noop-journal",
+        );
+        let (_temp, path) =
+            copy_numbering_fixture("standard-noop-journal.mp3", ID3V2_NUMBERING_FIXTURE);
+        let requested_title = "Already current";
+        write_metadata_field_transactional_with_control_at_verification(
+            &path,
+            MetadataField::Title,
+            requested_title,
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("establish requested metadata value");
+        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some(requested_title));
+
+        let before = std::fs::read(&path).expect("read carrier before guarded no-op");
+        let backup = crate::db::Database::backup_path_for(&path);
+        let db = crate::db::Database::open().expect("open metadata journal");
+        db.begin_metadata_write(
+            &path.display().to_string(),
+            &backup.display().to_string(),
+        )
+        .expect("seed prepared recovery authority");
+
+        reset_test_metadata_write_io();
+        crate::db::reset_test_metadata_mutation_audit();
+        let error = write_metadata_field_transactional_with_control_at_verification(
+            &path,
+            MetadataField::Title,
+            requested_title,
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("semantic no-op must not bypass armed recovery authority");
+
+        assert!(error.contains("unresolved prepared journal"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).expect("read carrier after guarded no-op"),
+            before,
+        );
+        assert_eq!(test_metadata_write_io(), MetadataWriteIoCounters::default());
+        assert_eq!(
+            crate::db::test_metadata_mutation_audit(),
+            crate::db::TestMetadataMutationAudit::default(),
+            "the refusal check is read-only",
+        );
+        assert_eq!(
+            db.stale_metadata_writes().expect("read retained journal").len(),
+            1,
+            "the writer must not retire recovery authority",
+        );
+    }
+
+    #[test]
+    fn standard_generic_metadata_noop_refuses_stale_legacy_backup_before_success() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-standard-metadata-noop-backup",
+        );
+        let (_temp, path) =
+            copy_numbering_fixture("standard-noop-backup.mp3", ID3V2_NUMBERING_FIXTURE);
+        let requested_title = "Already current";
+        write_metadata_field_transactional_with_control_at_verification(
+            &path,
+            MetadataField::Title,
+            requested_title,
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("establish requested metadata value");
+        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some(requested_title));
+
+        let before = std::fs::read(&path).expect("read carrier before guarded no-op");
+        let backup = crate::db::Database::backup_path_for(&path);
+        std::fs::write(&backup, b"authoritative stale rollback bytes")
+            .expect("seed stale legacy backup");
+
+        reset_test_metadata_write_io();
+        crate::db::reset_test_metadata_mutation_audit();
+        let error = write_metadata_field_transactional_with_control_at_verification(
+            &path,
+            MetadataField::Title,
+            requested_title,
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("semantic no-op must not bypass stale rollback authority");
+
+        assert!(error.contains("stale rollback marker"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).expect("read carrier after guarded no-op"),
+            before,
+        );
+        assert_eq!(
+            std::fs::read(&backup).expect("stale backup retained"),
+            b"authoritative stale rollback bytes",
+        );
+        assert_eq!(test_metadata_write_io(), MetadataWriteIoCounters::default());
+        assert_eq!(
+            crate::db::test_metadata_mutation_audit(),
+            crate::db::TestMetadataMutationAudit::default(),
+            "the refusal check is read-only",
+        );
     }
 
     #[cfg(all(target_os = "linux", unix))]
@@ -15056,6 +17079,194 @@ mod tests {
         assert!(!rollback_path.exists());
     }
 
+}
+
+#[cfg(test)]
+mod live_metadata_perf_harness {
+    use super::*;
+
+    /// Field-perf harness for a real generic-format carrier. The fixture must
+    /// be at least 50 MiB and must use the Lofty route (for example WAV, AIFF,
+    /// MP3, M4A, APE, WavPack, or OGG). Run with a release build:
+    ///
+    /// ```text
+    /// TONEPOET_METADATA_PERF_FILE=/path/to/large.wav \
+    /// cargo test --release -p tonepoet --lib -- live_metadata_edit_perf --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn live_metadata_edit_perf() {
+        let Some(fixture) = std::env::var_os("TONEPOET_METADATA_PERF_FILE") else {
+            eprintln!("TONEPOET_METADATA_PERF_FILE not set; skipping");
+            return;
+        };
+        let fixture = std::path::PathBuf::from(fixture);
+        let fixture_len = std::fs::metadata(&fixture)
+            .unwrap_or_else(|error| panic!("stat metadata perf fixture '{}': {error}", fixture.display()))
+            .len();
+        assert!(
+            fixture_len >= 50 * 1024 * 1024,
+            "metadata perf fixture must be at least 50 MiB"
+        );
+        assert!(
+            !uses_native_flac_metadata_journal(&fixture)
+                && !crate::dsf_tags::is_dsf(&fixture)
+                && !fixture
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("dff")),
+            "metadata perf fixture must exercise the generic Lofty route"
+        );
+
+        let _config_home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-live-metadata-perf",
+        );
+        let parent = fixture.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let scratch = parent.join(format!(
+            ".tonepoet-metadata-perf-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&scratch).expect("metadata perf scratch");
+
+        eprintln!(
+            "METADATA PERF {:.1} MiB at {}:",
+            fixture_len as f64 / (1024.0 * 1024.0),
+            fixture.display()
+        );
+        for verification in [
+            tui_file_picker::VerificationMode::Standard,
+            tui_file_picker::VerificationMode::Strong,
+        ] {
+            let label = match verification {
+                tui_file_picker::VerificationMode::Standard => "standard",
+                tui_file_picker::VerificationMode::Strong => "strong",
+            };
+            let extension = fixture
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("audio");
+            let target = scratch.join(format!("{label}.{extension}"));
+            std::fs::copy(&fixture, &target).expect("copy metadata perf fixture");
+            let value = format!("tonepoet metadata perf {label} {}", std::process::id());
+            reset_test_metadata_write_io();
+            crate::db::reset_test_metadata_mutation_audit();
+            let start = std::time::Instant::now();
+            write_metadata_field_transactional_with_control_at_verification(
+                &target,
+                MetadataField::Title,
+                &value,
+                None,
+                None,
+                verification,
+            )
+            .unwrap_or_else(|error| panic!("{label} metadata write failed: {error}"));
+            let elapsed = start.elapsed();
+            let io = test_metadata_write_io();
+            let mutation = crate::db::test_metadata_mutation_audit();
+            let committed_len = std::fs::metadata(&target)
+                .unwrap_or_else(|error| panic!("stat {label} metadata result: {error}"))
+                .len();
+            assert_eq!(
+                super::tests::editor_value(&target, "TITLE").as_deref(),
+                Some(value.as_str()),
+                "{label} result must survive production read-back",
+            );
+            let strategy = match io.strategy {
+                Some(StandardMetadataWriteStrategy::InMemory) => "in-memory",
+                Some(StandardMetadataWriteStrategy::BoundedMemory) => "bounded-memory",
+                None => "not-applicable",
+            };
+            eprintln!(
+                "  {label:8} single-field edit: {elapsed:?}; strategy={strategy}; io={io:?}; recovery={mutation:?}"
+            );
+            eprintln!(
+                "METADATA_PERF_RESULT mode={label} strategy={strategy} threshold_bytes={STANDARD_METADATA_IN_MEMORY_MAX_BYTES} bytes={fixture_len} committed_bytes={committed_len} elapsed_ms={:.3} source_read_passes={} source_bytes_read={} source_parse_passes={} source_parse_bytes_read={} source_copy_passes={} source_copy_bytes_read={} replacement_write_passes={} replacement_bytes_written={} replacement_copy_passes={} replacement_copy_bytes_written={} replacement_rewrite_passes={} replacement_rewrite_bytes_written={} file_sync_calls={} directory_sync_calls={} backup_bytes={} journal_writes={} read_back=exact",
+                elapsed.as_secs_f64() * 1000.0,
+                io.source_read_passes,
+                io.source_bytes_read,
+                io.source_parse_passes,
+                io.source_parse_bytes_read,
+                io.source_copy_passes,
+                io.source_copy_bytes_read,
+                io.replacement_write_passes,
+                io.replacement_bytes_written,
+                io.replacement_copy_passes,
+                io.replacement_copy_bytes_written,
+                io.replacement_rewrite_passes,
+                io.replacement_rewrite_bytes_written,
+                io.file_sync_calls,
+                io.directory_sync_calls,
+                mutation.backup_bytes_copied,
+                mutation.journal_write_transactions,
+            );
+            match verification {
+                tui_file_picker::VerificationMode::Standard => {
+                    if standard_metadata_write_strategy(fixture_len)
+                        == StandardMetadataWriteStrategy::InMemory
+                    {
+                        assert_eq!(
+                            io.strategy,
+                            Some(StandardMetadataWriteStrategy::InMemory),
+                        );
+                        assert_eq!(io.source_read_passes, 1);
+                        assert_eq!(io.source_bytes_read, fixture_len);
+                        assert_eq!(io.source_parse_passes, 1);
+                        assert_eq!(io.source_parse_bytes_read, fixture_len);
+                        assert_eq!(io.source_copy_passes, 0);
+                        assert_eq!(io.source_copy_bytes_read, 0);
+                        assert_eq!(io.replacement_write_passes, 1);
+                        assert_eq!(io.replacement_bytes_written, committed_len);
+                        assert_eq!(io.replacement_copy_passes, 0);
+                        assert_eq!(io.replacement_copy_bytes_written, 0);
+                        assert_eq!(io.replacement_rewrite_passes, 1);
+                        assert_eq!(io.replacement_rewrite_bytes_written, committed_len);
+                    } else {
+                        assert_eq!(
+                            io.strategy,
+                            Some(StandardMetadataWriteStrategy::BoundedMemory),
+                        );
+                        assert_eq!(io.source_read_passes, 2);
+                        assert_eq!(io.source_parse_passes, 1);
+                        assert!(io.source_parse_bytes_read > 0);
+                        assert_eq!(io.source_copy_passes, 1);
+                        assert_eq!(io.source_copy_bytes_read, fixture_len);
+                        assert_eq!(
+                            io.source_bytes_read,
+                            io.source_parse_bytes_read
+                                .checked_add(io.source_copy_bytes_read)
+                                .expect("source byte budget overflow"),
+                        );
+                        assert_eq!(io.replacement_write_passes, 2);
+                        assert_eq!(io.replacement_copy_passes, 1);
+                        assert_eq!(io.replacement_copy_bytes_written, fixture_len);
+                        assert_eq!(io.replacement_rewrite_passes, 1);
+                        assert!(io.replacement_rewrite_bytes_written > 0);
+                        assert_eq!(
+                            io.replacement_bytes_written,
+                            io.replacement_copy_bytes_written
+                                .checked_add(io.replacement_rewrite_bytes_written)
+                                .expect("replacement byte budget overflow"),
+                        );
+                    }
+                    assert!(io.file_sync_calls + io.directory_sync_calls <= 2);
+                    assert_eq!(mutation.backup_bytes_copied, 0);
+                    assert_eq!(mutation.journal_write_transactions, 0);
+                }
+                tui_file_picker::VerificationMode::Strong => {
+                    assert!(
+                        mutation.backup_bytes_copied >= fixture_len,
+                        "strong mode must retain full-file rollback authority",
+                    );
+                    assert!(
+                        mutation.journal_write_transactions > 0,
+                        "strong mode must retain journal state transitions",
+                    );
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }
 
 #[cfg(test)]

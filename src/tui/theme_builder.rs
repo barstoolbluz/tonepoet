@@ -3422,14 +3422,17 @@ mod tests {
         state.tab = BuilderTab::Derived;
         state.derived_visible_rows.set(derived_list_rows().len());
 
-        for _ in 0..28 {
+        // The cursor ranges over derived SPECS; derived_list_rows() adds
+        // group-header rows and is only the scroll viewport size.
+        let last = theme::derived_element_specs().len() - 1;
+        for _ in 0..last {
             assert_eq!(handle_theme_builder_key(&mut state, key(KeyCode::Down)), ThemeBuilderAction::None);
         }
-        assert_eq!(state.derived_cursor, 28);
+        assert_eq!(state.derived_cursor, last);
         assert_eq!(state.derived_scroll, 0);
 
         assert_eq!(handle_theme_builder_key(&mut state, key(KeyCode::Down)), ThemeBuilderAction::None);
-        assert_eq!(state.derived_cursor, 28);
+        assert_eq!(state.derived_cursor, last);
     }
 
     #[test]

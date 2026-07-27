@@ -55,8 +55,8 @@ fn editing_cell_styles(theme: super::theme::Theme, normal: Style) -> EditingCell
         normal,
         selection: Style::default().fg(theme.bg).bg(theme.text_bright),
         cursor_unselected: Style::default()
-            .fg(theme.bg)
-            .bg(theme.info)
+            .fg(theme.editing_cursor_foreground())
+            .bg(theme.editing_cursor)
             .add_modifier(Modifier::BOLD),
         cursor_selected: Style::default()
             .fg(theme.text_bright)
@@ -303,29 +303,42 @@ mod tests {
             .iter()
             .find(|span| {
                 span.content.as_ref() == " "
-                    && span.style.fg == Some(theme.bg)
-                    && span.style.bg == Some(theme.info)
+                    && span.style.fg == Some(theme.editing_cursor_foreground())
+                    && span.style.bg == Some(theme.editing_cursor)
             })
             .expect("cursor cell should be rendered with its dedicated style");
         assert_eq!(cursor_span.content.as_ref(), " ");
     }
-    fn relative_luminance(color: ratatui::style::Color) -> f64 {
-        let (r, g, b) = crate::tui::theme::rgb_tuple(color);
-        let channel = |value: u8| {
-            let value = f64::from(value) / 255.0;
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
-    }
-
-    fn contrast(left: ratatui::style::Color, right: ratatui::style::Color) -> f64 {
-        let left = relative_luminance(left);
-        let right = relative_luminance(right);
-        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    #[test]
+    fn editing_cursor_clears_contrast_thresholds_in_every_builtin_theme() {
+        for palette in crate::tui::theme::palettes() {
+            let theme = crate::tui::theme::Theme::from_palette(palette);
+            let foreground = theme.editing_cursor_foreground();
+            assert!(
+                crate::tui::theme::contrast_ratio(foreground, theme.editing_cursor) >= 4.5,
+                "{} cursor glyph contrast was {}",
+                palette.slug,
+                crate::tui::theme::contrast_ratio(foreground, theme.editing_cursor)
+            );
+            assert!(
+                crate::tui::theme::contrast_ratio(
+                    theme.editing_cursor,
+                    theme.input_focused_bg,
+                ) >= 3.0,
+                "{} cursor surface contrast was {}",
+                palette.slug,
+                crate::tui::theme::contrast_ratio(
+                    theme.editing_cursor,
+                    theme.input_focused_bg,
+                )
+            );
+            assert_ne!(
+                theme.editing_cursor,
+                theme.info,
+                "{} cursor must not fall back to the info/cyan accent",
+                palette.slug,
+            );
+        }
     }
 
     #[test]
@@ -333,16 +346,10 @@ mod tests {
         for palette in crate::tui::theme::palettes() {
             let theme = crate::tui::theme::Theme::from_palette(palette);
             assert!(
-                contrast(theme.bg, theme.text_bright) >= 4.5,
+                crate::tui::theme::contrast_ratio(theme.bg, theme.text_bright) >= 4.5,
                 "{} selected text contrast was {}",
                 palette.slug,
-                contrast(theme.bg, theme.text_bright)
-            );
-            assert!(
-                contrast(theme.text_bright, theme.input_focused_bg) >= 3.0,
-                "{} selection surface contrast was {}",
-                palette.slug,
-                contrast(theme.text_bright, theme.input_focused_bg)
+                crate::tui::theme::contrast_ratio(theme.bg, theme.text_bright)
             );
         }
     }
@@ -390,8 +397,8 @@ mod tests {
         // dedicated cursor-outside-selection style, distinct from all others.
         assert!(spans.iter().any(|span| {
             span.content.as_ref() == " "
-                && span.style.fg == Some(theme.bg)
-                && span.style.bg == Some(theme.info)
+                && span.style.fg == Some(theme.editing_cursor_foreground())
+                && span.style.bg == Some(theme.editing_cursor)
         }));
     }
 
@@ -452,8 +459,8 @@ mod tests {
         let unselected_cursor = render_inline_value_with_embedded_cursor(&input, 4, theme);
         assert!(unselected_cursor.iter().any(|span| {
             span.content.as_ref() == "d"
-                && span.style.fg == Some(theme.bg)
-                && span.style.bg == Some(theme.info)
+                && span.style.fg == Some(theme.editing_cursor_foreground())
+                && span.style.bg == Some(theme.editing_cursor)
         }));
     }
 

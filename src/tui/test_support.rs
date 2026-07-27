@@ -38,6 +38,11 @@ pub(crate) fn test_config_home_override() -> Option<PathBuf> {
 pub(crate) struct XdgConfigHomeGuard {
     _lock: MutexGuard<'static, ()>,
     previous: Option<OsString>,
+    /// `XDG_DATA_HOME` is redirected alongside the config home: the metadata
+    /// journal database resolves through `dirs::data_dir()`, and a guard that
+    /// left it pointing at the user's real data directory let tests write
+    /// journal entries into the live tonepoet.db (field-observed leak).
+    previous_data: Option<OsString>,
     previous_override: Option<PathBuf>,
     previous_picker_override: Option<PathBuf>,
     directory: tempfile::TempDir,
@@ -53,6 +58,7 @@ impl XdgConfigHomeGuard {
             .tempdir()
             .expect("create isolated XDG_CONFIG_HOME");
         let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_data = std::env::var_os("XDG_DATA_HOME");
         let previous_override = {
             let mut override_path = test_config_home_cell()
                 .write()
@@ -64,9 +70,11 @@ impl XdgConfigHomeGuard {
                 directory.path().to_path_buf(),
             ));
         std::env::set_var("XDG_CONFIG_HOME", directory.path());
+        std::env::set_var("XDG_DATA_HOME", directory.path().join("data"));
         Self {
             _lock: lock,
             previous,
+            previous_data,
             previous_override,
             previous_picker_override,
             directory,
@@ -83,6 +91,10 @@ impl Drop for XdgConfigHomeGuard {
         match self.previous.take() {
             Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match self.previous_data.take() {
+            Some(previous) => std::env::set_var("XDG_DATA_HOME", previous),
+            None => std::env::remove_var("XDG_DATA_HOME"),
         }
         let mut override_path = test_config_home_cell()
             .write()

@@ -537,6 +537,7 @@ pub enum AppMessage {
     /// Completion of background undo/redo execution. Recursive proof capture,
     /// replay verification, and quarantine deletion never run in the reducer.
     FileOperationReplayComplete {
+        session_id: u64,
         entry: crate::tui::app::FileOperationUndoEntry,
         undo: bool,
         result: FileOperationReplayResult,

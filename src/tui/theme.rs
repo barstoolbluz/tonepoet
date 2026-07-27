@@ -104,6 +104,9 @@ pub struct Theme {
     pub pill_preset_bg: Color,
     pub pill_preset_fg: Color,
     pub input_focused_bg: Color,
+    /// Embedded text-edit cursor surface, derived from the warm accent and
+    /// adjusted only along its lightness axis to retain palette congruence.
+    pub editing_cursor: Color,
     pub input_unfocused_bg: Color,
     pub input_disabled_bg: Color,
     pub dropdown_bg: Color,
@@ -147,6 +150,105 @@ fn rgb_components(color: Color) -> (u8, u8, u8) {
     }
 }
 
+
+fn srgb_channel_luminance(value: u8) -> f64 {
+    let value = f64::from(value) / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+pub fn relative_luminance(color: Color) -> f64 {
+    let (r, g, b) = rgb_components(color);
+    0.2126 * srgb_channel_luminance(r)
+        + 0.7152 * srgb_channel_luminance(g)
+        + 0.0722 * srgb_channel_luminance(b)
+}
+
+pub fn contrast_ratio(left: Color, right: Color) -> f64 {
+    let left = relative_luminance(left);
+    let right = relative_luminance(right);
+    (left.max(right) + 0.05) / (left.min(right) + 0.05)
+}
+
+fn rgb_to_hsl(color: Color) -> (f64, f64, f64) {
+    let (r, g, b) = rgb_components(color);
+    let r = f64::from(r) / 255.0;
+    let g = f64::from(g) / 255.0;
+    let b = f64::from(b) / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    let delta = max - min;
+    if delta <= f64::EPSILON {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = delta / (1.0 - (2.0 * lightness - 1.0).abs());
+    let hue_sector = if (max - r).abs() <= f64::EPSILON {
+        ((g - b) / delta).rem_euclid(6.0)
+    } else if (max - g).abs() <= f64::EPSILON {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    (hue_sector * 60.0, saturation, lightness)
+}
+
+fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Color {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let hue_sector = hue.rem_euclid(360.0) / 60.0;
+    let secondary = chroma * (1.0 - (hue_sector.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hue_sector as u8 {
+        0 => (chroma, secondary, 0.0),
+        1 => (secondary, chroma, 0.0),
+        2 => (0.0, chroma, secondary),
+        3 => (0.0, secondary, chroma),
+        4 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+    let offset = lightness - chroma / 2.0;
+    let channel = |value: f64| ((value + offset).clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color::Rgb(channel(r1), channel(g1), channel(b1))
+}
+
+const EDITING_CURSOR_SURFACE_CONTRAST: f64 = 3.0;
+const EDITING_CURSOR_GLYPH_CONTRAST: f64 = 4.5;
+const EDITING_CURSOR_LIGHTNESS_STEP: f64 = 0.04;
+const EDITING_CURSOR_MAX_STEPS: usize = 25;
+
+fn editing_cursor_surface(
+    warm_accent: Color,
+    input_focused_bg: Color,
+    dark_pole: Color,
+    light_pole: Color,
+    dark_theme: bool,
+) -> Color {
+    let (hue, saturation, initial_lightness) = rgb_to_hsl(warm_accent);
+    for step in 0..=EDITING_CURSOR_MAX_STEPS {
+        let delta = EDITING_CURSOR_LIGHTNESS_STEP * step as f64;
+        let lightness = if dark_theme {
+            (initial_lightness + delta).min(1.0)
+        } else {
+            (initial_lightness - delta).max(0.0)
+        };
+        let candidate = hsl_to_rgb(hue, saturation, lightness);
+        let best_glyph_contrast = contrast_ratio(candidate, dark_pole)
+            .max(contrast_ratio(candidate, light_pole));
+        if contrast_ratio(candidate, input_focused_bg) >= EDITING_CURSOR_SURFACE_CONTRAST
+            && best_glyph_contrast >= EDITING_CURSOR_GLYPH_CONTRAST
+        {
+            return candidate;
+        }
+    }
+
+    // The bounded HSL walk reaches an achromatic endpoint at step 25. Keep a
+    // deterministic total fallback for non-RGB terminal colors and future
+    // palette inputs rather than borrowing a semantically unrelated accent.
+    if dark_theme { rgb(255, 255, 255) } else { rgb(0, 0, 0) }
+}
+
 impl Theme {
     pub fn from_palette(palette: &ThemePalette) -> Self {
         let surface = mix(palette.panel_bg, palette.border, 1, 3);
@@ -158,6 +260,13 @@ impl Theme {
         };
         let text_dim = mix(palette.label, palette.panel_bg, 1, 2);
         let input_focused_bg = mix(palette.panel_bg, palette.selection_bg, 3, 4);
+        let editing_cursor = editing_cursor_surface(
+            palette.accents[WARM_ACCENT],
+            input_focused_bg,
+            palette.panel_bg,
+            text_bright,
+            palette.dark,
+        );
         let input_unfocused_bg = mix(palette.panel_bg, palette.selection_bg, 1, 2);
         let input_disabled_bg = mix(palette.panel_bg, palette.border, 1, 5);
         let dropdown_bg = mix(palette.panel_bg, palette.border, 1, 4);
@@ -221,9 +330,24 @@ impl Theme {
             pill_preset_bg: mix(palette.panel_bg, palette.chip_go, 1, 2),
             pill_preset_fg: palette.chip_go,
             input_focused_bg,
+            editing_cursor,
             input_unfocused_bg,
             input_disabled_bg,
             dropdown_bg,
+        }
+    }
+
+    /// Choose the higher-contrast palette pole for the embedded cursor glyph.
+    /// The cursor surface derivation guarantees a 4.5:1 floor for builtin
+    /// palettes; user overrides remain visible and use the same deterministic
+    /// pole selection.
+    pub fn editing_cursor_foreground(self) -> Color {
+        if contrast_ratio(self.editing_cursor, self.bg)
+            >= contrast_ratio(self.editing_cursor, self.text_bright)
+        {
+            self.bg
+        } else {
+            self.text_bright
         }
     }
 
@@ -735,6 +859,7 @@ const DERIVED_SPECS: &[DerivedElementSpec] = &[
     DerivedElementSpec { key: "text_dim", label: "text dim", formula: "mix(label, panel_bg, 1:2)", used_by: "help text, disabled copy, low-emphasis annotations", group: "text" },
     DerivedElementSpec { key: "hover_bg", label: "hover bg", formula: "mix(panel_bg, selection_bg, 2:3)", used_by: "hovered rows and mouse targets", group: "interaction" },
     DerivedElementSpec { key: "input_focused_bg", label: "input focused bg", formula: "mix(panel_bg, selection_bg, 3:4)", used_by: "focused text inputs", group: "interaction" },
+    DerivedElementSpec { key: "editing_cursor", label: "editing cursor", formula: "warm accent; fixed-step HSL lightness adjustment for contrast", used_by: "embedded cursor in inline text editing", group: "interaction" },
     DerivedElementSpec { key: "input_unfocused_bg", label: "input unfocused bg", formula: "mix(panel_bg, selection_bg, 1:2)", used_by: "inactive text inputs", group: "interaction" },
     DerivedElementSpec { key: "input_disabled_bg", label: "input disabled bg", formula: "mix(panel_bg, border, 1:5)", used_by: "disabled text inputs", group: "interaction" },
     DerivedElementSpec { key: "dropdown_bg", label: "dropdown bg", formula: "mix(panel_bg, border, 1:4)", used_by: "dropdowns, menus, overlays", group: "interaction" },
@@ -941,6 +1066,7 @@ fn quantize_theme_for_depth(theme: &mut Theme, depth: ColorDepth) {
     theme.pill_preset_bg = quantize_color_for_depth(theme.pill_preset_bg, depth);
     theme.pill_preset_fg = quantize_color_for_depth(theme.pill_preset_fg, depth);
     theme.input_focused_bg = quantize_color_for_depth(theme.input_focused_bg, depth);
+    theme.editing_cursor = quantize_color_for_depth(theme.editing_cursor, depth);
     theme.input_unfocused_bg = quantize_color_for_depth(theme.input_unfocused_bg, depth);
     theme.input_disabled_bg = quantize_color_for_depth(theme.input_disabled_bg, depth);
     theme.dropdown_bg = quantize_color_for_depth(theme.dropdown_bg, depth);
@@ -1627,6 +1753,7 @@ pub fn theme_color_by_derived_key(theme: Theme, key: &str) -> Option<Color> {
         "text_dim" => theme.text_dim,
         "hover_bg" => theme.hover_bg,
         "input_focused_bg" => theme.input_focused_bg,
+        "editing_cursor" => theme.editing_cursor,
         "input_unfocused_bg" => theme.input_unfocused_bg,
         "input_disabled_bg" => theme.input_disabled_bg,
         "dropdown_bg" => theme.dropdown_bg,
@@ -1662,6 +1789,7 @@ pub fn set_theme_derived_color(theme: &mut Theme, key: &str, color: Color) -> bo
         "text_dim" => theme.text_dim = color,
         "hover_bg" => theme.hover_bg = color,
         "input_focused_bg" => theme.input_focused_bg = color,
+        "editing_cursor" => theme.editing_cursor = color,
         "input_unfocused_bg" => theme.input_unfocused_bg = color,
         "input_disabled_bg" => theme.input_disabled_bg = color,
         "dropdown_bg" => theme.dropdown_bg = color,

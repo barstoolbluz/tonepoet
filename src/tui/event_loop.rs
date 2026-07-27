@@ -1190,6 +1190,11 @@ fn reduce_file_task_complete(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let terminal_update = terminal_update_from_completion_report(&report);
+    let report_finished_cleanly = !report.roots.is_empty()
+        && report.roots.iter().all(|root| {
+            root.disposition == tui_file_picker::FileTaskRootDisposition::Completed
+        });
+    let mut should_auto_close = false;
     let mut active_progress_snapshot = None;
     if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
         if session.session_id == session_id {
@@ -1198,6 +1203,9 @@ fn reduce_file_task_complete(
             }
             session.progress.append_completion_report(&report);
             if session.is_live_task() {
+                should_auto_close = report_finished_cleanly
+                    && session.progress.auto_close_available()
+                    && session.progress.auto_close();
                 active_progress_snapshot = Some(session.progress.clone());
             }
         }
@@ -1246,6 +1254,18 @@ fn reduce_file_task_complete(
 
     let undo_record_warning =
         super::keybindings::record_completed_file_task_for_undo(app, session_id, &mut report);
+
+    // Retention and undo-recording are authoritative and must complete before
+    // presentation state is dismissed. Never close a newer or retained viewer.
+    if should_auto_close
+        && matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == session_id && session.is_live_task()
+        )
+    {
+        app.active_overlay = ActiveOverlay::None;
+    }
 
     let matches_pending = app
         .browse
@@ -1450,10 +1470,19 @@ fn reduce_file_task_complete(
             ));
         }
     }
+    let requires_attention = !all_completed
+        || unavailable_sources > 0
+        || !completion_warnings.is_empty()
+        || !incomplete_details.is_empty()
+        || undo_record_warning.is_some();
     if let Some(warning) = undo_record_warning {
         status.push_str(&format!("; undo was not retained: {warning}"));
     }
-    app.set_status(status);
+    if requires_attention {
+        app.set_status(status);
+    } else {
+        app.set_routine_file_operation_status(status);
+    }
 }
 
 fn matching_file_picker_conflict_policy(
@@ -4648,12 +4677,14 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             );
         }
         AppMessage::FileOperationReplayComplete {
+            session_id,
             entry,
             undo,
             result,
         } => {
             super::keybindings::complete_file_operation_replay(
                 app,
+                session_id,
                 entry,
                 undo,
                 result,
@@ -12837,6 +12868,7 @@ mod artwork_file_picker_completion_tests {
                 cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
                 delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
                 verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Standard,
             },
             ..tui_file_picker::FilePickerConfig::default()
         });
@@ -13338,6 +13370,68 @@ mod async_message_drain_tests {
                 proof: None,
             }],
         }
+    }
+
+    fn clean_completion_report() -> tui_file_picker::FileTaskCompletionReport {
+        tui_file_picker::FileTaskCompletionReport {
+            is_move: false,
+            roots: vec![tui_file_picker::FileTaskRootResult {
+                source: std::path::PathBuf::from("source.bin"),
+                destination: std::path::PathBuf::from("destination.bin"),
+                disposition: tui_file_picker::FileTaskRootDisposition::Completed,
+                message: None,
+                undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                proof: None,
+            }],
+        }
+    }
+
+    fn install_auto_close_progress(app: &mut AppState) -> u64 {
+        let mut progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        progress.set_auto_close(true);
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = super::super::app::FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.install_file_task_progress(session);
+        session_id
+    }
+
+    #[test]
+    fn clean_file_task_auto_closes_only_after_retaining_authoritative_report() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let session_id = install_auto_close_progress(&mut app);
+        let report = clean_completion_report();
+        let (tx, _rx) = mpsc::channel(4);
+
+        reduce_file_task_complete(&mut app, session_id, report.clone(), None, &tx);
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        let (retained_id, retained) = app
+            .last_file_task_progress
+            .as_ref()
+            .expect("auto-close must retain diagnostics");
+        assert_eq!(*retained_id, session_id);
+        assert_eq!(retained.completion_report(), Some(&report));
+    }
+
+    #[test]
+    fn warning_file_task_ignores_auto_close_and_remains_visible() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let session_id = install_auto_close_progress(&mut app);
+        let report = completion_report("durability warning");
+        let (tx, _rx) = mpsc::channel(4);
+
+        reduce_file_task_complete(&mut app, session_id, report.clone(), None, &tx);
+
+        let ActiveOverlay::FileTaskProgress(session) = &app.active_overlay else {
+            panic!("warning completion must remain open");
+        };
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.progress.completion_report(), Some(&report));
     }
 
     #[test]

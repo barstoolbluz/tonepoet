@@ -45,7 +45,8 @@ pub use bookmarks::{
 pub use name_validation::{validate_file_name, NameValidationError};
 pub use state::{rename_no_replace, RenameNoReplaceMode};
 pub use source_guard::{
-    capture_manifest, capture_manifest_with_cancel, digest_open_file,
+    capture_manifest, capture_manifest_with_cancel, capture_manifest_with_mode,
+    capture_manifest_with_mode_and_cancel, digest_open_file,
     filesystem_capabilities, filesystem_identity_policy, filesystem_identity_policy_notice,
     preserve_open_file_metadata, record_filesystem_capability, rename_path_no_replace, snapshot_open_file,
     snapshot_open_handle, snapshot_path, verify_path, verify_path_with_capabilities,
@@ -78,6 +79,7 @@ pub use state::{
     ExactPasteProofFailure, ExactPasteProofSuccess, ExactPasteRootProof, PasteFailure,
     PasteMapping, PastePlan, PasteRetryPlan, PasteSuccess, PasteWarning, SaveModeConfig,
     SaveModeStyle, SymlinkCopyPolicy, SymlinkPolicy, ToolbarAction, TreeNode,
+    VerificationMode,
 };
 pub use theme::FilePickerTheme;
 pub use tree::{initial_tree_nodes_with_hidden, expand_tree_to_path, refresh_tree_children, child_directories};

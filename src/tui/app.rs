@@ -5721,6 +5721,9 @@ pub enum ActiveOverlay {
         /// Current field value (for "active" badge).
         active_template: Option<String>,
     },
+    /// Advanced file-operation settings opened from the Config screen. The
+    /// overlay owns a draft and commits all values together on Enter.
+    FileOperationSettings(FileOperationSettingsState),
     /// Format-specific settings overlay (e.g. FLAC compression/verify/md5,
     /// AAC profile/quality/bitrate). Owns temporary copies; committed on
     /// Enter, discarded on Esc.
@@ -9890,6 +9893,87 @@ impl Default for ConfigFocus {
     }
 }
 
+/// Keyboard focus within the advanced file-operation settings overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOperationSettingsFocus {
+    Verification,
+    StatusVerbosity,
+    AutoCloseProgress,
+}
+
+impl Default for FileOperationSettingsFocus {
+    fn default() -> Self {
+        Self::Verification
+    }
+}
+
+impl FileOperationSettingsFocus {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Verification => Self::StatusVerbosity,
+            Self::StatusVerbosity => Self::AutoCloseProgress,
+            Self::AutoCloseProgress => Self::Verification,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Verification => Self::AutoCloseProgress,
+            Self::StatusVerbosity => Self::Verification,
+            Self::AutoCloseProgress => Self::StatusVerbosity,
+        }
+    }
+}
+
+/// Draft values owned by the Config-screen advanced file-operation control.
+/// Nothing is persisted until the user accepts the overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileOperationSettingsState {
+    pub focus: FileOperationSettingsFocus,
+    pub verification: tui_file_picker::VerificationMode,
+    pub status_verbosity: crate::config::FileOperationStatusVerbosity,
+    pub auto_close_progress: bool,
+}
+
+impl FileOperationSettingsState {
+    pub fn from_config(config: &crate::config::FileOperationsConfig) -> Self {
+        Self {
+            focus: FileOperationSettingsFocus::default(),
+            verification: config.verification,
+            status_verbosity: config.status_verbosity,
+            auto_close_progress: config.auto_close_progress,
+        }
+    }
+
+    pub fn cycle_focused_value(&mut self) {
+        match self.focus {
+            FileOperationSettingsFocus::Verification => {
+                self.verification = match self.verification {
+                    tui_file_picker::VerificationMode::Standard => {
+                        tui_file_picker::VerificationMode::Strong
+                    }
+                    tui_file_picker::VerificationMode::Strong => {
+                        tui_file_picker::VerificationMode::Standard
+                    }
+                };
+            }
+            FileOperationSettingsFocus::StatusVerbosity => {
+                self.status_verbosity = match self.status_verbosity {
+                    crate::config::FileOperationStatusVerbosity::Quiet => {
+                        crate::config::FileOperationStatusVerbosity::Verbose
+                    }
+                    crate::config::FileOperationStatusVerbosity::Verbose => {
+                        crate::config::FileOperationStatusVerbosity::Quiet
+                    }
+                };
+            }
+            FileOperationSettingsFocus::AutoCloseProgress => {
+                self.auto_close_progress = !self.auto_close_progress;
+            }
+        }
+    }
+}
+
 impl ConfigFocus {
     pub fn next(self) -> Self {
         match self {
@@ -11438,6 +11522,10 @@ impl AppState {
         // Import TOML presets into DB on first run.
         crate::tui::presets::import_presets_to_db(&db);
         let browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
+        let file_task_verbose_degrade_notices = matches!(
+            config.file_operations.status_verbosity,
+            crate::config::FileOperationStatusVerbosity::Verbose
+        );
 
         Self {
             config,
@@ -11486,7 +11574,7 @@ impl AppState {
             file_operation_undo: FileOperationUndoJournal::default(),
             #[cfg(test)]
             test_view_file_dispatches: None,
-            file_task_verbose_degrade_notices: false,
+            file_task_verbose_degrade_notices,
             bulk_guard_bypass: None,
             bulk_guard_frozen_paths: None,
             browse_context_action_paths: None,
@@ -12101,6 +12189,25 @@ impl AppState {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), std::time::Instant::now()));
+    }
+
+    #[must_use]
+    pub fn file_operation_status_is_verbose(&self) -> bool {
+        matches!(
+            self.config.file_operations.status_verbosity,
+            crate::config::FileOperationStatusVerbosity::Verbose
+        )
+    }
+
+    /// Emit routine file-operation narration only when the persisted verbosity
+    /// preference requests it. Errors, partial results, and degraded-operation
+    /// warnings must continue to use `set_status` directly so quiet mode never
+    /// hides a result that needs attention. Full diagnostics remain available
+    /// through `:messages` independently of this presentation preference.
+    pub fn set_routine_file_operation_status(&mut self, msg: impl Into<String>) {
+        if self.file_operation_status_is_verbose() {
+            self.set_status(msg);
+        }
     }
 
     /// Clear expired status messages. While analysis is in flight,

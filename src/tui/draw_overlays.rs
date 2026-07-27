@@ -10,7 +10,8 @@ use ratatui::{
 
 use super::app::{
     ActiveOverlay, AppState, BulkRenameFocus, BulkRenameState, CuePreviewState,
-    FormatSettingsFocus, FormatSettingsKind, MbSelectState, SourceMode,
+    FileOperationSettingsFocus, FileOperationSettingsState, FormatSettingsFocus,
+    FormatSettingsKind, MbSelectState, SourceMode,
 };
 use super::button_map::TuiButton;
 use crate::convert::ConversionStatus;
@@ -590,6 +591,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             }
             super::template_builder::draw_template_builder(f, state, &mut app.button_map, theme);
         }
+        ActiveOverlay::FileOperationSettings(state) => {
+            draw_file_operation_settings(f, state, theme);
+        }
         ActiveOverlay::TemplatePicker {
             target,
             ref templates,
@@ -1120,6 +1124,107 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+fn draw_file_operation_settings(
+    f: &mut Frame,
+    state: FileOperationSettingsState,
+    theme: super::theme::Theme,
+) {
+    let area = f.size();
+    let popup = centered_rect(68, 13, area);
+    f.render_widget(Clear, popup);
+    let block = super::draw::solid_title_block(
+        popup,
+        " File Operations - Advanced ",
+        theme.amber,
+        theme,
+    );
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let verification = match state.verification {
+        tui_file_picker::VerificationMode::Standard => "standard (fast, identity-level)",
+        tui_file_picker::VerificationMode::Strong => "strong (full content proofs)",
+    };
+    let verbosity = match state.status_verbosity {
+        crate::config::FileOperationStatusVerbosity::Quiet => "quiet",
+        crate::config::FileOperationStatusVerbosity::Verbose => "verbose",
+    };
+    let auto_close = if state.auto_close_progress { "on" } else { "off" };
+
+    let draw_row = |f: &mut Frame,
+                    area: Rect,
+                    focused: bool,
+                    label: &str,
+                    value: &str| {
+        let style = if focused {
+            Style::default()
+                .fg(theme.text_bright)
+                .bg(theme.input_focused_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text).bg(theme.panel_bg)
+        };
+        let marker = if focused { ">" } else { " " };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{marker} {label:<22}"), style),
+                Span::styled(value.to_string(), style),
+            ]))
+            .style(style),
+            area,
+        );
+    };
+
+    draw_row(
+        f,
+        rows[0],
+        state.focus == FileOperationSettingsFocus::Verification,
+        "Verification",
+        verification,
+    );
+    draw_row(
+        f,
+        rows[1],
+        state.focus == FileOperationSettingsFocus::StatusVerbosity,
+        "Status messages",
+        verbosity,
+    );
+    draw_row(
+        f,
+        rows[2],
+        state.focus == FileOperationSettingsFocus::AutoCloseProgress,
+        "Close progress on success",
+        auto_close,
+    );
+
+    f.render_widget(
+        Paragraph::new("Up/Down select   Left/Right or Space change")
+            .style(Style::default().fg(theme.text_muted))
+            .alignment(Alignment::Center),
+        rows[3],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            footer_pill("Enter save", theme.green, theme),
+            pill_gap(),
+            footer_pill("Esc cancel", theme.dismiss, theme),
+        ]))
+        .alignment(Alignment::Center),
+        rows[4],
+    );
 }
 
 /// Draw the BatchList expand overlay: full list of paths in the current

@@ -4196,15 +4196,41 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     } else {
                         "quiet"
                     };
-                    app.set_status(format!("file-operation capability notices: {mode}"));
+                    app.set_status(format!("file-operation status verbosity: {mode}"));
                 }
                 Some(value) if value == "quiet" || value == "off" => {
-                    app.file_task_verbose_degrade_notices = false;
-                    app.set_status("file-operation capability notices: quiet");
+                    let previous = app.config.file_operations.status_verbosity;
+                    app.config.file_operations.status_verbosity =
+                        crate::config::FileOperationStatusVerbosity::Quiet;
+                    match app.config.save() {
+                        Ok(()) => {
+                            app.file_task_verbose_degrade_notices = false;
+                            app.set_status("file-operation status verbosity: quiet");
+                        }
+                        Err(error) => {
+                            app.config.file_operations.status_verbosity = previous;
+                            app.set_status(format!(
+                                "file-operation status verbosity unchanged because config save failed: {error}"
+                            ));
+                        }
+                    }
                 }
                 Some(value) if value == "verbose" || value == "on" => {
-                    app.file_task_verbose_degrade_notices = true;
-                    app.set_status("file-operation capability notices: verbose");
+                    let previous = app.config.file_operations.status_verbosity;
+                    app.config.file_operations.status_verbosity =
+                        crate::config::FileOperationStatusVerbosity::Verbose;
+                    match app.config.save() {
+                        Ok(()) => {
+                            app.file_task_verbose_degrade_notices = true;
+                            app.set_status("file-operation status verbosity: verbose");
+                        }
+                        Err(error) => {
+                            app.config.file_operations.status_verbosity = previous;
+                            app.set_status(format!(
+                                "file-operation status verbosity unchanged because config save failed: {error}"
+                            ));
+                        }
+                    }
                 }
                 Some(_) => app.set_status("usage: :file-notices [quiet|verbose]"),
             }
@@ -8921,6 +8947,7 @@ fn directory_destination_picker_policy(
         cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
         delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
         verbose_degrade_notices,
+        verification: tui_file_picker::VerificationMode::Standard,
     }
 }
 
@@ -9025,6 +9052,7 @@ fn preset_picker_policy(
         cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
         delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
         verbose_degrade_notices,
+        verification: tui_file_picker::VerificationMode::Standard,
     }
 }
 
@@ -13756,7 +13784,7 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
 fn execute_set(app: &mut AppState, key: &str, value: &str) {
     if key.is_empty() {
         app.set_status(
-            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-auto-margin, dsd-normalize-target)",
+            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-auto-margin, dsd-normalize-target, verification)",
         );
         return;
     }
@@ -13848,6 +13876,13 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                     app.convert.format.dsd_normalize_target_dbfs.render(false)
                 ));
             }
+            "verification" => {
+                let value = match app.config.file_operations.verification {
+                    tui_file_picker::VerificationMode::Standard => "standard",
+                    tui_file_picker::VerificationMode::Strong => "strong",
+                };
+                app.set_status(format!("verification = {value}"));
+            }
             _ => {
                 app.set_status(format!("Unknown setting: {}", key));
             }
@@ -13856,6 +13891,34 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
     }
 
     match key {
+        "verification" => {
+            let verification = match value.trim().to_ascii_lowercase().as_str() {
+                "standard" => tui_file_picker::VerificationMode::Standard,
+                "strong" => tui_file_picker::VerificationMode::Strong,
+                _ => {
+                    app.set_status("usage: :set verification standard|strong");
+                    return;
+                }
+            };
+            let previous = app.config.file_operations.verification;
+            app.config.file_operations.verification = verification;
+            match app.config.save() {
+                Ok(()) => app.set_status(format!(
+                    "verification = {}",
+                    if verification == tui_file_picker::VerificationMode::Strong {
+                        "strong"
+                    } else {
+                        "standard"
+                    }
+                )),
+                Err(error) => {
+                    app.config.file_operations.verification = previous;
+                    app.set_status(format!(
+                        "verification unchanged because config save failed: {error}"
+                    ));
+                }
+            }
+        }
         "f" | "format" => {
             let fmt = match value.to_lowercase().as_str() {
                 "flac" => Some(AudioFormat::Flac),
