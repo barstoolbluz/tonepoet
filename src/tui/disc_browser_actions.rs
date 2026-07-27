@@ -75,15 +75,20 @@ pub fn open_selected_disc_browser(app: &mut AppState, tx: &mpsc::Sender<AppMessa
 /// completion, and reports a clean error for non-disc ISOs.
 fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
     let index = app.browse.selected_index;
-    let (path, current_kind) = app
-        .browse
-        .entries
-        .get(index)
-        .map(|entry| (entry.path.clone(), entry.kind.clone()))?;
+    let entry = app.browse.entries.get(index)?;
+    let path = entry.path.clone();
+    let current_kind = entry.kind.clone();
 
     if current_kind.is_disc_source() {
         return Some(path);
     }
+
+    if let Some(classification) = app.browse.valid_folder_classification_for_entry(entry) {
+        if classification.kind == crate::tui::browse::FolderClassificationKind::Disc {
+            return Some(classification.disc_probe_source_path(&path).to_path_buf());
+        }
+    }
+
     let is_iso = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -633,7 +638,16 @@ mod tests {
     use super::*;
     use crate::config::TonepoetConfig;
     use crate::convert::classify::EntryKind;
-    use crate::tui::browse::BrowseEntry;
+    use crate::disc::model::{
+        AudioPresentationFormat, CopyProtectionSummary, DiscFormat, DiscPresentation,
+        DiscTrack, FormatProvenance, PresentationId,
+    };
+    use crate::disc::SacdAreaId;
+    use crate::tui::browse::{
+        BrowseEntry, FolderAudioSummary, FolderContentClassification, FolderClassificationKind,
+        FolderDiscMarkerKind, FolderUnitSummary, ProbeCacheIdentity,
+    };
+    use crate::tui::disc_browser::{disc_probe_fingerprint, DiscProbeCacheEntry};
     use std::fs::File;
     use std::io::{Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
@@ -657,6 +671,129 @@ mod tests {
             None,
         )];
         app.browse.selected_index = 0;
+        app
+    }
+
+    fn selectable_disc_contents(
+        source_path: PathBuf,
+        marker: FolderDiscMarkerKind,
+    ) -> DiscContents {
+        let (format, id, codec) = match marker {
+            FolderDiscMarkerKind::DvdAudio => (
+                DiscFormat::DvdAudio,
+                PresentationId::DvdAudioGroup(1),
+                "MLP",
+            ),
+            FolderDiscMarkerKind::DvdVideo => (
+                DiscFormat::DvdVideo,
+                PresentationId::dvd_video(1, 1, 0),
+                "LPCM",
+            ),
+            FolderDiscMarkerKind::Sacd => (
+                DiscFormat::Sacd,
+                PresentationId::SacdArea(SacdAreaId::Stereo),
+                "DSD",
+            ),
+            FolderDiscMarkerKind::BluRay | FolderDiscMarkerKind::Iso => (
+                DiscFormat::BluRay,
+                PresentationId::try_blu_ray_title(1, 0x1101, 0, 1)
+                    .expect("valid Blu-ray presentation id"),
+                "LPCM",
+            ),
+        };
+        DiscContents {
+            format,
+            label: marker.label().to_string(),
+            source_path,
+            presentations: vec![DiscPresentation {
+                id,
+                label: "stream 1".to_string(),
+                format: AudioPresentationFormat {
+                    codec: Some(codec.to_string()),
+                    sample_rate: Some(96_000),
+                    bit_depth: Some(24),
+                    channels: Some(2),
+                    channel_layout: Some("stereo".to_string()),
+                    lossless: true,
+                    provenance: FormatProvenance::IfoAttributes,
+                },
+                tracks: vec![DiscTrack {
+                    number: 1,
+                    title: None,
+                    performer: None,
+                    duration_secs: Some(60.0),
+                    format_note: None,
+                }],
+                total_duration_secs: 60.0,
+                album_title: None,
+                album_artist: None,
+                genre: None,
+                year: None,
+            }],
+            suppressed: Vec::new(),
+            copy_protection: CopyProtectionSummary {
+                description: "none".to_string(),
+            },
+            diagnostics: Vec::new(),
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+        }
+    }
+
+    fn app_with_selected_classified_disc_folder(
+        root: &Path,
+        nested_iso: &Path,
+        marker: FolderDiscMarkerKind,
+    ) -> AppState {
+        let metadata = std::fs::metadata(root).expect("folder metadata");
+        let entry = BrowseEntry::new(
+            root.to_path_buf(),
+            "disc folder".to_string(),
+            EntryKind::Directory,
+            metadata.len(),
+            metadata.modified().ok(),
+        );
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Disc,
+            identity,
+            audio: FolderAudioSummary::default(),
+            units: vec![FolderUnitSummary {
+                path: nested_iso.to_path_buf(),
+                parent: root.to_path_buf(),
+                name: nested_iso
+                    .file_name()
+                    .expect("fixture file name")
+                    .to_string_lossy()
+                    .into_owned(),
+                disc_marker: Some(marker),
+                audio: FolderAudioSummary::default(),
+            }],
+            unit_count: 1,
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: Some(marker),
+        };
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![entry];
+        app.browse.selected_index = 0;
+        app.browse.insert_folder_classification_for_identity(
+            root.to_path_buf(),
+            identity,
+            classification,
+        );
+        let fingerprint = disc_probe_fingerprint(nested_iso).expect("disc fingerprint");
+        app.browse.disc_probe_cache.insert(
+            nested_iso.to_path_buf(),
+            DiscProbeCacheEntry::from_success(
+                fingerprint,
+                selectable_disc_contents(nested_iso.to_path_buf(), marker),
+            ),
+        );
         app
     }
 
@@ -705,5 +842,38 @@ mod tests {
 
         assert!(selected_entry_effective_disc_path(&mut app).is_none());
         assert!(matches!(app.browse.entries[0].kind, EntryKind::Archive));
+    }
+
+    #[test]
+    fn classified_folders_activate_nested_iso_audio_streams_for_all_disc_markers() {
+        let marker_cases = [
+            (FolderDiscMarkerKind::DvdAudio, "dvda.iso"),
+            (FolderDiscMarkerKind::DvdVideo, "dvdv.iso"),
+            (FolderDiscMarkerKind::Sacd, "sacd.iso"),
+            (FolderDiscMarkerKind::BluRay, "bluray.iso"),
+        ];
+
+        for (marker, file_name) in marker_cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = temp.path().join("album");
+            std::fs::create_dir(&root).expect("disc folder");
+            let nested_iso = root.join(file_name);
+            std::fs::write(&nested_iso, b"disc image fixture").expect("disc image");
+            let mut app = app_with_selected_classified_disc_folder(&root, &nested_iso, marker);
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+            assert_eq!(
+                selected_entry_effective_disc_path(&mut app).as_deref(),
+                Some(nested_iso.as_path()),
+                "{marker:?} folder must resolve to its nested ISO",
+            );
+
+            open_selected_disc_browser(&mut app, &tx);
+
+            assert!(
+                matches!(app.active_overlay, ActiveOverlay::DiscBrowser(_)),
+                "{marker:?} folder-level activation must open the audio-streams overlay",
+            );
+        }
     }
 }

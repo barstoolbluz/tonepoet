@@ -41,6 +41,8 @@ const COL_CHANNELS_W: usize = 8;
 const COL_DURATION_W: usize = 9;
 const COL_ARTIST_W: usize = 16;
 const COL_ALBUM_W: usize = 16;
+const BROWSE_PATH_GO_LABEL: &str = " go ";
+const BROWSE_PATH_GO_WIDTH: u16 = 5;
 
 #[derive(Debug, Clone, Copy)]
 struct BrowseColumnCell {
@@ -367,12 +369,11 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     // Render path bar on line 3, inside the borders. Reserve explicit hit
     // rectangles for both trailing actions so the breadcrumb never overlaps them.
     let row_area = Rect::new(area.x + 1, area.y + 3, area.width.saturating_sub(2), 1);
-    const GO_WIDTH: u16 = 5;
     const BOOKMARK_WIDTH: u16 = 13;
     // One blank cell between Go and bookmarks so the two buttons read as
     // separate controls instead of one fused pill (user-requested spacer).
     const ACTION_GAP: u16 = 1;
-    let action_width = GO_WIDTH
+    let action_width = BROWSE_PATH_GO_WIDTH
         .saturating_add(ACTION_GAP)
         .saturating_add(BOOKMARK_WIDTH);
     let path_area = Rect::new(
@@ -402,14 +403,22 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
         }
     }
     if row_area.width >= action_width {
-        let go = Rect::new(row_area.right().saturating_sub(action_width), row_area.y, GO_WIDTH, 1);
+        let go = Rect::new(
+            row_area.right().saturating_sub(action_width),
+            row_area.y,
+            BROWSE_PATH_GO_WIDTH,
+            1,
+        );
         let bookmarks = Rect::new(
             go.right().saturating_add(ACTION_GAP),
             row_area.y,
             BOOKMARK_WIDTH,
             1,
         );
-        f.render_widget(Paragraph::new(" Go ").style(browse_toolbar_button_style(theme)), go);
+        f.render_widget(
+            Paragraph::new(BROWSE_PATH_GO_LABEL).style(browse_toolbar_button_style(theme)),
+            go,
+        );
         f.render_widget(
             Paragraph::new(" bookmarks ▾ ").style(browse_toolbar_button_style(theme)),
             bookmarks,
@@ -3151,7 +3160,7 @@ fn push_disc_probe_summary_lines(
                 theme.muted(),
             )]);
         }
-        if contents.presentations.len() >= 2 {
+        if !contents.presentations.is_empty() {
             lines.push(vec![]);
             let row = lines.len();
             let label = " audio streams ";
@@ -4721,6 +4730,102 @@ mod folder_classification_info_pane_tests {
     }
 
     #[test]
+    fn classified_iso_folders_show_audio_streams_for_one_presentation_across_disc_markers() {
+        let marker_cases = [
+            (FolderDiscMarkerKind::DvdAudio, "dvda.iso"),
+            (FolderDiscMarkerKind::DvdVideo, "dvdv.iso"),
+            (FolderDiscMarkerKind::Sacd, "sacd.iso"),
+            (FolderDiscMarkerKind::BluRay, "bluray.iso"),
+        ];
+
+        for (marker, file_name) in marker_cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = temp.path().join("album");
+            std::fs::create_dir(&root).expect("disc folder");
+            let nested_iso = root.join(file_name);
+            std::fs::write(&nested_iso, b"disc image fixture").expect("disc image");
+            let metadata = std::fs::metadata(&root).expect("folder metadata");
+            let identity = ProbeCacheIdentity::from_metadata(&metadata);
+            let entry = directory_entry(&root, "album", identity);
+            let classification = FolderContentClassification {
+                kind: FolderClassificationKind::Disc,
+                identity,
+                audio: FolderAudioSummary::default(),
+                units: vec![FolderUnitSummary {
+                    path: nested_iso.clone(),
+                    parent: root.clone(),
+                    name: file_name.to_string(),
+                    disc_marker: Some(marker),
+                    audio: FolderAudioSummary::default(),
+                }],
+                unit_count: 1,
+                collection_many: false,
+                io_budget_exhausted: false,
+                disc_marker: Some(marker),
+            };
+            let mut contents = disc_contents(nested_iso.clone());
+            contents.presentations.truncate(1);
+            let presentation = contents
+                .presentations
+                .first_mut()
+                .expect("single presentation fixture");
+            match marker {
+                FolderDiscMarkerKind::DvdAudio => {
+                    contents.format = DiscFormat::DvdAudio;
+                    presentation.id = PresentationId::DvdAudioGroup(1);
+                    presentation.format.codec = Some("MLP".to_string());
+                }
+                FolderDiscMarkerKind::DvdVideo => {
+                    contents.format = DiscFormat::DvdVideo;
+                    presentation.id = PresentationId::dvd_video(1, 1, 0);
+                    presentation.format.codec = Some("LPCM".to_string());
+                }
+                FolderDiscMarkerKind::Sacd => {
+                    contents.format = DiscFormat::Sacd;
+                    presentation.id = PresentationId::SacdArea(SacdAreaId::Stereo);
+                    presentation.format.codec = Some("DSD".to_string());
+                    presentation.format.sample_rate = Some(2_822_400);
+                    presentation.format.bit_depth = Some(1);
+                }
+                FolderDiscMarkerKind::BluRay | FolderDiscMarkerKind::Iso => {}
+            }
+
+            let mut browse = BrowseState::new();
+            browse.entries = vec![entry.clone()];
+            browse.selected_index = 0;
+            browse.insert_folder_classification_for_identity(
+                root.clone(),
+                identity,
+                classification,
+            );
+            let fingerprint = disc_probe_fingerprint(&nested_iso).expect("disc fingerprint");
+            browse.disc_probe_cache.insert(
+                nested_iso.clone(),
+                DiscProbeCacheEntry::from_success(fingerprint, contents),
+            );
+
+            let info = entry_info_lines(
+                &entry,
+                &browse,
+                96,
+                false,
+                false,
+                false,
+                None,
+                None,
+                theme(),
+            );
+            let rendered = flatten(&info);
+
+            assert!(
+                info.audio_streams_pill_row.is_some(),
+                "{marker:?} folder with one presentation must expose audio streams",
+            );
+            assert!(rendered.contains("content: 1 audio stream"));
+        }
+    }
+
+    #[test]
     fn disc_folder_renders_copy_protection_only_when_not_none() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("PROTECTED");
@@ -4974,6 +5079,18 @@ fn size_str(bytes: u64) -> String {
 #[cfg(test)]
 mod path_field_render_tests {
     use super::*;
+
+    #[test]
+    fn browse_path_go_label_is_lowercase_without_changing_hit_width() {
+        assert_eq!(BROWSE_PATH_GO_LABEL, " go ");
+        // The label renders inside the 5-cell hit rect and has always been 4
+        // cells wide (" Go " was too); the rect width is the unchanged part.
+        assert_eq!(BROWSE_PATH_GO_WIDTH, 5);
+        assert!(
+            crate::tui::display_width::width(BROWSE_PATH_GO_LABEL)
+                <= BROWSE_PATH_GO_WIDTH as usize,
+        );
+    }
 
     #[test]
     fn path_input_renderer_shows_partial_selection() {

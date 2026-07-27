@@ -1,6 +1,6 @@
 //! Vi-style command mode: parsing and execution
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
@@ -80,7 +80,7 @@ pub fn maybe_confirm_bulk_operation(
     true
 }
 
-fn current_bulk_guard_paths(app: &AppState) -> Vec<PathBuf> {
+pub(crate) fn current_bulk_guard_paths(app: &AppState) -> Vec<PathBuf> {
     if let Some(paths) = app.bulk_guard_frozen_paths.as_ref() {
         return paths.clone();
     }
@@ -92,6 +92,122 @@ fn current_bulk_guard_paths(app: &AppState) -> Vec<PathBuf> {
 }
 pub(crate) fn expand_audio_paths_for_metadata(paths: &[PathBuf]) -> Vec<PathBuf> {
     expand_audio_paths(paths)
+}
+
+/// Bounded, cooperatively cancellable metadata expansion for Copy tags.
+///
+/// This preserves `expand_paths_to_all_audio` semantics: deterministic
+/// files-before-directories traversal, no child-symlink following, audio-only
+/// results, and deduplication by queue identity. Unlike the legacy adapter, it
+/// prevents an obsolete Copy-tags request from walking an unbounded tree.
+pub(crate) fn expand_audio_paths_for_metadata_limited<F>(
+    paths: &[PathBuf],
+    max_visited: usize,
+    max_audio_files: usize,
+    cancelled: F,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: Fn() -> bool,
+{
+    fn add_visit(visited: &mut usize, limit: usize) -> Result<(), String> {
+        *visited = visited.saturating_add(1);
+        if *visited > limit {
+            Err(format!(
+                "Copy tags refused: selection traversal exceeds {limit} filesystem entries"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn push_audio(
+        path: PathBuf,
+        out: &mut Vec<PathBuf>,
+        seen: &mut HashSet<PathBuf>,
+        max_audio_files: usize,
+    ) -> Result<(), String> {
+        if !matches!(
+            crate::convert::classify::classify_file(&path),
+            crate::convert::classify::EntryKind::AudioFile(_)
+        ) {
+            return Ok(());
+        }
+        if seen.insert(queue_path_key(&path)) {
+            if out.len() >= max_audio_files {
+                return Err(format!(
+                    "Copy tags refused: selection exceeds {max_audio_files} audio files"
+                ));
+            }
+            out.push(path);
+        }
+        Ok(())
+    }
+
+    if max_visited == 0 || max_audio_files == 0 {
+        return Err("Copy tags refused: expansion limits must be nonzero".to_string());
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut visited = 0usize;
+
+    // `counted` means the node was already charged while its parent directory
+    // was streamed. This lets the bound stop a single enormous directory while
+    // avoiding double-counting directories when they are later popped.
+    for root in paths {
+        let mut stack = vec![(root.clone(), false)];
+        while let Some((path, counted)) = stack.pop() {
+            if cancelled() {
+                return Err("Copy tags superseded by a newer request".to_string());
+            }
+            if !counted {
+                add_visit(&mut visited, max_visited)?;
+            }
+
+            if path.is_dir() {
+                let Ok(read_dir) = fs::read_dir(&path) else {
+                    continue;
+                };
+                let mut directories = Vec::new();
+                let mut files = Vec::new();
+                for entry in read_dir.flatten() {
+                    if cancelled() {
+                        return Err("Copy tags superseded by a newer request".to_string());
+                    }
+                    add_visit(&mut visited, max_visited)?;
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_symlink() {
+                        continue;
+                    }
+                    let child = entry.path();
+                    if file_type.is_dir() {
+                        directories.push(child);
+                    } else {
+                        files.push(child);
+                    }
+                }
+
+                files.sort();
+                directories.sort();
+                for file in files {
+                    if cancelled() {
+                        return Err("Copy tags superseded by a newer request".to_string());
+                    }
+                    push_audio(file, &mut out, &mut seen, max_audio_files)?;
+                }
+                // Reverse push preserves ascending depth-first traversal.
+                for directory in directories.into_iter().rev() {
+                    stack.push((directory, true));
+                }
+            } else {
+                push_audio(path, &mut out, &mut seen, max_audio_files)?;
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 fn expand_audio_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -19996,5 +20112,84 @@ mod metadata_autonumber_command_tests {
             parse_command("autopopulate discnumber"),
             Command::MetaAutoPopulate(AutoPopulateTarget::DiscNumber)
         ));
+    }
+}
+
+#[cfg(test)]
+mod tag_copy_expansion_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn audio(path: &Path) {
+        fs::write(path, b"fLaC").expect("write audio fixture");
+    }
+
+    #[test]
+    fn limited_metadata_expansion_preserves_deterministic_all_audio_semantics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir(root.join("b")).expect("b dir");
+        fs::create_dir(root.join("a")).expect("a dir");
+        audio(&root.join("z.flac"));
+        fs::write(root.join("ignored.txt"), b"not audio").expect("text fixture");
+        audio(&root.join("a").join("a.flac"));
+        audio(&root.join("b").join("b.flac"));
+
+        let expanded = expand_audio_paths_for_metadata_limited(
+            &[root.to_path_buf()],
+            32,
+            8,
+            || false,
+        )
+        .expect("bounded expansion");
+
+        assert_eq!(
+            expanded,
+            vec![
+                root.join("z.flac"),
+                root.join("a").join("a.flac"),
+                root.join("b").join("b.flac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn limited_metadata_expansion_observes_cancellation_before_io() {
+        let cancelled = AtomicBool::new(true);
+        let err = expand_audio_paths_for_metadata_limited(
+            &[PathBuf::from("/not/visited")],
+            32,
+            8,
+            || cancelled.load(Ordering::Acquire),
+        )
+        .expect_err("cancelled expansion must stop");
+        assert!(err.contains("superseded"));
+    }
+
+    #[test]
+    fn limited_metadata_expansion_enforces_audio_and_traversal_caps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        audio(&root.join("one.flac"));
+        audio(&root.join("two.flac"));
+
+        let audio_err = expand_audio_paths_for_metadata_limited(
+            &[root.to_path_buf()],
+            32,
+            1,
+            || false,
+        )
+        .expect_err("second audio file must exceed cap");
+        assert!(audio_err.contains("exceeds 1 audio files"));
+
+        let traversal_err = expand_audio_paths_for_metadata_limited(
+            &[root.to_path_buf()],
+            1,
+            8,
+            || false,
+        )
+        .expect_err("directory entry must exceed traversal cap");
+        assert!(traversal_err.contains("exceeds 1 filesystem entries"));
     }
 }

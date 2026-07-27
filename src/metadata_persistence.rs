@@ -7,13 +7,95 @@
 //! types fail closed: adding support requires an explicit backend declaration
 //! here rather than inheriting an unsafe default.
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use lofty::file::TaggedFileExt;
 use lofty::tag::{ItemKey, TagType};
 
 const FLAC_MAGIC: &[u8; 4] = b"fLaC";
+const ID3V2_HEADER_LEN: u64 = 10;
+const ID3V2_FOOTER_LEN: u64 = 10;
+/// A prepended ID3v2 tag larger than this is treated as malformed rather than
+/// allowing attacker-controlled offsets or unbounded allocation/seek behavior.
+pub(crate) const MAX_ID3V2_FLAC_PREFIX_LEN: u64 = 16 * 1024 * 1024;
+
+/// Detect a native FLAC stream at byte zero or immediately after one bounded,
+/// well-formed ID3v2 tag. Returns `Ok(None)` for non-FLAC input and an error for
+/// a file that claims an ID3v2 prefix but cannot be parsed safely or is not
+/// followed immediately by `fLaC`.
+pub(crate) fn detect_flac_stream_offset<R: Read + Seek>(reader: &mut R) -> Result<Option<u64>, String> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| format!("seek file start while detecting FLAC: {err}"))?;
+    let mut header = [0u8; 10];
+    let mut read = 0usize;
+    while read < 4 {
+        match reader.read(&mut header[read..4]) {
+            Ok(0) => return Ok(None),
+            Ok(count) => read += count,
+            Err(err) => return Err(format!("read FLAC/ID3 signature: {err}")),
+        }
+    }
+    if &header[..4] == FLAC_MAGIC {
+        return Ok(Some(0));
+    }
+    if &header[..3] != b"ID3" {
+        return Ok(None);
+    }
+
+    while read < header.len() {
+        match reader.read(&mut header[read..]) {
+            Ok(0) => return Err("truncated ID3v2 header before FLAC stream".to_string()),
+            Ok(count) => read += count,
+            Err(err) => return Err(format!("read ID3v2 header before FLAC stream: {err}")),
+        }
+    }
+    let major = header[3];
+    if !matches!(major, 2 | 3 | 4) {
+        return Err(format!("unsupported ID3v2.{major} prefix before FLAC stream"));
+    }
+    if header[6..10].iter().any(|byte| byte & 0x80 != 0) {
+        return Err("malformed ID3v2 syncsafe size before FLAC stream".to_string());
+    }
+    let payload_len = header[6..10]
+        .iter()
+        .fold(0u64, |value, byte| (value << 7) | u64::from(*byte));
+    let footer_len = if major == 4 && header[5] & 0x10 != 0 {
+        ID3V2_FOOTER_LEN
+    } else {
+        0
+    };
+    let stream_offset = ID3V2_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|value| value.checked_add(footer_len))
+        .ok_or_else(|| "ID3v2 prefix length overflow before FLAC stream".to_string())?;
+    if stream_offset > MAX_ID3V2_FLAC_PREFIX_LEN {
+        return Err(format!(
+            "ID3v2 prefix before FLAC stream is too large ({stream_offset} bytes; maximum {MAX_ID3V2_FLAC_PREFIX_LEN})"
+        ));
+    }
+
+    reader
+        .seek(SeekFrom::Start(stream_offset))
+        .map_err(|err| format!("seek past ID3v2 prefix before FLAC stream: {err}"))?;
+    let mut magic = [0u8; 4];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|err| format!("read FLAC magic after ID3v2 prefix: {err}"))?;
+    if &magic != FLAC_MAGIC {
+        return Err("ID3v2 prefix is not followed immediately by a FLAC stream".to_string());
+    }
+    Ok(Some(stream_offset))
+}
+
+/// Path-oriented wrapper shared by routing and the native writer.
+pub(crate) fn flac_stream_offset(path: &Path) -> Result<Option<u64>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|err| format!("open '{}': {err}", path.display()))?;
+    detect_flac_stream_offset(&mut file)
+        .map_err(|err| format!("inspect '{}': {err}", path.display()))
+}
 
 /// Top-level persistence route used by the metadata writer.
 ///
@@ -142,11 +224,7 @@ fn extension_is(path: &Path, expected: &str) -> bool {
 }
 
 fn has_flac_magic(path: &Path) -> bool {
-    let mut magic = [0u8; 4];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .map(|()| &magic == FLAC_MAGIC)
-        .unwrap_or(false)
+    matches!(flac_stream_offset(path), Ok(Some(_)))
 }
 
 /// Resolve the same top-level route used by the metadata writer.
@@ -615,6 +693,89 @@ pub fn metadata_numbering_capability_for_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn syncsafe(value: u32) -> [u8; 4] {
+        assert!(value < (1 << 28));
+        [
+            ((value >> 21) & 0x7f) as u8,
+            ((value >> 14) & 0x7f) as u8,
+            ((value >> 7) & 0x7f) as u8,
+            (value & 0x7f) as u8,
+        ]
+    }
+
+    #[test]
+    fn flac_stream_detection_accepts_direct_and_bounded_id3v2_prefixes() {
+        let mut direct = std::io::Cursor::new(b"fLaC".to_vec());
+        assert_eq!(detect_flac_stream_offset(&mut direct).unwrap(), Some(0));
+
+        let payload_len = 4_633u32;
+        let mut prefixed = Vec::new();
+        prefixed.extend_from_slice(&[
+            b'I', b'D', b'3', 3, 0, 0x80,
+            syncsafe(payload_len)[0], syncsafe(payload_len)[1],
+            syncsafe(payload_len)[2], syncsafe(payload_len)[3],
+        ]);
+        prefixed.extend(std::iter::repeat(0x55).take(payload_len as usize));
+        prefixed.extend_from_slice(b"fLaC");
+        let mut prefixed = std::io::Cursor::new(prefixed);
+        assert_eq!(
+            detect_flac_stream_offset(&mut prefixed).unwrap(),
+            Some(ID3V2_HEADER_LEN + u64::from(payload_len)),
+        );
+
+        let mut v24_with_footer = Vec::new();
+        v24_with_footer.extend_from_slice(&[
+            b'I', b'D', b'3', 4, 0, 0x10, 0, 0, 0, 3,
+        ]);
+        v24_with_footer.extend_from_slice(b"tag");
+        v24_with_footer.extend_from_slice(&[b'3', b'D', b'I', 4, 0, 0x10, 0, 0, 0, 3]);
+        v24_with_footer.extend_from_slice(b"fLaC");
+        let mut v24_with_footer = std::io::Cursor::new(v24_with_footer);
+        assert_eq!(
+            detect_flac_stream_offset(&mut v24_with_footer).unwrap(),
+            Some(ID3V2_HEADER_LEN + 3 + ID3V2_FOOTER_LEN),
+        );
+    }
+
+    #[test]
+    fn flac_stream_detection_rejects_malformed_or_unbounded_id3v2_prefixes() {
+        let mut malformed_syncsafe = std::io::Cursor::new(vec![
+            b'I', b'D', b'3', 3, 0, 0, 0x80, 0, 0, 0,
+        ]);
+        assert!(detect_flac_stream_offset(&mut malformed_syncsafe)
+            .unwrap_err()
+            .contains("syncsafe"));
+
+        let oversized = (MAX_ID3V2_FLAC_PREFIX_LEN + 1 - ID3V2_HEADER_LEN) as u32;
+        let size = syncsafe(oversized);
+        let mut oversized = std::io::Cursor::new(vec![
+            b'I', b'D', b'3', 3, 0, 0, size[0], size[1], size[2], size[3],
+        ]);
+        assert!(detect_flac_stream_offset(&mut oversized)
+            .unwrap_err()
+            .contains("too large"));
+
+        let mut missing_flac = std::io::Cursor::new(
+            [&[b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 1][..], b"xNOPE".as_slice()].concat(),
+        );
+        assert!(detect_flac_stream_offset(&mut missing_flac)
+            .unwrap_err()
+            .contains("not followed immediately"));
+    }
+
+    #[test]
+    fn id3v2_prefixed_flac_magic_routes_without_a_flac_extension() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("extensionless-prefixed-audio");
+        let mut bytes = vec![b'I', b'D', b'3', 3, 0, 0x80, 0, 0, 0, 2];
+        bytes.extend_from_slice(b"xxfLaC");
+        std::fs::write(&path, bytes).expect("write prefixed FLAC signature fixture");
+        assert_eq!(
+            metadata_persistence_route_for_path(&path),
+            MetadataPersistenceRoute::NativeFlacVorbis,
+        );
+    }
 
     #[test]
     fn every_declared_backend_reports_explicit_capabilities() {

@@ -26750,32 +26750,49 @@ fn footer_pill_hit_with_extra<'a>(
     None
 }
 
-/// Ensure the cursor is visible in the metadata editor's scroll window.
-fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
-    let visible = crossterm::terminal::size()
-        .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(4))
-        .unwrap_or(20);
+fn metadata_editor_terminal_area() -> Rect {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    Rect::new(0, 0, width, height)
+}
+
+fn metadata_editor_visible_rows_for_area(area: Rect) -> usize {
+    super::draw_overlays::metadata_editor_layout_for_area(area)
+        .content_area
+        .height
+        .max(1) as usize
+}
+
+/// Ensure the cursor is visible in the exact metadata-editor content window
+/// used by the renderer. Keeping this area-parameterized makes the geometry
+/// invariant directly testable at short and conventional terminal heights.
+fn ensure_cursor_visible_for_area(state: &mut super::app::MetadataEditorState, area: Rect) {
+    let visible = metadata_editor_visible_rows_for_area(area);
     if state.cursor < state.scroll {
         state.scroll = state.cursor;
-    } else if state.cursor >= state.scroll + visible {
-        state.scroll = state.cursor.saturating_sub(visible - 1);
+    } else if state.cursor >= state.scroll.saturating_add(visible) {
+        state.scroll = state.cursor.saturating_sub(visible.saturating_sub(1));
     }
 }
 
-/// Ensure the detail cursor is visible in the detail overlay.
-fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
-    let visible = crossterm::terminal::size()
-        .map(|(_, h)| (h as usize * 85 / 100).max(14).saturating_sub(6))
-        .unwrap_or(15);
-    // The detail view has a 2-line header (field name + blank) before
-    // per-file rows. Cursor index i maps to line i+2 in the content.
+fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
+    ensure_cursor_visible_for_area(state, metadata_editor_terminal_area());
+}
+
+/// Ensure the detail cursor is visible in the exact metadata-editor content
+/// window. The detail view adds a two-line header inside that same content area.
+fn ensure_detail_visible_for_area(state: &mut super::app::MetadataEditorState, area: Rect) {
+    let visible = metadata_editor_visible_rows_for_area(area);
     let header_offset = 2usize;
-    let cursor_line = state.detail_cursor + header_offset;
+    let cursor_line = state.detail_cursor.saturating_add(header_offset);
     if cursor_line < state.detail_scroll {
         state.detail_scroll = cursor_line;
-    } else if cursor_line >= state.detail_scroll + visible {
-        state.detail_scroll = cursor_line.saturating_sub(visible - 1);
+    } else if cursor_line >= state.detail_scroll.saturating_add(visible) {
+        state.detail_scroll = cursor_line.saturating_sub(visible.saturating_sub(1));
     }
+}
+
+fn ensure_detail_visible(state: &mut super::app::MetadataEditorState) {
+    ensure_detail_visible_for_area(state, metadata_editor_terminal_area());
 }
 
 fn metadata_editor_file_slot_counts(state: &super::app::MetadataEditorState) -> (usize, usize) {
@@ -52142,6 +52159,103 @@ mod metadata_editor_inline_navigation_tests {
             labels,
             MetadataTechnicalDetails::default(),
         ))
+    }
+
+    #[test]
+    fn metadata_editor_add_row_scroll_uses_rendered_content_height() {
+        let entries: Vec<TagEntry> = (0..40)
+            .map(|idx| {
+                entry(
+                    &format!("FIELD_{idx}"),
+                    ItemKey::Unknown(format!("FIELD_{idx}")),
+                    &["value"],
+                    false,
+                )
+            })
+            .collect();
+        let mut state = editor(entries, 1);
+        state.cursor = state.active_surface().entries.len();
+        state.scroll = 0;
+
+        for area in [
+            Rect::new(0, 0, 80, 14),
+            Rect::new(0, 0, 100, 18),
+            Rect::new(0, 0, 120, 24),
+            Rect::new(0, 0, 160, 40),
+        ] {
+            state.scroll = 0;
+            ensure_cursor_visible_for_area(&mut state, area);
+            let visible = metadata_editor_visible_rows_for_area(area);
+            assert_eq!(
+                visible,
+                super::super::draw_overlays::metadata_editor_layout_for_area(area)
+                    .content_area
+                    .height
+                    .max(1) as usize,
+            );
+            assert!(state.cursor >= state.scroll);
+            assert!(state.cursor < state.scroll.saturating_add(visible));
+        }
+    }
+
+    #[test]
+    fn metadata_editor_detail_scroll_uses_the_same_rendered_window() {
+        let values: Vec<String> = (0..30).map(|idx| format!("value-{idx}")).collect();
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let paths: Vec<std::path::PathBuf> = (0..values.len())
+            .map(|idx| std::path::PathBuf::from(format!("track-{idx}.flac")))
+            .collect();
+        let labels: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
+        let mut state = Box::new(MetadataEditorState::for_files(
+            paths,
+            vec![entry("TITLE", ItemKey::TrackTitle, &refs, true)],
+            labels,
+            MetadataTechnicalDetails::default(),
+        ));
+        state.detail_cursor = values.len() - 1;
+
+        for area in [Rect::new(0, 0, 80, 14), Rect::new(0, 0, 120, 24)] {
+            state.detail_scroll = 0;
+            ensure_detail_visible_for_area(&mut state, area);
+            let visible = metadata_editor_visible_rows_for_area(area);
+            let cursor_line = state.detail_cursor + 2;
+            assert!(cursor_line >= state.detail_scroll);
+            assert!(cursor_line < state.detail_scroll.saturating_add(visible));
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_editor_alt_l_selects_inline_text_while_alt_a_remains_apply() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = editor(
+            vec![entry("TITLE", ItemKey::TrackTitle, &["old"], false)],
+            1,
+        );
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.edit_input = Some(super::super::text_input::TextInputState::new(
+            "replacement".to_string(),
+        ));
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            &mut state,
+            &tx(),
+        );
+        let input = state.edit_input.as_ref().expect("inline input remains active");
+        assert_eq!(input.selection_range(), Some(0..input.text.len()));
+        assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            &mut state,
+            &tx(),
+        );
+        // With a dirty entry, Apply commits the inline edit and enters the
+        // save flow — Saving IS the "Alt+A remains apply" proof.
+        assert_eq!(state.phase, MetadataEditorPhase::Saving);
+        assert_eq!(state.active_surface().entries[0].value, "replacement");
     }
 
     #[test]

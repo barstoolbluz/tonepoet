@@ -2257,6 +2257,24 @@ pub(crate) struct PendingClipboardPaste {
     pub retry_plan: Option<BrowsePasteRetryPlan>,
 }
 
+/// Session-scoped metadata clipboard payload. `entries` are positionally
+/// aligned to `source_paths` through every per-file vector they carry.
+#[derive(Debug, Clone)]
+pub struct TagClipboard {
+    pub source_paths: Vec<PathBuf>,
+    pub entries: Vec<crate::tui::probe::TagEntry>,
+}
+
+/// Latest deferred Copy-tags request while an older blocking worker drains.
+/// Replacing this value coalesces arbitrarily many repeated requests to one
+/// pending operation and preserves only the user's newest selection.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTagClipboardCopy {
+    pub generation: u64,
+    pub roots: Vec<PathBuf>,
+    pub selection: super::context_menu::TagCopySelection,
+}
+
 /// State for the browse screen
 #[derive(Debug, Clone)]
 pub struct BrowseState {
@@ -2288,6 +2306,26 @@ pub struct BrowseState {
 
     /// Shared in-memory filesystem clipboard used by Cut/Copy/Paste.
     pub filesystem_clipboard: Option<tui_file_picker::FilesystemClipboard>,
+
+    /// Session-scoped metadata clipboard. Entries remain complete `TagEntry`
+    /// clones so future paste semantics retain row scope, mixed/cardinality
+    /// evidence, and positional alignment with `source_paths`.
+    pub tag_clipboard: Option<TagClipboard>,
+
+    /// Monotonic guard for background tag-copy requests and completions.
+    pub(crate) tag_clipboard_copy_generation: u64,
+
+    /// Generation currently owned by the single blocking Copy-tags worker.
+    /// At most one worker may be active for an AppState.
+    pub(crate) tag_clipboard_copy_active_generation: Option<u64>,
+
+    /// Cooperative cancellation flag for the active Copy-tags worker. A newer
+    /// request sets this before replacing `tag_clipboard_copy_pending`.
+    pub(crate) tag_clipboard_copy_cancel: Option<Arc<AtomicBool>>,
+
+    /// Last-request-wins pending work. Repeated requests while a worker is
+    /// active replace this slot instead of spawning additional filesystem I/O.
+    pub(crate) tag_clipboard_copy_pending: Option<PendingTagClipboardCopy>,
 
     /// Exact mappings/proofs retained only for an incomplete cut. A new Cut or
     /// Copy command clears this token.
@@ -2888,6 +2926,11 @@ impl BrowseState {
             visible_height: 0,
             multi_selected: Vec::new(),
             filesystem_clipboard: None,
+            tag_clipboard: None,
+            tag_clipboard_copy_generation: 0,
+            tag_clipboard_copy_active_generation: None,
+            tag_clipboard_copy_cancel: None,
+            tag_clipboard_copy_pending: None,
             filesystem_clipboard_retry_plan: None,
             pending_clipboard_paste: None,
             multi_select_anchor: None,

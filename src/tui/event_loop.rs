@@ -3323,6 +3323,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         AppMessage::StatusMessage(msg) => {
             app.set_status(msg);
         }
+        AppMessage::TagClipboardCopyComplete {
+            generation,
+            source_paths,
+            result,
+        } => {
+            super::context_menu::handle_tag_clipboard_copy_complete(
+                app,
+                tx,
+                generation,
+                source_paths,
+                result,
+            );
+        }
         AppMessage::ActionsRunPreparationProgress {
             preparation_id,
             detail,
@@ -12818,6 +12831,96 @@ mod musicbrainz_completion_dispatch_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod tag_clipboard_completion_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::probe::{RowScope, TagEntry};
+    use lofty::tag::ItemKey;
+    use std::path::PathBuf;
+
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(4);
+        tx
+    }
+
+    fn tag(display_key: &str, value: &str) -> TagEntry {
+        TagEntry {
+            display_key: display_key.to_string(),
+            item_key: ItemKey::Unknown(display_key.to_string()),
+            value: value.to_string(),
+            original: value.to_string(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: false,
+            row_scope: RowScope::File,
+            per_file_stored_value_counts: vec![1],
+            per_file_values: vec![value.to_string()],
+            per_file_originals: vec![value.to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn tag_clipboard_completion_is_last_request_wins_and_retains_full_entries() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.tag_clipboard_copy_generation = 2;
+        app.browse.tag_clipboard_copy_active_generation = Some(2);
+        app.browse.tag_clipboard_copy_cancel = Some(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        app.browse.tag_clipboard = Some(super::super::browse::TagClipboard {
+            source_paths: vec![PathBuf::from("current.flac")],
+            entries: vec![tag("TITLE", "current")],
+        });
+
+        handle_message(
+            &mut app,
+            AppMessage::TagClipboardCopyComplete {
+                generation: 1,
+                source_paths: vec![PathBuf::from("stale.flac")],
+                result: Ok((vec![tag("TITLE", "stale")], 0)),
+            },
+            &tx(),
+        );
+        let clipboard = app.browse.tag_clipboard.as_ref().expect("current clipboard");
+        assert_eq!(clipboard.source_paths, vec![PathBuf::from("current.flac")]);
+        assert_eq!(clipboard.entries[0].value, "current");
+
+        let mut copied = tag("TRACKTOTAL", "12");
+        copied.row_scope = RowScope::Track;
+        copied.is_mixed = true;
+        copied.per_file_stored_value_counts = vec![2, 1];
+        copied.per_file_values = vec!["12".to_string(), "13".to_string()];
+        copied.per_file_originals = copied.per_file_values.clone();
+        handle_message(
+            &mut app,
+            AppMessage::TagClipboardCopyComplete {
+                generation: 2,
+                source_paths: vec![PathBuf::from("one.flac"), PathBuf::from("two.flac")],
+                result: Ok((vec![copied], 0)),
+            },
+            &tx(),
+        );
+
+        let clipboard = app.browse.tag_clipboard.as_ref().expect("replacement clipboard");
+        assert_eq!(
+            clipboard.source_paths,
+            vec![PathBuf::from("one.flac"), PathBuf::from("two.flac")],
+        );
+        assert_eq!(clipboard.entries[0].row_scope, RowScope::Track);
+        assert!(clipboard.entries[0].is_mixed);
+        assert_eq!(clipboard.entries[0].per_file_stored_value_counts, vec![2, 1]);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("Copied 1 field from 2 files"),
+        );
+        assert_eq!(app.browse.tag_clipboard_copy_active_generation, None);
+        assert!(app.browse.tag_clipboard_copy_cancel.is_none());
+    }
 }
 
 #[cfg(test)]

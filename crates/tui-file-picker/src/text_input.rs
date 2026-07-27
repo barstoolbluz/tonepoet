@@ -744,7 +744,7 @@ fn next_boundary_after(text: &str, pos: usize) -> Option<usize> {
 ///
 /// Plain keys: Char, Backspace, Delete, Left, Right, Home, End.
 /// Standard selection plus readline-style Ctrl bindings (case-insensitive):
-///   Ctrl+A or Alt+A=select all; Ctrl+/ or Ctrl+_=deselect;
+///   Ctrl+A or Alt+L=select all; Ctrl+/ or Ctrl+_=deselect;
 ///   Ctrl+E=end, Ctrl+B=left, Ctrl+F=right,
 ///   Ctrl+H=backspace, Ctrl+D=delete-fwd,
 ///   Ctrl+W=delete-prev-word, Ctrl+U=kill-to-start, Ctrl+K=kill-to-end.
@@ -793,13 +793,13 @@ pub fn handle_text_input_key_with_boundaries(
     }
 
     match (ctrl, alt, shift, key.code) {
-        // Standard text-editor select all plus an Alt+A alternative for
+        // Standard text-editor select all plus an Alt+L alternative for
         // terminal multiplexers that reserve Ctrl+A.
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'a') => {
             input.select_all_text();
             true
         }
-        (false, true, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'a') => {
+        (false, true, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'l') => {
             input.select_all_text();
             true
         }
@@ -1634,14 +1634,21 @@ mod tests {
 
 
     #[test]
-    fn alt_a_is_a_terminal_safe_select_all_alias() {
+    fn alt_l_is_a_terminal_safe_select_all_alias_and_alt_a_is_unbound() {
         let mut input = TextInputState::new("Blue Öyster Cult".to_string());
         input.cursor = 4;
         assert!(handle_text_input_key(
             &mut input,
-            &key(KeyCode::Char('a'), KeyModifiers::ALT),
+            &key(KeyCode::Char('l'), KeyModifiers::ALT),
         ));
         assert_eq!(input.selection_range(), Some(0..input.text.len()));
+
+        input.clear_selection();
+        assert!(!handle_text_input_key(
+            &mut input,
+            &key(KeyCode::Char('a'), KeyModifiers::ALT),
+        ));
+        assert_eq!(input.selection_range(), None);
     }
 
     #[test]

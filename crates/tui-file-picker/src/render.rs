@@ -290,7 +290,7 @@ impl FilePickerState {
     }
 
     fn render_address(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let go_label = "Go";
+        let go_label = ADDRESS_GO_LABEL;
         let go_width = button_width(go_label);
         let label = "Address:";
         let input_x = area.x.saturating_add(crate::display_width::width(label) as u16 + 2);
@@ -1738,6 +1738,8 @@ fn fit_text_right(text: &str, width: usize) -> String {
     crate::display_width::fit_end(text, width)
 }
 
+const ADDRESS_GO_LABEL: &str = "go";
+
 fn button_width(label: &str) -> u16 {
     crate::display_width::width(label).saturating_add(2) as u16
 }
@@ -1925,6 +1927,12 @@ fn same_display_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::{ConflictPolicyPreset, FilePickerConfig, FilePickerFilter, FilePickerMenuAction};
+
+    #[test]
+    fn address_go_label_is_lowercase_without_changing_button_width() {
+        assert_eq!(ADDRESS_GO_LABEL, "go");
+        assert_eq!(button_width(ADDRESS_GO_LABEL), button_width("Go"));
+    }
 
     #[test]
     fn fit_text_start_keeps_name_prefix_and_marks_overflow_at_the_end() {

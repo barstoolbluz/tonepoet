@@ -769,7 +769,8 @@ mod flac_metadata_writer {
     const JOURNAL_MAGIC_V2: &[u8] = b"TPFLACMJ2\0\0";
     const JOURNAL_MAGIC_V3: &[u8] = b"TPFLACMJ3\0\0";
     const JOURNAL_MAGIC_V4: &[u8] = b"TPFLACMJ4\0\0";
-    const JOURNAL_MAGIC: &[u8] = b"TPFLACMJ5\0\0";
+    const JOURNAL_MAGIC_V5: &[u8] = b"TPFLACMJ5\0\0";
+    const JOURNAL_MAGIC: &[u8] = b"TPFLACMJ6\0\0";
     const BLOCK_STREAMINFO: u8 = 0;
     const BLOCK_PADDING: u8 = 1;
     const BLOCK_VORBIS_COMMENT: u8 = 4;
@@ -781,7 +782,8 @@ mod flac_metadata_writer {
     const ARTWORK_ROLLBACK_MAGIC_V1: &[u8] = b"TPFLACAJ1\0\0";
     const ARTWORK_ROLLBACK_MAGIC_V2: &[u8] = b"TPFLACAJ2\0\0";
     const ARTWORK_ROLLBACK_MAGIC_V3: &[u8] = b"TPFLACAJ3\0\0";
-    const ARTWORK_ROLLBACK_MAGIC: &[u8] = b"TPFLACAJ4\0\0";
+    const ARTWORK_ROLLBACK_MAGIC_V4: &[u8] = b"TPFLACAJ4\0\0";
+    const ARTWORK_ROLLBACK_MAGIC: &[u8] = b"TPFLACAJ5\0\0";
     const WRITE_LOCK_MAGIC_V1: &[u8] = b"TPFLACWL1\0\0";
     const WRITE_LOCK_MAGIC: &[u8] = b"TPFLACWL2\0\0";
 
@@ -952,12 +954,16 @@ mod flac_metadata_writer {
     #[derive(Debug, Clone)]
     struct FlacMetadata {
         blocks: Vec<FlacBlock>,
+        /// Byte offset of the `fLaC` marker (zero for ordinary FLAC files).
+        stream_offset: u64,
+        /// Absolute byte offset of the first audio frame.
         audio_start: u64,
         raw_metadata_region: Vec<u8>,
     }
 
     #[derive(Debug, Clone)]
     pub(super) struct FlacMetadataSnapshot {
+        pub(super) stream_offset: u64,
         pub(super) audio_start: u64,
         pub(super) raw_metadata_region: Vec<u8>,
     }
@@ -1251,24 +1257,48 @@ mod flac_metadata_writer {
         }
         let _write_claim = acquire_common_write_claim(path, "metadata snapshot restore")?;
         match read_flac_metadata(path) {
-            Ok(current) if current.audio_start == snapshot.audio_start => {
-                overwrite_metadata_region(path, &snapshot.raw_metadata_region)
-            }
+            Ok(current) if current.stream_offset != snapshot.stream_offset => Err(format!(
+                "cannot restore FLAC metadata for '{}': FLAC stream offset changed from {} to {}",
+                path.display(),
+                snapshot.stream_offset,
+                current.stream_offset,
+            )),
+            Ok(current) if current.audio_start == snapshot.audio_start => overwrite_metadata_region(
+                path,
+                snapshot.stream_offset,
+                &snapshot.raw_metadata_region,
+            ),
             Ok(current) => {
                 let blocks = decode_metadata_region(&snapshot.raw_metadata_region)?;
-                stream_rewrite(path, current.audio_start, &blocks, None).map(|_| ())
+                stream_rewrite(
+                    path,
+                    snapshot.stream_offset,
+                    current.audio_start,
+                    &blocks,
+                    None,
+                )
+                .map(|_| ())
             }
             Err(parse_err) => {
                 let file_len = std::fs::metadata(path)
                     .map_err(|err| format!("stat FLAC for metadata restore '{}': {err}", path.display()))?
                     .len();
-                if file_len < 4 + snapshot.raw_metadata_region.len() as u64 {
+                let minimum_len = snapshot
+                    .stream_offset
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(snapshot.raw_metadata_region.len() as u64))
+                    .ok_or_else(|| format!("saved FLAC metadata extent overflows for '{}'", path.display()))?;
+                if file_len < minimum_len {
                     return Err(format!(
                         "cannot restore FLAC metadata for '{}': file is shorter than the saved metadata region after parse failure ({parse_err})",
                         path.display()
                     ));
                 }
-                overwrite_metadata_region(path, &snapshot.raw_metadata_region)
+                overwrite_metadata_region(
+                    path,
+                    snapshot.stream_offset,
+                    &snapshot.raw_metadata_region,
+                )
             }
         }
     }
@@ -1282,16 +1312,32 @@ mod flac_metadata_writer {
             let file_len = std::fs::metadata(path)
                 .map_err(|err| format!("stat FLAC for metadata restore '{}': {err}", path.display()))?
                 .len();
-            if file_len < 4 + snapshot.raw_metadata_region.len() as u64 {
+            let minimum_len = snapshot
+                .stream_offset
+                .checked_add(4)
+                .and_then(|value| value.checked_add(snapshot.raw_metadata_region.len() as u64))
+                .ok_or_else(|| format!("saved FLAC metadata extent overflows for '{}'", path.display()))?;
+            if file_len < minimum_len {
                 return Err(format!(
                     "cannot restore FLAC metadata for '{}': file is shorter than the saved metadata region",
                     path.display()
                 ));
             }
-            overwrite_metadata_region(path, &snapshot.raw_metadata_region)
+            overwrite_metadata_region(
+                path,
+                snapshot.stream_offset,
+                &snapshot.raw_metadata_region,
+            )
         } else {
             let blocks = decode_metadata_region(&snapshot.raw_metadata_region)?;
-            stream_rewrite(path, current_audio_start, &blocks, None).map(|_| ())
+            stream_rewrite(
+                path,
+                snapshot.stream_offset,
+                current_audio_start,
+                &blocks,
+                None,
+            )
+            .map(|_| ())
         }
     }
 
@@ -1314,6 +1360,7 @@ mod flac_metadata_writer {
         let intended_region = encode_replacement_region_for_identity(&metadata, replacement)?;
         Ok((
             FlacMetadataSnapshot {
+                stream_offset: metadata.stream_offset,
                 audio_start: metadata.audio_start,
                 raw_metadata_region: metadata.raw_metadata_region,
             },
@@ -1343,6 +1390,7 @@ mod flac_metadata_writer {
         let intended_region = encode_replacement_region_for_identity(&metadata, replacement)?;
         Ok(Some((
             FlacMetadataSnapshot {
+                stream_offset: metadata.stream_offset,
                 audio_start: metadata.audio_start,
                 raw_metadata_region: metadata.raw_metadata_region,
             },
@@ -1408,6 +1456,11 @@ mod flac_metadata_writer {
     fn read_flac_metadata(path: &Path) -> Result<FlacMetadata, String> {
         let mut file = std::fs::File::open(path)
             .map_err(|err| format!("open FLAC '{}': {err}", path.display()))?;
+        let stream_offset = crate::metadata_persistence::detect_flac_stream_offset(&mut file)
+            .map_err(|err| format!("inspect FLAC prefix '{}': {err}", path.display()))?
+            .ok_or_else(|| format!("'{}' is not a FLAC stream", path.display()))?;
+        file.seek(SeekFrom::Start(stream_offset))
+            .map_err(|err| format!("seek FLAC stream '{}': {err}", path.display()))?;
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)
             .map_err(|err| format!("read FLAC magic '{}': {err}", path.display()))?;
@@ -1445,6 +1498,7 @@ mod flac_metadata_writer {
                     .map_err(|err| format!("read FLAC metadata offset '{}': {err}", path.display()))?;
                 return Ok(FlacMetadata {
                     blocks,
+                    stream_offset,
                     audio_start,
                     raw_metadata_region,
                 });
@@ -1838,7 +1892,7 @@ mod flac_metadata_writer {
                 }
                 #[cfg(test)]
                 run_test_backup_absence_hook(path);
-                let write_result = overwrite_metadata_region(path, &encoded);
+                let write_result = overwrite_metadata_region(path, metadata.stream_offset, &encoded);
                 if let Err(err) = write_result {
                     let recover_result = recover_owned_metadata_journal(path);
                     return Err(match recover_result {
@@ -1858,7 +1912,13 @@ mod flac_metadata_writer {
         }
 
         append_padding(&mut replacement, REWRITE_PADDING_BYTES)?;
-        let commit = stream_rewrite(path, metadata.audio_start, &replacement, cancel)?;
+        let commit = stream_rewrite(
+            path,
+            metadata.stream_offset,
+            metadata.audio_start,
+            &replacement,
+            cancel,
+        )?;
         Ok(FlacWriteReport::clean()
             .with_warning(commit.durability_warning))
     }
@@ -1970,19 +2030,28 @@ mod flac_metadata_writer {
         Ok(())
     }
 
-    fn overwrite_metadata_region(path: &Path, encoded_metadata_region: &[u8]) -> Result<(), String> {
+    fn overwrite_metadata_region(
+        path: &Path,
+        stream_offset: u64,
+        encoded_metadata_region: &[u8],
+    ) -> Result<(), String> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(|err| format!("open FLAC for metadata write '{}': {err}", path.display()))?;
+        file.seek(SeekFrom::Start(stream_offset))
+            .map_err(|err| format!("seek FLAC magic before write '{}': {err}", path.display()))?;
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)
             .map_err(|err| format!("verify FLAC magic before write '{}': {err}", path.display()))?;
         if &magic != FLAC_MAGIC {
             return Err(format!("refusing to write '{}': FLAC magic changed", path.display()));
         }
-        file.seek(SeekFrom::Start(4))
+        let metadata_offset = stream_offset
+            .checked_add(4)
+            .ok_or_else(|| format!("FLAC metadata offset overflow for '{}'", path.display()))?;
+        file.seek(SeekFrom::Start(metadata_offset))
             .map_err(|err| format!("seek FLAC metadata '{}': {err}", path.display()))?;
         #[cfg(test)]
         run_test_metadata_write_len_hook(path, encoded_metadata_region.len());
@@ -1995,8 +2064,44 @@ mod flac_metadata_writer {
         Ok(())
     }
 
+    fn copy_stream_prefix(
+        path: &Path,
+        input: &mut std::fs::File,
+        output: &mut std::fs::File,
+        prefix_len: u64,
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+    ) -> Result<(), String> {
+        if prefix_len > crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN {
+            return Err(format!(
+                "refusing FLAC rewrite for '{}': saved ID3v2 prefix is too large ({} bytes; maximum {})",
+                path.display(),
+                prefix_len,
+                crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN,
+            ));
+        }
+        input
+            .seek(SeekFrom::Start(0))
+            .map_err(|err| format!("seek FLAC prefix '{}': {err}", path.display()))?;
+        let mut remaining = prefix_len;
+        let buffer_len = prefix_len.min(STREAM_COPY_BUF as u64).max(1) as usize;
+        let mut buffer = vec![0u8; buffer_len];
+        while remaining > 0 {
+            super::check_metadata_write_cancel(cancel, "while preserving FLAC ID3v2 prefix")?;
+            let chunk_len = remaining.min(buffer.len() as u64) as usize;
+            input
+                .read_exact(&mut buffer[..chunk_len])
+                .map_err(|err| format!("read FLAC prefix '{}': {err}", path.display()))?;
+            output
+                .write_all(&buffer[..chunk_len])
+                .map_err(|err| format!("write FLAC prefix '{}': {err}", path.display()))?;
+            remaining -= chunk_len as u64;
+        }
+        Ok(())
+    }
+
     fn stream_rewrite(
         path: &Path,
+        stream_offset: u64,
         old_audio_start: u64,
         blocks: &[FlacBlock],
         cancel: Option<&super::MetadataWriteCancelFlag>,
@@ -2014,8 +2119,42 @@ mod flac_metadata_writer {
         reject_hardlinked_overflow_rewrite(path, &source_metadata)?;
         let source_identity = SourceFileIdentity::capture(path, &source_metadata)?;
         let preservation = OriginalFileMetadata::capture(path, &source_metadata)?;
+        if stream_offset > crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN {
+            return Err(format!(
+                "invalid FLAC rewrite offset for '{}': stream offset {} exceeds maximum {}",
+                path.display(),
+                stream_offset,
+                crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN,
+            ));
+        }
+        let metadata_start = stream_offset
+            .checked_add(4)
+            .ok_or_else(|| format!("FLAC stream offset overflows for '{}'", path.display()))?;
+        if old_audio_start < metadata_start || old_audio_start > source_metadata.len() {
+            return Err(format!(
+                "invalid FLAC rewrite offsets for '{}': stream at {}, audio at {}, file length {}",
+                path.display(),
+                stream_offset,
+                old_audio_start,
+                source_metadata.len(),
+            ));
+        }
+        input
+            .seek(SeekFrom::Start(stream_offset))
+            .map_err(|err| format!("seek FLAC magic before rewrite '{}': {err}", path.display()))?;
+        let mut magic = [0u8; 4];
+        input
+            .read_exact(&mut magic)
+            .map_err(|err| format!("verify FLAC magic before rewrite '{}': {err}", path.display()))?;
+        if &magic != FLAC_MAGIC {
+            return Err(format!(
+                "refusing to rewrite '{}': FLAC magic changed",
+                path.display(),
+            ));
+        }
         let mut output = create_restrictive_rewrite_temp(&tmp_path)
             .map_err(|err| format!("create FLAC rewrite temp '{}': {err}", tmp_path.display()))?;
+        copy_stream_prefix(path, &mut input, &mut output, stream_offset, cancel)?;
         output
             .write_all(FLAC_MAGIC)
             .map_err(|err| format!("write FLAC magic '{}': {err}", tmp_path.display()))?;
@@ -3154,6 +3293,7 @@ mod flac_metadata_writer {
         let claim_token = current_common_write_claim_token(path).unwrap_or_else(new_claim_token);
         body.extend_from_slice(JOURNAL_MAGIC);
         push_le_u64(&mut body, file_meta.len());
+        push_le_u64(&mut body, metadata.stream_offset);
         push_le_u64(&mut body, metadata.audio_start);
         push_le_u64(&mut body, raw_metadata_region.len() as u64);
         push_le_u64(&mut body, checksum64(raw_metadata_region));
@@ -3391,12 +3531,27 @@ mod flac_metadata_writer {
             .unwrap_or(0);
         let intended_file_len = intended_metadata_region
             .map(|region| {
-                file_meta
-                    .len()
-                    .saturating_sub(snapshot.audio_start)
-                    .saturating_add(4)
-                    .saturating_add(region.len() as u64)
+                let audio_len = file_meta.len().checked_sub(snapshot.audio_start).ok_or_else(|| {
+                    format!(
+                        "invalid FLAC artwork snapshot for '{}': audio offset {} exceeds file length {}",
+                        path.display(),
+                        snapshot.audio_start,
+                        file_meta.len(),
+                    )
+                })?;
+                snapshot
+                    .stream_offset
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(region.len() as u64))
+                    .and_then(|value| value.checked_add(audio_len))
+                    .ok_or_else(|| {
+                        format!(
+                            "FLAC artwork intended file length overflows for '{}'",
+                            path.display(),
+                        )
+                    })
             })
+            .transpose()?
             .unwrap_or(0);
         let mut body = Vec::new();
         body.extend_from_slice(ARTWORK_ROLLBACK_MAGIC);
@@ -3406,6 +3561,7 @@ mod flac_metadata_writer {
         push_le_u64(&mut body, owner.process_token);
         push_le_u64(&mut body, claim_token);
         push_le_u64(&mut body, file_meta.len());
+        push_le_u64(&mut body, snapshot.stream_offset);
         push_le_u64(&mut body, snapshot.audio_start);
         push_le_u64(&mut body, original_len);
         push_le_u64(&mut body, original_checksum);
@@ -3565,6 +3721,7 @@ mod flac_metadata_writer {
                     ));
                 };
                 let snapshot = FlacMetadataSnapshot {
+                    stream_offset: record.stream_offset,
                     audio_start: record.audio_start,
                     raw_metadata_region: record.raw_metadata_region.clone(),
                 };
@@ -3573,6 +3730,14 @@ mod flac_metadata_writer {
                 return Ok(());
             }
         };
+        if current.stream_offset != record.stream_offset {
+            return Err(format!(
+                "refusing FLAC artwork rollback recovery for '{}': FLAC stream offset changed from {} to {}",
+                path.display(),
+                record.stream_offset,
+                current.stream_offset,
+            ));
+        }
         let current_len = current.raw_metadata_region.len() as u64;
         let current_checksum = checksum64(&current.raw_metadata_region);
 
@@ -3597,6 +3762,7 @@ mod flac_metadata_writer {
         }
 
         let snapshot = FlacMetadataSnapshot {
+            stream_offset: record.stream_offset,
             audio_start: record.audio_start,
             raw_metadata_region: record.raw_metadata_region,
         };
@@ -3609,6 +3775,7 @@ mod flac_metadata_writer {
         owner: OwnerProcessIdentity,
         claim_token: u64,
         file_len: u64,
+        stream_offset: u64,
         audio_start: u64,
         metadata_len: u64,
         metadata_checksum: u64,
@@ -3685,7 +3852,10 @@ mod flac_metadata_writer {
             // should begin: the artwork rollback journal records the intended metadata length
             // used to build that committed artwork mutation.
             if self.matches_intended_recovery_identity(current_file_meta) {
-                return Some(4 + self.intended_metadata_len);
+                return self
+                    .stream_offset
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(self.intended_metadata_len));
             }
             None
         }
@@ -3723,19 +3893,23 @@ mod flac_metadata_writer {
         journal: &Path,
         data: &[u8],
     ) -> Result<ParsedArtworkRollbackJournal, String> {
-        let is_v4 = data.len() >= ARTWORK_ROLLBACK_MAGIC.len()
+        let is_v5 = data.len() >= ARTWORK_ROLLBACK_MAGIC.len()
             && &data[..ARTWORK_ROLLBACK_MAGIC.len()] == ARTWORK_ROLLBACK_MAGIC;
+        let is_v4 = data.len() >= ARTWORK_ROLLBACK_MAGIC_V4.len()
+            && &data[..ARTWORK_ROLLBACK_MAGIC_V4.len()] == ARTWORK_ROLLBACK_MAGIC_V4;
         let is_v3 = data.len() >= ARTWORK_ROLLBACK_MAGIC_V3.len()
             && &data[..ARTWORK_ROLLBACK_MAGIC_V3.len()] == ARTWORK_ROLLBACK_MAGIC_V3;
         let is_v2 = data.len() >= ARTWORK_ROLLBACK_MAGIC_V2.len()
             && &data[..ARTWORK_ROLLBACK_MAGIC_V2.len()] == ARTWORK_ROLLBACK_MAGIC_V2;
         let is_v1 = data.len() >= ARTWORK_ROLLBACK_MAGIC_V1.len()
             && &data[..ARTWORK_ROLLBACK_MAGIC_V1.len()] == ARTWORK_ROLLBACK_MAGIC_V1;
-        if !is_v4 && !is_v3 && !is_v2 && !is_v1 {
+        if !is_v5 && !is_v4 && !is_v3 && !is_v2 && !is_v1 {
             return Err(format!("invalid FLAC artwork rollback journal '{}': bad magic", journal.display()));
         }
-        let mut pos = if is_v4 {
+        let mut pos = if is_v5 {
             ARTWORK_ROLLBACK_MAGIC.len()
+        } else if is_v4 {
+            ARTWORK_ROLLBACK_MAGIC_V4.len()
         } else if is_v3 {
             ARTWORK_ROLLBACK_MAGIC_V3.len()
         } else if is_v2 {
@@ -3744,7 +3918,7 @@ mod flac_metadata_writer {
             ARTWORK_ROLLBACK_MAGIC_V1.len()
         };
         let owner_pid = read_le_u64(data, &mut pos)?;
-        let (owner_start_ticks, owner_boot_id_hash, owner_process_token) = if is_v4 || is_v3 {
+        let (owner_start_ticks, owner_boot_id_hash, owner_process_token) = if is_v5 || is_v4 || is_v3 {
             (
                 read_le_u64(data, &mut pos)?,
                 read_le_u64(data, &mut pos)?,
@@ -3759,9 +3933,10 @@ mod flac_metadata_writer {
             boot_id_hash: owner_boot_id_hash,
             process_token: owner_process_token,
         };
-        let claim_token = if is_v4 { read_le_u64(data, &mut pos)? } else { 0 };
+        let claim_token = if is_v5 || is_v4 { read_le_u64(data, &mut pos)? } else { 0 };
         let (
             file_len,
+            stream_offset,
             audio_start,
             metadata_len,
             metadata_checksum,
@@ -3774,8 +3949,9 @@ mod flac_metadata_writer {
             mtime_nsec,
             ctime_sec,
             ctime_nsec,
-        ) = if is_v4 || is_v3 || is_v2 {
+        ) = if is_v5 || is_v4 || is_v3 || is_v2 {
             let file_len = read_le_u64(data, &mut pos)?;
+            let stream_offset = if is_v5 { read_le_u64(data, &mut pos)? } else { 0 };
             let audio_start = read_le_u64(data, &mut pos)?;
             let metadata_len = read_le_u64(data, &mut pos)?;
             let metadata_checksum = read_le_u64(data, &mut pos)?;
@@ -3790,6 +3966,7 @@ mod flac_metadata_writer {
             let ctime_nsec = read_le_i64(data, &mut pos)?;
             (
                 file_len,
+                stream_offset,
                 audio_start,
                 metadata_len,
                 metadata_checksum,
@@ -3808,6 +3985,7 @@ mod flac_metadata_writer {
             let metadata_len = read_le_u64(data, &mut pos)?;
             let metadata_checksum = read_le_u64(data, &mut pos)?;
             (
+                0,
                 0,
                 audio_start,
                 metadata_len,
@@ -3836,6 +4014,7 @@ mod flac_metadata_writer {
             owner,
             claim_token,
             file_len,
+            stream_offset,
             audio_start,
             metadata_len,
             metadata_checksum,
@@ -3857,6 +4036,14 @@ mod flac_metadata_writer {
         path: &Path,
         record: &ParsedArtworkRollbackJournal,
     ) -> Result<(), String> {
+        if record.stream_offset > crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN {
+            return Err(format!(
+                "invalid FLAC artwork rollback journal for '{}': saved stream offset {} exceeds the maximum supported ID3v2 prefix size {}",
+                path.display(),
+                record.stream_offset,
+                crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN,
+            ));
+        }
         let current_path = canonical_journal_path(path).to_string_lossy().as_bytes().to_vec();
         if !record.canonical_path.is_empty() && record.canonical_path != current_path {
             return Err(format!(
@@ -3864,12 +4051,26 @@ mod flac_metadata_writer {
                 path.display()
             ));
         }
-        if record.audio_start != 4 + record.metadata_len {
+        let expected_audio_start = record
+            .stream_offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(record.metadata_len))
+            .ok_or_else(|| format!("invalid FLAC artwork rollback journal for '{}': saved offsets overflow", path.display()))?;
+        if record.audio_start != expected_audio_start {
             return Err(format!(
-                "invalid FLAC artwork rollback journal for '{}': saved audio offset {} does not match metadata length {}",
+                "invalid FLAC artwork rollback journal for '{}': saved audio offset {} does not match stream offset {} plus metadata length {}",
                 path.display(),
                 record.audio_start,
+                record.stream_offset,
                 record.metadata_len
+            ));
+        }
+        if record.file_len != 0 && record.audio_start > record.file_len {
+            return Err(format!(
+                "invalid FLAC artwork rollback journal for '{}': saved audio offset {} exceeds file length {}",
+                path.display(),
+                record.audio_start,
+                record.file_len,
             ));
         }
         Ok(())
@@ -3979,6 +4180,14 @@ mod flac_metadata_writer {
 
         match read_flac_metadata(path) {
             Ok(current) => {
+                if current.stream_offset != record.stream_offset {
+                    return Err(format!(
+                        "refusing FLAC journal recovery for '{}': FLAC stream offset changed from {} to {}",
+                        path.display(),
+                        record.stream_offset,
+                        current.stream_offset,
+                    ));
+                }
                 let current_len = current.raw_metadata_region.len() as u64;
                 let current_checksum = checksum64(&current.raw_metadata_region);
                 if current_len == record.metadata_len && current_checksum == record.metadata_checksum {
@@ -4011,13 +4220,14 @@ mod flac_metadata_writer {
             }
         }
 
-        overwrite_metadata_region(path, &record.raw_metadata_region)?;
+        overwrite_metadata_region(path, record.stream_offset, &record.raw_metadata_region)?;
         remove_metadata_journal(path)?;
         Ok(MetadataJournalRecovery::RecoveredOrCleaned)
     }
 
     struct ParsedMetadataJournal {
         file_len: u64,
+        stream_offset: u64,
         audio_start: u64,
         metadata_len: u64,
         metadata_checksum: u64,
@@ -4039,15 +4249,18 @@ mod flac_metadata_writer {
     }
 
     fn parse_metadata_journal(journal: &Path, data: &[u8]) -> Result<ParsedMetadataJournal, String> {
-        let is_v5 = data.len() >= JOURNAL_MAGIC.len() && &data[..JOURNAL_MAGIC.len()] == JOURNAL_MAGIC;
+        let is_v6 = data.len() >= JOURNAL_MAGIC.len() && &data[..JOURNAL_MAGIC.len()] == JOURNAL_MAGIC;
+        let is_v5 = data.len() >= JOURNAL_MAGIC_V5.len() && &data[..JOURNAL_MAGIC_V5.len()] == JOURNAL_MAGIC_V5;
         let is_v4 = data.len() >= JOURNAL_MAGIC_V4.len() && &data[..JOURNAL_MAGIC_V4.len()] == JOURNAL_MAGIC_V4;
         let is_v3 = data.len() >= JOURNAL_MAGIC_V3.len() && &data[..JOURNAL_MAGIC_V3.len()] == JOURNAL_MAGIC_V3;
         let is_v2 = data.len() >= JOURNAL_MAGIC_V2.len() && &data[..JOURNAL_MAGIC_V2.len()] == JOURNAL_MAGIC_V2;
-        if !is_v5 && !is_v4 && !is_v3 && !is_v2 {
+        if !is_v6 && !is_v5 && !is_v4 && !is_v3 && !is_v2 {
             return Err(format!("invalid FLAC metadata journal '{}': bad magic", journal.display()));
         }
-        let mut pos = if is_v5 {
+        let mut pos = if is_v6 {
             JOURNAL_MAGIC.len()
+        } else if is_v5 {
+            JOURNAL_MAGIC_V5.len()
         } else if is_v4 {
             JOURNAL_MAGIC_V4.len()
         } else if is_v3 {
@@ -4056,15 +4269,16 @@ mod flac_metadata_writer {
             JOURNAL_MAGIC_V2.len()
         };
         let file_len = read_le_u64(data, &mut pos)?;
+        let stream_offset = if is_v6 { read_le_u64(data, &mut pos)? } else { 0 };
         let audio_start = read_le_u64(data, &mut pos)?;
         let metadata_len = read_le_u64(data, &mut pos)?;
         let metadata_checksum = read_le_u64(data, &mut pos)?;
-        let (intended_metadata_len, intended_metadata_checksum) = if is_v5 || is_v4 || is_v3 {
+        let (intended_metadata_len, intended_metadata_checksum) = if is_v6 || is_v5 || is_v4 || is_v3 {
             (read_le_u64(data, &mut pos)?, read_le_u64(data, &mut pos)?)
         } else {
             (0, 0)
         };
-        let owner = if is_v5 || is_v4 {
+        let owner = if is_v6 || is_v5 || is_v4 {
             Some(OwnerProcessIdentity {
                 pid: read_le_u64(data, &mut pos)?,
                 start_ticks: read_le_u64(data, &mut pos)?,
@@ -4074,7 +4288,7 @@ mod flac_metadata_writer {
         } else {
             None
         };
-        let claim_token = if is_v5 { read_le_u64(data, &mut pos)? } else { 0 };
+        let claim_token = if is_v6 || is_v5 { read_le_u64(data, &mut pos)? } else { 0 };
         let dev = read_le_u64(data, &mut pos)?;
         let ino = read_le_u64(data, &mut pos)?;
         let path_len = read_le_u64(data, &mut pos)? as usize;
@@ -4088,6 +4302,7 @@ mod flac_metadata_writer {
         }
         Ok(ParsedMetadataJournal {
             file_len,
+            stream_offset,
             audio_start,
             metadata_len,
             metadata_checksum,
@@ -4103,6 +4318,14 @@ mod flac_metadata_writer {
     }
 
     fn validate_journal_target(path: &Path, record: &ParsedMetadataJournal) -> Result<(), String> {
+        if record.stream_offset > crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN {
+            return Err(format!(
+                "invalid FLAC metadata journal for '{}': saved stream offset {} exceeds the maximum supported ID3v2 prefix size {}",
+                path.display(),
+                record.stream_offset,
+                crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN,
+            ));
+        }
         let meta = std::fs::metadata(path)
             .map_err(|err| format!("stat FLAC before journal recovery '{}': {err}", path.display()))?;
         if meta.len() != record.file_len {
@@ -4127,12 +4350,26 @@ mod flac_metadata_writer {
                 path.display()
             ));
         }
-        if record.audio_start != 4 + record.metadata_len {
+        let expected_audio_start = record
+            .stream_offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(record.metadata_len))
+            .ok_or_else(|| format!("invalid FLAC metadata journal for '{}': saved offsets overflow", path.display()))?;
+        if record.audio_start != expected_audio_start {
             return Err(format!(
-                "invalid FLAC metadata journal for '{}': saved audio offset {} does not match metadata length {}",
+                "invalid FLAC metadata journal for '{}': saved audio offset {} does not match stream offset {} plus metadata length {}",
                 path.display(),
                 record.audio_start,
+                record.stream_offset,
                 record.metadata_len
+            ));
+        }
+        if record.audio_start > record.file_len {
+            return Err(format!(
+                "invalid FLAC metadata journal for '{}': saved audio offset {} exceeds file length {}",
+                path.display(),
+                record.audio_start,
+                record.file_len,
             ));
         }
         Ok(())
@@ -4867,7 +5104,7 @@ mod flac_metadata_writer {
                     .write(true)
                     .open(path)
                     .map_err(|err| format!("open FLAC kill-point fixture '{}': {err}", path.display()))?;
-                file.seek(SeekFrom::Start(4))
+                file.seek(SeekFrom::Start(metadata.stream_offset + 4))
                     .map_err(|err| format!("seek FLAC kill-point fixture '{}': {err}", path.display()))?;
                 file.write_all(&[0x7f, 0xff, 0xff, 0xff])
                     .map_err(|err| format!("write FLAC partial kill-point fixture '{}': {err}", path.display()))?;
@@ -4876,7 +5113,7 @@ mod flac_metadata_writer {
                 Ok(())
             }
             TestInPlaceKillPoint::AfterSyncedOverwriteBeforeJournalRemoval => {
-                overwrite_metadata_region(path, &encoded)
+                overwrite_metadata_region(path, metadata.stream_offset, &encoded)
             }
         }
     }
@@ -4913,7 +5150,7 @@ mod flac_metadata_writer {
             .write(true)
             .open(path)
             .map_err(|err| format!("open FLAC wrong-offset fixture '{}': {err}", path.display()))?;
-        file.seek(SeekFrom::Start(4))
+        file.seek(SeekFrom::Start(metadata.stream_offset + 4))
             .map_err(|err| format!("seek FLAC wrong-offset fixture '{}': {err}", path.display()))?;
         file.write_all(&[0x80 | BLOCK_STREAMINFO, 0x00, 0x00, 0x22])
             .map_err(|err| format!("write FLAC wrong-offset fixture '{}': {err}", path.display()))?;
@@ -4959,7 +5196,7 @@ mod flac_metadata_writer {
         let mut replacement = build_vorbis_comment_replacement(&metadata, changes)?
             .ok_or_else(|| "test forced-rewrite change set was already satisfied".to_string())?;
         append_padding(&mut replacement, REWRITE_PADDING_BYTES)?;
-        stream_rewrite(path, metadata.audio_start, &replacement, None).map(|_| ())
+        stream_rewrite(path, metadata.stream_offset, metadata.audio_start, &replacement, None).map(|_| ())
     }
 
     #[cfg(test)]
@@ -5044,7 +5281,57 @@ mod flac_metadata_writer {
             replacement.insert(1, replacement_comment);
         }
         append_padding(&mut replacement, REWRITE_PADDING_BYTES)?;
-        stream_rewrite(path, metadata.audio_start, &replacement, None).map(|_| ())
+        stream_rewrite(path, metadata.stream_offset, metadata.audio_start, &replacement, None).map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_downgrade_metadata_journal_to_v5(path: &Path) -> Result<(), String> {
+        let journal = journal_path(path);
+        let data = std::fs::read(&journal)
+            .map_err(|err| format!("read current metadata journal '{}': {err}", journal.display()))?;
+        if data.len() < JOURNAL_MAGIC.len() + 16 || !data.starts_with(JOURNAL_MAGIC) {
+            return Err(format!("metadata journal '{}' is not current v6 format", journal.display()));
+        }
+        let mut downgraded = Vec::with_capacity(data.len() - 8);
+        downgraded.extend_from_slice(JOURNAL_MAGIC_V5);
+        let fields = &data[JOURNAL_MAGIC.len()..];
+        downgraded.extend_from_slice(&fields[..8]);
+        downgraded.extend_from_slice(&fields[16..]);
+        std::fs::write(&journal, downgraded)
+            .map_err(|err| format!("write v5 metadata journal '{}': {err}", journal.display()))?;
+        std::fs::File::open(&journal)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("sync v5 metadata journal '{}': {err}", journal.display()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_downgrade_artwork_rollback_journal_to_v4(path: &Path) -> Result<(), String> {
+        let journal = artwork_rollback_journal_path(path);
+        let data = std::fs::read(&journal)
+            .map_err(|err| format!("read current artwork rollback journal '{}': {err}", journal.display()))?;
+        const PREFIX_FIELDS_BEFORE_STREAM_OFFSET: usize = 6 * std::mem::size_of::<u64>();
+        let minimum_len = ARTWORK_ROLLBACK_MAGIC
+            .len()
+            .saturating_add(PREFIX_FIELDS_BEFORE_STREAM_OFFSET)
+            .saturating_add(std::mem::size_of::<u64>());
+        if data.len() < minimum_len || !data.starts_with(ARTWORK_ROLLBACK_MAGIC) {
+            return Err(format!(
+                "artwork rollback journal '{}' is not current v5 format",
+                journal.display(),
+            ));
+        }
+        let fields = &data[ARTWORK_ROLLBACK_MAGIC.len()..];
+        let mut downgraded = Vec::with_capacity(data.len() - std::mem::size_of::<u64>());
+        downgraded.extend_from_slice(ARTWORK_ROLLBACK_MAGIC_V4);
+        downgraded.extend_from_slice(&fields[..PREFIX_FIELDS_BEFORE_STREAM_OFFSET]);
+        downgraded.extend_from_slice(
+            &fields[PREFIX_FIELDS_BEFORE_STREAM_OFFSET + std::mem::size_of::<u64>()..],
+        );
+        std::fs::write(&journal, downgraded)
+            .map_err(|err| format!("write v4 artwork rollback journal '{}': {err}", journal.display()))?;
+        std::fs::File::open(&journal)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("sync v4 artwork rollback journal '{}': {err}", journal.display()))
     }
 
     #[cfg(test)]
@@ -5081,6 +5368,11 @@ mod flac_metadata_writer {
         file.sync_all()
             .map_err(|err| format!("sync stale FLAC common write lock '{}': {err}", lock.display()))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_read_stream_offset(path: &Path) -> Result<u64, String> {
+        read_flac_metadata(path).map(|metadata| metadata.stream_offset)
     }
 
     #[cfg(test)]
@@ -7120,8 +7412,26 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
 pub fn read_all_tags_merged_with_metadata(
     paths: &[std::path::PathBuf],
 ) -> Result<MergedTagsAndMetadata, String> {
+    read_all_tags_merged_with_metadata_cancellable(paths, || false)
+}
+
+/// Copy-tags variant with cooperative cancellation between files and before
+/// each blocking tag read. A single in-progress parser call cannot be
+/// interrupted safely, but an obsolete request performs no subsequent reads.
+pub(crate) fn read_all_tags_merged_with_metadata_cancellable<F>(
+    paths: &[std::path::PathBuf],
+    cancelled: F,
+) -> Result<MergedTagsAndMetadata, String>
+where
+    F: Fn() -> bool,
+{
     use lofty::file::TaggedFileExt;
     use std::collections::HashMap;
+
+    const CANCELLED: &str = "Copy tags superseded by a newer request";
+    if cancelled() {
+        return Err(CANCELLED.to_string());
+    }
 
     let n = paths.len();
     if paths.is_empty() {
@@ -7133,6 +7443,9 @@ pub fn read_all_tags_merged_with_metadata(
     }
 
     if paths.len() == 1 {
+        if cancelled() {
+            return Err(CANCELLED.to_string());
+        }
         let path = &paths[0];
         if crate::dsf_tags::is_dsf(path) {
             return match crate::dsf_tags::read_with_warnings(path) {
@@ -7164,6 +7477,9 @@ pub fn read_all_tags_merged_with_metadata(
                 metadata_errors: vec![Some(MetadataReadIssue::filesystem(path, err))],
             });
         }
+        if cancelled() {
+            return Err(CANCELLED.to_string());
+        }
         let tagged = match lofty::read_from_path(path) {
             Ok(tagged) => tagged,
             Err(err) => {
@@ -7174,6 +7490,9 @@ pub fn read_all_tags_merged_with_metadata(
                 });
             }
         };
+        if cancelled() {
+            return Err(CANCELLED.to_string());
+        }
         let entries = read_all_tags_from_tagged_file(&tagged);
         let metadata = source_metadata_from_tags(path, tagged.tags(), false);
         return Ok(MergedTagsAndMetadata {
@@ -7196,6 +7515,9 @@ pub fn read_all_tags_merged_with_metadata(
     let mut key_map = HashMap::<String, KeyData>::new();
 
     for (file_idx, path) in paths.iter().enumerate() {
+        if cancelled() {
+            return Err(CANCELLED.to_string());
+        }
         if crate::dsf_tags::is_dsf(path) {
             match crate::dsf_tags::read_with_warnings(path) {
                 Ok(outcome) => {
@@ -7232,11 +7554,17 @@ pub fn read_all_tags_merged_with_metadata(
                     });
                 }
             }
+            if cancelled() {
+                return Err(CANCELLED.to_string());
+            }
             continue;
         }
         if let Err(err) = flac_metadata_writer::recover_before_read(path) {
             metadata_errors[file_idx] = Some(MetadataReadIssue::filesystem(path, err));
             continue;
+        }
+        if cancelled() {
+            return Err(CANCELLED.to_string());
         }
         let tagged = match lofty::read_from_path(path) {
             Ok(tagged) => tagged,
@@ -7245,6 +7573,9 @@ pub fn read_all_tags_merged_with_metadata(
                 continue;
             }
         };
+        if cancelled() {
+            return Err(CANCELLED.to_string());
+        }
         metadata[file_idx] = source_metadata_from_tags(path, tagged.tags(), false);
         let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
             continue;
@@ -7310,6 +7641,9 @@ pub fn read_all_tags_merged_with_metadata(
     }
     sort_entries_standard_first(&mut entries);
 
+    if cancelled() {
+        return Err(CANCELLED.to_string());
+    }
     Ok(MergedTagsAndMetadata {
         entries,
         metadata,
@@ -12656,10 +12990,36 @@ mod tests {
             .write(true)
             .open(path)
             .expect("open FLAC for metadata corruption");
-        file.seek(SeekFrom::Start(4)).expect("seek metadata header");
+        let stream_offset = flac_metadata_writer::test_read_stream_offset(path)
+            .expect("read FLAC stream offset before corruption");
+        file.seek(SeekFrom::Start(stream_offset + 4))
+            .expect("seek metadata header");
         file.write_all(&[0x7f, 0xff, 0xff, 0xff])
             .expect("write corrupt metadata header");
         file.sync_data().expect("sync corrupt metadata header");
+    }
+
+    fn id3v2_syncsafe(value: u32) -> [u8; 4] {
+        assert!(value < (1 << 28));
+        [
+            ((value >> 21) & 0x7f) as u8,
+            ((value >> 14) & 0x7f) as u8,
+            ((value >> 7) & 0x7f) as u8,
+            (value & 0x7f) as u8,
+        ]
+    }
+
+    fn prepend_id3v23_prefix(path: &std::path::Path, payload_len: u32) -> Vec<u8> {
+        let original = std::fs::read(path).expect("read FLAC before prefixing");
+        let size = id3v2_syncsafe(payload_len);
+        let mut prefix = vec![
+            b'I', b'D', b'3', 3, 0, 0x80, size[0], size[1], size[2], size[3],
+        ];
+        prefix.extend((0..payload_len).map(|idx| (idx % 251) as u8));
+        let mut prefixed = prefix.clone();
+        prefixed.extend_from_slice(&original);
+        std::fs::write(path, prefixed).expect("write ID3v2-prefixed FLAC");
+        prefix
     }
 
     fn write_synthetic_flac_with_blocks(
@@ -13029,6 +13389,149 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read artwork-layout FLAC");
         assert_eq!(&bytes[audio_start_after as usize..], audio.as_slice());
         assert!(!crate::db::Database::backup_path_for(&path).exists());
+    }
+
+    #[test]
+    fn id3v23_prefixed_flac_native_in_place_and_overflow_writes_preserve_prefix_and_audio() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let padded = temp.path().join("prefixed-padded.flac");
+        let padded_audio = write_synthetic_flac(
+            &padded,
+            &[("TITLE", "Old"), ("ARTIST", "The Band")],
+            8 * 1024,
+            128 * 1024,
+        );
+        let padded_prefix = prepend_id3v23_prefix(&padded, 4_633);
+        let padded_audio_start_before =
+            flac_metadata_writer::test_read_audio_start(&padded).expect("padded audio start");
+        assert_eq!(
+            flac_metadata_writer::test_read_stream_offset(&padded).expect("padded stream offset"),
+            padded_prefix.len() as u64,
+        );
+        write_all_tags(
+            &padded,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("Updated in place".to_string()))],
+        )
+        .expect("ID3-prefixed in-place FLAC tag write");
+        let padded_after = std::fs::read(&padded).expect("read padded after write");
+        assert_eq!(&padded_after[..padded_prefix.len()], padded_prefix.as_slice());
+        let padded_audio_start_after =
+            flac_metadata_writer::test_read_audio_start(&padded).expect("padded audio start after");
+        assert_eq!(padded_audio_start_before, padded_audio_start_after);
+        assert_eq!(
+            &padded_after[padded_audio_start_after as usize..],
+            padded_audio.as_slice(),
+        );
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&padded, "TITLE")
+                .expect("padded title readback"),
+            vec!["Updated in place".to_string()],
+        );
+
+        let overflow = temp.path().join("prefixed-overflow.flac");
+        let overflow_audio = write_synthetic_flac(&overflow, &[("TITLE", "Old")], 0, 256 * 1024);
+        let overflow_prefix = prepend_id3v23_prefix(&overflow, 4_710);
+        write_all_tags(
+            &overflow,
+            &[(
+                lofty::tag::ItemKey::TrackTitle,
+                Some("x".repeat(128 * 1024)),
+            )],
+        )
+        .expect("ID3-prefixed overflow FLAC tag write");
+        let overflow_after = std::fs::read(&overflow).expect("read overflow after write");
+        assert_eq!(&overflow_after[..overflow_prefix.len()], overflow_prefix.as_slice());
+        assert_eq!(
+            flac_metadata_writer::test_read_stream_offset(&overflow)
+                .expect("overflow stream offset"),
+            overflow_prefix.len() as u64,
+        );
+        let overflow_audio_start =
+            flac_metadata_writer::test_read_audio_start(&overflow).expect("overflow audio start");
+        assert_eq!(
+            &overflow_after[overflow_audio_start as usize..],
+            overflow_audio.as_slice(),
+        );
+    }
+
+    #[test]
+    fn id3v23_prefixed_flac_metadata_journal_recovers_at_recorded_stream_offset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("prefixed-journal.flac");
+        let _audio = write_synthetic_flac(&path, &[("TITLE", "Original")], 8 * 1024, 64 * 1024);
+        let prefix = prepend_id3v23_prefix(&path, 4_655);
+        let before = std::fs::read(&path).expect("read prefixed original");
+
+        flac_metadata_writer::test_simulate_in_place_kill_point(
+            &path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("Interrupted".to_string()))],
+            crate::tui::probe::flac_metadata_writer::TestInPlaceKillPoint::DuringPartialMetadataOverwrite,
+        )
+        .expect("construct prefixed stale journal");
+        assert!(flac_metadata_writer::test_journal_path(&path).exists());
+
+        recover_flac_metadata_before_read(&path).expect("recover prefixed metadata journal");
+        assert!(!flac_metadata_writer::test_journal_path(&path).exists());
+        let recovered = std::fs::read(&path).expect("read recovered prefixed FLAC");
+        assert_eq!(recovered, before);
+        assert_eq!(&recovered[..prefix.len()], prefix.as_slice());
+    }
+
+    #[test]
+    fn id3v23_prefixed_flac_artwork_rollback_recovers_at_recorded_stream_offset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("prefixed-artwork-journal.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Original")], 8 * 1024, 64 * 1024);
+        let prefix = prepend_id3v23_prefix(&path, 4_619);
+        let before = std::fs::read(&path).expect("read prefixed original");
+        let png = tiny_png();
+        let (snapshot, intended_metadata_region) = flac_metadata_writer::preview_picture_write(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            "image/png",
+            &png,
+        )
+        .expect("preview prefixed artwork write");
+        assert_eq!(snapshot.stream_offset, prefix.len() as u64);
+        let rollback = flac_metadata_writer::begin_artwork_rollback_journal_with_intended(
+            &path,
+            &snapshot,
+            &intended_metadata_region,
+        )
+        .expect("write prefixed artwork rollback journal");
+        flac_metadata_writer::test_mark_artwork_rollback_journal_stale(&path)
+            .expect("mark prefixed artwork rollback journal stale");
+        corrupt_synthetic_flac_metadata_header(&path);
+        let rollback_path = rollback.path.clone();
+        drop(rollback);
+
+        recover_flac_metadata_before_read(&path)
+            .expect("recover prefixed artwork rollback journal");
+        let recovered = std::fs::read(&path).expect("read recovered prefixed FLAC");
+        assert_eq!(recovered, before);
+        assert_eq!(&recovered[..prefix.len()], prefix.as_slice());
+        assert!(!rollback_path.exists());
+    }
+
+    #[test]
+    fn malformed_id3v2_prefix_is_refused_without_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("malformed-prefix.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
+        let original = std::fs::read(&path).expect("read direct FLAC");
+        let mut malformed = vec![b'I', b'D', b'3', 3, 0, 0, 0x80, 0, 0, 0];
+        malformed.extend_from_slice(&original);
+        std::fs::write(&path, &malformed).expect("write malformed prefixed FLAC");
+        let before = std::fs::read(&path).expect("read malformed fixture");
+
+        let error = write_all_tags(
+            &path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("Must not write".to_string()))],
+        )
+        .expect_err("malformed ID3v2 prefix must fail closed");
+        assert!(error.contains("syncsafe"), "unexpected refusal: {error}");
+        assert_eq!(std::fs::read(&path).expect("read refused fixture"), before);
     }
 
     #[test]
@@ -14692,6 +15195,56 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".tonepoet-flac-rewrite-")),
             "pre-commit revalidation failure must clean the rewrite temp file"
         );
+    }
+
+    #[test]
+    fn offsetless_v5_metadata_journal_remains_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("legacy-v5-journal.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
+        let before = std::fs::read(&path).expect("read original");
+        flac_metadata_writer::test_write_current_metadata_journal(&path)
+            .expect("write current journal");
+        flac_metadata_writer::test_downgrade_metadata_journal_to_v5(&path)
+            .expect("downgrade journal to v5");
+        corrupt_synthetic_flac_metadata_header(&path);
+
+        recover_flac_metadata_before_read(&path).expect("recover offsetless v5 journal");
+        assert_eq!(std::fs::read(&path).expect("read recovered"), before);
+        assert!(!flac_metadata_writer::test_journal_path(&path).exists());
+    }
+
+    #[test]
+    fn offsetless_v4_artwork_rollback_journal_remains_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("legacy-v4-artwork-journal.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
+        let before = std::fs::read(&path).expect("read original");
+        let png = tiny_png();
+        let (snapshot, intended_metadata_region) = flac_metadata_writer::preview_picture_write(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            "image/png",
+            &png,
+        )
+        .expect("preview artwork write");
+        let rollback = flac_metadata_writer::begin_artwork_rollback_journal_with_intended(
+            &path,
+            &snapshot,
+            &intended_metadata_region,
+        )
+        .expect("write current artwork journal");
+        flac_metadata_writer::test_downgrade_artwork_rollback_journal_to_v4(&path)
+            .expect("downgrade artwork journal to v4");
+        flac_metadata_writer::test_mark_artwork_rollback_journal_stale(&path)
+            .expect("mark legacy artwork journal stale");
+        corrupt_synthetic_flac_metadata_header(&path);
+        let rollback_path = rollback.path.clone();
+        drop(rollback);
+
+        recover_flac_metadata_before_read(&path).expect("recover offsetless v4 artwork journal");
+        assert_eq!(std::fs::read(&path).expect("read recovered"), before);
+        assert!(!rollback_path.exists());
     }
 
     #[test]
@@ -17303,5 +17856,20 @@ mod tolerant_dsf_editor_read_tests {
         assert_eq!(issue.kind, MetadataReadIssueKind::ContainerQuirk);
         assert!(issue.reason.contains("declared file size"));
         assert!(issue.reason.contains("metadata writes are blocked"));
+    }
+}
+
+#[cfg(test)]
+mod tag_copy_metadata_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellable_merged_tag_read_stops_before_touching_paths() {
+        let err = read_all_tags_merged_with_metadata_cancellable(
+            &[std::path::PathBuf::from("/path/must/not/be/read.flac")],
+            || true,
+        )
+        .expect_err("cancelled tag read must stop before I/O");
+        assert!(err.contains("superseded"));
     }
 }

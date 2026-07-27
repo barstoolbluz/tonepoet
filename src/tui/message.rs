@@ -151,6 +151,14 @@ pub enum AppMessage {
     FilesScanned { paths: Vec<std::path::PathBuf> },
     /// Status message to show in the status bar
     StatusMessage(String),
+    /// Completion of the single active session tag-clipboard worker. The
+    /// generation binds ownership so stale completions only drain the worker
+    /// slot and launch the latest coalesced request; they never publish data.
+    TagClipboardCopyComplete {
+        generation: u64,
+        source_paths: Vec<std::path::PathBuf>,
+        result: Result<(Vec<crate::tui::probe::TagEntry>, usize), String>,
+    },
     /// Progress from background explicit-action preview preparation.
     ActionsRunPreparationProgress {
         preparation_id: String,
