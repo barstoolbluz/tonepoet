@@ -4,6 +4,58 @@ use std::path::Path;
 
 use crate::convert::formats::AudioFormat;
 
+// One declarative authority drives both extension classification and every
+// feature that needs to enumerate supported audio suffixes. Adding an alias
+// here changes `classify_file`, CUE admission, and the transfer picker together.
+macro_rules! supported_audio_extension_table {
+    ($consumer:ident) => {
+        $consumer! {
+            "flac" => AudioFormat::Flac,
+            "wav" => AudioFormat::Wav,
+            "wave" => AudioFormat::Wav,
+            "w64" => AudioFormat::Wav,
+            "rf64" => AudioFormat::Wav,
+            "bwf" => AudioFormat::Wav,
+            "aiff" => AudioFormat::Aiff,
+            "aif" => AudioFormat::Aiff,
+            "aifc" => AudioFormat::Aiff,
+            "wv" => AudioFormat::WavPack,
+            "ape" => AudioFormat::Ape,
+            "dsf" => AudioFormat::Dsf,
+            "dff" => AudioFormat::Dff,
+            "shn" => AudioFormat::Shorten,
+            "ogg" => AudioFormat::Ogg,
+            "oga" => AudioFormat::Ogg,
+            "tta" => AudioFormat::Tta,
+            "mp3" => AudioFormat::Mp3,
+            "m4a" => AudioFormat::Aac,
+            "mp4" => AudioFormat::Aac,
+            "m4b" => AudioFormat::Aac,
+            "m4r" => AudioFormat::Aac,
+            "aac" => AudioFormat::Aac,
+            "alac" => AudioFormat::Alac,
+            "caf" => AudioFormat::Alac,
+            "opus" => AudioFormat::Opus,
+            // Documented input-only formats: CUE FILE references to these must
+            // resolve as audio even though they are not output formats.
+            "dts" => AudioFormat::Dts,
+            "ac3" => AudioFormat::Ac3,
+        }
+    };
+}
+
+macro_rules! audio_extension_slice {
+    ($($extension:literal => $format:expr,)*) => {
+        &[$($extension),*]
+    };
+}
+
+/// Canonical extension-level audio coverage for enumeration-only consumers.
+/// The values are generated from the same table used by
+/// `audio_format_from_extension`; they cannot drift independently.
+pub const SUPPORTED_AUDIO_FILE_EXTENSIONS: &[&str] =
+    supported_audio_extension_table!(audio_extension_slice);
+
 /// Domain classification for a filesystem entry that may be shown or queued
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
@@ -91,6 +143,24 @@ pub fn is_audio_file_path(path: &Path) -> bool {
     matches!(classify_file(path), EntryKind::AudioFile(_))
 }
 
+/// Map one extension (without a leading dot) to the application's canonical
+/// extension-level audio format. Callers that need extension-only audio
+/// coverage must use this function or `is_audio_file_path` rather than
+/// maintaining a parallel alias table.
+pub fn audio_format_from_extension(extension: &str) -> Option<AudioFormat> {
+    macro_rules! classify_extension {
+        ($($candidate:literal => $format:expr,)*) => {{
+            let normalized = extension.to_ascii_lowercase();
+            match normalized.as_str() {
+                $($candidate => Some($format),)*
+                _ => None,
+            }
+        }};
+    }
+
+    supported_audio_extension_table!(classify_extension)
+}
+
 pub fn classify_file(path: &Path) -> EntryKind {
     // Check for double-extension archives first (e.g., .tar.gz).
     if is_tar_compound(path) {
@@ -102,28 +172,11 @@ pub fn classify_file(path: &Path) -> EntryKind {
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase());
 
+    if let Some(format) = ext.as_deref().and_then(audio_format_from_extension) {
+        return EntryKind::AudioFile(format);
+    }
+
     match ext.as_deref() {
-        Some("flac") => EntryKind::AudioFile(AudioFormat::Flac),
-        Some("wav") | Some("wave") | Some("w64") | Some("rf64") => {
-            EntryKind::AudioFile(AudioFormat::Wav)
-        }
-        Some("aiff") | Some("aif") | Some("aifc") => EntryKind::AudioFile(AudioFormat::Aiff),
-        Some("wv") => EntryKind::AudioFile(AudioFormat::WavPack),
-        Some("ape") => EntryKind::AudioFile(AudioFormat::Ape),
-        Some("dsf") => EntryKind::AudioFile(AudioFormat::Dsf),
-        Some("dff") => EntryKind::AudioFile(AudioFormat::Dff),
-        Some("shn") => EntryKind::AudioFile(AudioFormat::Shorten),
-        Some("ogg") | Some("oga") => EntryKind::AudioFile(AudioFormat::Ogg),
-        Some("tta") => EntryKind::AudioFile(AudioFormat::Tta),
-        Some("mp3") => EntryKind::AudioFile(AudioFormat::Mp3),
-        Some("m4a") | Some("mp4") | Some("aac") => EntryKind::AudioFile(AudioFormat::Aac),
-        Some("alac") => EntryKind::AudioFile(AudioFormat::Alac),
-        Some("opus") => EntryKind::AudioFile(AudioFormat::Opus),
-        // Documented input-only formats: CUE FILE references to these must
-        // resolve as audio (the unified split-CUE resolver classifies its
-        // direct targets, and dropping them regressed BIN-era DTS/AC3 rips).
-        Some("dts") => EntryKind::AudioFile(AudioFormat::Dts),
-        Some("ac3") => EntryKind::AudioFile(AudioFormat::Ac3),
         Some("7z") | Some("zip") | Some("rar") | Some("tar") | Some("iso") | Some("cab")
         | Some("dmg") | Some("tgz") | Some("tbz2") | Some("txz") => EntryKind::Archive,
         _ => EntryKind::OtherFile,
@@ -157,23 +210,21 @@ mod tests {
 
     #[test]
     fn classify_file_maps_supported_audio_extensions_case_insensitively() {
-        assert_eq!(classify_file(Path::new("track.FLAC")), EntryKind::AudioFile(AudioFormat::Flac));
-        assert_eq!(classify_file(Path::new("track.wave")), EntryKind::AudioFile(AudioFormat::Wav));
-        assert_eq!(classify_file(Path::new("track.W64")), EntryKind::AudioFile(AudioFormat::Wav));
-        assert_eq!(classify_file(Path::new("track.rf64")), EntryKind::AudioFile(AudioFormat::Wav));
-        assert_eq!(classify_file(Path::new("track.AIFC")), EntryKind::AudioFile(AudioFormat::Aiff));
-        assert_eq!(classify_file(Path::new("track.wv")), EntryKind::AudioFile(AudioFormat::WavPack));
-        assert_eq!(classify_file(Path::new("track.APE")), EntryKind::AudioFile(AudioFormat::Ape));
-        assert_eq!(classify_file(Path::new("track.dsf")), EntryKind::AudioFile(AudioFormat::Dsf));
-        assert_eq!(classify_file(Path::new("track.DFF")), EntryKind::AudioFile(AudioFormat::Dff));
-        assert_eq!(classify_file(Path::new("track.SHN")), EntryKind::AudioFile(AudioFormat::Shorten));
-        assert_eq!(classify_file(Path::new("track.ogg")), EntryKind::AudioFile(AudioFormat::Ogg));
-        assert_eq!(classify_file(Path::new("track.OGA")), EntryKind::AudioFile(AudioFormat::Ogg));
-        assert_eq!(classify_file(Path::new("track.TTA")), EntryKind::AudioFile(AudioFormat::Tta));
-        assert_eq!(classify_file(Path::new("track.MP3")), EntryKind::AudioFile(AudioFormat::Mp3));
-        assert_eq!(classify_file(Path::new("track.m4a")), EntryKind::AudioFile(AudioFormat::Aac));
-        assert_eq!(classify_file(Path::new("track.ALAC")), EntryKind::AudioFile(AudioFormat::Alac));
-        assert_eq!(classify_file(Path::new("track.OPUS")), EntryKind::AudioFile(AudioFormat::Opus));
+        let mut seen = std::collections::BTreeSet::new();
+        for extension in SUPPORTED_AUDIO_FILE_EXTENSIONS {
+            assert!(seen.insert(*extension), "duplicate canonical extension: {extension}");
+            assert_eq!(extension.to_ascii_lowercase(), *extension);
+            let path = std::path::PathBuf::from(format!(
+                "track.{}",
+                extension.to_ascii_uppercase()
+            ));
+            assert!(
+                matches!(classify_file(&path), EntryKind::AudioFile(_)),
+                "canonical extension must classify as audio: {}",
+                path.display()
+            );
+            assert!(is_audio_file_path(&path));
+        }
     }
 
     #[test]

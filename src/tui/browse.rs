@@ -2280,17 +2280,62 @@ pub(crate) enum PendingTagTransferSource {
     Roots(Vec<PathBuf>),
     EditorSnapshot {
         entries: Vec<crate::tui::probe::TagEntry>,
-        source_count: usize,
+        dimension: crate::tui::tag_interchange::TransferDimension,
     },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PendingTagTransferTarget {
+    Roots(Vec<PathBuf>),
+    Classified(crate::tui::tag_interchange::TransferCarrier),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTagTransfer {
     pub generation: u64,
     pub source: PendingTagTransferSource,
-    pub target_roots: Vec<PathBuf>,
+    pub target: PendingTagTransferTarget,
     pub scope: super::app::TagTransferScope,
     pub verification: tui_file_picker::VerificationMode,
+    pub require_browse_confirmation: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedTagTransfer {
+    pub generation: u64,
+    pub source_entries: Vec<crate::tui::probe::TagEntry>,
+    pub source_dimension: crate::tui::tag_interchange::TransferDimension,
+    pub source_carrier: String,
+    pub target: crate::tui::tag_interchange::TransferCarrier,
+    pub scope: super::app::TagTransferScope,
+    pub verification: tui_file_picker::VerificationMode,
+    pub field_count: usize,
+}
+
+impl PreparedTagTransfer {
+    pub fn confirmation_prompt(&self) -> String {
+        match &self.target {
+            crate::tui::tag_interchange::TransferCarrier::Files { paths } => format!(
+                "Write {} field{} to {} file{}?",
+                self.field_count,
+                if self.field_count == 1 { "" } else { "s" },
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" },
+            ),
+            crate::tui::tag_interchange::TransferCarrier::SidecarCue { sheet, .. } => format!(
+                "Write {} field{} to sidecar CUE ({} tracks)?",
+                self.field_count,
+                if self.field_count == 1 { "" } else { "s" },
+                sheet.tracks.len(),
+            ),
+            crate::tui::tag_interchange::TransferCarrier::EmbeddedCue { sheet, .. } => format!(
+                "Write {} field{} to embedded CUE ({} tracks)?",
+                self.field_count,
+                if self.field_count == 1 { "" } else { "s" },
+                sheet.tracks.len(),
+            ),
+        }
+    }
 }
 
 /// State for the browse screen
@@ -11937,6 +11982,74 @@ mod tests {
             identity.modified,
         );
         (dir, path, entry, identity, mtime_unix)
+    }
+
+    fn transfer_test_sheet(track_count: usize) -> crate::convert::cue_parser::CueSheet {
+        crate::convert::cue_parser::CueSheet {
+            tracks: (0..track_count)
+                .map(|index| crate::convert::cue_parser::CueTrack {
+                    number: (index + 1) as u32,
+                    ..crate::convert::cue_parser::CueTrack::default()
+                })
+                .collect(),
+            ..crate::convert::cue_parser::CueSheet::default()
+        }
+    }
+
+    fn prepared_transfer_for_prompt(
+        field_count: usize,
+        target: crate::tui::tag_interchange::TransferCarrier,
+    ) -> PreparedTagTransfer {
+        PreparedTagTransfer {
+            generation: 1,
+            source_entries: Vec::new(),
+            source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
+            source_carrier: "files".to_string(),
+            target,
+            scope: super::super::app::TagTransferScope::All,
+            verification: tui_file_picker::VerificationMode::Standard,
+            field_count,
+        }
+    }
+
+    #[test]
+    fn prepared_tag_transfer_confirmation_names_carrier_and_cardinality() {
+        let files = prepared_transfer_for_prompt(
+            4,
+            crate::tui::tag_interchange::TransferCarrier::Files {
+                paths: (0..12)
+                    .map(|index| PathBuf::from(format!("/music/{index:02}.flac")))
+                    .collect(),
+            },
+        );
+        assert_eq!(files.confirmation_prompt(), "Write 4 fields to 12 files?");
+
+        let sidecar = prepared_transfer_for_prompt(
+            1,
+            crate::tui::tag_interchange::TransferCarrier::SidecarCue {
+                cue_path: PathBuf::from("/music/album.cue"),
+                image_path: PathBuf::from("/music/album.flac"),
+                cue_text: String::new(),
+                sheet: transfer_test_sheet(12),
+            },
+        );
+        assert_eq!(
+            sidecar.confirmation_prompt(),
+            "Write 1 field to sidecar CUE (12 tracks)?"
+        );
+
+        let embedded = prepared_transfer_for_prompt(
+            4,
+            crate::tui::tag_interchange::TransferCarrier::EmbeddedCue {
+                image_path: PathBuf::from("/music/album.flac"),
+                cue_text: String::new(),
+                sheet: transfer_test_sheet(2),
+            },
+        );
+        assert_eq!(
+            embedded.confirmation_prompt(),
+            "Write 4 fields to embedded CUE (2 tracks)?"
+        );
     }
 
     #[test]

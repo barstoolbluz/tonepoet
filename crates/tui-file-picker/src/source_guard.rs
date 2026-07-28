@@ -8023,7 +8023,17 @@ mod verified_removal_tests {
         .expect("detach destination")
         .prepare_for_commit()
         .expect("bounded preflight");
-        let retained = fd_count().saturating_sub(baseline);
+        // The process-wide count includes descriptors sibling tests hold
+        // transiently; `prepared`'s own retention is constant, so re-sample
+        // until concurrent churn settles before judging it.
+        let mut retained = fd_count().saturating_sub(baseline);
+        for _ in 0..20 {
+            if retained <= 8 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            retained = fd_count().saturating_sub(baseline);
+        }
         assert!(
             retained <= 8,
             "prepared cleanup retained {retained} descriptors for a 1,501-entry tree",

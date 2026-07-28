@@ -1139,6 +1139,30 @@ mod flac_metadata_writer {
         changes: &[(lofty::tag::ItemKey, Option<String>)],
         cancel: Option<&super::MetadataWriteCancelFlag>,
     ) -> Result<FlacWriteReport, String> {
+        write_vorbis_comment_changes_conditionally(path, changes, None, cancel)
+    }
+
+    pub(super) fn write_vorbis_comment_changes_if_current_value_matches(
+        path: &Path,
+        changes: &[(lofty::tag::ItemKey, Option<String>)],
+        expected_key: &str,
+        expected_value: &str,
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+    ) -> Result<FlacWriteReport, String> {
+        write_vorbis_comment_changes_conditionally(
+            path,
+            changes,
+            Some((expected_key, expected_value)),
+            cancel,
+        )
+    }
+
+    fn write_vorbis_comment_changes_conditionally(
+        path: &Path,
+        changes: &[(lofty::tag::ItemKey, Option<String>)],
+        expected_current: Option<(&str, &str)>,
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+    ) -> Result<FlacWriteReport, String> {
         if changes.is_empty() {
             return Ok(FlacWriteReport::clean());
         }
@@ -1148,6 +1172,14 @@ mod flac_metadata_writer {
         recover_artwork_rollback_journal_before_native_write(path, "tag write")?;
         reject_hardlinked_native_write(path, "tag write")?;
         let metadata = read_flac_metadata(path)?;
+        if let Some((expected_key, expected_value)) = expected_current {
+            require_exact_vorbis_comment_value(
+                &metadata,
+                expected_key,
+                expected_value,
+                path,
+            )?;
+        }
         let Some(replacement) = build_vorbis_comment_replacement(&metadata, changes)? else {
             let mut report = FlacWriteReport::clean();
             if let Some(warning) = write_claim.release_with_warning(
@@ -1508,6 +1540,44 @@ mod flac_metadata_writer {
             "invalid FLAC '{}': metadata block chain did not terminate",
             path.display()
         ))
+    }
+
+    fn require_exact_vorbis_comment_value(
+        metadata: &FlacMetadata,
+        expected_key: &str,
+        expected_value: &str,
+        path: &Path,
+    ) -> Result<(), String> {
+        let Some(block) = metadata
+            .blocks
+            .iter()
+            .find(|block| block.block_type == BLOCK_VORBIS_COMMENT)
+        else {
+            return Err(format!(
+                "embedded CUE target '{}' changed before write: CUESHEET is absent; left unchanged",
+                path.display()
+            ));
+        };
+        let comments = parse_vorbis_comments(&block.data)?;
+        let values = comments
+            .comments
+            .iter()
+            .filter_map(|comment| match comment {
+                VorbisComment::Parsed { name, value }
+                    if name.eq_ignore_ascii_case(expected_key) =>
+                {
+                    Some(value.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if values.len() != 1 || values[0] != expected_value {
+            return Err(format!(
+                "embedded CUE target '{}' changed before write: expected the exact observed CUESHEET value; left unchanged",
+                path.display()
+            ));
+        }
+        Ok(())
     }
 
     fn build_vorbis_comment_replacement(
@@ -8294,6 +8364,46 @@ pub(crate) fn write_all_tags_for_transfer_at_verification(
         verification,
     )
     .map_err(MetadataWriteFailure::into_message)
+}
+
+/// Compare-and-write path for embedded FLAC CUESHEET transfer. The expected
+/// value is checked after the native writer has acquired its path-local write
+/// claim and read the metadata snapshot that will be mutated.
+pub(crate) fn write_embedded_cuesheet_for_transfer_at_verification(
+    path: &std::path::Path,
+    expected_cuesheet: &str,
+    replacement_cuesheet: String,
+    cancel: Option<&MetadataWriteCancelFlag>,
+    _verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, String> {
+    let changes = [(
+        lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+        Some(replacement_cuesheet),
+    )];
+    let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
+    check_metadata_write_cancel(
+        operation_cancel.as_ref(),
+        "before starting embedded CUESHEET compare-and-write",
+    )?;
+    let report = flac_metadata_writer::write_vorbis_comment_changes_if_current_value_matches(
+        path,
+        &changes,
+        "CUESHEET",
+        expected_cuesheet,
+        operation_cancel.as_ref(),
+    );
+    report
+        .map(|report| MetadataWriteCommitReport::from_warnings(report.durability_warnings))
+        .map_err(|message| {
+            if operation_cancel
+                .as_ref()
+                .is_some_and(|flag| flag.observation_count() > 0)
+            {
+                MetadataWriteFailure::Cancelled(message).into_message()
+            } else {
+                MetadataWriteFailure::Failed(message).into_message()
+            }
+        })
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // strong-mode compatibility seam; production routes through the _at_verification variant
@@ -16069,6 +16179,45 @@ mod tests {
         let audio_start_after = flac_metadata_writer::test_read_audio_start(&path).expect("audio start after");
         let bytes = std::fs::read(&path).expect("read committed rewrite");
         assert_eq!(&bytes[audio_start_after as usize..], audio.as_slice());
+    }
+
+    #[test]
+    fn embedded_cuesheet_transfer_compare_and_write_refuses_stale_observation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("embedded-cue-race.flac");
+        let observed = concat!(
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Observed One\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Observed Two\"\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let concurrent = observed.replace("Observed One", "Concurrent One");
+        let replacement = observed.replace("Observed One", "Requested One");
+        let _audio = write_synthetic_flac(
+            &path,
+            &[("CUESHEET", concurrent.as_str())],
+            4096,
+            64 * 1024,
+        );
+        let before = std::fs::read(&path).expect("read before compare-and-write");
+
+        let error = write_embedded_cuesheet_for_transfer_at_verification(
+            &path,
+            observed,
+            replacement,
+            None,
+            tui_file_picker::VerificationMode::Strong,
+        )
+        .expect_err("stale embedded CUESHEET observation must refuse");
+        assert!(error.contains("expected the exact observed CUESHEET value"));
+        assert_eq!(
+            std::fs::read(&path).expect("read after refused compare-and-write"),
+            before,
+            "the conditional writer must leave a concurrently changed FLAC byte-identical"
+        );
     }
 
     #[test]

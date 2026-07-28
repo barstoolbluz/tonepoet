@@ -109,11 +109,58 @@ pub(crate) fn expand_audio_paths_for_metadata_limited<F>(
 where
     F: Fn() -> bool,
 {
-    fn add_visit(visited: &mut usize, limit: usize) -> Result<(), String> {
+    expand_audio_paths_limited_for_operation(
+        paths,
+        max_visited,
+        max_audio_files,
+        cancelled,
+        "Copy tags",
+        "Copy tags superseded by a newer request",
+    )
+}
+
+/// Transfer-specific bounded expansion. It shares the exact traversal engine
+/// and limits with Copy tags while returning transfer-specific refusal and
+/// cancellation statuses.
+pub(crate) fn expand_audio_paths_for_transfer_limited<F>(
+    paths: &[PathBuf],
+    max_visited: usize,
+    max_audio_files: usize,
+    cancelled: F,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: Fn() -> bool,
+{
+    expand_audio_paths_limited_for_operation(
+        paths,
+        max_visited,
+        max_audio_files,
+        cancelled,
+        "Transfer tags",
+        "Transfer tags cancelled during bounded directory traversal",
+    )
+}
+
+fn expand_audio_paths_limited_for_operation<F>(
+    paths: &[PathBuf],
+    max_visited: usize,
+    max_audio_files: usize,
+    cancelled: F,
+    operation: &str,
+    cancellation_message: &str,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: Fn() -> bool,
+{
+    fn add_visit(
+        visited: &mut usize,
+        limit: usize,
+        operation: &str,
+    ) -> Result<(), String> {
         *visited = visited.saturating_add(1);
         if *visited > limit {
             Err(format!(
-                "Copy tags refused: selection traversal exceeds {limit} filesystem entries"
+                "{operation} refused: selection traversal exceeds {limit} filesystem entries"
             ))
         } else {
             Ok(())
@@ -125,6 +172,7 @@ where
         out: &mut Vec<PathBuf>,
         seen: &mut HashSet<PathBuf>,
         max_audio_files: usize,
+        operation: &str,
     ) -> Result<(), String> {
         if !matches!(
             crate::convert::classify::classify_file(&path),
@@ -135,7 +183,7 @@ where
         if seen.insert(queue_path_key(&path)) {
             if out.len() >= max_audio_files {
                 return Err(format!(
-                    "Copy tags refused: selection exceeds {max_audio_files} audio files"
+                    "{operation} refused: selection exceeds {max_audio_files} audio files"
                 ));
             }
             out.push(path);
@@ -144,7 +192,9 @@ where
     }
 
     if max_visited == 0 || max_audio_files == 0 {
-        return Err("Copy tags refused: expansion limits must be nonzero".to_string());
+        return Err(format!(
+            "{operation} refused: expansion limits must be nonzero"
+        ));
     }
 
     let mut out = Vec::new();
@@ -158,10 +208,10 @@ where
         let mut stack = vec![(root.clone(), false)];
         while let Some((path, counted)) = stack.pop() {
             if cancelled() {
-                return Err("Copy tags superseded by a newer request".to_string());
+                return Err(cancellation_message.to_string());
             }
             if !counted {
-                add_visit(&mut visited, max_visited)?;
+                add_visit(&mut visited, max_visited, operation)?;
             }
 
             if path.is_dir() {
@@ -172,9 +222,9 @@ where
                 let mut files = Vec::new();
                 for entry in read_dir.flatten() {
                     if cancelled() {
-                        return Err("Copy tags superseded by a newer request".to_string());
+                        return Err(cancellation_message.to_string());
                     }
-                    add_visit(&mut visited, max_visited)?;
+                    add_visit(&mut visited, max_visited, operation)?;
                     let Ok(file_type) = entry.file_type() else {
                         continue;
                     };
@@ -193,16 +243,16 @@ where
                 directories.sort();
                 for file in files {
                     if cancelled() {
-                        return Err("Copy tags superseded by a newer request".to_string());
+                        return Err(cancellation_message.to_string());
                     }
-                    push_audio(file, &mut out, &mut seen, max_audio_files)?;
+                    push_audio(file, &mut out, &mut seen, max_audio_files, operation)?;
                 }
                 // Reverse push preserves ascending depth-first traversal.
                 for directory in directories.into_iter().rev() {
                     stack.push((directory, true));
                 }
             } else {
-                push_audio(path, &mut out, &mut seen, max_audio_files)?;
+                push_audio(path, &mut out, &mut seen, max_audio_files, operation)?;
             }
         }
     }
@@ -20317,8 +20367,10 @@ mod round6_application_quit_lifecycle_tests {
                 editor_fingerprint,
                 scope: TagTransferScope::All,
                 source_entries: vec![album_entry("Unsaved Album", "Original Album")],
-                source_count: 1,
-                result: Ok(vec![std::env::temp_dir().join("late-target.flac")]),
+                source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
+                result: Ok(crate::tui::tag_interchange::TransferCarrier::Files {
+                    paths: vec![std::env::temp_dir().join("late-target.flac")],
+                }),
             },
             &tx,
         );

@@ -287,6 +287,7 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
         | AppMessage::BookmarkDetailStarted { .. }
         | AppMessage::BookmarkDetailLoaded { .. }
         | AppMessage::MetadataWriteComplete { .. }
+        | AppMessage::TagTransferPrepared { .. }
         | AppMessage::TagTransferComplete { .. }
         | AppMessage::OffsetCorrectionComplete { .. }
         | AppMessage::CtdbRepairComplete { .. } => true,
@@ -866,11 +867,29 @@ fn read_tag_blocks_file_bounded(
     super::tag_interchange::parse_field_blocks(&text).map_err(|error| error.to_string())
 }
 
+fn append_ignored_directory_disclosure(app: &mut AppState, ignored_directories: usize) {
+    if ignored_directories == 0 {
+        return;
+    }
+    let suffix = format!(
+        "({} director{} ignored)",
+        ignored_directories,
+        if ignored_directories == 1 { "y" } else { "ies" },
+    );
+    let current = app
+        .status_message
+        .as_ref()
+        .map(|(message, _)| message.clone())
+        .unwrap_or_else(|| "file picker: selection completed".to_string());
+    app.set_status(format!("{current} {suffix}"));
+}
+
 fn reduce_file_picker_complete(
     app: &mut AppState,
     session_id: u64,
     purpose: super::app::FilePickerPurpose,
     path: Option<std::path::PathBuf>,
+    paths: Vec<std::path::PathBuf>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     match purpose.clone() {
@@ -1006,11 +1025,16 @@ fn reduce_file_picker_complete(
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         return;
                     }
-                    let Some(selected) = path else {
+                    let selected_roots = if paths.is_empty() {
+                        path.into_iter().collect::<Vec<_>>()
+                    } else {
+                        paths
+                    };
+                    if selected_roots.is_empty() {
                         app.set_status("metadata editor: tag transfer cancelled");
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         return;
-                    };
+                    }
                     let editor_session = metadata_editor_session_guard(&state);
                     let editor_fingerprint =
                         super::tag_interchange::metadata_editor_transfer_fingerprint(&state);
@@ -1018,25 +1042,16 @@ fn reduce_file_picker_complete(
                         state.begin_tag_transfer_preparation();
                     match direction {
                         super::app::TagTransferDirection::To => {
-                            let (source_entries, source_count) =
+                            let (source_entries, source_dimension) =
                                 super::tag_interchange::metadata_editor_transfer_snapshot(&state);
                             let worker_tx = tx.clone();
-                            app.set_status("metadata editor: resolving tag-transfer targets...");
+                            app.set_status("metadata editor: resolving tag-transfer target carrier...");
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
-                                    super::command::expand_audio_paths_for_metadata_limited(
-                                        &[selected],
-                                        super::context_menu::TAG_CLIPBOARD_COPY_MAX_VISITED,
-                                        super::context_menu::TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
-                                        || prepare_cancel.is_cancelled(),
+                                    super::keybindings::classify_tag_transfer_roots(
+                                        &selected_roots,
+                                        &prepare_cancel,
                                     )
-                                    .and_then(|paths| {
-                                        if paths.is_empty() {
-                                            Err("Transfer tags: target contains no audio files".to_string())
-                                        } else {
-                                            Ok(paths)
-                                        }
-                                    })
                                 })
                                 .await
                                 .unwrap_or_else(|error| {
@@ -1049,7 +1064,7 @@ fn reduce_file_picker_complete(
                                         editor_fingerprint,
                                         scope,
                                         source_entries,
-                                        source_count,
+                                        source_dimension,
                                         result,
                                     })
                                     .await;
@@ -1057,45 +1072,33 @@ fn reduce_file_picker_complete(
                         }
                         super::app::TagTransferDirection::From => {
                             let worker_tx = tx.clone();
-                            app.set_status("metadata editor: reading tag-transfer source...");
+                            app.set_status("metadata editor: reading tag-transfer source carrier...");
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
-                                    let paths =
-                                        super::command::expand_audio_paths_for_metadata_limited(
-                                            &[selected],
-                                            super::context_menu::TAG_CLIPBOARD_COPY_MAX_VISITED,
-                                            super::context_menu::TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
-                                            || prepare_cancel.is_cancelled(),
-                                        )?;
-                                    if paths.is_empty() {
-                                        return Err(
-                                            "Transfer tags: source contains no audio files".to_string(),
-                                        );
-                                    }
-                                    let source_count = paths.len();
+                                    let carrier = super::keybindings::classify_tag_transfer_roots(
+                                        &selected_roots,
+                                        &prepare_cancel,
+                                    )?;
+                                    let dimension = carrier.dimension();
+                                    let carrier_label = carrier.label().to_string();
                                     let entries =
-                                        super::tag_interchange::read_transfer_source_entries(
-                                            &paths,
+                                        super::tag_interchange::read_transfer_carrier_entries(
+                                            &carrier,
                                             scope,
                                             &prepare_cancel,
                                         )?;
-                                    Ok((entries, source_count))
+                                    Ok((entries, dimension, carrier_label))
                                 })
                                 .await
                                 .unwrap_or_else(|error| {
                                     Err(format!("tag-transfer source worker failed: {error}"))
                                 });
-                                let (source_count, result) = match result {
-                                    Ok((entries, source_count)) => (source_count, Ok(entries)),
-                                    Err(error) => (0, Err(error)),
-                                };
                                 let _ = worker_tx
                                     .send(AppMessage::MetadataTagTransferSourcePrepared {
                                         request_id,
                                         editor_session,
                                         editor_fingerprint,
                                         scope,
-                                        source_count,
                                         result,
                                     })
                                     .await;
@@ -1155,13 +1158,18 @@ fn reduce_file_picker_complete(
                 app.set_status("file picker: ignored stale tag-transfer completion");
                 return;
             }
-            let Some(selected) = path else {
+            let selected_roots = if paths.is_empty() {
+                path.into_iter().collect::<Vec<_>>()
+            } else {
+                paths
+            };
+            if selected_roots.is_empty() {
                 app.set_status("Transfer tags cancelled");
                 return;
-            };
+            }
             let (source_roots, target_roots) = match direction {
-                super::app::TagTransferDirection::To => (fixed_roots, vec![selected]),
-                super::app::TagTransferDirection::From => (vec![selected], fixed_roots),
+                super::app::TagTransferDirection::To => (fixed_roots, selected_roots),
+                super::app::TagTransferDirection::From => (selected_roots, fixed_roots),
             };
             super::context_menu::start_tag_transfer(
                 app,
@@ -3611,6 +3619,14 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 result,
             );
         }
+        AppMessage::TagTransferPrepared { generation, result } => {
+            super::context_menu::handle_tag_transfer_prepared(
+                app,
+                tx,
+                generation,
+                result,
+            );
+        }
         AppMessage::TagTransferComplete { generation, result } => {
             super::context_menu::handle_tag_transfer_complete(
                 app,
@@ -3687,7 +3703,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             editor_fingerprint,
             scope,
             source_entries,
-            source_count,
+            source_dimension,
             result,
         } => {
             let Some(mut taken) = take_metadata_editor_with_restore_slot(app) else {
@@ -3715,42 +3731,61 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
 
             match result {
-                Ok(target_paths) => {
+                Ok(target) => {
+                    if let Err(error) = super::tag_interchange::preview_tag_transfer(
+                        &source_entries,
+                        source_dimension,
+                        &target,
+                        scope,
+                    ) {
+                        restore_taken_metadata_editor(app, taken);
+                        app.set_status(error);
+                        return;
+                    }
                     let edit_count = super::tag_interchange::metadata_editor_unsaved_edit_count(
                         &taken.state,
                     );
                     if edit_count > 0 {
-                        let target_count = target_paths.len();
+                        let target_label = target.label();
+                        let target_count = target.count();
+                        let target_unit = if target_label == "files" {
+                            if target_count == 1 { "file" } else { "files" }
+                        } else {
+                            if target_count == 1 { "track" } else { "tracks" }
+                        };
                         app.pending_metadata_editor = Some(taken.state);
                         app.active_overlay = ActiveOverlay::Confirmation {
                             message: format!(
-                                "Transfer {} unsaved edit{} to {} file{}?",
+                                "Transfer {} unsaved edit{} to {} ({} {})?",
                                 edit_count,
                                 if edit_count == 1 { "" } else { "s" },
+                                target_label,
                                 target_count,
-                                if target_count == 1 { "" } else { "s" },
+                                target_unit,
                             ),
                             action: super::app::ConfirmAction::MetadataTransferUnsaved {
                                 source_entries,
-                                source_count,
-                                target_paths,
+                                source_dimension,
+                                target,
                                 scope,
                                 edit_count,
                             },
                         };
                     } else {
-                        let target_count = target_paths.len();
+                        let target_label = target.label();
+                        let target_count = target.count();
                         super::context_menu::start_tag_transfer_from_editor_snapshot(
                             app,
                             source_entries,
-                            source_count,
-                            target_paths,
+                            source_dimension,
+                            target,
                             scope,
                             tx,
                         );
                         restore_taken_metadata_editor(app, taken);
                         app.set_status(format!(
-                            "Transfer tags: {} target{}; reading and writing metadata...",
+                            "Transfer tags: {} {} target position{}; writing metadata...",
+                            target_label,
                             target_count,
                             if target_count == 1 { "" } else { "s" }
                         ));
@@ -3767,7 +3802,6 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             editor_session,
             editor_fingerprint,
             scope,
-            source_count,
             result,
         } => {
             let Some(mut taken) = take_metadata_editor_with_restore_slot(app) else {
@@ -3795,22 +3829,41 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
 
             match result {
-                Ok(entries) => match super::tag_interchange::apply_transfer_entries_to_editor(
-                    &mut taken.state,
-                    &entries,
-                    source_count,
-                    scope,
-                ) {
-                    Ok(report) => {
-                        for warning in &report.cardinality_warnings {
-                            log::warn!("editor tag transfer: {warning}");
+                Ok((entries, source_dimension, source_carrier)) => {
+                    match super::tag_interchange::apply_transfer_entries_to_editor_with_dimension(
+                        &mut taken.state,
+                        &entries,
+                        source_dimension,
+                        scope,
+                    ) {
+                        Ok(report) => {
+                            for warning in &report.cardinality_warnings {
+                                log::warn!("editor tag transfer: {warning}");
+                            }
+                            let target_count =
+                                super::tag_interchange::metadata_editor_transfer_dimension(
+                                    &taken.state,
+                                )
+                                .count();
+                            let source_unit = if matches!(
+                                source_dimension,
+                                super::tag_interchange::TransferDimension::Tracks(_)
+                            ) {
+                                "tracks"
+                            } else {
+                                "files"
+                            };
+                            app.set_status(format!(
+                                "read {} {} from {}; {}",
+                                source_dimension.count(),
+                                source_unit,
+                                source_carrier,
+                                report.success_status(target_count),
+                            ));
                         }
-                        app.set_status(
-                            report.success_status(taken.state.active_surface().paths.len()),
-                        );
+                        Err(error) => app.set_status(error),
                     }
-                    Err(error) => app.set_status(error),
-                },
+                }
                 Err(error) => app.set_status(error),
             }
             restore_taken_metadata_editor(app, taken);
@@ -5142,8 +5195,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 ));
             }
         },
-        AppMessage::FilePickerComplete { session_id, purpose, path } => {
-            reduce_file_picker_complete(app, session_id, purpose, path, tx);
+        AppMessage::FilePickerComplete {
+            session_id,
+            purpose,
+            path,
+            paths,
+            ignored_directories,
+        } => {
+            reduce_file_picker_complete(app, session_id, purpose, path, paths, tx);
+            append_ignored_directory_disclosure(app, ignored_directories);
         }
         AppMessage::FileTaskProgress { session_id, update } => {
             reduce_file_task_progress(app, session_id, update, tx);
@@ -13536,8 +13596,10 @@ mod editor_tag_transfer_preparation_tests {
                 editor_fingerprint,
                 scope: TagTransferScope::All,
                 source_entries: vec![title("Stale outbound")],
-                source_count: 1,
-                result: Ok(vec![PathBuf::from("/tmp/stale-target.dsf")]),
+                source_dimension: super::super::tag_interchange::TransferDimension::Files(1),
+                result: Ok(super::super::tag_interchange::TransferCarrier::Files {
+                    paths: vec![PathBuf::from("/tmp/stale-target.dsf")],
+                }),
             },
             &tx(),
         );
@@ -13561,8 +13623,11 @@ mod editor_tag_transfer_preparation_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
-                source_count: 1,
-                result: Ok(vec![title("Current inbound")]),
+                result: Ok((
+                    vec![title("Current inbound")],
+                    super::super::tag_interchange::TransferDimension::Files(1),
+                    "files".to_string(),
+                )),
             },
             &tx(),
         );
@@ -13617,8 +13682,11 @@ mod editor_tag_transfer_preparation_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
-                source_count: 1,
-                result: Ok(vec![title("Applied once")]),
+                result: Ok((
+                    vec![title("Applied once")],
+                    super::super::tag_interchange::TransferDimension::Files(1),
+                    "files".to_string(),
+                )),
             },
             &tx(),
         );
@@ -13644,8 +13712,11 @@ mod editor_tag_transfer_preparation_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
-                source_count: 1,
-                result: Ok(vec![title("Duplicate delivery")]),
+                result: Ok((
+                    vec![title("Duplicate delivery")],
+                    super::super::tag_interchange::TransferDimension::Files(1),
+                    "files".to_string(),
+                )),
             },
             &tx(),
         );
@@ -13806,6 +13877,8 @@ mod artwork_file_picker_completion_tests {
                 session_id,
                 purpose: FilePickerPurpose::SelectArtwork { picture_type: picture_type.clone() },
                 path: None,
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &channel(),
         );
@@ -13838,6 +13911,8 @@ mod artwork_file_picker_completion_tests {
                 session_id,
                 purpose: FilePickerPurpose::SelectArtwork { picture_type: picture_type.clone() },
                 path: Some(image_path.clone()),
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &channel(),
         );
@@ -13874,6 +13949,8 @@ mod artwork_file_picker_completion_tests {
                 session_id: stale_session_id,
                 purpose: FilePickerPurpose::SelectArtwork { picture_type },
                 path: Some(stale_image),
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &channel(),
         );
@@ -14089,6 +14166,8 @@ mod copy_move_file_picker_flow_tests {
                 session_id,
                 purpose,
                 path: Some(dest.clone()),
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &tx(),
         );
@@ -14125,6 +14204,8 @@ mod copy_move_file_picker_flow_tests {
                 session_id,
                 purpose,
                 path: Some(dest.clone()),
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &tx(),
         );
@@ -14164,6 +14245,8 @@ mod copy_move_file_picker_flow_tests {
                 session_id,
                 purpose,
                 path: Some(nested_dest.clone()),
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &tx(),
         );
@@ -14205,6 +14288,8 @@ mod copy_move_file_picker_flow_tests {
                 session_id: active_session_id.saturating_add(1),
                 purpose,
                 path: Some(dest.clone()),
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &tx(),
         );
@@ -14243,6 +14328,8 @@ mod copy_move_file_picker_flow_tests {
                 session_id,
                 purpose,
                 path: Some(nested_dest.clone()),
+                paths: Vec::new(),
+                ignored_directories: 0,
             },
             &tx(),
         );

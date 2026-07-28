@@ -399,34 +399,7 @@ fn cue_decode_collect_audio_candidates(
 }
 
 fn cue_decode_has_audio_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "flac"
-                    | "wav"
-                    | "wave"
-                    | "aiff"
-                    | "aif"
-                    | "aifc"
-                    | "w64"
-                    | "rf64"
-                    | "ape"
-                    | "wv"
-                    | "tta"
-                    | "mp3"
-                    | "m4a"
-                    | "mp4"
-                    | "aac"
-                    | "ogg"
-                    | "opus"
-                    | "dsf"
-                    | "dff"
-                    | "shn"
-            )
-        })
-        .unwrap_or(false)
+    crate::convert::classify::is_audio_file_path(path)
 }
 
 fn is_cjk_or_kana(ch: char) -> bool {
@@ -450,6 +423,21 @@ pub enum CueSidecarWritebackOutcome {
     /// The source encoding could not represent the corrected text, so the
     /// sidecar was atomically rewritten as UTF-8 without a BOM.
     RewrittenUtf8Fallback { source_encoding: String },
+}
+
+/// Apply replacement CUE metadata to an in-memory CUESHEET template while
+/// preserving every structural and unsupported directive. This is the
+/// embedded-CUE counterpart to the sidecar byte-preserving engine.
+pub fn compose_cue_metadata_replacement(
+    template_cuesheet: &str,
+    replacement_cuesheet: &str,
+) -> Result<String, String> {
+    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet)?;
+    let desired = explicit_cue_metadata(replacement_cuesheet);
+    if desired.tracks.is_empty() {
+        return Err("replacement CUESHEET has no audio tracks".to_string());
+    }
+    rewrite_cue_metadata_text(template_cuesheet, &desired)
 }
 
 /// Rewrite only editable metadata fields in a sidecar CUE file using the
@@ -480,9 +468,31 @@ pub fn rewrite_cue_sidecar_metadata_from_cuesheet(
     cue_path: &Path,
     replacement_cuesheet: &str,
 ) -> Result<CueSidecarWritebackOutcome, String> {
+    rewrite_cue_sidecar_metadata_from_cuesheet_validated(
+        cue_path,
+        replacement_cuesheet,
+        |_raw, _decoded| Ok(()),
+    )
+}
+
+/// Rewrite CUE metadata only if `validate_snapshot` accepts the exact bytes
+/// read by this mutator. The validator therefore observes the same snapshot
+/// from which byte-preserving edits are composed, rather than a prior read by
+/// a caller. Immediately before the atomic replacement, the function also
+/// verifies that the path still contains those exact bytes and refuses to
+/// clobber a concurrent change.
+pub fn rewrite_cue_sidecar_metadata_from_cuesheet_validated<F>(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+    validate_snapshot: F,
+) -> Result<CueSidecarWritebackOutcome, String>
+where
+    F: FnOnce(&[u8], &str) -> Result<(), String>,
+{
     let raw = std::fs::read(cue_path)
         .map_err(|e| format!("failed to read sidecar CUE '{}': {}", cue_path.display(), e))?;
     let decoded = decode_cue_bytes_with_context_for_write(&raw, cue_path.parent())?;
+    validate_snapshot(&raw, &decoded.text)?;
     validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet)?;
     let desired = explicit_cue_metadata(replacement_cuesheet);
     if desired.tracks.is_empty() {
@@ -491,7 +501,10 @@ pub fn rewrite_cue_sidecar_metadata_from_cuesheet(
 
     let rewrite = rewrite_cue_metadata_preserving_bytes(&raw, &decoded, &desired)?;
     let (bytes, encoding_outcome) = match rewrite {
-        CueByteRewrite::Unchanged => return Ok(CueSidecarWritebackOutcome::Unchanged),
+        CueByteRewrite::Unchanged => {
+            ensure_sidecar_snapshot_unchanged(cue_path, &raw)?;
+            return Ok(CueSidecarWritebackOutcome::Unchanged);
+        }
         CueByteRewrite::Rewritten { bytes, outcome } => (bytes, outcome),
         CueByteRewrite::NeedsUtf8Fallback { rewritten_text, source_encoding } => (
             rewritten_text.into_bytes(),
@@ -508,7 +521,7 @@ pub fn rewrite_cue_sidecar_metadata_from_cuesheet(
         ));
     }
 
-    atomic_replace(cue_path, &bytes)?;
+    atomic_replace_if_unchanged(cue_path, &bytes, Some(&raw))?;
     Ok(encoding_outcome)
 }
 
@@ -520,6 +533,7 @@ struct ExplicitCueMetadata {
 
 #[derive(Debug, Clone, Default)]
 struct ExplicitCueScopeMetadata {
+    track_number: Option<u32>,
     title: Option<String>,
     performer: Option<String>,
     songwriter: Option<String>,
@@ -603,9 +617,12 @@ fn explicit_cue_metadata(text: &str) -> ExplicitCueMetadata {
         };
         let trimmed = line.trim();
 
-        if let Some((_num, is_audio)) = parse_track_header(trimmed) {
+        if let Some((number, is_audio)) = parse_track_header(trimmed) {
             if is_audio {
-                metadata.tracks.push(ExplicitCueScopeMetadata::default());
+                metadata.tracks.push(ExplicitCueScopeMetadata {
+                    track_number: Some(number),
+                    ..ExplicitCueScopeMetadata::default()
+                });
                 current_track = Some(metadata.tracks.len() - 1);
                 ignored_track_block = false;
             } else {
@@ -665,6 +682,7 @@ struct CueMetadataLayout {
 
 #[derive(Debug, Clone, Default)]
 struct CueScopeLayout {
+    track_number: Option<u32>,
     title: Option<usize>,
     performer: Option<usize>,
     songwriter: Option<usize>,
@@ -673,6 +691,52 @@ struct CueScopeLayout {
     catalog: Option<usize>,
     insert_after: Option<usize>,
     indent: Option<String>,
+}
+
+fn pair_cue_track_metadata<'a>(
+    layout_tracks: &'a [CueScopeLayout],
+    desired_tracks: &'a [ExplicitCueScopeMetadata],
+) -> Result<Vec<(&'a CueScopeLayout, &'a ExplicitCueScopeMetadata)>, String> {
+    if layout_tracks.len() != desired_tracks.len() {
+        return Err(format!(
+            "sidecar CUE has {} audio tracks but replacement CUESHEET has {}; sidecar left unchanged",
+            layout_tracks.len(),
+            desired_tracks.len()
+        ));
+    }
+
+    let mut desired_by_number = std::collections::BTreeMap::new();
+    for desired in desired_tracks {
+        let number = desired.track_number.ok_or_else(|| {
+            "replacement CUESHEET audio track has no track number; sidecar left unchanged"
+                .to_string()
+        })?;
+        if desired_by_number.insert(number, desired).is_some() {
+            return Err(format!(
+                "replacement CUESHEET has duplicate audio track number {number}; sidecar left unchanged"
+            ));
+        }
+    }
+
+    let mut seen_layout_numbers = std::collections::BTreeSet::new();
+    let mut paired = Vec::with_capacity(layout_tracks.len());
+    for layout in layout_tracks {
+        let number = layout.track_number.ok_or_else(|| {
+            "sidecar CUE audio track has no track number; sidecar left unchanged".to_string()
+        })?;
+        if !seen_layout_numbers.insert(number) {
+            return Err(format!(
+                "sidecar CUE has duplicate audio track number {number}; sidecar left unchanged"
+            ));
+        }
+        let desired = desired_by_number.get(&number).copied().ok_or_else(|| {
+            format!(
+                "sidecar CUE track geometry changed: replacement has no track {number}; sidecar left unchanged"
+            )
+        })?;
+        paired.push((layout, desired));
+    }
+    Ok(paired)
 }
 
 fn rewrite_cue_metadata_text(
@@ -702,7 +766,9 @@ fn rewrite_cue_metadata_text(
         true,
     )?;
 
-    for (track_layout, desired_track) in layout.tracks.iter().zip(desired.tracks.iter()) {
+    for (track_layout, desired_track) in
+        pair_cue_track_metadata(&layout.tracks, &desired.tracks)?
+    {
         let mut insertions = Vec::new();
         queue_scope_metadata_edits(
             &lines,
@@ -826,7 +892,9 @@ fn rewrite_cue_metadata_preserving_bytes(
         &mut need_utf8_fallback,
     )?;
 
-    for (track_layout, desired_track) in layout.tracks.iter().zip(desired.tracks.iter()) {
+    for (track_layout, desired_track) in
+        pair_cue_track_metadata(&layout.tracks, &desired.tracks)?
+    {
         let mut insertions = Vec::new();
         queue_scope_metadata_byte_edits(
             &raw_lines,
@@ -1548,9 +1616,10 @@ fn cue_metadata_layout(lines: &[CueTextLine]) -> CueMetadataLayout {
             layout.album_insert_at = idx;
         }
 
-        if let Some((_num, is_audio)) = parse_track_header(trimmed) {
+        if let Some((number, is_audio)) = parse_track_header(trimmed) {
             if is_audio {
                 layout.tracks.push(CueScopeLayout {
+                    track_number: Some(number),
                     insert_after: Some(idx),
                     indent: Some(child_indent_for_track_line(&line.body)),
                     ..Default::default()
@@ -1839,7 +1908,31 @@ fn encode_cue_text_for_write(
     }
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn ensure_sidecar_snapshot_unchanged(
+    path: &Path,
+    expected_original: &[u8],
+) -> Result<(), String> {
+    let current = std::fs::read(path).map_err(|e| {
+        format!(
+            "failed to re-read sidecar CUE '{}' before completing validated rewrite: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if current != expected_original {
+        return Err(format!(
+            "sidecar CUE '{}' changed while metadata was being prepared; left unchanged",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_replace_if_unchanged(
+    path: &Path,
+    bytes: &[u8],
+    expected_original: Option<&[u8]>,
+) -> Result<(), String> {
     use std::io::Write;
 
     let parent = path.parent().ok_or_else(|| {
@@ -1894,6 +1987,9 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
                 format!("failed to sync temporary sidecar CUE '{}': {}", temp_path.display(), e)
             })?;
             drop(file);
+            if let Some(expected_original) = expected_original {
+                ensure_sidecar_snapshot_unchanged(path, expected_original)?;
+            }
             std::fs::rename(&temp_path, path).map_err(|e| {
                 format!(
                     "failed to replace sidecar CUE '{}' atomically from '{}': {}",
@@ -2252,6 +2348,42 @@ pub fn parse_cue_timestamp(ts: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_sidecar_rewrite_refuses_a_change_after_snapshot_validation() {
+        let dir = unique_cue_parser_test_dir("sidecar_compare_and_rewrite");
+        let cue_path = dir.join("album.cue");
+        let original = concat!(
+            "TITLE \"Original\"\n",
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"One\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Two\"\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let concurrent = original.replace("TITLE \"Original\"", "TITLE \"Concurrent\"");
+        let replacement = original.replace("TITLE \"Original\"", "TITLE \"Requested\"");
+        std::fs::write(&cue_path, original).expect("write original cue");
+
+        let error = rewrite_cue_sidecar_metadata_from_cuesheet_validated(
+            &cue_path,
+            &replacement,
+            |_raw, _decoded| {
+                std::fs::write(&cue_path, &concurrent).expect("inject concurrent cue change");
+                Ok(())
+            },
+        )
+        .expect_err("the exact validated snapshot must still be current at commit");
+        assert!(error.contains("changed while metadata was being prepared"));
+        assert_eq!(
+            std::fs::read_to_string(&cue_path).expect("read concurrent cue"),
+            concurrent,
+            "a concurrent change must not be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn sidecar_writeback_rewrites_utf8_metadata_only_as_golden_bytes_and_is_idempotent() {
@@ -2890,6 +3022,102 @@ FILE "current.wav" WAVE
             "BOM-prefixed first line still yields album-level TITLE"
         );
         assert_eq!(sheet.tracks.len(), 1);
+    }
+
+    #[test]
+    fn embedded_metadata_composer_preserves_structure_unsupported_lines_and_is_idempotent() {
+        let template = concat!(
+            "REM COMMENT keep-me\r\n",
+            "CATALOG OLD-CAT\r\n",
+            "PERFORMER \"Old Album Artist\"\r\n",
+            "TITLE \"Old Album\"\r\n",
+            "FILE \"album.flac\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    FLAGS PRE\r\n",
+            "    SONGWRITER \"Keep Writer\"\r\n",
+            "    TITLE \"Old One\"\r\n",
+            "    INDEX 01 00:00:00\r\n",
+            "  TRACK 02 AUDIO\r\n",
+            "    TITLE \"Old Two\"\r\n",
+            "    ISRC USABC1234567\r\n",
+            "    INDEX 01 03:00:00\r\n",
+        );
+        let replacement = concat!(
+            "CATALOG NEW-CAT\n",
+            "PERFORMER \"New Album Artist\"\n",
+            "TITLE \"New Album\"\n",
+            "REM DATE \"1981\"\n",
+            "REM GENRE \"Rock\"\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"New One\"\n",
+            "    PERFORMER \"Artist One\"\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"New Two\"\n",
+            "    PERFORMER \"Artist Two\"\n",
+        );
+
+        let composed = compose_cue_metadata_replacement(template, replacement)
+            .expect("embedded composition");
+        assert!(composed.contains("REM COMMENT keep-me\r\n"));
+        assert!(composed.contains("FLAGS PRE\r\n"));
+        assert!(composed.contains("SONGWRITER \"Keep Writer\"\r\n"));
+        assert!(composed.contains("ISRC USABC1234567\r\n"));
+        assert!(composed.contains("INDEX 01 03:00:00\r\n"));
+        assert!(composed.contains("TITLE \"New Album\"\r\n"));
+        assert!(composed.contains("TITLE \"New One\"\r\n"));
+        assert!(composed.contains("PERFORMER \"Artist Two\"\r\n"));
+        assert_eq!(
+            compose_cue_metadata_replacement(&composed, replacement)
+                .expect("idempotent embedded composition"),
+            composed,
+        );
+    }
+
+    #[test]
+    fn metadata_rewriter_matches_tracks_by_number_when_declaration_order_differs() {
+        let template = concat!(
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Old Two\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Old One\"\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let replacement = concat!(
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"New One\"\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"New Two\"\n",
+        );
+
+        let composed = compose_cue_metadata_replacement(template, replacement)
+            .expect("track-number keyed composition");
+        assert!(composed.contains(
+            "TRACK 02 AUDIO\n    TITLE \"New Two\"\n    INDEX 01 00:00:00"
+        ));
+        assert!(composed.contains(
+            "TRACK 01 AUDIO\n    TITLE \"New One\"\n    INDEX 01 03:00:00"
+        ));
+    }
+
+    #[test]
+    fn embedded_metadata_composer_refuses_track_count_mismatch() {
+        let template = concat!(
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let replacement = concat!(
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Only One\"\n",
+        );
+        let error = compose_cue_metadata_replacement(template, replacement)
+            .expect_err("track-count mismatch must refuse");
+        assert!(error.contains("2 audio tracks"));
+        assert!(error.contains("replacement CUESHEET has 1"));
     }
 
 }

@@ -159,6 +159,12 @@ pub enum AppMessage {
         source_paths: Vec<std::path::PathBuf>,
         result: Result<(Vec<crate::tui::probe::TagEntry>, usize), String>,
     },
+    /// Classification and dry-run planning completed for a browse-side
+    /// transfer. No target has been written when this message is emitted.
+    TagTransferPrepared {
+        generation: u64,
+        result: Result<crate::tui::browse::PreparedTagTransfer, String>,
+    },
     /// Completion of the single active explicit tag-transfer worker.
     TagTransferComplete {
         generation: u64,
@@ -193,8 +199,8 @@ pub enum AppMessage {
         editor_fingerprint: u64,
         scope: crate::tui::app::TagTransferScope,
         source_entries: Vec<crate::tui::probe::TagEntry>,
-        source_count: usize,
-        result: Result<Vec<std::path::PathBuf>, String>,
+        source_dimension: crate::tui::tag_interchange::TransferDimension,
+        result: Result<crate::tui::tag_interchange::TransferCarrier, String>,
     },
     /// Bounded source expansion and metadata read for an inbound editor
     /// transfer. The editor fingerprint prevents a late completion from
@@ -204,8 +210,11 @@ pub enum AppMessage {
         editor_session: MetadataEditorSessionGuard,
         editor_fingerprint: u64,
         scope: crate::tui::app::TagTransferScope,
-        source_count: usize,
-        result: Result<Vec<crate::tui::probe::TagEntry>, String>,
+        result: Result<(
+            Vec<crate::tui::probe::TagEntry>,
+            crate::tui::tag_interchange::TransferDimension,
+            String,
+        ), String>,
     },
     /// Progress from background explicit-action preview preparation.
     ActionsRunPreparationProgress {
@@ -567,7 +576,15 @@ pub enum AppMessage {
     FilePickerComplete {
         session_id: u64,
         purpose: crate::tui::app::FilePickerPurpose,
+        /// Compatibility projection consumed by the eight non-transfer picker
+        /// purposes. It is always `paths.first().cloned()`.
         path: Option<std::path::PathBuf>,
+        /// Full deterministic selection. Only the two transfer purposes consume
+        /// multiple paths; all other purposes remain single-path.
+        paths: Vec<std::path::PathBuf>,
+        /// Marked directories filtered by explicit confirmation. The reducer
+        /// appends this disclosure to the purpose-specific completion status.
+        ignored_directories: usize,
     },
     /// Progress snapshot for a hosted long-running file task. The reusable
     /// progress state lives in `tui-file-picker`; Tonepoet only matches the

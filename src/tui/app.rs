@@ -2507,43 +2507,13 @@ fn compute_format_histogram(paths: &[PathBuf]) -> Vec<(AudioFormat, usize)> {
 /// Mappings pick the closest existing `AudioFormat` variant; some are
 /// best-effort (e.g. `.ogg` is typically Vorbis but could also be Opus
 /// or FLAC — we map to Opus as the most common modern case). Extensions
-/// without a reasonable represented histogram bucket (wma/tta/amr,
+/// without a reasonable represented histogram bucket (wma/amr,
 /// and other unsupported formats) return `None` and fall
 /// through to "(no recognised audio extensions)" if the whole batch is
 /// unrecognised.
 fn detect_format_from_extension(path: &std::path::Path) -> Option<AudioFormat> {
     let ext = path.extension().and_then(|e| e.to_str())?;
-    match ext.to_lowercase().as_str() {
-        // FLAC — lossless
-        "flac" => Some(AudioFormat::Flac),
-        // WAV family (includes Wave64 and RF64 >4GB variants)
-        "wav" | "w64" | "rf64" | "bwf" => Some(AudioFormat::Wav),
-        // AIFF / AIFF-C
-        "aiff" | "aif" | "aifc" => Some(AudioFormat::Aiff),
-        // WavPack
-        "wv" => Some(AudioFormat::WavPack),
-        // MP3
-        "mp3" => Some(AudioFormat::Mp3),
-        // AAC family (m4a, adts .aac, .mp4 audio)
-        "m4a" | "aac" | "mp4" | "m4b" | "m4r" => Some(AudioFormat::Aac),
-        // ALAC — typically carried in m4a but sometimes standalone
-        "alac" | "caf" => Some(AudioFormat::Alac),
-        // Opus (.opus is unambiguous). Generic Ogg containers are modeled
-        // separately as input-decodable source coverage so Browse, metadata,
-        // and queue paths agree on admissibility without exposing Ogg as an
-        // output codec.
-        "opus" => Some(AudioFormat::Opus),
-        "ogg" | "oga" => Some(AudioFormat::Ogg),
-        // DSD family. Keep this cheap extension path aligned with
-        // FormatDetector so batch histograms do not silently drop DSD-only
-        // selections.
-        "dsf" => Some(AudioFormat::Dsf),
-        "dff" => Some(AudioFormat::Dff),
-        "ape" => Some(AudioFormat::Ape),
-        "shn" => Some(AudioFormat::Shorten),
-        "tta" => Some(AudioFormat::Tta),
-        _ => None,
-    }
+    crate::convert::classify::audio_format_from_extension(ext)
 }
 
 #[cfg(test)]
@@ -10331,10 +10301,15 @@ pub enum ConfirmAction {
     /// the exact snapshot named by the prompt.
     MetadataTransferUnsaved {
         source_entries: Vec<crate::tui::probe::TagEntry>,
-        source_count: usize,
-        target_paths: Vec<PathBuf>,
+        source_dimension: crate::tui::tag_interchange::TransferDimension,
+        target: crate::tui::tag_interchange::TransferCarrier,
         scope: TagTransferScope,
         edit_count: usize,
+    },
+    /// Browse-side tag transfer prepared and dry-run planned before any
+    /// target mutation. Confirmation executes exactly this frozen snapshot.
+    BrowseTagTransfer {
+        prepared: crate::tui::browse::PreparedTagTransfer,
     },
     /// Close the metadata editor and discard unsaved changes after an
     /// explicit confirmation. The editor itself is parked in

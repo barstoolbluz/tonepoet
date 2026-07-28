@@ -6922,7 +6922,15 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             let session_id = session.session_id;
             let purpose = session.purpose.clone();
             let action = session.picker.handle_key(key);
-            if let Err(err) = send_file_picker_completion(app, tx, session_id, purpose, action) {
+            let ignored_directories = session.picker.take_last_selection_ignored_directories();
+            if let Err(err) = send_file_picker_completion(
+                app,
+                tx,
+                session_id,
+                purpose,
+                ignored_directories,
+                action,
+            ) {
                 app.set_status(format!("file picker: failed to queue completion: {err}"));
             }
             app.active_overlay = ActiveOverlay::FilePicker(session);
@@ -10801,7 +10809,7 @@ pub(crate) fn metadata_editor_open_tag_transfer_picker(
         app,
         tui_file_picker::FilePickerConfig {
             start_dir,
-            filter: tui_file_picker::FilePickerFilter::Audio,
+            filter: super::tag_interchange::tag_transfer_picker_filter(),
             title: title.to_string(),
             theme: file_picker_theme_from_theme(&app.theme),
             selection_mode: tui_file_picker::FilePickerSelectionMode::FilesOrDirectories,
@@ -11868,7 +11876,15 @@ fn handle_metadata_file_picker_key(
     let session_id = session.session_id;
     let purpose = session.purpose.clone();
     let action = session.picker.handle_key(key);
-    if let Err(err) = send_file_picker_completion(app, tx, session_id, purpose, action) {
+    let ignored_directories = session.picker.take_last_selection_ignored_directories();
+    if let Err(err) = send_file_picker_completion(
+        app,
+        tx,
+        session_id,
+        purpose,
+        ignored_directories,
+        action,
+    ) {
         app.set_status(format!("file picker: failed to queue completion: {err}"));
     }
 }
@@ -11878,25 +11894,39 @@ fn send_file_picker_completion(
     tx: &mpsc::Sender<AppMessage>,
     session_id: u64,
     purpose: super::app::FilePickerPurpose,
+    ignored_directories: usize,
     action: tui_file_picker::FilePickerAction,
 ) -> Result<(), mpsc::error::TrySendError<AppMessage>> {
+    let send_selection = |paths: Vec<std::path::PathBuf>| {
+        let path = paths.first().cloned();
+        tx.try_send(AppMessage::FilePickerComplete {
+            session_id,
+            purpose: purpose.clone(),
+            path,
+            paths,
+            ignored_directories,
+        })
+    };
+
     match action {
         tui_file_picker::FilePickerAction::None => Ok(()),
-        tui_file_picker::FilePickerAction::Selected(path) => tx.try_send(AppMessage::FilePickerComplete {
-            session_id,
-            purpose,
-            path: Some(path),
-        }),
+        tui_file_picker::FilePickerAction::Selected(path) => send_selection(vec![path]),
+        tui_file_picker::FilePickerAction::SelectedMany(paths) => send_selection(paths),
         tui_file_picker::FilePickerAction::OpenSystemDefault(path) => {
-            let result = super::external_editor::open_in_editor(&path).map_err(|err| err.to_string());
+            let result =
+                super::external_editor::open_in_editor(&path).map_err(|err| err.to_string());
             report_file_picker_open_result(app, &path, result);
             Ok(())
         }
-        tui_file_picker::FilePickerAction::Cancelled => tx.try_send(AppMessage::FilePickerComplete {
-            session_id,
-            purpose,
-            path: None,
-        }),
+        tui_file_picker::FilePickerAction::Cancelled => {
+            tx.try_send(AppMessage::FilePickerComplete {
+                session_id,
+                purpose: purpose.clone(),
+                path: None,
+                paths: Vec::new(),
+                ignored_directories: 0,
+            })
+        }
     }
 }
 
@@ -11965,7 +11995,15 @@ fn handle_metadata_file_picker_mouse(
         super::draw_overlays::file_picker_overlay_area(parent)
     };
     let action = session.picker.handle_mouse(mouse, area);
-    if let Err(err) = send_file_picker_completion(app, tx, session_id, purpose, action) {
+    let ignored_directories = session.picker.take_last_selection_ignored_directories();
+    if let Err(err) = send_file_picker_completion(
+        app,
+        tx,
+        session_id,
+        purpose,
+        ignored_directories,
+        action,
+    ) {
         app.set_status(format!("file picker: failed to queue completion: {err}"));
     }
 }
@@ -11986,7 +12024,15 @@ fn handle_global_file_picker_mouse(
     let session_id = session.session_id;
     let purpose = session.purpose.clone();
     let action = session.picker.handle_mouse(mouse, Rect::default());
-    if let Err(err) = send_file_picker_completion(app, tx, session_id, purpose, action) {
+    let ignored_directories = session.picker.take_last_selection_ignored_directories();
+    if let Err(err) = send_file_picker_completion(
+        app,
+        tx,
+        session_id,
+        purpose,
+        ignored_directories,
+        action,
+    ) {
         app.set_status(format!("file picker: failed to queue completion: {err}"));
     }
     app.active_overlay = ActiveOverlay::FilePicker(session);
@@ -14022,14 +14068,22 @@ fn embedded_cue_candidate_for_metadata(
     entries: &[super::probe::TagEntry],
     audio_path: &std::path::Path,
 ) -> EmbeddedCueCandidate {
+    embedded_cue_candidate_for_metadata_at(entries, audio_path, 0)
+}
+
+fn embedded_cue_candidate_for_metadata_at(
+    entries: &[super::probe::TagEntry],
+    audio_path: &std::path::Path,
+    file_index: usize,
+) -> EmbeddedCueCandidate {
     let Some(text) = entries
         .iter()
         .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
         .and_then(|entry| {
             entry
                 .per_file_originals
-                .first()
-                .or_else(|| entry.per_file_values.first())
+                .get(file_index)
+                .or_else(|| entry.per_file_values.get(file_index))
         })
         .filter(|text| !text.trim().is_empty())
         .cloned()
@@ -14259,16 +14313,45 @@ struct MetadataCueAdmission {
     selection_prompt: Option<crate::convert::queue_expansion::QueueCueSelectionPrompt>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataCueOrdinaryPathMode {
+    Expand,
+    StructuralOnly,
+}
+
 fn collect_metadata_cue_admission(paths: &[std::path::PathBuf]) -> MetadataCueAdmission {
-    collect_metadata_cue_admission_with_selections(
+    collect_metadata_cue_admission_with_selections_and_mode(
         paths,
         &crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
+        MetadataCueOrdinaryPathMode::Expand,
     )
 }
 
 fn collect_metadata_cue_admission_with_selections(
     paths: &[std::path::PathBuf],
     cue_selections: &crate::convert::queue_expansion::QueueCueSelectionOverrides,
+) -> MetadataCueAdmission {
+    collect_metadata_cue_admission_with_selections_and_mode(
+        paths,
+        cue_selections,
+        MetadataCueOrdinaryPathMode::Expand,
+    )
+}
+
+fn collect_metadata_cue_admission_structural(
+    paths: &[std::path::PathBuf],
+) -> MetadataCueAdmission {
+    collect_metadata_cue_admission_with_selections_and_mode(
+        paths,
+        &crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
+        MetadataCueOrdinaryPathMode::StructuralOnly,
+    )
+}
+
+fn collect_metadata_cue_admission_with_selections_and_mode(
+    paths: &[std::path::PathBuf],
+    cue_selections: &crate::convert::queue_expansion::QueueCueSelectionOverrides,
+    ordinary_path_mode: MetadataCueOrdinaryPathMode,
 ) -> MetadataCueAdmission {
     let inputs = metadata_cue_admission_inputs(paths);
     let mut cue_scopes = Vec::new();
@@ -14303,11 +14386,13 @@ fn collect_metadata_cue_admission_with_selections(
     // ordinary metadata path used by raw/cue-less selections. Keep this
     // decision per folder so a valid CUE album in another selected folder
     // cannot make cue-less audio disappear from the mixed editor.
-    for input in &inputs {
-        if !by_parent.contains_key(&input.folder_key) {
-            ordinary_paths.extend(super::command::expand_audio_paths_for_metadata(&[
-                input.ordinary_scope.clone(),
-            ]));
+    if ordinary_path_mode == MetadataCueOrdinaryPathMode::Expand {
+        for input in &inputs {
+            if !by_parent.contains_key(&input.folder_key) {
+                ordinary_paths.extend(super::command::expand_audio_paths_for_metadata(&[
+                    input.ordinary_scope.clone(),
+                ]));
+            }
         }
     }
 
@@ -14349,9 +14434,11 @@ fn collect_metadata_cue_admission_with_selections(
             crate::convert::split_cue_album::SplitCueFolderSelection::NoViable {
                 rejected,
             } => {
-                ordinary_paths.extend(super::command::expand_audio_paths_for_metadata(&[
-                    parent.clone(),
-                ]));
+                if ordinary_path_mode == MetadataCueOrdinaryPathMode::Expand {
+                    ordinary_paths.extend(super::command::expand_audio_paths_for_metadata(&[
+                        parent.clone(),
+                    ]));
+                }
                 let detail = rejected
                     .into_iter()
                     .map(|rejection| rejection.to_string())
@@ -14378,7 +14465,9 @@ fn collect_metadata_cue_admission_with_selections(
                 surfaces.push(surface);
             }
         } else {
-            ordinary_paths.extend(member.referenced_audio.iter().cloned());
+            if ordinary_path_mode == MetadataCueOrdinaryPathMode::Expand {
+                ordinary_paths.extend(member.referenced_audio.iter().cloned());
+            }
             if let Some(surface) = metadata_cue_surface_from_admitted_member(member) {
                 metadata_sidecar_surfaces.push(surface);
             }
@@ -14395,6 +14484,471 @@ fn collect_metadata_cue_admission_with_selections(
         warnings,
         selection_prompt: None,
     }
+}
+
+
+fn default_transfer_cue_policy() -> crate::convert::pipeline::CueSidecarPolicy {
+    super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY
+}
+
+fn transfer_carrier_from_admitted_surface(
+    surface: &MetadataCueSurface,
+    embedded: &EmbeddedCueCandidate,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    if surface.sheet.tracks.len() < 2 {
+        return Err(format!(
+            "Transfer tags: CUE '{}' has fewer than 2 audio tracks",
+            surface.cue_path.display()
+        ));
+    }
+    if surface.audio_paths.len() != 1 {
+        return Err(
+            "Transfer tags: multi-file CUE albums are not yet transfer targets/sources"
+                .to_string(),
+        );
+    }
+    let image_path = surface.audio_path.clone();
+    let resolved = resolve_metadata_cue_source(
+        default_transfer_cue_policy(),
+        surface,
+        embedded,
+    )?;
+    match resolved.identity {
+        super::app::MetadataCueSource::Sidecar(cue_path) => {
+            Ok(super::tag_interchange::TransferCarrier::SidecarCue {
+                cue_path,
+                image_path,
+                cue_text: resolved.cue_text,
+                sheet: resolved.sheet,
+            })
+        }
+        super::app::MetadataCueSource::Embedded(image_path) => {
+            Ok(super::tag_interchange::TransferCarrier::EmbeddedCue {
+                image_path,
+                cue_text: resolved.cue_text,
+                sheet: resolved.sheet,
+            })
+        }
+    }
+}
+
+fn transfer_carrier_from_explicit_cue(
+    cue_path: &std::path::Path,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    let member = crate::convert::split_cue_album::admit_split_cue_member(cue_path).map_err(
+        |error| format!("Transfer tags: CUE admission failed for '{}': {error}", cue_path.display()),
+    )?;
+    if member.sheet.tracks.len() < 2 {
+        return Err(format!(
+            "Transfer tags: CUE '{}' has fewer than 2 audio tracks",
+            cue_path.display()
+        ));
+    }
+    if member.referenced_audio.len() != 1 {
+        return Err(
+            "Transfer tags: multi-file CUE albums are not yet transfer targets/sources"
+                .to_string(),
+        );
+    }
+    let raw = std::fs::read(&member.cue_path).map_err(|error| {
+        format!(
+            "Transfer tags: failed to read CUE '{}': {error}",
+            member.cue_path.display()
+        )
+    })?;
+    let cue_text = super::cue_parser::decode_cue_bytes_for_path(&raw, &member.cue_path)
+        .map_err(|error| {
+            format!(
+                "Transfer tags: failed to decode CUE '{}': {error}",
+                member.cue_path.display()
+            )
+        })?;
+    Ok(super::tag_interchange::TransferCarrier::SidecarCue {
+        cue_path: member.cue_path,
+        image_path: member.referenced_audio[0].clone(),
+        cue_text,
+        sheet: member.sheet,
+    })
+}
+
+fn transfer_path_is_disc_source(path: &std::path::Path) -> bool {
+    super::sacd::is_sacd_iso(path)
+        || crate::disc::dvda_utils::is_dvda_source(path)
+        || is_dvdv_source_for_editor(path)
+        || is_bluray_source_for_editor(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRANSFER_CLASSIFICATION_ADMISSION_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TRANSFER_CLASSIFICATION_EMBEDDED_BATCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn collect_transfer_metadata_cue_admission(
+    roots: &[std::path::PathBuf],
+) -> MetadataCueAdmission {
+    #[cfg(test)]
+    TRANSFER_CLASSIFICATION_ADMISSION_PASSES.with(|count| count.set(count.get() + 1));
+    // Transfer classification needs only structural CUE discovery here.
+    // Ordinary directory/file expansion is performed exactly once later by
+    // the bounded, cancellable transfer traversal.
+    collect_metadata_cue_admission_structural(roots)
+}
+
+fn transfer_admission_surfaces<'a>(
+    admission: &'a MetadataCueAdmission,
+) -> impl Iterator<Item = &'a MetadataCueSurface> + 'a {
+    admission
+        .surfaces
+        .iter()
+        .chain(admission.metadata_sidecar_surfaces.iter())
+}
+
+struct TransferAdmissionIndex<'a> {
+    surfaces: Vec<&'a MetadataCueSurface>,
+    by_parent: std::collections::BTreeMap<std::path::PathBuf, Vec<usize>>,
+    by_image: std::collections::BTreeMap<std::path::PathBuf, Vec<usize>>,
+}
+
+impl<'a> TransferAdmissionIndex<'a> {
+    fn new(admission: &'a MetadataCueAdmission) -> Self {
+        let surfaces = transfer_admission_surfaces(admission).collect::<Vec<_>>();
+        let mut by_parent = std::collections::BTreeMap::<
+            std::path::PathBuf,
+            Vec<usize>,
+        >::new();
+        let mut by_image = std::collections::BTreeMap::<
+            std::path::PathBuf,
+            Vec<usize>,
+        >::new();
+        for (index, surface) in surfaces.iter().enumerate() {
+            let parent = surface
+                .cue_path
+                .parent()
+                .map(metadata_cue_surface_key)
+                .unwrap_or_else(|| metadata_cue_surface_key(&surface.cue_path));
+            by_parent.entry(parent).or_default().push(index);
+            if surface.audio_paths.len() == 1 {
+                by_image
+                    .entry(metadata_cue_surface_key(&surface.audio_path))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        Self {
+            surfaces,
+            by_parent,
+            by_image,
+        }
+    }
+
+    fn by_parent(&self, key: &std::path::Path) -> &[usize] {
+        self.by_parent.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn by_image(&self, key: &std::path::Path) -> &[usize] {
+        self.by_image.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+fn read_transfer_embedded_candidates(
+    roots: &[std::path::PathBuf],
+    admission_index: &TransferAdmissionIndex<'_>,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<
+    std::collections::BTreeMap<
+        std::path::PathBuf,
+        Result<EmbeddedCueCandidate, String>,
+    >,
+    String,
+> {
+    let mut by_identity = std::collections::BTreeMap::new();
+    for root in roots {
+        if matches!(
+            crate::convert::classify::classify_file(root),
+            crate::convert::classify::EntryKind::AudioFile(_)
+        ) {
+            by_identity
+                .entry(metadata_cue_surface_key(root))
+                .or_insert_with(|| root.clone());
+        }
+    }
+    for surface in &admission_index.surfaces {
+        by_identity
+            .entry(metadata_cue_surface_key(&surface.audio_path))
+            .or_insert_with(|| surface.audio_path.clone());
+    }
+    if by_identity.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+
+    let paths = by_identity.into_values().collect::<Vec<_>>();
+    #[cfg(test)]
+    TRANSFER_CLASSIFICATION_EMBEDDED_BATCH_READS.with(|count| count.set(count.get() + 1));
+    let merged = super::probe::read_all_tags_merged_with_metadata_cancellable_for_operation(
+        &paths,
+        || cancel.is_cancelled(),
+        "tag transfer cancelled while checking embedded CUESHEET carriers",
+    )?;
+
+    let mut candidates = std::collections::BTreeMap::new();
+    for (index, path) in paths.iter().enumerate() {
+        let candidate = if let Some(issue) = merged
+            .metadata_errors
+            .get(index)
+            .and_then(|issue| issue.as_ref())
+        {
+            Err(format!(
+                "Transfer tags: failed to read '{}': {}",
+                path.display(),
+                issue.reason
+            ))
+        } else {
+            Ok(embedded_cue_candidate_for_metadata_at(
+                &merged.entries,
+                path,
+                index,
+            ))
+        };
+        candidates.insert(metadata_cue_surface_key(path), candidate);
+    }
+    Ok(candidates)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransferTraversalLimits {
+    max_visited: usize,
+    max_audio_files: usize,
+}
+
+impl TransferTraversalLimits {
+    const fn production() -> Self {
+        Self {
+            max_visited: super::context_menu::TAG_CLIPBOARD_COPY_MAX_VISITED,
+            max_audio_files: super::context_menu::TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+        }
+    }
+}
+
+fn transfer_embedded_candidate<'a>(
+    candidates: &'a std::collections::BTreeMap<
+        std::path::PathBuf,
+        Result<EmbeddedCueCandidate, String>,
+    >,
+    identity: &std::path::Path,
+    display_path: &std::path::Path,
+) -> Result<&'a EmbeddedCueCandidate, String> {
+    candidates
+        .get(identity)
+        .ok_or_else(|| {
+            format!(
+                "internal error: no cached embedded-CUE classification for '{}'",
+                display_path.display()
+            )
+        })?
+        .as_ref()
+        .map_err(|error| error.clone())
+}
+
+fn classify_single_transfer_root(
+    root: &std::path::Path,
+    admission_index: &TransferAdmissionIndex<'_>,
+    embedded_candidates: &std::collections::BTreeMap<
+        std::path::PathBuf,
+        Result<EmbeddedCueCandidate, String>,
+    >,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    traversal_limits: TransferTraversalLimits,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    if cancel.is_cancelled() {
+        return Err("Transfer tags: cancelled during carrier classification".to_string());
+    }
+    if super::cue_parser::is_user_visible_cue_path(root) {
+        return transfer_carrier_from_explicit_cue(root);
+    }
+    if transfer_path_is_disc_source(root) {
+        return Err("Transfer tags: disc-image sources and targets are not supported this round"
+            .to_string());
+    }
+    if root.is_dir() {
+        let root_key = metadata_cue_surface_key(root);
+        let surface_indices = admission_index.by_parent(&root_key);
+        if surface_indices.len() > 1 {
+            return Err(
+                "Transfer tags: multiple CUE albums in this folder; select a specific .cue or image"
+                    .to_string(),
+            );
+        }
+        if let Some(surface_index) = surface_indices.first() {
+            let surface = admission_index.surfaces[*surface_index];
+            let image_key = metadata_cue_surface_key(&surface.audio_path);
+            let embedded = transfer_embedded_candidate(
+                embedded_candidates,
+                &image_key,
+                &surface.audio_path,
+            )?;
+            return transfer_carrier_from_admitted_surface(surface, embedded);
+        }
+        let paths = super::command::expand_audio_paths_for_transfer_limited(
+            &[root.to_path_buf()],
+            traversal_limits.max_visited,
+            traversal_limits.max_audio_files,
+            || cancel.is_cancelled(),
+        )?;
+        if paths.is_empty() {
+            return Err("Transfer tags: selected folder contains no audio files".to_string());
+        }
+        return Ok(super::tag_interchange::TransferCarrier::Files { paths });
+    }
+
+    match crate::convert::classify::classify_file(root) {
+        crate::convert::classify::EntryKind::Archive => Err(
+            "Transfer tags: archives and disc images are not supported transfer carriers"
+                .to_string(),
+        ),
+        crate::convert::classify::EntryKind::AudioFile(_) => {
+            let root_key = metadata_cue_surface_key(root);
+            let surface_indices = admission_index.by_image(&root_key);
+            if surface_indices.len() > 1 {
+                return Err(
+                    "Transfer tags: multiple viable CUE sheets describe this image; select the intended .cue"
+                        .to_string(),
+                );
+            }
+            if let Some(surface_index) = surface_indices.first() {
+                let surface = admission_index.surfaces[*surface_index];
+                let embedded =
+                    transfer_embedded_candidate(embedded_candidates, &root_key, root)?;
+                return transfer_carrier_from_admitted_surface(surface, embedded);
+            }
+
+            let path = root.to_path_buf();
+            match transfer_embedded_candidate(embedded_candidates, &root_key, root)? {
+                EmbeddedCueCandidate::Absent => {
+                    Ok(super::tag_interchange::TransferCarrier::Files { paths: vec![path] })
+                }
+                EmbeddedCueCandidate::Invalid(error) => Err(format!(
+                    "Transfer tags: embedded CUESHEET in '{}' is invalid: {error}",
+                    root.display()
+                )),
+                EmbeddedCueCandidate::Valid {
+                    audio_path,
+                    cue_text,
+                    sheet,
+                } => {
+                    if sheet.tracks.len() < 2 {
+                        return Err(format!(
+                            "Transfer tags: embedded CUE in '{}' has fewer than 2 audio tracks",
+                            root.display()
+                        ));
+                    }
+                    Ok(super::tag_interchange::TransferCarrier::EmbeddedCue {
+                        image_path: audio_path.clone(),
+                        cue_text: cue_text.clone(),
+                        sheet: sheet.clone(),
+                    })
+                }
+            }
+        }
+        _ => Err(format!(
+            "Transfer tags: '{}' is not an audio file, CUE sheet, or directory",
+            root.display()
+        )),
+    }
+}
+
+/// Classify every user-selected root before any transfer read or write. A
+/// multi-selection may combine only file-dimensional carriers; mixing a CUE
+/// authority with other paths is refused rather than silently dropping roots.
+pub(crate) fn classify_tag_transfer_roots(
+    roots: &[std::path::PathBuf],
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    classify_tag_transfer_roots_with_limits(
+        roots,
+        cancel,
+        TransferTraversalLimits::production(),
+    )
+}
+
+fn classify_tag_transfer_roots_with_limits(
+    roots: &[std::path::PathBuf],
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    traversal_limits: TransferTraversalLimits,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    if roots.is_empty() {
+        return Err("Transfer tags: no carrier selected".to_string());
+    }
+    let cue_count = roots
+        .iter()
+        .filter(|path| super::cue_parser::is_user_visible_cue_path(path))
+        .count();
+    if cue_count > 0 && roots.len() > 1 {
+        return Err(
+            "Transfer tags: selection mixes a CUE with audio files; select one carrier"
+                .to_string(),
+        );
+    }
+
+    if cue_count == 1 {
+        return transfer_carrier_from_explicit_cue(&roots[0]);
+    }
+
+    let admission = collect_transfer_metadata_cue_admission(roots);
+    if admission.selection_prompt.is_some() {
+        return Err(
+            "Transfer tags: multiple CUE albums in this folder; select a specific .cue or image"
+                .to_string(),
+        );
+    }
+    let admission_index = TransferAdmissionIndex::new(&admission);
+    let embedded_candidates =
+        read_transfer_embedded_candidates(roots, &admission_index, cancel)?;
+
+    let mut files = Vec::new();
+    let mut non_file_carrier = None;
+    for root in roots {
+        match classify_single_transfer_root(
+            root,
+            &admission_index,
+            &embedded_candidates,
+            cancel,
+            traversal_limits,
+        )? {
+            super::tag_interchange::TransferCarrier::Files { paths } => {
+                if non_file_carrier.is_some() {
+                    return Err(
+                        "Transfer tags: selection mixes a CUE carrier with individual files"
+                            .to_string(),
+                    );
+                }
+                files.extend(paths);
+            }
+            carrier => {
+                if non_file_carrier.is_some() || !files.is_empty() || roots.len() > 1 {
+                    return Err(
+                        "Transfer tags: selection contains more than one carrier; select one CUE carrier or individual files"
+                            .to_string(),
+                    );
+                }
+                non_file_carrier = Some(carrier);
+            }
+        }
+    }
+    if let Some(carrier) = non_file_carrier {
+        return Ok(carrier);
+    }
+    let mut files_by_identity = std::collections::BTreeMap::new();
+    for path in files {
+        files_by_identity
+            .entry(metadata_cue_surface_key(&path))
+            .or_insert(path);
+    }
+    let files = files_by_identity.into_values().collect::<Vec<_>>();
+    if files.is_empty() {
+        return Err("Transfer tags: selected carrier contains no audio files".to_string());
+    }
+    Ok(super::tag_interchange::TransferCarrier::Files { paths: files })
 }
 
 #[cfg(test)] // superseded in production by collect_metadata_cue_admission_with_selections; retained for regression tests
@@ -37019,6 +37573,9 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
         Some(ConfirmAction::MetadataTransferUnsaved { .. }) => {
             app.set_status("metadata editor: tag transfer cancelled; unsaved edits retained".to_string());
         }
+        Some(ConfirmAction::BrowseTagTransfer { .. }) => {
+            app.set_status("Transfer tags: write cancelled; target left unchanged".to_string());
+        }
         Some(ConfirmAction::DiscardMetadataEditorChanges) => {
             app.quit_after_browse_archive_metadata_resolution = false;
             app.set_status("metadata editor: discard cancelled".to_string());
@@ -37430,8 +37987,8 @@ fn execute_confirm_action(
         }
         ConfirmAction::MetadataTransferUnsaved {
             source_entries,
-            source_count,
-            target_paths,
+            source_dimension,
+            target,
             scope,
             edit_count: _,
         } => {
@@ -37443,12 +38000,15 @@ fn execute_confirm_action(
             super::context_menu::start_tag_transfer_from_editor_snapshot(
                 app,
                 source_entries.clone(),
-                *source_count,
-                target_paths.clone(),
+                *source_dimension,
+                target.clone(),
                 *scope,
                 tx,
             );
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        ConfirmAction::BrowseTagTransfer { prepared } => {
+            super::context_menu::launch_prepared_tag_transfer(app, prepared.clone(), tx);
         }
         ConfirmAction::DiscardMetadataEditorChanges => {
             let quit_after_resolution = app.quit_after_browse_archive_metadata_resolution;
@@ -47299,6 +47859,147 @@ mod artwork_file_picker_handoff_tests {
     }
 
     #[test]
+    fn all_non_transfer_picker_purposes_keep_first_path_compatibility() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, mut rx) = channel();
+        let first = PathBuf::from("/music/01.flac");
+        let second = PathBuf::from("/music/02.flac");
+        let purposes = vec![
+            FilePickerPurpose::SelectArtwork {
+                picture_type: lofty::picture::PictureType::CoverFront,
+            },
+            FilePickerPurpose::SelectFile,
+            FilePickerPurpose::SelectDirectory,
+            FilePickerPurpose::SelectDestination,
+            FilePickerPurpose::SelectPreset,
+            FilePickerPurpose::SavePreset,
+            FilePickerPurpose::CopyTo {
+                sources: vec![PathBuf::from("/source/copy.flac")],
+                force: false,
+            },
+            FilePickerPurpose::MoveTo {
+                sources: vec![PathBuf::from("/source/move.flac")],
+                force: true,
+            },
+            FilePickerPurpose::MetadataTagBlocksFile,
+            FilePickerPurpose::Generic {
+                id: "compatibility-pin".to_string(),
+            },
+        ];
+
+        for (index, purpose) in purposes.into_iter().enumerate() {
+            let session_id = index as u64 + 1;
+            send_file_picker_completion(
+                &mut app,
+                &tx,
+                session_id,
+                purpose.clone(),
+                2,
+                tui_file_picker::FilePickerAction::SelectedMany(vec![
+                    first.clone(),
+                    second.clone(),
+                ]),
+            )
+            .expect("queue compatibility completion");
+
+            match rx.try_recv().expect("compatibility completion") {
+                AppMessage::FilePickerComplete {
+                    session_id: observed_session,
+                    purpose: observed_purpose,
+                    path,
+                    paths,
+                    ignored_directories,
+                } => {
+                    assert_eq!(observed_session, session_id);
+                    assert_eq!(observed_purpose, purpose);
+                    assert_eq!(path, Some(first.clone()));
+                    assert_eq!(paths, vec![first.clone(), second.clone()]);
+                    assert_eq!(ignored_directories, 2);
+                }
+                other => panic!("expected FilePickerComplete, got {other:?}"),
+            }
+        }
+    }
+
+    fn browse_confirmation_fixture(generation: u64, target_path: PathBuf) -> ConfirmAction {
+        ConfirmAction::BrowseTagTransfer {
+            prepared: super::super::browse::PreparedTagTransfer {
+                generation,
+                source_entries: Vec::new(),
+                source_dimension: super::super::tag_interchange::TransferDimension::Files(1),
+                source_carrier: "files".to_string(),
+                target: super::super::tag_interchange::TransferCarrier::Files {
+                    paths: vec![target_path],
+                },
+                scope: TagTransferScope::All,
+                verification: tui_file_picker::VerificationMode::Standard,
+                field_count: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn browse_transfer_confirmation_decline_keeps_target_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.flac");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let action = browse_confirmation_fixture(1, target.clone());
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: "Write 0 fields to 1 file?".to_string(),
+            action: action.clone(),
+        };
+
+        cancel_confirm_action(&mut app, Some(&action));
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app.browse.tag_transfer_cancel.is_none());
+        assert!(app.browse.tag_transfer_active_generation.is_none());
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("Transfer tags: write cancelled; target left unchanged")
+        );
+        assert!(!target.exists(), "declining must not create or modify the target");
+    }
+
+    #[tokio::test]
+    async fn browse_transfer_confirmation_accept_starts_only_the_frozen_prepared_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.flac");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let generation = 9;
+        app.browse.tag_transfer_generation = generation;
+        let action = browse_confirmation_fixture(generation, target.clone());
+        let (tx, mut rx) = channel();
+
+        execute_confirm_action(&mut app, &action, &tx);
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(app.browse.tag_transfer_active_generation, Some(generation));
+        let cancel = app
+            .browse
+            .tag_transfer_cancel
+            .as_ref()
+            .expect("accepted write owns a cancellation flag")
+            .clone();
+        cancel.cancel();
+
+        match rx.recv().await.expect("cancelled prepared write completion") {
+            AppMessage::TagTransferComplete {
+                generation: observed_generation,
+                result,
+            } => {
+                assert_eq!(observed_generation, generation);
+                assert!(
+                    result.is_err(),
+                    "the deliberately missing target must fail without being created"
+                );
+            }
+            other => panic!("expected TagTransferComplete, got {other:?}"),
+        }
+        assert!(!target.exists(), "accepting must not invent a missing target");
+    }
+
+    #[test]
     fn source_tree_has_no_app_local_file_picker_and_uses_crate() {
         assert!(
             !Path::new("src/tui/file_picker.rs").exists(),
@@ -47370,9 +48071,11 @@ mod artwork_file_picker_handoff_tests {
         );
 
         match rx.try_recv().expect("file picker completion") {
-            AppMessage::FilePickerComplete { session_id: completion_session_id, purpose, path } => {
+            AppMessage::FilePickerComplete { session_id: completion_session_id, purpose, path, paths, ignored_directories } => {
                 assert_eq!(completion_session_id, session_id);
-                assert_eq!(path, Some(image));
+                assert_eq!(path, Some(image.clone()));
+                assert_eq!(paths, vec![image]);
+                assert_eq!(ignored_directories, 0);
                 assert_eq!(
                     purpose,
                     FilePickerPurpose::SelectArtwork {
@@ -47407,9 +48110,11 @@ mod artwork_file_picker_handoff_tests {
         );
 
         match rx.try_recv().expect("file picker cancel completion") {
-            AppMessage::FilePickerComplete { session_id: completion_session_id, purpose, path } => {
+            AppMessage::FilePickerComplete { session_id: completion_session_id, purpose, path, paths, ignored_directories } => {
                 assert_eq!(completion_session_id, session_id);
                 assert!(path.is_none());
+                assert!(paths.is_empty());
+                assert_eq!(ignored_directories, 0);
                 assert!(matches!(purpose, FilePickerPurpose::SelectArtwork { .. }));
             }
             other => panic!("expected FilePickerComplete, got {other:?}"),
@@ -47791,7 +48496,7 @@ mod single_image_metadata_editor_regression_tests {
         tx
     }
 
-    fn fixture_tool_available(tool: &str) -> bool {
+    pub(super) fn fixture_tool_available(tool: &str) -> bool {
         let available = std::process::Command::new(tool)
             .arg("-version")
             .stdout(std::process::Stdio::null())
@@ -49442,8 +50147,10 @@ mod single_image_metadata_editor_regression_tests {
                 editor_fingerprint,
                 scope: crate::tui::app::TagTransferScope::All,
                 source_entries: vec![cuesheet_tag_entry(&changed, &original)],
-                source_count: 1,
-                result: Ok(vec![temp.path().join("late-target.flac")]),
+                source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
+                result: Ok(crate::tui::tag_interchange::TransferCarrier::Files {
+                    paths: vec![temp.path().join("late-target.flac")],
+                }),
             },
             &tx(),
         );
@@ -49583,7 +50290,7 @@ mod single_image_metadata_editor_regression_tests {
         assert!(validate_embedded_cuesheet_text(no_tracks).is_err());
     }
 
-    fn create_flac_fixture(path: &std::path::Path) -> bool {
+    pub(super) fn create_flac_fixture(path: &std::path::Path) -> bool {
         let status = std::process::Command::new("ffmpeg")
             .args([
                 "-y",
@@ -52544,6 +53251,9 @@ mod single_image_metadata_editor_regression_tests {
 
 #[cfg(test)]
 mod metadata_cue_source_coverage_tests {
+    use super::single_image_metadata_editor_regression_tests::{
+        create_flac_fixture, fixture_tool_available,
+    };
     use super::*;
 
     fn policy_surface() -> MetadataCueSurface {
@@ -52671,6 +53381,339 @@ mod metadata_cue_source_coverage_tests {
             assert!(entries
                 .iter()
                 .all(|entry| !entry.display_key.eq_ignore_ascii_case("CATALOGNUMBER")));
+        }
+    }
+
+    #[test]
+    fn transfer_resolution_consults_the_frontend_default_cue_policy() {
+        assert_eq!(
+            default_transfer_cue_policy(),
+            super::super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
+            "transfer classification must thread the swappable frontend default at the resolution layer",
+        );
+    }
+
+    #[test]
+    fn transfer_structural_admission_never_performs_ordinary_directory_expansion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue_less = temp.path().join("cue-less");
+        std::fs::create_dir_all(cue_less.join("nested")).expect("cue-less tree");
+        std::fs::write(cue_less.join("nested/track.flac"), b"audio").expect("audio");
+
+        let rejected = temp.path().join("rejected");
+        std::fs::create_dir_all(&rejected).expect("rejected tree");
+        std::fs::write(rejected.join("track.flac"), b"audio").expect("audio");
+        std::fs::write(
+            rejected.join("broken.cue"),
+            concat!(
+                "FILE \"missing.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("rejected cue");
+
+        for root in [cue_less, rejected] {
+            let admission = collect_transfer_metadata_cue_admission(&[root]);
+            assert!(
+                admission.ordinary_paths.is_empty(),
+                "transfer admission is structural only; bounded traversal owns ordinary expansion"
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_directory_fallback_enforces_caps_for_cueless_and_rejected_cues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue_less = temp.path().join("cue-less");
+        let rejected = temp.path().join("rejected");
+        std::fs::create_dir_all(&cue_less).expect("cue-less directory");
+        std::fs::create_dir_all(&rejected).expect("rejected directory");
+        for index in 0..4 {
+            std::fs::write(cue_less.join(format!("{index}.flac")), b"audio")
+                .expect("cue-less audio");
+            std::fs::write(rejected.join(format!("{index}.flac")), b"audio")
+                .expect("rejected audio");
+        }
+        std::fs::write(
+            rejected.join("broken.cue"),
+            concat!(
+                "FILE \"missing.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("rejected cue");
+
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        for root in [&cue_less, &rejected] {
+            let visit_error = classify_tag_transfer_roots_with_limits(
+                &[root.clone()],
+                &cancel,
+                TransferTraversalLimits {
+                    max_visited: 2,
+                    max_audio_files: 32,
+                },
+            )
+            .expect_err("visitation cap must stop the bounded transfer traversal");
+            assert!(visit_error.contains(
+                "Transfer tags refused: selection traversal exceeds 2 filesystem entries"
+            ));
+
+            let file_error = classify_tag_transfer_roots_with_limits(
+                &[root.clone()],
+                &cancel,
+                TransferTraversalLimits {
+                    max_visited: 64,
+                    max_audio_files: 2,
+                },
+            )
+            .expect_err("audio-file cap must stop the bounded transfer traversal");
+            assert!(file_error.contains(
+                "Transfer tags refused: selection exceeds 2 audio files"
+            ));
+        }
+    }
+
+    #[test]
+    fn transfer_directory_fallback_observes_cancellation_during_bounded_walk() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("album");
+        std::fs::create_dir_all(&root).expect("directory");
+        for index in 0..8 {
+            std::fs::write(root.join(format!("{index}.flac")), b"audio").expect("audio");
+        }
+        let checks = std::cell::Cell::new(0usize);
+        let error = super::super::command::expand_audio_paths_for_transfer_limited(
+            &[root],
+            64,
+            64,
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 4
+            },
+        )
+        .expect_err("cancellation must stop traversal");
+        assert_eq!(
+            error,
+            "Transfer tags cancelled during bounded directory traversal"
+        );
+        assert!(checks.get() >= 4);
+    }
+
+    #[test]
+    fn multi_file_transfer_classification_batches_admission_and_embedded_reads_once() {
+        TRANSFER_CLASSIFICATION_ADMISSION_PASSES.with(|count| count.set(0));
+        TRANSFER_CLASSIFICATION_EMBEDDED_BATCH_READS.with(|count| count.set(0));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        std::fs::write(&first, b"not a real FLAC").expect("first fixture");
+        std::fs::write(&second, b"not a real FLAC").expect("second fixture");
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let _ = classify_tag_transfer_roots(&[first, second], &cancel);
+
+        assert_eq!(
+            TRANSFER_CLASSIFICATION_ADMISSION_PASSES.with(|count| count.get()),
+            1,
+            "all selected roots must enter one batched folder-admission pass"
+        );
+        assert_eq!(
+            TRANSFER_CLASSIFICATION_EMBEDDED_BATCH_READS.with(|count| count.get()),
+            1,
+            "all selected audio roots must share one merged embedded-tag read"
+        );
+    }
+
+    #[test]
+    fn explicit_cue_classification_refuses_invalid_fenced_and_mixed_selections() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path();
+        let image_a = album.join("a.flac");
+        let image_b = album.join("b.flac");
+        std::fs::write(&image_a, b"placeholder").expect("image a");
+        std::fs::write(&image_b, b"placeholder").expect("image b");
+
+        let valid = album.join("valid.cue");
+        std::fs::write(
+            &valid,
+            r#"FILE "a.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("valid cue");
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let carrier = classify_tag_transfer_roots(std::slice::from_ref(&valid), &cancel)
+            .expect("explicit cue carrier");
+        assert!(matches!(
+            carrier,
+            super::super::tag_interchange::TransferCarrier::SidecarCue { ref cue_path, .. }
+                if cue_path == &valid
+        ));
+
+        let missing = album.join("missing.cue");
+        std::fs::write(
+            &missing,
+            r#"FILE "missing.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("missing cue");
+        assert!(classify_tag_transfer_roots(std::slice::from_ref(&missing), &cancel)
+            .expect_err("missing FILE reference must refuse")
+            .contains("admission failed"));
+
+        let one_track = album.join("one-track.cue");
+        std::fs::write(
+            &one_track,
+            r#"FILE "a.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("one-track cue");
+        assert!(classify_tag_transfer_roots(std::slice::from_ref(&one_track), &cancel)
+            .expect_err("one-track cue must refuse")
+            .contains("fewer than 2"));
+
+        let multi_file = album.join("multi-file.cue");
+        std::fs::write(
+            &multi_file,
+            r#"FILE "a.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+FILE "b.flac" WAVE
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("multi-file cue");
+        assert!(classify_tag_transfer_roots(std::slice::from_ref(&multi_file), &cancel)
+            .expect_err("multi-file cue must refuse")
+            .contains("multi-file CUE albums"));
+
+        assert!(classify_tag_transfer_roots(&[valid, image_b], &cancel)
+            .expect_err("mixed cue and audio must refuse")
+            .contains("selection mixes a CUE with audio files"));
+
+        let archive = album.join("album.zip");
+        std::fs::write(&archive, b"archive").expect("archive");
+        assert!(classify_tag_transfer_roots(std::slice::from_ref(&archive), &cancel)
+            .expect_err("archive must refuse")
+            .contains("archives"));
+
+        let ambiguous = album.join("ambiguous");
+        std::fs::create_dir_all(&ambiguous).expect("ambiguous folder");
+        for stem in ["one", "two"] {
+            std::fs::write(ambiguous.join(format!("{stem}.flac")), b"placeholder")
+                .expect("ambiguous image");
+            std::fs::write(
+                ambiguous.join(format!("{stem}.cue")),
+                format!(
+                    "FILE \"{stem}.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n"
+                ),
+            )
+            .expect("ambiguous cue");
+        }
+        assert!(classify_tag_transfer_roots(std::slice::from_ref(&ambiguous), &cancel)
+            .expect_err("multiple CUE scopes must refuse")
+            .contains("multiple CUE albums"));
+
+        let empty = album.join("empty");
+        std::fs::create_dir(&empty).expect("empty folder");
+        assert!(classify_tag_transfer_roots(std::slice::from_ref(&empty), &cancel)
+            .expect_err("empty folder must refuse")
+            .contains("contains no audio files"));
+
+        use std::io::{Seek, SeekFrom, Write};
+        let disc = album.join("disc.iso");
+        let total = (crate::tui::sacd::MASTER_TOC_LSNS[0] + 1)
+            * crate::tui::sacd::SECTOR_SIZE;
+        let mut iso = std::fs::File::create(&disc).expect("SACD fixture");
+        iso.set_len(total).expect("size SACD fixture");
+        iso.seek(SeekFrom::Start(
+            crate::tui::sacd::MASTER_TOC_LSNS[0] * crate::tui::sacd::SECTOR_SIZE,
+        ))
+        .expect("seek SACD fixture");
+        iso.write_all(crate::tui::sacd::MASTER_TOC_MAGIC)
+            .expect("write SACD magic");
+        drop(iso);
+        assert!(classify_tag_transfer_roots(std::slice::from_ref(&disc), &cancel)
+            .expect_err("disc image must refuse")
+            .contains("disc-image"));
+    }
+
+    #[test]
+    fn directory_cue_and_image_gestures_resolve_the_same_sidecar_carrier() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        let image = album.join("album.flac");
+        let cue = album.join("album.cue");
+        assert!(create_flac_fixture(&image), "flac fixture");
+        let sidecar = concat!(
+            "TITLE \"Sidecar Album\"\n",
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"One\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Two\"\n",
+            "    INDEX 01 00:30:00\n",
+        );
+        let embedded = sidecar.replace("Sidecar Album", "Embedded Album");
+        std::fs::write(&cue, sidecar).expect("sidecar cue");
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded.clone()),
+            )],
+        )
+        .expect("embedded cuesheet");
+
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let by_directory = classify_tag_transfer_roots(std::slice::from_ref(&album), &cancel)
+            .expect("directory carrier");
+        let by_cue = classify_tag_transfer_roots(std::slice::from_ref(&cue), &cancel)
+            .expect("cue carrier");
+        let by_image = classify_tag_transfer_roots(std::slice::from_ref(&image), &cancel)
+            .expect("image carrier");
+
+        for carrier in [&by_directory, &by_cue, &by_image] {
+            assert!(matches!(
+                carrier,
+                super::super::tag_interchange::TransferCarrier::SidecarCue { cue_path, .. }
+                    if cue_path == &cue
+            ));
+        }
+        for carrier in [&by_directory, &by_image] {
+            let super::super::tag_interchange::TransferCarrier::SidecarCue { cue_text, .. } = carrier else {
+                unreachable!();
+            };
+            // The CUESHEET tag round-trip normalizes the trailing newline;
+            // the "Embedded Album" marker still proves embedded text won.
+            assert_eq!(
+                cue_text.trim_end_matches('\n'),
+                embedded.trim_end_matches('\n'),
+                "matched embedded text must be read under sidecar identity",
+            );
         }
     }
 
@@ -53007,8 +54050,10 @@ mod mb_picker_verification_lifecycle_tests {
                 editor_fingerprint,
                 scope: TagTransferScope::All,
                 source_entries: vec![album_entry("Unsaved Album")],
-                source_count: 1,
-                result: Ok(vec![std::env::temp_dir().join("late-target.flac")]),
+                source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
+                result: Ok(crate::tui::tag_interchange::TransferCarrier::Files {
+                    paths: vec![std::env::temp_dir().join("late-target.flac")],
+                }),
             },
             &worker_tx,
         );

@@ -1745,7 +1745,7 @@ fn open_browse_tag_transfer_picker(
             app,
             tui_file_picker::FilePickerConfig {
                 start_dir,
-                filter: tui_file_picker::FilePickerFilter::Audio,
+                filter: super::tag_interchange::tag_transfer_picker_filter(),
                 title: title.to_string(),
                 theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
                 selection_mode: tui_file_picker::FilePickerSelectionMode::FilesOrDirectories,
@@ -1770,7 +1770,9 @@ fn open_browse_tag_transfer_picker(
         },
         picker,
     ));
-    app.set_status(format!("{title}: choose one audio file or directory"));
+    app.set_status(format!(
+        "{title}: choose audio files, a CUE sheet, or a directory"
+    ));
 }
 
 pub(crate) fn start_tag_transfer(
@@ -1789,9 +1791,10 @@ pub(crate) fn start_tag_transfer(
     let request = super::browse::PendingTagTransfer {
         generation,
         source: super::browse::PendingTagTransferSource::Roots(source_roots),
-        target_roots,
+        target: super::browse::PendingTagTransferTarget::Roots(target_roots),
         scope,
         verification: app.config.file_operations.verification,
+        require_browse_confirmation: true,
     };
 
     if let Some(cancel) = app.browse.tag_transfer_cancel.as_ref() {
@@ -1806,12 +1809,12 @@ pub(crate) fn start_tag_transfer(
 pub(crate) fn start_tag_transfer_from_editor_snapshot(
     app: &mut AppState,
     entries: Vec<super::probe::TagEntry>,
-    source_count: usize,
-    target_roots: Vec<PathBuf>,
+    source_dimension: super::tag_interchange::TransferDimension,
+    target: super::tag_interchange::TransferCarrier,
     scope: TagTransferScope,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    if source_count == 0 || target_roots.is_empty() {
+    if source_dimension.count() == 0 || target.count() == 0 {
         app.set_status("Transfer tags: editor source and target are required");
         return;
     }
@@ -1821,11 +1824,12 @@ pub(crate) fn start_tag_transfer_from_editor_snapshot(
         generation,
         source: super::browse::PendingTagTransferSource::EditorSnapshot {
             entries,
-            source_count,
+            dimension: source_dimension,
         },
-        target_roots,
+        target: super::browse::PendingTagTransferTarget::Classified(target),
         scope,
         verification: app.config.file_operations.verification,
+        require_browse_confirmation: false,
     };
     if let Some(cancel) = app.browse.tag_transfer_cancel.as_ref() {
         cancel.cancel();
@@ -1846,24 +1850,201 @@ fn launch_tag_transfer(
     let super::browse::PendingTagTransfer {
         generation,
         source,
-        target_roots,
+        target,
         scope,
         verification,
+        require_browse_confirmation,
     } = request;
     let cancel = super::probe::MetadataWriteCancelFlag::new();
     app.browse.tag_transfer_active_generation = Some(generation);
     app.browse.tag_transfer_cancel = Some(cancel.clone());
-    app.set_status("Transfer tags: reading source and target metadata...");
+    app.set_status(if require_browse_confirmation {
+        "Transfer tags: resolving carriers before confirmation..."
+    } else {
+        "Transfer tags: resolving carriers and metadata..."
+    });
 
     let worker_tx = tx.clone();
     tokio::spawn(async move {
-        let worker_cancel = cancel.clone();
+        if require_browse_confirmation {
+            let worker_cancel = cancel.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                let super::browse::PendingTagTransferSource::Roots(source_roots) = source else {
+                    return Err(
+                        "internal error: browse confirmation requires root-based source"
+                            .to_string(),
+                    );
+                };
+                let super::browse::PendingTagTransferTarget::Roots(target_roots) = target else {
+                    return Err(
+                        "internal error: browse confirmation requires root-based target"
+                            .to_string(),
+                    );
+                };
+                let source_carrier = super::keybindings::classify_tag_transfer_roots(
+                    &source_roots,
+                    &worker_cancel,
+                )?;
+                let target = super::keybindings::classify_tag_transfer_roots(
+                    &target_roots,
+                    &worker_cancel,
+                )?;
+                let source_entries = super::tag_interchange::read_transfer_carrier_entries(
+                    &source_carrier,
+                    scope,
+                    &worker_cancel,
+                )?;
+                let source_dimension = source_carrier.dimension();
+                let field_count = super::tag_interchange::preview_tag_transfer(
+                    &source_entries,
+                    source_dimension,
+                    &target,
+                    scope,
+                )?;
+                Ok(super::browse::PreparedTagTransfer {
+                    generation,
+                    source_entries,
+                    source_dimension,
+                    source_carrier: source_carrier.label().to_string(),
+                    target,
+                    scope,
+                    verification,
+                    field_count,
+                })
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(format!("Transfer tags preparation worker failed: {error}"))
+            });
+            let _ = worker_tx
+                .send(AppMessage::TagTransferPrepared {
+                    generation,
+                    result: prepared,
+                })
+                .await;
+        } else {
+            let worker_cancel = cancel.clone();
+            let progress_tx = worker_tx.clone();
+            let completion = tokio::task::spawn_blocking(move || {
+                let progress = |completed: usize, total: usize, path: &std::path::Path| {
+                    if completed == 1 || completed == total || completed % 16 == 0 {
+                        let _ = progress_tx.try_send(AppMessage::TagTransferProgress {
+                            generation,
+                            completed,
+                            total,
+                            path: path.to_path_buf(),
+                        });
+                    }
+                };
+                let target = match target {
+                    super::browse::PendingTagTransferTarget::Roots(target_roots) => {
+                        super::keybindings::classify_tag_transfer_roots(
+                            &target_roots,
+                            &worker_cancel,
+                        )?
+                    }
+                    super::browse::PendingTagTransferTarget::Classified(target) => target,
+                };
+                match source {
+                    super::browse::PendingTagTransferSource::Roots(source_roots) => {
+                        let source = super::keybindings::classify_tag_transfer_roots(
+                            &source_roots,
+                            &worker_cancel,
+                        )?;
+                        super::tag_interchange::execute_tag_transfer_between_carriers(
+                            &source,
+                            &target,
+                            scope,
+                            verification,
+                            &worker_cancel,
+                            Some(&progress),
+                        )
+                    }
+                    super::browse::PendingTagTransferSource::EditorSnapshot {
+                        entries,
+                        dimension,
+                    } => super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
+                        &entries,
+                        dimension,
+                        &target,
+                        scope,
+                        verification,
+                        &worker_cancel,
+                        Some(&progress),
+                    ),
+                }
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("Transfer tags worker failed: {error}")));
+            let _ = worker_tx
+                .send(AppMessage::TagTransferComplete {
+                    generation,
+                    result: completion,
+                })
+                .await;
+        }
+    });
+}
+
+pub(crate) fn handle_tag_transfer_prepared(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    result: Result<super::browse::PreparedTagTransfer, String>,
+) {
+    if app.browse.tag_transfer_active_generation != Some(generation) {
+        return;
+    }
+    app.browse.tag_transfer_active_generation = None;
+    app.browse.tag_transfer_cancel = None;
+
+    if let Some(pending) = app.browse.tag_transfer_pending.take() {
+        launch_tag_transfer(app, pending, tx);
+        return;
+    }
+    if generation != app.browse.tag_transfer_generation {
+        return;
+    }
+    match result {
+        Ok(prepared) => {
+            let message = prepared.confirmation_prompt();
+            app.active_overlay = ActiveOverlay::Confirmation {
+                message,
+                action: super::app::ConfirmAction::BrowseTagTransfer { prepared },
+            };
+            app.set_status("Transfer tags: confirm write");
+        }
+        Err(error) => app.set_status(error),
+    }
+}
+
+pub(crate) fn launch_prepared_tag_transfer(
+    app: &mut AppState,
+    prepared: super::browse::PreparedTagTransfer,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if app.browse.tag_transfer_cancel.is_some()
+        || app.browse.tag_transfer_active_generation.is_some()
+    {
+        app.set_status("Transfer tags: another transfer is already active");
+        return;
+    }
+    let generation = prepared.generation;
+    if generation != app.browse.tag_transfer_generation {
+        app.set_status("Transfer tags: confirmation expired after a newer request");
+        return;
+    }
+    let cancel = super::probe::MetadataWriteCancelFlag::new();
+    app.browse.tag_transfer_active_generation = Some(generation);
+    app.browse.tag_transfer_cancel = Some(cancel.clone());
+    app.active_overlay = ActiveOverlay::None;
+    app.set_status("Transfer tags: writing confirmed carrier...");
+
+    let worker_tx = tx.clone();
+    tokio::spawn(async move {
         let progress_tx = worker_tx.clone();
         let completion = tokio::task::spawn_blocking(move || {
             let progress = |completed: usize, total: usize, path: &std::path::Path| {
-                // File-count progress is advisory. Never block a metadata write
-                // behind a saturated UI channel, and avoid message floods for
-                // large directory transfers.
                 if completed == 1 || completed == total || completed % 16 == 0 {
                     let _ = progress_tx.try_send(AppMessage::TagTransferProgress {
                         generation,
@@ -1873,51 +2054,20 @@ fn launch_tag_transfer(
                     });
                 }
             };
-            let target_paths = super::command::expand_audio_paths_for_metadata_limited(
-                &target_roots,
-                TAG_CLIPBOARD_COPY_MAX_VISITED,
-                TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
-                || worker_cancel.is_cancelled(),
+            let mut report = super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
+                &prepared.source_entries,
+                prepared.source_dimension,
+                &prepared.target,
+                prepared.scope,
+                prepared.verification,
+                &cancel,
+                Some(&progress),
             )?;
-            if target_paths.is_empty() {
-                return Err("Transfer tags: target contains no audio files".to_string());
-            }
-            match source {
-                super::browse::PendingTagTransferSource::Roots(source_roots) => {
-                    let source_paths = super::command::expand_audio_paths_for_metadata_limited(
-                        &source_roots,
-                        TAG_CLIPBOARD_COPY_MAX_VISITED,
-                        TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
-                        || worker_cancel.is_cancelled(),
-                    )?;
-                    if source_paths.is_empty() {
-                        return Err("Transfer tags: source contains no audio files".to_string());
-                    }
-                    super::tag_interchange::execute_tag_transfer_from_paths(
-                        &source_paths,
-                        &target_paths,
-                        scope,
-                        verification,
-                        &worker_cancel,
-                        Some(&progress),
-                    )
-                }
-                super::browse::PendingTagTransferSource::EditorSnapshot {
-                    entries,
-                    source_count,
-                } => super::tag_interchange::execute_tag_transfer_from_entries(
-                    &entries,
-                    source_count,
-                    &target_paths,
-                    scope,
-                    verification,
-                    &worker_cancel,
-                    Some(&progress),
-                ),
-            }
+            report.source_carrier = Some(prepared.source_carrier.clone());
+            Ok(report)
         })
         .await
-        .unwrap_or_else(|err| Err(format!("Transfer tags worker failed: {err}")));
+        .unwrap_or_else(|error| Err(format!("Transfer tags worker failed: {error}")));
         let _ = worker_tx
             .send(AppMessage::TagTransferComplete {
                 generation,
@@ -1945,7 +2095,7 @@ pub(crate) fn handle_tag_transfer_progress(
         .and_then(|value| value.to_str())
         .unwrap_or("target");
     app.set_status(format!(
-        "Transfer tags: {completed} of {total} files processed ({name})"
+        "Transfer tags: {completed} of {total} targets processed ({name})"
     ));
 }
 
@@ -3965,7 +4115,7 @@ mod tests {
         );
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Transfer tags: 16 of 40 files processed (16 - Duchess.flac)")
+            Some("Transfer tags: 16 of 40 targets processed (16 - Duchess.flac)")
         );
 
         let current = app.status_message.as_ref().map(|(message, _)| message.clone());

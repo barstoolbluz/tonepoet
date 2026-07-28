@@ -227,12 +227,20 @@ impl FilePickerState {
         let mut spans = Vec::new();
         let mut x = area.x;
         let toolbar_right = area.x.saturating_add(area.width);
-        let mut buttons = vec![
+        // Confirmation is purpose-critical and must survive the toolbar's
+        // hard clip at narrow embedded-picker widths. Place it before all
+        // overflow-prone file-management controls.
+        let mut buttons = Vec::new();
+        if let Some(label) = self.selection_confirmation_label() {
+            buttons.push((label, Some(ToolbarAction::AcceptSelection), false));
+            buttons.push(("│".to_string(), None, true));
+        }
+        buttons.extend([
             ("‹ Back".to_string(), Some(ToolbarAction::Back), self.history_back.is_empty()),
             ("› Forward".to_string(), Some(ToolbarAction::Forward), self.history_forward.is_empty()),
             ("↑ Up".to_string(), Some(ToolbarAction::Up), self.current_dir.parent().is_none()),
             ("│".to_string(), None, true),
-        ];
+        ]);
         if self.hide_extension.as_deref() == Some(".toml") {
             let no_selection = self.current_selection().is_none();
             buttons.push(("Rename".to_string(), Some(ToolbarAction::Rename), no_selection));
@@ -248,9 +256,6 @@ impl FilePickerState {
             buttons.push(("Search".to_string(), Some(ToolbarAction::Search), false));
             buttons.push(("Properties".to_string(), Some(ToolbarAction::Properties), self.current_selection().is_none()));
             buttons.push(("Bookmarks".to_string(), Some(ToolbarAction::Bookmarks), false));
-        }
-        if self.selection_mode == FilePickerSelectionMode::Directories {
-            buttons.push(("Select Folder".to_string(), Some(ToolbarAction::AcceptSelection), false));
         }
         for (idx, (label, action, disabled)) in buttons.iter().enumerate() {
             if idx > 0 {
@@ -2165,14 +2170,24 @@ mod tests {
             }
         }
 
-        let file_ops = picker
-            .toolbar_button_rect(ToolbarAction::FileOperations)
-            .expect("visible file operations geometry");
+        // Priority-placed confirm ("Select File") may push File operations
+        // past the hard clip at this width; the pin is that any visible
+        // geometry stays clipped, and the confirm itself survives.
+        let confirm = picker
+            .toolbar_button_rect(ToolbarAction::AcceptSelection)
+            .expect("priority-placed confirm geometry");
         assert!(
-            rect_contains_rect(toolbar_area, file_ops),
-            "toolbar geometry not clipped: {:?}",
-            file_ops
+            rect_contains_rect(toolbar_area, confirm),
+            "confirm geometry not clipped: {:?}",
+            confirm
         );
+        if let Some(file_ops) = picker.toolbar_button_rect(ToolbarAction::FileOperations) {
+            assert!(
+                rect_contains_rect(toolbar_area, file_ops),
+                "toolbar geometry not clipped: {:?}",
+                file_ops
+            );
+        }
     }
 
     #[test]
@@ -2609,4 +2624,36 @@ mod tests {
         }
         None
     }
+
+    #[test]
+    fn contextual_confirm_remains_visible_at_embedded_picker_minimum_width() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        fs::write(&file, b"audio").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::FilesOrDirectories,
+            ..FilePickerConfig::default()
+        });
+        let file_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == file)
+            .expect("file visible");
+        picker.set_file_cursor(file_index, 8);
+
+        // Tonepoet's embedded overlay clamps to 56 columns.
+        let backend = TestBackend::new(56, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 56, 18)))
+            .expect("draw");
+
+        assert!(
+            picker.toolbar_button_rect(ToolbarAction::AcceptSelection).is_some(),
+            "the explicit confirm must be placed before overflow-prone controls"
+        );
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("Select File"));
+    }
+
 }

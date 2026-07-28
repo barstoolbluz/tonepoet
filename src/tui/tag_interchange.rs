@@ -10,6 +10,100 @@ use std::fmt;
 
 use super::probe::TagEntry;
 
+/// Picker-local filter for tag transfer. Keeping this separate from the global
+/// Audio filter prevents `.cue` visibility from changing unrelated pickers.
+pub(crate) fn tag_transfer_picker_filter() -> tui_file_picker::FilePickerFilter {
+    let mut extensions = crate::convert::classify::SUPPORTED_AUDIO_FILE_EXTENSIONS
+        .iter()
+        .map(|extension| (*extension).to_string())
+        .collect::<Vec<_>>();
+    extensions.push("cue".to_string());
+    tui_file_picker::FilePickerFilter::Custom {
+        label: "Audio and CUE".to_string(),
+        extensions,
+    }
+}
+
+/// Carrier selected at the transfer boundary. CUE carriers retain both their
+/// policy-selected text and the concrete write authority needed for TOCTOU
+/// revalidation immediately before a write.
+#[derive(Debug, Clone)]
+pub enum TransferCarrier {
+    Files { paths: Vec<std::path::PathBuf> },
+    SidecarCue {
+        cue_path: std::path::PathBuf,
+        image_path: std::path::PathBuf,
+        // Written by classification; read by carrier regression tests.
+        #[allow(dead_code)]
+        cue_text: String,
+        sheet: crate::convert::cue_parser::CueSheet,
+    },
+    EmbeddedCue {
+        image_path: std::path::PathBuf,
+        #[allow(dead_code)]
+        cue_text: String,
+        sheet: crate::convert::cue_parser::CueSheet,
+    },
+}
+
+impl TransferCarrier {
+    pub(crate) fn dimension(&self) -> TransferDimension {
+        match self {
+            Self::Files { paths } => TransferDimension::Files(paths.len()),
+            Self::SidecarCue { sheet, .. } | Self::EmbeddedCue { sheet, .. } => {
+                TransferDimension::Tracks(sheet.tracks.len())
+            }
+        }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.dimension().count()
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Files { .. } => "files",
+            Self::SidecarCue { .. } => "sidecar CUE",
+            Self::EmbeddedCue { .. } => "embedded CUE",
+        }
+    }
+
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDimension {
+    Files(usize),
+    Tracks(usize),
+}
+
+impl TransferDimension {
+    pub(crate) fn count(self) -> usize {
+        match self {
+            Self::Files(count) | Self::Tracks(count) => count,
+        }
+    }
+
+    fn is_tracks(self) -> bool {
+        matches!(self, Self::Tracks(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstTrackCollapseEligibility {
+    Forbidden,
+    /// The target is the file-dimensional metadata surface of one audio image
+    /// and that surface carries a CUESHEET anchor. This is the only shape in
+    /// which collapsing multiple source positions to the first track is
+    /// semantically authorized.
+    SingleImageWithCuesheet,
+}
+
+impl FirstTrackCollapseEligibility {
+    fn permits(self) -> bool {
+        matches!(self, Self::SingleImageWithCuesheet)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldBlock {
     pub key: String,
@@ -868,6 +962,615 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn transfer_picker_filter_is_canonical_audio_plus_cue_without_widening_global_audio() {
+        let transfer = tag_transfer_picker_filter();
+        let actual_extensions = match &transfer {
+            tui_file_picker::FilePickerFilter::Custom { extensions, .. } => extensions
+                .iter()
+                .map(|extension| extension.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>(),
+            other => panic!("transfer filter must be explicit canonical composition: {other:?}"),
+        };
+        let mut expected_extensions = crate::convert::classify::SUPPORTED_AUDIO_FILE_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        expected_extensions.insert("cue".to_string());
+        assert_eq!(
+            actual_extensions, expected_extensions,
+            "transfer filter must equal canonical audio coverage plus only CUE"
+        );
+
+        for extension in crate::convert::classify::SUPPORTED_AUDIO_FILE_EXTENSIONS {
+            let path = std::path::PathBuf::from(format!("track.{extension}"));
+            assert!(
+                crate::convert::classify::is_audio_file_path(&path),
+                "canonical source must classify {extension} as audio"
+            );
+            assert!(
+                transfer.accepts_path(&path, false),
+                "transfer picker must admit canonical audio extension {extension}"
+            );
+        }
+        assert!(transfer.accepts_path(std::path::Path::new("album.CUE"), false));
+        assert!(!transfer.accepts_path(std::path::Path::new("notes.txt"), false));
+        assert!(!tui_file_picker::FilePickerFilter::Audio
+            .accepts_path(std::path::Path::new("album.cue"), false));
+    }
+
+    #[test]
+    fn cue_rows_sort_gapped_track_numbers_positionally_and_map_fields() {
+        let sheet = crate::convert::cue_parser::CueSheet {
+            title: Some("Album".to_string()),
+            performer: Some("Album Artist".to_string()),
+            date: Some("1980".to_string()),
+            genre: Some("Rock".to_string()),
+            catalog: Some("CAT-7".to_string()),
+            tracks: vec![
+                crate::convert::cue_parser::CueTrack {
+                    number: 7,
+                    title: Some("Seven".to_string()),
+                    performer: Some("Artist Seven".to_string()),
+                    isrc: Some("ISRC00000007".to_string()),
+                    ..Default::default()
+                },
+                crate::convert::cue_parser::CueTrack {
+                    number: 2,
+                    title: Some("Two".to_string()),
+                    performer: Some("Artist Two".to_string()),
+                    isrc: Some("ISRC00000002".to_string()),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let entries = cue_sheet_transfer_entries(&sheet);
+        let by_key = |key: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.display_key == key)
+                .expect("CUE field")
+        };
+        assert_eq!(by_key("TITLE").per_file_values, vec!["Two", "Seven"]);
+        assert_eq!(
+            by_key("ARTIST").per_file_values,
+            vec!["Artist Two", "Artist Seven"]
+        );
+        assert_eq!(
+            by_key("ISRC").per_file_values,
+            vec!["ISRC00000002", "ISRC00000007"]
+        );
+        assert_eq!(by_key("ALBUM").per_file_values, vec!["Album", "Album"]);
+        assert!(entries
+            .iter()
+            .all(|entry| matches!(entry.row_scope, RowScope::Track)));
+    }
+
+    #[test]
+    fn track_dimension_plans_cover_n_to_n_mismatch_collapse_and_one_file_skip() {
+        let track_source = vec![entry("TITLE", &["First", "Second"])];
+        let positional = plan_transfer_values_for_dimensions(
+            &track_source,
+            TransferDimension::Tracks(2),
+            TransferDimension::Tracks(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("track positional plan");
+        assert_eq!(positional.fields[0].values, vec!["First", "Second"]);
+
+        let tracks_to_files = plan_transfer_values_for_dimensions(
+            &track_source,
+            TransferDimension::Tracks(2),
+            TransferDimension::Files(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("track carrier to files positional plan");
+        assert_eq!(tracks_to_files.fields[0].values, vec!["First", "Second"]);
+
+        let files_to_tracks = plan_transfer_values_for_dimensions(
+            &track_source,
+            TransferDimension::Files(2),
+            TransferDimension::Tracks(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("files to track carrier positional plan");
+        assert_eq!(files_to_tracks.fields[0].values, vec!["First", "Second"]);
+
+        assert_eq!(
+            plan_transfer_values_for_dimensions(
+                &track_source,
+                TransferDimension::Tracks(2),
+                TransferDimension::Tracks(3),
+                super::super::app::TagTransferScope::All,
+            )
+            .unwrap_err(),
+            "tag transfer carrier dimensions do not match: 2 source positions and 3 target positions"
+        );
+
+        assert!(plan_transfer_values_for_dimensions(
+            &track_source,
+            TransferDimension::Tracks(2),
+            TransferDimension::Files(1),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect_err("ordinary single-file target must not collapse track values")
+        .contains("do not match"));
+
+        let collapsed = plan_transfer_values_for_dimensions_with_collapse(
+            &track_source,
+            TransferDimension::Tracks(2),
+            TransferDimension::Files(1),
+            super::super::app::TagTransferScope::All,
+            FirstTrackCollapseEligibility::SingleImageWithCuesheet,
+        )
+        .expect("track-carrier to single-image collapse");
+        assert!(collapsed.first_track_collapse);
+        assert_eq!(collapsed.fields[0].values, vec!["First"]);
+
+        assert!(plan_transfer_values_for_dimensions(
+            &track_source,
+            TransferDimension::Files(2),
+            TransferDimension::Files(1),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect_err("ordinary single-file target must not collapse file values")
+        .contains("equal source/target counts"));
+
+        let file_collapse = plan_transfer_values_for_dimensions_with_collapse(
+            &track_source,
+            TransferDimension::Files(2),
+            TransferDimension::Files(1),
+            super::super::app::TagTransferScope::All,
+            FirstTrackCollapseEligibility::SingleImageWithCuesheet,
+        )
+        .expect("multi-file to single-image collapse");
+        assert!(file_collapse.first_track_collapse);
+        assert_eq!(file_collapse.fields[0].values, vec!["First"]);
+
+        let file_source = vec![
+            entry("ALBUM", &["Duke"]),
+            entry("TITLE", &["Single file title"]),
+        ];
+        let into_tracks = plan_transfer_values_for_dimensions(
+            &file_source,
+            TransferDimension::Files(1),
+            TransferDimension::Tracks(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("one file into track carrier");
+        assert_eq!(into_tracks.fields.len(), 1);
+        assert_eq!(into_tracks.fields[0].canonical_key, "ALBUM");
+        assert_eq!(into_tracks.fields[0].values, vec!["Duke", "Duke"]);
+        assert!(into_tracks
+            .skipped_fields
+            .iter()
+            .any(|message| message.starts_with("TITLE skipped:")));
+    }
+
+    #[test]
+    fn first_track_collapse_requires_single_image_and_nonempty_cuesheet_evidence() {
+        let source = vec![entry("TITLE", &["First", "Second"])];
+        let mut ordinary = editor_with_files(1, Vec::new());
+        assert_eq!(
+            metadata_editor_first_track_collapse_eligibility(
+                &ordinary,
+                TransferDimension::Files(1)
+            ),
+            FirstTrackCollapseEligibility::Forbidden
+        );
+        assert!(apply_transfer_entries_to_editor_with_dimension(
+            &mut ordinary,
+            &source,
+            TransferDimension::Files(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect_err("ordinary single file must reject multi-source collapse")
+        .contains("equal source/target counts"));
+
+        let cuesheet = concat!(
+            "FILE \"image.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let mut single_image = editor_with_files(1, vec![entry("CUESHEET", &[cuesheet])]);
+        assert_eq!(
+            metadata_editor_first_track_collapse_eligibility(
+                &single_image,
+                TransferDimension::Files(1)
+            ),
+            FirstTrackCollapseEligibility::SingleImageWithCuesheet
+        );
+        let report = apply_transfer_entries_to_editor_with_dimension(
+            &mut single_image,
+            &source,
+            TransferDimension::Files(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("single image with CUESHEET may collapse to first track");
+        assert!(report.first_track_collapse);
+        let title = single_image
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("collapsed title row");
+        assert_eq!(title.per_file_values, vec!["First"]);
+    }
+
+    #[test]
+    fn cue_album_fields_use_first_source_value_with_explicit_warning() {
+        let source = vec![
+            entry("ALBUM", &["First Album", "Second Album"]),
+            entry("TITLE", &["Track One", "Track Two"]),
+        ];
+        let plan = plan_transfer_values_for_dimensions(
+            &source,
+            TransferDimension::Files(2),
+            TransferDimension::Tracks(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("file rows into CUE tracks");
+
+        let album = plan
+            .fields
+            .iter()
+            .find(|field| field.canonical_key == "ALBUM")
+            .expect("album field");
+        assert_eq!(album.values, vec!["First Album", "First Album"]);
+        let title = plan
+            .fields
+            .iter()
+            .find(|field| field.canonical_key == "TITLE")
+            .expect("track title field");
+        assert_eq!(title.values, vec!["Track One", "Track Two"]);
+        assert_eq!(
+            plan.cardinality_warnings,
+            vec!["ALBUM is album-scoped in CUE; used the first source value"]
+        );
+    }
+
+    #[test]
+    fn cue_target_field_cap_excludes_songwriter_isrc_numbering_and_unknowns() {
+        let source = vec![
+            entry("TITLE", &["One", "Two"]),
+            entry("ARTIST", &["A", "B"]),
+            entry("ALBUM", &["Album", "Album"]),
+            entry("SONGWRITER", &["Writer", "Writer"]),
+            entry("ISRC", &["X", "Y"]),
+            entry("TRACKNUMBER", &["1", "2"]),
+            entry("COMMENT", &["No", "No"]),
+        ];
+        let plan = plan_transfer_values_for_dimensions(
+            &source,
+            TransferDimension::Tracks(2),
+            TransferDimension::Tracks(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("CUE cap plan");
+        assert_eq!(
+            plan.fields
+                .iter()
+                .map(|field| field.canonical_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["TITLE", "ARTIST", "ALBUM"]
+        );
+        assert!(plan
+            .skipped_fields
+            .iter()
+            .any(|message| message.contains("SONGWRITER excluded")));
+        assert!(plan
+            .skipped_fields
+            .iter()
+            .any(|message| message.contains("ISRC skipped")));
+        assert!(plan
+            .skipped_fields
+            .iter()
+            .any(|message| message.contains("TRACKNUMBER skipped")));
+        assert!(plan
+            .skipped_fields
+            .iter()
+            .any(|message| message.contains("COMMENT skipped")));
+    }
+
+    #[test]
+    fn embedded_cue_writes_fail_closed_for_non_flac_targets() {
+        let source = vec![entry("TITLE", &["One", "Two"])];
+        let sheet = crate::convert::cue_parser::CueSheet {
+            tracks: vec![
+                crate::convert::cue_parser::CueTrack {
+                    number: 1,
+                    index01_frames: Some(0),
+                    ..Default::default()
+                },
+                crate::convert::cue_parser::CueTrack {
+                    number: 2,
+                    index01_frames: Some(75),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let target = TransferCarrier::EmbeddedCue {
+            image_path: std::path::PathBuf::from("image.wav"),
+            cue_text: concat!(
+                "FILE \"image.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    INDEX 01 00:01:00\n",
+            )
+            .to_string(),
+            sheet,
+        };
+        let error = execute_tag_transfer_to_cue(
+            &source,
+            TransferDimension::Tracks(2),
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Standard,
+            &super::super::probe::MetadataWriteCancelFlag::new(),
+            None,
+        )
+        .expect_err("non-FLAC embedded writes must fail closed");
+        assert_eq!(
+            error,
+            "embedded CUE write is supported for FLAC images this round",
+        );
+    }
+
+    #[test]
+    fn sidecar_cue_transfer_route_preserves_structure_and_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("album.flac");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&image, b"audio").expect("image");
+        let original = concat!(
+            "REM COMMENT \"leave this alone\"\r\n",
+            "TITLE \"Old Album\"\r\n",
+            "FILE \"album.flac\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    TITLE \"Old One\"\r\n",
+            "    FLAGS PRE\r\n",
+            "    INDEX 01 00:00:00\r\n",
+            "  TRACK 02 AUDIO\r\n",
+            "    TITLE \"Old Two\"\r\n",
+            "    INDEX 01 03:00:00\r\n",
+        );
+        std::fs::write(&cue, original).expect("cue");
+        let target = TransferCarrier::SidecarCue {
+            cue_path: cue.clone(),
+            image_path: image,
+            cue_text: original.to_string(),
+            sheet: crate::convert::cue_parser::parse_cue(original),
+        };
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let source = vec![
+            entry("ALBUM", &["New Album", "New Album"]),
+            entry("TITLE", &["New One", "New Two"]),
+            entry("ARTIST", &["Artist One", "Artist Two"]),
+        ];
+
+        let first = execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            TransferDimension::Tracks(2),
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("sidecar CUE transfer");
+        assert_eq!(first.written, 1);
+        assert_eq!(first.failed.len(), 0);
+        let first_status = first.status();
+        assert!(first_status.starts_with("Wrote 3 fields to sidecar CUE"));
+        assert!(first_status.contains(&cue.display().to_string()));
+        assert!(first_status.contains("1 rewritten, 0 unchanged, 0 failed"));
+        let rewritten = std::fs::read_to_string(&cue).expect("rewritten cue");
+        assert!(rewritten.contains("REM COMMENT \"leave this alone\"\r\n"));
+        assert!(rewritten.contains("FILE \"album.flac\" WAVE\r\n"));
+        assert!(rewritten.contains("FLAGS PRE\r\n"));
+        assert!(rewritten.contains("INDEX 01 03:00:00\r\n"));
+        assert!(rewritten.contains("TITLE \"New Album\"\r\n"));
+        assert!(rewritten.contains("TITLE \"New One\"\r\n"));
+        assert!(rewritten.contains("PERFORMER \"Artist Two\"\r\n"));
+
+        let before_second = std::fs::read(&cue).expect("before second transfer");
+        let second = execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            TransferDimension::Tracks(2),
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("idempotent sidecar CUE transfer");
+        assert_eq!(second.unchanged, 1);
+        let second_status = second.status();
+        assert!(second_status.starts_with("Sidecar CUE"));
+        assert!(second_status.contains(&cue.display().to_string()));
+        assert!(second_status.contains("already matched 3 fields"));
+        assert!(second_status.contains("0 rewritten, 1 unchanged, 0 failed"));
+        assert!(!second_status.starts_with("Wrote"));
+        assert_eq!(std::fs::read(&cue).expect("after second transfer"), before_second);
+    }
+
+    #[test]
+    fn embedded_flac_cue_transfer_round_trips_and_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("album.flac");
+        let original = concat!(
+            "REM COMMENT \"leave this alone\"\n",
+            "TITLE \"Old Album\"\n",
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Old One\"\n",
+            "    FLAGS PRE\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Old Two\"\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let mut bytes = b"fLaC".to_vec();
+        bytes.extend_from_slice(&flac_block(0, false, &[0; 34]));
+        bytes.extend_from_slice(&flac_block(
+            4,
+            false,
+            &vorbis_block_body(&[("TITLE", "Image"), ("CUESHEET", original)]),
+        ));
+        bytes.extend_from_slice(&flac_block(1, true, &[0; 4096]));
+        bytes.extend((0..4096).map(|index| (index % 251) as u8));
+        std::fs::write(&image, bytes).expect("synthetic FLAC image");
+
+        let target = TransferCarrier::EmbeddedCue {
+            image_path: image.clone(),
+            cue_text: original.to_string(),
+            sheet: crate::convert::cue_parser::parse_cue(original),
+        };
+        let source = vec![
+            entry("ALBUM", &["New Album", "New Album"]),
+            entry("TITLE", &["New One", "New Two"]),
+            entry("ARTIST", &["Artist One", "Artist Two"]),
+        ];
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+
+        let first = execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            TransferDimension::Tracks(2),
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("embedded FLAC CUE transfer");
+        assert_eq!(first.written, 1);
+        let first_status = first.status();
+        assert!(first_status.starts_with("Wrote 3 fields to embedded CUE in"));
+        assert!(first_status.contains(&image.display().to_string()));
+        assert!(first_status.contains("1 rewritten, 0 unchanged, 0 failed"));
+        let rewritten = super::super::probe::read_all_tags_merged(&[image.clone()])
+            .expect("read embedded transfer result")
+            .into_iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .and_then(|entry| entry.per_file_values.into_iter().next())
+            .expect("embedded CUESHEET");
+        assert!(rewritten.contains("REM COMMENT \"leave this alone\""));
+        assert!(rewritten.contains("FILE \"album.flac\" WAVE"));
+        assert!(rewritten.contains("FLAGS PRE"));
+        assert!(rewritten.contains("INDEX 01 03:00:00"));
+        assert!(rewritten.contains("TITLE \"New Album\""));
+        assert!(rewritten.contains("TITLE \"New One\""));
+        assert!(rewritten.contains("PERFORMER \"Artist Two\""));
+
+        let before_second = std::fs::read(&image).expect("before second transfer");
+        let second = execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            TransferDimension::Tracks(2),
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("idempotent embedded FLAC CUE transfer");
+        assert_eq!(second.unchanged, 1);
+        let second_status = second.status();
+        assert!(second_status.starts_with("Embedded CUE in"));
+        assert!(second_status.contains(&image.display().to_string()));
+        assert!(second_status.contains("already matched 3 fields"));
+        assert!(second_status.contains("0 rewritten, 1 unchanged, 0 failed"));
+        assert!(!second_status.starts_with("Wrote"));
+        assert_eq!(std::fs::read(&image).expect("after second transfer"), before_second);
+    }
+
+    #[test]
+    fn sidecar_write_re_admission_detects_target_identity_and_complete_track_geometry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("album.flac");
+        let replacement_image = temp.path().join("replacement.flac");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&image, b"audio").expect("image");
+        std::fs::write(&replacement_image, b"audio").expect("replacement image");
+        let original = concat!(
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let expected_sheet = crate::convert::cue_parser::parse_cue(original);
+        std::fs::write(&cue, original).expect("cue");
+        validate_sidecar_transfer_snapshot(
+            &cue,
+            &std::fs::read_to_string(&cue).expect("read cue snapshot"),
+            &image,
+            &expected_sheet,
+        )
+            .expect("unchanged target must re-admit");
+
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"replacement.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("retarget cue");
+        assert!(validate_sidecar_transfer_snapshot(
+            &cue,
+            &std::fs::read_to_string(&cue).expect("read cue snapshot"),
+            &image,
+            &expected_sheet,
+        )
+            .expect_err("retargeted cue must refuse")
+            .contains("no longer references the expected image"));
+
+        for changed in [
+            concat!(
+                "FILE \"album.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    INDEX 01 04:00:00\n",
+            ),
+            concat!(
+                "FILE \"album.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 03 AUDIO\n",
+                "    INDEX 01 03:00:00\n",
+            ),
+            concat!(
+                "FILE \"album.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    INDEX 01 03:00:00\n",
+                "  TRACK 03 AUDIO\n",
+                "    INDEX 01 06:00:00\n",
+            ),
+        ] {
+            std::fs::write(&cue, changed).expect("change track geometry");
+            assert!(validate_sidecar_transfer_snapshot(
+            &cue,
+            &std::fs::read_to_string(&cue).expect("read cue snapshot"),
+            &image,
+            &expected_sheet,
+        )
+                .expect_err("any geometry change must refuse")
+                .contains("changed track structure after classification"));
+        }
+    }
+
 }
 
 #[derive(Debug, Clone, Default)]
@@ -876,23 +1579,98 @@ pub struct TagTransferReport {
     pub target_count: usize,
     pub written: usize,
     pub unchanged: usize,
+    pub written_fields: usize,
+    pub source_carrier: Option<String>,
+    pub target_carrier: Option<String>,
+    pub target_paths: Vec<std::path::PathBuf>,
+    pub first_track_collapse: bool,
     pub written_paths: Vec<std::path::PathBuf>,
     pub failed: Vec<(std::path::PathBuf, String)>,
     pub skipped_numbering_keys: Vec<String>,
+    pub skipped_fields: Vec<String>,
     pub cardinality_warnings: Vec<String>,
     pub durability_warnings: Vec<String>,
 }
 
 impl TagTransferReport {
+    fn cue_target_description(&self, target_carrier: &str) -> String {
+        let path = self
+            .target_paths
+            .first()
+            .map(|path| format!("'{}'", path.display()))
+            .unwrap_or_else(|| "<unknown target>".to_string());
+        match target_carrier {
+            "embedded CUE" => format!("embedded CUE in {path}"),
+            "sidecar CUE" => format!("sidecar CUE {path}"),
+            other => format!("{other} {path}"),
+        }
+    }
+
     pub fn status(&self) -> String {
-        let mut status = format!(
-            "Transferred tags to {} file{} ({} written, {} unchanged, {} failed)",
-            self.target_count,
-            if self.target_count == 1 { "" } else { "s" },
-            self.written,
-            self.unchanged,
-            self.failed.len(),
-        );
+        let mut status = if let Some(target_carrier) = self.target_carrier.as_deref() {
+            if target_carrier == "files" {
+                format!(
+                    "Transferred {} field{} to {} file{} ({} written, {} unchanged, {} failed)",
+                    self.written_fields,
+                    if self.written_fields == 1 { "" } else { "s" },
+                    self.target_count,
+                    if self.target_count == 1 { "" } else { "s" },
+                    self.written,
+                    self.unchanged,
+                    self.failed.len(),
+                )
+            } else {
+                let target = self.cue_target_description(target_carrier);
+                if self.written > 0 {
+                    format!(
+                        "Wrote {} field{} to {} ({} tracks; {} rewritten, {} unchanged, {} failed)",
+                        self.written_fields,
+                        if self.written_fields == 1 { "" } else { "s" },
+                        target,
+                        self.target_count,
+                        self.written,
+                        self.unchanged,
+                        self.failed.len(),
+                    )
+                } else if self.unchanged > 0 {
+                    let sentence_target = match target_carrier {
+                        "embedded CUE" => target.replacen("embedded", "Embedded", 1),
+                        "sidecar CUE" => target.replacen("sidecar", "Sidecar", 1),
+                        _ => target,
+                    };
+                    format!(
+                        "{} already matched {} field{} ({} tracks; {} rewritten, {} unchanged, {} failed)",
+                        sentence_target,
+                        self.written_fields,
+                        if self.written_fields == 1 { "" } else { "s" },
+                        self.target_count,
+                        self.written,
+                        self.unchanged,
+                        self.failed.len(),
+                    )
+                } else {
+                    format!(
+                        "Failed to write {} field{} to {} ({} tracks; {} rewritten, {} unchanged, {} failed)",
+                        self.written_fields,
+                        if self.written_fields == 1 { "" } else { "s" },
+                        target,
+                        self.target_count,
+                        self.written,
+                        self.unchanged,
+                        self.failed.len(),
+                    )
+                }
+            }
+        } else {
+            format!(
+                "Transferred tags to {} file{} ({} written, {} unchanged, {} failed)",
+                self.target_count,
+                if self.target_count == 1 { "" } else { "s" },
+                self.written,
+                self.unchanged,
+                self.failed.len(),
+            )
+        };
         if !self.skipped_numbering_keys.is_empty() {
             status.push_str(&format!(
                 "; 1-to-N skipped {}",
@@ -905,6 +1683,15 @@ impl TagTransferReport {
                 self.cardinality_warnings.len(),
                 if self.cardinality_warnings.len() == 1 { "" } else { "s" }
             ));
+        }
+        if self.first_track_collapse {
+            status.push_str("; wrote first-track values to single image");
+        }
+        if !self.skipped_fields.is_empty() {
+            status.push_str(&format!("; {}", self.skipped_fields.join("; ")));
+        }
+        if let Some(source_carrier) = self.source_carrier.as_deref() {
+            status.push_str(&format!("; source {source_carrier}"));
         }
         if !self.durability_warnings.is_empty() {
             status.push_str(&format!(
@@ -927,9 +1714,12 @@ fn is_transfer_numbering_key(key: &str) -> bool {
 fn transfer_entry_selected(
     entry: &TagEntry,
     scope: super::app::TagTransferScope,
-    source_count: usize,
+    source_dimension: TransferDimension,
 ) -> bool {
-    if entry.is_binary || entry.is_track_scoped(source_count) {
+    if entry.is_binary {
+        return false;
+    }
+    if matches!(source_dimension, TransferDimension::Files(file_count) if entry.is_track_scoped(file_count)) {
         return false;
     }
     match scope {
@@ -940,6 +1730,23 @@ fn transfer_entry_selected(
             )
         }
         super::app::TagTransferScope::All => true,
+    }
+}
+
+fn is_cue_per_track_field(key: &str) -> bool {
+    matches!(key, "TITLE" | "ARTIST" | "TRACKNUMBER" | "ISRC")
+}
+
+fn cue_target_key(key: &str) -> Option<&'static str> {
+    match key {
+        "TITLE" => Some("TITLE"),
+        "ARTIST" => Some("PERFORMER"),
+        "ALBUM" => Some("TITLE"),
+        "ALBUMARTIST" => Some("PERFORMER"),
+        "DATE" => Some("REM DATE"),
+        "GENRE" => Some("REM GENRE"),
+        "CATALOGNUMBER" => Some("CATALOG"),
+        _ => None,
     }
 }
 
@@ -954,7 +1761,9 @@ struct PlannedTransferField {
 struct TransferValuePlan {
     fields: Vec<PlannedTransferField>,
     skipped_numbering_keys: Vec<String>,
+    skipped_fields: Vec<String>,
     cardinality_warnings: Vec<String>,
+    first_track_collapse: bool,
 }
 
 fn canonical_transfer_item_key(
@@ -967,30 +1776,77 @@ fn canonical_transfer_item_key(
     }
 }
 
-fn plan_transfer_values(
+fn plan_transfer_values_for_dimensions(
     source_entries: &[TagEntry],
-    source_count: usize,
-    target_count: usize,
+    source_dimension: TransferDimension,
+    target_dimension: TransferDimension,
     scope: super::app::TagTransferScope,
 ) -> Result<TransferValuePlan, String> {
+    plan_transfer_values_for_dimensions_with_collapse(
+        source_entries,
+        source_dimension,
+        target_dimension,
+        scope,
+        FirstTrackCollapseEligibility::Forbidden,
+    )
+}
+
+fn plan_transfer_values_for_dimensions_with_collapse(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    target_dimension: TransferDimension,
+    scope: super::app::TagTransferScope,
+    collapse_eligibility: FirstTrackCollapseEligibility,
+) -> Result<TransferValuePlan, String> {
+    let source_count = source_dimension.count();
+    let target_count = target_dimension.count();
     if source_count == 0 {
-        return Err("tag transfer has no source files".to_string());
+        return Err("tag transfer has no source positions".to_string());
     }
     if target_count == 0 {
-        return Err("tag transfer target contains no audio files".to_string());
-    }
-    if source_count != 1 && source_count != target_count {
-        return Err(format!(
-            "tag transfer requires 1 source or equal source/target counts; got {} sources and {} targets",
-            source_count, target_count
-        ));
+        return Err("tag transfer target has no positions".to_string());
     }
 
-    let broadcast = source_count == 1 && target_count > 1;
-    let mut plan = TransferValuePlan::default();
+    let first_track_collapse = collapse_eligibility.permits()
+        && matches!(target_dimension, TransferDimension::Files(1))
+        && source_count > 1;
+    let file_broadcast = matches!(source_dimension, TransferDimension::Files(1))
+        && matches!(target_dimension, TransferDimension::Files(count) if count > 1);
+    let one_file_to_tracks = matches!(source_dimension, TransferDimension::Files(1))
+        && target_dimension.is_tracks();
+
+    let cardinality_valid = match (source_dimension, target_dimension) {
+        (TransferDimension::Files(1), TransferDimension::Files(_)) => true,
+        (TransferDimension::Files(1), TransferDimension::Tracks(_)) => true,
+        (TransferDimension::Files(source), TransferDimension::Files(1)) => {
+            source == 1 || first_track_collapse
+        }
+        (TransferDimension::Files(source), TransferDimension::Files(target)) => source == target,
+        (TransferDimension::Files(source), TransferDimension::Tracks(target)) => source == target,
+        (TransferDimension::Tracks(_), TransferDimension::Files(1)) => first_track_collapse,
+        (TransferDimension::Tracks(source), TransferDimension::Files(target)) => source == target,
+        (TransferDimension::Tracks(source), TransferDimension::Tracks(target)) => source == target,
+    };
+    if !cardinality_valid {
+        return match (source_dimension, target_dimension) {
+            (TransferDimension::Files(_), TransferDimension::Files(_)) => Err(format!(
+                "tag transfer requires 1 source or equal source/target counts; got {} sources and {} targets",
+                source_count, target_count
+            )),
+            _ => Err(format!(
+                "tag transfer carrier dimensions do not match: {} source positions and {} target positions",
+                source_count, target_count
+            )),
+        };
+    }
+
+    let mut plan = TransferValuePlan {
+        first_track_collapse,
+        ..TransferValuePlan::default()
+    };
     let mut seen = std::collections::BTreeSet::new();
     for entry in source_entries {
-        if !transfer_entry_selected(entry, scope, source_count) {
+        if !transfer_entry_selected(entry, scope, source_dimension) {
             continue;
         }
         let canonical_key = super::probe::canonical_metadata_display_key(&entry.display_key);
@@ -999,14 +1855,50 @@ fn plan_transfer_values(
                 "tag transfer source contains duplicate field {canonical_key}"
             ));
         }
-        if broadcast && is_transfer_numbering_key(&canonical_key) {
+        if file_broadcast && is_transfer_numbering_key(&canonical_key) {
             plan.skipped_numbering_keys.push(canonical_key);
             continue;
         }
+        if one_file_to_tracks && is_cue_per_track_field(&canonical_key) {
+            plan.skipped_fields.push(format!(
+                "{} skipped: one file cannot broadcast a per-track CUE field",
+                canonical_key
+            ));
+            continue;
+        }
+        if target_dimension.is_tracks() {
+            if canonical_key == "SONGWRITER" {
+                plan.skipped_fields
+                    .push("SONGWRITER excluded from CUE transfer this round".to_string());
+                continue;
+            }
+            if canonical_key == "ISRC" {
+                plan.skipped_fields
+                    .push("ISRC skipped: CUE writeback is read-only this round".to_string());
+                continue;
+            }
+            if canonical_key == "TRACKNUMBER" {
+                plan.skipped_fields
+                    .push("TRACKNUMBER skipped: CUE TRACK numbers are structural".to_string());
+                continue;
+            }
+            if cue_target_key(&canonical_key).is_none() {
+                plan.skipped_fields.push(format!(
+                    "{} skipped: not representable by the CUE field cap",
+                    canonical_key
+                ));
+                continue;
+            }
+        }
 
         let mut values = Vec::with_capacity(target_count);
+        let mut warned_stored_sources = std::collections::BTreeSet::new();
         for target_index in 0..target_count {
-            let source_index = if source_count == 1 { 0 } else { target_index };
+            let source_index = if first_track_collapse || file_broadcast || one_file_to_tracks {
+                0
+            } else {
+                target_index
+            };
             let value = entry.per_file_values.get(source_index).ok_or_else(|| {
                 format!(
                     "{} has no source value at position {}",
@@ -1015,7 +1907,7 @@ fn plan_transfer_values(
                 )
             })?;
             let stored_count = entry.stored_value_count_for_slot(source_index);
-            if stored_count > 1 {
+            if stored_count > 1 && warned_stored_sources.insert(source_index) {
                 plan.cardinality_warnings.push(format!(
                     "{} source {} collapsed {} stored values to its display value",
                     canonical_key,
@@ -1025,6 +1917,17 @@ fn plan_transfer_values(
             }
             values.push(value.clone());
         }
+        if target_dimension.is_tracks()
+            && !is_cue_per_track_field(&canonical_key)
+            && values.windows(2).any(|pair| pair[0] != pair[1])
+        {
+            let first = values[0].clone();
+            values.fill(first);
+            plan.cardinality_warnings.push(format!(
+                "{} is album-scoped in CUE; used the first source value",
+                canonical_key
+            ));
+        }
         plan.fields.push(PlannedTransferField {
             item_key: canonical_transfer_item_key(&canonical_key, &entry.item_key),
             canonical_key,
@@ -1032,10 +1935,142 @@ fn plan_transfer_values(
         });
     }
 
-    if plan.fields.is_empty() && plan.skipped_numbering_keys.is_empty() {
+    if plan.fields.is_empty()
+        && plan.skipped_numbering_keys.is_empty()
+        && plan.skipped_fields.is_empty()
+    {
         return Err("tag transfer source contains no applicable text fields".to_string());
     }
     Ok(plan)
+}
+
+#[cfg(test)] // superseded by the prepared/classified round-7 flow; exercised by regression tests
+fn plan_transfer_values(
+    source_entries: &[TagEntry],
+    source_count: usize,
+    target_count: usize,
+    scope: super::app::TagTransferScope,
+) -> Result<TransferValuePlan, String> {
+    plan_transfer_values_for_dimensions(
+        source_entries,
+        TransferDimension::Files(source_count),
+        TransferDimension::Files(target_count),
+        scope,
+    )
+}
+
+
+fn cue_transfer_entry(
+    display_key: &str,
+    item_key: lofty::tag::ItemKey,
+    values: Vec<String>,
+) -> Option<TagEntry> {
+    if values.is_empty() || values.iter().all(String::is_empty) {
+        return None;
+    }
+    let is_mixed = values.windows(2).any(|pair| pair[0] != pair[1]);
+    let value = if is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        values.first().cloned().unwrap_or_default()
+    };
+    Some(TagEntry {
+        display_key: display_key.to_string(),
+        item_key,
+        value: value.clone(),
+        original: value,
+        is_binary: false,
+        is_mixed,
+        has_multiple_stored_values: false,
+        row_scope: super::probe::RowScope::Track,
+        per_file_stored_value_counts: vec![1; values.len()],
+        per_file_originals: values.clone(),
+        per_file_values: values,
+        mb_proposed_value: None,
+        mb_proposed_per_file: None,
+    })
+}
+
+/// Convert a parsed CUE into transfer rows. Track pairing is positional after
+/// sorting by authored TRACK number; gapped and non-one-based numbers are
+/// intentionally accepted. CUESHEET itself is never surfaced as a field.
+pub(crate) fn cue_sheet_transfer_entries(
+    sheet: &crate::convert::cue_parser::CueSheet,
+) -> Vec<TagEntry> {
+    let mut tracks = sheet.tracks.iter().collect::<Vec<_>>();
+    tracks.sort_by_key(|track| track.number);
+    let track_count = tracks.len();
+    let repeated = |value: &Option<String>| {
+        vec![value.clone().unwrap_or_default(); track_count]
+    };
+    let mut entries = Vec::new();
+    let candidates = [
+        cue_transfer_entry(
+            "TITLE",
+            lofty::tag::ItemKey::TrackTitle,
+            tracks
+                .iter()
+                .map(|track| track.title.clone().unwrap_or_default())
+                .collect(),
+        ),
+        cue_transfer_entry(
+            "ARTIST",
+            lofty::tag::ItemKey::TrackArtist,
+            tracks
+                .iter()
+                .map(|track| track.performer.clone().unwrap_or_default())
+                .collect(),
+        ),
+        cue_transfer_entry(
+            "ISRC",
+            lofty::tag::ItemKey::Isrc,
+            tracks
+                .iter()
+                .map(|track| track.isrc.clone().unwrap_or_default())
+                .collect(),
+        ),
+        cue_transfer_entry("ALBUM", lofty::tag::ItemKey::AlbumTitle, repeated(&sheet.title)),
+        cue_transfer_entry(
+            "ALBUMARTIST",
+            lofty::tag::ItemKey::AlbumArtist,
+            repeated(&sheet.performer),
+        ),
+        cue_transfer_entry("DATE", lofty::tag::ItemKey::Year, repeated(&sheet.date)),
+        cue_transfer_entry("GENRE", lofty::tag::ItemKey::Genre, repeated(&sheet.genre)),
+        cue_transfer_entry(
+            "CATALOGNUMBER",
+            lofty::tag::ItemKey::CatalogNumber,
+            repeated(&sheet.catalog),
+        ),
+    ];
+    entries.extend(candidates.into_iter().flatten());
+    entries
+}
+
+pub(crate) fn read_transfer_carrier_entries(
+    carrier: &TransferCarrier,
+    scope: super::app::TagTransferScope,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<Vec<TagEntry>, String> {
+    match carrier {
+        TransferCarrier::Files { paths } => read_transfer_source_entries(paths, scope, cancel),
+        TransferCarrier::SidecarCue { sheet, .. }
+        | TransferCarrier::EmbeddedCue { sheet, .. } => {
+            let entries = cue_sheet_transfer_entries(sheet);
+            Ok(entries
+                .into_iter()
+                .filter(|entry| match scope {
+                    super::app::TagTransferScope::Canonical => {
+                        super::context_menu::tag_entry_matches_copy_selection(
+                            entry,
+                            super::context_menu::TagCopySelection::CanonicalOnly,
+                        )
+                    }
+                    super::app::TagTransferScope::All => true,
+                })
+                .collect())
+        }
+    }
 }
 
 pub(crate) fn read_transfer_source_entries(
@@ -1070,10 +2105,11 @@ pub(crate) fn read_transfer_source_entries(
     Ok(merged
         .entries
         .into_iter()
-        .filter(|entry| transfer_entry_selected(entry, scope, source_paths.len()))
+        .filter(|entry| transfer_entry_selected(entry, scope, TransferDimension::Files(source_paths.len())))
         .collect())
 }
 
+#[cfg(test)] // superseded by the prepared/classified round-7 flow; exercised by regression tests
 pub(crate) fn execute_tag_transfer_from_entries(
     source_entries: &[TagEntry],
     source_count: usize,
@@ -1102,9 +2138,40 @@ pub(crate) fn execute_tag_transfer_from_entries(
     )
 }
 
+#[cfg(test)] // superseded by the prepared/classified round-7 flow; exercised by regression tests
 fn execute_tag_transfer_from_entries_with_writer<F>(
     source_entries: &[TagEntry],
     source_count: usize,
+    target_paths: &[std::path::PathBuf],
+    scope: super::app::TagTransferScope,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+    writer: F,
+) -> Result<TagTransferReport, String>
+where
+    F: FnMut(
+        &std::path::Path,
+        &[(lofty::tag::ItemKey, Option<String>)],
+        Option<&super::probe::MetadataWriteCancelFlag>,
+        tui_file_picker::VerificationMode,
+    ) -> Result<super::probe::MetadataWriteCommitReport, String>,
+{
+    execute_tag_transfer_to_files_with_writer(
+        source_entries,
+        TransferDimension::Files(source_count),
+        target_paths,
+        scope,
+        verification,
+        cancel,
+        progress,
+        writer,
+    )
+}
+
+fn execute_tag_transfer_to_files_with_writer<F>(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
     target_paths: &[std::path::PathBuf],
     scope: super::app::TagTransferScope,
     verification: tui_file_picker::VerificationMode,
@@ -1120,10 +2187,10 @@ where
         tui_file_picker::VerificationMode,
     ) -> Result<super::probe::MetadataWriteCommitReport, String>,
 {
-    let value_plan = plan_transfer_values(
+    let value_plan = plan_transfer_values_for_dimensions(
         source_entries,
-        source_count,
-        target_paths.len(),
+        source_dimension,
+        TransferDimension::Files(target_paths.len()),
         scope,
     )?;
     if cancel.is_cancelled() {
@@ -1138,9 +2205,19 @@ where
         )?;
 
     let mut report = TagTransferReport {
-        source_count,
+        source_count: source_dimension.count(),
         target_count: target_paths.len(),
+        written_fields: value_plan.fields.len(),
+        source_carrier: Some(if source_dimension.is_tracks() {
+            "CUE tracks".to_string()
+        } else {
+            "files".to_string()
+        }),
+        target_carrier: Some("files".to_string()),
+        target_paths: target_paths.to_vec(),
+        first_track_collapse: value_plan.first_track_collapse,
         skipped_numbering_keys: value_plan.skipped_numbering_keys,
+        skipped_fields: value_plan.skipped_fields,
         cardinality_warnings: value_plan.cardinality_warnings,
         ..TagTransferReport::default()
     };
@@ -1201,12 +2278,7 @@ where
             continue;
         }
 
-        match writer(
-            target_path,
-            &changes,
-            Some(cancel),
-            verification,
-        ) {
+        match writer(target_path, &changes, Some(cancel), verification) {
             Ok(commit) => {
                 report.written += 1;
                 report.written_paths.push(target_path.clone());
@@ -1227,6 +2299,413 @@ where
     Ok(report)
 }
 
+fn cue_replacement_value<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
+    if value.contains('\r') || value.contains('\n') || value.contains('"') {
+        return Err(format!(
+            "{} cannot be written to CUE losslessly because it contains a line break or double quote",
+            field
+        ));
+    }
+    Ok(value)
+}
+
+fn cue_metadata_replacement_text(
+    value_plan: &TransferValuePlan,
+    target_sheet: &crate::convert::cue_parser::CueSheet,
+) -> Result<String, String> {
+    let target_count = target_sheet.tracks.len();
+    let field = |key: &str| {
+        value_plan
+            .fields
+            .iter()
+            .find(|field| field.canonical_key == key)
+    };
+    let mut lines = Vec::new();
+    let mut push_album_quoted = |key: &str, cue_key: &str| -> Result<(), String> {
+        let Some(value) = field(key).and_then(|field| field.values.first()) else {
+            return Ok(());
+        };
+        if value.is_empty() {
+            return Ok(());
+        }
+        lines.push(format!(
+            "{} \"{}\"",
+            cue_key,
+            cue_replacement_value(value, key)?
+        ));
+        Ok(())
+    };
+    push_album_quoted("ALBUM", "TITLE")?;
+    push_album_quoted("ALBUMARTIST", "PERFORMER")?;
+    drop(push_album_quoted);
+    if let Some(value) = field("DATE").and_then(|field| field.values.first()) {
+        if !value.is_empty() {
+            lines.push(format!(
+                "REM DATE \"{}\"",
+                cue_replacement_value(value, "DATE")?
+            ));
+        }
+    }
+    if let Some(value) = field("GENRE").and_then(|field| field.values.first()) {
+        if !value.is_empty() {
+            lines.push(format!(
+                "REM GENRE \"{}\"",
+                cue_replacement_value(value, "GENRE")?
+            ));
+        }
+    }
+    if let Some(value) = field("CATALOGNUMBER").and_then(|field| field.values.first()) {
+        if !value.is_empty() {
+            lines.push(format!(
+                "CATALOG {}",
+                cue_replacement_value(value, "CATALOGNUMBER")?
+            ));
+        }
+    }
+
+    let mut target_tracks = target_sheet.tracks.iter().collect::<Vec<_>>();
+    target_tracks.sort_by_key(|track| track.number);
+    for (index, track) in target_tracks.iter().enumerate() {
+        lines.push(format!("  TRACK {:02} AUDIO", track.number));
+        for (key, cue_key) in [("TITLE", "TITLE"), ("ARTIST", "PERFORMER")] {
+            let Some(value) = field(key).and_then(|field| field.values.get(index)) else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "    {} \"{}\"",
+                cue_key,
+                cue_replacement_value(value, key)?
+            ));
+        }
+    }
+    if target_tracks.len() != target_count {
+        return Err("internal error: CUE target track ordering changed cardinality".to_string());
+    }
+    Ok(lines.join("\n"))
+}
+
+fn transfer_path_identity(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn validate_sidecar_transfer_snapshot(
+    cue_path: &std::path::Path,
+    current_cue_text: &str,
+    expected_image: &std::path::Path,
+    expected_sheet: &crate::convert::cue_parser::CueSheet,
+) -> Result<(), String> {
+    let current_sheet = crate::convert::cue_parser::parse_cue(current_cue_text);
+    let parent = cue_path.parent().ok_or_else(|| {
+        format!(
+            "sidecar CUE '{}' has no parent directory; left unchanged",
+            cue_path.display()
+        )
+    })?;
+    let mut referenced_by_identity = std::collections::BTreeMap::new();
+    for file_ref in current_sheet
+        .tracks
+        .iter()
+        .filter_map(|track| track.file.as_deref())
+    {
+        let resolved = super::accuraterip::resolve_cue_file_reference(parent, file_ref)
+            .ok_or_else(|| {
+                format!(
+                    "sidecar CUE '{}' no longer resolves FILE reference '{}'; left unchanged",
+                    cue_path.display(),
+                    file_ref
+                )
+            })?;
+        referenced_by_identity
+            .entry(transfer_path_identity(&resolved))
+            .or_insert(resolved);
+    }
+    if referenced_by_identity.len() != 1
+        || !referenced_by_identity.contains_key(&transfer_path_identity(expected_image))
+    {
+        return Err(format!(
+            "sidecar CUE '{}' no longer references the expected image; left unchanged",
+            cue_path.display()
+        ));
+    }
+    if !cue_track_geometry_matches(expected_sheet, &current_sheet) {
+        return Err(format!(
+            "sidecar CUE '{}' changed track structure after classification; left unchanged",
+            cue_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn cue_track_geometry_matches(
+    expected: &crate::convert::cue_parser::CueSheet,
+    current: &crate::convert::cue_parser::CueSheet,
+) -> bool {
+    let mut expected_tracks = expected.tracks.iter().collect::<Vec<_>>();
+    let mut current_tracks = current.tracks.iter().collect::<Vec<_>>();
+    expected_tracks.sort_by_key(|track| track.number);
+    current_tracks.sort_by_key(|track| track.number);
+    expected_tracks.len() == current_tracks.len()
+        && expected_tracks
+            .iter()
+            .zip(current_tracks.iter())
+            .all(|(expected, current)| {
+                expected.number == current.number
+                    && expected.index01_frames == current.index01_frames
+            })
+}
+
+fn revalidate_embedded_transfer_target(
+    image_path: &std::path::Path,
+    expected_sheet: &crate::convert::cue_parser::CueSheet,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<String, String> {
+    let merged = super::probe::read_all_tags_merged_with_metadata_cancellable_for_operation(
+        &[image_path.to_path_buf()],
+        || cancel.is_cancelled(),
+        "tag transfer cancelled while re-admitting embedded CUE target",
+    )?;
+    if let Some(issue) = merged.metadata_errors.first().and_then(|issue| issue.as_ref()) {
+        return Err(format!(
+            "embedded CUE target '{}' could not be re-read immediately before write; left unchanged: {}",
+            image_path.display(),
+            issue.reason,
+        ));
+    }
+    let current_text = merged
+        .entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .and_then(|entry| entry.per_file_values.first())
+        .filter(|text| !text.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "embedded CUE target '{}' no longer carries a CUESHEET; left unchanged",
+                image_path.display(),
+            )
+        })?;
+    let current_sheet = crate::convert::cue_parser::parse_cue(&current_text);
+    if !cue_track_geometry_matches(expected_sheet, &current_sheet) {
+        return Err(format!(
+            "embedded CUE target '{}' changed track structure after classification; left unchanged",
+            image_path.display(),
+        ));
+    }
+    Ok(current_text)
+}
+
+fn execute_tag_transfer_to_cue(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    target: &TransferCarrier,
+    scope: super::app::TagTransferScope,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+) -> Result<TagTransferReport, String> {
+    let target_dimension = target.dimension();
+    let value_plan = plan_transfer_values_for_dimensions(
+        source_entries,
+        source_dimension,
+        target_dimension,
+        scope,
+    )?;
+    let (target_sheet, target_path) = match target {
+        TransferCarrier::SidecarCue { cue_path, sheet, .. } => (sheet, cue_path.as_path()),
+        TransferCarrier::EmbeddedCue { image_path, sheet, .. } => (sheet, image_path.as_path()),
+        TransferCarrier::Files { .. } => {
+            return Err("internal error: CUE writer received file carrier".to_string())
+        }
+    };
+    let replacement = cue_metadata_replacement_text(&value_plan, target_sheet)?;
+    let mut report = TagTransferReport {
+        source_count: source_dimension.count(),
+        target_count: target_dimension.count(),
+        written_fields: value_plan.fields.len(),
+        source_carrier: Some(if source_dimension.is_tracks() {
+            "CUE tracks".to_string()
+        } else {
+            "files".to_string()
+        }),
+        target_carrier: Some(target.label().to_string()),
+        target_paths: vec![target_path.to_path_buf()],
+        first_track_collapse: value_plan.first_track_collapse,
+        skipped_numbering_keys: value_plan.skipped_numbering_keys,
+        skipped_fields: value_plan.skipped_fields,
+        cardinality_warnings: value_plan.cardinality_warnings,
+        ..TagTransferReport::default()
+    };
+
+    if cancel.is_cancelled() {
+        return Err("tag transfer cancelled before CUE write".to_string());
+    }
+    let write_result = match target {
+        TransferCarrier::SidecarCue {
+            cue_path,
+            image_path,
+            sheet,
+            ..
+        } => {
+            crate::convert::cue_parser::rewrite_cue_sidecar_metadata_from_cuesheet_validated(
+                cue_path,
+                &replacement,
+                |_raw, current_cue_text| {
+                    validate_sidecar_transfer_snapshot(
+                        cue_path,
+                        current_cue_text,
+                        image_path,
+                        sheet,
+                    )
+                },
+            )
+            .map(|outcome| match outcome {
+                crate::convert::cue_parser::CueSidecarWritebackOutcome::Unchanged => None,
+                crate::convert::cue_parser::CueSidecarWritebackOutcome::Rewritten { .. } => {
+                    Some(super::probe::MetadataWriteCommitReport::default())
+                }
+                crate::convert::cue_parser::CueSidecarWritebackOutcome::RewrittenUtf8Fallback {
+                    source_encoding,
+                } => Some(super::probe::MetadataWriteCommitReport {
+                    durability_warnings: vec![format!(
+                        "sidecar CUE encoding changed from {source_encoding} to UTF-8 because the requested metadata was not representable losslessly"
+                    )],
+                }),
+            })
+        }
+        TransferCarrier::EmbeddedCue {
+            image_path,
+            sheet,
+            ..
+        } => {
+            let is_flac = image_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"));
+            if !is_flac {
+                return Err(
+                    "embedded CUE write is supported for FLAC images this round".to_string(),
+                );
+            }
+            let current_cue_text =
+                revalidate_embedded_transfer_target(image_path, sheet, cancel)?;
+            let composed = crate::convert::cue_parser::compose_cue_metadata_replacement(
+                &current_cue_text,
+                &replacement,
+            )?;
+            if composed == current_cue_text {
+                Ok(None)
+            } else {
+                super::probe::write_embedded_cuesheet_for_transfer_at_verification(
+                    image_path,
+                    &current_cue_text,
+                    composed,
+                    Some(cancel),
+                    verification,
+                )
+                .map(Some)
+            }
+        }
+        TransferCarrier::Files { .. } => unreachable!(),
+    };
+
+    match write_result {
+        Ok(Some(commit)) => {
+            report.written = 1;
+            report.written_paths.push(target_path.to_path_buf());
+            report.durability_warnings.extend(commit.durability_warnings);
+        }
+        Ok(None) => report.unchanged = 1,
+        Err(error) => report.failed.push((target_path.to_path_buf(), error)),
+    }
+    if let Some(progress) = progress {
+        progress(1, 1, target_path);
+    }
+    Ok(report)
+}
+
+pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    target: &TransferCarrier,
+    scope: super::app::TagTransferScope,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+) -> Result<TagTransferReport, String> {
+    match target {
+        TransferCarrier::Files { paths } => execute_tag_transfer_to_files_with_writer(
+            source_entries,
+            source_dimension,
+            paths,
+            scope,
+            verification,
+            cancel,
+            progress,
+            |path, changes, cancel, verification| {
+                super::probe::write_all_tags_for_transfer_at_verification(
+                    path,
+                    changes,
+                    cancel,
+                    verification,
+                )
+            },
+        ),
+        TransferCarrier::SidecarCue { .. } | TransferCarrier::EmbeddedCue { .. } => {
+            execute_tag_transfer_to_cue(
+                source_entries,
+                source_dimension,
+                target,
+                scope,
+                verification,
+                cancel,
+                progress,
+            )
+        }
+    }
+}
+
+pub(crate) fn preview_tag_transfer(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    target: &TransferCarrier,
+    scope: super::app::TagTransferScope,
+) -> Result<usize, String> {
+    Ok(plan_transfer_values_for_dimensions(
+        source_entries,
+        source_dimension,
+        target.dimension(),
+        scope,
+    )?
+    .fields
+    .len())
+}
+
+pub(crate) fn execute_tag_transfer_between_carriers(
+    source: &TransferCarrier,
+    target: &TransferCarrier,
+    scope: super::app::TagTransferScope,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+) -> Result<TagTransferReport, String> {
+    let source_entries = read_transfer_carrier_entries(source, scope, cancel)?;
+    let mut report = execute_tag_transfer_from_entries_to_carrier(
+        &source_entries,
+        source.dimension(),
+        target,
+        scope,
+        verification,
+        cancel,
+        progress,
+    )?;
+    report.source_carrier = Some(source.label().to_string());
+    Ok(report)
+}
+
+#[cfg(test)] // superseded by the prepared/classified round-7 flow; exercised by regression tests
 pub(crate) fn execute_tag_transfer_from_paths(
     source_paths: &[std::path::PathBuf],
     target_paths: &[std::path::PathBuf],
@@ -1371,20 +2850,22 @@ pub struct EditorTransferApplyReport {
     pub applied: Vec<(String, FieldBlockValueMode)>,
     pub skipped_numbering_keys: Vec<String>,
     pub skipped_track_scoped: Vec<String>,
+    pub skipped_fields: Vec<String>,
+    pub first_track_collapse: bool,
     pub cardinality_warnings: Vec<String>,
 }
 
 impl EditorTransferApplyReport {
-    pub fn success_status(&self, file_count: usize) -> String {
+    pub fn success_status(&self, target_count: usize) -> String {
         let mut parts = self
             .applied
             .iter()
             .map(|(key, mode)| match mode {
                 FieldBlockValueMode::Broadcast => format!(
-                    "{} (broadcast to {} file{})",
+                    "{} (broadcast to {} position{})",
                     key,
-                    file_count,
-                    if file_count == 1 { "" } else { "s" }
+                    target_count,
+                    if target_count == 1 { "" } else { "s" }
                 ),
                 FieldBlockValueMode::Positional => format!("{} (positional)", key),
             })
@@ -1401,6 +2882,10 @@ impl EditorTransferApplyReport {
                 self.skipped_track_scoped.join(", ")
             ));
         }
+        parts.extend(self.skipped_fields.iter().cloned());
+        if self.first_track_collapse {
+            parts.push("used first-track values for the single-image editor".to_string());
+        }
         if !self.cardinality_warnings.is_empty() {
             parts.push(format!(
                 "{} cardinality warning{}",
@@ -1412,11 +2897,58 @@ impl EditorTransferApplyReport {
     }
 }
 
+pub(crate) fn metadata_editor_transfer_dimension(
+    state: &super::app::MetadataEditorState,
+) -> TransferDimension {
+    let surface = state.active_surface();
+    let track_count = surface
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            !surface.deleted.contains(index)
+                && matches!(entry.row_scope, super::probe::RowScope::Track)
+        })
+        .map(|(_, entry)| entry.per_file_values.len())
+        .max()
+        .unwrap_or(0);
+    if track_count > 0 {
+        TransferDimension::Tracks(track_count)
+    } else {
+        TransferDimension::Files(surface.paths.len())
+    }
+}
+
+fn metadata_editor_first_track_collapse_eligibility(
+    state: &super::app::MetadataEditorState,
+    target_dimension: TransferDimension,
+) -> FirstTrackCollapseEligibility {
+    let surface = state.active_surface();
+    let single_image = matches!(target_dimension, TransferDimension::Files(1))
+        && surface.paths.len() == 1;
+    let has_cuesheet = surface.entries.iter().enumerate().any(|(index, entry)| {
+        !surface.deleted.contains(&index)
+            && entry.display_key.eq_ignore_ascii_case("CUESHEET")
+            && !entry
+                .per_file_values
+                .first()
+                .map(String::as_str)
+                .unwrap_or(entry.value.as_str())
+                .trim()
+                .is_empty()
+    });
+    if single_image && has_cuesheet {
+        FirstTrackCollapseEligibility::SingleImageWithCuesheet
+    } else {
+        FirstTrackCollapseEligibility::Forbidden
+    }
+}
+
 pub(crate) fn metadata_editor_transfer_snapshot(
     state: &super::app::MetadataEditorState,
-) -> (Vec<TagEntry>, usize) {
+) -> (Vec<TagEntry>, TransferDimension) {
     let surface = state.active_surface();
-    let source_count = surface.paths.len();
+    let dimension = metadata_editor_transfer_dimension(state);
     let entries = surface
         .entries
         .iter()
@@ -1424,7 +2956,7 @@ pub(crate) fn metadata_editor_transfer_snapshot(
         .filter(|(index, _)| !surface.deleted.contains(index))
         .map(|(_, entry)| entry.clone())
         .collect();
-    (entries, source_count)
+    (entries, dimension)
 }
 
 pub(crate) fn metadata_editor_unsaved_edit_count(
@@ -1444,35 +2976,24 @@ pub(crate) fn metadata_editor_unsaved_edit_count(
     changed.len()
 }
 
-pub(crate) fn apply_transfer_entries_to_editor(
+pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
     state: &mut super::app::MetadataEditorState,
     source_entries: &[TagEntry],
-    source_count: usize,
+    source_dimension: TransferDimension,
     scope: super::app::TagTransferScope,
 ) -> Result<EditorTransferApplyReport, String> {
-    let target_count = state.active_surface().paths.len();
-    if source_count == 0 {
-        return Err("tag transfer has no source files".to_string());
-    }
+    let target_dimension = metadata_editor_transfer_dimension(state);
+    let target_count = target_dimension.count();
     if target_count == 0 {
-        return Err("metadata editor has no file targets".to_string());
+        return Err("metadata editor has no transfer target positions".to_string());
     }
-    if source_count != 1 && source_count != target_count {
-        return Err(format!(
-            "tag transfer requires 1 source or equal source/target counts; got {} sources and {} editor targets",
-            source_count, target_count
-        ));
-    }
-
-    #[derive(Debug)]
-    struct Plan {
-        key: String,
-        item_key: lofty::tag::ItemKey,
-        mode: FieldBlockValueMode,
-        existing_row: Option<usize>,
-        values: Vec<String>,
-        cardinality_warnings: Vec<String>,
-    }
+    let value_plan = plan_transfer_values_for_dimensions_with_collapse(
+        source_entries,
+        source_dimension,
+        target_dimension,
+        scope,
+        metadata_editor_first_track_collapse_eligibility(state, target_dimension),
+    )?;
 
     let mut target_rows = std::collections::HashMap::new();
     for (index, entry) in state.active_surface().entries.iter().enumerate() {
@@ -1484,111 +3005,68 @@ pub(crate) fn apply_transfer_entries_to_editor(
         }
     }
 
-    let broadcast = source_count == 1 && target_count > 1;
-    let mut report = EditorTransferApplyReport::default();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut plans = Vec::new();
-    for source_entry in source_entries {
-        if !transfer_entry_selected(source_entry, scope, source_count) {
-            continue;
-        }
-        let key = super::probe::canonical_metadata_display_key(&source_entry.display_key);
-        if !seen.insert(key.clone()) {
-            return Err(format!("tag transfer source contains duplicate field {key}"));
-        }
-        if broadcast && is_transfer_numbering_key(&key) {
-            report.skipped_numbering_keys.push(key);
-            continue;
-        }
-        let existing_row = target_rows.get(&key).copied();
-        if existing_row
-            .and_then(|index| state.active_surface().entries.get(index))
-            .is_some_and(|entry| entry.is_track_scoped(target_count))
-        {
-            report.skipped_track_scoped.push(key);
-            continue;
-        }
-        let mode = if source_count == 1 {
-            FieldBlockValueMode::Broadcast
-        } else {
-            FieldBlockValueMode::Positional
-        };
-        let mut values = Vec::with_capacity(target_count);
-        let mut warnings = Vec::new();
-        for target_index in 0..target_count {
-            let source_index = if source_count == 1 { 0 } else { target_index };
-            let Some(value) = source_entry.per_file_values.get(source_index) else {
-                return Err(format!(
-                    "{} has no source value at position {}",
-                    key,
-                    source_index + 1
-                ));
-            };
-            let stored_count = source_entry.stored_value_count_for_slot(source_index);
-            if stored_count > 1 {
-                warnings.push(format!(
-                    "{} source {} collapsed {} stored values to its display value",
-                    key,
-                    source_index + 1,
-                    stored_count
-                ));
-            }
-            values.push(value.clone());
-        }
-        let item_key = canonical_transfer_item_key(&key, &source_entry.item_key);
-        plans.push(Plan {
-            key,
-            item_key,
-            mode,
-            existing_row,
-            values,
-            cardinality_warnings: warnings,
-        });
-    }
+    let mode = if source_dimension.count() == 1 && target_count > 1 {
+        FieldBlockValueMode::Broadcast
+    } else {
+        FieldBlockValueMode::Positional
+    };
+    let row_scope = if target_dimension.is_tracks() {
+        super::probe::RowScope::Track
+    } else {
+        super::probe::RowScope::File
+    };
+    let mut report = EditorTransferApplyReport {
+        skipped_numbering_keys: value_plan.skipped_numbering_keys,
+        skipped_fields: value_plan.skipped_fields,
+        first_track_collapse: value_plan.first_track_collapse,
+        cardinality_warnings: value_plan.cardinality_warnings,
+        ..EditorTransferApplyReport::default()
+    };
 
-    for plan in plans {
-        let all_same = plan.values.windows(2).all(|pair| pair[0] == pair[1]);
+    for PlannedTransferField {
+        canonical_key,
+        item_key,
+        values,
+    } in value_plan.fields
+    {
+        let all_same = values.windows(2).all(|pair| pair[0] == pair[1]);
         let display = if all_same {
-            plan.values.first().cloned().unwrap_or_default()
+            values.first().cloned().unwrap_or_default()
         } else {
             "<multiple values>".to_string()
         };
-        if let Some(row) = plan.existing_row {
+        if let Some(row) = target_rows.get(&canonical_key).copied() {
             let surface = state.active_surface_mut();
             let entry = &mut surface.entries[row];
             entry.value = display;
             entry.is_mixed = !all_same;
-            entry.per_file_values = plan.values;
+            entry.row_scope = row_scope;
+            entry.per_file_values = values;
             entry.mb_proposed_value = None;
             entry.mb_proposed_per_file = None;
             surface.deleted.retain(|deleted| *deleted != row);
         } else {
+            let key = canonical_key.clone();
             state.active_surface_mut().entries.push(TagEntry {
-                display_key: plan.key.clone(),
-                item_key: plan.item_key,
+                display_key: key.clone(),
+                item_key,
                 value: display,
                 original: String::new(),
                 is_binary: false,
                 is_mixed: !all_same,
                 has_multiple_stored_values: false,
-                row_scope: super::probe::RowScope::File,
+                row_scope,
                 per_file_stored_value_counts: vec![0; target_count],
-                per_file_values: plan.values,
+                per_file_values: values,
                 per_file_originals: vec![String::new(); target_count],
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
+            target_rows.insert(key, state.active_surface().entries.len() - 1);
         }
-        report.applied.push((plan.key, plan.mode));
-        report.cardinality_warnings.extend(plan.cardinality_warnings);
+        report.applied.push((canonical_key, mode));
     }
 
-    if report.applied.is_empty()
-        && report.skipped_numbering_keys.is_empty()
-        && report.skipped_track_scoped.is_empty()
-    {
-        return Err("tag transfer source contains no applicable text fields".to_string());
-    }
     state.recompute_active_dirty();
     Ok(report)
 }

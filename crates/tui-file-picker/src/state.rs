@@ -113,6 +113,9 @@ pub struct FilePickerEntry {
 pub enum FilePickerAction {
     None,
     Selected(PathBuf),
+    /// Explicit confirm of the marked files in current visible order.
+    /// Directory marks are deliberately excluded at the picker boundary.
+    SelectedMany(Vec<PathBuf>),
     OpenSystemDefault(PathBuf),
     Cancelled,
 }
@@ -1021,6 +1024,9 @@ pub struct FilePickerState {
     pub(crate) context_menu_anchor: Option<(u16, u16)>,
     pub(crate) selected: Option<PathBuf>,
     pub(crate) multi_selected: Vec<PathBuf>,
+    /// Directory marks discarded by the most recent explicit confirmation.
+    /// Hosts can surface this without widening `SelectedMany`.
+    pub(crate) last_selection_ignored_directories: usize,
     pub(crate) title: String,
     pub(crate) theme: FilePickerTheme,
     pub(crate) focus: FilePickerFocus,
@@ -1100,6 +1106,7 @@ impl FilePickerState {
             context_menu_anchor: None,
             selected: None,
             multi_selected: Vec::new(),
+            last_selection_ignored_directories: 0,
             title: config.title,
             theme: config.theme,
             focus: FilePickerFocus::Files,
@@ -1194,6 +1201,61 @@ impl FilePickerState {
 
     pub fn is_path_multi_selected(&self, path: &Path) -> bool {
         self.multi_selected.iter().any(|candidate| same_path(candidate, path))
+    }
+
+    /// Number of directory marks filtered by the most recent explicit
+    /// selection confirmation. The value is reset at the start of every
+    /// confirmation attempt.
+    pub fn last_selection_ignored_directories(&self) -> usize {
+        self.last_selection_ignored_directories
+    }
+
+    /// Consume the directory-filter count associated with the most recent
+    /// explicit confirmation. Hosts use this one-shot accessor so a later
+    /// Enter, double-click, or cancellation cannot inherit stale context.
+    pub fn take_last_selection_ignored_directories(&mut self) -> usize {
+        std::mem::take(&mut self.last_selection_ignored_directories)
+    }
+
+    /// Return marked files in the same sorted order as the visible file pane,
+    /// plus the number of marked directories that were intentionally ignored.
+    /// This makes completion deterministic regardless of marking gesture.
+    pub(crate) fn marked_files_in_visible_order(&self) -> (Vec<PathBuf>, usize) {
+        let mut files = Vec::new();
+        let mut ignored_directories = 0usize;
+        for entry in &self.entries {
+            if !self.is_path_multi_selected(&entry.path) {
+                continue;
+            }
+            if entry.is_dir {
+                ignored_directories = ignored_directories.saturating_add(1);
+            } else {
+                files.push(entry.path.clone());
+            }
+        }
+        (files, ignored_directories)
+    }
+
+    /// Context-sensitive label for the explicit picker confirmation button.
+    pub(crate) fn selection_confirmation_label(&self) -> Option<String> {
+        if self.selection_mode == FilePickerSelectionMode::Directories {
+            return Some("Select Folder".to_string());
+        }
+        let (marked_files, _) = self.marked_files_in_visible_order();
+        if !marked_files.is_empty() {
+            return Some(format!(
+                "Select {} File{}",
+                marked_files.len(),
+                if marked_files.len() == 1 { "" } else { "s" }
+            ));
+        }
+        let entry = self.current_selection()?;
+        if entry.is_dir {
+            (self.selection_mode == FilePickerSelectionMode::FilesOrDirectories)
+                .then(|| "Select Folder".to_string())
+        } else {
+            Some("Select File".to_string())
+        }
     }
 
     pub fn toggle_current_multi_selection(&mut self) -> bool {
@@ -2279,9 +2341,17 @@ impl FilePickerState {
     }
 
     pub fn accept_current_selection(&mut self) -> FilePickerAction {
+        self.last_selection_ignored_directories = 0;
         if self.selection_mode == FilePickerSelectionMode::Directories {
             return FilePickerAction::Selected(self.current_dir.clone());
         }
+
+        let (marked_files, ignored_directories) = self.marked_files_in_visible_order();
+        self.last_selection_ignored_directories = ignored_directories;
+        if !marked_files.is_empty() {
+            return FilePickerAction::SelectedMany(marked_files);
+        }
+
         let Some(entry) = self.entries.get(self.file_cursor).cloned() else {
             self.set_error(FilePickerError::NoSelection);
             return FilePickerAction::None;
@@ -8974,6 +9044,111 @@ mod tests {
         );
         assert_eq!(fs::read(destination.join("disc/track.flac")).expect("track"), b"audio");
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn marked_file_confirmation_filters_directories_and_emits_visible_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("00-folder");
+        let first = temp.path().join("01-first.flac");
+        let second = temp.path().join("02-second.flac");
+        fs::create_dir(&directory).expect("directory");
+        fs::write(&first, b"first").expect("first");
+        fs::write(&second, b"second").expect("second");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::FilesOrDirectories,
+            ..FilePickerConfig::default()
+        });
+
+        // Deliberately use gesture order opposite to visible sort order and
+        // include a directory mark. Completion must be deterministic.
+        picker.multi_selected = vec![second.clone(), directory, first.clone()];
+        assert_eq!(picker.selection_confirmation_label().as_deref(), Some("Select 2 Files"));
+        assert_eq!(
+            picker.accept_current_selection(),
+            FilePickerAction::SelectedMany(vec![first, second])
+        );
+        assert_eq!(picker.last_selection_ignored_directories(), 1);
+    }
+
+    #[test]
+    fn directory_only_marks_fall_back_to_cursor_selection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("folder");
+        let file = temp.path().join("track.flac");
+        fs::create_dir(&directory).expect("directory");
+        fs::write(&file, b"audio").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::FilesOrDirectories,
+            ..FilePickerConfig::default()
+        });
+        let file_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == file)
+            .expect("file visible");
+        picker.set_file_cursor(file_index, 8);
+        picker.multi_selected = vec![directory];
+
+        assert_eq!(picker.selection_confirmation_label().as_deref(), Some("Select File"));
+        assert_eq!(picker.accept_current_selection(), FilePickerAction::Selected(file));
+        assert_eq!(picker.last_selection_ignored_directories(), 1);
+    }
+
+    #[test]
+    fn contextual_confirmation_labels_cover_all_selection_states() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("folder");
+        let file = temp.path().join("track.flac");
+        fs::create_dir(&directory).expect("directory");
+        fs::write(&file, b"audio").expect("file");
+
+        let mut mixed = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::FilesOrDirectories,
+            ..FilePickerConfig::default()
+        });
+        let directory_index = mixed
+            .entries()
+            .iter()
+            .position(|entry| entry.path == directory)
+            .expect("directory visible");
+        let file_index = mixed
+            .entries()
+            .iter()
+            .position(|entry| entry.path == file)
+            .expect("file visible");
+        mixed.set_file_cursor(directory_index, 8);
+        assert_eq!(mixed.selection_confirmation_label().as_deref(), Some("Select Folder"));
+        mixed.set_file_cursor(file_index, 8);
+        assert_eq!(mixed.selection_confirmation_label().as_deref(), Some("Select File"));
+        mixed.multi_selected = vec![file.clone()];
+        assert_eq!(mixed.selection_confirmation_label().as_deref(), Some("Select 1 File"));
+
+        let mut files_only = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Files,
+            ..FilePickerConfig::default()
+        });
+        let directory_index = files_only
+            .entries()
+            .iter()
+            .position(|entry| entry.path == directory)
+            .expect("directory visible");
+        files_only.set_file_cursor(directory_index, 8);
+        assert_eq!(files_only.selection_confirmation_label(), None);
+
+        let directories = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Directories,
+            ..FilePickerConfig::default()
+        });
+        assert_eq!(
+            directories.selection_confirmation_label().as_deref(),
+            Some("Select Folder")
+        );
     }
 
 }
