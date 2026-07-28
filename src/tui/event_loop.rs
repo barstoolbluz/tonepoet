@@ -287,6 +287,7 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
         | AppMessage::BookmarkDetailStarted { .. }
         | AppMessage::BookmarkDetailLoaded { .. }
         | AppMessage::MetadataWriteComplete { .. }
+        | AppMessage::TagTransferComplete { .. }
         | AppMessage::OffsetCorrectionComplete { .. }
         | AppMessage::CtdbRepairComplete { .. } => true,
         AppMessage::CueWriteComplete { refresh_browse, .. } => *refresh_browse,
@@ -294,6 +295,7 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
             purpose,
             super::app::FilePickerPurpose::CopyTo { .. }
                 | super::app::FilePickerPurpose::MoveTo { .. }
+                | super::app::FilePickerPurpose::BrowseTagTransfer { .. }
         ),
         AppMessage::FileTaskProgress { update, .. } => matches!(
             update,
@@ -480,7 +482,7 @@ fn reconcile_browse_archive_metadata_editor_for_quit(
         return true;
     }
 
-    super::keybindings::metadata_editor_cancel_details_probe(&mut state);
+    super::keybindings::metadata_editor_prepare_for_competing_workflow(app, &mut state);
 
     if state.any_presentation_dirty() {
         app.should_quit = false;
@@ -810,6 +812,60 @@ fn metadata_editor_apply_artwork_metadata(
     }
 }
 
+const MAX_TAG_BLOCK_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_tag_blocks_file_bounded(
+    path: &std::path::Path,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<Vec<super::tag_interchange::FieldBlock>, String> {
+    use std::io::Read;
+
+    if cancel.is_cancelled() {
+        return Err("tag-block file read cancelled".to_string());
+    }
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open '{}': {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect '{}': {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("'{}' is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_TAG_BLOCK_FILE_BYTES {
+        return Err(format!(
+            "tag-block file is too large ({} bytes; limit {})",
+            metadata.len(),
+            MAX_TAG_BLOCK_FILE_BYTES,
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut reader = file.take(MAX_TAG_BLOCK_FILE_BYTES.saturating_add(1));
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err("tag-block file read cancelled".to_string());
+        }
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| format!("cannot read '{}': {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    if bytes.len() as u64 > MAX_TAG_BLOCK_FILE_BYTES {
+        return Err(format!(
+            "tag-block file grew beyond the {}-byte limit while being read",
+            MAX_TAG_BLOCK_FILE_BYTES
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|error| format!("'{}' is not valid UTF-8: {error}", path.display()))?;
+    super::tag_interchange::parse_field_blocks(&text).map_err(|error| error.to_string())
+}
+
 fn reduce_file_picker_complete(
     app: &mut AppState,
     session_id: u64,
@@ -862,6 +918,200 @@ fn reduce_file_picker_complete(
                 }
             }
         }
+        super::app::FilePickerPurpose::MetadataTagBlocksFile => {
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            match overlay {
+                ActiveOverlay::MetadataEditor(mut state) => {
+                    let matches_open_picker = state
+                        .file_picker
+                        .as_ref()
+                        .is_some_and(|picker| {
+                            picker.session_id == session_id && picker.purpose == purpose
+                        });
+                    if matches_open_picker {
+                        if let Some(open_picker) = state.file_picker.as_ref() {
+                            super::keybindings::persist_file_picker_sort_if_changed(
+                                app,
+                                &open_picker.picker,
+                            );
+                        }
+                        state.file_picker = None;
+                    }
+                    if !matches_open_picker {
+                        app.set_status("file picker: ignored stale tag-block completion");
+                    } else if let Some(path) = path {
+                        let editor_session = metadata_editor_session_guard(&state);
+                        let editor_fingerprint =
+                            super::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+                        let (request_id, prepare_cancel) =
+                            state.begin_tag_transfer_preparation();
+                        let worker_tx = tx.clone();
+                        let worker_path = path.clone();
+                        app.set_status(format!(
+                            "metadata editor: reading tag blocks from {}...",
+                            path.display()
+                        ));
+                        tokio::spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                read_tag_blocks_file_bounded(&worker_path, &prepare_cancel)
+                            })
+                            .await
+                            .unwrap_or_else(|error| {
+                                Err(format!("tag-block file worker failed: {error}"))
+                            });
+                            let _ = worker_tx
+                                .send(AppMessage::MetadataTagBlocksFilePrepared {
+                                    request_id,
+                                    editor_session,
+                                    editor_fingerprint,
+                                    path,
+                                    result,
+                                })
+                                .await;
+                        });
+                    } else {
+                        app.set_status("metadata editor: tag-block file picker cancelled");
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                }
+                other => {
+                    app.active_overlay = other;
+                    app.set_status(
+                        "file picker: ignored tag-block completion without an active editor",
+                    );
+                }
+            }
+        }
+        super::app::FilePickerPurpose::MetadataTagTransfer { direction, scope } => {
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            match overlay {
+                ActiveOverlay::MetadataEditor(mut state) => {
+                    let matches_open_picker = state
+                        .file_picker
+                        .as_ref()
+                        .is_some_and(|picker| {
+                            picker.session_id == session_id && picker.purpose == purpose
+                        });
+                    if matches_open_picker {
+                        if let Some(open_picker) = state.file_picker.as_ref() {
+                            super::keybindings::persist_file_picker_sort_if_changed(
+                                app,
+                                &open_picker.picker,
+                            );
+                        }
+                        state.file_picker = None;
+                    }
+                    if !matches_open_picker {
+                        app.set_status("file picker: ignored stale editor tag-transfer completion");
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        return;
+                    }
+                    let Some(selected) = path else {
+                        app.set_status("metadata editor: tag transfer cancelled");
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        return;
+                    };
+                    let editor_session = metadata_editor_session_guard(&state);
+                    let editor_fingerprint =
+                        super::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+                    let (request_id, prepare_cancel) =
+                        state.begin_tag_transfer_preparation();
+                    match direction {
+                        super::app::TagTransferDirection::To => {
+                            let (source_entries, source_count) =
+                                super::tag_interchange::metadata_editor_transfer_snapshot(&state);
+                            let worker_tx = tx.clone();
+                            app.set_status("metadata editor: resolving tag-transfer targets...");
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    super::command::expand_audio_paths_for_metadata_limited(
+                                        &[selected],
+                                        super::context_menu::TAG_CLIPBOARD_COPY_MAX_VISITED,
+                                        super::context_menu::TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+                                        || prepare_cancel.is_cancelled(),
+                                    )
+                                    .and_then(|paths| {
+                                        if paths.is_empty() {
+                                            Err("Transfer tags: target contains no audio files".to_string())
+                                        } else {
+                                            Ok(paths)
+                                        }
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    Err(format!("tag-transfer target worker failed: {error}"))
+                                });
+                                let _ = worker_tx
+                                    .send(AppMessage::MetadataTagTransferTargetsPrepared {
+                                        request_id,
+                                        editor_session,
+                                        editor_fingerprint,
+                                        scope,
+                                        source_entries,
+                                        source_count,
+                                        result,
+                                    })
+                                    .await;
+                            });
+                        }
+                        super::app::TagTransferDirection::From => {
+                            let worker_tx = tx.clone();
+                            app.set_status("metadata editor: reading tag-transfer source...");
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let paths =
+                                        super::command::expand_audio_paths_for_metadata_limited(
+                                            &[selected],
+                                            super::context_menu::TAG_CLIPBOARD_COPY_MAX_VISITED,
+                                            super::context_menu::TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+                                            || prepare_cancel.is_cancelled(),
+                                        )?;
+                                    if paths.is_empty() {
+                                        return Err(
+                                            "Transfer tags: source contains no audio files".to_string(),
+                                        );
+                                    }
+                                    let source_count = paths.len();
+                                    let entries =
+                                        super::tag_interchange::read_transfer_source_entries(
+                                            &paths,
+                                            scope,
+                                            &prepare_cancel,
+                                        )?;
+                                    Ok((entries, source_count))
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    Err(format!("tag-transfer source worker failed: {error}"))
+                                });
+                                let (source_count, result) = match result {
+                                    Ok((entries, source_count)) => (source_count, Ok(entries)),
+                                    Err(error) => (0, Err(error)),
+                                };
+                                let _ = worker_tx
+                                    .send(AppMessage::MetadataTagTransferSourcePrepared {
+                                        request_id,
+                                        editor_session,
+                                        editor_fingerprint,
+                                        scope,
+                                        source_count,
+                                        result,
+                                    })
+                                    .await;
+                            });
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                }
+                other => {
+                    app.active_overlay = other;
+                    app.set_status(
+                        "file picker: ignored editor tag-transfer completion without an active editor",
+                    );
+                }
+            }
+        }
         super::app::FilePickerPurpose::CopyTo { sources, force }
         | super::app::FilePickerPurpose::MoveTo { sources, force } => {
             let is_move = matches!(purpose, super::app::FilePickerPurpose::MoveTo { .. });
@@ -894,6 +1144,31 @@ fn reduce_file_picker_complete(
                 &dest,
                 tx,
                 conflict_policy,
+            );
+        }
+        super::app::FilePickerPurpose::BrowseTagTransfer {
+            direction,
+            scope,
+            fixed_roots,
+        } => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status("file picker: ignored stale tag-transfer completion");
+                return;
+            }
+            let Some(selected) = path else {
+                app.set_status("Transfer tags cancelled");
+                return;
+            };
+            let (source_roots, target_roots) = match direction {
+                super::app::TagTransferDirection::To => (fixed_roots, vec![selected]),
+                super::app::TagTransferDirection::From => (vec![selected], fixed_roots),
+            };
+            super::context_menu::start_tag_transfer(
+                app,
+                source_roots,
+                target_roots,
+                scope,
+                tx,
             );
         }
         super::app::FilePickerPurpose::SelectDestination => {
@@ -3335,6 +3610,210 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 source_paths,
                 result,
             );
+        }
+        AppMessage::TagTransferComplete { generation, result } => {
+            super::context_menu::handle_tag_transfer_complete(
+                app,
+                tx,
+                generation,
+                result,
+            );
+        }
+        AppMessage::TagTransferProgress {
+            generation,
+            completed,
+            total,
+            path,
+        } => {
+            super::context_menu::handle_tag_transfer_progress(
+                app,
+                generation,
+                completed,
+                total,
+                &path,
+            );
+        }
+        AppMessage::MetadataTagBlocksFilePrepared {
+            request_id,
+            editor_session,
+            editor_fingerprint,
+            path,
+            result,
+        } => {
+            let Some(mut taken) = take_metadata_editor_with_restore_slot(app) else {
+                log::debug!(
+                    "ignored editor tag-block file preparation {request_id}: editor is closed"
+                );
+                return;
+            };
+            if !taken.state.take_tag_transfer_preparation(request_id) {
+                restore_taken_metadata_editor(app, taken);
+                log::debug!(
+                    "ignored superseded or duplicate editor tag-block file preparation {request_id}"
+                );
+                return;
+            }
+            if metadata_editor_session_guard(&taken.state) != editor_session
+                || super::tag_interchange::metadata_editor_transfer_fingerprint(&taken.state)
+                    != editor_fingerprint
+            {
+                restore_taken_metadata_editor(app, taken);
+                app.set_status(
+                    "metadata editor: tag-block file result became stale; choose the file again",
+                );
+                return;
+            }
+
+            match result {
+                Ok(blocks) => match super::tag_interchange::apply_field_blocks_to_editor(
+                    &mut taken.state,
+                    &blocks,
+                ) {
+                    Ok(report) => app.set_status(
+                        report.success_status(taken.state.active_surface().paths.len()),
+                    ),
+                    Err(error) => app.set_status(format!("tag blocks: {error}")),
+                },
+                Err(error) => app.set_status(format!(
+                    "tag blocks from '{}': {error}",
+                    path.display()
+                )),
+            }
+            restore_taken_metadata_editor(app, taken);
+        }
+        AppMessage::MetadataTagTransferTargetsPrepared {
+            request_id,
+            editor_session,
+            editor_fingerprint,
+            scope,
+            source_entries,
+            source_count,
+            result,
+        } => {
+            let Some(mut taken) = take_metadata_editor_with_restore_slot(app) else {
+                log::debug!(
+                    "ignored editor tag-transfer target preparation {request_id}: editor is closed"
+                );
+                return;
+            };
+            if !taken.state.take_tag_transfer_preparation(request_id) {
+                restore_taken_metadata_editor(app, taken);
+                log::debug!(
+                    "ignored superseded or duplicate editor tag-transfer target preparation {request_id}"
+                );
+                return;
+            }
+            if metadata_editor_session_guard(&taken.state) != editor_session
+                || super::tag_interchange::metadata_editor_transfer_fingerprint(&taken.state)
+                    != editor_fingerprint
+            {
+                restore_taken_metadata_editor(app, taken);
+                app.set_status(
+                    "metadata editor: tag-transfer target result became stale; choose the target again",
+                );
+                return;
+            }
+
+            match result {
+                Ok(target_paths) => {
+                    let edit_count = super::tag_interchange::metadata_editor_unsaved_edit_count(
+                        &taken.state,
+                    );
+                    if edit_count > 0 {
+                        let target_count = target_paths.len();
+                        app.pending_metadata_editor = Some(taken.state);
+                        app.active_overlay = ActiveOverlay::Confirmation {
+                            message: format!(
+                                "Transfer {} unsaved edit{} to {} file{}?",
+                                edit_count,
+                                if edit_count == 1 { "" } else { "s" },
+                                target_count,
+                                if target_count == 1 { "" } else { "s" },
+                            ),
+                            action: super::app::ConfirmAction::MetadataTransferUnsaved {
+                                source_entries,
+                                source_count,
+                                target_paths,
+                                scope,
+                                edit_count,
+                            },
+                        };
+                    } else {
+                        let target_count = target_paths.len();
+                        super::context_menu::start_tag_transfer_from_editor_snapshot(
+                            app,
+                            source_entries,
+                            source_count,
+                            target_paths,
+                            scope,
+                            tx,
+                        );
+                        restore_taken_metadata_editor(app, taken);
+                        app.set_status(format!(
+                            "Transfer tags: {} target{}; reading and writing metadata...",
+                            target_count,
+                            if target_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                Err(error) => {
+                    restore_taken_metadata_editor(app, taken);
+                    app.set_status(error);
+                }
+            }
+        }
+        AppMessage::MetadataTagTransferSourcePrepared {
+            request_id,
+            editor_session,
+            editor_fingerprint,
+            scope,
+            source_count,
+            result,
+        } => {
+            let Some(mut taken) = take_metadata_editor_with_restore_slot(app) else {
+                log::debug!(
+                    "ignored editor tag-transfer source preparation {request_id}: editor is closed"
+                );
+                return;
+            };
+            if !taken.state.take_tag_transfer_preparation(request_id) {
+                restore_taken_metadata_editor(app, taken);
+                log::debug!(
+                    "ignored superseded or duplicate editor tag-transfer source preparation {request_id}"
+                );
+                return;
+            }
+            if metadata_editor_session_guard(&taken.state) != editor_session
+                || super::tag_interchange::metadata_editor_transfer_fingerprint(&taken.state)
+                    != editor_fingerprint
+            {
+                restore_taken_metadata_editor(app, taken);
+                app.set_status(
+                    "metadata editor: tag-transfer source result became stale; choose the source again",
+                );
+                return;
+            }
+
+            match result {
+                Ok(entries) => match super::tag_interchange::apply_transfer_entries_to_editor(
+                    &mut taken.state,
+                    &entries,
+                    source_count,
+                    scope,
+                ) {
+                    Ok(report) => {
+                        for warning in &report.cardinality_warnings {
+                            log::warn!("editor tag transfer: {warning}");
+                        }
+                        app.set_status(
+                            report.success_status(taken.state.active_surface().paths.len()),
+                        );
+                    }
+                    Err(error) => app.set_status(error),
+                },
+                Err(error) => app.set_status(error),
+            }
+            restore_taken_metadata_editor(app, taken);
         }
         AppMessage::ActionsRunPreparationProgress {
             preparation_id,
@@ -6095,6 +6574,16 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                             input.insert_char(c);
                         }
                     }
+                } else if state.phase == MetadataEditorPhase::Editing {
+                    if let Err(reason) =
+                        super::keybindings::metadata_editor_apply_row_or_block_paste(
+                            app,
+                            &mut state,
+                            text,
+                        )
+                    {
+                        app.set_status(reason);
+                    }
                 }
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
@@ -6540,6 +7029,68 @@ mod metadata_detail_paste_tests {
     use crate::tui::app::{MetadataEditorPhase, MetadataEditorState, MetadataTechnicalDetails};
     use crate::tui::probe::{RowScope, TagEntry};
     use lofty::tag::ItemKey;
+
+    fn editing_entry(key: &str, item_key: ItemKey, values: &[&str]) -> TagEntry {
+        TagEntry {
+            row_scope: RowScope::File,
+            display_key: key.to_string(),
+            item_key,
+            value: values.first().copied().unwrap_or_default().to_string(),
+            original: values.first().copied().unwrap_or_default().to_string(),
+            is_binary: false,
+            is_mixed: values.windows(2).any(|pair| pair[0] != pair[1]),
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: vec![1; values.len()],
+            per_file_values: values.iter().map(|value| (*value).to_string()).collect(),
+            per_file_originals: values.iter().map(|value| (*value).to_string()).collect(),
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn editing_phase_bracketed_paste_uses_block_then_row_classification_and_reports_errors() {
+        let mut state = MetadataEditorState::for_files(
+            vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
+            vec![editing_entry("TITLE", ItemKey::TrackTitle, &["Old A", "Old B"])],
+            vec!["a".to_string(), "b".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::Editing;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(8);
+
+        handle_paste(&mut app, "TITLE\nShared", &tx);
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("editor remains open after block paste");
+        };
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            ["Shared", "Shared"]
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("applied TITLE (broadcast to 2 files) — review before save")
+        );
+
+        handle_paste(&mut app, "One\nTwo", &tx);
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("editor remains open after row paste");
+        };
+        assert_eq!(state.active_surface().entries[0].per_file_values, ["One", "Two"]);
+
+        let before = state.active_surface().entries[0].per_file_values.clone();
+        handle_paste(&mut app, "TITLE\nOne\nTwo\nThree", &tx);
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("editor remains open after rejected block paste");
+        };
+        assert_eq!(state.active_surface().entries[0].per_file_values, before);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("tag blocks: TITLE has 3 values for 2 files")
+        );
+    }
 
     #[test]
     fn detail_paste_status_keeps_cardinality_warning() {
@@ -11583,6 +12134,7 @@ mod musicbrainz_completion_dispatch_tests {
         app.active_overlay = ActiveOverlay::ContextMenu {
             levels: Vec::new(),
             origin: (4, 5),
+            anchor_bottom: false,
         };
         app.set_status(":tags-mb: B context menu".to_string());
         let status_before = app.status_message.as_ref().map(|(message, _)| message.clone());
@@ -12916,10 +13468,267 @@ mod tag_clipboard_completion_tests {
         assert_eq!(clipboard.entries[0].per_file_stored_value_counts, vec![2, 1]);
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Copied 1 field from 2 files"),
+            Some("Copied 1 field from 2 files (text clipboard)"),
         );
         assert_eq!(app.browse.tag_clipboard_copy_active_generation, None);
         assert!(app.browse.tag_clipboard_copy_cancel.is_none());
+    }
+}
+
+#[cfg(test)]
+mod editor_tag_transfer_preparation_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{
+        AppScreen, MetadataEditorState, MetadataTechnicalDetails, TagTransferScope,
+    };
+    use crate::tui::probe::{RowScope, TagEntry};
+    use lofty::tag::ItemKey;
+    use std::path::PathBuf;
+
+    fn tx() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(8);
+        tx
+    }
+
+    fn title(value: &str) -> TagEntry {
+        TagEntry {
+            display_key: "TITLE".to_string(),
+            item_key: ItemKey::TrackTitle,
+            value: value.to_string(),
+            original: value.to_string(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: false,
+            row_scope: RowScope::File,
+            per_file_stored_value_counts: vec![1],
+            per_file_values: vec![value.to_string()],
+            per_file_originals: vec![value.to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn editor_transfer_preparation_is_last_request_wins_across_directions() {
+        let mut state = MetadataEditorState::for_files(
+            vec![PathBuf::from("/tmp/editor.dsf")],
+            vec![title("Original")],
+            vec!["editor.dsf".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        let (stale_target_request, stale_cancel) = state.begin_tag_transfer_preparation();
+        let (current_source_request, _current_cancel) = state.begin_tag_transfer_preparation();
+        assert!(stale_cancel.is_cancelled(), "new request must cancel the old directory walk");
+        let editor_session = metadata_editor_session_guard(&state);
+        let editor_fingerprint =
+            super::super::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        app.set_status("newer source request is pending");
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataTagTransferTargetsPrepared {
+                request_id: stale_target_request,
+                editor_session,
+                editor_fingerprint,
+                scope: TagTransferScope::All,
+                source_entries: vec![title("Stale outbound")],
+                source_count: 1,
+                result: Ok(vec![PathBuf::from("/tmp/stale-target.dsf")]),
+            },
+            &tx(),
+        );
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("superseded target completion must leave the editor open");
+        };
+        assert_eq!(state.active_surface().entries[0].value, "Original");
+        assert!(state.owns_tag_transfer_preparation(current_source_request));
+        assert!(state.tag_transfer_prepare_cancel.is_some());
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("newer source request is pending"),
+            "a stale completion must not overwrite the newer request's status"
+        );
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataTagTransferSourcePrepared {
+                request_id: current_source_request,
+                editor_session,
+                editor_fingerprint,
+                scope: TagTransferScope::All,
+                source_count: 1,
+                result: Ok(vec![title("Current inbound")]),
+            },
+            &tx(),
+        );
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("current source completion must restore the editor");
+        };
+        assert_eq!(state.active_surface().entries[0].value, "Current inbound");
+        assert!(state.tag_transfer_prepare_cancel.is_none());
+        assert!(!state.owns_tag_transfer_preparation(current_source_request));
+    }
+
+    #[test]
+    fn editor_tag_interchange_preparation_authority_is_consumed_once() {
+        let mut state = MetadataEditorState::for_files(
+            vec![PathBuf::from("/tmp/editor.flac")],
+            vec![title("Original")],
+            vec!["editor.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        let (request_id, _cancel) = state.begin_tag_transfer_preparation();
+
+        assert!(state.take_tag_transfer_preparation(request_id));
+        assert!(!state.take_tag_transfer_preparation(request_id));
+        assert!(!state.owns_tag_transfer_preparation(request_id));
+    }
+
+    #[test]
+    fn parked_editor_transfer_completion_reduces_once_and_preserves_visible_overlay() {
+        let mut state = MetadataEditorState::for_files(
+            vec![PathBuf::from("/tmp/editor.dsf")],
+            vec![title("Original")],
+            vec!["editor.dsf".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        let (request_id, _cancel) = state.begin_tag_transfer_preparation();
+        let editor_session = metadata_editor_session_guard(&state);
+        let editor_fingerprint =
+            super::super::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        app.active_overlay = ActiveOverlay::Help {
+            screen: AppScreen::Browse,
+            scroll: 3,
+        };
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataTagTransferSourcePrepared {
+                request_id,
+                editor_session,
+                editor_fingerprint,
+                scope: TagTransferScope::All,
+                source_count: 1,
+                result: Ok(vec![title("Applied once")]),
+            },
+            &tx(),
+        );
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Help {
+                screen: AppScreen::Browse,
+                scroll: 3
+            }
+        ));
+        let state = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("parked editor must be restored");
+        assert_eq!(state.active_surface().entries[0].value, "Applied once");
+        let accepted_status = app.status_message.clone();
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataTagTransferSourcePrepared {
+                request_id,
+                editor_session,
+                editor_fingerprint,
+                scope: TagTransferScope::All,
+                source_count: 1,
+                result: Ok(vec![title("Duplicate delivery")]),
+            },
+            &tx(),
+        );
+
+        let state = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("duplicate must leave parked editor intact");
+        assert_eq!(state.active_surface().entries[0].value, "Applied once");
+        assert_eq!(app.status_message, accepted_status);
+    }
+
+    #[test]
+    fn parked_editor_file_import_is_last_request_wins() {
+        let mut state = MetadataEditorState::for_files(
+            vec![PathBuf::from("/tmp/editor.flac")],
+            vec![title("Original")],
+            vec!["editor.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        let (older_request, older_cancel) = state.begin_tag_transfer_preparation();
+        let (newer_request, _newer_cancel) = state.begin_tag_transfer_preparation();
+        assert!(older_cancel.is_cancelled());
+        let editor_session = metadata_editor_session_guard(&state);
+        let editor_fingerprint =
+            super::super::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        app.active_overlay = ActiveOverlay::Help {
+            screen: AppScreen::Browse,
+            scroll: 0,
+        };
+        app.set_status("newer file import pending");
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataTagBlocksFilePrepared {
+                request_id: older_request,
+                editor_session,
+                editor_fingerprint,
+                path: PathBuf::from("/tmp/older.txt"),
+                result: Ok(vec![super::super::tag_interchange::FieldBlock {
+                    key: "TITLE".to_string(),
+                    values: vec!["Older".to_string()],
+                }]),
+            },
+            &tx(),
+        );
+        assert_eq!(
+            app.pending_metadata_editor
+                .as_ref()
+                .expect("editor remains parked")
+                .active_surface()
+                .entries[0]
+                .value,
+            "Original"
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("newer file import pending")
+        );
+
+        handle_message(
+            &mut app,
+            AppMessage::MetadataTagBlocksFilePrepared {
+                request_id: newer_request,
+                editor_session,
+                editor_fingerprint,
+                path: PathBuf::from("/tmp/newer.txt"),
+                result: Ok(vec![super::super::tag_interchange::FieldBlock {
+                    key: "TITLE".to_string(),
+                    values: vec!["Newer".to_string()],
+                }]),
+            },
+            &tx(),
+        );
+        let state = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("newer completion restores parked editor");
+        assert_eq!(state.active_surface().entries[0].value, "Newer");
+        assert!(!state.owns_tag_transfer_preparation(newer_request));
     }
 }
 
@@ -14409,6 +15218,61 @@ mod async_message_drain_tests {
             "neither vanished source can be advertised as retryable"
         );
         assert!(app.browse.filesystem_clipboard_retry_plan.is_none());
+    }
+
+    #[test]
+    fn bounded_tag_block_file_reader_accepts_valid_utf8_blocks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tags.txt");
+        std::fs::write(&path, b"TITLE\nOne\nTwo\n\nARTIST\nGenesis\n")
+            .expect("write tag blocks");
+
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        let blocks = read_tag_blocks_file_bounded(&path, &cancel).expect("valid blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].key, "TITLE");
+        assert_eq!(blocks[0].values, vec!["One", "Two"]);
+        assert_eq!(blocks[1].key, "ARTIST");
+        assert_eq!(blocks[1].values, vec!["Genesis"]);
+    }
+
+    #[test]
+    fn bounded_tag_block_file_reader_rejects_invalid_utf8() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tags.txt");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        let error =
+            read_tag_blocks_file_bounded(&path, &cancel).expect_err("invalid utf8 must fail");
+        assert!(error.contains("not valid UTF-8"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn bounded_tag_block_file_reader_rejects_oversized_regular_file_before_reading() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tags.txt");
+        let file = std::fs::File::create(&path).expect("create sparse file");
+        file.set_len(MAX_TAG_BLOCK_FILE_BYTES + 1)
+            .expect("extend sparse file");
+
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        let error =
+            read_tag_blocks_file_bounded(&path, &cancel).expect_err("oversized file must fail");
+        assert!(error.contains("too large"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn bounded_tag_block_file_reader_honors_pre_cancel() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tags.txt");
+        std::fs::write(&path, b"TITLE\nOne\n").expect("write tag blocks");
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        cancel.cancel();
+
+        let error = read_tag_blocks_file_bounded(&path, &cancel)
+            .expect_err("cancelled read must not start");
+        assert_eq!(error, "tag-block file read cancelled");
     }
 
 }

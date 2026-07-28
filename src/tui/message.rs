@@ -159,6 +159,54 @@ pub enum AppMessage {
         source_paths: Vec<std::path::PathBuf>,
         result: Result<(Vec<crate::tui::probe::TagEntry>, usize), String>,
     },
+    /// Completion of the single active explicit tag-transfer worker.
+    TagTransferComplete {
+        generation: u64,
+        result: Result<crate::tui::tag_interchange::TagTransferReport, String>,
+    },
+    /// Best-effort file-count progress from the active explicit tag transfer.
+    /// The sender uses `try_send`, so a saturated UI channel never stalls the
+    /// metadata writer.
+    TagTransferProgress {
+        generation: u64,
+        completed: usize,
+        total: usize,
+        path: std::path::PathBuf,
+    },
+    /// Bounded file read and strict field-block parse for editor import. The
+    /// request ID provides last-request-wins ownership; the editor fingerprint
+    /// prevents a late completion from applying to a changed or reopened
+    /// editor session.
+    MetadataTagBlocksFilePrepared {
+        request_id: u64,
+        editor_session: MetadataEditorSessionGuard,
+        editor_fingerprint: u64,
+        path: std::path::PathBuf,
+        result: Result<Vec<crate::tui::tag_interchange::FieldBlock>, String>,
+    },
+    /// Bounded expansion of the selected editor transfer target. The captured
+    /// fingerprint binds the result to the exact unsaved editor snapshot that
+    /// the user chose to transfer.
+    MetadataTagTransferTargetsPrepared {
+        request_id: u64,
+        editor_session: MetadataEditorSessionGuard,
+        editor_fingerprint: u64,
+        scope: crate::tui::app::TagTransferScope,
+        source_entries: Vec<crate::tui::probe::TagEntry>,
+        source_count: usize,
+        result: Result<Vec<std::path::PathBuf>, String>,
+    },
+    /// Bounded source expansion and metadata read for an inbound editor
+    /// transfer. The editor fingerprint prevents a late completion from
+    /// overwriting rows changed after the picker was accepted.
+    MetadataTagTransferSourcePrepared {
+        request_id: u64,
+        editor_session: MetadataEditorSessionGuard,
+        editor_fingerprint: u64,
+        scope: crate::tui::app::TagTransferScope,
+        source_count: usize,
+        result: Result<Vec<crate::tui::probe::TagEntry>, String>,
+    },
     /// Progress from background explicit-action preview preparation.
     ActionsRunPreparationProgress {
         preparation_id: String,

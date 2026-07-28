@@ -77,6 +77,7 @@ fn pill_gap() -> Span<'static> {
 /// Values wider than this (in terminal cells) use multiline drop-down editing
 /// instead of single-line horizontal scrolling.
 pub const MULTILINE_EDIT_THRESHOLD: usize = 96;
+pub(crate) const METADATA_EDITOR_KEY_COL_W: usize = 22;
 
 /// Truncate a string to at most `max` terminal cells with an ellipsis on overflow.
 fn truncate_to_chars(s: &str, max: usize) -> String {
@@ -512,8 +513,8 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         ActiveOverlay::BatchList { scroll } => {
             draw_batch_list(f, app, scroll, theme);
         }
-        ActiveOverlay::ContextMenu { ref levels, origin } => {
-            draw_context_menu_stack(f, levels, origin, theme);
+        ActiveOverlay::ContextMenu { ref levels, origin, anchor_bottom } => {
+            draw_context_menu_stack(f, levels, origin, anchor_bottom, theme);
         }
         ActiveOverlay::BulkRename(ref state) => {
             let state = state.clone();
@@ -654,6 +655,7 @@ fn draw_context_menu_stack(
     f: &mut Frame,
     levels: &[super::context_menu::MenuLevel],
     origin: (u16, u16),
+    anchor_bottom: bool,
     theme: super::theme::Theme,
 ) {
     if levels.is_empty() {
@@ -664,7 +666,13 @@ fn draw_context_menu_stack(
     // Reuse the same geometry helper that hover/click use, so all three
     // paths agree on rect placement (incl. width-overflow shift).
     let (rects, preview) =
-        super::keybindings::context_menu_stack_rects(levels, origin, area.width, area.height);
+        super::keybindings::context_menu_stack_rects_anchored(
+            levels,
+            origin,
+            area.width,
+            area.height,
+            anchor_bottom,
+        );
 
     let focused_idx = levels.len() - 1;
     for (i, level) in levels.iter().enumerate() {
@@ -4951,7 +4959,7 @@ fn draw_metadata_editor(
         return;
     }
 
-    let key_col_w: usize = 22;
+    let key_col_w = METADATA_EDITOR_KEY_COL_W;
 
     // Build content lines.
     let total_rows = state.active_surface().entries.len() + 1; // +1 for "+ Add field..."
@@ -4961,6 +4969,7 @@ fn draw_metadata_editor(
 
     for (i, entry) in state.active_surface().entries.iter().enumerate() {
         let is_cursor = i == state.cursor;
+        let is_selected = state.active_surface().selected_rows.contains(&i);
         let is_deleted = state.active_surface().deleted.contains(&i);
         let is_dirty = !is_deleted
             && (entry.value != entry.original
@@ -4972,15 +4981,16 @@ fn draw_metadata_editor(
 
         // Key label, fitted in terminal display columns.
         let key_display = format!(
-            " {}",
+            "{}{}",
+            if is_selected { "▸" } else { " " },
             super::display_width::pad_or_truncate(
                 &entry.display_key,
-                key_col_w.saturating_sub(2),
+                key_col_w.saturating_sub(1),
                 false,
             )
         );
 
-        let key_style = if is_deleted {
+        let mut key_style = if is_deleted {
             Style::default()
                 .fg(theme.text_dim)
                 .add_modifier(Modifier::CROSSED_OUT)
@@ -4988,9 +4998,16 @@ fn draw_metadata_editor(
             Style::default()
                 .fg(theme.amber)
                 .add_modifier(Modifier::BOLD)
+        } else if is_selected {
+            Style::default()
+                .fg(theme.text_bright)
+                .add_modifier(Modifier::BOLD)
         } else {
             theme.muted()
         };
+        if is_selected {
+            key_style = key_style.bg(theme.selection_bg);
+        }
 
         // Value — show inline editor if this row is being edited.
         let key_chars = super::display_width::width(&key_display);
@@ -5147,7 +5164,7 @@ fn draw_metadata_editor(
             entry.value.replace('\n', "↵").replace('\r', "")
         };
 
-        let val_style = if is_deleted {
+        let mut val_style = if is_deleted {
             Style::default()
                 .fg(theme.destructive)
                 .add_modifier(Modifier::CROSSED_OUT)
@@ -5162,6 +5179,9 @@ fn draw_metadata_editor(
         } else {
             Style::default().fg(theme.text_bright)
         };
+        if is_selected {
+            val_style = val_style.bg(theme.selection_bg);
+        }
 
         // Hide the bulk pill on rows showing `<multiple values>`; the
         // detail overlay surfaces a field-level pill + restore for
@@ -5309,13 +5329,9 @@ fn draw_metadata_editor(
                 spans.push(footer_pill("← back", theme.amber, theme));
                 spans.push(pill_gap());
             }
-            // Click dispatches `:tags-mb`, which routes through
-            // `try_dispatch_in_editor_tags_mb` and handles SACD ISOs
-            // and regular file editors uniformly. Sync any change
-            // here with the matching tuple in `keybindings.rs`'s
-            // footer hit-test list — see
-            // `project_editor_footer_pills.md` memory entry.
-            spans.push(footer_pill(":tags-mb", theme.cyan, theme));
+            // Opens the bottom-anchored tag interchange popup. Keep this
+            // label/order synchronized with the footer hit-test tuple.
+            spans.push(footer_pill("tags", theme.cyan, theme));
             spans.push(pill_gap());
             spans.extend_from_slice(&[
                 footer_pill(":fix-caps", theme.blue, theme),

@@ -1,13 +1,80 @@
 //! Shared text input state with UTF-8 safe cursor movement and horizontal scrolling
 
 use crossterm::event::{KeyCode, KeyEvent};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 static TEXT_INPUT_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
 
+thread_local! {
+    /// Optional thread-scoped clipboard used by tests that need an atomic
+    /// setup/dispatch/assertion sequence without contending on process-global
+    /// clipboard state. Production callers never install an override.
+    static SCOPED_TEXT_INPUT_CLIPBOARD: RefCell<Option<String>> = RefCell::new(None);
+}
+
 fn shared_text_input_clipboard() -> &'static Mutex<String> {
     TEXT_INPUT_CLIPBOARD.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// Replace the process-wide text clipboard shared by every picker/editor text
+/// input. Poisoning cannot make clipboard access permanently unavailable: the
+/// recovered value is replaced atomically under the same mutex.
+pub fn write_shared_text_clipboard(text: impl Into<String>) {
+    let text = text.into();
+    let handled_scoped = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
+        let mut scoped = scoped.borrow_mut();
+        if scoped.is_some() {
+            *scoped = Some(text.clone());
+            true
+        } else {
+            false
+        }
+    });
+    if handled_scoped {
+        return;
+    }
+    let mut clipboard = shared_text_input_clipboard()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *clipboard = text;
+}
+
+/// Read an exact snapshot of the process-wide text clipboard.
+pub fn read_shared_text_clipboard() -> String {
+    if let Some(value) = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| scoped.borrow().clone()) {
+        return value;
+    }
+    let clipboard = shared_text_input_clipboard()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clipboard.clone()
+}
+
+/// Run a closure with a thread-scoped shared clipboard. This is intended for
+/// deterministic tests that exercise production clipboard routes in parallel.
+/// The previous scoped value is restored even if the closure panics.
+#[doc(hidden)]
+pub fn with_scoped_shared_text_clipboard<R>(
+    initial: impl Into<String>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<String>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
+                scoped.replace(self.0.take());
+            });
+        }
+    }
+
+    let previous = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
+        scoped.replace(Some(initial.into()))
+    });
+    let _restore = Restore(previous);
+    f()
 }
 
 /// State for a single-line text input field.
@@ -158,9 +225,7 @@ impl TextInputState {
             return false;
         };
         self.clipboard = self.text[range].to_string();
-        if let Ok(mut shared) = shared_text_input_clipboard().lock() {
-            *shared = self.clipboard.clone();
-        }
+        write_shared_text_clipboard(self.clipboard.clone());
         true
     }
 
@@ -176,18 +241,14 @@ impl TextInputState {
         if !self.clipboard.is_empty() {
             return true;
         }
-        shared_text_input_clipboard()
-            .lock()
-            .map(|shared| !shared.is_empty())
-            .unwrap_or(false)
+        !read_shared_text_clipboard().is_empty()
     }
 
     pub fn paste_clipboard(&mut self) -> bool {
         if self.clipboard.is_empty() {
-            if let Ok(shared) = shared_text_input_clipboard().lock() {
-                if !shared.is_empty() {
-                    self.clipboard = shared.clone();
-                }
+            let shared = read_shared_text_clipboard();
+            if !shared.is_empty() {
+                self.clipboard = shared;
             }
         }
         if self.clipboard.is_empty() {
@@ -1687,6 +1748,57 @@ mod tests {
         assert!(input.transform_selection_or_all(str::to_lowercase));
         assert_eq!(input.text, "mixed case");
         assert_eq!(input.selection_range(), Some(0..input.text.len()));
+    }
+
+    #[test]
+    fn public_shared_clipboard_api_round_trips_exact_text() {
+        with_scoped_shared_text_clipboard("", || {
+            let payload = "TITLE\nBehind the Lines\nDuchess";
+            write_shared_text_clipboard(payload);
+            assert_eq!(read_shared_text_clipboard(), payload);
+        });
+    }
+
+    #[test]
+    fn scoped_shared_clipboards_are_isolated_between_parallel_tests() {
+        use std::sync::{Arc, Barrier};
+
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            with_scoped_shared_text_clipboard("first", || {
+                first_barrier.wait();
+                let before = read_shared_text_clipboard();
+                write_shared_text_clipboard("first-updated");
+                first_barrier.wait();
+                let after = read_shared_text_clipboard();
+                (before, after)
+            })
+        });
+        let second = std::thread::spawn(move || {
+            with_scoped_shared_text_clipboard("second", || {
+                barrier.wait();
+                let before = read_shared_text_clipboard();
+                write_shared_text_clipboard("second-updated");
+                barrier.wait();
+                let after = read_shared_text_clipboard();
+                (before, after)
+            })
+        });
+
+        // Join both workers before asserting. If isolation regresses, both
+        // rendezvous still complete and the test fails normally instead of
+        // stranding one worker forever at the second barrier.
+        let first_observed = first.join().expect("first scoped clipboard thread");
+        let second_observed = second.join().expect("second scoped clipboard thread");
+        assert_eq!(
+            first_observed,
+            ("first".to_string(), "first-updated".to_string())
+        );
+        assert_eq!(
+            second_observed,
+            ("second".to_string(), "second-updated".to_string())
+        );
     }
 
 }

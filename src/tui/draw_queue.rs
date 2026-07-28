@@ -456,7 +456,7 @@ fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::
         ("p pause", TuiButton::Pause, theme.amber),
         ("x stop", TuiButton::Stop, theme.destructive),
         ("r retry", TuiButton::RetryFailed, theme.cyan),
-        ("C-l clear done", TuiButton::ClearFinished, theme.purple),
+        ("clear done", TuiButton::ClearFinished, theme.purple),
         ("clear all", TuiButton::ClearAll, theme.destructive),
     ];
 

@@ -26,6 +26,9 @@ fn persist_browse_config(app: &mut AppState) {
 /// stores `Vec<MenuLevel>` and refuses to push beyond this depth.
 pub const MAX_CONTEXT_MENU_DEPTH: usize = 4;
 
+pub(crate) const TONEPOET_CLIPBOARD_NO_TAG_BLOCKS_STATUS: &str =
+    "tonepoet's clipboard has no tag blocks; paste from the system clipboard with your terminal's paste key instead";
+
 /// One panel in the cascade. The deepest level is the focused one;
 /// ancestor levels stay visible with a muted border, their selected
 /// row marking the breadcrumb.
@@ -204,8 +207,21 @@ pub enum ContextAction {
     CopyTags(TagCopySelection),
     /// Deferred Custom tag-field builder; surfaced honestly this round.
     CopyTagsCustomDeferred,
-    /// Deferred tag-paste execution; surfaced honestly this round.
-    PasteTagsDeferred,
+    /// Open the Browse transfer picker with a frozen source/target side.
+    BrowseTransferTags {
+        direction: TagTransferDirection,
+        scope: TagTransferScope,
+    },
+    /// Metadata editor footer popup: launch one of the tag lookup/apply flows.
+    MetadataTagsMusicBrainz,
+    MetadataTagsGnudb,
+    MetadataTagsClipboard,
+    MetadataTagsFile,
+    /// Metadata editor footer popup: transfer between the open editor and a picker target.
+    MetadataTransferTags {
+        direction: TagTransferDirection,
+        scope: TagTransferScope,
+    },
     /// MetadataEditor: toggle the cursor row between MB-proposed and
     /// the file's pre-MB value. No-op when the row was not modified by
     /// MB or has been manually edited.
@@ -218,6 +234,15 @@ pub enum ContextAction {
     MetadataRestoreEntry,
     /// MetadataEditor: open the "add new field" input.
     MetadataAddField,
+    /// MetadataEditor row-level clipboard and selection actions.
+    MetadataRowsCopy,
+    MetadataRowsCut,
+    MetadataRowsPaste,
+    MetadataRowsSelectAll,
+    MetadataRowsInvertSelection,
+    MetadataRowsDeselect,
+    /// MetadataEditor: open the existing per-file value browser for this row.
+    MetadataEditValuesPerFile,
     /// MetadataEditor: immediately apply one numbering scheme.
     MetadataAutoNumber(
         crate::tui::metadata_autonumber::NumberingTarget,
@@ -658,9 +683,52 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
             enabled: true,
         }));
     }
+    let transfer_tags = ContextMenuEntry::Submenu {
+        label: "Transfer tags".to_string(),
+        children: vec![
+            ContextMenuEntry::Submenu {
+                label: "Transfer to".to_string(),
+                children: vec![
+                    item(
+                        "Canonical",
+                        ContextAction::BrowseTransferTags {
+                            direction: TagTransferDirection::To,
+                            scope: TagTransferScope::Canonical,
+                        },
+                    ),
+                    item(
+                        "All",
+                        ContextAction::BrowseTransferTags {
+                            direction: TagTransferDirection::To,
+                            scope: TagTransferScope::All,
+                        },
+                    ),
+                ],
+            },
+            ContextMenuEntry::Submenu {
+                label: "Transfer from".to_string(),
+                children: vec![
+                    item(
+                        "Canonical",
+                        ContextAction::BrowseTransferTags {
+                            direction: TagTransferDirection::From,
+                            scope: TagTransferScope::Canonical,
+                        },
+                    ),
+                    item(
+                        "All",
+                        ContextAction::BrowseTransferTags {
+                            direction: TagTransferDirection::From,
+                            scope: TagTransferScope::All,
+                        },
+                    ),
+                ],
+            },
+        ],
+    };
     children.push(separator());
     children.push(copy_tags);
-    children.push(item("Paste tags", ContextAction::PasteTagsDeferred));
+    children.push(transfer_tags);
     ContextMenuEntry::Submenu {
         label: "Tags & Tagging".to_string(),
         children,
@@ -670,6 +738,61 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
 /// "Disc Tools" submenu — AccurateRip and CUETools DB lookups, both
 /// of which only return useful results for redbook CD rips (16-bit /
 /// 44.1 kHz with a known TOC).
+
+/// Build the metadata editor's bottom-anchored `tags` popup. The eight leaf
+/// actions are deliberately explicit so dispatch tests can pin each route.
+pub(crate) fn build_metadata_tags_popup() -> Vec<ContextMenuEntry> {
+    vec![
+        ContextMenuEntry::Submenu {
+            label: "Get tags from".to_string(),
+            children: vec![
+                item("MusicBrainz", ContextAction::MetadataTagsMusicBrainz),
+                item("gnuDB", ContextAction::MetadataTagsGnudb),
+                item("Clipboard", ContextAction::MetadataTagsClipboard),
+                item("File", ContextAction::MetadataTagsFile),
+            ],
+        },
+        ContextMenuEntry::Submenu {
+            label: "Transfer tags from".to_string(),
+            children: vec![
+                item(
+                    "Canonical",
+                    ContextAction::MetadataTransferTags {
+                        direction: TagTransferDirection::From,
+                        scope: TagTransferScope::Canonical,
+                    },
+                ),
+                item(
+                    "All",
+                    ContextAction::MetadataTransferTags {
+                        direction: TagTransferDirection::From,
+                        scope: TagTransferScope::All,
+                    },
+                ),
+            ],
+        },
+        ContextMenuEntry::Submenu {
+            label: "Transfer tags to".to_string(),
+            children: vec![
+                item(
+                    "Canonical",
+                    ContextAction::MetadataTransferTags {
+                        direction: TagTransferDirection::To,
+                        scope: TagTransferScope::Canonical,
+                    },
+                ),
+                item(
+                    "All",
+                    ContextAction::MetadataTransferTags {
+                        direction: TagTransferDirection::To,
+                        scope: TagTransferScope::All,
+                    },
+                ),
+            ],
+        },
+    ]
+}
+
 fn build_disk_tools_submenu() -> ContextMenuEntry {
     ContextMenuEntry::Submenu {
         label: "Disc Tools".to_string(),
@@ -1247,6 +1370,7 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         ContextAction::DetectPreemphasis => Some("pre-emphasis detection"),
         ContextAction::QueryGnudb | ContextAction::TagsFromMb => Some("tag lookup"),
         ContextAction::CopyTags(_) => Some("tag copying"),
+        ContextAction::BrowseTransferTags { .. } => Some("tag transfer"),
         ContextAction::ViewFile(_) | ContextAction::EditFile(_) => Some("text file view/edit"),
         _ => None,
     }
@@ -1339,7 +1463,7 @@ fn open_browse_metadata_cue_action(
     }
 }
 
-fn tag_entry_matches_copy_selection(
+pub(crate) fn tag_entry_matches_copy_selection(
     entry: &super::probe::TagEntry,
     selection: TagCopySelection,
 ) -> bool {
@@ -1381,8 +1505,8 @@ fn tag_entry_matches_copy_selection(
     }
 }
 
-const TAG_CLIPBOARD_COPY_MAX_VISITED: usize = 100_000;
-const TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES: usize = 50_000;
+pub(crate) const TAG_CLIPBOARD_COPY_MAX_VISITED: usize = 100_000;
+pub(crate) const TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES: usize = 50_000;
 
 fn start_tag_clipboard_copy(
     app: &mut AppState,
@@ -1525,6 +1649,26 @@ pub(crate) fn handle_tag_clipboard_copy_complete(
     source_paths: Vec<PathBuf>,
     result: Result<(Vec<crate::tui::probe::TagEntry>, usize), String>,
 ) {
+    handle_tag_clipboard_copy_complete_with_publisher(
+        app,
+        tx,
+        generation,
+        source_paths,
+        result,
+        publish_text_clipboard,
+    );
+}
+
+fn handle_tag_clipboard_copy_complete_with_publisher<F>(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    source_paths: Vec<PathBuf>,
+    result: Result<(Vec<crate::tui::probe::TagEntry>, usize), String>,
+    mut publish: F,
+) where
+    F: FnMut(&str),
+{
     // A completion may mutate worker ownership only when it belongs to the
     // currently active worker. This also makes duplicate/stray completions
     // harmless.
@@ -1541,14 +1685,16 @@ pub(crate) fn handle_tag_clipboard_copy_complete(
     {
         match result {
             Ok((entries, failure_count)) => {
-                let field_count = entries.len();
                 let file_count = source_paths.len();
+                let serialized = super::tag_interchange::serialize_tag_entries(entries.iter());
+                let field_count = serialized.keys.len();
+                publish(&serialized.text);
                 app.browse.tag_clipboard = Some(super::browse::TagClipboard {
                     source_paths,
                     entries,
                 });
                 let mut status = format!(
-                    "Copied {} field{} from {} file{}",
+                    "Copied {} field{} from {} file{} (text clipboard)",
                     field_count,
                     if field_count == 1 { "" } else { "s" },
                     file_count,
@@ -1561,6 +1707,9 @@ pub(crate) fn handle_tag_clipboard_copy_complete(
                         if failure_count == 1 { "" } else { "s" },
                     ));
                 }
+                for skipped in &serialized.skipped {
+                    status.push_str(&format!("; {} skipped: {}", skipped.key, skipped.reason));
+                }
                 app.set_status(status);
             }
             Err(reason) => app.set_status(reason),
@@ -1569,6 +1718,301 @@ pub(crate) fn handle_tag_clipboard_copy_complete(
 
     if let Some(pending) = app.browse.tag_clipboard_copy_pending.take() {
         launch_tag_clipboard_copy(app, pending, tx);
+    }
+}
+
+fn open_browse_tag_transfer_picker(
+    app: &mut AppState,
+    direction: TagTransferDirection,
+    scope: TagTransferScope,
+) {
+    let fixed_roots = super::command::current_bulk_guard_paths(app);
+    if fixed_roots.is_empty() {
+        app.set_status("Transfer tags: no files selected");
+        return;
+    }
+    let start_dir = if app.browse.current_dir.is_dir() {
+        app.browse.current_dir.clone()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    let title = match direction {
+        TagTransferDirection::To => "Transfer tags to...",
+        TagTransferDirection::From => "Transfer tags from...",
+    };
+    let picker = tui_file_picker::FilePickerState::new(
+        super::keybindings::file_picker_config_with_browse_sort(
+            app,
+            tui_file_picker::FilePickerConfig {
+                start_dir,
+                filter: tui_file_picker::FilePickerFilter::Audio,
+                title: title.to_string(),
+                theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
+                selection_mode: tui_file_picker::FilePickerSelectionMode::FilesOrDirectories,
+                operation_policy: tui_file_picker::FileOperationPolicy {
+                    allow_new_file: false,
+                    allow_new_folder: false,
+                    allow_cut: false,
+                    allow_copy: false,
+                    allow_paste: false,
+                    allow_delete: false,
+                    ..tui_file_picker::FileOperationPolicy::default()
+                },
+                ..tui_file_picker::FilePickerConfig::default()
+            },
+        ),
+    );
+    app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(
+        FilePickerPurpose::BrowseTagTransfer {
+            direction,
+            scope,
+            fixed_roots,
+        },
+        picker,
+    ));
+    app.set_status(format!("{title}: choose one audio file or directory"));
+}
+
+pub(crate) fn start_tag_transfer(
+    app: &mut AppState,
+    source_roots: Vec<PathBuf>,
+    target_roots: Vec<PathBuf>,
+    scope: TagTransferScope,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if source_roots.is_empty() || target_roots.is_empty() {
+        app.set_status("Transfer tags: source and target are required");
+        return;
+    }
+    let generation = app.browse.tag_transfer_generation.checked_add(1).unwrap_or(1);
+    app.browse.tag_transfer_generation = generation;
+    let request = super::browse::PendingTagTransfer {
+        generation,
+        source: super::browse::PendingTagTransferSource::Roots(source_roots),
+        target_roots,
+        scope,
+        verification: app.config.file_operations.verification,
+    };
+
+    if let Some(cancel) = app.browse.tag_transfer_cancel.as_ref() {
+        cancel.cancel();
+        app.browse.tag_transfer_pending = Some(request);
+        app.set_status("Transfer tags: cancelling superseded operation...");
+        return;
+    }
+    launch_tag_transfer(app, request, tx);
+}
+
+pub(crate) fn start_tag_transfer_from_editor_snapshot(
+    app: &mut AppState,
+    entries: Vec<super::probe::TagEntry>,
+    source_count: usize,
+    target_roots: Vec<PathBuf>,
+    scope: TagTransferScope,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if source_count == 0 || target_roots.is_empty() {
+        app.set_status("Transfer tags: editor source and target are required");
+        return;
+    }
+    let generation = app.browse.tag_transfer_generation.checked_add(1).unwrap_or(1);
+    app.browse.tag_transfer_generation = generation;
+    let request = super::browse::PendingTagTransfer {
+        generation,
+        source: super::browse::PendingTagTransferSource::EditorSnapshot {
+            entries,
+            source_count,
+        },
+        target_roots,
+        scope,
+        verification: app.config.file_operations.verification,
+    };
+    if let Some(cancel) = app.browse.tag_transfer_cancel.as_ref() {
+        cancel.cancel();
+        app.browse.tag_transfer_pending = Some(request);
+        app.set_status("Transfer tags: cancelling superseded operation...");
+        return;
+    }
+    launch_tag_transfer(app, request, tx);
+}
+
+fn launch_tag_transfer(
+    app: &mut AppState,
+    request: super::browse::PendingTagTransfer,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    debug_assert!(app.browse.tag_transfer_cancel.is_none());
+    debug_assert!(app.browse.tag_transfer_active_generation.is_none());
+    let super::browse::PendingTagTransfer {
+        generation,
+        source,
+        target_roots,
+        scope,
+        verification,
+    } = request;
+    let cancel = super::probe::MetadataWriteCancelFlag::new();
+    app.browse.tag_transfer_active_generation = Some(generation);
+    app.browse.tag_transfer_cancel = Some(cancel.clone());
+    app.set_status("Transfer tags: reading source and target metadata...");
+
+    let worker_tx = tx.clone();
+    tokio::spawn(async move {
+        let worker_cancel = cancel.clone();
+        let progress_tx = worker_tx.clone();
+        let completion = tokio::task::spawn_blocking(move || {
+            let progress = |completed: usize, total: usize, path: &std::path::Path| {
+                // File-count progress is advisory. Never block a metadata write
+                // behind a saturated UI channel, and avoid message floods for
+                // large directory transfers.
+                if completed == 1 || completed == total || completed % 16 == 0 {
+                    let _ = progress_tx.try_send(AppMessage::TagTransferProgress {
+                        generation,
+                        completed,
+                        total,
+                        path: path.to_path_buf(),
+                    });
+                }
+            };
+            let target_paths = super::command::expand_audio_paths_for_metadata_limited(
+                &target_roots,
+                TAG_CLIPBOARD_COPY_MAX_VISITED,
+                TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+                || worker_cancel.is_cancelled(),
+            )?;
+            if target_paths.is_empty() {
+                return Err("Transfer tags: target contains no audio files".to_string());
+            }
+            match source {
+                super::browse::PendingTagTransferSource::Roots(source_roots) => {
+                    let source_paths = super::command::expand_audio_paths_for_metadata_limited(
+                        &source_roots,
+                        TAG_CLIPBOARD_COPY_MAX_VISITED,
+                        TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+                        || worker_cancel.is_cancelled(),
+                    )?;
+                    if source_paths.is_empty() {
+                        return Err("Transfer tags: source contains no audio files".to_string());
+                    }
+                    super::tag_interchange::execute_tag_transfer_from_paths(
+                        &source_paths,
+                        &target_paths,
+                        scope,
+                        verification,
+                        &worker_cancel,
+                        Some(&progress),
+                    )
+                }
+                super::browse::PendingTagTransferSource::EditorSnapshot {
+                    entries,
+                    source_count,
+                } => super::tag_interchange::execute_tag_transfer_from_entries(
+                    &entries,
+                    source_count,
+                    &target_paths,
+                    scope,
+                    verification,
+                    &worker_cancel,
+                    Some(&progress),
+                ),
+            }
+        })
+        .await
+        .unwrap_or_else(|err| Err(format!("Transfer tags worker failed: {err}")));
+        let _ = worker_tx
+            .send(AppMessage::TagTransferComplete {
+                generation,
+                result: completion,
+            })
+            .await;
+    });
+}
+
+pub(crate) fn handle_tag_transfer_progress(
+    app: &mut AppState,
+    generation: u64,
+    completed: usize,
+    total: usize,
+    path: &std::path::Path,
+) {
+    if app.browse.tag_transfer_active_generation != Some(generation)
+        || app.browse.tag_transfer_generation != generation
+        || app.browse.tag_transfer_pending.is_some()
+    {
+        return;
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("target");
+    app.set_status(format!(
+        "Transfer tags: {completed} of {total} files processed ({name})"
+    ));
+}
+
+fn record_tag_transfer_report_side_effects(
+    app: &mut AppState,
+    report: &super::tag_interchange::TagTransferReport,
+) {
+    for path in &report.written_paths {
+        app.browse.remove_probe_cache_entry(path);
+        app.browse.probe_pending.remove(path);
+        app.browse.invalidate_search_tag_cache_for_metadata_path(path);
+        let _ = app.db.invalidate_probe(&path.display().to_string());
+    }
+    if !report.written_paths.is_empty() {
+        app.browse.tag_transfer_refresh_pending = true;
+    }
+    for (path, reason) in &report.failed {
+        log::error!("tag transfer failed for '{}': {}", path.display(), reason);
+    }
+    for warning in &report.cardinality_warnings {
+        log::warn!("tag transfer: {warning}");
+    }
+    for warning in &report.durability_warnings {
+        log::warn!("tag transfer durability: {warning}");
+    }
+}
+
+pub(crate) fn handle_tag_transfer_complete(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    result: Result<super::tag_interchange::TagTransferReport, String>,
+) {
+    if app.browse.tag_transfer_active_generation != Some(generation) {
+        return;
+    }
+    app.browse.tag_transfer_active_generation = None;
+    app.browse.tag_transfer_cancel = None;
+
+    // Unlike Copy tags, a superseded transfer may already have committed one
+    // or more target files before cancellation was observed. Always account
+    // for those side effects, even when an older completion no longer owns the
+    // status line. Otherwise the probe/search caches could indefinitely expose
+    // pre-transfer metadata for files that were in fact changed.
+    if let Ok(report) = &result {
+        record_tag_transfer_report_side_effects(app, report);
+    }
+
+    let owns_status = generation == app.browse.tag_transfer_generation
+        && app.browse.tag_transfer_pending.is_none();
+    if owns_status {
+        match &result {
+            Ok(report) => app.set_status(report.status()),
+            Err(reason) => app.set_status(reason.clone()),
+        }
+    } else if let Err(reason) = &result {
+        log::debug!("superseded tag transfer completed without a report: {reason}");
+    }
+
+    if let Some(pending) = app.browse.tag_transfer_pending.take() {
+        launch_tag_transfer(app, pending, tx);
+        return;
+    }
+
+    if app.browse.tag_transfer_refresh_pending {
+        app.browse.tag_transfer_refresh_pending = false;
+        app.browse.probe_current_with_db(tx, Some(&app.db));
     }
 }
 
@@ -1990,8 +2434,167 @@ pub fn execute_context_action(
         ContextAction::CopyTagsCustomDeferred => {
             app.set_status("Custom tag selection arrives in a later round");
         }
-        ContextAction::PasteTagsDeferred => {
-            app.set_status("Paste tags arrives in a later round");
+        ContextAction::BrowseTransferTags { direction, scope } => {
+            open_browse_tag_transfer_picker(app, direction, scope);
+        }
+        ContextAction::MetadataTagsMusicBrainz => {
+            if let Some(state) = app.pending_metadata_editor.take() {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                let command = super::command::Command::TagsFromMb {
+                    query: None,
+                    catno: None,
+                    year: None,
+                };
+                super::command::execute_command(app, command, tx);
+            } else {
+                app.set_status("metadata editor: tag popup lost its editor session");
+            }
+        }
+        ContextAction::MetadataTagsGnudb => {
+            if let Some(state) = app.pending_metadata_editor.take() {
+                // GNUDB's guarded reducer requires an editor-originated lookup
+                // to own a parked editor while no interactive overlay is live.
+                // Freeze the editor's exact file set into the existing browse
+                // selection seam before dispatch; never fall back to whatever
+                // happens to be selected behind the editor.
+                app.browse_context_action_paths =
+                    Some(state.active_surface().paths.clone());
+                app.pending_metadata_editor = Some(state);
+                app.active_overlay = ActiveOverlay::None;
+                execute_gnudb_query(app, tx);
+            } else {
+                app.set_status("metadata editor: tag popup lost its editor session");
+            }
+        }
+        ContextAction::MetadataTagsClipboard => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status("metadata editor: tag popup lost its editor session");
+                return;
+            };
+            let clipboard = tui_file_picker::read_shared_text_clipboard();
+            let result = super::tag_interchange::parse_field_blocks(&clipboard);
+            match result {
+                Ok(blocks) => match super::tag_interchange::apply_field_blocks_to_editor(
+                    &mut state,
+                    &blocks,
+                ) {
+                    Ok(report) => app.set_status(
+                        report.success_status(state.active_surface().paths.len()),
+                    ),
+                    Err(reason) => app.set_status(format!("tag blocks: {reason}")),
+                },
+                Err(error) => {
+                    log::debug!("tonepoet clipboard did not contain applicable tag blocks: {error}");
+                    app.set_status(TONEPOET_CLIPBOARD_NO_TAG_BLOCKS_STATUS);
+                }
+            }
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        ContextAction::MetadataTagsFile => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status("metadata editor: tag popup lost its editor session");
+                return;
+            };
+            super::keybindings::metadata_editor_open_tag_blocks_file_picker(app, &mut state);
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            app.set_status("metadata editor: choose a tag-block text file");
+        }
+        ContextAction::MetadataTransferTags { direction, scope } => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status("metadata editor: tag popup lost its editor session");
+                return;
+            };
+            super::keybindings::metadata_editor_open_tag_transfer_picker(
+                app,
+                &mut state,
+                direction,
+                scope,
+            );
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            app.set_status(match direction {
+                TagTransferDirection::From => "metadata editor: choose a tag source",
+                TagTransferDirection::To => "metadata editor: choose a tag-transfer target",
+            });
+        }
+        ContextAction::MetadataRowsCopy => {
+            if let Some(state) = app.pending_metadata_editor.take() {
+                if let Err(reason) =
+                    super::keybindings::metadata_editor_copy_selected_rows(app, &state)
+                {
+                    app.set_status(reason);
+                }
+                app.pending_metadata_editor = Some(state);
+            } else {
+                app.set_status("metadata editor: row clipboard action lost its editor session");
+            }
+        }
+        ContextAction::MetadataRowsCut => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                if let Err(reason) =
+                    super::keybindings::metadata_editor_cut_selected_rows(app, &mut state)
+                {
+                    app.set_status(reason);
+                }
+                app.pending_metadata_editor = Some(state);
+            } else {
+                app.set_status("metadata editor: row clipboard action lost its editor session");
+            }
+        }
+        ContextAction::MetadataRowsPaste => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                if let Err(reason) =
+                    super::keybindings::metadata_editor_paste_shared_clipboard(app, &mut state)
+                {
+                    app.set_status(reason);
+                }
+                app.pending_metadata_editor = Some(state);
+            } else {
+                app.set_status("metadata editor: row clipboard action lost its editor session");
+            }
+        }
+        ContextAction::MetadataRowsSelectAll => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let count = super::keybindings::metadata_editor_select_all_rows(&mut state);
+                app.set_status(format!(
+                    "metadata editor: selected {} row{}",
+                    count,
+                    if count == 1 { "" } else { "s" },
+                ));
+                app.pending_metadata_editor = Some(state);
+            }
+        }
+        ContextAction::MetadataRowsInvertSelection => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let count = super::keybindings::metadata_editor_invert_row_selection(&mut state);
+                app.set_status(format!(
+                    "metadata editor: {} row{} selected",
+                    count,
+                    if count == 1 { "" } else { "s" },
+                ));
+                app.pending_metadata_editor = Some(state);
+            }
+        }
+        ContextAction::MetadataRowsDeselect => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                super::keybindings::metadata_editor_deselect_all_rows(&mut state);
+                app.set_status("metadata editor: row selection cleared");
+                app.pending_metadata_editor = Some(state);
+            }
+        }
+        ContextAction::MetadataEditValuesPerFile => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                let cursor = state.cursor;
+                if let Some(reason) =
+                    super::keybindings::metadata_editor_begin_detail_edit_for_entry(
+                        &mut state,
+                        cursor,
+                        false,
+                    )
+                {
+                    app.set_status(reason);
+                }
+                app.pending_metadata_editor = Some(state);
+            }
         }
         ContextAction::MetadataRevertMb => {
             // Toggle the parked editor's cursor row, mirroring :revert.
@@ -2219,7 +2822,7 @@ pub fn execute_context_action(
             super::command::execute_command(app, super::command::Command::Write, tx);
         }
         ContextAction::CuePreviewCancel => {
-            super::command::execute_command(app, super::command::Command::Quit, tx);
+            super::command::cancel_pending_cue_preview(app);
         }
         ContextAction::CuePreviewEditLine(line_0based) => {
             super::command::execute_command(
@@ -2461,6 +3064,31 @@ pub fn execute_context_action(
         | ContextAction::BrowseDiscStreams
         | ContextAction::ConvertDiscStream(_) => {}
     }
+}
+
+const OSC52_TEXT_CLIPBOARD_MAX_BYTES: usize = 64 * 1024;
+
+/// Publish to Tonepoet's authoritative in-process text clipboard and then make
+/// one best-effort OSC 52 attempt for terminals that support it.
+pub(crate) fn publish_text_clipboard(text: &str) {
+    tui_file_picker::write_shared_text_clipboard(text.to_string());
+    let _ = write_osc52_clipboard_to(&mut std::io::stdout(), text);
+}
+
+/// Best-effort OSC 52 system-clipboard publication. `Ok(false)` means the
+/// payload exceeded the conservative terminal interoperability cap and was
+/// intentionally not emitted.
+pub(crate) fn write_osc52_clipboard_to(
+    writer: &mut impl std::io::Write,
+    text: &str,
+) -> std::io::Result<bool> {
+    if text.len() > OSC52_TEXT_CLIPBOARD_MAX_BYTES {
+        return Ok(false);
+    }
+    let encoded = base64_encode(text.as_bytes());
+    write!(writer, "\x1b]52;c;{}\x07", encoded)?;
+    writer.flush()?;
+    Ok(true)
 }
 
 /// Minimal base64 encoder for OSC 52 clipboard (no crate dependency).
@@ -2903,7 +3531,9 @@ fn resolve_convert_start(app: &AppState, invert: bool) -> bool {
 mod tests {
     use super::*;
     use crate::config::TonepoetConfig;
-    use crate::tui::app::{AppScreen, SourceMode};
+    use crate::tui::app::{
+        AppScreen, FilePickerPurpose, MetadataEditorState, MetadataTechnicalDetails, SourceMode,
+    };
     use crate::tui::message::AppMessage;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
@@ -3241,15 +3871,316 @@ mod tests {
                 ..
             }) if label == "Custom..."
         )));
-        assert!(children.iter().any(|entry| matches!(
-            entry,
-            ContextMenuEntry::Item(ContextMenuItem {
-                label,
-                action: ContextAction::PasteTagsDeferred,
-                enabled: true,
-                ..
-            }) if label == "Paste tags"
-        )));
+        assert!(!menu_labels_recursive(&children).iter().any(|label| label == "Paste tags"));
+        assert!(menu_labels_recursive(&children).iter().any(|label| label == "Transfer tags"));
+    }
+
+    #[test]
+    fn winning_copy_tags_completion_publishes_serialized_field_blocks() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.tag_clipboard_copy_generation = 9;
+        app.browse.tag_clipboard_copy_active_generation = Some(9);
+        app.browse.tag_clipboard_copy_cancel = Some(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let entry = crate::tui::probe::TagEntry {
+            display_key: "TITLE".to_string(),
+            item_key: lofty::tag::ItemKey::TrackTitle,
+            value: "<multiple values>".to_string(),
+            original: "<multiple values>".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            has_multiple_stored_values: false,
+            row_scope: crate::tui::probe::RowScope::File,
+            per_file_stored_value_counts: vec![1, 1],
+            per_file_values: vec!["Behind the Lines".to_string(), "Duchess".to_string()],
+            per_file_originals: vec!["Behind the Lines".to_string(), "Duchess".to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        };
+        let mut published = None;
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_tag_clipboard_copy_complete_with_publisher(
+            &mut app,
+            &tx,
+            9,
+            vec![PathBuf::from("01.flac"), PathBuf::from("02.flac")],
+            Ok((vec![entry], 0)),
+            |text| published = Some(text.to_string()),
+        );
+
+        assert_eq!(
+            published.as_deref(),
+            Some("TITLE\nBehind the Lines\nDuchess"),
+            "the generation-winning completion must invoke the text-clipboard publication seam"
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("Copied 1 field from 2 files (text clipboard)")
+        );
+    }
+
+    #[test]
+    fn osc52_tag_clipboard_write_is_exact_and_size_gated() {
+        let mut emitted = Vec::new();
+        assert!(write_osc52_clipboard_to(&mut emitted, "Duke").expect("OSC 52 write"));
+        assert_eq!(emitted, b"\x1b]52;c;RHVrZQ==\x07");
+
+        let mut oversized = Vec::new();
+        assert!(!write_osc52_clipboard_to(
+            &mut oversized,
+            &"x".repeat(OSC52_TEXT_CLIPBOARD_MAX_BYTES + 1),
+        )
+        .expect("oversized OSC 52 skip"));
+        assert!(oversized.is_empty(), "oversized payloads must not emit a partial escape");
+    }
+
+    #[test]
+    fn superseded_transfer_reports_still_schedule_cache_refresh() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let report = super::super::tag_interchange::TagTransferReport {
+            target_count: 1,
+            written: 1,
+            written_paths: vec![PathBuf::from("/tmp/changed.flac")],
+            ..super::super::tag_interchange::TagTransferReport::default()
+        };
+
+        record_tag_transfer_report_side_effects(&mut app, &report);
+
+        assert!(app.browse.tag_transfer_refresh_pending);
+    }
+
+    #[test]
+    fn tag_transfer_progress_updates_only_the_latest_active_request() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.tag_transfer_generation = 7;
+        app.browse.tag_transfer_active_generation = Some(7);
+        handle_tag_transfer_progress(
+            &mut app,
+            7,
+            16,
+            40,
+            std::path::Path::new("/music/16 - Duchess.flac"),
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("Transfer tags: 16 of 40 files processed (16 - Duchess.flac)")
+        );
+
+        let current = app.status_message.as_ref().map(|(message, _)| message.clone());
+        handle_tag_transfer_progress(
+            &mut app,
+            6,
+            40,
+            40,
+            std::path::Path::new("/music/stale.flac"),
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.clone()),
+            current,
+            "superseded progress must not overwrite the current request's status"
+        );
+    }
+
+    #[test]
+    fn invalid_tonepoet_clipboard_status_wording_is_pinned() {
+        assert_eq!(
+            TONEPOET_CLIPBOARD_NO_TAG_BLOCKS_STATUS,
+            "tonepoet's clipboard has no tag blocks; paste from the system clipboard with your terminal's paste key instead"
+        );
+    }
+
+    #[test]
+    fn metadata_tags_popup_exposes_exactly_eight_leaf_routes() {
+        fn collect<'a>(entries: &'a [ContextMenuEntry], out: &mut Vec<(&'a str, &'a ContextAction)>) {
+            for entry in entries {
+                match entry {
+                    ContextMenuEntry::Item(item) => out.push((item.label.as_str(), &item.action)),
+                    ContextMenuEntry::Submenu { children, .. } => collect(children, out),
+                    ContextMenuEntry::Separator => {}
+                }
+            }
+        }
+
+        let popup = build_metadata_tags_popup();
+        let mut leaves = Vec::new();
+        collect(&popup, &mut leaves);
+        assert_eq!(leaves.len(), 8);
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "MusicBrainz" && matches!(action, ContextAction::MetadataTagsMusicBrainz)
+        }));
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "gnuDB" && matches!(action, ContextAction::MetadataTagsGnudb)
+        }));
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "Clipboard" && matches!(action, ContextAction::MetadataTagsClipboard)
+        }));
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "File" && matches!(action, ContextAction::MetadataTagsFile)
+        }));
+        for direction in [TagTransferDirection::From, TagTransferDirection::To] {
+            for scope in [TagTransferScope::Canonical, TagTransferScope::All] {
+                assert!(leaves.iter().any(|(_, action)| matches!(
+                    action,
+                    ContextAction::MetadataTransferTags {
+                        direction: actual_direction,
+                        scope: actual_scope,
+                    } if *actual_direction == direction && *actual_scope == scope
+                )));
+            }
+        }
+    }
+
+    fn parked_test_editor(paths: Vec<std::path::PathBuf>) -> Box<MetadataEditorState> {
+        let labels = paths
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "track.flac".to_string())
+            })
+            .collect();
+        Box::new(MetadataEditorState::for_files(
+            paths,
+            Vec::new(),
+            labels,
+            MetadataTechnicalDetails::default(),
+        ))
+    }
+
+    #[test]
+    fn metadata_tags_popup_all_eight_leaf_actions_execute_their_dispatch_routes() {
+        tui_file_picker::with_scoped_shared_text_clipboard("TITLE\nDuke", || {
+            let tx = {
+                let (tx, _rx) = mpsc::channel(16);
+                tx
+            };
+
+            let mut musicbrainz = AppState::new_for_test(TonepoetConfig::default());
+            musicbrainz.pending_metadata_editor = Some(parked_test_editor(Vec::new()));
+            execute_context_action(
+                &mut musicbrainz,
+                ContextAction::MetadataTagsMusicBrainz,
+                &tx,
+                false,
+            );
+            assert!(matches!(
+                &musicbrainz.active_overlay,
+                ActiveOverlay::MetadataEditor(_)
+            ));
+            assert_eq!(
+                musicbrainz
+                    .status_message
+                    .as_ref()
+                    .map(|(message, _)| message.as_str()),
+                Some(":tags-mb: editor has no paths")
+            );
+
+            let mut gnudb = AppState::new_for_test(TonepoetConfig::default());
+            gnudb.pending_metadata_editor = Some(parked_test_editor(Vec::new()));
+            execute_context_action(
+                &mut gnudb,
+                ContextAction::MetadataTagsGnudb,
+                &tx,
+                false,
+            );
+            assert!(gnudb.pending_metadata_editor.is_some());
+            assert_eq!(
+                gnudb
+                    .status_message
+                    .as_ref()
+                    .map(|(message, _)| message.as_str()),
+                Some("No audio files for GNUDB lookup")
+            );
+
+            let mut clipboard = AppState::new_for_test(TonepoetConfig::default());
+            clipboard.pending_metadata_editor = Some(parked_test_editor(vec![
+                std::path::PathBuf::from("/tmp/editor.flac"),
+            ]));
+            execute_context_action(
+                &mut clipboard,
+                ContextAction::MetadataTagsClipboard,
+                &tx,
+                false,
+            );
+            let ActiveOverlay::MetadataEditor(state) = &clipboard.active_overlay else {
+                panic!("Clipboard dispatch must restore the editor");
+            };
+            assert_eq!(state.active_surface().entries[0].display_key, "TITLE");
+            assert_eq!(state.active_surface().entries[0].value, "Duke");
+
+            let mut file = AppState::new_for_test(TonepoetConfig::default());
+            file.pending_metadata_editor = Some(parked_test_editor(vec![
+                std::path::PathBuf::from("/tmp/editor.flac"),
+            ]));
+            execute_context_action(
+                &mut file,
+                ContextAction::MetadataTagsFile,
+                &tx,
+                false,
+            );
+            let ActiveOverlay::MetadataEditor(state) = &file.active_overlay else {
+                panic!("File dispatch must restore the editor");
+            };
+            assert!(matches!(
+                state.file_picker.as_ref().map(|picker| &picker.purpose),
+                Some(FilePickerPurpose::MetadataTagBlocksFile)
+            ));
+
+            for direction in [TagTransferDirection::From, TagTransferDirection::To] {
+                for scope in [TagTransferScope::Canonical, TagTransferScope::All] {
+                    let mut transfer = AppState::new_for_test(TonepoetConfig::default());
+                    transfer.pending_metadata_editor = Some(parked_test_editor(vec![
+                        std::path::PathBuf::from("/tmp/editor.flac"),
+                    ]));
+                    execute_context_action(
+                        &mut transfer,
+                        ContextAction::MetadataTransferTags { direction, scope },
+                        &tx,
+                        false,
+                    );
+                    let ActiveOverlay::MetadataEditor(state) = &transfer.active_overlay else {
+                        panic!("Transfer dispatch must restore the editor");
+                    };
+                    assert!(matches!(
+                        state.file_picker.as_ref().map(|picker| &picker.purpose),
+                        Some(FilePickerPurpose::MetadataTagTransfer {
+                            direction: actual_direction,
+                            scope: actual_scope,
+                        }) if *actual_direction == direction && *actual_scope == scope
+                    ));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn browse_transfer_menu_has_four_terminal_routes_and_no_paste_stub() {
+        fn collect_actions<'a>(
+            entries: &'a [ContextMenuEntry],
+            out: &mut Vec<&'a ContextAction>,
+        ) {
+            for entry in entries {
+                match entry {
+                    ContextMenuEntry::Item(item) => out.push(&item.action),
+                    ContextMenuEntry::Submenu { children, .. } => collect_actions(children, out),
+                    ContextMenuEntry::Separator => {}
+                }
+            }
+        }
+
+        let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(false) else {
+            panic!("tagging menu must be a submenu");
+        };
+        let mut actions = Vec::new();
+        collect_actions(&children, &mut actions);
+        let transfer_count = actions
+            .iter()
+            .filter(|action| matches!(action, ContextAction::BrowseTransferTags { .. }))
+            .count();
+        assert_eq!(transfer_count, 4);
+        assert!(menu_labels_recursive(&children).iter().all(|label| label != "Paste tags"));
     }
 
     #[test]
@@ -3296,7 +4227,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_tag_clipboard_actions_emit_exact_honest_status_without_mutation() {
+    fn deferred_custom_tag_clipboard_action_emits_exact_honest_status_without_mutation() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.browse.tag_clipboard = Some(crate::tui::browse::TagClipboard {
             source_paths: vec![std::path::PathBuf::from("existing.flac")],
@@ -3320,15 +4251,6 @@ mod tests {
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
             Some("Custom tag selection arrives in a later round"),
-        );
-        let clipboard = app.browse.tag_clipboard.as_ref().expect("tag clipboard");
-        assert_eq!(clipboard.source_paths, before_paths);
-        assert!(clipboard.entries.is_empty());
-
-        execute_context_action(&mut app, ContextAction::PasteTagsDeferred, &tx, false);
-        assert_eq!(
-            app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Paste tags arrives in a later round"),
         );
         let clipboard = app.browse.tag_clipboard.as_ref().expect("tag clipboard");
         assert_eq!(clipboard.source_paths, before_paths);
@@ -4044,6 +4966,35 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn cue_preview_cancel_action_closes_preview_without_quitting() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_cue_preview = Some(Box::new(crate::tui::app::CuePreviewState::new(
+            "FILE \"album.flac\" WAVE\n".to_string(),
+            std::path::PathBuf::from("/tmp/album.cue"),
+            "editable preview".to_string(),
+        )));
+        app.active_overlay = crate::tui::app::ActiveOverlay::ContextMenu {
+            levels: Vec::new(),
+            origin: (0, 0),
+            anchor_bottom: false,
+        };
+        let (tx, _rx) = mpsc::channel(4);
+
+        execute_context_action(&mut app, ContextAction::CuePreviewCancel, &tx, false);
+
+        assert!(app.pending_cue_preview.is_none());
+        assert!(matches!(
+            app.active_overlay,
+            crate::tui::app::ActiveOverlay::None
+        ));
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("CUE preview cancelled")
+        );
     }
 
 }

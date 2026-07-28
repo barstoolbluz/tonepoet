@@ -1565,6 +1565,7 @@ pub fn populate_editor_mb_supplemental_scoped(
     }
 
     crate::tui::probe::sort_entries_standard_first_existing_only(&mut state.active_surface_mut().entries);
+    state.active_surface_mut().selected_rows.clear();
     state.active_surface_mut().dirty = true;
 }
 
@@ -2265,6 +2266,7 @@ pub fn populate_editor_from_mb_scoped(
         }
     }
     state.active_surface_mut().deleted = remapped_deleted;
+    state.active_surface_mut().selected_rows.clear();
     state.active_surface_mut().dirty = true;
     crate::tui::probe::MetadataMutationReport::between(
         &before_entries,

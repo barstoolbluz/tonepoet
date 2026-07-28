@@ -35,6 +35,20 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // Ctrl+Q is application-global, including while an overlay owns input.
+    // Route it directly through the application-quit reducer. Typed `:q` uses
+    // the same reducer after its established parked-CUE-preview cancellation
+    // case, so editor writes, unsaved changes, archive staging, and pending
+    // tag-interchange preparation receive one consistent quit decision before
+    // ordinary overlay dispatch can consume the key.
+    if matches!(
+        (key.code, key.modifiers),
+        (KeyCode::Char('q'), KeyModifiers::CONTROL)
+    ) {
+        super::command::request_application_quit(app, tx);
+        return;
+    }
+
     if key.code == KeyCode::Esc && app.cancel_inline_metadata_write() {
         app.set_status("Cancelling metadata write...");
         return;
@@ -161,11 +175,6 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     // Global keys (except in Wizard mode)
     if app.current_screen != AppScreen::Wizard {
         match (key.code, key.modifiers) {
-            // Quit via Ctrl+Q (intentional modifier prevents accidental exits).
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
-                app.should_quit = true;
-                return;
-            }
             (KeyCode::Char('1'), KeyModifiers::NONE) => {
                 switch_screen_reconciling_browse_archive(app, AppScreen::Browse, tx);
                 return;
@@ -6800,28 +6809,6 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
             }
         }
 
-        // Clear completed
-        (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-            let finished_count = app
-                .items_snapshot
-                .iter()
-                .filter(|i| {
-                    matches!(
-                        i.status,
-                        ConversionStatus::Completed { .. }
-                            | ConversionStatus::CompletedWithActionErrors { .. }
-                            | ConversionStatus::Partial { .. }
-                            | ConversionStatus::Failed { .. }
-                            | ConversionStatus::Cancelled
-                    )
-                })
-                .count();
-            if finished_count > 0 {
-                app.manager.clear_finished();
-                app.save_queue();
-                app.set_status(format!("Cleared {} finished items", finished_count));
-            }
-        }
 
         // Retry failed
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
@@ -7320,8 +7307,8 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         ActiveOverlay::BatchList { scroll } => {
             handle_batch_list_key(app, key, scroll, tx);
         }
-        ActiveOverlay::ContextMenu { levels, origin } => {
-            handle_context_menu_key(app, key, levels, origin, tx);
+        ActiveOverlay::ContextMenu { levels, origin, anchor_bottom } => {
+            handle_context_menu_key(app, key, levels, origin, anchor_bottom, tx);
         }
         ActiveOverlay::BulkRename(state) => {
             handle_bulk_rename_key(app, key, *state, tx);
@@ -8933,6 +8920,7 @@ fn open_editor_context_menu(
     app.active_overlay = ActiveOverlay::ContextMenu {
         levels: vec![super::context_menu::MenuLevel::new(entries)],
         origin: (x, y),
+        anchor_bottom: false,
     };
     true
 }
@@ -9071,6 +9059,7 @@ fn handle_context_menu_key(
     key: KeyEvent,
     mut levels: Vec<super::context_menu::MenuLevel>,
     origin: (u16, u16),
+    anchor_bottom: bool,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     use super::context_menu::{ContextMenuEntry, MenuLevel, MAX_CONTEXT_MENU_DEPTH};
@@ -9158,7 +9147,7 @@ fn handle_context_menu_key(
         }
     }
 
-    app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
+    app.active_overlay = ActiveOverlay::ContextMenu { levels, origin, anchor_bottom };
 }
 
 fn browse_context_paths_for_current_entry(app: &AppState) -> Option<Vec<std::path::PathBuf>> {
@@ -9248,6 +9237,7 @@ pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
     app.active_overlay = ActiveOverlay::ContextMenu {
         levels,
         origin: (x, y),
+        anchor_bottom: false,
     };
 }
 
@@ -9526,6 +9516,19 @@ pub(super) fn metadata_editor_delete_cursor(state: &mut super::app::MetadataEdit
             })
             .collect();
         state.active_surface_mut().deleted = remapped_deleted;
+        let remapped_selected = state
+            .active_surface()
+            .selected_rows
+            .iter()
+            .filter_map(|&idx| {
+                if idx == removed {
+                    None
+                } else {
+                    Some(if idx > removed { idx - 1 } else { idx })
+                }
+            })
+            .collect();
+        state.active_surface_mut().selected_rows = remapped_selected;
         let len = state.active_surface().entries.len();
         state.cursor = state.cursor.min(len.saturating_sub(1));
         recalc_dirty(state);
@@ -10320,8 +10323,12 @@ fn bluray_sidecar_save_status(
 
 pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
     app: &mut AppState,
-    state: Box<super::app::MetadataEditorState>,
+    mut state: Box<super::app::MetadataEditorState>,
 ) {
+    // The accepted MusicBrainz result is newer editor work. Retire any older
+    // tag-block or transfer preparation whether the result reopens the editor
+    // directly or first asks for multi-presentation confirmation.
+    state.invalidate_tag_interchange_preparation();
     if state.has_multiple_presentations() {
         app.pending_metadata_editor = Some(state.clone());
         app.active_overlay = ActiveOverlay::Confirmation {
@@ -10426,6 +10433,25 @@ fn metadata_editor_cycle_field_in_current_tab(
     }
 }
 
+/// Relinquish asynchronous editor work before a newer close or confirmation
+/// workflow takes ownership of the editor.
+///
+/// The operation is constant-time: cancel the existing tag-interchange flag,
+/// invalidate its generation, retire any direct MusicBrainz apply operation,
+/// and cancel the Details probe. Callers must perform their write/scan blockers
+/// first so a refused transition leaves the still-active editor untouched.
+pub(super) fn metadata_editor_prepare_for_competing_workflow(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+) {
+    state.invalidate_tag_interchange_preparation();
+    if state.model.tags_mb_in_flight {
+        super::event_loop::finish_metadata_editor_tags_mb_operation(app);
+        state.model.tags_mb_in_flight = false;
+    }
+    metadata_editor_cancel_details_probe(state);
+}
+
 fn request_metadata_editor_close(
     app: &mut AppState,
     state: &mut Box<super::app::MetadataEditorState>,
@@ -10459,16 +10485,12 @@ fn request_metadata_editor_close(
         );
         return;
     }
-    if state.model.tags_mb_in_flight {
-        // The editor is now actually leaving its interactive surface (either
-        // closing or entering dirty-close confirmation). Invalidate any direct
-        // single-match verification so its delayed completion cannot reopen or
-        // mutate this session. Blocked close attempts above deliberately leave
-        // the operation intact because the editor remains active.
-        super::event_loop::finish_metadata_editor_tags_mb_operation(app);
-        state.model.tags_mb_in_flight = false;
-    }
-    metadata_editor_cancel_details_probe(state);
+    // The editor is now actually leaving its interactive surface (either
+    // closing or entering a competing discard-confirmation workflow). Cancel
+    // and invalidate tag-block/transfer preparation before parking or dropping
+    // the editor so an older completion cannot replace the newer close modal,
+    // mutate the parked editor, or continue orphaned bounded work.
+    metadata_editor_prepare_for_competing_workflow(app, state);
     if state.any_presentation_dirty() {
         app.pending_metadata_editor = Some(state.clone());
         app.active_overlay = ActiveOverlay::Confirmation {
@@ -10716,6 +10738,89 @@ fn metadata_editor_current_artwork_type(
         .rows
         .get(state.artwork_cursor)
         .map(|row| row.picture_type.clone())
+}
+
+pub(crate) fn metadata_editor_open_tag_blocks_file_picker(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+) {
+    let start_dir = state
+        .active_surface()
+        .paths
+        .first()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let picker = tui_file_picker::FilePickerState::new(file_picker_config_with_browse_sort(
+        app,
+        tui_file_picker::FilePickerConfig {
+            start_dir,
+            filter: tui_file_picker::FilePickerFilter::Custom {
+                label: "Text".to_string(),
+                extensions: vec!["txt".to_string()],
+            },
+            title: "Get tags from file".to_string(),
+            theme: file_picker_theme_from_theme(&app.theme),
+            selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
+            operation_policy: tui_file_picker::FileOperationPolicy {
+                allow_new_file: false,
+                allow_new_folder: false,
+                allow_cut: false,
+                allow_copy: false,
+                allow_paste: false,
+                allow_delete: false,
+                ..tui_file_picker::FileOperationPolicy::default()
+            },
+            ..tui_file_picker::FilePickerConfig::default()
+        },
+    ));
+    state.file_picker = Some(super::app::MetadataFilePickerState::new(
+        super::app::FilePickerPurpose::MetadataTagBlocksFile,
+        picker,
+    ));
+}
+
+pub(crate) fn metadata_editor_open_tag_transfer_picker(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    direction: super::app::TagTransferDirection,
+    scope: super::app::TagTransferScope,
+) {
+    let start_dir = state
+        .active_surface()
+        .paths
+        .first()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let title = match direction {
+        super::app::TagTransferDirection::From => "Transfer tags from...",
+        super::app::TagTransferDirection::To => "Transfer tags to...",
+    };
+    let picker = tui_file_picker::FilePickerState::new(file_picker_config_with_browse_sort(
+        app,
+        tui_file_picker::FilePickerConfig {
+            start_dir,
+            filter: tui_file_picker::FilePickerFilter::Audio,
+            title: title.to_string(),
+            theme: file_picker_theme_from_theme(&app.theme),
+            selection_mode: tui_file_picker::FilePickerSelectionMode::FilesOrDirectories,
+            operation_policy: tui_file_picker::FileOperationPolicy {
+                allow_new_file: false,
+                allow_new_folder: false,
+                allow_cut: false,
+                allow_copy: false,
+                allow_paste: false,
+                allow_delete: false,
+                ..tui_file_picker::FileOperationPolicy::default()
+            },
+            ..tui_file_picker::FilePickerConfig::default()
+        },
+    ));
+    state.file_picker = Some(super::app::MetadataFilePickerState::new(
+        super::app::FilePickerPurpose::MetadataTagTransfer { direction, scope },
+        picker,
+    ));
 }
 
 fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super::app::MetadataEditorState>) {
@@ -12699,6 +12804,232 @@ fn metadata_editor_handle_alt_commit_action(
     true
 }
 
+fn metadata_editor_effective_selected_rows(
+    state: &super::app::MetadataEditorState,
+) -> Vec<usize> {
+    let len = state.active_surface().entries.len();
+    let selected = state
+        .active_surface()
+        .selected_rows
+        .iter()
+        .copied()
+        .filter(|index| *index < len)
+        .collect::<Vec<_>>();
+    if selected.is_empty() && state.cursor < len {
+        vec![state.cursor]
+    } else {
+        selected
+    }
+}
+
+pub(super) fn metadata_editor_select_all_rows(
+    state: &mut super::app::MetadataEditorState,
+) -> usize {
+    let len = state.active_surface().entries.len();
+    state.active_surface_mut().selected_rows = (0..len).collect();
+    len
+}
+
+pub(super) fn metadata_editor_invert_row_selection(
+    state: &mut super::app::MetadataEditorState,
+) -> usize {
+    let len = state.active_surface().entries.len();
+    let prior = state.active_surface().selected_rows.clone();
+    state.active_surface_mut().selected_rows =
+        (0..len).filter(|index| !prior.contains(index)).collect();
+    state.active_surface().selected_rows.len()
+}
+
+pub(super) fn metadata_editor_deselect_all_rows(
+    state: &mut super::app::MetadataEditorState,
+) {
+    state.active_surface_mut().selected_rows.clear();
+}
+
+fn metadata_editor_selected_rows_serialization(
+    state: &super::app::MetadataEditorState,
+) -> Result<super::tag_interchange::FieldBlockSerialization, String> {
+    let rows = metadata_editor_effective_selected_rows(state);
+    if rows.is_empty() {
+        return Err("metadata editor: no tag row selected".to_string());
+    }
+    let serialized = super::tag_interchange::serialize_tag_entries(
+        rows.iter()
+            .filter_map(|index| state.active_surface().entries.get(*index)),
+    );
+    if serialized.text.is_empty() {
+        return Err("metadata editor: selected rows contain no serializable text fields".to_string());
+    }
+    Ok(serialized)
+}
+
+pub(super) fn metadata_editor_copy_selected_rows(
+    app: &mut AppState,
+    state: &super::app::MetadataEditorState,
+) -> Result<usize, String> {
+    let serialized = metadata_editor_selected_rows_serialization(state)?;
+    super::context_menu::publish_text_clipboard(&serialized.text);
+    let mut status = format!(
+        "Copied {} field{} (text clipboard)",
+        serialized.keys.len(),
+        if serialized.keys.len() == 1 { "" } else { "s" },
+    );
+    for skipped in &serialized.skipped {
+        status.push_str(&format!("; {} skipped: {}", skipped.key, skipped.reason));
+    }
+    app.set_status(status);
+    Ok(serialized.keys.len())
+}
+
+pub(super) fn metadata_editor_cut_selected_rows(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+) -> Result<usize, String> {
+    metadata_editor_copy_selected_rows(app, state)?;
+    if state.read_only {
+        return Err("metadata editor: copied rows, but read-only sources cannot be marked deleted".to_string());
+    }
+    let original_cursor = state.cursor;
+    let mut rows = metadata_editor_effective_selected_rows(state);
+    rows.sort_unstable_by(|left, right| right.cmp(left));
+    let mut marked = 0usize;
+    let mut refusals = Vec::new();
+    for row in rows {
+        if row >= state.active_surface().entries.len() {
+            continue;
+        }
+        state.cursor = row;
+        let was_deleted = state.active_surface().deleted.contains(&row);
+        let status = metadata_editor_delete_cursor(state);
+        let is_deleted = row < state.active_surface().entries.len()
+            && state.active_surface().deleted.contains(&row);
+        if !was_deleted && is_deleted {
+            marked += 1;
+        }
+        if let Some(status) = status {
+            refusals.push(status);
+        }
+    }
+    let len = state.active_surface().entries.len();
+    state.cursor = original_cursor.min(len.saturating_sub(1));
+    state.active_surface_mut().selected_rows.clear();
+    if !refusals.is_empty() {
+        app.set_status(format!(
+            "Cut: marked {} row{} deleted; {}",
+            marked,
+            if marked == 1 { "" } else { "s" },
+            refusals.join("; "),
+        ));
+    } else {
+        app.set_status(format!(
+            "Cut: marked {} row{} deleted — review before save",
+            marked,
+            if marked == 1 { "" } else { "s" },
+        ));
+    }
+    Ok(marked)
+}
+
+fn metadata_editor_known_field_block_key(
+    state: &super::app::MetadataEditorState,
+    key: &str,
+) -> bool {
+    super::probe::STANDARD_KEY_ORDER
+        .iter()
+        .any(|known| *known == key)
+        || state.active_surface().entries.iter().any(|entry| {
+            super::probe::canonical_metadata_display_key(&entry.display_key) == key
+        })
+}
+
+fn normalized_paste_lines(text: &str) -> Vec<String> {
+    let mut normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.ends_with('\n') {
+        normalized.pop();
+    }
+    normalized.split('\n').map(str::to_string).collect()
+}
+
+pub(super) fn metadata_editor_apply_row_or_block_paste(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+    text: &str,
+) -> Result<(), String> {
+    if state.content_tab != crate::tui::app::ContentTab::Metadata
+        || state.phase != super::app::MetadataEditorPhase::Editing
+    {
+        return Err("metadata editor: row paste requires the Metadata tab in Editing mode".to_string());
+    }
+    let lines = normalized_paste_lines(text);
+    let first = lines.first().map(String::as_str).unwrap_or("");
+    let field_blocks = lines.len() >= 2
+        && super::tag_interchange::is_field_block_key(first)
+        && metadata_editor_known_field_block_key(state, first);
+    if field_blocks {
+        let blocks = super::tag_interchange::parse_field_blocks(text)
+            .map_err(|error| format!("tag blocks: {error}"))?;
+        if let Some(unknown) = blocks
+            .iter()
+            .find(|block| !metadata_editor_known_field_block_key(state, &block.key))
+        {
+            return Err(format!(
+                "tag blocks: {} is not a known editor field; use Get tags from Clipboard or File to create custom fields",
+                unknown.key
+            ));
+        }
+        let report = super::tag_interchange::apply_field_blocks_to_editor(state, &blocks)
+            .map_err(|error| format!("tag blocks: {error}"))?;
+        app.set_status(report.success_status(state.active_surface().paths.len()));
+        return Ok(());
+    }
+
+    let row = state.cursor;
+    let Some(entry) = state.active_surface().entries.get(row) else {
+        return Err("metadata editor: select a tag row before pasting".to_string());
+    };
+    let slot_count = entry.per_file_values.len();
+    let key = super::probe::canonical_metadata_display_key(&entry.display_key);
+    let album_replicated = matches!(
+        key.as_str(),
+        "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
+    );
+    let valid_count = lines.len() == slot_count || (album_replicated && lines.len() == 1);
+    if !valid_count {
+        let expectation = if album_replicated {
+            format!(
+                "1 broadcast value or {} positional value{}",
+                slot_count,
+                if slot_count == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("{} positional value{}", slot_count, if slot_count == 1 { "" } else { "s" })
+        };
+        return Err(format!(
+            "{} paste has {} line{}; expected {}",
+            key,
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" },
+            expectation,
+        ));
+    }
+    let force_positional = album_replicated && lines.len() > 1;
+    let result =
+        metadata_editor_apply_detail_paste_with_mode(state, row, text, force_positional)?;
+    app.set_status(metadata_editor_detail_paste_status(&key, &result));
+    Ok(())
+}
+
+pub(super) fn metadata_editor_paste_shared_clipboard(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+) -> Result<(), String> {
+    let text = tui_file_picker::read_shared_text_clipboard();
+    if text.is_empty() {
+        return Err("tonepoet's clipboard has no tag text".to_string());
+    }
+    metadata_editor_apply_row_or_block_paste(app, state, &text)
+}
+
 fn handle_metadata_editor_key(
     app: &mut AppState,
     key: KeyEvent,
@@ -12905,6 +13236,54 @@ fn handle_metadata_editor_key(
                         crate::tui::app::ContentTab::Metadata => {}
                     }
                 }
+                KeyCode::Char('a')
+                    if key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    let count = metadata_editor_select_all_rows(state);
+                    app.set_status(format!(
+                        "metadata editor: selected {} row{}",
+                        count,
+                        if count == 1 { "" } else { "s" },
+                    ));
+                }
+                KeyCode::Char('l')
+                    if key.modifiers == KeyModifiers::ALT =>
+                {
+                    let count = metadata_editor_select_all_rows(state);
+                    app.set_status(format!(
+                        "metadata editor: selected {} row{}",
+                        count,
+                        if count == 1 { "" } else { "s" },
+                    ));
+                }
+                KeyCode::Char('/') | KeyCode::Char('_')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    metadata_editor_deselect_all_rows(state);
+                    app.set_status("metadata editor: row selection cleared");
+                }
+                KeyCode::Char('c')
+                    if key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    if let Err(reason) = metadata_editor_copy_selected_rows(app, state) {
+                        app.set_status(reason);
+                    }
+                }
+                KeyCode::Char('x')
+                    if key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    if let Err(reason) = metadata_editor_cut_selected_rows(app, state) {
+                        app.set_status(reason);
+                    }
+                }
+                KeyCode::Char('v') | KeyCode::Char('p')
+                    if key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    if let Err(reason) = metadata_editor_paste_shared_clipboard(app, state) {
+                        app.set_status(reason);
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.cursor = state.cursor.saturating_sub(1);
                     ensure_cursor_visible(state);
@@ -13002,7 +13381,7 @@ fn handle_metadata_editor_key(
                     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
                     let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
                     let inner_w = layout.content_area.width as usize;
-                    let key_col_w = 22usize;
+                    let key_col_w = super::draw_overlays::METADATA_EDITOR_KEY_COL_W;
                     let value_width = inner_w.saturating_sub(key_col_w + 1);
 
                     if (display_len > super::draw_overlays::MULTILINE_EDIT_THRESHOLD || has_nl)
@@ -15985,6 +16364,19 @@ fn remove_metadata_entry_at(surface: &mut super::app::PresentationTab, idx: usiz
             }
         })
         .collect();
+    surface.selected_rows = surface
+        .selected_rows
+        .iter()
+        .filter_map(|selected| {
+            if *selected == idx {
+                None
+            } else if *selected > idx {
+                Some(*selected - 1)
+            } else {
+                Some(*selected)
+            }
+        })
+        .collect();
 }
 
 fn remove_cuesheet_derived_per_track_rows(
@@ -16238,7 +16630,7 @@ fn embedded_cuesheet_delete_confirmation_message(
 /// still only stages an editor tombstone; it does not write tags.
 pub(super) fn open_embedded_cuesheet_delete_confirmation(
     app: &mut AppState,
-    state: Box<super::app::MetadataEditorState>,
+    mut state: Box<super::app::MetadataEditorState>,
 ) {
     if state.read_only {
         app.set_status(":cuesheet-delete: metadata editor is read-only".to_string());
@@ -16258,6 +16650,11 @@ pub(super) fn open_embedded_cuesheet_delete_confirmation(
         &state.active_surface().label,
         state.active_surface().paths.len(),
     );
+    // This destructive-action confirmation supersedes any older asynchronous
+    // tag import/transfer preparation. Invalidate before parking so a late
+    // completion cannot replace the prompt, mutate the hidden editor, or start
+    // a transfer behind it.
+    metadata_editor_prepare_for_competing_workflow(app, &mut state);
     app.pending_metadata_editor = Some(state);
     app.active_overlay = ActiveOverlay::Confirmation {
         message,
@@ -16681,6 +17078,7 @@ fn metadata_editor_stage_embedded_cuesheet_edit(
             let surface = state.active_surface_mut();
             surface.cue_album_synthetic_sheet = Some(sheet);
             surface.entries = entries;
+            surface.selected_rows.clear();
             if metadata_cuesheet_entry_index(&surface.entries).is_none() {
                 return Err("embedded CUESHEET row disappeared before staging".to_string());
             }
@@ -16709,6 +17107,7 @@ fn metadata_editor_stage_embedded_cuesheet_edit(
         surface.embedded_cuesheet_present = true;
         surface.sidecar_cuesheet_shadow_present = false;
         apply_embedded_cuesheet_per_track(&mut surface.entries);
+        surface.selected_rows.clear();
         surface.dirty = true;
     }
     Ok(())
@@ -23895,9 +24294,37 @@ fn metadata_auto_populate_menu_item(
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetadataRowColumn {
+    Key,
+    Value,
+}
+
+pub(super) fn metadata_editor_row_column_for_x(
+    content_x: u16,
+    mouse_x: u16,
+) -> MetadataRowColumn {
+    if mouse_x < content_x.saturating_add(
+        super::draw_overlays::METADATA_EDITOR_KEY_COL_W as u16,
+    ) {
+        MetadataRowColumn::Key
+    } else {
+        MetadataRowColumn::Value
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // compatibility wrapper; production routes through the _for_column variant
 pub(super) fn build_metadata_row_context_menu(
     state: &super::app::MetadataEditorState,
     row: usize,
+) -> Vec<super::context_menu::ContextMenuEntry> {
+    build_metadata_row_context_menu_for_column(state, row, MetadataRowColumn::Value)
+}
+
+pub(super) fn build_metadata_row_context_menu_for_column(
+    state: &super::app::MetadataEditorState,
+    row: usize,
+    _column: MetadataRowColumn,
 ) -> Vec<super::context_menu::ContextMenuEntry> {
     use super::context_menu::{ContextAction, ContextMenuEntry, ContextMenuItem};
     let mut entries: Vec<ContextMenuEntry> = Vec::new();
@@ -23927,6 +24354,46 @@ pub(super) fn build_metadata_row_context_menu(
         }));
         entries.push(ContextMenuEntry::Separator);
     }
+    entries.extend([
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Copy".to_string(),
+            action: ContextAction::MetadataRowsCopy,
+            shortcut: Some("Ctrl+C".to_string()),
+            enabled: true,
+        }),
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Cut".to_string(),
+            action: ContextAction::MetadataRowsCut,
+            shortcut: Some("Ctrl+X".to_string()),
+            enabled: !state.read_only,
+        }),
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Paste".to_string(),
+            action: ContextAction::MetadataRowsPaste,
+            shortcut: Some("Ctrl+V".to_string()),
+            enabled: !state.read_only,
+        }),
+        ContextMenuEntry::Separator,
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Select All".to_string(),
+            action: ContextAction::MetadataRowsSelectAll,
+            shortcut: Some("Ctrl+A".to_string()),
+            enabled: true,
+        }),
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Invert Selection".to_string(),
+            action: ContextAction::MetadataRowsInvertSelection,
+            shortcut: None,
+            enabled: true,
+        }),
+        ContextMenuEntry::Item(ContextMenuItem {
+            label: "Deselect".to_string(),
+            action: ContextAction::MetadataRowsDeselect,
+            shortcut: Some("Ctrl+/".to_string()),
+            enabled: true,
+        }),
+        ContextMenuEntry::Separator,
+    ]);
     let pill = state.active_surface()
         .entries
         .get(row)
@@ -23959,6 +24426,19 @@ pub(super) fn build_metadata_row_context_menu(
             shortcut: None,
             enabled: true,
         }));
+        if state
+            .active_surface()
+            .entries
+            .get(row)
+            .is_some_and(|entry| entry.is_mixed && entry.per_file_values.len() > 1)
+        {
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Edit values (per file)".to_string(),
+                action: ContextAction::MetadataEditValuesPerFile,
+                shortcut: None,
+                enabled: true,
+            }));
+        }
     }
     if state.active_surface().deleted.contains(&row) {
         entries.push(ContextMenuEntry::Item(ContextMenuItem {
@@ -25413,7 +25893,8 @@ fn handle_cue_preview_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Se
                     park_and_run(app, state, super::command::Command::Write, tx);
                 }
                 Some(super::button_map::TuiButton::CuePreviewCancel) => {
-                    park_and_run(app, state, super::command::Command::Quit, tx);
+                    app.pending_cue_preview = Some(state);
+                    super::command::cancel_pending_cue_preview(app);
                 }
                 Some(super::button_map::TuiButton::CuePreviewTop) => {
                     park_and_run(app, state, super::command::Command::CueScrollTop, tx);
@@ -25495,6 +25976,7 @@ fn handle_cue_preview_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Se
             app.active_overlay = ActiveOverlay::ContextMenu {
                 levels: vec![super::context_menu::MenuLevel::new(entries)],
                 origin: (mx, my),
+                anchor_bottom: false,
             };
         }
         _ => {
@@ -25652,6 +26134,7 @@ fn handle_mb_select_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Send
                 app.active_overlay = ActiveOverlay::ContextMenu {
                     levels: vec![super::context_menu::MenuLevel::new(entries)],
                     origin: (mx, my),
+                    anchor_bottom: false,
                 };
             } else {
                 let operation_id = state.operation_id;
@@ -26047,6 +26530,7 @@ fn handle_metadata_editor_mouse_in_area(
                                 app.active_overlay = ActiveOverlay::ContextMenu {
                                     levels: vec![super::context_menu::MenuLevel::new(entries)],
                                     origin: (mx, my),
+                                    anchor_bottom: false,
                                 };
                             } else {
                                 // Outside the actionable detail rows,
@@ -26062,11 +26546,17 @@ fn handle_metadata_editor_mouse_in_area(
                         let row = (my - content_y) as usize + state.scroll;
                         if row < state.active_surface().entries.len() {
                             state.cursor = row;
-                            let entries = build_metadata_row_context_menu(&state, row);
+                            let column = metadata_editor_row_column_for_x(inner_x, mx);
+                            let entries = build_metadata_row_context_menu_for_column(
+                                &state,
+                                row,
+                                column,
+                            );
                             app.pending_metadata_editor = Some(state);
                             app.active_overlay = ActiveOverlay::ContextMenu {
                                 levels: vec![super::context_menu::MenuLevel::new(entries)],
                                 origin: (mx, my),
+                                anchor_bottom: false,
                             };
                         } else if row == state.active_surface().entries.len() {
                             // Only the rendered "+ Add field..." row is
@@ -26083,6 +26573,7 @@ fn handle_metadata_editor_mouse_in_area(
                             app.active_overlay = ActiveOverlay::ContextMenu {
                                 levels: vec![super::context_menu::MenuLevel::new(entries)],
                                 origin: (mx, my),
+                                anchor_bottom: false,
                             };
                         } else {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -26242,7 +26733,7 @@ fn handle_metadata_editor_mouse_in_area(
                 // drop-down area repositions the cursor; clicking elsewhere
                 // commits the edit.
                 if state.phase == MetadataEditorPhase::InlineEdit {
-                    let key_col_w = 22usize;
+                    let key_col_w = super::draw_overlays::METADATA_EDITOR_KEY_COL_W;
                     let iw = inner_w as usize;
                     let vm = iw.saturating_sub(key_col_w + 1); // val_max
 
@@ -26479,8 +26970,8 @@ fn handle_metadata_editor_mouse_in_area(
                     // Mirror of the render list in `draw_overlays.rs`
                     // `draw_metadata_editor` Editing arm. Order and
                     // labels MUST match exactly so click hit-tests
-                    // align. See `project_editor_footer_pills.md`.
-                    pills.push((":tags-mb", ":tags-mb"));
+                    // align with the renderer's footer-pill order.
+                    pills.push(("tags", "tags"));
                     pills.extend_from_slice(&[
                         (":fix-caps", ":fix-caps"),
                         (":d delete", ":d"),
@@ -26493,6 +26984,16 @@ fn handle_metadata_editor_mouse_in_area(
                     pills.push(("Alt+O OK", "ok"));
                     pills.push(("Esc close", "esc"));
                     if let Some(action) = footer_pill_hit(&pills, mx, inner_x, inner_w) {
+                        if action == "tags" {
+                            let entries = super::context_menu::build_metadata_tags_popup();
+                            app.pending_metadata_editor = Some(state);
+                            app.active_overlay = ActiveOverlay::ContextMenu {
+                                levels: vec![super::context_menu::MenuLevel::new(entries)],
+                                origin: (mx, my),
+                                anchor_bottom: true,
+                            };
+                            return;
+                        }
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                             let cmd = super::command::parse_command(&action[1..]);
@@ -26810,7 +27311,7 @@ fn metadata_editor_first_writable_slot(
     (0..limit).find(|&idx| metadata_editor_slot_is_writable(state, idx))
 }
 
-fn metadata_editor_begin_detail_edit_for_entry(
+pub(super) fn metadata_editor_begin_detail_edit_for_entry(
     state: &mut super::app::MetadataEditorState,
     entry_idx: usize,
     edit_first_writable_slot: bool,
@@ -27012,6 +27513,20 @@ pub(super) fn metadata_editor_apply_detail_paste(
     entry_idx: usize,
     text: &str,
 ) -> Result<DetailPasteResult, String> {
+    metadata_editor_apply_detail_paste_with_mode(state, entry_idx, text, false)
+}
+
+/// Core paste apply. `force_positional` is used ONLY by the Editing-phase
+/// row-paste wrapper for an exact-count multi-line paste onto an
+/// album-replicated key: the wrapper's pre-validation promises positional
+/// semantics there, while DetailEdit callers keep the legacy replication
+/// behavior unchanged via the plain entry point above.
+fn metadata_editor_apply_detail_paste_with_mode(
+    state: &mut super::app::MetadataEditorState,
+    entry_idx: usize,
+    text: &str,
+    force_positional: bool,
+) -> Result<DetailPasteResult, String> {
     if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, entry_idx) {
         return Err(reason);
     }
@@ -27057,7 +27572,7 @@ pub(super) fn metadata_editor_apply_detail_paste(
             )
         })
         .unwrap_or(false);
-    let targets: Vec<(usize, String)> = if album_scoped && dim > 1 {
+    let targets: Vec<(usize, String)> = if album_scoped && dim > 1 && !force_positional {
         (0..dim).map(|idx| (idx, lines[0].clone())).collect()
     } else {
         lines
@@ -27206,6 +27721,19 @@ pub fn context_menu_stack_rects<'a>(
     Vec<Rect>,
     Option<(&'a [super::context_menu::ContextMenuEntry], usize)>,
 ) {
+    context_menu_stack_rects_anchored(levels, origin, area_w, area_h, false)
+}
+
+pub fn context_menu_stack_rects_anchored<'a>(
+    levels: &'a [super::context_menu::MenuLevel],
+    origin: (u16, u16),
+    area_w: u16,
+    area_h: u16,
+    anchor_bottom: bool,
+) -> (
+    Vec<Rect>,
+    Option<(&'a [super::context_menu::ContextMenuEntry], usize)>,
+) {
     use super::context_menu::{ContextMenuEntry, MAX_CONTEXT_MENU_DEPTH};
     let mut rects: Vec<Rect> = Vec::with_capacity(levels.len() + 1);
     if levels.is_empty() {
@@ -27214,7 +27742,13 @@ pub fn context_menu_stack_rects<'a>(
     // Root: clamp x to fit on screen (right-click near the right edge
     // shouldn't render off-screen). Cascaded levels do NOT clamp — we
     // post-process the whole stack with a uniform left shift instead.
-    let root = context_menu_panel_rect(&levels[0].entries, origin, area_w, area_h, true);
+    let root_origin = if anchor_bottom {
+        let menu_h = (levels[0].entries.len() + 2).min(area_h as usize) as u16;
+        (origin.0, origin.1.saturating_sub(menu_h))
+    } else {
+        origin
+    };
+    let root = context_menu_panel_rect(&levels[0].entries, root_origin, area_w, area_h, true);
     rects.push(root);
     // Direction tracked parallel to rects. Root is conventionally
     // Right (it has no parent; the value only matters for inheritance
@@ -27395,8 +27929,10 @@ fn context_menu_mouse_hover(app: &mut AppState, mx: u16, my: u16) {
     let area = crossterm::terminal::size().unwrap_or((80, 24));
 
     // Extract levels + origin without holding a borrow during mutation.
-    let (mut levels, origin) = match &app.active_overlay {
-        ActiveOverlay::ContextMenu { levels, origin } => (levels.clone(), *origin),
+    let (mut levels, origin, anchor_bottom) = match &app.active_overlay {
+        ActiveOverlay::ContextMenu { levels, origin, anchor_bottom } => {
+            (levels.clone(), *origin, *anchor_bottom)
+        }
         _ => return,
     };
 
@@ -27404,7 +27940,7 @@ fn context_menu_mouse_hover(app: &mut AppState, mx: u16, my: u16) {
         Vec<Rect>,
         Option<(Vec<super::context_menu::ContextMenuEntry>, usize)>,
     ) = {
-        let (r, p) = context_menu_stack_rects(&levels, origin, area.0, area.1);
+        let (r, p) = context_menu_stack_rects_anchored(&levels, origin, area.0, area.1, anchor_bottom);
         (r, p.map(|(es, idx)| (es.to_vec(), idx)))
     };
     let preview = preview_owned.as_ref().map(|(v, i)| (v.as_slice(), *i));
@@ -27420,7 +27956,7 @@ fn context_menu_mouse_hover(app: &mut AppState, mx: u16, my: u16) {
                 let mut new_level = MenuLevel::new(preview_entries.to_vec());
                 new_level.selected = idx;
                 levels.push(new_level);
-                app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
+                app.active_overlay = ActiveOverlay::ContextMenu { levels, origin, anchor_bottom };
             }
             return;
         }
@@ -27434,7 +27970,7 @@ fn context_menu_mouse_hover(app: &mut AppState, mx: u16, my: u16) {
         if let Some(idx) = context_menu_hit_test(&entries, rects[level_idx], mx, my) {
             levels.truncate(level_idx + 1);
             levels[level_idx].selected = idx;
-            app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
+            app.active_overlay = ActiveOverlay::ContextMenu { levels, origin, anchor_bottom };
             return;
         }
     }
@@ -27453,15 +27989,17 @@ fn context_menu_mouse_click(
     use super::context_menu::{ContextMenuEntry, MenuLevel, MAX_CONTEXT_MENU_DEPTH};
     let area = crossterm::terminal::size().unwrap_or((80, 24));
 
-    let (mut levels, origin) = match &app.active_overlay {
-        ActiveOverlay::ContextMenu { levels, origin } => (levels.clone(), *origin),
+    let (mut levels, origin, anchor_bottom) = match &app.active_overlay {
+        ActiveOverlay::ContextMenu { levels, origin, anchor_bottom } => {
+            (levels.clone(), *origin, *anchor_bottom)
+        }
         _ => return false,
     };
 
     // Compute rects + preview, then immediately clone the preview's
     // entries so we can drop the borrow on `levels` before mutating it.
     let (rects, preview_owned): (Vec<Rect>, Option<(Vec<ContextMenuEntry>, usize)>) = {
-        let (r, p) = context_menu_stack_rects(&levels, origin, area.0, area.1);
+        let (r, p) = context_menu_stack_rects_anchored(&levels, origin, area.0, area.1, anchor_bottom);
         (r, p.map(|(es, idx)| (es.to_vec(), idx)))
     };
     let preview = preview_owned.as_ref().map(|(v, i)| (v.as_slice(), *i));
@@ -27503,7 +28041,7 @@ fn context_menu_mouse_click(
                             if levels.len() < MAX_CONTEXT_MENU_DEPTH {
                                 levels.push(MenuLevel::new(children.clone()));
                             }
-                            app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
+                            app.active_overlay = ActiveOverlay::ContextMenu { levels, origin, anchor_bottom };
                             return true;
                         }
                     }
@@ -27530,7 +28068,7 @@ fn context_menu_mouse_click(
                         if levels.len() < MAX_CONTEXT_MENU_DEPTH {
                             levels.push(MenuLevel::new(children.clone()));
                         }
-                        app.active_overlay = ActiveOverlay::ContextMenu { levels, origin };
+                        app.active_overlay = ActiveOverlay::ContextMenu { levels, origin, anchor_bottom };
                         return true;
                     }
                     _ => {}
@@ -36478,6 +37016,9 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
             app.bulk_guard_frozen_paths = None;
             app.set_status(format!("{} cancelled", operation.label()));
         }
+        Some(ConfirmAction::MetadataTransferUnsaved { .. }) => {
+            app.set_status("metadata editor: tag transfer cancelled; unsaved edits retained".to_string());
+        }
         Some(ConfirmAction::DiscardMetadataEditorChanges) => {
             app.quit_after_browse_archive_metadata_resolution = false;
             app.set_status("metadata editor: discard cancelled".to_string());
@@ -36886,6 +37427,28 @@ fn execute_confirm_action(
                 .append_collapse_warning(&mut status);
             app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
             app.set_status(status);
+        }
+        ConfirmAction::MetadataTransferUnsaved {
+            source_entries,
+            source_count,
+            target_paths,
+            scope,
+            edit_count: _,
+        } => {
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("metadata editor: transfer confirmation lost its editor session".to_string());
+                return;
+            };
+            super::context_menu::start_tag_transfer_from_editor_snapshot(
+                app,
+                source_entries.clone(),
+                *source_count,
+                target_paths.clone(),
+                *scope,
+                tx,
+            );
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
         ConfirmAction::DiscardMetadataEditorChanges => {
             let quit_after_resolution = app.quit_after_browse_archive_metadata_resolution;
@@ -39897,6 +40460,246 @@ mod phase4_tests {
         }
     }
 
+    fn two_file_editor(entries: Vec<TagEntry>) -> MetadataEditorState {
+        MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/01.flac"),
+                std::path::PathBuf::from("/tmp/02.flac"),
+            ],
+            entries,
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        )
+    }
+
+    #[test]
+    fn metadata_row_selection_is_owned_per_presentation_surface() {
+        let first = crate::tui::app::PresentationTab::new(
+            crate::disc::model::PresentationId::DvdAudioGroup(1),
+            "First",
+            vec![std::path::PathBuf::from("/tmp/first.flac")],
+            vec![entry("TITLE", ItemKey::TrackTitle, &["First"], &["First"])],
+            vec!["first".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let second = crate::tui::app::PresentationTab::new(
+            crate::disc::model::PresentationId::DvdAudioGroup(2),
+            "Second",
+            vec![std::path::PathBuf::from("/tmp/second.flac")],
+            vec![entry("TITLE", ItemKey::TrackTitle, &["Second"], &["Second"])],
+            vec!["second".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let mut state = MetadataEditorState::for_disc_presentations(vec![first, second], 0);
+
+        assert_eq!(metadata_editor_select_all_rows(&mut state), 1);
+        assert_eq!(state.presentation_tabs[0].selected_rows, [0].into_iter().collect());
+        assert!(state.presentation_tabs[1].selected_rows.is_empty());
+        assert!(state.switch_presentation_tab(1));
+        assert!(state.active_surface().selected_rows.is_empty());
+        assert_eq!(metadata_editor_invert_row_selection(&mut state), 1);
+        assert_eq!(state.presentation_tabs[1].selected_rows, [0].into_iter().collect());
+        metadata_editor_deselect_all_rows(&mut state);
+        assert!(state.presentation_tabs[1].selected_rows.is_empty());
+        assert_eq!(state.presentation_tabs[0].selected_rows, [0].into_iter().collect());
+    }
+
+    #[test]
+    fn metadata_ctrl_c_serializes_only_selected_rows_as_field_blocks() {
+        let mut state = two_file_editor(vec![
+            entry("TITLE", ItemKey::TrackTitle, &["Behind the Lines", "Duchess"], &["Behind the Lines", "Duchess"]),
+            entry("ARTIST", ItemKey::TrackArtist, &["Genesis", "Genesis"], &["Genesis", "Genesis"]),
+        ]);
+        state.active_surface_mut().selected_rows.insert(1);
+        let serialized = metadata_editor_selected_rows_serialization(&state).expect("selection serializes");
+        assert_eq!(serialized.keys, vec!["ARTIST"]);
+        assert_eq!(serialized.text, "ARTIST\nGenesis\nGenesis");
+    }
+
+    #[test]
+    fn metadata_ctrl_x_marks_writable_rows_deleted_and_honors_cuesheet_refusal() {
+        tui_file_picker::with_scoped_shared_text_clipboard("", || {
+            let mut state = MetadataEditorState::for_files(
+                vec![std::path::PathBuf::from("/tmp/album.flac")],
+                vec![
+                    entry("TITLE", ItemKey::TrackTitle, &["One"], &["One"]),
+                    entry(
+                        "CUESHEET",
+                        ItemKey::Unknown("CUESHEET".to_string()),
+                        &["FILE \"album.flac\" WAVE"],
+                        &["FILE \"album.flac\" WAVE"],
+                    ),
+                ],
+                vec!["album".to_string()],
+                crate::tui::app::MetadataTechnicalDetails::default(),
+            );
+            state.active_surface_mut().embedded_cuesheet_present = true;
+            state.active_surface_mut().selected_rows.extend([0, 1]);
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+            assert_eq!(metadata_editor_cut_selected_rows(&mut app, &mut state).unwrap(), 1);
+            assert_eq!(state.active_surface().deleted, vec![0]);
+            assert!(state.active_surface().selected_rows.is_empty());
+            assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+                message.contains("marked 1 row deleted")
+                    && message.contains("CUESHEET")
+                    && message.contains("requires confirmation")
+            }));
+        });
+    }
+
+    #[test]
+    fn editing_row_paste_pins_duke_positional_known_block_precedence_and_album_modes() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = MetadataEditorState::for_files(
+            (1..=12)
+                .map(|index| std::path::PathBuf::from(format!("/tmp/{index:02}.flac")))
+                .collect(),
+            vec![entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &vec!["old"; 12],
+                &vec!["old"; 12],
+            )],
+            (1..=12).map(|index| format!("{index:02}")).collect(),
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        let duke = [
+            "Behind the Lines", "Duchess", "Guide Vocal", "Man of Our Times",
+            "Misunderstanding", "Heathaze", "Turn It On Again", "Alone Tonight",
+            "Cul-de-sac", "Please Don't Ask", "Duke's Travels", "Duke's End",
+        ]
+        .join("\n");
+        metadata_editor_apply_row_or_block_paste(&mut app, &mut state, &duke)
+            .expect("Duke positional paste");
+        assert_eq!(state.active_surface().entries[0].per_file_values[0], "Behind the Lines");
+        assert_eq!(state.active_surface().entries[0].per_file_values[11], "Duke's End");
+
+        let before = state.active_surface().entries[0].per_file_values.clone();
+        assert_eq!(
+            metadata_editor_apply_row_or_block_paste(
+                &mut app,
+                &mut state,
+                "TRACKNUMBER\n1\n2",
+            )
+            .unwrap_err(),
+            "tag blocks: TRACKNUMBER has 2 values for 12 files"
+        );
+        assert_eq!(state.active_surface().entries[0].per_file_values, before);
+
+        assert_eq!(
+            metadata_editor_apply_row_or_block_paste(
+                &mut app,
+                &mut state,
+                "TITLE\nShared\n\nUNKNOWN_CUSTOM\nvalue",
+            )
+            .unwrap_err(),
+            "tag blocks: UNKNOWN_CUSTOM is not a known editor field; use Get tags from Clipboard or File to create custom fields"
+        );
+        assert!(state
+            .active_surface()
+            .entries
+            .iter()
+            .all(|entry| entry.display_key != "UNKNOWN_CUSTOM"));
+
+        let unknown_key_shaped_values = (0..12)
+            .map(|index| if index == 0 { "UNKNOWN".to_string() } else { format!("value-{index}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        metadata_editor_apply_row_or_block_paste(&mut app, &mut state, &unknown_key_shaped_values)
+            .expect("unknown key-shaped first line must remain row paste");
+        assert_eq!(state.active_surface().entries[0].per_file_values[0], "UNKNOWN");
+
+        let mut album_state = two_file_editor(vec![entry(
+            "ALBUM",
+            ItemKey::AlbumTitle,
+            &["Old A", "Old B"],
+            &["Old A", "Old B"],
+        )]);
+        metadata_editor_apply_row_or_block_paste(
+            &mut app,
+            &mut album_state,
+            "New A\nNew B",
+        )
+        .expect("album positional paste");
+        assert_eq!(
+            album_state.active_surface().entries[0].per_file_values,
+            ["New A", "New B"]
+        );
+        metadata_editor_apply_row_or_block_paste(&mut app, &mut album_state, "Shared")
+            .expect("album broadcast paste");
+        assert_eq!(
+            album_state.active_surface().entries[0].per_file_values,
+            ["Shared", "Shared"]
+        );
+    }
+
+    #[test]
+    fn metadata_row_context_menu_classifies_both_columns_and_exposes_per_file_edit() {
+        let mut mixed = entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["One", "Two"],
+            &["One", "Two"],
+        );
+        mixed.is_mixed = true;
+        let state = two_file_editor(vec![mixed]);
+        let boundary = 10 + super::super::draw_overlays::METADATA_EDITOR_KEY_COL_W as u16;
+        assert_eq!(metadata_editor_row_column_for_x(10, boundary - 1), MetadataRowColumn::Key);
+        assert_eq!(metadata_editor_row_column_for_x(10, boundary), MetadataRowColumn::Value);
+
+        for column in [MetadataRowColumn::Key, MetadataRowColumn::Value] {
+            let menu = build_metadata_row_context_menu_for_column(&state, 0, column);
+            let labels = menu
+                .iter()
+                .filter_map(|entry| match entry {
+                    super::super::context_menu::ContextMenuEntry::Item(item) => Some(item.label.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for required in ["Copy", "Cut", "Paste", "Select All", "Invert Selection", "Deselect"] {
+                assert!(labels.contains(&required), "{column:?} menu missing {required}");
+            }
+            assert!(labels.contains(&"Edit values (per file)"));
+        }
+    }
+
+    #[test]
+    fn queue_ctrl_l_is_unbound_while_clear_finished_remains_a_mouse_action() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Queue;
+        app.set_status("sentinel");
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_queue_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("sentinel")
+        );
+        assert!(include_str!("draw_queue.rs").contains(
+            r#"("clear done", TuiButton::ClearFinished"#
+        ));
+        assert!(!include_str!("draw_queue.rs").contains("C-l clear done"));
+        assert!(include_str!("keybindings.rs").contains("TuiButton::ClearFinished =>"));
+    }
+
+    #[test]
+    fn metadata_tags_popup_root_is_bottom_anchored_above_footer() {
+        let levels = vec![super::super::context_menu::MenuLevel::new(
+            super::super::context_menu::build_metadata_tags_popup(),
+        )];
+        let origin = (20, 30);
+        let (rects, _) = context_menu_stack_rects_anchored(&levels, origin, 100, 50, true);
+        let root = rects[0];
+        assert_eq!(root.y + root.height, origin.1);
+    }
+
     #[test]
     fn inline_edit_warns_before_collapsing_multiple_stored_values() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -40727,6 +41530,78 @@ mod phase4_tests {
     }
 
     #[test]
+    fn editable_cue_preview_cancel_button_closes_preview_without_quitting() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+            crate::tui::app::CuePreviewState::new(
+                "FILE \"album.flac\" WAVE\n".to_string(),
+                std::path::PathBuf::from("/tmp/album.cue"),
+                "editable preview".to_string(),
+            ),
+        ));
+        let area = crossterm::terminal::size().unwrap_or((80, 24));
+        let width = ((area.0 as u32 * 80 / 100) as u16)
+            .max(60)
+            .min(area.0.saturating_sub(2));
+        let height = ((area.1 as u32 * 80 / 100) as u16)
+            .max(15)
+            .min(area.1.saturating_sub(2));
+        let x = (area.0.saturating_sub(width)) / 2;
+        let y = (area.1.saturating_sub(height)) / 2;
+        let click_x = x.saturating_add(1);
+        let click_y = y.saturating_add(1);
+        app.button_map.record_button(
+            super::super::button_map::TuiButton::CuePreviewCancel,
+            ratatui::layout::Rect::new(click_x, click_y, 1, 1),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        handle_cue_preview_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: click_x,
+                row: click_y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert!(app.pending_cue_preview.is_none());
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("CUE preview cancelled")
+        );
+    }
+
+    #[test]
+    fn ctrl_q_in_cue_preview_requests_application_quit() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+            crate::tui::app::CuePreviewState::new(
+                "FILE \"album.flac\" WAVE\n".to_string(),
+                std::path::PathBuf::from("/tmp/album.cue"),
+                "editable preview".to_string(),
+            ),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &tx,
+        );
+
+        assert!(app.should_quit);
+        assert!(matches!(app.active_overlay, ActiveOverlay::CuePreview(_)));
+        assert!(app.pending_cue_preview.is_none());
+    }
+
+    #[test]
     fn review_click_commit_lands_on_the_row_the_edit_was_opened_on() {
         // Audit E-finding: a row click moved the review cursor under an open
         // inline edit, so Enter wrote the buffer to the NEW row. The click
@@ -41407,7 +42282,7 @@ mod phase4_tests {
     fn footer_close_mouse_event() -> MouseEvent {
         let layout = metadata_editor_test_layout();
         let pills: Vec<(&str, &str)> = vec![
-            (":tags-mb", ":tags-mb"),
+            ("tags", "tags"),
             (":fix-caps", ":fix-caps"),
             (":d delete", ":d"),
             (":u undo", ":u"),
@@ -41547,6 +42422,7 @@ mod phase4_tests {
                 },
             )])],
             origin: (2, 2),
+            anchor_bottom: false,
         };
         app
     }
@@ -41620,7 +42496,7 @@ mod phase4_tests {
         for button in [MouseButton::Left, MouseButton::Middle] {
             let mut app = parked_metadata_context_menu();
             let (levels, origin) = match &app.active_overlay {
-                ActiveOverlay::ContextMenu { levels, origin } => (levels.clone(), *origin),
+                ActiveOverlay::ContextMenu { levels, origin, .. } => (levels.clone(), *origin),
                 _ => unreachable!(),
             };
             let (rects, _) = context_menu_stack_rects(&levels, origin, area.0, area.1);
@@ -48520,6 +49396,83 @@ mod single_image_metadata_editor_regression_tests {
     }
 
     #[test]
+    fn cuesheet_delete_confirmation_supersedes_late_tag_transfer_preparation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("side_a.flac");
+        std::fs::write(&image, b"placeholder").expect("image");
+        let original = fixture_cue("side_a", "Album", "Embedded", 2);
+        let changed = fixture_cue("side_a", "Unsaved Album", "Embedded", 2);
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            vec![image.clone()],
+            vec![cuesheet_tag_entry(&changed, &original)],
+            vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().embedded_cuesheet_present = true;
+        state.active_surface_mut().dirty = true;
+        let (request_id, prepare_cancel) = state.begin_tag_transfer_preparation();
+        let details = &state.active_surface().technical_details;
+        let editor_session = crate::tui::message::MetadataEditorSessionGuard {
+            session_id: details.session_id,
+            save_generation: details.save_generation,
+            editor_generation: state.model.editor_save_generation,
+        };
+        let editor_fingerprint =
+            crate::tui::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let transfer_generation_before = app.browse.tag_transfer_generation;
+        open_embedded_cuesheet_delete_confirmation(&mut app, Box::new(state));
+
+        assert!(prepare_cancel.is_cancelled());
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                message,
+                action: ConfirmAction::DeleteEmbeddedCueSheet { path },
+            } if message.contains("Delete the embedded CUESHEET tag") && path == &image
+        ));
+        let confirmation_status = app.status_message.clone();
+
+        crate::tui::event_loop::handle_message(
+            &mut app,
+            AppMessage::MetadataTagTransferTargetsPrepared {
+                request_id,
+                editor_session,
+                editor_fingerprint,
+                scope: crate::tui::app::TagTransferScope::All,
+                source_entries: vec![cuesheet_tag_entry(&changed, &original)],
+                source_count: 1,
+                result: Ok(vec![temp.path().join("late-target.flac")]),
+            },
+            &tx(),
+        );
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                message,
+                action: ConfirmAction::DeleteEmbeddedCueSheet { path },
+            } if message.contains("Delete the embedded CUESHEET tag") && path == &image
+        ));
+        assert_eq!(app.status_message, confirmation_status);
+        assert_eq!(app.browse.tag_transfer_generation, transfer_generation_before);
+        let parked = app
+            .pending_metadata_editor
+            .as_deref()
+            .expect("CUESHEET confirmation must retain the parked editor");
+        // The display value is the CUE summary form (the fixture itself
+        // builds values via cue_summary_string); the raw text lives in
+        // per_file_values.
+        assert_eq!(
+            parked.active_surface().entries[0].value,
+            crate::tui::probe::cue_summary_string(&changed)
+        );
+        assert_eq!(parked.active_surface().entries[0].per_file_values[0], changed);
+        assert!(!parked.owns_tag_transfer_preparation(request_id));
+    }
+
+    #[test]
     fn embedded_cuesheet_delete_decline_restores_editor_without_staging_or_touching_sidecar() {
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("side_a.flac");
@@ -51900,10 +52853,10 @@ mod mb_picker_verification_lifecycle_tests {
     use super::*;
     use crate::config::TonepoetConfig;
     use crate::tui::app::{
-        ActiveOverlay, ActiveTagsMbOperation, MetadataEditorState, MetadataTechnicalDetails,
-        MbSelectPhase, MbSelectState,
+        ActiveOverlay, ActiveTagsMbOperation, ConfirmAction, MetadataEditorState,
+        MetadataTechnicalDetails, MbSelectPhase, MbSelectState, TagTransferScope,
     };
-    use crate::tui::message::{AppMessage, TagsMbOperationId};
+    use crate::tui::message::{AppMessage, MetadataEditorSessionGuard, TagsMbOperationId};
     use crate::tui::probe::{RowScope, TagEntry};
     use lofty::tag::ItemKey;
     use std::time::Duration;
@@ -51983,6 +52936,7 @@ mod mb_picker_verification_lifecycle_tests {
             MetadataTechnicalDetails::default(),
         ));
         state.model.tags_mb_in_flight = true;
+        let (tag_request_id, tag_prepare_cancel) = state.begin_tag_transfer_preparation();
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.tags_mb_operation_generation = 7;
@@ -51996,7 +52950,129 @@ mod mb_picker_verification_lifecycle_tests {
 
         assert!(app.active_tags_mb_operation.is_none());
         assert!(!state.model.tags_mb_in_flight);
+        assert!(tag_prepare_cancel.is_cancelled());
+        assert!(!state.owns_tag_transfer_preparation(tag_request_id));
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
+    #[test]
+    fn dirty_editor_close_confirmation_supersedes_late_tag_transfer_preparation() {
+        let (worker_tx, _worker_rx) = mpsc::channel(1);
+        let path = std::env::temp_dir().join("tonepoet-tag-transfer-close-race.flac");
+        let mut state = Box::new(MetadataEditorState::for_files(
+            vec![path],
+            vec![album_entry("Original Album")],
+            vec!["Single image".to_string()],
+            MetadataTechnicalDetails::default(),
+        ));
+        {
+            let surface = state.active_surface_mut();
+            surface.entries[0].value = "Unsaved Album".to_string();
+            surface.entries[0].per_file_values = vec!["Unsaved Album".to_string()];
+            surface.dirty = true;
+        }
+        let (request_id, prepare_cancel) = state.begin_tag_transfer_preparation();
+        let details = &state.active_surface().technical_details;
+        let editor_session = MetadataEditorSessionGuard {
+            session_id: details.session_id,
+            save_generation: details.save_generation,
+            editor_generation: state.model.editor_save_generation,
+        };
+        let editor_fingerprint =
+            crate::tui::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let transfer_generation_before = app.browse.tag_transfer_generation;
+        request_metadata_editor_close(&mut app, &mut state, &worker_tx);
+
+        assert!(prepare_cancel.is_cancelled());
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                message,
+                action: ConfirmAction::DiscardMetadataEditorChanges,
+            } if message == "Discard unsaved metadata changes? Y discards them; N/Esc returns to the editor."
+        ));
+        let close_status = app.status_message.clone();
+        assert!(app
+            .pending_metadata_editor
+            .as_deref()
+            .is_some_and(|editor| !editor.owns_tag_transfer_preparation(request_id)));
+
+        crate::tui::event_loop::handle_message(
+            &mut app,
+            AppMessage::MetadataTagTransferTargetsPrepared {
+                request_id,
+                editor_session,
+                editor_fingerprint,
+                scope: TagTransferScope::All,
+                source_entries: vec![album_entry("Unsaved Album")],
+                source_count: 1,
+                result: Ok(vec![std::env::temp_dir().join("late-target.flac")]),
+            },
+            &worker_tx,
+        );
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                message,
+                action: ConfirmAction::DiscardMetadataEditorChanges,
+            } if message == "Discard unsaved metadata changes? Y discards them; N/Esc returns to the editor."
+        ));
+        assert_eq!(app.status_message, close_status);
+        assert_eq!(app.browse.tag_transfer_generation, transfer_generation_before);
+        let parked = app
+            .pending_metadata_editor
+            .as_deref()
+            .expect("discard confirmation must retain the parked editor");
+        assert_eq!(parked.active_surface().entries[0].value, "Unsaved Album");
+        assert!(!parked.owns_tag_transfer_preparation(request_id));
+    }
+
+    #[test]
+    fn ctrl_q_is_global_in_dirty_metadata_editor_and_uses_quit_confirmation() {
+        let (worker_tx, _worker_rx) = mpsc::channel(1);
+        let path = std::env::temp_dir().join("tonepoet-global-ctrl-q-editor.flac");
+        let mut state = MetadataEditorState::for_files(
+            vec![path],
+            vec![album_entry("Original Album")],
+            vec!["Single image".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        {
+            let surface = state.active_surface_mut();
+            surface.entries[0].value = "Unsaved Album".to_string();
+            surface.entries[0].per_file_values = vec!["Unsaved Album".to_string()];
+            surface.dirty = true;
+        }
+        let (request_id, prepare_cancel) = state.begin_tag_transfer_preparation();
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &worker_tx,
+        );
+
+        assert!(!app.should_quit);
+        assert!(prepare_cancel.is_cancelled());
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                message,
+                action: ConfirmAction::DiscardMetadataEditorChanges,
+            } if message == concat!(
+                "Discard unsaved metadata changes before quitting? ",
+                "Y discards them; N/Esc returns to the editor."
+            )
+        ));
+        assert!(app
+            .pending_metadata_editor
+            .as_deref()
+            .is_some_and(|editor| !editor.owns_tag_transfer_preparation(request_id)));
     }
 
     #[tokio::test]
@@ -54250,6 +55326,7 @@ mod file_picker_browse_parity_regression_tests {
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             vec![MenuLevel::new(entries.clone())],
             (0, 0),
+            false,
             &tx,
         );
         let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
@@ -54263,6 +55340,7 @@ mod file_picker_browse_parity_regression_tests {
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             wrapped_levels,
             (0, 0),
+            false,
             &tx,
         );
         let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {

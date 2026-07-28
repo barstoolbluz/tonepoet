@@ -3860,6 +3860,81 @@ fn toggle_convert_advanced(app: &mut AppState, focus: ConvertFocus) {
 pub(super) const CONVERSION_ACTIONS_GATED_STATUS: &str =
     "conversion actions are gated off — set show_conversion_actions = true under [ui] in config.toml";
 
+/// Cancel an editable CUE preview that was parked for command or context-menu
+/// handling. This is deliberately separate from application quit: preview
+/// Cancel and typed `:q` close only the preview, while global Ctrl+Q calls
+/// [`request_application_quit`] directly.
+pub(super) fn cancel_pending_cue_preview(app: &mut AppState) -> bool {
+    if app.pending_cue_preview.take().is_none() {
+        return false;
+    }
+
+    app.active_overlay = super::app::ActiveOverlay::None;
+    if let Some(parked) = app.pending_metadata_editor.take() {
+        app.active_overlay = super::app::ActiveOverlay::MetadataEditor(parked);
+    }
+    app.set_status("CUE preview cancelled".to_string());
+    true
+}
+
+/// Request application quit through one editor-aware lifecycle reducer.
+///
+/// Global Ctrl+Q always uses this path. Typed `:q` uses it unless a parked
+/// editable CUE preview first consumes `:q` as preview cancellation. The
+/// reducer preserves active-write safeguards, invalidates obsolete editor
+/// background preparation only after the quit transition is admitted, and
+/// opens the same unsaved-editor discard confirmation for every application-
+/// quit request.
+pub(super) fn request_application_quit(
+    app: &mut AppState,
+    _tx: &mpsc::Sender<AppMessage>,
+) {
+    let Some(mut taken) = super::event_loop::take_metadata_editor_with_restore_slot(app) else {
+        app.should_quit = true;
+        return;
+    };
+
+    if taken.state.phase == super::app::MetadataEditorPhase::Saving
+        || taken.state.artwork_write.is_some()
+        || taken.state.replaygain_scan.is_some()
+    {
+        super::event_loop::restore_taken_metadata_editor(app, taken);
+        app.should_quit = false;
+        app.set_status(
+            "quit blocked: metadata editor has an active write; wait for completion or cancel it from the editor"
+                .to_string(),
+        );
+        return;
+    }
+
+    super::keybindings::metadata_editor_prepare_for_competing_workflow(
+        app,
+        &mut taken.state,
+    );
+
+    if taken.state.any_presentation_dirty() {
+        app.should_quit = false;
+        app.quit_after_browse_archive_metadata_resolution = true;
+        app.pending_metadata_editor = Some(taken.state);
+        app.active_overlay = super::app::ActiveOverlay::Confirmation {
+            message: concat!(
+                "Discard unsaved metadata changes before quitting? ",
+                "Y discards them; N/Esc returns to the editor."
+            )
+            .to_string(),
+            action: super::app::ConfirmAction::DiscardMetadataEditorChanges,
+        };
+        app.set_status("quit deferred: confirm unsaved metadata changes".to_string());
+        return;
+    }
+
+    // Keep a clean editor authoritative until the event-loop quit reconciler
+    // handles any Browse-archive staging it owns. This mirrors the prior `:q`
+    // behavior while ensuring pending interchange work is already cancelled.
+    app.active_overlay = super::app::ActiveOverlay::MetadataEditor(taken.state);
+    app.should_quit = true;
+}
+
 fn edit_source_path_is_admitted(path: &std::path::Path) -> bool {
     path.is_dir() || crate::convert::source_admission::is_direct_queue_source_path(path)
 }
@@ -3867,50 +3942,13 @@ fn edit_source_path_is_admitted(path: &std::path::Path) -> bool {
 pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMessage>) {
     match cmd {
         Command::Quit => {
-            // If a CUE preview is parked, :q just cancels the preview
-            // rather than quitting the app.
-            if app.pending_cue_preview.take().is_some() {
-                app.set_status("CUE preview cancelled".to_string());
-                return;
+            // Command-mode `:q` historically means "cancel this editable CUE
+            // preview" when the preview was parked to open `:`. Global Ctrl+Q
+            // bypasses this compatibility branch and calls the application-quit
+            // reducer directly from key routing.
+            if !cancel_pending_cue_preview(app) {
+                request_application_quit(app, tx);
             }
-
-            let editor = if let Some(parked) = app.pending_metadata_editor.take() {
-                Some(parked)
-            } else if matches!(app.active_overlay, super::app::ActiveOverlay::MetadataEditor(_)) {
-                match std::mem::replace(
-                    &mut app.active_overlay,
-                    super::app::ActiveOverlay::None,
-                ) {
-                    super::app::ActiveOverlay::MetadataEditor(state) => Some(state),
-                    other => {
-                        app.active_overlay = other;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some(state) = editor {
-                if state.any_presentation_dirty() {
-                    app.should_quit = false;
-                    app.quit_after_browse_archive_metadata_resolution = true;
-                    app.pending_metadata_editor = Some(state);
-                    app.active_overlay = super::app::ActiveOverlay::Confirmation {
-                        message: concat!(
-                            "Discard unsaved metadata changes before quitting? ",
-                            "Y discards them; N/Esc returns to the editor."
-                        )
-                        .to_string(),
-                        action: super::app::ConfirmAction::DiscardMetadataEditorChanges,
-                    };
-                    app.set_status(
-                        "quit deferred: confirm unsaved metadata changes".to_string(),
-                    );
-                    return;
-                }
-                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
-            }
-            app.should_quit = true;
         }
         Command::Write => {
             // If the metadata editor is parked or active, :w saves
@@ -9963,6 +10001,7 @@ pub fn preload_dvdv_metadata_editor_state_from_sidecar_with_presentation_id(
             sidecar,
         );
         surface.deleted.clear();
+        surface.selected_rows.clear();
         surface.dirty = false;
         return Ok(true);
     }
@@ -9981,6 +10020,7 @@ pub fn preload_dvdv_metadata_editor_state_from_sidecar_with_presentation_id(
             sidecar,
         );
         tab.deleted.clear();
+        tab.selected_rows.clear();
         tab.dirty = false;
         applied_any = true;
     }
@@ -9991,6 +10031,7 @@ pub fn preload_dvdv_metadata_editor_state_from_sidecar_with_presentation_id(
             state.active_surface_mut().entries = active.entries;
             state.active_surface_mut().file_labels = active.file_labels;
             state.active_surface_mut().deleted = active.deleted;
+            state.active_surface_mut().selected_rows = active.selected_rows;
             state.active_surface_mut().dirty = active.dirty;
             state.active_surface_mut().sacd_area_kind = active.sacd_area_kind;
             state.active_surface_mut().sacd_stereo_durations = active.sacd_stereo_durations;
@@ -11151,6 +11192,7 @@ pub fn preload_bluray_metadata_editor_state_from_sidecars_with_report(
         bluray_apply_sidecar_to_editor_fields(&mut surface.entries, track_count, sidecar);
         bluray_apply_sidecar_track_labels(&mut surface.file_labels, sidecar);
         surface.deleted.clear();
+        surface.selected_rows.clear();
         surface.dirty = false;
         preload_report.applied_presentations = 1;
         return preload_report;
@@ -11174,6 +11216,7 @@ pub fn preload_bluray_metadata_editor_state_from_sidecars_with_report(
             tab.label = album.trim().to_string();
         }
         tab.deleted.clear();
+        tab.selected_rows.clear();
         tab.dirty = false;
         preload_report.applied_presentations += 1;
     }
@@ -11190,6 +11233,7 @@ fn bluray_sync_active_tab_to_editor_state(state: &mut super::app::MetadataEditor
         state.active_surface_mut().entries = active.entries;
         state.active_surface_mut().file_labels = active.file_labels;
         state.active_surface_mut().deleted = active.deleted;
+        state.active_surface_mut().selected_rows = active.selected_rows;
         state.active_surface_mut().dirty = active.dirty;
         state.active_surface_mut().sacd_area_kind = active.sacd_area_kind;
         state.active_surface_mut().sacd_stereo_durations = active.sacd_stereo_durations;
@@ -20191,5 +20235,133 @@ mod tag_copy_expansion_tests {
         )
         .expect_err("directory entry must exceed traversal cap");
         assert!(traversal_err.contains("exceeds 1 filesystem entries"));
+    }
+}
+
+#[cfg(test)]
+mod round6_application_quit_lifecycle_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{
+        ActiveOverlay, ConfirmAction, MetadataEditorState, MetadataTechnicalDetails,
+        TagTransferScope,
+    };
+    use crate::tui::message::{AppMessage, MetadataEditorSessionGuard};
+    use crate::tui::probe::{RowScope, TagEntry};
+    use lofty::tag::ItemKey;
+
+    fn album_entry(value: &str, original: &str) -> TagEntry {
+        TagEntry {
+            row_scope: RowScope::File,
+            display_key: "ALBUM".to_string(),
+            item_key: ItemKey::AlbumTitle,
+            value: value.to_string(),
+            original: original.to_string(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
+            per_file_values: vec![value.to_string()],
+            per_file_originals: vec![original.to_string()],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn colon_q_confirmation_supersedes_late_tag_transfer_preparation() {
+        let path = std::env::temp_dir().join("tonepoet-colon-q-transfer-race.flac");
+        let mut state = MetadataEditorState::for_files(
+            vec![path],
+            vec![album_entry("Unsaved Album", "Original Album")],
+            vec!["Single image".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.active_surface_mut().dirty = true;
+        let (request_id, prepare_cancel) = state.begin_tag_transfer_preparation();
+        let details = &state.active_surface().technical_details;
+        let editor_session = MetadataEditorSessionGuard {
+            session_id: details.session_id,
+            save_generation: details.save_generation,
+            editor_generation: state.model.editor_save_generation,
+        };
+        let editor_fingerprint =
+            crate::tui::tag_interchange::metadata_editor_transfer_fingerprint(&state);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let transfer_generation_before = app.browse.tag_transfer_generation;
+        let (tx, _rx) = mpsc::channel(4);
+
+        execute_command(&mut app, Command::Quit, &tx);
+
+        assert!(prepare_cancel.is_cancelled());
+        assert!(!app.should_quit);
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                message,
+                action: ConfirmAction::DiscardMetadataEditorChanges,
+            } if message == concat!(
+                "Discard unsaved metadata changes before quitting? ",
+                "Y discards them; N/Esc returns to the editor."
+            )
+        ));
+        let quit_status = app.status_message.clone();
+
+        crate::tui::event_loop::handle_message(
+            &mut app,
+            AppMessage::MetadataTagTransferTargetsPrepared {
+                request_id,
+                editor_session,
+                editor_fingerprint,
+                scope: TagTransferScope::All,
+                source_entries: vec![album_entry("Unsaved Album", "Original Album")],
+                source_count: 1,
+                result: Ok(vec![std::env::temp_dir().join("late-target.flac")]),
+            },
+            &tx,
+        );
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                message,
+                action: ConfirmAction::DiscardMetadataEditorChanges,
+            } if message == concat!(
+                "Discard unsaved metadata changes before quitting? ",
+                "Y discards them; N/Esc returns to the editor."
+            )
+        ));
+        assert_eq!(app.status_message, quit_status);
+        assert_eq!(app.browse.tag_transfer_generation, transfer_generation_before);
+        let parked = app
+            .pending_metadata_editor
+            .as_deref()
+            .expect("quit confirmation must retain the parked editor");
+        assert_eq!(parked.active_surface().entries[0].value, "Unsaved Album");
+        assert!(!parked.owns_tag_transfer_preparation(request_id));
+    }
+
+    #[test]
+    fn colon_q_with_pending_cue_preview_cancels_preview_without_quitting() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_cue_preview = Some(Box::new(crate::tui::app::CuePreviewState::new(
+            "FILE \"album.flac\" WAVE\n".to_string(),
+            std::path::PathBuf::from("/tmp/album.cue"),
+            "editable preview".to_string(),
+        )));
+        app.active_overlay = ActiveOverlay::None;
+        let (tx, _rx) = mpsc::channel(4);
+
+        execute_command(&mut app, Command::Quit, &tx);
+
+        assert!(app.pending_cue_preview.is_none());
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("CUE preview cancelled")
+        );
     }
 }

@@ -2275,6 +2275,24 @@ pub(crate) struct PendingTagClipboardCopy {
     pub selection: super::context_menu::TagCopySelection,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum PendingTagTransferSource {
+    Roots(Vec<PathBuf>),
+    EditorSnapshot {
+        entries: Vec<crate::tui::probe::TagEntry>,
+        source_count: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTagTransfer {
+    pub generation: u64,
+    pub source: PendingTagTransferSource,
+    pub target_roots: Vec<PathBuf>,
+    pub scope: super::app::TagTransferScope,
+    pub verification: tui_file_picker::VerificationMode,
+}
+
 /// State for the browse screen
 #[derive(Debug, Clone)]
 pub struct BrowseState {
@@ -2326,6 +2344,18 @@ pub struct BrowseState {
     /// Last-request-wins pending work. Repeated requests while a worker is
     /// active replace this slot instead of spawning additional filesystem I/O.
     pub(crate) tag_clipboard_copy_pending: Option<PendingTagClipboardCopy>,
+
+    /// Monotonic ownership and cooperative cancellation for explicit tag
+    /// transfers. As with Copy tags, at most one blocking worker is active and
+    /// repeated requests coalesce to the newest pending operation.
+    pub(crate) tag_transfer_generation: u64,
+    pub(crate) tag_transfer_active_generation: Option<u64>,
+    pub(crate) tag_transfer_cancel: Option<crate::tui::probe::MetadataWriteCancelFlag>,
+    pub(crate) tag_transfer_pending: Option<PendingTagTransfer>,
+    /// A superseded transfer may have committed files before observing
+    /// cancellation. Defer the visible re-probe until the coalesced transfer
+    /// chain drains so the UI never retains stale metadata for those commits.
+    pub(crate) tag_transfer_refresh_pending: bool,
 
     /// Exact mappings/proofs retained only for an incomplete cut. A new Cut or
     /// Copy command clears this token.
@@ -2931,6 +2961,11 @@ impl BrowseState {
             tag_clipboard_copy_active_generation: None,
             tag_clipboard_copy_cancel: None,
             tag_clipboard_copy_pending: None,
+            tag_transfer_generation: 0,
+            tag_transfer_active_generation: None,
+            tag_transfer_cancel: None,
+            tag_transfer_pending: None,
+            tag_transfer_refresh_pending: false,
             filesystem_clipboard_retry_plan: None,
             pending_clipboard_paste: None,
             multi_select_anchor: None,

@@ -6529,6 +6529,45 @@ pub fn canonical_metadata_display_key(display_key: &str) -> String {
     crate::dsf_tags::canonical_metadata_key(display_key)
 }
 
+/// Return the strongest typed Lofty identity for a newly-created canonical
+/// editor row. Unknown keys remain exact custom-field names rather than being
+/// guessed through a carrier-specific mapping.
+pub(crate) fn item_key_for_new_editor_row(canonical_display_key: &str) -> lofty::tag::ItemKey {
+    use lofty::tag::ItemKey;
+
+    match canonical_display_key {
+        "TITLE" => ItemKey::TrackTitle,
+        "ARTIST" => ItemKey::TrackArtist,
+        "ALBUM" => ItemKey::AlbumTitle,
+        "ALBUMARTIST" => ItemKey::AlbumArtist,
+        "TRACKNUMBER" => ItemKey::TrackNumber,
+        "TRACKTOTAL" => ItemKey::TrackTotal,
+        "DISCNUMBER" => ItemKey::DiscNumber,
+        "DISCTOTAL" => ItemKey::DiscTotal,
+        "DATE" => ItemKey::Year,
+        "GENRE" => ItemKey::Genre,
+        "COMMENT" => ItemKey::Comment,
+        "COMPOSER" => ItemKey::Composer,
+        "LYRICIST" => ItemKey::Lyricist,
+        "ARRANGER" => ItemKey::Arranger,
+        "PERFORMER" => ItemKey::Performer,
+        "ISRC" => ItemKey::Isrc,
+        "CATALOGNUMBER" => ItemKey::CatalogNumber,
+        "PUBLISHER" => ItemKey::Publisher,
+        "ORIGINALDATE" => ItemKey::OriginalReleaseDate,
+        "MUSICBRAINZ_ALBUMID" => ItemKey::MusicBrainzReleaseId,
+        "MUSICBRAINZ_ALBUMARTISTID" => ItemKey::MusicBrainzReleaseArtistId,
+        "MUSICBRAINZ_RELEASEGROUPID" => ItemKey::MusicBrainzReleaseGroupId,
+        "MUSICBRAINZ_TRACKID" => ItemKey::MusicBrainzRecordingId,
+        "MUSICBRAINZ_RELEASETRACKID" => ItemKey::MusicBrainzTrackId,
+        "MUSICBRAINZ_ARTISTID" => ItemKey::MusicBrainzArtistId,
+        "REPLAYGAIN_TRACK_GAIN" => ItemKey::ReplayGainTrackGain,
+        "REPLAYGAIN_TRACK_PEAK" => ItemKey::ReplayGainTrackPeak,
+        "REPLAYGAIN_ALBUM_GAIN" => ItemKey::ReplayGainAlbumGain,
+        "REPLAYGAIN_ALBUM_PEAK" => ItemKey::ReplayGainAlbumPeak,
+        _ => ItemKey::Unknown(canonical_display_key.to_string()),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CanonicalEditorTagField {
@@ -7425,12 +7464,27 @@ pub(crate) fn read_all_tags_merged_with_metadata_cancellable<F>(
 where
     F: Fn() -> bool,
 {
+    read_all_tags_merged_with_metadata_cancellable_for_operation(
+        paths,
+        cancelled,
+        "Copy tags superseded by a newer request",
+    )
+}
+
+pub(crate) fn read_all_tags_merged_with_metadata_cancellable_for_operation<F>(
+    paths: &[std::path::PathBuf],
+    cancelled: F,
+    cancellation_message: &str,
+) -> Result<MergedTagsAndMetadata, String>
+where
+    F: Fn() -> bool,
+{
     use lofty::file::TaggedFileExt;
     use std::collections::HashMap;
 
-    const CANCELLED: &str = "Copy tags superseded by a newer request";
+    let cancelled_message = || cancellation_message.to_string();
     if cancelled() {
-        return Err(CANCELLED.to_string());
+        return Err(cancelled_message());
     }
 
     let n = paths.len();
@@ -7444,7 +7498,7 @@ where
 
     if paths.len() == 1 {
         if cancelled() {
-            return Err(CANCELLED.to_string());
+            return Err(cancelled_message());
         }
         let path = &paths[0];
         if crate::dsf_tags::is_dsf(path) {
@@ -7478,7 +7532,7 @@ where
             });
         }
         if cancelled() {
-            return Err(CANCELLED.to_string());
+            return Err(cancelled_message());
         }
         let tagged = match lofty::read_from_path(path) {
             Ok(tagged) => tagged,
@@ -7491,7 +7545,7 @@ where
             }
         };
         if cancelled() {
-            return Err(CANCELLED.to_string());
+            return Err(cancelled_message());
         }
         let entries = read_all_tags_from_tagged_file(&tagged);
         let metadata = source_metadata_from_tags(path, tagged.tags(), false);
@@ -7516,7 +7570,7 @@ where
 
     for (file_idx, path) in paths.iter().enumerate() {
         if cancelled() {
-            return Err(CANCELLED.to_string());
+            return Err(cancelled_message());
         }
         if crate::dsf_tags::is_dsf(path) {
             match crate::dsf_tags::read_with_warnings(path) {
@@ -7555,7 +7609,7 @@ where
                 }
             }
             if cancelled() {
-                return Err(CANCELLED.to_string());
+                return Err(cancelled_message());
             }
             continue;
         }
@@ -7564,7 +7618,7 @@ where
             continue;
         }
         if cancelled() {
-            return Err(CANCELLED.to_string());
+            return Err(cancelled_message());
         }
         let tagged = match lofty::read_from_path(path) {
             Ok(tagged) => tagged,
@@ -7574,7 +7628,7 @@ where
             }
         };
         if cancelled() {
-            return Err(CANCELLED.to_string());
+            return Err(cancelled_message());
         }
         metadata[file_idx] = source_metadata_from_tags(path, tagged.tags(), false);
         let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
@@ -7642,7 +7696,7 @@ where
     sort_entries_standard_first(&mut entries);
 
     if cancelled() {
-        return Err(CANCELLED.to_string());
+        return Err(cancelled_message());
     }
     Ok(MergedTagsAndMetadata {
         entries,
@@ -8224,6 +8278,22 @@ fn write_all_tags_with_cancel_report_classified_at_verification(
                 MetadataWriteFailure::Failed(message)
             }
         })
+}
+
+pub(crate) fn write_all_tags_for_transfer_at_verification(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, String> {
+    write_all_tags_with_cancel_report_classified_at_verification(
+        path,
+        changes,
+        cancel,
+        None,
+        verification,
+    )
+    .map_err(MetadataWriteFailure::into_message)
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // strong-mode compatibility seam; production routes through the _at_verification variant

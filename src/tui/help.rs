@@ -174,7 +174,6 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                     ("a / f", "Add files"),
                     ("c", "Configure selected items"),
                     ("d / Delete", "Remove selected (with confirmation)"),
-                    ("Ctrl+l", "Clear completed items"),
                     ("Ctrl+r", "Retry failed items"),
                 ],
             },

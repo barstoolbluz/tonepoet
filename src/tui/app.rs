@@ -5625,8 +5625,10 @@ pub enum ActiveOverlay {
     /// at `MAX_CONTEXT_MENU_DEPTH` (4).
     ContextMenu {
         levels: Vec<crate::tui::context_menu::MenuLevel>,
-        /// Anchor for the root level (right-click position).
+        /// Anchor for the root level (right-click position or footer edge).
         origin: (u16, u16),
+        /// Place the root panel immediately above `origin.1` instead of below it.
+        anchor_bottom: bool,
     },
     /// Bulk rename wizard overlay. Boxed because the state is large.
     BulkRename(Box<BulkRenameState>),
@@ -6150,6 +6152,18 @@ impl FileTaskProgressSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagTransferDirection {
+    To,
+    From,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagTransferScope {
+    Canonical,
+    All,
+}
+
 /// Tonepoet-specific purpose for a reusable file-picker session.
 ///
 /// The picker crate intentionally does not know what a selected path means.
@@ -6183,6 +6197,20 @@ pub enum FilePickerPurpose {
     MoveTo {
         sources: Vec<PathBuf>,
         force: bool,
+    },
+    /// Browse-side explicit tag transfer. `fixed_roots` is the side captured
+    /// before the picker opens; the selected path supplies the opposite side.
+    BrowseTagTransfer {
+        direction: TagTransferDirection,
+        scope: TagTransferScope,
+        fixed_roots: Vec<PathBuf>,
+    },
+    /// Read field blocks from a text file into the currently open editor.
+    MetadataTagBlocksFile,
+    /// Editor-side transfer picker. The active editor surface is the fixed side.
+    MetadataTagTransfer {
+        direction: TagTransferDirection,
+        scope: TagTransferScope,
     },
     Generic {
         id: String,
@@ -7355,6 +7383,9 @@ pub struct PresentationTab {
     pub entries: Vec<crate::tui::probe::TagEntry>,
     pub file_labels: Vec<String>,
     pub deleted: Vec<usize>,
+    /// Row selection belongs to this presentation surface so switching tabs
+    /// cannot leave indices pointing into another surface's entry vector.
+    pub selected_rows: std::collections::BTreeSet<usize>,
     pub dirty: bool,
     /// Sticky unresolved state set when a mandatory post-save re-read fails.
     /// It survives ordinary dirty recomputation and is cleared only after a
@@ -7422,6 +7453,7 @@ impl Default for PresentationTab {
             entries: Vec::new(),
             file_labels: Vec::new(),
             deleted: Vec::new(),
+            selected_rows: std::collections::BTreeSet::new(),
             dirty: false,
             refresh_failed: false,
             technical_details: MetadataTechnicalDetails::default(),
@@ -7505,6 +7537,7 @@ impl PresentationTab {
             active.technical_details.clone(),
         );
         tab.deleted = active.deleted.clone();
+        tab.selected_rows = active.selected_rows.clone();
         tab.dirty = active.dirty;
         tab.sacd_area_kind = active.sacd_area_kind;
         tab.sacd_stereo_durations = active.sacd_stereo_durations.clone();
@@ -7585,6 +7618,15 @@ pub struct MetadataEditorModel {
     pub artwork_write_generation: u64,
     pub artwork_write: Option<MetadataArtworkWriteState>,
     pub file_picker: Option<MetadataFilePickerState>,
+    /// Monotonic ownership token for asynchronous editor tag-interchange
+    /// preparation. Only the most recently accepted file-import or transfer
+    /// request may reduce its completion into the editor.
+    pub tag_transfer_prepare_generation: u64,
+    /// Cooperative cancellation for the currently owned file-import or
+    /// source/target preparation worker. This is intentionally one slot: a
+    /// newer request supersedes the older one rather than allowing parallel
+    /// preparation work.
+    pub tag_transfer_prepare_cancel: Option<crate::tui::probe::MetadataWriteCancelFlag>,
     pub pending_artwork_type: Option<lofty::picture::PictureType>,
     pub read_only: bool,
     pub sacd_sidecar_path: Option<std::path::PathBuf>,
@@ -7627,6 +7669,8 @@ impl Default for MetadataEditorModel {
             artwork_write_generation: 0,
             artwork_write: None,
             file_picker: None,
+            tag_transfer_prepare_generation: 0,
+            tag_transfer_prepare_cancel: None,
             pending_artwork_type: None,
             read_only: false,
             sacd_sidecar_path: None,
@@ -7859,6 +7903,55 @@ impl MetadataEditorState {
         self.model.active_surface_mut()
     }
 
+    /// Supersede any older editor tag-interchange preparation and return the
+    /// ownership token and cancellation flag for the new worker.
+    pub fn begin_tag_transfer_preparation(
+        &mut self,
+    ) -> (u64, crate::tui::probe::MetadataWriteCancelFlag) {
+        if let Some(cancel) = self.tag_transfer_prepare_cancel.take() {
+            cancel.cancel();
+        }
+        let request_id = self
+            .tag_transfer_prepare_generation
+            .checked_add(1)
+            .unwrap_or(1);
+        self.tag_transfer_prepare_generation = request_id;
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        self.tag_transfer_prepare_cancel = Some(cancel.clone());
+        (request_id, cancel)
+    }
+
+    /// Cancel and invalidate any pending tag-interchange preparation.
+    ///
+    /// This is called when the editor begins a competing close workflow. The
+    /// generation advance makes every already-enqueued completion stale, while
+    /// cancelling the flag stops bounded file reads and directory/metadata
+    /// preparation at their existing cooperative checkpoints.
+    pub fn invalidate_tag_interchange_preparation(&mut self) {
+        if let Some(cancel) = self.tag_transfer_prepare_cancel.take() {
+            cancel.cancel();
+        }
+        self.tag_transfer_prepare_generation = self
+            .tag_transfer_prepare_generation
+            .checked_add(1)
+            .unwrap_or(1);
+    }
+
+    pub fn owns_tag_transfer_preparation(&self, request_id: u64) -> bool {
+        self.tag_transfer_prepare_generation == request_id
+            && self.tag_transfer_prepare_cancel.is_some()
+    }
+
+    /// Consume the preparation slot only when the completion still owns it.
+    /// A consumed request cannot be reduced twice, so duplicate channel
+    /// delivery is harmless.
+    pub fn take_tag_transfer_preparation(&mut self, request_id: u64) -> bool {
+        if !self.owns_tag_transfer_preparation(request_id) {
+            return false;
+        }
+        self.tag_transfer_prepare_cancel = None;
+        true
+    }
 
     pub fn apply_analysis_result(&mut self, result: &crate::tui::analyze::AnalysisResult) -> bool {
         let mut changed = false;
@@ -8711,6 +8804,7 @@ impl MetadataEditorState {
             };
             tab.entries = entries;
             tab.deleted.clear();
+            tab.selected_rows.clear();
             tab.dirty = false;
             tab.refresh_failed = false;
             tab.embedded_cuesheet_present = false;
@@ -9128,7 +9222,24 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
     let removed: std::collections::BTreeSet<usize> = remove_entries.iter().copied().collect();
     tab.deleted = retained_deleted
         .into_iter()
-        .filter(|idx| !removed.contains(idx))
+        .filter_map(|idx| {
+            if removed.contains(&idx) {
+                None
+            } else {
+                Some(idx - removed.range(..idx).count())
+            }
+        })
+        .collect();
+    tab.selected_rows = tab
+        .selected_rows
+        .iter()
+        .filter_map(|idx| {
+            if removed.contains(idx) {
+                None
+            } else {
+                Some(*idx - removed.range(..*idx).count())
+            }
+        })
         .collect();
     for idx in remove_entries.into_iter().rev() {
         if idx < tab.entries.len() {
@@ -10214,6 +10325,17 @@ pub enum ConfirmAction {
     /// Copy the active tab's just-populated MusicBrainz values to every
     /// other presentation tab that has the same track count.
     ApplyMbToAllPresentations(Box<MetadataEditorState>),
+    /// Write the current editor snapshot to explicitly selected target files.
+    /// Dirty editors are parked while this blocking confirmation is open, so
+    /// cancellation restores the exact unsaved state and confirmation writes
+    /// the exact snapshot named by the prompt.
+    MetadataTransferUnsaved {
+        source_entries: Vec<crate::tui::probe::TagEntry>,
+        source_count: usize,
+        target_paths: Vec<PathBuf>,
+        scope: TagTransferScope,
+        edit_count: usize,
+    },
     /// Close the metadata editor and discard unsaved changes after an
     /// explicit confirmation. The editor itself is parked in
     /// `AppState::pending_metadata_editor` so cancellation restores it.
@@ -15563,6 +15685,49 @@ mod metadata_presentation_tab_tests {
         assert!(!state.active_surface().refresh_failed);
         assert!(!state.recompute_active_dirty());
         assert!(!state.active_surface().dirty);
+    }
+
+    #[test]
+    fn successful_surface_reread_clears_row_selection_bound_to_old_entries() {
+        let mut surface = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![tag("TITLE", "before", vec!["before"])],
+            1,
+        );
+        surface.technical_details.session_id = 78;
+        surface.selected_rows.insert(0);
+        let mut state = state_with_tabs(vec![surface], 0);
+
+        assert!(state.replace_saved_surface_entries(
+            78,
+            vec![tag("ARTIST", "after", vec!["after"])],
+        ));
+        assert!(state.active_surface().selected_rows.is_empty());
+    }
+
+    #[test]
+    fn saved_row_removal_remaps_selection_indices_without_retargeting() {
+        let mut surface = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![
+                tag("TITLE", "one", vec!["one"]),
+                tag("ARTIST", "two", vec!["two"]),
+                tag("ALBUM", "three", vec!["three"]),
+            ],
+            1,
+        );
+        surface.deleted = vec![1];
+        surface.selected_rows.extend([0, 1, 2]);
+
+        reduce_saved_slots(&mut surface, &[0].into_iter().collect());
+
+        assert_eq!(surface.entries.len(), 2);
+        assert_eq!(surface.entries[0].display_key, "TITLE");
+        assert_eq!(surface.entries[1].display_key, "ALBUM");
+        assert_eq!(surface.selected_rows, [0, 1].into_iter().collect());
+        assert!(surface.deleted.is_empty());
     }
 
     #[test]
