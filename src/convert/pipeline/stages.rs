@@ -10266,7 +10266,17 @@ fn conversion_log_album_dir(
     // deriving the sidecar directory from the first audio artifact's parent can
     // incorrectly place `conversion.log` in a track subdirectory. Prefer the
     // same planner/dispatcher-authored album root that publish uses.
-    if req.album_batch.is_some() {
+    // Ordered (fragment-flow) batches coordinate their hidden fragments in
+    // the stable batch workspace. Completion-order batches stage a VISIBLE
+    // standalone conversion.log instead (fragments are gated off for them),
+    // and that log belongs at the real album root like any legacy
+    // independent job — publish containment refuses coordination-dir paths
+    // for non-fragment roles by design.
+    if req
+        .album_batch
+        .as_ref()
+        .is_some_and(|batch| !batch.uses_completion_order())
+    {
         if let Some(coord_dir) = conversion_log_batch_coordination_album_dir(req) {
             return coord_dir;
         }
@@ -34942,7 +34952,14 @@ fn render_template_with_tokens(
     track_extra: Option<&BTreeMap<String, String>>,
     album_extra: &BTreeMap<String, String>,
 ) -> String {
-    let conditional = render_conditional_template_blocks(template, tokens, track_extra, album_extra);
+    // %EXT% renders empty by design (append_default_extension is the
+    // extension authority). Consume the template's `.%EXT%` separator+token
+    // TOGETHER: leaving the literal dot behind produced `Title..flac` once
+    // the round-9 dot-preserving extension join stopped silently eating
+    // trailing dots. A bare %EXT% (no separator) still renders empty.
+    let template = template.replace(".%EXT%", "").replace("%EXT%", "");
+    let conditional =
+        render_conditional_template_blocks(&template, tokens, track_extra, album_extra);
     render_template_segment(&conditional, tokens, track_extra, album_extra)
 }
 
@@ -40457,6 +40474,58 @@ mod naming_template_tests {
     }
 
     #[test]
+    fn completion_order_batch_plans_visible_conversion_log_inside_album_dir() {
+        // Round-9 field regression pin (Supertramp fixture): completion-order
+        // batches stage a VISIBLE standalone conversion.log (fragments are
+        // gated off for them) — it must plan into the REAL album dir, never
+        // the .tonepoet-batch coordination workspace, or publish containment
+        // refuses every track with "outside album directory".
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = template_source();
+        let mut req = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
+        // Batch dispatch requires a single-file audio source, not an archive.
+        let src_root = temp.path().join("src-root");
+        std::fs::create_dir_all(&src_root).expect("source root");
+        req.container = src_root.join("track.wv");
+        std::fs::write(&req.container, b"not real audio; log-dir pin only")
+            .expect("container fixture");
+        req.output_root = temp.path().join("out");
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, None, 1));
+        let plan = plan_outputs(&source, &req).expect("plan outputs");
+
+        let dispatch = prepare_independent_single_file_album_batch_for_completion_order_dispatch(
+            vec![req],
+            plan.album_dir.clone(),
+            src_root,
+        )
+        .expect("completion-order dispatch");
+        let req = dispatch.requests.into_iter().next().expect("request back");
+        assert!(req
+            .album_batch
+            .as_ref()
+            .is_some_and(AlbumBatchContext::uses_completion_order));
+
+        let staging = StagingDir::new(
+            temp.path().join("staging"),
+            "completion-order-log-dir".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+
+        let log_dir = conversion_log_album_dir(&source, &req, &artifacts);
+        assert_eq!(
+            log_dir, plan.album_dir,
+            "completion-order standalone conversion.log must live at the album root"
+        );
+        assert!(
+            !log_dir
+                .components()
+                .any(|c| c.as_os_str() == CONVERSION_LOG_BATCH_COORDINATION_DIR),
+            "completion-order log dir must not be the batch coordination workspace"
+        );
+    }
+
+    #[test]
     fn render_folder_template_preserves_template_slashes() {
         let source = template_source();
         assert_eq!(
@@ -41357,6 +41426,33 @@ mod naming_template_tests {
         assert_eq!(
             path,
             PathBuf::from("01 - Even in the Quietest Moments....flac")
+        );
+    }
+
+    #[test]
+    fn ext_token_consumes_its_separator_dot_and_never_doubles_extensions() {
+        // Field regression pin (Supertramp acceptance): the default filename
+        // template ends `.%EXT%`; %EXT% renders empty, and pre-fix the
+        // orphaned separator dot survived into "Title..flac".
+        let source = template_source();
+        let track = &source.tracks[0];
+        let rendered = render_track_template(
+            "%TRACKNN% - %TITLE%.%EXT%",
+            &source,
+            track,
+            &PlannerAudioFormat::Flac,
+        )
+        .expect("render track template");
+        let mut path = rendered.clone();
+        append_default_extension(&mut path, &PlannerAudioFormat::Flac, None);
+        let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+        assert!(
+            name.ends_with(".flac") && !name.ends_with("..flac"),
+            "separator dot must be consumed with %EXT%, got: {name}"
+        );
+        assert!(
+            !name.ends_with(".flac.flac"),
+            "extension must not double, got: {name}"
         );
     }
 
