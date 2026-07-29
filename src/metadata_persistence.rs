@@ -99,12 +99,17 @@ pub(crate) fn flac_stream_offset(path: &Path) -> Result<Option<u64>, String> {
 
 /// Top-level persistence route used by the metadata writer.
 ///
-/// The native routes are format-owned. `Lofty` means the writer probes the
-/// carrier and writes its actual primary tag type through Lofty.
+/// Format-owned routes centralize policy without necessarily forcing one
+/// serializer. `WavPackApeDispatch` keeps healthy files on the established
+/// Lofty path and activates the native APEv2 recovery writer only after a
+/// typed APE decoding failure. `Lofty` probes the carrier and writes its
+/// actual primary tag type through Lofty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataPersistenceRoute {
     NativeFlacVorbis,
     NativeDsfId3,
+    WavPackApeDispatch,
+    ReadOnlyApeFamily,
     Lofty,
     UnsupportedDff,
 }
@@ -117,10 +122,12 @@ pub enum MetadataPersistenceRoute {
 pub enum MetadataPersistenceBackend {
     NativeFlacVorbis,
     NativeDsfId3,
+    NativeWavPackApe,
     LoftyVorbisComments,
     LoftyId3v2,
     LoftyApe,
     LoftyMp4Ilst,
+    ReadOnlyApeFamily,
     UnsupportedDff,
     UnclassifiedLofty,
 }
@@ -194,10 +201,11 @@ impl MetadataPersistenceBackend {
                 MetadataNumberingCapabilities::TEXTUAL
             }
             Self::NativeDsfId3
+            | Self::NativeWavPackApe
             | Self::LoftyId3v2
             | Self::LoftyApe
             | Self::LoftyMp4Ilst => MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY,
-            Self::UnsupportedDff | Self::UnclassifiedLofty => {
+            Self::ReadOnlyApeFamily | Self::UnsupportedDff | Self::UnclassifiedLofty => {
                 MetadataNumberingCapabilities::NONE
             }
         }
@@ -207,10 +215,12 @@ impl MetadataPersistenceBackend {
         match self {
             Self::NativeFlacVorbis => "native FLAC/Vorbis comments",
             Self::NativeDsfId3 => "native DSF/ID3",
+            Self::NativeWavPackApe => "native WavPack/APEv2",
             Self::LoftyVorbisComments => "Lofty Vorbis comments",
             Self::LoftyId3v2 => "Lofty ID3v2",
             Self::LoftyApe => "Lofty APE",
             Self::LoftyMp4Ilst => "Lofty MP4 ilst",
+            Self::ReadOnlyApeFamily => "read-only APE/Musepack metadata",
             Self::UnsupportedDff => "unsupported DFF metadata",
             Self::UnclassifiedLofty => "unclassified Lofty tag type",
         }
@@ -229,12 +239,19 @@ fn has_flac_magic(path: &Path) -> bool {
 
 /// Resolve the same top-level route used by the metadata writer.
 ///
-/// Dispatch order is intentional: DSF is extension-owned; FLAC uses either its
+/// Dispatch order is intentional: DSF is extension-owned native; WavPack is
+/// extension-owned policy dispatch (healthy tags use Lofty, typed malformed
+/// APE tags use the native recovery writer); APE/Musepack remain
+/// read-fallback-only; FLAC uses either its
 /// extension or file magic; DFF is explicitly unsupported; every other path is
 /// delegated to Lofty's content probe.
 pub fn metadata_persistence_route_for_path(path: &Path) -> MetadataPersistenceRoute {
     if extension_is(path, "dsf") {
         MetadataPersistenceRoute::NativeDsfId3
+    } else if extension_is(path, "wv") {
+        MetadataPersistenceRoute::WavPackApeDispatch
+    } else if extension_is(path, "ape") || extension_is(path, "mpc") {
+        MetadataPersistenceRoute::ReadOnlyApeFamily
     } else if extension_is(path, "flac") || has_flac_magic(path) {
         MetadataPersistenceRoute::NativeFlacVorbis
     } else if extension_is(path, "dff") {
@@ -323,12 +340,14 @@ impl MetadataNumberingField {
             {
                 Some(Self::DiscNumber)
             }
-            MetadataPersistenceBackend::LoftyApe
+            MetadataPersistenceBackend::NativeWavPackApe
+            | MetadataPersistenceBackend::LoftyApe
                 if name.eq_ignore_ascii_case("TRACK") =>
             {
                 Some(Self::TrackNumber)
             }
-            MetadataPersistenceBackend::LoftyApe
+            MetadataPersistenceBackend::NativeWavPackApe
+            | MetadataPersistenceBackend::LoftyApe
                 if name.eq_ignore_ascii_case("DISC") =>
             {
                 Some(Self::DiscNumber)
@@ -383,8 +402,10 @@ impl MetadataNumberingField {
         match (backend, self) {
             (MetadataPersistenceBackend::LoftyId3v2, Self::TrackNumber) => &["TRCK"],
             (MetadataPersistenceBackend::LoftyId3v2, Self::DiscNumber) => &["TPOS"],
-            (MetadataPersistenceBackend::LoftyApe, Self::TrackNumber) => &["TRACK"],
-            (MetadataPersistenceBackend::LoftyApe, Self::DiscNumber) => &["DISC"],
+            (MetadataPersistenceBackend::NativeWavPackApe, Self::TrackNumber)
+            | (MetadataPersistenceBackend::LoftyApe, Self::TrackNumber) => &["TRACK"],
+            (MetadataPersistenceBackend::NativeWavPackApe, Self::DiscNumber)
+            | (MetadataPersistenceBackend::LoftyApe, Self::DiscNumber) => &["DISC"],
             (MetadataPersistenceBackend::LoftyMp4Ilst, Self::TrackNumber) => &["TRKN"],
             (MetadataPersistenceBackend::LoftyMp4Ilst, Self::DiscNumber) => &["DISK"],
             _ => &[],
@@ -433,6 +454,7 @@ pub fn normalize_numbering_item_key_for_backend(
     if !matches!(
         backend,
         MetadataPersistenceBackend::LoftyId3v2
+            | MetadataPersistenceBackend::NativeWavPackApe
             | MetadataPersistenceBackend::LoftyApe
             | MetadataPersistenceBackend::LoftyMp4Ilst
     ) {
@@ -463,11 +485,12 @@ pub(crate) fn normalized_typed_lofty_changes(
     if !matches!(
         backend,
         MetadataPersistenceBackend::LoftyId3v2
+            | MetadataPersistenceBackend::NativeWavPackApe
             | MetadataPersistenceBackend::LoftyApe
             | MetadataPersistenceBackend::LoftyMp4Ilst
     ) {
         return Err(format!(
-            "{} is not a typed Lofty metadata backend",
+            "{} is not a typed metadata backend",
             backend.label()
         ));
     }
@@ -653,6 +676,12 @@ pub fn metadata_backend_for_path(path: &Path) -> Result<MetadataPersistenceBacke
             Ok(MetadataPersistenceBackend::NativeFlacVorbis)
         }
         MetadataPersistenceRoute::NativeDsfId3 => Ok(MetadataPersistenceBackend::NativeDsfId3),
+        MetadataPersistenceRoute::WavPackApeDispatch => {
+            Ok(MetadataPersistenceBackend::NativeWavPackApe)
+        }
+        MetadataPersistenceRoute::ReadOnlyApeFamily => {
+            Ok(MetadataPersistenceBackend::ReadOnlyApeFamily)
+        }
         MetadataPersistenceRoute::UnsupportedDff => {
             Ok(MetadataPersistenceBackend::UnsupportedDff)
         }
@@ -791,6 +820,7 @@ mod tests {
         }
         for backend in [
             MetadataPersistenceBackend::NativeDsfId3,
+            MetadataPersistenceBackend::NativeWavPackApe,
             MetadataPersistenceBackend::LoftyId3v2,
             MetadataPersistenceBackend::LoftyApe,
             MetadataPersistenceBackend::LoftyMp4Ilst,
@@ -802,6 +832,7 @@ mod tests {
             );
         }
         for backend in [
+            MetadataPersistenceBackend::ReadOnlyApeFamily,
             MetadataPersistenceBackend::UnsupportedDff,
             MetadataPersistenceBackend::UnclassifiedLofty,
         ] {
@@ -827,6 +858,7 @@ mod tests {
 
         for backend in [
             MetadataPersistenceBackend::NativeDsfId3,
+            MetadataPersistenceBackend::NativeWavPackApe,
             MetadataPersistenceBackend::LoftyId3v2,
             MetadataPersistenceBackend::LoftyApe,
             MetadataPersistenceBackend::LoftyMp4Ilst,
@@ -1127,6 +1159,7 @@ mod tests {
     fn typed_lofty_backends_normalize_synthetic_numbering_keys() {
         for backend in [
             MetadataPersistenceBackend::LoftyId3v2,
+            MetadataPersistenceBackend::NativeWavPackApe,
             MetadataPersistenceBackend::LoftyApe,
             MetadataPersistenceBackend::LoftyMp4Ilst,
         ] {
@@ -1348,6 +1381,18 @@ mod tests {
         assert_eq!(
             metadata_persistence_route_for_path(Path::new("track.DSF")),
             MetadataPersistenceRoute::NativeDsfId3
+        );
+        assert_eq!(
+            metadata_persistence_route_for_path(Path::new("track.WV")),
+            MetadataPersistenceRoute::WavPackApeDispatch
+        );
+        assert_eq!(
+            metadata_persistence_route_for_path(Path::new("track.ape")),
+            MetadataPersistenceRoute::ReadOnlyApeFamily
+        );
+        assert_eq!(
+            metadata_persistence_route_for_path(Path::new("track.MPC")),
+            MetadataPersistenceRoute::ReadOnlyApeFamily
         );
         assert_eq!(
             metadata_persistence_route_for_path(Path::new("track.dff")),

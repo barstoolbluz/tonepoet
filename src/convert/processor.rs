@@ -1194,7 +1194,7 @@ fn mark_queued_album_batch_as_ordering_unavailable(
     }
 }
 
-fn strict_track_number_from_dispatch_path(path: &Path) -> Option<u32> {
+pub(crate) fn strict_track_number_from_dispatch_path(path: &Path) -> Option<u32> {
     let stem = path.file_stem()?.to_str()?.trim();
     let mut digits = String::new();
     let mut chars = stem.char_indices().peekable();
@@ -1216,7 +1216,7 @@ fn strict_track_number_from_dispatch_path(path: &Path) -> Option<u32> {
     digits.parse::<u32>().ok().filter(|value| *value > 0)
 }
 
-fn has_strict_track_prefix_separator(rest: &str) -> bool {
+pub(crate) fn has_strict_track_prefix_separator(rest: &str) -> bool {
     if rest.is_empty() {
         return true;
     }

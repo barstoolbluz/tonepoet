@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 static TEXT_INPUT_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
+static TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK: OnceLock<fn(&str)> = OnceLock::new();
 
 thread_local! {
     /// Optional thread-scoped clipboard used by tests that need an atomic
     /// setup/dispatch/assertion sequence without contending on process-global
     /// clipboard state. Production callers never install an override.
     static SCOPED_TEXT_INPUT_CLIPBOARD: RefCell<Option<String>> = RefCell::new(None);
+    static SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK: RefCell<Option<Box<dyn Fn(&str)>>> = RefCell::new(None);
 }
 
 fn shared_text_input_clipboard() -> &'static Mutex<String> {
@@ -32,13 +34,34 @@ pub fn write_shared_text_clipboard(text: impl Into<String>) {
             false
         }
     });
-    if handled_scoped {
-        return;
+    if !handled_scoped {
+        let mut clipboard = shared_text_input_clipboard()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *clipboard = text.clone();
     }
-    let mut clipboard = shared_text_input_clipboard()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *clipboard = text;
+
+    let handled_scoped_hook = SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.with(|hook| {
+        let hook = hook.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(&text);
+            true
+        } else {
+            false
+        }
+    });
+    if !handled_scoped && !handled_scoped_hook {
+        if let Some(hook) = TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.get() {
+            hook(&text);
+        }
+    }
+}
+
+/// Install the host's best-effort system-clipboard publisher. The first
+/// installation wins for the process lifetime; repeated startup calls are
+/// harmless and cannot replace an established authority.
+pub fn set_shared_clipboard_publish_hook(hook: fn(&str)) -> bool {
+    TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.set(hook).is_ok()
 }
 
 /// Read an exact snapshot of the process-wide text clipboard.
@@ -72,6 +95,31 @@ pub fn with_scoped_shared_text_clipboard<R>(
 
     let previous = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
         scoped.replace(Some(initial.into()))
+    });
+    let _restore = Restore(previous);
+    f()
+}
+
+/// Run a closure with a thread-scoped publication hook. This is a deterministic
+/// test seam for copy/cut paths and never changes the process-global hook.
+#[doc(hidden)]
+pub fn with_scoped_shared_text_clipboard_publish_hook<R>(
+    hook: impl Fn(&str) + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Box<dyn Fn(&str)>>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.with(|hook| {
+                *hook.borrow_mut() = previous;
+            });
+        }
+    }
+
+    let previous = SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.with(|slot| {
+        slot.borrow_mut().replace(Box::new(hook))
     });
     let _restore = Restore(previous);
     f()
@@ -1757,6 +1805,33 @@ mod tests {
             write_shared_text_clipboard(payload);
             assert_eq!(read_shared_text_clipboard(), payload);
         });
+    }
+
+    #[test]
+    fn text_input_copy_and_cut_publish_through_the_shared_hook() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let published = Rc::new(RefCell::new(Vec::<String>::new()));
+        let hook_published = Rc::clone(&published);
+        with_scoped_shared_text_clipboard("", || {
+            with_scoped_shared_text_clipboard_publish_hook(
+                move |text| hook_published.borrow_mut().push(text.to_string()),
+                || {
+                    let mut input = TextInputState::new_selected("path/to/album".to_string());
+                    assert!(input.copy_selection());
+                    assert_eq!(read_shared_text_clipboard(), "path/to/album");
+
+                    input.select_all_text();
+                    assert!(input.cut_selection());
+                    assert!(input.text.is_empty());
+                },
+            );
+        });
+        assert_eq!(
+            published.borrow().as_slice(),
+            &["path/to/album".to_string(), "path/to/album".to_string()]
+        );
     }
 
     #[test]

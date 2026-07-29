@@ -528,7 +528,7 @@ fn log_line_track_number(line: &str) -> Option<u32> {
     None
 }
 
-fn leading_track_number(audio_path: &Path) -> Option<u32> {
+pub(crate) fn leading_track_number(audio_path: &Path) -> Option<u32> {
     let stem = audio_path.file_stem()?.to_str()?.trim_start();
     let digit_count = stem.chars().take_while(|c| c.is_ascii_digit()).count();
 

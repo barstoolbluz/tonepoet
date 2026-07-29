@@ -1,7 +1,7 @@
 use crate::state::{
     DeleteConfirmButton, FilePickerAction, FilePickerContextMenuKind, FilePickerCreateKind,
     FilePickerError, FilePickerFocus, FilePickerHitAction, FilePickerMenuAction,
-    FilePickerMenuEntry, FilePickerSortKey, FilePickerState, FilePickerSubmenuEntry,
+    FilePickerMenuEntry, FilePickerSelectionMode, FilePickerSortKey, FilePickerState, FilePickerSubmenuEntry,
     FilePickerSubmenuKind, LastClick, LastTextClick, PickerTextTarget,
     TextPointerSession, ToolbarAction,
 };
@@ -484,11 +484,18 @@ impl FilePickerState {
     fn handle_file_key(&mut self, key: KeyEvent) -> FilePickerAction {
         let rows = self.file_visible_rows();
         match key.code {
+            // Visual-mode precedence is intentional: Space commits the range
+            // without also toggling/advancing, and Esc exits visual mode
+            // without clearing the pre-existing persistent mark set.
+            KeyCode::Esc if self.cancel_visual_range() => FilePickerAction::None,
             KeyCode::Esc if !self.multi_selected.is_empty() => {
                 self.deselect_all();
                 FilePickerAction::None
             }
-            KeyCode::Esc => FilePickerAction::Cancelled,
+            KeyCode::Esc => {
+                self.range_anchor = None;
+                FilePickerAction::Cancelled
+            }
             KeyCode::Left if key.modifiers == KeyModifiers::ALT => {
                 self.go_back();
                 FilePickerAction::None
@@ -535,33 +542,91 @@ impl FilePickerState {
                 self.toggle_current_multi_selection();
                 FilePickerAction::None
             }
-            KeyCode::Up => {
+            KeyCode::Char('v') if key.modifiers.is_empty() => {
+                self.begin_or_commit_visual_range();
+                FilePickerAction::None
+            }
+            KeyCode::Char(' ') if key.modifiers.is_empty() && self.visual_range.is_some() => {
+                self.commit_visual_range();
+                FilePickerAction::None
+            }
+            KeyCode::Up
+                if self.visual_range.is_some()
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+            {
                 self.move_file_cursor(-1, rows);
                 FilePickerAction::None
             }
-            KeyCode::Down => {
+            KeyCode::Down
+                if self.visual_range.is_some()
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+            {
                 self.move_file_cursor(1, rows);
                 FilePickerAction::None
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp if self.visual_range.is_some() && key.modifiers.is_empty() => {
                 self.move_file_cursor(-(rows as isize), rows);
                 FilePickerAction::None
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown if self.visual_range.is_some() && key.modifiers.is_empty() => {
                 self.move_file_cursor(rows as isize, rows);
                 FilePickerAction::None
             }
-            KeyCode::Home => {
+            KeyCode::Home if self.visual_range.is_some() && key.modifiers.is_empty() => {
                 self.set_file_cursor(0, rows);
                 FilePickerAction::None
             }
-            KeyCode::End => {
+            KeyCode::End if self.visual_range.is_some() && key.modifiers.is_empty() => {
                 let last = self.entries.len().saturating_sub(1);
                 self.set_file_cursor(last, rows);
                 FilePickerAction::None
             }
+            KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
+                self.extend_range_with_cursor_move(-1, rows);
+                FilePickerAction::None
+            }
+            KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
+                self.extend_range_with_cursor_move(1, rows);
+                FilePickerAction::None
+            }
+            KeyCode::Up if key.modifiers.is_empty() => {
+                self.move_file_cursor(-1, rows);
+                FilePickerAction::None
+            }
+            KeyCode::Down if key.modifiers.is_empty() => {
+                self.move_file_cursor(1, rows);
+                FilePickerAction::None
+            }
+            KeyCode::PageUp if key.modifiers.is_empty() => {
+                self.move_file_cursor(-(rows as isize), rows);
+                FilePickerAction::None
+            }
+            KeyCode::PageDown if key.modifiers.is_empty() => {
+                self.move_file_cursor(rows as isize, rows);
+                FilePickerAction::None
+            }
+            KeyCode::Home if key.modifiers.is_empty() => {
+                self.set_file_cursor(0, rows);
+                FilePickerAction::None
+            }
+            KeyCode::End if key.modifiers.is_empty() => {
+                let last = self.entries.len().saturating_sub(1);
+                self.set_file_cursor(last, rows);
+                FilePickerAction::None
+            }
+            // Must precede the deliberately unguarded plain-Enter arm.
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.accept_current_selection()
+            }
             KeyCode::Enter => self.open_or_select_current(),
-            KeyCode::Char(' ') => self.accept_current_selection(),
+            KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                if self.selection_mode == FilePickerSelectionMode::Directories {
+                    self.accept_current_selection()
+                } else {
+                    self.toggle_current_multi_selection_and_advance(rows);
+                    FilePickerAction::None
+                }
+            }
             KeyCode::Char('o') if key.modifiers == KeyModifiers::ALT => {
                 self.open_menu();
                 FilePickerAction::None
@@ -873,12 +938,27 @@ impl FilePickerState {
             FilePickerHitAction::FileRow(index) => {
                 self.focus = FilePickerFocus::Files;
                 self.tree_focused = false;
+                let pre_click_cursor = self.current_selection().map(|entry| entry.path.clone());
+                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+                    self.visual_range = None;
+                    if self.range_anchor.is_none() {
+                        self.range_anchor = pre_click_cursor;
+                    }
+                    self.mark_range_to_index(index);
+                    self.set_file_cursor(index, self.file_visible_rows());
+                    // classify_click recorded this press before dispatch. A
+                    // range gesture is never the first half of a double click.
+                    self.last_click = None;
+                    return FilePickerAction::None;
+                }
                 self.set_file_cursor(index, self.file_visible_rows());
                 if modifiers.contains(KeyModifiers::CONTROL) {
                     self.last_click = None;
                     self.toggle_current_multi_selection();
                     return FilePickerAction::None;
                 }
+                self.visual_range = None;
+                self.range_anchor = self.current_selection().map(|entry| entry.path.clone());
                 if is_double_click {
                     self.last_click = None;
                     self.open_or_select_current()
@@ -2024,6 +2104,102 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
             FilePickerAction::Selected(temp.path().to_path_buf())
         );
+    }
+
+    #[test]
+    fn space_marks_and_advances_while_alt_enter_confirms_many() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        fs::write(&first, b"one").expect("first");
+        fs::write(&second, b"two").expect("second");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::FilesOrDirectories,
+            ..FilePickerConfig::default()
+        });
+        let first_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == first)
+            .expect("first visible");
+        let second_index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == second)
+            .expect("second visible");
+        picker.set_file_cursor(first_index, 4);
+
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            FilePickerAction::None
+        );
+        assert!(picker.is_path_multi_selected(&first));
+        assert_eq!(picker.file_cursor, second_index);
+        assert_eq!(picker.range_anchor.as_deref(), Some(first.as_path()));
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            FilePickerAction::SelectedMany(vec![first])
+        );
+    }
+
+    #[test]
+    fn visual_range_commit_is_additive_and_does_not_toggle_or_advance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 1..=4 {
+            fs::write(temp.path().join(format!("{index:02}.flac")), b"audio")
+                .expect("fixture");
+        }
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.set_file_cursor(0, 4);
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            FilePickerAction::None
+        );
+        let persistent = picker.entries()[0].path.clone();
+        picker.set_file_cursor(1, 4);
+
+        picker.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let committed_cursor = picker.file_cursor;
+        picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert!(picker.visual_range.is_none());
+        assert_eq!(picker.file_cursor, committed_cursor);
+        assert!(picker.is_path_multi_selected(&persistent));
+        assert!(picker.is_path_multi_selected(&picker.entries()[1].path));
+        assert!(picker.is_path_multi_selected(&picker.entries()[2].path));
+        assert!(!picker.is_path_multi_selected(&picker.entries()[3].path));
+    }
+
+    #[test]
+    fn alt_click_ranges_from_stable_anchor_and_clears_double_click_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 1..=5 {
+            fs::write(temp.path().join(format!("{index:02}.flac")), b"audio")
+                .expect("fixture");
+        }
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.set_file_cursor(1, 5);
+        picker.apply_click_action(FilePickerHitAction::FileRow(1), KeyModifiers::NONE);
+        let anchor = picker.entries()[1].path.clone();
+
+        picker.apply_click_action(FilePickerHitAction::FileRow(3), KeyModifiers::ALT);
+        assert_eq!(picker.range_anchor.as_deref(), Some(anchor.as_path()));
+        assert!(picker.last_click.is_none());
+        for index in 1..=3 {
+            assert!(picker.is_path_multi_selected(&picker.entries()[index].path));
+        }
+
+        picker.apply_click_action(FilePickerHitAction::FileRow(4), KeyModifiers::ALT);
+        assert_eq!(picker.range_anchor.as_deref(), Some(anchor.as_path()));
+        assert!(picker.is_path_multi_selected(&picker.entries()[4].path));
     }
 
     #[test]

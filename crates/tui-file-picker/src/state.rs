@@ -9,7 +9,7 @@ use crate::tree::{filesystem_root, refresh_tree_children};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -291,6 +291,11 @@ pub struct HitRegion {
 pub(crate) struct ToolbarButtonGeometry {
     pub action: ToolbarAction,
     pub rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisualRangeSelection {
+    pub anchor: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1008,6 +1013,9 @@ pub struct FilePickerState {
     pub(crate) tree_scroll: usize,
     pub(crate) tree_focused: bool,
     pub(crate) entries: Vec<FilePickerEntry>,
+    /// Exact visible-entry lookup rebuilt with each refresh. Range highlighting
+    /// is therefore O(1) per rendered row and performs no filesystem I/O.
+    pub(crate) visible_path_indices: HashMap<PathBuf, usize>,
     pub(crate) file_cursor: usize,
     pub(crate) file_scroll: usize,
     pub(crate) file_table_state: TableState,
@@ -1024,9 +1032,25 @@ pub struct FilePickerState {
     pub(crate) context_menu_anchor: Option<(u16, u16)>,
     pub(crate) selected: Option<PathBuf>,
     pub(crate) multi_selected: Vec<PathBuf>,
+    /// Hash-backed membership for `multi_selected`. The vector remains only as
+    /// a compact compatibility/order cache; all membership and range insertion
+    /// decisions use this set. Deterministic emission is derived from the
+    /// visible-entry order, never the vector order.
+    pub(crate) multi_selected_lookup: HashSet<PathBuf>,
+    /// Stable origin for additive range gestures. This is deliberately
+    /// independent of pointer/double-click state because every key event
+    /// clears the latter.
+    pub(crate) range_anchor: Option<PathBuf>,
+    /// Pending keyboard visual range. The persistent mark set is not mutated
+    /// until the user commits with `v`, Space, or explicit confirmation.
+    pub(crate) visual_range: Option<VisualRangeSelection>,
     /// Directory marks discarded by the most recent explicit confirmation.
     /// Hosts can surface this without widening `SelectedMany`.
     pub(crate) last_selection_ignored_directories: usize,
+    /// Marks pruned because a refresh/filter/hidden change made them
+    /// invisible. Kept as a one-shot disclosure so no selection disappears
+    /// silently.
+    pub(crate) last_selection_dropped_invisible: usize,
     pub(crate) title: String,
     pub(crate) theme: FilePickerTheme,
     pub(crate) focus: FilePickerFocus,
@@ -1090,6 +1114,7 @@ impl FilePickerState {
             tree_scroll: 0,
             tree_focused: false,
             entries: Vec::new(),
+            visible_path_indices: HashMap::new(),
             file_cursor: 0,
             file_scroll: 0,
             file_table_state: TableState::default(),
@@ -1106,7 +1131,11 @@ impl FilePickerState {
             context_menu_anchor: None,
             selected: None,
             multi_selected: Vec::new(),
+            multi_selected_lookup: HashSet::new(),
+            range_anchor: None,
+            visual_range: None,
             last_selection_ignored_directories: 0,
+            last_selection_dropped_invisible: 0,
             title: config.title,
             theme: config.theme,
             focus: FilePickerFocus::Files,
@@ -1200,7 +1229,177 @@ impl FilePickerState {
     }
 
     pub fn is_path_multi_selected(&self, path: &Path) -> bool {
-        self.multi_selected.iter().any(|candidate| same_path(candidate, path))
+        self.multi_selected_lookup.contains(path) || self.is_path_in_visual_range(path)
+    }
+
+    pub(crate) fn replace_multi_selected<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.multi_selected.clear();
+        self.multi_selected_lookup.clear();
+        for path in paths {
+            if self.multi_selected_lookup.insert(path.clone()) {
+                self.multi_selected.push(path);
+            }
+        }
+    }
+
+    fn mark_path(&mut self, path: PathBuf) -> bool {
+        if !self.multi_selected_lookup.insert(path.clone()) {
+            return false;
+        }
+        self.multi_selected.push(path);
+        true
+    }
+
+    fn unmark_path(&mut self, path: &Path) -> bool {
+        if !self.multi_selected_lookup.remove(path) {
+            return false;
+        }
+        self.multi_selected.retain(|candidate| candidate != path);
+        true
+    }
+
+    fn clear_multi_selected(&mut self) {
+        self.multi_selected.clear();
+        self.multi_selected_lookup.clear();
+    }
+
+    fn retain_multi_selected(&mut self, mut keep: impl FnMut(&Path) -> bool) {
+        self.multi_selected.retain(|path| keep(path));
+        self.multi_selected_lookup = self.multi_selected.iter().cloned().collect();
+        debug_assert_eq!(self.multi_selected_lookup.len(), self.multi_selected.len());
+    }
+
+    fn is_path_in_visual_range(&self, path: &Path) -> bool {
+        let Some(visual) = self.visual_range.as_ref() else {
+            return false;
+        };
+        let (Some(anchor_index), Some(path_index)) =
+            (self.visible_index_of(&visual.anchor), self.visible_index_of(path))
+        else {
+            return false;
+        };
+        let (start, end) = if anchor_index <= self.file_cursor {
+            (anchor_index, self.file_cursor)
+        } else {
+            (self.file_cursor, anchor_index)
+        };
+        (start..=end).contains(&path_index)
+    }
+
+    pub(crate) fn effective_selected_count(&self) -> usize {
+        let Some(visual) = self.visual_range.as_ref() else {
+            return self.multi_selected_lookup.len();
+        };
+        let Some(anchor_index) = self.visible_index_of(&visual.anchor) else {
+            return self.multi_selected_lookup.len();
+        };
+        let endpoint_index = self.file_cursor.min(self.entries.len().saturating_sub(1));
+        let (start, end) = if anchor_index <= endpoint_index {
+            (anchor_index, endpoint_index)
+        } else {
+            (endpoint_index, anchor_index)
+        };
+        self.multi_selected_lookup.len()
+            + self.entries[start..=end]
+                .iter()
+                .filter(|entry| !self.multi_selected_lookup.contains(&entry.path))
+                .count()
+    }
+
+    fn visible_index_of(&self, path: &Path) -> Option<usize> {
+        self.visible_path_indices.get(path).copied()
+    }
+
+    fn range_paths_between(&self, anchor: &Path, endpoint_index: usize) -> Vec<PathBuf> {
+        let Some(anchor_index) = self.visible_index_of(anchor) else {
+            return Vec::new();
+        };
+        let endpoint_index = endpoint_index.min(self.entries.len().saturating_sub(1));
+        let (start, end) = if anchor_index <= endpoint_index {
+            (anchor_index, endpoint_index)
+        } else {
+            (endpoint_index, anchor_index)
+        };
+        self.entries[start..=end]
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn visual_range_paths(&self) -> Vec<PathBuf> {
+        let Some(visual) = self.visual_range.as_ref() else {
+            return Vec::new();
+        };
+        self.range_paths_between(&visual.anchor, self.file_cursor)
+    }
+
+    pub(crate) fn begin_or_commit_visual_range(&mut self) -> bool {
+        if self.visual_range.is_some() {
+            self.commit_visual_range();
+            return true;
+        }
+        let Some(anchor) = self.current_selection().map(|entry| entry.path.clone()) else {
+            return false;
+        };
+        self.range_anchor = Some(anchor.clone());
+        self.visual_range = Some(VisualRangeSelection { anchor });
+        true
+    }
+
+    pub(crate) fn commit_visual_range(&mut self) -> bool {
+        if self.visual_range.is_none() {
+            return false;
+        }
+        let paths = self.visual_range_paths();
+        for path in paths {
+            self.mark_path(path);
+        }
+        self.visual_range = None;
+        true
+    }
+
+    pub(crate) fn cancel_visual_range(&mut self) -> bool {
+        let cancelled = self.visual_range.take().is_some();
+        if cancelled {
+            self.range_anchor = None;
+        }
+        cancelled
+    }
+
+    pub(crate) fn mark_range_to_index(&mut self, endpoint_index: usize) -> bool {
+        let fallback_anchor = self.current_selection().map(|entry| entry.path.clone());
+        let Some(anchor) = self.range_anchor.clone().or(fallback_anchor) else {
+            return false;
+        };
+        if self.range_anchor.is_none() {
+            self.range_anchor = Some(anchor.clone());
+        }
+        let paths = self.range_paths_between(&anchor, endpoint_index);
+        if paths.is_empty() {
+            return false;
+        }
+        for path in paths {
+            self.mark_path(path);
+        }
+        true
+    }
+
+    pub(crate) fn extend_range_with_cursor_move(
+        &mut self,
+        delta: isize,
+        visible_rows: usize,
+    ) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        if self.range_anchor.is_none() {
+            self.range_anchor = self.current_selection().map(|entry| entry.path.clone());
+        }
+        self.move_file_cursor(delta, visible_rows);
+        self.mark_range_to_index(self.file_cursor)
     }
 
     /// Number of directory marks filtered by the most recent explicit
@@ -1217,19 +1416,47 @@ impl FilePickerState {
         std::mem::take(&mut self.last_selection_ignored_directories)
     }
 
-    /// Return marked files in the same sorted order as the visible file pane,
-    /// plus the number of marked directories that were intentionally ignored.
-    /// This makes completion deterministic regardless of marking gesture.
-    pub(crate) fn marked_files_in_visible_order(&self) -> (Vec<PathBuf>, usize) {
-        let mut files = Vec::new();
-        let mut ignored_directories = 0usize;
+    pub fn last_selection_dropped_invisible(&self) -> usize {
+        self.last_selection_dropped_invisible
+    }
+
+    pub fn take_last_selection_dropped_invisible(&mut self) -> usize {
+        std::mem::take(&mut self.last_selection_dropped_invisible)
+    }
+
+    fn marked_visible_counts_with(
+        &self,
+        mut is_marked: impl FnMut(&Path) -> bool,
+    ) -> (usize, usize) {
+        let mut files = 0usize;
+        let mut directories = 0usize;
         for entry in &self.entries {
-            if !self.is_path_multi_selected(&entry.path) {
+            if !is_marked(&entry.path) {
                 continue;
             }
             if entry.is_dir {
-                ignored_directories = ignored_directories.saturating_add(1);
+                directories = directories.saturating_add(1);
             } else {
+                files = files.saturating_add(1);
+            }
+        }
+        (files, directories)
+    }
+
+    fn marked_visible_counts(&self) -> (usize, usize) {
+        self.marked_visible_counts_with(|path| self.multi_selected_lookup.contains(path))
+    }
+
+    /// Return marked files in the same sorted order as the visible file pane,
+    /// plus the number of marked directories that were intentionally ignored.
+    /// This makes completion deterministic regardless of marking gesture. Path
+    /// allocation is intentionally confined to explicit confirmation; render-
+    /// time labels use `marked_visible_counts` and allocate no selected paths.
+    pub(crate) fn marked_files_in_visible_order(&self) -> (Vec<PathBuf>, usize) {
+        let (file_count, ignored_directories) = self.marked_visible_counts();
+        let mut files = Vec::with_capacity(file_count);
+        for entry in &self.entries {
+            if !entry.is_dir && self.multi_selected_lookup.contains(&entry.path) {
                 files.push(entry.path.clone());
             }
         }
@@ -1241,12 +1468,12 @@ impl FilePickerState {
         if self.selection_mode == FilePickerSelectionMode::Directories {
             return Some("Select Folder".to_string());
         }
-        let (marked_files, _) = self.marked_files_in_visible_order();
-        if !marked_files.is_empty() {
+        let (marked_file_count, _) = self.marked_visible_counts();
+        if marked_file_count > 0 {
             return Some(format!(
                 "Select {} File{}",
-                marked_files.len(),
-                if marked_files.len() == 1 { "" } else { "s" }
+                marked_file_count,
+                if marked_file_count == 1 { "" } else { "s" }
             ));
         }
         let entry = self.current_selection()?;
@@ -1262,34 +1489,52 @@ impl FilePickerState {
         let Some(path) = self.current_selection().map(|entry| entry.path.clone()) else {
             return false;
         };
-        if let Some(index) = self
-            .multi_selected
-            .iter()
-            .position(|candidate| same_path(candidate, &path))
-        {
-            self.multi_selected.remove(index);
-        } else {
-            self.multi_selected.push(path);
+        self.visual_range = None;
+        self.range_anchor = Some(path.clone());
+        if !self.unmark_path(&path) {
+            self.mark_path(path);
+        }
+        true
+    }
+
+    pub(crate) fn toggle_current_multi_selection_and_advance(
+        &mut self,
+        visible_rows: usize,
+    ) -> bool {
+        if !self.toggle_current_multi_selection() {
+            return false;
+        }
+        if self.file_cursor + 1 < self.entries.len() {
+            self.move_file_cursor(1, visible_rows);
         }
         true
     }
 
     pub fn select_all_visible(&mut self) {
-        self.multi_selected = self.entries.iter().map(|entry| entry.path.clone()).collect();
+        self.visual_range = None;
+        self.range_anchor = None;
+        let paths = self.entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>();
+        self.replace_multi_selected(paths);
     }
 
     pub fn invert_visible_selection(&mut self) {
-        let selected: HashSet<PathBuf> = self.multi_selected.drain(..).collect();
-        self.multi_selected = self
+        self.visual_range = None;
+        self.range_anchor = None;
+        let selected = std::mem::take(&mut self.multi_selected_lookup);
+        self.multi_selected.clear();
+        let paths = self
             .entries
             .iter()
             .filter(|entry| !selected.contains(&entry.path))
             .map(|entry| entry.path.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        self.replace_multi_selected(paths);
     }
 
     pub fn deselect_all(&mut self) {
-        self.multi_selected.clear();
+        self.clear_multi_selected();
+        self.visual_range = None;
+        self.range_anchor = None;
     }
 
     pub(crate) fn action_paths(&self) -> Vec<PathBuf> {
@@ -1946,9 +2191,16 @@ impl FilePickerState {
             Ok(read_dir) => read_dir,
             Err(err) => {
                 self.set_error(io_error("read directory", &self.current_dir, err));
+                self.last_selection_dropped_invisible = self
+                    .last_selection_dropped_invisible
+                    .saturating_add(self.multi_selected.len());
+                self.clear_multi_selected();
+                self.range_anchor = None;
+                self.visual_range = None;
                 self.file_cursor = 0;
                 self.file_scroll = 0;
                 self.selected = None;
+                self.visible_path_indices.clear();
                 #[cfg(feature = "image-preview")]
                 self.clear_image_preview_load();
                 self.sync_address_from_current_dir();
@@ -1993,8 +2245,33 @@ impl FilePickerState {
         let reverse = self.sort_reverse;
         entries.sort_by(|a, b| compare_entries(a, b, sort_key, reverse));
         self.entries = entries;
+        self.visible_path_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.path.clone(), index))
+            .collect();
         let visible_paths: HashSet<PathBuf> = self.entries.iter().map(|entry| entry.path.clone()).collect();
-        self.multi_selected.retain(|path| visible_paths.contains(path));
+        let before = self.multi_selected.len();
+        self.retain_multi_selected(|path| visible_paths.contains(path));
+        let dropped = before.saturating_sub(self.multi_selected.len());
+        self.last_selection_dropped_invisible = self
+            .last_selection_dropped_invisible
+            .saturating_add(dropped);
+        if self
+            .range_anchor
+            .as_ref()
+            .is_some_and(|path| !visible_paths.contains(path))
+        {
+            self.range_anchor = None;
+        }
+        if self
+            .visual_range
+            .as_ref()
+            .is_some_and(|visual| !visible_paths.contains(&visual.anchor))
+        {
+            self.visual_range = None;
+        }
         if self.entries.is_empty() {
             self.file_cursor = 0;
             self.file_scroll = 0;
@@ -2017,6 +2294,8 @@ impl FilePickerState {
     /// unrecoverable if the post-commit metadata probe is temporarily denied.
     fn adopt_committed_current_dir(&mut self, dir: PathBuf) {
         self.current_dir = dir;
+        self.range_anchor = None;
+        self.visual_range = None;
         self.file_cursor = 0;
         self.file_scroll = 0;
         self.selected = None;
@@ -2045,6 +2324,8 @@ impl FilePickerState {
             self.history_forward.clear();
         }
         self.current_dir = dir;
+        self.range_anchor = None;
+        self.visual_range = None;
         self.file_cursor = 0;
         self.file_scroll = 0;
         self.selected = None;
@@ -2341,6 +2622,7 @@ impl FilePickerState {
     }
 
     pub fn accept_current_selection(&mut self) -> FilePickerAction {
+        self.commit_visual_range();
         self.last_selection_ignored_directories = 0;
         if self.selection_mode == FilePickerSelectionMode::Directories {
             return FilePickerAction::Selected(self.current_dir.clone());
@@ -2545,7 +2827,7 @@ impl FilePickerState {
         }
 
         let destinations = duplicate_files_in_place(&paths, self.operation_policy)?;
-        self.multi_selected = destinations.clone();
+        self.replace_multi_selected(destinations.iter().cloned());
         self.selected = destinations.last().cloned();
         self.refresh();
         if let Some(path) = self.selected.clone() {
@@ -3133,7 +3415,7 @@ impl FilePickerState {
             self.adopt_committed_current_dir(current);
         } else {
             self.refresh();
-            self.multi_selected = completed_destinations.clone();
+            self.replace_multi_selected(completed_destinations.iter().cloned());
             self.selected = completed_destinations.last().cloned();
             if let Some(path) = self.selected.clone() {
                 self.select_path_in_entries(&path);
@@ -3307,8 +3589,7 @@ impl FilePickerState {
             match delete_path(&path, self.operation_policy.delete) {
                 Ok(()) => {
                     self.pending_delete.remove(0);
-                    self.multi_selected
-                        .retain(|selected| !same_path(selected, &path));
+                    self.retain_multi_selected(|selected| !same_path(selected, &path));
                     if self
                         .selected
                         .as_ref()
@@ -3395,7 +3676,7 @@ impl FilePickerState {
         if destinations.is_empty() {
             return Ok(0);
         }
-        self.multi_selected = destinations.clone();
+        self.replace_multi_selected(destinations.iter().cloned());
         self.selected = destinations.last().cloned();
         self.refresh();
         if let Some(path) = self.selected.clone() {
@@ -9063,13 +9344,88 @@ mod tests {
 
         // Deliberately use gesture order opposite to visible sort order and
         // include a directory mark. Completion must be deterministic.
-        picker.multi_selected = vec![second.clone(), directory, first.clone()];
+        picker.replace_multi_selected(vec![second.clone(), directory, first.clone()]);
         assert_eq!(picker.selection_confirmation_label().as_deref(), Some("Select 2 Files"));
         assert_eq!(
             picker.accept_current_selection(),
             FilePickerAction::SelectedMany(vec![first, second])
         );
         assert_eq!(picker.last_selection_ignored_directories(), 1);
+    }
+
+    #[test]
+    fn refresh_discloses_each_marked_path_that_disappeared_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("01-first.flac");
+        let second = temp.path().join("02-second.flac");
+        fs::write(&first, b"first").expect("first");
+        fs::write(&second, b"second").expect("second");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.replace_multi_selected(vec![first.clone(), second.clone()]);
+
+        fs::remove_file(&second).expect("remove marked file");
+        picker.refresh();
+
+        assert_eq!(picker.multi_selected, vec![first]);
+        assert_eq!(picker.take_last_selection_dropped_invisible(), 1);
+        assert_eq!(picker.take_last_selection_dropped_invisible(), 0);
+    }
+
+    #[test]
+    fn large_range_selection_uses_one_membership_probe_per_visible_entry() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            selection_mode: FilePickerSelectionMode::Files,
+            ..FilePickerConfig::default()
+        });
+        const COUNT: usize = 20_000;
+        picker.entries = (0..COUNT)
+            .map(|index| FilePickerEntry {
+                name: format!("{index:05}.flac"),
+                path: temp.path().join(format!("{index:05}.flac")),
+                is_dir: false,
+                size: Some(1),
+                file_type: "FLAC".to_string(),
+                modified: None,
+            })
+            .collect();
+        picker.visible_path_indices = picker
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.path.clone(), index))
+            .collect();
+        picker.file_cursor = COUNT - 1;
+        picker.range_anchor = Some(picker.entries[0].path.clone());
+
+        assert!(picker.mark_range_to_index(COUNT - 1));
+        assert_eq!(picker.multi_selected_lookup.len(), COUNT);
+        assert_eq!(picker.multi_selected.len(), COUNT);
+        assert_eq!(picker.effective_selected_count(), COUNT);
+        assert_eq!(
+            picker.selection_confirmation_label().as_deref(),
+            Some("Select 20000 Files")
+        );
+
+        let probes = Cell::new(0usize);
+        let (marked_files, marked_directories) = picker.marked_visible_counts_with(|path| {
+            probes.set(probes.get().saturating_add(1));
+            picker.multi_selected_lookup.contains(path)
+        });
+        assert_eq!(probes.get(), COUNT, "visible mark counting must be one linear scan");
+        assert_eq!((marked_files, marked_directories), (COUNT, 0));
+
+        let (ordered, ignored_directories) = picker.marked_files_in_visible_order();
+        assert_eq!(ordered.len(), COUNT);
+        assert_eq!(ignored_directories, 0);
+        assert_eq!(ordered.first(), picker.entries.first().map(|entry| &entry.path));
+        assert_eq!(ordered.last(), picker.entries.last().map(|entry| &entry.path));
     }
 
     #[test]
@@ -9090,7 +9446,7 @@ mod tests {
             .position(|entry| entry.path == file)
             .expect("file visible");
         picker.set_file_cursor(file_index, 8);
-        picker.multi_selected = vec![directory];
+        picker.replace_multi_selected(vec![directory]);
 
         assert_eq!(picker.selection_confirmation_label().as_deref(), Some("Select File"));
         assert_eq!(picker.accept_current_selection(), FilePickerAction::Selected(file));
@@ -9124,7 +9480,7 @@ mod tests {
         assert_eq!(mixed.selection_confirmation_label().as_deref(), Some("Select Folder"));
         mixed.set_file_cursor(file_index, 8);
         assert_eq!(mixed.selection_confirmation_label().as_deref(), Some("Select File"));
-        mixed.multi_selected = vec![file.clone()];
+        mixed.replace_multi_selected(vec![file.clone()]);
         assert_eq!(mixed.selection_confirmation_label().as_deref(), Some("Select 1 File"));
 
         let mut files_only = FilePickerState::new(FilePickerConfig {

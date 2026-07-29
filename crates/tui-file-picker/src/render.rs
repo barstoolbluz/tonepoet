@@ -224,23 +224,30 @@ impl FilePickerState {
     }
 
     fn render_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let mut spans = Vec::new();
-        let mut x = area.x;
         let toolbar_right = area.x.saturating_add(area.width);
-        // Confirmation is purpose-critical and must survive the toolbar's
-        // hard clip at narrow embedded-picker widths. Place it before all
-        // overflow-prone file-management controls.
-        let mut buttons = Vec::new();
-        if let Some(label) = self.selection_confirmation_label() {
-            buttons.push((label, Some(ToolbarAction::AcceptSelection), false));
-            buttons.push(("│".to_string(), None, true));
-        }
-        buttons.extend([
+        let confirm = self.selection_confirmation_label().map(|label| {
+            let width = button_width(&label).min(area.width);
+            let x = toolbar_right.saturating_sub(width);
+            (label, Rect::new(x, area.y, width, 1))
+        });
+        let left_right = confirm
+            .as_ref()
+            .map(|(_, rect)| rect.x.saturating_sub(2))
+            .unwrap_or(toolbar_right)
+            .max(area.x);
+        let left_area = Rect::new(
+            area.x,
+            area.y,
+            left_right.saturating_sub(area.x),
+            area.height,
+        );
+
+        let mut buttons = vec![
             ("‹ Back".to_string(), Some(ToolbarAction::Back), self.history_back.is_empty()),
             ("› Forward".to_string(), Some(ToolbarAction::Forward), self.history_forward.is_empty()),
             ("↑ Up".to_string(), Some(ToolbarAction::Up), self.current_dir.parent().is_none()),
             ("│".to_string(), None, true),
-        ]);
+        ];
         if self.hide_extension.as_deref() == Some(".toml") {
             let no_selection = self.current_selection().is_none();
             buttons.push(("Rename".to_string(), Some(ToolbarAction::Rename), no_selection));
@@ -257,6 +264,10 @@ impl FilePickerState {
             buttons.push(("Properties".to_string(), Some(ToolbarAction::Properties), self.current_selection().is_none()));
             buttons.push(("Bookmarks".to_string(), Some(ToolbarAction::Bookmarks), false));
         }
+
+        let mut spans = Vec::new();
+        let mut x = left_area.x;
+        let left_limit = left_area.x.saturating_add(left_area.width);
         for (idx, (label, action, disabled)) in buttons.iter().enumerate() {
             if idx > 0 {
                 spans.push(Span::raw("  "));
@@ -267,6 +278,9 @@ impl FilePickerState {
                 let width = crate::display_width::width(label) as u16;
                 spans.push(Span::styled(label.clone(), self.theme.border_dim));
                 x = x.saturating_add(width);
+                if x >= left_limit {
+                    break;
+                }
                 continue;
             }
 
@@ -280,18 +294,27 @@ impl FilePickerState {
             };
             spans.push(button_span(label, style));
             let raw_rect = Rect::new(x, area.y, width, 1);
-            if let Some(visible_rect) = intersect_rect(raw_rect, area) {
+            if let Some(visible_rect) = intersect_rect(raw_rect, left_area) {
                 self.record_toolbar_button_geometry((*action).unwrap(), visible_rect);
                 if !*disabled {
                     self.record_hit_region(visible_rect, FilePickerHitAction::Toolbar((*action).unwrap()));
                 }
             }
             x = x.saturating_add(width);
-            if x >= toolbar_right {
+            if x >= left_limit {
                 break;
             }
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
+
+        if let Some((label, rect)) = confirm {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![button_span(&label, self.theme.button)])),
+                rect,
+            );
+            self.record_toolbar_button_geometry(ToolbarAction::AcceptSelection, rect);
+            self.record_hit_region(rect, FilePickerHitAction::Toolbar(ToolbarAction::AcceptSelection));
+        }
     }
 
     fn render_address(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1003,7 +1026,14 @@ impl FilePickerState {
         let count = self.entries.len();
         let total = format_size(self.visible_total_size());
         let error = self.status_error_message();
-        let selected_count = self.multi_selected.len();
+        // Preserve the disclosure while an error owns the center status, then
+        // consume it on the first frame where it can actually be seen.
+        let dropped_selection = if error.is_none() {
+            self.take_last_selection_dropped_invisible()
+        } else {
+            self.last_selection_dropped_invisible()
+        };
+        let selected_count = self.effective_selected_count();
         let left = if selected_count > 0 {
             format!(
                 "{count} {}; {selected_count} selected",
@@ -1012,19 +1042,37 @@ impl FilePickerState {
         } else {
             format!("{count} {}", pluralize(count, "item", "items"))
         };
-        let center = error.unwrap_or_else(|| format!("{total} visible"));
+        let center = error.unwrap_or_else(|| {
+            if dropped_selection > 0 {
+                format!(
+                    "{dropped_selection} marked file{} no longer visible were dropped",
+                    if dropped_selection == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("{total} visible")
+            }
+        });
         let free_space = match self.free_space_bytes {
             Some(bytes) => format!("{} free", format_size(bytes)),
             None => "free space unavailable".to_string(),
         };
-        let right = if self.operation_policy.allow_paste {
-            format!("Ctrl+V/P Paste | {free_space}")
+        let selection_hint = if self.selection_mode == FilePickerSelectionMode::Directories {
+            "Space Select Folder"
         } else {
-            free_space
+            "Space Mark  Alt+Enter Confirm"
+        };
+        let right = if self.operation_policy.allow_paste {
+            format!("{selection_hint} | Ctrl+V/P Paste | {free_space}")
+        } else {
+            format!("{selection_hint} | {free_space}")
         };
         let width = area.width as usize;
         let line = distribute_status(&left, &center, &right, width);
-        let style = if self.last_error.is_some() { self.theme.error } else { self.theme.status };
+        let style = if self.last_error.is_some() || dropped_selection > 0 {
+            self.theme.error
+        } else {
+            self.theme.status
+        };
         frame.render_widget(Paragraph::new(line).style(style), area);
     }
 
@@ -2170,9 +2218,8 @@ mod tests {
             }
         }
 
-        // Priority-placed confirm ("Select File") may push File operations
-        // past the hard clip at this width; the pin is that any visible
-        // geometry stays clipped, and the confirm itself survives.
+        // The right-reserved confirm may clip the tail of the left run at
+        // this width; every recorded rectangle must remain inside its budget.
         let confirm = picker
             .toolbar_button_rect(ToolbarAction::AcceptSelection)
             .expect("priority-placed confirm geometry");
@@ -2375,7 +2422,7 @@ mod tests {
             ..FilePickerConfig::default()
         });
         picker.selected = Some(file.clone());
-        picker.multi_selected = vec![file];
+        picker.replace_multi_selected(vec![file]);
         picker.context_menu_kind = FilePickerContextMenuKind::File;
         picker.context_menu_anchor = Some((30, 8));
         picker.menu_open = true;
@@ -2651,7 +2698,19 @@ mod tests {
 
         assert!(
             picker.toolbar_button_rect(ToolbarAction::AcceptSelection).is_some(),
-            "the explicit confirm must be placed before overflow-prone controls"
+            "the explicit confirm must reserve the toolbar's right edge"
+        );
+        let confirm = picker
+            .toolbar_button_rect(ToolbarAction::AcceptSelection)
+            .expect("confirm geometry");
+        let toolbar_right = 55;
+        assert_eq!(confirm.x.saturating_add(confirm.width), toolbar_right);
+        let file_ops = picker
+            .toolbar_button_rect(ToolbarAction::FileOperations)
+            .expect("File Operations remains partially visible");
+        assert!(
+            file_ops.width < button_width("File Operations ▾"),
+            "File Operations must be clipped before the reserved confirm"
         );
         assert!(format!("{:?}", terminal.backend().buffer()).contains("Select File"));
     }

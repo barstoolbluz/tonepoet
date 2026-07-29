@@ -7727,13 +7727,16 @@ fn draw_cue_preview(
 
     f.render_widget(Clear, popup);
 
-    let title_name = state
-        .write_path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| state.write_path.display().to_string());
+    let title = state.title_override.clone().unwrap_or_else(|| {
+        let title_name = state
+            .write_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| state.write_path.display().to_string());
+        format!("CUE preview · {title_name}")
+    });
 
-    let block = super::draw::solid_title_block(popup, format!(" CUE preview · {} ", title_name), theme.amber, theme);
+    let block = super::draw::solid_title_block(popup, format!(" {title} "), theme.amber, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 

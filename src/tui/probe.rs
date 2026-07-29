@@ -586,7 +586,6 @@ fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
 
 /// Read metadata tags from an audio file using lofty
 pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
-    use lofty::file::TaggedFileExt;
 
     // SACD ISOs aren't tagged files in lofty's sense — pull the
     // album-level fields out of the ScarletBook Master TOC + SACDText
@@ -599,6 +598,8 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
     if crate::dsf_tags::is_dsf(path) {
         return crate::dsf_tags::read(path).map(|snapshot| source_metadata_from_dsf(&snapshot));
     }
+
+    use lofty::file::TaggedFileExt;
 
     flac_metadata_writer::recover_before_read(path)?;
 
@@ -617,6 +618,7 @@ pub fn read_embedded_picture_bytes(
     path: &Path,
     picture_type: lofty::picture::PictureType,
 ) -> Result<Vec<u8>, String> {
+
     use lofty::file::TaggedFileExt;
 
     flac_metadata_writer::recover_before_read(path)?;
@@ -5600,7 +5602,13 @@ pub fn write_metadata_field_transactional_with_control_at_verification(
     let change = metadata_field_change(field, value)
         .map_err(|error| format!("write failed before mutation: {error}"))?;
     reject_unsupported_dff_metadata_write(path, "writing")?;
-    if uses_native_flac_metadata_journal(path) || crate::dsf_tags::is_dsf(path) {
+    if uses_native_flac_metadata_journal(path)
+        || crate::dsf_tags::is_dsf(path)
+        || matches!(
+            crate::metadata_persistence::metadata_persistence_route_for_path(path),
+            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
+        )
+    {
         return write_all_tags_with_cancel_report_classified_at_verification(
             path,
             &[change],
@@ -5639,7 +5647,16 @@ fn write_metadata_field_with_database(
     change: (lofty::tag::ItemKey, Option<String>),
 ) -> Result<(), String> {
     reject_unsupported_dff_metadata_write(path, "writing")?;
-    if crate::dsf_tags::is_dsf(path) {
+    if crate::dsf_tags::is_dsf(path)
+        || matches!(
+            crate::metadata_persistence::metadata_persistence_route_for_path(path),
+            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
+        )
+    {
+        // DSF and WavPack dispatch own their complete transaction authority.
+        // Do not wrap them in the legacy database transaction: malformed APE
+        // recovery uses its native atomic journal, while healthy WavPack uses
+        // the established Lofty transaction selected by the top-level writer.
         return write_all_tags(path, std::slice::from_ref(&change));
     }
     db.atomic_metadata_write(path, || {
@@ -7249,15 +7266,459 @@ fn source_metadata_from_tags(
     meta
 }
 
-fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEntry> {
-    use lofty::file::TaggedFileExt;
+const APE_SIGNATURE: &[u8; 8] = b"APETAGEX";
+const APE_DESCRIPTOR_LEN: usize = 32;
+const APE_VERSION_2: u32 = 2_000;
+const APE_FLAG_HEADER_PRESENT: u32 = 1 << 31;
+const APE_FLAG_IS_HEADER: u32 = 1 << 29;
+const APE_ITEM_READ_ONLY: u32 = 1;
+const APE_ITEM_TYPE_MASK: u32 = 0b110;
+const APE_ITEM_TYPE_TEXT: u32 = 0;
+const APE_ITEM_TYPE_BINARY: u32 = 0b010;
+const APE_ITEM_TYPE_LOCATOR: u32 = 0b100;
+const MAX_NATIVE_APE_TAG_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NATIVE_APE_ITEMS: u32 = 1_000_000;
 
-    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        Some(tag) => tag,
-        None => return Vec::new(),
+#[derive(Debug, Clone)]
+struct NativeApeItem {
+    raw: Vec<u8>,
+    key_bytes: Vec<u8>,
+    key: Option<String>,
+    flags: u32,
+    value: Vec<u8>,
+}
+
+impl NativeApeItem {
+    fn item_type(&self) -> u32 {
+        self.flags & APE_ITEM_TYPE_MASK
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.flags & APE_ITEM_READ_ONLY != 0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeApeTag {
+    replace_start: u64,
+    footer_end: u64,
+    had_header: bool,
+    items: Vec<NativeApeItem>,
+}
+
+#[derive(Debug)]
+struct NativeApeReadOutcome {
+    fields: Vec<CanonicalEditorTagField>,
+    metadata: SourceMetadata,
+    warning: Option<MetadataReadIssue>,
+}
+
+fn u32_le_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "truncated APEv2 integer field".to_string())?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn native_ape_error_is_eligible(err: &lofty::error::LoftyError) -> bool {
+    use lofty::error::ErrorKind;
+
+    matches!(
+        err.kind(),
+        ErrorKind::FileDecoding(decoding)
+            if decoding.format() == Some(lofty::file::FileType::Ape)
+    )
+}
+
+fn ape_key_is_valid(key: &[u8]) -> bool {
+    if !(2..=255).contains(&key.len()) || !key.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+        return false;
+    }
+    ![b"ID3".as_slice(), b"TAG".as_slice(), b"OGGS".as_slice(), b"MP+".as_slice()]
+        .iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved))
+}
+
+fn display_escaped_ape_key(key: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(key) {
+        let mut escaped = String::new();
+        for ch in text.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '\'' => escaped.push_str("\\'"),
+                ch if ch.is_control() => escaped.extend(ch.escape_default()),
+                ch => escaped.push(ch),
+            }
+        }
+        return escaped;
+    }
+
+    key.iter()
+        .map(|byte| format!("\\x{byte:02X}"))
+        .collect::<String>()
+}
+
+fn optional_id3v1_start(file: &mut std::fs::File, file_len: u64) -> Result<Option<u64>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if file_len < 128 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(file_len - 128))
+        .map_err(|error| format!("seek trailing ID3v1 probe: {error}"))?;
+    let mut signature = [0u8; 3];
+    file.read_exact(&mut signature)
+        .map_err(|error| format!("read trailing ID3v1 probe: {error}"))?;
+    Ok((&signature == b"TAG").then_some(file_len - 128))
+}
+
+fn read_native_ape_tag(path: &std::path::Path) -> Result<Option<NativeApeTag>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat '{}': {error}", path.display()))?
+        .len();
+    let footer_end = optional_id3v1_start(&mut file, file_len)?.unwrap_or(file_len);
+    if footer_end < APE_DESCRIPTOR_LEN as u64 {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(footer_end - APE_DESCRIPTOR_LEN as u64))
+        .map_err(|error| format!("seek APEv2 footer in '{}': {error}", path.display()))?;
+    let mut footer = [0u8; APE_DESCRIPTOR_LEN];
+    file.read_exact(&mut footer)
+        .map_err(|error| format!("read APEv2 footer in '{}': {error}", path.display()))?;
+    if &footer[..8] != APE_SIGNATURE {
+        return Ok(None);
+    }
+
+    let version = u32_le_at(&footer, 8)?;
+    if version != APE_VERSION_2 {
+        return Err(format!(
+            "unsupported APE tag version {version} in '{}'; native fallback accepts APEv2 only",
+            path.display()
+        ));
+    }
+    let tag_size = u64::from(u32_le_at(&footer, 12)?);
+    let item_count = u32_le_at(&footer, 16)?;
+    let footer_flags = u32_le_at(&footer, 20)?;
+    if tag_size < APE_DESCRIPTOR_LEN as u64
+        || tag_size > MAX_NATIVE_APE_TAG_BYTES
+        || tag_size > footer_end
+    {
+        return Err(format!(
+            "invalid APEv2 tag size {tag_size} in '{}'",
+            path.display()
+        ));
+    }
+    if item_count > MAX_NATIVE_APE_ITEMS {
+        return Err(format!(
+            "APEv2 item count {item_count} exceeds the native safety limit in '{}'",
+            path.display()
+        ));
+    }
+
+    let items_start = footer_end - tag_size;
+    let items_len = tag_size - APE_DESCRIPTOR_LEN as u64;
+    let had_header = footer_flags & APE_FLAG_HEADER_PRESENT != 0;
+    let replace_start = if had_header {
+        if items_start < APE_DESCRIPTOR_LEN as u64 {
+            return Err(format!("APEv2 header underflows file start in '{}'", path.display()));
+        }
+        let header_start = items_start - APE_DESCRIPTOR_LEN as u64;
+        file.seek(SeekFrom::Start(header_start))
+            .map_err(|error| format!("seek APEv2 header in '{}': {error}", path.display()))?;
+        let mut header = [0u8; APE_DESCRIPTOR_LEN];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read APEv2 header in '{}': {error}", path.display()))?;
+        if &header[..8] != APE_SIGNATURE
+            || u32_le_at(&header, 8)? != version
+            || u32_le_at(&header, 12)? != tag_size as u32
+            || u32_le_at(&header, 16)? != item_count
+            || u32_le_at(&header, 20)? & APE_FLAG_IS_HEADER == 0
+        {
+            return Err(format!(
+                "APEv2 footer claims a header but the matching header is absent or inconsistent in '{}'",
+                path.display()
+            ));
+        }
+        header_start
+    } else {
+        items_start
     };
 
-    let mut entries = canonical_editor_fields_from_tag(tag)
+    let items_len_usize = usize::try_from(items_len)
+        .map_err(|_| format!("APEv2 item region is too large in '{}'", path.display()))?;
+    file.seek(SeekFrom::Start(items_start))
+        .map_err(|error| format!("seek APEv2 items in '{}': {error}", path.display()))?;
+    let mut bytes = vec![0u8; items_len_usize];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read APEv2 items in '{}': {error}", path.display()))?;
+
+    let mut items = Vec::with_capacity(item_count as usize);
+    let mut cursor = 0usize;
+    for item_index in 0..item_count {
+        let item_start = cursor;
+        if cursor.checked_add(8).is_none_or(|end| end > bytes.len()) {
+            return Err(format!(
+                "truncated APEv2 item {item_index} header in '{}'",
+                path.display()
+            ));
+        }
+        let value_len = u32_le_at(&bytes, cursor)? as usize;
+        let flags = u32_le_at(&bytes, cursor + 4)?;
+        cursor += 8;
+        let key_end = bytes[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| cursor + offset)
+            .ok_or_else(|| {
+                format!(
+                    "unterminated APEv2 item {item_index} key in '{}'",
+                    path.display()
+                )
+            })?;
+        let key_bytes = bytes[cursor..key_end].to_vec();
+        cursor = key_end + 1;
+        let value_end = cursor.checked_add(value_len).ok_or_else(|| {
+            format!("APEv2 item {item_index} length overflow in '{}'", path.display())
+        })?;
+        if value_end > bytes.len() {
+            return Err(format!(
+                "truncated APEv2 item {item_index} value in '{}'",
+                path.display()
+            ));
+        }
+        let value = bytes[cursor..value_end].to_vec();
+        cursor = value_end;
+        let key = if ape_key_is_valid(&key_bytes) {
+            Some(String::from_utf8(key_bytes.clone()).map_err(|_| {
+                format!("ASCII APEv2 key decoded as invalid UTF-8 in '{}'", path.display())
+            })?)
+        } else {
+            None
+        };
+        items.push(NativeApeItem {
+            raw: bytes[item_start..cursor].to_vec(),
+            key_bytes,
+            key,
+            flags,
+            value,
+        });
+    }
+    if cursor != bytes.len() {
+        return Err(format!(
+            "APEv2 item count/size mismatch in '{}': {} unclaimed byte(s)",
+            path.display(),
+            bytes.len() - cursor
+        ));
+    }
+
+    Ok(Some(NativeApeTag {
+        replace_start,
+        footer_end,
+        had_header,
+        items,
+    }))
+}
+
+fn native_ape_canonical_key(raw_key: &str) -> String {
+    match raw_key.trim().to_ascii_uppercase().as_str() {
+        "TRACK" => "TRACKNUMBER".to_string(),
+        "DISK" | "DISC" => "DISCNUMBER".to_string(),
+        "ALBUM ARTIST" | "ALBUMARTIST" => "ALBUMARTIST".to_string(),
+        "YEAR" => "DATE".to_string(),
+        other => canonical_metadata_display_key(other),
+    }
+}
+
+fn native_ape_numbering_rows(
+    raw_key: &str,
+    value: &str,
+) -> Option<Vec<(String, lofty::tag::ItemKey, String)>> {
+    let normalized = raw_key.trim().to_ascii_uppercase();
+    let (number_key, total_key, number_item, total_item) = match normalized.as_str() {
+        "TRACK" => (
+            "TRACKNUMBER",
+            "TRACKTOTAL",
+            lofty::tag::ItemKey::TrackNumber,
+            lofty::tag::ItemKey::TrackTotal,
+        ),
+        "DISK" | "DISC" => (
+            "DISCNUMBER",
+            "DISCTOTAL",
+            lofty::tag::ItemKey::DiscNumber,
+            lofty::tag::ItemKey::DiscTotal,
+        ),
+        _ => return None,
+    };
+    let mut parts = value.split('/');
+    let number = parts.next().unwrap_or("").trim();
+    if number.parse::<u32>().is_err() {
+        return None;
+    }
+    let mut rows = vec![(number_key.to_string(), number_item, number.to_string())];
+    if let Some(total) = parts.next().map(str::trim).filter(|value| !value.is_empty()) {
+        if total.parse::<u32>().is_err() {
+            return None;
+        }
+        rows.push((total_key.to_string(), total_item, total.to_string()));
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(rows)
+}
+
+fn native_ape_fields(tag: &NativeApeTag, path: &std::path::Path) -> Result<Vec<CanonicalEditorTagField>, String> {
+    let mut fields = Vec::new();
+    let mut indexes = std::collections::HashMap::<String, usize>::new();
+    for item in tag.items.iter().filter(|item| item.key.is_some()) {
+        let key = item.key.as_deref().expect("filtered valid APE key");
+        let (value, is_binary) = match item.item_type() {
+            APE_ITEM_TYPE_TEXT | APE_ITEM_TYPE_LOCATOR => {
+                let value = std::str::from_utf8(&item.value).map_err(|_| {
+                    format!(
+                        "APEv2 item '{}' has invalid UTF-8 text in '{}'",
+                        key,
+                        path.display()
+                    )
+                })?;
+                (value.split('\0').collect::<Vec<_>>().join("; "), false)
+            }
+            APE_ITEM_TYPE_BINARY => (format!("<binary, {} bytes>", item.value.len()), true),
+            _ => {
+                return Err(format!(
+                    "APEv2 item '{}' has reserved value type in '{}'",
+                    key,
+                    path.display()
+                ));
+            }
+        };
+        if !is_binary {
+            if let Some(rows) = native_ape_numbering_rows(key, &value) {
+                for (display_key, item_key, row_value) in rows {
+                    merge_editor_field(
+                        &mut fields,
+                        &mut indexes,
+                        display_key,
+                        item_key,
+                        row_value,
+                        false,
+                    );
+                }
+                continue;
+            }
+        }
+        let display_key = native_ape_canonical_key(key);
+        let item_key = item_key_for_new_editor_row(&display_key);
+        merge_editor_field(
+            &mut fields,
+            &mut indexes,
+            display_key,
+            item_key,
+            value,
+            is_binary,
+        );
+    }
+    Ok(fields)
+}
+
+fn source_metadata_from_canonical_fields(fields: &[CanonicalEditorTagField]) -> SourceMetadata {
+    let value = |key: &str| {
+        fields
+            .iter()
+            .find(|field| field.display_key == key && !field.is_binary)
+            .map(|field| field.value.clone())
+    };
+    SourceMetadata {
+        title: value("TITLE"),
+        artist: value("ARTIST"),
+        album: value("ALBUM"),
+        genre: value("GENRE"),
+        year: value("DATE"),
+        tool: value("ENCODER").or_else(|| value("ENCODINGTOOL")),
+        track_number: value("TRACKNUMBER").and_then(|value| value.parse().ok()),
+        catalog_number: value("CATALOGNUMBER"),
+        rg_track_gain: value("REPLAYGAIN_TRACK_GAIN"),
+        rg_track_peak: value("REPLAYGAIN_TRACK_PEAK"),
+        rg_album_gain: value("REPLAYGAIN_ALBUM_GAIN"),
+        rg_album_peak: value("REPLAYGAIN_ALBUM_PEAK"),
+        r128_track_gain: value("R128_TRACK_GAIN").as_deref().and_then(r128_raw_to_db),
+        r128_album_gain: value("R128_ALBUM_GAIN").as_deref().and_then(r128_raw_to_db),
+        isrc: value("ISRC"),
+        ..SourceMetadata::default()
+    }
+}
+
+fn read_native_ape_fallback(path: &std::path::Path) -> Result<NativeApeReadOutcome, String> {
+    let tag = read_native_ape_tag(path)?.ok_or_else(|| {
+        format!(
+            "Lofty reported an APEv2 decoding failure for '{}', but no bounded trailing APEv2 footer was found",
+            path.display()
+        )
+    })?;
+    let fields = native_ape_fields(&tag, path)?;
+    let invalid_keys = tag
+        .items
+        .iter()
+        .filter(|item| item.key.is_none())
+        .map(|item| format!("'{}'", display_escaped_ape_key(&item.key_bytes)))
+        .collect::<Vec<_>>();
+    let warning = (!invalid_keys.is_empty()).then(|| MetadataReadIssue {
+        kind: MetadataReadIssueKind::RecoverableTagWarning,
+        reason: format!(
+            "{} invalid APE key{} skipped in '{}': {}",
+            invalid_keys.len(),
+            if invalid_keys.len() == 1 { "" } else { "s" },
+            path.display(),
+            invalid_keys.join(", ")
+        ),
+    });
+    let metadata = source_metadata_from_canonical_fields(&fields);
+    Ok(NativeApeReadOutcome {
+        fields,
+        metadata,
+        warning,
+    })
+}
+
+fn read_canonical_metadata_file(
+    path: &std::path::Path,
+) -> Result<(Vec<CanonicalEditorTagField>, SourceMetadata, Option<MetadataReadIssue>), MetadataReadIssue> {
+    use lofty::file::TaggedFileExt;
+
+    match lofty::read_from_path(path) {
+        Ok(tagged) => Ok((
+            tagged
+                .primary_tag()
+                .or_else(|| tagged.first_tag())
+                .map(canonical_editor_fields_from_tag)
+                .unwrap_or_default(),
+            source_metadata_from_tags(path, tagged.tags(), false),
+            None,
+        )),
+        Err(err) if native_ape_error_is_eligible(&err) => match read_native_ape_fallback(path) {
+            Ok(outcome) => Ok((outcome.fields, outcome.metadata, outcome.warning)),
+            Err(native_error) => Err(MetadataReadIssue {
+                kind: MetadataReadIssueKind::TagRead,
+                reason: format!(
+                    "failed to read '{}': {err}; native APEv2 fallback also refused: {native_error}",
+                    path.display()
+                ),
+            }),
+        },
+        Err(err) => Err(MetadataReadIssue::from_lofty_read_error(path, err)),
+    }
+}
+
+fn tag_entries_from_canonical_fields(
+    fields: Vec<CanonicalEditorTagField>,
+) -> Vec<TagEntry> {
+    let mut entries = fields
         .into_iter()
         .map(|field| TagEntry {
             row_scope: crate::tui::probe::RowScope::File,
@@ -7275,16 +7736,15 @@ fn read_all_tags_from_tagged_file(tagged: &lofty::file::TaggedFile) -> Vec<TagEn
             mb_proposed_per_file: None,
         })
         .collect::<Vec<_>>();
-
     for entry in &mut entries {
         if is_synthetic_preview(entry) {
             entry.is_binary = true;
         }
     }
-
     sort_entries_standard_first(&mut entries);
     entries
 }
+
 
 /// Read all tags from an audio file's primary tag.
 /// Returns entries sorted: standard fields first, then alphabetical.
@@ -7297,9 +7757,12 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
         return Ok(tag_entries_from_dsf_snapshot(&outcome.snapshot));
     }
     flac_metadata_writer::recover_before_read(path)?;
-    let tagged = lofty::read_from_path(path)
-        .map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
-    Ok(read_all_tags_from_tagged_file(&tagged))
+    let (fields, _metadata, warning) =
+        read_canonical_metadata_file(path).map_err(|issue| issue.reason)?;
+    if let Some(warning) = warning {
+        log::warn!("{}", warning.reason);
+    }
+    Ok(tag_entries_from_canonical_fields(fields))
 }
 
 /// Tags plus compact source metadata read from the same Lofty pass.
@@ -7317,6 +7780,9 @@ pub enum MetadataReadIssueKind {
     UnsupportedFormat,
     /// Lofty recognized the file class but failed while decoding tag data.
     TagRead,
+    /// Audio remains readable, and a native fallback recovered valid metadata.
+    /// The warning is disclosed but does not block editing or transfer.
+    RecoverableTagWarning,
     /// Audio remains readable, but noncanonical container metadata means the
     /// editor must remain read-only until the file is repaired or rewritten.
     ContainerQuirk,
@@ -7361,6 +7827,10 @@ impl MetadataReadIssue {
         }
     }
 
+    pub(crate) fn blocks_metadata_use(&self) -> bool {
+        !matches!(self.kind, MetadataReadIssueKind::RecoverableTagWarning)
+    }
+
     fn from_lofty_read_error(path: &std::path::Path, err: lofty::error::LoftyError) -> Self {
         use lofty::error::ErrorKind;
         let kind = match err.kind() {
@@ -7395,7 +7865,6 @@ pub struct MergedTagsAndMetadata {
 /// If all files agree → shared value. If they differ → `<mixed>`.
 /// Duplicate keys within a single file are joined with "; ".
 pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry>, String> {
-    use lofty::file::TaggedFileExt;
     use std::collections::HashMap;
 
     if paths.is_empty() {
@@ -7444,13 +7913,13 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             continue;
         }
         flac_metadata_writer::recover_before_read(path)?;
-        let tagged = lofty::read_from_path(path)
-            .map_err(|err| format!("failed to read '{}': {}", path.display(), err))?;
-        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-            continue;
-        };
+        let (fields, _metadata, warning) =
+            read_canonical_metadata_file(path).map_err(|issue| issue.reason)?;
+        if let Some(warning) = warning {
+            log::warn!("{}", warning.reason);
+        }
 
-        for field in canonical_editor_fields_from_tag(tag) {
+        for field in fields {
             let key = field.display_key.clone();
             if !key_map.contains_key(&key) {
                 key_order.push(key.clone());
@@ -7549,7 +8018,6 @@ pub(crate) fn read_all_tags_merged_with_metadata_cancellable_for_operation<F>(
 where
     F: Fn() -> bool,
 {
-    use lofty::file::TaggedFileExt;
     use std::collections::HashMap;
 
     let cancelled_message = || cancellation_message.to_string();
@@ -7604,25 +8072,23 @@ where
         if cancelled() {
             return Err(cancelled_message());
         }
-        let tagged = match lofty::read_from_path(path) {
-            Ok(tagged) => tagged,
-            Err(err) => {
+        let (fields, metadata, warning) = match read_canonical_metadata_file(path) {
+            Ok(read) => read,
+            Err(issue) => {
                 return Ok(MergedTagsAndMetadata {
                     entries: Vec::new(),
                     metadata: vec![SourceMetadata::default()],
-                    metadata_errors: vec![Some(MetadataReadIssue::from_lofty_read_error(path, err))],
+                    metadata_errors: vec![Some(issue)],
                 });
             }
         };
         if cancelled() {
             return Err(cancelled_message());
         }
-        let entries = read_all_tags_from_tagged_file(&tagged);
-        let metadata = source_metadata_from_tags(path, tagged.tags(), false);
         return Ok(MergedTagsAndMetadata {
-            entries,
+            entries: tag_entries_from_canonical_fields(fields),
             metadata: vec![metadata],
-            metadata_errors: vec![None],
+            metadata_errors: vec![warning],
         });
     }
 
@@ -7690,21 +8156,19 @@ where
         if cancelled() {
             return Err(cancelled_message());
         }
-        let tagged = match lofty::read_from_path(path) {
-            Ok(tagged) => tagged,
-            Err(err) => {
-                metadata_errors[file_idx] = Some(MetadataReadIssue::from_lofty_read_error(path, err));
+        let (fields, source_metadata, warning) = match read_canonical_metadata_file(path) {
+            Ok(read) => read,
+            Err(issue) => {
+                metadata_errors[file_idx] = Some(issue);
                 continue;
             }
         };
         if cancelled() {
             return Err(cancelled_message());
         }
-        metadata[file_idx] = source_metadata_from_tags(path, tagged.tags(), false);
-        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-            continue;
-        };
-        for field in canonical_editor_fields_from_tag(tag) {
+        metadata[file_idx] = source_metadata;
+        metadata_errors[file_idx] = warning;
+        for field in fields {
             let key = field.display_key.clone();
             if !key_map.contains_key(&key) {
                 key_order.push(key.clone());
@@ -8374,8 +8838,16 @@ pub(crate) fn write_embedded_cuesheet_for_transfer_at_verification(
     expected_cuesheet: &str,
     replacement_cuesheet: String,
     cancel: Option<&MetadataWriteCancelFlag>,
-    _verification: tui_file_picker::VerificationMode,
+    verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, String> {
+    // The native FLAC compare-and-swap writer always performs the stronger
+    // path-local snapshot validation required by this route. Keep the caller's
+    // verification choice explicit so the seam cannot silently lose policy;
+    // both current modes intentionally select the same stronger primitive.
+    match verification {
+        tui_file_picker::VerificationMode::Standard
+        | tui_file_picker::VerificationMode::Strong => {}
+    }
     let changes = [(
         lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
         Some(replacement_cuesheet),
@@ -8424,6 +8896,480 @@ fn write_all_tags_with_cancel_report(
     )
 }
 
+#[derive(Debug, Clone)]
+struct NativeApeRequestedChange {
+    physical_key: String,
+    value: Option<String>,
+}
+
+fn native_ape_change_identity_and_key(
+    key: &lofty::tag::ItemKey,
+) -> Result<(String, String), String> {
+    let numbering = crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+        crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
+        key,
+    );
+    if let Some(identity) = numbering {
+        let physical = match identity {
+            "TRACKNUMBER" | "TRACKTOTAL" => "Track",
+            "DISCNUMBER" | "DISCTOTAL" => "Disc",
+            _ => unreachable!("numbering identity is exhaustive"),
+        };
+        return Ok((identity.to_string(), physical.to_string()));
+    }
+
+    let physical_key = match key {
+        lofty::tag::ItemKey::Unknown(name) => name.trim().to_string(),
+        _ => key
+            .map_key(lofty::tag::TagType::Ape, false)
+            .map(str::to_string)
+            .ok_or_else(|| format!("cannot map {:?} to an APEv2 item key", key))?,
+    };
+    if !ape_key_is_valid(physical_key.as_bytes()) {
+        return Err(format!(
+            "refusing to create invalid APEv2 item key {:?}",
+            physical_key
+        ));
+    }
+    Ok((native_ape_canonical_key(&physical_key), physical_key))
+}
+
+fn collect_native_ape_requested_changes(
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<std::collections::BTreeMap<String, NativeApeRequestedChange>, String> {
+    let mut requested =
+        std::collections::BTreeMap::<String, NativeApeRequestedChange>::new();
+    for (key, value) in changes {
+        let (identity, physical_key) = native_ape_change_identity_and_key(key)?;
+        // The public metadata-write contract treats both `None` and an
+        // empty string as deletion. Normalize at the native boundary so every
+        // downstream path, including combined Track/Disc serialization, sees
+        // one unambiguous delete representation.
+        let candidate = NativeApeRequestedChange {
+            physical_key,
+            value: value.as_ref().filter(|value| !value.is_empty()).cloned(),
+        };
+        if let Some(existing) = requested.get(&identity) {
+            if existing.value != candidate.value {
+                return Err(format!(
+                    "conflicting metadata changes target the same native WavPack/APEv2 field {identity}"
+                ));
+            }
+            continue;
+        }
+        requested.insert(identity, candidate);
+    }
+    Ok(requested)
+}
+
+fn canonical_field_value(
+    fields: &[CanonicalEditorTagField],
+    key: &str,
+) -> Option<String> {
+    fields
+        .iter()
+        .find(|field| field.display_key == key && !field.is_binary)
+        .map(|field| field.value.clone())
+        .filter(|value| !value.is_empty())
+}
+
+fn combine_native_ape_numbering_change(
+    requested: &mut std::collections::BTreeMap<String, NativeApeRequestedChange>,
+    fields: &[CanonicalEditorTagField],
+    number_identity: &str,
+    total_identity: &str,
+    physical_key: &str,
+) -> Result<(), String> {
+    let number_change = requested.remove(number_identity);
+    let total_change = requested.remove(total_identity);
+    if number_change.is_none() && total_change.is_none() {
+        return Ok(());
+    }
+
+    let existing_number = canonical_field_value(fields, number_identity);
+    let existing_total = canonical_field_value(fields, total_identity);
+    let value = match (number_change, total_change) {
+        (Some(number), Some(total)) => match (number.value, total.value) {
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(format!(
+                    "native WavPack/APEv2 cannot persist {total_identity} without {number_identity}"
+                ));
+            }
+            (Some(number), None) => Some(number),
+            (Some(number), Some(total)) => Some(format!("{number}/{total}")),
+        },
+        (Some(number), None) => match number.value {
+            // Track/Disc number owns the combined physical item. Deleting the
+            // number therefore deletes the whole item and its inseparable
+            // total, exactly as the logical tag-delete contract requires.
+            None => None,
+            Some(number) => Some(match existing_total {
+                Some(total) => format!("{number}/{total}"),
+                None => number,
+            }),
+        },
+        (None, Some(total)) => match total.value {
+            // Deleting only the total preserves the existing number as a
+            // non-fractional physical value.
+            None => existing_number,
+            Some(total) => match existing_number {
+                Some(number) => Some(format!("{number}/{total}")),
+                None => {
+                    return Err(format!(
+                        "native WavPack/APEv2 cannot persist {total_identity} without {number_identity}"
+                    ));
+                }
+            },
+        },
+        (None, None) => unreachable!("numbering changes were checked above"),
+    };
+    requested.insert(
+        number_identity.to_string(),
+        NativeApeRequestedChange {
+            physical_key: physical_key.to_string(),
+            value,
+        },
+    );
+    Ok(())
+}
+
+fn encode_native_ape_text_item(key: &str, value: &str) -> Result<Vec<u8>, String> {
+    if !ape_key_is_valid(key.as_bytes()) {
+        return Err(format!("refusing to encode invalid APEv2 key {key:?}"));
+    }
+    let value_len = u32::try_from(value.len())
+        .map_err(|_| format!("APEv2 value for {key:?} exceeds 4 GiB"))?;
+    let mut raw = Vec::with_capacity(8 + key.len() + 1 + value.len());
+    raw.extend_from_slice(&value_len.to_le_bytes());
+    raw.extend_from_slice(&APE_ITEM_TYPE_TEXT.to_le_bytes());
+    raw.extend_from_slice(key.as_bytes());
+    raw.push(0);
+    raw.extend_from_slice(value.as_bytes());
+    Ok(raw)
+}
+
+fn native_ape_descriptor(size: u32, item_count: u32, flags: u32) -> [u8; APE_DESCRIPTOR_LEN] {
+    let mut descriptor = [0u8; APE_DESCRIPTOR_LEN];
+    descriptor[..8].copy_from_slice(APE_SIGNATURE);
+    descriptor[8..12].copy_from_slice(&APE_VERSION_2.to_le_bytes());
+    descriptor[12..16].copy_from_slice(&size.to_le_bytes());
+    descriptor[16..20].copy_from_slice(&item_count.to_le_bytes());
+    descriptor[20..24].copy_from_slice(&flags.to_le_bytes());
+    descriptor
+}
+
+fn serialize_native_ape_tag(items: &[Vec<u8>], with_header: bool) -> Result<Vec<u8>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body_len = items.iter().try_fold(0usize, |total, item| {
+        total.checked_add(item.len()).ok_or_else(|| "APEv2 body length overflow".to_string())
+    })?;
+    let size = u32::try_from(body_len + APE_DESCRIPTOR_LEN)
+        .map_err(|_| "APEv2 tag exceeds the 4 GiB format limit".to_string())?;
+    if u64::from(size) > MAX_NATIVE_APE_TAG_BYTES {
+        return Err(format!(
+            "refusing to write an APEv2 tag larger than {MAX_NATIVE_APE_TAG_BYTES} bytes"
+        ));
+    }
+    let item_count = u32::try_from(items.len())
+        .map_err(|_| "APEv2 item count exceeds the format limit".to_string())?;
+    let mut output = Vec::with_capacity(
+        body_len + APE_DESCRIPTOR_LEN + if with_header { APE_DESCRIPTOR_LEN } else { 0 },
+    );
+    if with_header {
+        output.extend_from_slice(&native_ape_descriptor(
+            size,
+            item_count,
+            APE_FLAG_HEADER_PRESENT | APE_FLAG_IS_HEADER,
+        ));
+    }
+    for item in items {
+        output.extend_from_slice(item);
+    }
+    output.extend_from_slice(&native_ape_descriptor(
+        size,
+        item_count,
+        if with_header { APE_FLAG_HEADER_PRESENT } else { 0 },
+    ));
+    Ok(output)
+}
+
+#[cfg(test)]
+pub(crate) fn native_ape_has_item_for_test(
+    path: &std::path::Path,
+    display_key: &str,
+) -> Result<bool, String> {
+    let Some(tag) = read_native_ape_tag(path)? else {
+        return Ok(false);
+    };
+    Ok(tag.items.iter().any(|item| {
+        item.key
+            .as_deref()
+            .is_some_and(|key| native_ape_canonical_key(key) == display_key)
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn inject_invalid_ape_key_item_for_test(
+    path: &std::path::Path,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Vec<u8>, String> {
+    let tag = read_native_ape_tag(path)?
+        .ok_or_else(|| format!("test WavPack fixture '{}' has no APEv2 tag", path.display()))?;
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&APE_ITEM_TYPE_TEXT.to_le_bytes());
+    raw.extend_from_slice(key);
+    raw.push(0);
+    raw.extend_from_slice(value);
+    let mut items = tag.items.iter().map(|item| item.raw.clone()).collect::<Vec<_>>();
+    items.push(raw.clone());
+    let replacement = serialize_native_ape_tag(&items, tag.had_header)?;
+    let source = std::fs::read(path)
+        .map_err(|error| format!("read test WavPack fixture '{}': {error}", path.display()))?;
+    let mut output = Vec::with_capacity(
+        source.len() - (tag.footer_end - tag.replace_start) as usize + replacement.len(),
+    );
+    output.extend_from_slice(&source[..tag.replace_start as usize]);
+    output.extend_from_slice(&replacement);
+    output.extend_from_slice(&source[tag.footer_end as usize..]);
+    std::fs::write(path, output)
+        .map_err(|error| format!("write test WavPack fixture '{}': {error}", path.display()))?;
+    Ok(raw)
+}
+
+fn prepare_native_ape_replacement(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<(u64, u64, Vec<u8>, bool), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat '{}': {error}", path.display()))?
+        .len();
+    let insertion_point = optional_id3v1_start(&mut file, file_len)?.unwrap_or(file_len);
+    let existing = read_native_ape_tag(path)?;
+    let fields = match existing.as_ref() {
+        Some(tag) => native_ape_fields(tag, path)?,
+        None => Vec::new(),
+    };
+    let mut requested = collect_native_ape_requested_changes(changes)?;
+    combine_native_ape_numbering_change(
+        &mut requested,
+        &fields,
+        "TRACKNUMBER",
+        "TRACKTOTAL",
+        "Track",
+    )?;
+    combine_native_ape_numbering_change(
+        &mut requested,
+        &fields,
+        "DISCNUMBER",
+        "DISCTOTAL",
+        "Disc",
+    )?;
+
+    let mut emitted = std::collections::BTreeSet::new();
+    let mut output_items = Vec::new();
+    if let Some(tag) = &existing {
+        for item in &tag.items {
+            let Some(key) = item.key.as_deref() else {
+                output_items.push(item.raw.clone());
+                continue;
+            };
+            let identity = native_ape_canonical_key(key);
+            let Some(change) = requested.get(&identity) else {
+                output_items.push(item.raw.clone());
+                continue;
+            };
+            if item.is_read_only() {
+                if change.value.as_deref().is_some_and(|expected| {
+                    matches!(item.item_type(), APE_ITEM_TYPE_TEXT | APE_ITEM_TYPE_LOCATOR)
+                        && item.value == expected.as_bytes()
+                }) && emitted.insert(identity.clone())
+                {
+                    output_items.push(item.raw.clone());
+                    continue;
+                }
+                return Err(format!(
+                    "refusing to replace read-only APEv2 item '{}' in '{}'",
+                    key,
+                    path.display()
+                ));
+            }
+            if emitted.insert(identity.clone()) {
+                if let Some(value) = change.value.as_deref() {
+                    output_items.push(encode_native_ape_text_item(&change.physical_key, value)?);
+                }
+            }
+        }
+    }
+    for (identity, change) in &requested {
+        if emitted.contains(identity) {
+            continue;
+        }
+        if let Some(value) = change.value.as_deref() {
+            output_items.push(encode_native_ape_text_item(&change.physical_key, value)?);
+        }
+    }
+
+    let with_header = existing.as_ref().map_or(true, |tag| tag.had_header);
+    let replacement = serialize_native_ape_tag(&output_items, with_header)?;
+    let (replace_start, footer_end) = existing
+        .as_ref()
+        .map(|tag| (tag.replace_start, tag.footer_end))
+        .unwrap_or((insertion_point, insertion_point));
+    let original_len = footer_end
+        .checked_sub(replace_start)
+        .ok_or_else(|| "native APEv2 replacement range underflow".to_string())?;
+    let unchanged = if original_len == replacement.len() as u64 {
+        file.seek(SeekFrom::Start(replace_start))
+            .map_err(|error| format!("seek original APEv2 region in '{}': {error}", path.display()))?;
+        let mut original = vec![0u8; replacement.len()];
+        file.read_exact(&mut original)
+            .map_err(|error| format!("read original APEv2 region in '{}': {error}", path.display()))?;
+        original == replacement
+    } else {
+        false
+    };
+    Ok((replace_start, footer_end, replacement, unchanged))
+}
+
+fn copy_exact_prefix(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+    bytes: u64,
+    path: &std::path::Path,
+) -> Result<u64, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    source.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind '{}': {error}", path.display()))?;
+    let copied = std::io::copy(&mut source.take(bytes), destination)
+        .map_err(|error| format!("copy metadata carrier prefix '{}': {error}", path.display()))?;
+    if copied != bytes {
+        return Err(format!(
+            "short read while copying metadata carrier prefix '{}': expected {bytes}, copied {copied}",
+            path.display()
+        ));
+    }
+    Ok(copied)
+}
+
+fn wavpack_requires_native_ape_writer(path: &std::path::Path) -> Result<bool, String> {
+    match lofty::read_from_path(path) {
+        Ok(_) => Ok(false),
+        Err(error) if native_ape_error_is_eligible(&error) => Ok(true),
+        Err(error) => Err(format!(
+            "failed to read healthy-writer eligibility for '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+fn write_all_tags_native_wavpack_ape_atomic(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> Result<MetadataWriteCommitReport, String> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    crate::metadata_persistence::validate_numbering_changes_for_backend(
+        crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
+        changes,
+    )?;
+    let snapshot = GenericMetadataReplacementSnapshot::capture(path)?;
+    {
+        use std::io::Read;
+
+        let mut source = std::fs::File::open(path)
+            .map_err(|error| format!("open WavPack carrier '{}': {error}", path.display()))?;
+        let mut magic = [0u8; 4];
+        source.read_exact(&mut magic).map_err(|error| {
+            format!(
+                "read WavPack signature from '{}': {error}",
+                path.display()
+            )
+        })?;
+        if &magic != b"wvpk" {
+            return Err(format!(
+                "refusing native APEv2 write to '{}': file does not begin with a WavPack block signature",
+                path.display()
+            ));
+        }
+    }
+    check_metadata_write_cancel(cancel, "before checking WavPack metadata recovery authority")?;
+    {
+        let db = crate::db::Database::open().map_err(|error| {
+            format!("write failed before mutation: metadata journal unavailable: {error}")
+        })?;
+        db.assert_metadata_write_unarmed(path)?;
+    }
+
+    check_metadata_write_cancel(cancel, "before parsing native WavPack/APEv2 metadata")?;
+    let (replace_start, footer_end, replacement, unchanged) =
+        prepare_native_ape_replacement(path, changes)?;
+    if unchanged {
+        return Ok(MetadataWriteCommitReport::clean());
+    }
+
+    check_metadata_write_cancel(cancel, "before creating WavPack metadata replacement")?;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut temp = create_standard_metadata_temp(parent, path)?;
+    let mut source = std::fs::File::open(path)
+        .map_err(|error| format!("open WavPack carrier '{}': {error}", path.display()))?;
+    let prefix_bytes = copy_exact_prefix(&mut source, temp.as_file_mut(), replace_start, path)?;
+    record_metadata_source_copy(prefix_bytes);
+    temp.as_file_mut()
+        .write_all(&replacement)
+        .map_err(|error| format!("write native APEv2 replacement for '{}': {error}", path.display()))?;
+    record_metadata_replacement_rewrite(replacement.len() as u64);
+    source
+        .seek(SeekFrom::Start(footer_end))
+        .map_err(|error| format!("seek WavPack metadata suffix in '{}': {error}", path.display()))?;
+    let suffix_bytes = std::io::copy(&mut source, temp.as_file_mut())
+        .map_err(|error| format!("copy WavPack metadata suffix '{}': {error}", path.display()))?;
+    record_metadata_source_copy(suffix_bytes);
+    record_metadata_replacement_copy(prefix_bytes + suffix_bytes);
+
+    temp.as_file_mut()
+        .flush()
+        .map_err(|error| format!("flush WavPack metadata temp for '{}': {error}", path.display()))?;
+    snapshot.apply_to_temp(temp.path())?;
+    record_metadata_file_sync();
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| format!("sync WavPack metadata temp for '{}': {error}", path.display()))?;
+    check_metadata_write_cancel(cancel, "before committing WavPack metadata replacement")?;
+    snapshot.validate_unchanged(path)?;
+    replace_generic_metadata_file(temp.into_temp_path(), path).map_err(|error| {
+        format!("commit WavPack metadata replacement for '{}': {error}", path.display())
+    })?;
+    record_metadata_directory_sync();
+    Ok(MetadataWriteCommitReport::from_warnings(
+        flac_metadata_writer::post_commit_parent_sync_warning(
+            path,
+            "native WavPack/APEv2 metadata replacement commit",
+        )
+        .into_iter()
+        .collect(),
+    ))
+}
+
+fn reject_read_only_ape_family_write(path: &std::path::Path) -> Result<(), String> {
+    Err(format!(
+        "metadata writes to '{}' are refused this round: tolerant native APEv2 writes are implemented only for WavPack (.wv); .ape and .mpc remain read-fallback-only",
+        path.display()
+    ))
+}
+
+
 fn write_all_tags_with_cancel_report_at_verification(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
@@ -8454,7 +9400,14 @@ fn write_all_tags_with_cancel_report_at_verification(
                 changes,
             )?;
         }
-        crate::metadata_persistence::MetadataPersistenceRoute::Lofty
+        crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+            crate::metadata_persistence::validate_numbering_changes_for_backend(
+                crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
+                changes,
+            )?;
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily
+        | crate::metadata_persistence::MetadataPersistenceRoute::Lofty
         | crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {}
     }
     match route {
@@ -8531,6 +9484,27 @@ fn write_all_tags_with_cancel_report_at_verification(
                 }
             }
         }
+        crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+            if wavpack_requires_native_ape_writer(path)? {
+                return write_all_tags_native_wavpack_ape_atomic(path, changes, cancel);
+            }
+            // Healthy WavPack files retain the pre-Round-8 Lofty writer. The
+            // native serializer is a recovery path only for typed APE decode
+            // failures, keeping its mutation authority as narrow as the field
+            // defect that required it.
+            check_metadata_write_cancel(cancel, "before starting healthy WavPack metadata rewrite")?;
+            return if verification == tui_file_picker::VerificationMode::Standard {
+                write_all_tags_lofty_standard_atomic(path, changes, cancel)
+            } else {
+                let cleanup_warning = write_all_tags_lofty_with_backup(path, changes)?;
+                Ok(MetadataWriteCommitReport::from_warnings(
+                    cleanup_warning.into_iter().collect(),
+                ))
+            };
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily => {
+            reject_read_only_ape_family_write(path)?;
+        }
         crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {
             reject_unsupported_dff_metadata_write(path, "writing")?;
         }
@@ -8567,6 +9541,15 @@ fn write_all_tags_without_full_file_backup(
                 "internal transaction error: native FLAC path '{}' reached the full-file writer",
                 path.display()
             ));
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+            return Err(format!(
+                "internal transaction error: WavPack policy-dispatch path '{}' reached the legacy full-file writer",
+                path.display()
+            ));
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily => {
+            reject_read_only_ape_family_write(path)?;
         }
         crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {
             reject_unsupported_dff_metadata_write(path, "writing")?;
@@ -10882,6 +11865,266 @@ mod tests {
         (temp, path)
     }
 
+    fn append_invalid_key_ape_item(path: &std::path::Path) -> Vec<u8> {
+        inject_invalid_ape_key_item_for_test(path, "&год".as_bytes(), b"1977")
+            .expect("write invalid-key APEv2 fixture")
+    }
+
+    #[test]
+    fn native_ape_fallback_recovers_valid_items_and_discloses_invalid_key() {
+        let (_temp, path) = copy_numbering_fixture("invalid-key.wv", APE_NUMBERING_FIXTURE);
+        let invalid_raw = append_invalid_key_ape_item(&path);
+
+        let merged = read_all_tags_merged_with_metadata(&[path.clone()])
+            .expect("read WavPack through production fallback");
+        let issue = merged.metadata_errors[0]
+            .as_ref()
+            .expect("invalid key must be disclosed");
+        assert_eq!(issue.kind, MetadataReadIssueKind::RecoverableTagWarning);
+        assert!(!issue.blocks_metadata_use());
+        assert!(issue.reason.contains("1 invalid APE key skipped"));
+        assert!(issue.reason.contains("'&год'"));
+        assert!(merged.entries.iter().any(|entry| entry.display_key == "TITLE"));
+
+        let parsed = read_native_ape_tag(&path)
+            .expect("reparse invalid-key APEv2 fixture")
+            .expect("fixture still has APEv2 tag");
+        assert!(parsed.items.iter().any(|item| item.raw == invalid_raw));
+    }
+
+    #[test]
+    fn native_wavpack_write_preserves_invalid_ape_item_byte_exactly() {
+        let (_temp, path) = copy_numbering_fixture("invalid-key-write.wv", APE_NUMBERING_FIXTURE);
+        let invalid_raw = append_invalid_key_ape_item(&path);
+
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::TrackTitle,
+                Some("Even in the Quietest Moments".to_string()),
+            )],
+        )
+        .expect("native WavPack/APEv2 write");
+
+        let parsed = read_native_ape_tag(&path)
+            .expect("parse rewritten APEv2 tag")
+            .expect("rewritten file has APEv2 tag");
+        assert!(parsed.items.iter().any(|item| item.raw == invalid_raw));
+        let merged = read_all_tags_merged_with_metadata(&[path.clone()])
+            .expect("re-read rewritten WavPack through fallback");
+        assert_eq!(
+            merged
+                .entries
+                .iter()
+                .find(|entry| entry.display_key == "TITLE")
+                .and_then(|entry| entry.per_file_values.first())
+                .map(String::as_str),
+            Some("Even in the Quietest Moments")
+        );
+        assert_eq!(
+            merged.metadata_errors[0].as_ref().map(|issue| issue.kind),
+            Some(MetadataReadIssueKind::RecoverableTagWarning)
+        );
+    }
+
+    #[test]
+    fn native_wavpack_empty_string_deletes_ordinary_ape_item() {
+        let (_temp, path) = copy_numbering_fixture("empty-delete-title.wv", APE_NUMBERING_FIXTURE);
+        // The shared fixture carries only an `encoder` item; seed TITLE
+        // through the healthy Lofty route before forcing native fallback.
+        write_all_tags(
+            &path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("Seeded Title".to_string()))],
+        )
+        .expect("seed TITLE through healthy route");
+        assert_eq!(
+            editor_value(&path, "TITLE").as_deref(),
+            Some("Seeded Title"),
+            "fixture must begin with a non-empty TITLE"
+        );
+        append_invalid_key_ape_item(&path);
+
+        write_all_tags(
+            &path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some(String::new()))],
+        )
+        .expect("empty TITLE uses delete semantics");
+
+        // The editor reader synthesizes canonical rows with "" placeholders;
+        // the native parse below is the file-level absence proof.
+        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some(""));
+        let parsed = read_native_ape_tag(&path)
+            .expect("parse rewritten WavPack")
+            .expect("rewritten WavPack retains APEv2");
+        assert!(!parsed.items.iter().any(|item| {
+            item.key
+                .as_deref()
+                .is_some_and(|key| native_ape_canonical_key(key) == "TITLE")
+        }));
+    }
+
+    #[test]
+    fn native_wavpack_empty_numbering_deletes_or_reduces_combined_item() {
+        let (_temp, path) = copy_numbering_fixture("empty-delete-numbering.wv", APE_NUMBERING_FIXTURE);
+        append_invalid_key_ape_item(&path);
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("12".to_string()),
+                ),
+            ],
+        )
+        .expect("seed combined Track item");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        assert_eq!(editor_numbering_value(&path, "TRACKTOTAL"), "12");
+
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                Some(String::new()),
+            )],
+        )
+        .expect("empty total removes only the fraction total");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        assert_eq!(editor_value(&path, "TRACKTOTAL").as_deref(), Some(""));
+
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                Some(String::new()),
+            )],
+        )
+        .expect("empty number deletes the inseparable Track item");
+        assert_eq!(editor_value(&path, "TRACKNUMBER").as_deref(), Some(""));
+        assert_eq!(editor_value(&path, "TRACKTOTAL").as_deref(), Some(""));
+        let parsed = read_native_ape_tag(&path)
+            .expect("parse rewritten WavPack")
+            .expect("rewritten WavPack retains APEv2");
+        assert!(!parsed.items.iter().any(|item| {
+            item.key
+                .as_deref()
+                .is_some_and(|key| native_ape_canonical_key(key) == "TRACK")
+        }));
+    }
+
+    #[test]
+    fn healthy_wavpack_retains_lofty_writer_and_native_is_recovery_only() {
+        let (temp, path) = copy_numbering_fixture("healthy-lofty-route.wv", APE_NUMBERING_FIXTURE);
+        let lofty_transactions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = std::sync::Arc::clone(&lofty_transactions);
+
+        with_lofty_fallback_hook(
+            temp.path(),
+            move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            || {
+                write_all_tags(
+                    &path,
+                    &[(
+                        lofty::tag::ItemKey::TrackTitle,
+                        Some("Healthy Lofty route".to_string()),
+                    )],
+                )
+            },
+        )
+        .expect("healthy WavPack write");
+
+        assert_eq!(
+            lofty_transactions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "healthy WavPack must use the established Lofty transaction"
+        );
+        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some("Healthy Lofty route"));
+    }
+
+    #[test]
+    fn native_wavpack_write_is_byte_idempotent_for_matching_read_only_item() {
+        let (_temp, path) = copy_numbering_fixture("read-only-title.wv", APE_NUMBERING_FIXTURE);
+        // The shared fixture has no TITLE; seed one through the healthy
+        // Lofty route so a read-only TITLE item exists to protect.
+        write_all_tags(
+            &path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("Read Only Title".to_string()))],
+        )
+        .expect("seed TITLE through healthy route");
+        let tag = read_native_ape_tag(&path)
+            .expect("parse source APEv2 tag")
+            .expect("fixture APEv2 tag");
+        let title_index = tag
+            .items
+            .iter()
+            .position(|item| {
+                item.key
+                    .as_deref()
+                    .is_some_and(|key| native_ape_canonical_key(key) == "TITLE")
+                    && item.item_type() == APE_ITEM_TYPE_TEXT
+            })
+            .expect("fixture TITLE item");
+        let title = String::from_utf8(tag.items[title_index].value.clone())
+            .expect("fixture TITLE is UTF-8");
+        let mut items = tag.items.iter().map(|item| item.raw.clone()).collect::<Vec<_>>();
+        let flags = u32::from_le_bytes(
+            items[title_index][4..8]
+                .try_into()
+                .expect("APEv2 item flags"),
+        ) | APE_ITEM_READ_ONLY;
+        items[title_index][4..8].copy_from_slice(&flags.to_le_bytes());
+        let replacement = serialize_native_ape_tag(&items, tag.had_header)
+            .expect("serialize read-only APEv2 fixture");
+        let source = std::fs::read(&path).expect("read WavPack fixture");
+        let mut output = Vec::new();
+        output.extend_from_slice(&source[..tag.replace_start as usize]);
+        output.extend_from_slice(&replacement);
+        output.extend_from_slice(&source[tag.footer_end as usize..]);
+        std::fs::write(&path, output).expect("write read-only APEv2 fixture");
+        append_invalid_key_ape_item(&path);
+        let before = std::fs::read(&path).expect("snapshot read-only fixture");
+
+        write_all_tags(
+            &path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some(title))],
+        )
+        .expect("matching read-only value is an idempotent no-op");
+
+        assert_eq!(std::fs::read(&path).expect("re-read WavPack fixture"), before);
+    }
+
+    #[test]
+    fn native_ape_numbering_rejects_malformed_totals_and_extra_components() {
+        assert!(native_ape_numbering_rows("Track", "1/nope").is_none());
+        assert!(native_ape_numbering_rows("Track", "1/2/3").is_none());
+        assert!(native_ape_numbering_rows("Disc", "x/2").is_none());
+        assert_eq!(
+            native_ape_numbering_rows("Track", "1/12")
+                .expect("valid track numbering")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn non_ape_lofty_failure_does_not_activate_native_ape_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("not-audio.bin");
+        std::fs::write(&path, b"not an audio carrier").expect("write unknown carrier");
+        let merged = read_all_tags_merged_with_metadata(&[path])
+            .expect("typed read failure is returned in-band");
+        let issue = merged.metadata_errors[0]
+            .as_ref()
+            .expect("unknown carrier must have a read issue");
+        assert_ne!(issue.kind, MetadataReadIssueKind::RecoverableTagWarning);
+        assert!(issue.blocks_metadata_use());
+    }
+
     fn editor_numbering_value(path: &std::path::Path, display_key: &str) -> String {
         let merged = read_all_tags_merged_with_metadata(&[path.to_path_buf()])
             .expect("reopen metadata through production editor reader");
@@ -11192,21 +12435,21 @@ mod tests {
             vec![
                 (
                     lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
-                    Some("A01".to_string()),
+                    Some("7".to_string()),
                 ),
                 (
                     lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
-                    Some("B01".to_string()),
+                    Some("8".to_string()),
                 ),
             ],
             vec![
                 (
                     lofty::tag::ItemKey::Unknown(native_track_alias.to_string()),
-                    Some("B01".to_string()),
+                    Some("8".to_string()),
                 ),
                 (
                     lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
-                    Some("A01".to_string()),
+                    Some("7".to_string()),
                 ),
             ],
             vec![
@@ -11352,7 +12595,11 @@ mod tests {
         // accessors return None for APE regardless of what was written. The
         // editor-level round trip below (through the production reader, which
         // recovers the combined item) is the meaningful guarantee for APE.
-        if expected_backend != crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe {
+        if !matches!(
+            expected_backend,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe
+                | crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe
+        ) {
             assert_eq!(tag.disk(), Some(2));
             assert_eq!(tag.disk_total(), Some(3));
         }
@@ -11827,7 +13074,7 @@ mod tests {
         assert_plain_unsigned_numbering_backend_round_trip(
             "numbering.wv",
             APE_NUMBERING_FIXTURE,
-            crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe,
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
         );
     }
 
@@ -12017,7 +13264,7 @@ mod tests {
         assert_typed_numbering_conflicts_fail_closed(
             "aliases.wv",
             APE_NUMBERING_FIXTURE,
-            crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe,
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
             "Track",
             "Disc",
         );
@@ -12501,6 +13748,63 @@ mod tests {
             .expect("read tempdir")
             .flatten()
             .all(|entry| !entry.file_name().to_string_lossy().contains(".tonepoet-bak.txn-")));
+    }
+
+    #[test]
+    fn inline_wavpack_dispatch_bypasses_legacy_database_and_selects_serializer() {
+        let db = crate::db::Database::open_memory().expect("memory database");
+        let (temp, healthy) = copy_numbering_fixture("inline-healthy.wv", APE_NUMBERING_FIXTURE);
+        let malformed = temp.path().join("inline-malformed.wv");
+        std::fs::write(&malformed, APE_NUMBERING_FIXTURE).expect("write malformed fixture");
+        append_invalid_key_ape_item(&malformed);
+
+        write_metadata_field_with_database(
+            &db,
+            &malformed,
+            (
+                lofty::tag::ItemKey::TrackTitle,
+                Some("Native recovery".to_string()),
+            ),
+        )
+        .expect("malformed WavPack inline write uses native recovery");
+        assert_eq!(editor_value(&malformed, "TITLE").as_deref(), Some("Native recovery"));
+
+        let lofty_transactions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = std::sync::Arc::clone(&lofty_transactions);
+        with_lofty_fallback_hook(
+            temp.path(),
+            move |path| {
+                if path.ends_with("inline-healthy.wv") {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            || {
+                write_metadata_field_with_database(
+                    &db,
+                    &healthy,
+                    (
+                        lofty::tag::ItemKey::TrackTitle,
+                        Some("Established Lofty writer".to_string()),
+                    ),
+                )
+            },
+        )
+        .expect("healthy WavPack inline write uses Lofty");
+        assert_eq!(
+            lofty_transactions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "healthy inline WavPack write must use the established Lofty transaction"
+        );
+        assert_eq!(
+            editor_value(&healthy, "TITLE").as_deref(),
+            Some("Established Lofty writer")
+        );
+        assert!(
+            db.stale_metadata_writes()
+                .expect("read legacy metadata journal")
+                .is_empty(),
+            "WavPack dispatch must not nest inside the caller's legacy database transaction"
+        );
     }
 
     #[test]

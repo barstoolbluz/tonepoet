@@ -2281,6 +2281,7 @@ pub(crate) enum PendingTagTransferSource {
     EditorSnapshot {
         entries: Vec<crate::tui::probe::TagEntry>,
         dimension: crate::tui::tag_interchange::TransferDimension,
+        authored_track_numbers: Option<Vec<u32>>,
     },
 }
 
@@ -2305,11 +2306,19 @@ pub struct PreparedTagTransfer {
     pub generation: u64,
     pub source_entries: Vec<crate::tui::probe::TagEntry>,
     pub source_dimension: crate::tui::tag_interchange::TransferDimension,
+    /// Authored CUE TRACK numbers in transfer order. Required when a
+    /// track-dimensional source is paired with a Files target.
+    pub source_track_numbers: Option<Vec<u32>>,
     pub source_carrier: String,
+    /// Original roots retained for confirm-time reclassification of Files
+    /// targets. Empty only for already-classified editor-local transfers.
+    pub target_roots: Vec<PathBuf>,
     pub target: crate::tui::tag_interchange::TransferCarrier,
     pub scope: super::app::TagTransferScope,
     pub verification: tui_file_picker::VerificationMode,
     pub field_count: usize,
+    pub fanout_field_counts: Option<(usize, usize)>,
+    pub pairing_warnings: Vec<String>,
 }
 
 impl PreparedTagTransfer {
@@ -2322,12 +2331,32 @@ impl PreparedTagTransfer {
                 paths.len(),
                 if paths.len() == 1 { "" } else { "s" },
             ),
-            crate::tui::tag_interchange::TransferCarrier::SidecarCue { sheet, .. } => format!(
-                "Write {} field{} to sidecar CUE ({} tracks)?",
-                self.field_count,
-                if self.field_count == 1 { "" } else { "s" },
-                sheet.tracks.len(),
-            ),
+            crate::tui::tag_interchange::TransferCarrier::SidecarCue {
+                sheet,
+                track_audio_paths,
+                write_method,
+                ..
+            } => match (write_method, self.fanout_field_counts) {
+                (
+                    crate::tui::tag_interchange::SidecarCueWriteMethod::PerFileAndSidecar,
+                    Some((file_fields, cue_fields)),
+                ) => format!(
+                    "Write {} file field{} + {} CUE field{} to {} file{} + sidecar CUE ({} tracks)?",
+                    file_fields,
+                    if file_fields == 1 { "" } else { "s" },
+                    cue_fields,
+                    if cue_fields == 1 { "" } else { "s" },
+                    track_audio_paths.len(),
+                    if track_audio_paths.len() == 1 { "" } else { "s" },
+                    sheet.tracks.len(),
+                ),
+                _ => format!(
+                    "Write {} field{} to sidecar CUE only ({} tracks)?",
+                    self.field_count,
+                    if self.field_count == 1 { "" } else { "s" },
+                    sheet.tracks.len(),
+                ),
+            },
             crate::tui::tag_interchange::TransferCarrier::EmbeddedCue { sheet, .. } => format!(
                 "Write {} field{} to embedded CUE ({} tracks)?",
                 self.field_count,
@@ -12004,11 +12033,15 @@ mod tests {
             generation: 1,
             source_entries: Vec::new(),
             source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
+            source_track_numbers: None,
             source_carrier: "files".to_string(),
+            target_roots: Vec::new(),
             target,
             scope: super::super::app::TagTransferScope::All,
             verification: tui_file_picker::VerificationMode::Standard,
             field_count,
+            fanout_field_counts: None,
+            pairing_warnings: Vec::new(),
         }
     }
 
@@ -12028,14 +12061,17 @@ mod tests {
             1,
             crate::tui::tag_interchange::TransferCarrier::SidecarCue {
                 cue_path: PathBuf::from("/music/album.cue"),
-                image_path: PathBuf::from("/music/album.flac"),
+                image_paths: vec![PathBuf::from("/music/album.flac")],
+                track_audio_paths: vec![PathBuf::from("/music/album.flac"); 12],
+                role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+                write_method: crate::tui::tag_interchange::SidecarCueWriteMethod::SidecarOnly,
                 cue_text: String::new(),
                 sheet: transfer_test_sheet(12),
             },
         );
         assert_eq!(
             sidecar.confirmation_prompt(),
-            "Write 1 field to sidecar CUE (12 tracks)?"
+            "Write 1 field to sidecar CUE only (12 tracks)?"
         );
 
         let embedded = prepared_transfer_for_prompt(
@@ -12044,6 +12080,7 @@ mod tests {
                 image_path: PathBuf::from("/music/album.flac"),
                 cue_text: String::new(),
                 sheet: transfer_test_sheet(2),
+                multi_file_read_only: false,
             },
         );
         assert_eq!(

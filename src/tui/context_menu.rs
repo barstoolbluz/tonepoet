@@ -1601,15 +1601,19 @@ fn launch_tag_clipboard_copy(
                 let failure_count = merged
                     .metadata_errors
                     .iter()
-                    .filter(|issue| issue.is_some())
+                    .filter(|issue| {
+                        issue
+                            .as_ref()
+                            .is_some_and(super::probe::MetadataReadIssue::blocks_metadata_use)
+                    })
                     .count();
                 if failure_count == source_paths.len() {
                     let detail = merged
                         .metadata_errors
                         .iter()
                         .flatten()
+                        .find(|issue| issue.blocks_metadata_use())
                         .map(|issue| issue.reason.as_str())
-                        .next()
                         .unwrap_or("all selected files failed metadata reading");
                     return Err(format!("Copy tags failed: {detail}"));
                 }
@@ -1820,11 +1824,17 @@ pub(crate) fn start_tag_transfer_from_editor_snapshot(
     }
     let generation = app.browse.tag_transfer_generation.checked_add(1).unwrap_or(1);
     app.browse.tag_transfer_generation = generation;
+    let authored_track_numbers =
+        super::tag_interchange::editor_snapshot_authored_track_numbers(
+            &entries,
+            source_dimension,
+        );
     let request = super::browse::PendingTagTransfer {
         generation,
         source: super::browse::PendingTagTransferSource::EditorSnapshot {
             entries,
             dimension: source_dimension,
+            authored_track_numbers,
         },
         target: super::browse::PendingTagTransferTarget::Classified(target),
         scope,
@@ -1895,7 +1905,17 @@ fn launch_tag_transfer(
                     &worker_cancel,
                 )?;
                 let source_dimension = source_carrier.dimension();
-                let field_count = super::tag_interchange::preview_tag_transfer(
+                let source_track_numbers = source_carrier.authored_track_numbers();
+                let pairing_warnings =
+                    super::tag_interchange::corroborate_source_pairing(
+                        &source_carrier,
+                        &target,
+                        &source_entries,
+                    )?
+                    .into_iter()
+                    .collect();
+                let (field_count, fanout_field_counts) =
+                    super::tag_interchange::preview_tag_transfer_fanout(
                     &source_entries,
                     source_dimension,
                     &target,
@@ -1905,11 +1925,15 @@ fn launch_tag_transfer(
                     generation,
                     source_entries,
                     source_dimension,
+                    source_track_numbers,
                     source_carrier: source_carrier.label().to_string(),
+                    target_roots,
                     target,
                     scope,
                     verification,
                     field_count,
+                    fanout_field_counts,
+                    pairing_warnings,
                 })
             })
             .await
@@ -1963,9 +1987,11 @@ fn launch_tag_transfer(
                     super::browse::PendingTagTransferSource::EditorSnapshot {
                         entries,
                         dimension,
+                        authored_track_numbers,
                     } => super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
                         &entries,
                         dimension,
+                        authored_track_numbers.as_deref(),
                         &target,
                         scope,
                         verification,
@@ -2018,6 +2044,40 @@ pub(crate) fn handle_tag_transfer_prepared(
     }
 }
 
+fn reverify_prepared_files_target(
+    prepared: &super::browse::PreparedTagTransfer,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<(), String> {
+    let super::tag_interchange::TransferCarrier::Files { paths: prepared_paths } =
+        &prepared.target
+    else {
+        return Ok(());
+    };
+    if prepared.target_roots.is_empty() {
+        return Err(
+            "internal error: confirmed Files transfer has no retained target roots".to_string(),
+        );
+    }
+    let current = super::keybindings::classify_tag_transfer_roots(
+        &prepared.target_roots,
+        cancel,
+    )?;
+    let super::tag_interchange::TransferCarrier::Files {
+        paths: current_paths,
+    } = current
+    else {
+        return Err(
+            "target folder changed since the confirmation was prepared; retry".to_string(),
+        );
+    };
+    if current_paths != *prepared_paths {
+        return Err(
+            "target folder changed since the confirmation was prepared; retry".to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn launch_prepared_tag_transfer(
     app: &mut AppState,
     prepared: super::browse::PreparedTagTransfer,
@@ -2054,9 +2114,11 @@ pub(crate) fn launch_prepared_tag_transfer(
                     });
                 }
             };
+            reverify_prepared_files_target(&prepared, &cancel)?;
             let mut report = super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
                 &prepared.source_entries,
                 prepared.source_dimension,
+                prepared.source_track_numbers.as_deref(),
                 &prepared.target,
                 prepared.scope,
                 prepared.verification,
@@ -2064,6 +2126,9 @@ pub(crate) fn launch_prepared_tag_transfer(
                 Some(&progress),
             )?;
             report.source_carrier = Some(prepared.source_carrier.clone());
+            report
+                .cardinality_warnings
+                .extend(prepared.pairing_warnings.clone());
             Ok(report)
         })
         .await
@@ -2383,12 +2448,7 @@ pub fn execute_context_action(
         }
         ContextAction::CopyPath(path) => {
             let path_str = path.display().to_string();
-            // OSC 52: copy to system clipboard via terminal escape sequence.
-            // Works in iTerm2, WezTerm, kitty, Alacritty, foot, xterm, etc.
-            let b64 = base64_encode(path_str.as_bytes());
-            let osc = format!("\x1b]52;c;{}\x07", b64);
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            publish_text_clipboard(&path_str);
             app.set_status(format!("Copied: {}", path_str));
         }
         ContextAction::EditMetadata(field) => {
@@ -3218,10 +3278,17 @@ pub fn execute_context_action(
 
 const OSC52_TEXT_CLIPBOARD_MAX_BYTES: usize = 64 * 1024;
 
-/// Publish to Tonepoet's authoritative in-process text clipboard and then make
-/// one best-effort OSC 52 attempt for terminals that support it.
+/// Publish through Tonepoet's single text-clipboard authority. The picker
+/// crate stores the in-process value and invokes the process-wide system
+/// publisher installed by the TUI at startup.
 pub(crate) fn publish_text_clipboard(text: &str) {
     tui_file_picker::write_shared_text_clipboard(text.to_string());
+}
+
+/// Host hook installed into `tui-file-picker`. Publication remains
+/// best-effort: the authoritative in-process clipboard was already updated
+/// before this hook runs.
+pub(crate) fn publish_system_clipboard(text: &str) {
     let _ = write_osc52_clipboard_to(&mut std::io::stdout(), text);
 }
 
@@ -3232,11 +3299,31 @@ pub(crate) fn write_osc52_clipboard_to(
     writer: &mut impl std::io::Write,
     text: &str,
 ) -> std::io::Result<bool> {
+    write_osc52_clipboard_to_with_tmux(writer, text, std::env::var_os("TMUX").is_some())
+}
+
+fn write_osc52_clipboard_to_with_tmux(
+    writer: &mut impl std::io::Write,
+    text: &str,
+    tmux_passthrough: bool,
+) -> std::io::Result<bool> {
     if text.len() > OSC52_TEXT_CLIPBOARD_MAX_BYTES {
         return Ok(false);
     }
     let encoded = base64_encode(text.as_bytes());
-    write!(writer, "\x1b]52;c;{}\x07", encoded)?;
+    let osc = format!("\x1b]52;c;{}\x07", encoded);
+    writer.write_all(osc.as_bytes())?;
+    if tmux_passthrough {
+        writer.write_all(b"\x1bPtmux;")?;
+        for byte in osc.bytes() {
+            if byte == 0x1b {
+                writer.write_all(b"\x1b\x1b")?;
+            } else {
+                writer.write_all(&[byte])?;
+            }
+        }
+        writer.write_all(b"\x1b\\")?;
+    }
     writer.flush()?;
     Ok(true)
 }
@@ -3681,6 +3768,42 @@ fn resolve_convert_start(app: &AppState, invert: bool) -> bool {
 mod tests {
     use super::*;
     use crate::config::TonepoetConfig;
+
+    #[tokio::test]
+    async fn copy_path_routes_through_the_unified_clipboard_helper() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(8);
+        let path = std::path::PathBuf::from("/music/Album/track.flac");
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            || {
+                execute_context_action(
+                    &mut app,
+                    ContextAction::CopyPath(path.clone()),
+                    &tx,
+                    false,
+                );
+            },
+        );
+        // One publication through the single authority: hook fired once with
+        // the path text, and the in-app clipboard holds the same text.
+        assert_eq!(
+            published.borrow().as_slice(),
+            &["/music/Album/track.flac".to_string()],
+            "CopyPath must publish exactly once through the unified helper"
+        );
+        assert_eq!(
+            tui_file_picker::read_shared_text_clipboard(),
+            "/music/Album/track.flac"
+        );
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(status, _)| status.contains("Copied:")));
+    }
+
     use crate::tui::app::{
         AppScreen, FilePickerPurpose, MetadataEditorState, MetadataTechnicalDetails, SourceMode,
     };
@@ -4074,13 +4197,23 @@ mod tests {
     #[test]
     fn osc52_tag_clipboard_write_is_exact_and_size_gated() {
         let mut emitted = Vec::new();
-        assert!(write_osc52_clipboard_to(&mut emitted, "Duke").expect("OSC 52 write"));
+        assert!(write_osc52_clipboard_to_with_tmux(&mut emitted, "Duke", false)
+            .expect("OSC 52 write"));
         assert_eq!(emitted, b"\x1b]52;c;RHVrZQ==\x07");
 
+        let mut tmux = Vec::new();
+        assert!(write_osc52_clipboard_to_with_tmux(&mut tmux, "Duke", true)
+            .expect("tmux OSC 52 write"));
+        assert_eq!(
+            tmux,
+            b"\x1b]52;c;RHVrZQ==\x07\x1bPtmux;\x1b\x1b]52;c;RHVrZQ==\x07\x1b\\"
+        );
+
         let mut oversized = Vec::new();
-        assert!(!write_osc52_clipboard_to(
+        assert!(!write_osc52_clipboard_to_with_tmux(
             &mut oversized,
             &"x".repeat(OSC52_TEXT_CLIPBOARD_MAX_BYTES + 1),
+            true,
         )
         .expect("oversized OSC 52 skip"));
         assert!(oversized.is_empty(), "oversized payloads must not emit a partial escape");
@@ -4099,6 +4232,41 @@ mod tests {
         record_tag_transfer_report_side_effects(&mut app, &report);
 
         assert!(app.browse.tag_transfer_refresh_pending);
+    }
+
+    #[test]
+    fn confirmed_files_target_is_reexpanded_and_refuses_membership_changes() {
+        let temp = tempfile::tempdir().expect("transfer target tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        let third = temp.path().join("03.flac");
+        std::fs::write(&first, b"one").expect("first target");
+        std::fs::write(&second, b"two").expect("second target");
+        let prepared = super::super::browse::PreparedTagTransfer {
+            generation: 1,
+            source_entries: Vec::new(),
+            source_dimension: super::super::tag_interchange::TransferDimension::Files(1),
+            source_track_numbers: None,
+            source_carrier: "files".to_string(),
+            target_roots: vec![temp.path().to_path_buf()],
+            target: super::super::tag_interchange::TransferCarrier::Files {
+                paths: vec![first, second],
+            },
+            scope: super::super::app::TagTransferScope::All,
+            verification: tui_file_picker::VerificationMode::Standard,
+            field_count: 1,
+            fanout_field_counts: None,
+            pairing_warnings: Vec::new(),
+        };
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        reverify_prepared_files_target(&prepared, &cancel)
+            .expect("unchanged target membership re-verifies");
+
+        std::fs::write(&third, b"three").expect("third target");
+        assert_eq!(
+            reverify_prepared_files_target(&prepared, &cancel).unwrap_err(),
+            "target folder changed since the confirmation was prepared; retry"
+        );
     }
 
     #[test]

@@ -9583,9 +9583,12 @@ pub struct CuePreviewState {
     /// Destination path (existing CUE for `:cue-fill`, derived filename
     /// for `:cue-mb`).
     pub write_path: std::path::PathBuf,
-    /// One-line summary shown in the title bar
+    /// One-line summary shown beneath the title bar
     /// (e.g., `"Filled CUE: 7 ISRCs, 1 catalog"`).
     pub summary: String,
+    /// Optional generic title for read-only informational previews. `None`
+    /// preserves the historical CUE-preview title derived from `write_path`.
+    pub title_override: Option<String>,
     /// Top row of the visible window for vim-smooth scroll.
     pub scroll: usize,
     /// 0-based line being edited (for renderer highlight + commit
@@ -9610,6 +9613,7 @@ impl CuePreviewState {
             content,
             write_path,
             summary,
+            title_override: None,
             scroll: 0,
             cursor: None,
             edit: None,
@@ -9626,12 +9630,22 @@ impl CuePreviewState {
             content,
             write_path: std::path::PathBuf::new(),
             summary,
+            title_override: None,
             scroll: 0,
             cursor: None,
             edit: None,
             last_click: None,
             read_only: true,
         }
+    }
+
+    /// Build a read-only informational help surface using the mature preview
+    /// renderer and its scrolling/close controls without inventing a second
+    /// generic text-overlay implementation.
+    pub fn new_readonly_help(title: String, content: String, summary: String) -> Self {
+        let mut state = Self::new_readonly(content, summary);
+        state.title_override = Some(title);
+        state
     }
 
     /// Number of content lines (cached for scroll bounds + display).

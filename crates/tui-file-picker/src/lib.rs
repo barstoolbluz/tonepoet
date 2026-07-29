@@ -29,8 +29,9 @@ pub use filesystem_clipboard::{remap_path_after_cut, FilesystemClipboard};
 pub use text_input::{
     apply_path_completion, apply_tab_completion, apply_template_variable_completion,
     handle_text_input_key, handle_text_input_key_with_boundaries, read_shared_text_clipboard,
-    with_scoped_shared_text_clipboard, write_shared_text_clipboard, CompletionMode,
-    TextBoundaryMode, TextInputState,
+    set_shared_clipboard_publish_hook, with_scoped_shared_text_clipboard,
+    with_scoped_shared_text_clipboard_publish_hook, write_shared_text_clipboard,
+    CompletionMode, TextBoundaryMode, TextInputState,
 };
 pub use type_ahead::{
     first_type_ahead_match, TypeAheadCandidate, TypeAheadState, TYPE_AHEAD_TIMEOUT,

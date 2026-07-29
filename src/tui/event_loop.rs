@@ -44,6 +44,9 @@ pub async fn run_app(
     tx: mpsc::Sender<AppMessage>,
     mut rx: mpsc::Receiver<AppMessage>,
 ) -> io::Result<()> {
+    let _ = tui_file_picker::set_shared_clipboard_publish_hook(
+        super::context_menu::publish_system_clipboard,
+    );
     // Set the message channel on BrowseState so navigation methods can
     // spawn async scans. Must happen before the event loop starts.
     app.browse.set_tx(tx.clone());
@@ -882,6 +885,32 @@ fn append_ignored_directory_disclosure(app: &mut AppState, ignored_directories: 
         .map(|(message, _)| message.clone())
         .unwrap_or_else(|| "file picker: selection completed".to_string());
     app.set_status(format!("{current} {suffix}"));
+}
+
+fn file_picker_purpose_uses_single_path(purpose: &super::app::FilePickerPurpose) -> bool {
+    !matches!(
+        purpose,
+        super::app::FilePickerPurpose::BrowseTagTransfer { .. }
+            | super::app::FilePickerPurpose::MetadataTagTransfer { .. }
+    )
+}
+
+fn append_first_of_many_disclosure(
+    app: &mut AppState,
+    purpose: &super::app::FilePickerPurpose,
+    selected_count: usize,
+) {
+    if selected_count <= 1 || !file_picker_purpose_uses_single_path(purpose) {
+        return;
+    }
+    let current = app
+        .status_message
+        .as_ref()
+        .map(|(message, _)| message.clone())
+        .unwrap_or_else(|| "file picker: selection completed".to_string());
+    app.set_status(format!(
+        "{current} (first of {selected_count} selected files used)"
+    ));
 }
 
 fn reduce_file_picker_complete(
@@ -5202,7 +5231,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             paths,
             ignored_directories,
         } => {
+            let selected_count = paths.len();
+            let disclosure_purpose = purpose.clone();
             reduce_file_picker_complete(app, session_id, purpose, path, paths, tx);
+            append_first_of_many_disclosure(app, &disclosure_purpose, selected_count);
             append_ignored_directory_disclosure(app, ignored_directories);
         }
         AppMessage::FileTaskProgress { session_id, update } => {

@@ -27,12 +27,28 @@ pub(crate) fn tag_transfer_picker_filter() -> tui_file_picker::FilePickerFilter 
 /// Carrier selected at the transfer boundary. CUE carriers retain both their
 /// policy-selected text and the concrete write authority needed for TOCTOU
 /// revalidation immediately before a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarCueWriteMethod {
+    /// Rewrite only the authored sidecar. This is the explicit `.cue`
+    /// contract and the only supported target shape for synthetic multi-part
+    /// image albums this round.
+    SidecarOnly,
+    /// Write full Files-dimension tags to each one-file-per-track member, then
+    /// rewrite the CUE-capped sidecar only after every member write succeeds.
+    PerFileAndSidecar,
+}
+
 #[derive(Debug, Clone)]
 pub enum TransferCarrier {
     Files { paths: Vec<std::path::PathBuf> },
     SidecarCue {
         cue_path: std::path::PathBuf,
-        image_path: std::path::PathBuf,
+        /// Distinct referenced member images in first-reference order.
+        image_paths: Vec<std::path::PathBuf>,
+        /// Member ownership aligned to authored TRACK-number order.
+        track_audio_paths: Vec<std::path::PathBuf>,
+        role: crate::convert::split_cue_album::SplitCueMemberRole,
+        write_method: SidecarCueWriteMethod,
         // Written by classification; read by carrier regression tests.
         #[allow(dead_code)]
         cue_text: String,
@@ -43,6 +59,9 @@ pub enum TransferCarrier {
         #[allow(dead_code)]
         cue_text: String,
         sheet: crate::convert::cue_parser::CueSheet,
+        /// A multi-FILE embedded CUESHEET may be read as a source, but one
+        /// member image cannot authoritatively rewrite sibling references.
+        multi_file_read_only: bool,
     },
 }
 
@@ -66,6 +85,20 @@ impl TransferCarrier {
             Self::SidecarCue { .. } => "sidecar CUE",
             Self::EmbeddedCue { .. } => "embedded CUE",
         }
+    }
+
+    pub(crate) fn authored_track_numbers(&self) -> Option<Vec<u32>> {
+        let sheet = match self {
+            Self::SidecarCue { sheet, .. } | Self::EmbeddedCue { sheet, .. } => sheet,
+            Self::Files { .. } => return None,
+        };
+        let mut numbers = sheet
+            .tracks
+            .iter()
+            .map(|track| track.number)
+            .collect::<Vec<_>>();
+        numbers.sort_unstable();
+        Some(numbers)
     }
 
 }
@@ -770,6 +803,11 @@ mod tests {
         out
     }
 
+    const APE_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata_persistence/ape.wv"
+    ));
+
     fn write_test_flac(path: &std::path::Path, title: &str) {
         let mut bytes = b"fLaC".to_vec();
         bytes.extend_from_slice(&flac_block(0, false, &[0; 34]));
@@ -883,6 +921,67 @@ mod tests {
             error,
             "tag transfer requires 1 source or equal source/target counts; got 2 sources and 3 targets"
         );
+    }
+
+    #[test]
+    fn mixed_wavpack_transfer_empty_slot_deletes_native_fallback_target_field() {
+        // Strong-mode writes consult the metadata journal DB; isolate
+        // XDG dirs (and serialize with other env-redirecting tests) so a
+        // concurrent guard user cannot swap the journal path mid-write.
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-mixed-wavpack-transfer",
+        );
+        let temp = tempfile::tempdir().expect("mixed WavPack transfer tempdir");
+        let first = temp.path().join("01-first.wv");
+        let second = temp.path().join("02-second.wv");
+        std::fs::write(&first, APE_NUMBERING_FIXTURE).expect("write first WavPack target");
+        std::fs::write(&second, APE_NUMBERING_FIXTURE).expect("write second WavPack target");
+        // The shared fixture has no TITLE; seed one on the delete target so
+        // the empty slot performs a real deletion (a written change).
+        super::super::probe::write_all_tags(
+            &first,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("Doomed Title".to_string()))],
+        )
+        .expect("seed TITLE on first target");
+        super::super::probe::inject_invalid_ape_key_item_for_test(
+            &first,
+            "&год".as_bytes(),
+            b"1977",
+        )
+        .expect("force native fallback for first target");
+        super::super::probe::inject_invalid_ape_key_item_for_test(
+            &second,
+            "&год".as_bytes(),
+            b"1977",
+        )
+        .expect("force native fallback for second target");
+
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let report = execute_tag_transfer_from_entries(
+            &[entry("TITLE", &["", "Second title"])],
+            2,
+            &[first.clone(), second.clone()],
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("mixed native-fallback WavPack transfer");
+
+        assert_eq!(
+            report.failed,
+            Vec::new(),
+            "mixed transfer must not fail any target"
+        );
+        assert_eq!(report.written, 2);
+        // File-level absence proof (the merged reader may synthesize
+        // canonical placeholder rows).
+        assert!(
+            !super::super::probe::native_ape_has_item_for_test(&first, "TITLE")
+                .expect("parse first target"),
+            "deleted TITLE item must be absent from the rewritten APEv2 tag"
+        );
+        assert_eq!(merged_value(&second, "TITLE").as_deref(), Some("Second title"));
     }
 
     #[test]
@@ -1305,10 +1404,12 @@ mod tests {
             )
             .to_string(),
             sheet,
+            multi_file_read_only: false,
         };
         let error = execute_tag_transfer_to_cue(
             &source,
             TransferDimension::Tracks(2),
+            Some(&[1, 2]),
             &target,
             super::super::app::TagTransferScope::All,
             tui_file_picker::VerificationMode::Standard,
@@ -1343,7 +1444,10 @@ mod tests {
         std::fs::write(&cue, original).expect("cue");
         let target = TransferCarrier::SidecarCue {
             cue_path: cue.clone(),
-            image_path: image,
+            image_paths: vec![image.clone()],
+            track_audio_paths: vec![image; 2],
+            role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+            write_method: SidecarCueWriteMethod::SidecarOnly,
             cue_text: original.to_string(),
             sheet: crate::convert::cue_parser::parse_cue(original),
         };
@@ -1357,6 +1461,7 @@ mod tests {
         let first = execute_tag_transfer_from_entries_to_carrier(
             &source,
             TransferDimension::Tracks(2),
+            Some(&[1, 2]),
             &target,
             super::super::app::TagTransferScope::All,
             tui_file_picker::VerificationMode::Strong,
@@ -1383,6 +1488,7 @@ mod tests {
         let second = execute_tag_transfer_from_entries_to_carrier(
             &source,
             TransferDimension::Tracks(2),
+            Some(&[1, 2]),
             &target,
             super::super::app::TagTransferScope::All,
             tui_file_picker::VerificationMode::Strong,
@@ -1431,6 +1537,7 @@ mod tests {
             image_path: image.clone(),
             cue_text: original.to_string(),
             sheet: crate::convert::cue_parser::parse_cue(original),
+            multi_file_read_only: false,
         };
         let source = vec![
             entry("ALBUM", &["New Album", "New Album"]),
@@ -1442,6 +1549,7 @@ mod tests {
         let first = execute_tag_transfer_from_entries_to_carrier(
             &source,
             TransferDimension::Tracks(2),
+            Some(&[1, 2]),
             &target,
             super::super::app::TagTransferScope::All,
             tui_file_picker::VerificationMode::Strong,
@@ -1472,6 +1580,7 @@ mod tests {
         let second = execute_tag_transfer_from_entries_to_carrier(
             &source,
             TransferDimension::Tracks(2),
+            Some(&[1, 2]),
             &target,
             super::super::app::TagTransferScope::All,
             tui_file_picker::VerificationMode::Strong,
@@ -1509,7 +1618,7 @@ mod tests {
         validate_sidecar_transfer_snapshot(
             &cue,
             &std::fs::read_to_string(&cue).expect("read cue snapshot"),
-            &image,
+            &[image.clone(), image.clone()],
             &expected_sheet,
         )
             .expect("unchanged target must re-admit");
@@ -1528,47 +1637,207 @@ mod tests {
         assert!(validate_sidecar_transfer_snapshot(
             &cue,
             &std::fs::read_to_string(&cue).expect("read cue snapshot"),
-            &image,
+            &[image.clone(), image.clone()],
             &expected_sheet,
         )
             .expect_err("retargeted cue must refuse")
-            .contains("no longer references the expected image"));
+            .contains("no longer resolves to the expected per-track image set"));
 
-        for changed in [
-            concat!(
-                "FILE \"album.flac\" WAVE\n",
-                "  TRACK 01 AUDIO\n",
-                "    INDEX 01 00:00:00\n",
-                "  TRACK 02 AUDIO\n",
-                "    INDEX 01 04:00:00\n",
+        // Same-count variants trip the geometry check; the added-track
+        // variant trips the earlier count/ownership check — a different
+        // (equally fail-closed) refusal wording.
+        for (changed, expected_refusal) in [
+            (
+                concat!(
+                    "FILE \"album.flac\" WAVE\n",
+                    "  TRACK 01 AUDIO\n",
+                    "    INDEX 01 00:00:00\n",
+                    "  TRACK 02 AUDIO\n",
+                    "    INDEX 01 04:00:00\n",
+                ),
+                "changed track structure after classification",
             ),
-            concat!(
-                "FILE \"album.flac\" WAVE\n",
-                "  TRACK 01 AUDIO\n",
-                "    INDEX 01 00:00:00\n",
-                "  TRACK 03 AUDIO\n",
-                "    INDEX 01 03:00:00\n",
+            (
+                concat!(
+                    "FILE \"album.flac\" WAVE\n",
+                    "  TRACK 01 AUDIO\n",
+                    "    INDEX 01 00:00:00\n",
+                    "  TRACK 03 AUDIO\n",
+                    "    INDEX 01 03:00:00\n",
+                ),
+                "changed track structure after classification",
             ),
-            concat!(
-                "FILE \"album.flac\" WAVE\n",
-                "  TRACK 01 AUDIO\n",
-                "    INDEX 01 00:00:00\n",
-                "  TRACK 02 AUDIO\n",
-                "    INDEX 01 03:00:00\n",
-                "  TRACK 03 AUDIO\n",
-                "    INDEX 01 06:00:00\n",
+            (
+                concat!(
+                    "FILE \"album.flac\" WAVE\n",
+                    "  TRACK 01 AUDIO\n",
+                    "    INDEX 01 00:00:00\n",
+                    "  TRACK 02 AUDIO\n",
+                    "    INDEX 01 03:00:00\n",
+                    "  TRACK 03 AUDIO\n",
+                    "    INDEX 01 06:00:00\n",
+                ),
+                "changed track/image ownership after classification",
             ),
         ] {
             std::fs::write(&cue, changed).expect("change track geometry");
             assert!(validate_sidecar_transfer_snapshot(
             &cue,
             &std::fs::read_to_string(&cue).expect("read cue snapshot"),
-            &image,
+            &[image.clone(), image.clone()],
             &expected_sheet,
         )
                 .expect_err("any geometry change must refuse")
-                .contains("changed track structure after classification"));
+                .contains(expected_refusal));
         }
+    }
+
+    #[test]
+    fn files_to_tracks_pairing_requires_the_exact_authored_number_sequence() {
+        let paths = vec![
+            std::path::PathBuf::from("/album/02.flac"),
+            std::path::PathBuf::from("/album/03.flac"),
+        ];
+        let entries = vec![entry("TRACKNUMBER", &["2", "3"])];
+
+        assert_eq!(
+            corroborate_file_track_order(&paths, &entries, &[1, 2]).unwrap_err(),
+            "file order and track numbers disagree; renumber or rename before transferring"
+        );
+
+        let warning = corroborate_file_track_order(
+            &[
+                std::path::PathBuf::from("/album/alpha.flac"),
+                std::path::PathBuf::from("/album/beta.flac"),
+            ],
+            &[entry("TITLE", &["Alpha", "Beta"])],
+            &[1, 2],
+        )
+        .expect("missing numbering is an honestly disclosed positional fallback")
+        .expect("fallback warning");
+        assert!(warning.contains("paired by filename order"));
+    }
+
+    #[test]
+    fn editor_snapshot_retains_authored_cue_track_numbers_for_files_pairing() {
+        let cue = concat!(
+            "FILE \"b.flac\" WAVE\n",
+            "  TRACK 07 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "FILE \"a.flac\" WAVE\n",
+            "  TRACK 03 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        assert_eq!(
+            editor_snapshot_authored_track_numbers(
+                &[entry("CUESHEET", &[cue])],
+                TransferDimension::Tracks(2),
+            ),
+            Some(vec![3, 7])
+        );
+        assert_eq!(
+            editor_snapshot_authored_track_numbers(
+                &[entry("CUESHEET", &[cue])],
+                TransferDimension::Files(2),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn embedded_target_refusals_surface_before_confirmation() {
+        let source = vec![entry("TITLE", &["One", "Two"])];
+        let sheet = crate::convert::cue_parser::parse_cue(concat!(
+            "FILE \"album.wav\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 03:00:00\n",
+        ));
+        let non_flac = TransferCarrier::EmbeddedCue {
+            image_path: std::path::PathBuf::from("/album/album.wav"),
+            cue_text: String::new(),
+            sheet: sheet.clone(),
+            multi_file_read_only: false,
+        };
+        assert_eq!(
+            preview_tag_transfer(
+                &source,
+                TransferDimension::Tracks(2),
+                &non_flac,
+                super::super::app::TagTransferScope::All,
+            )
+            .unwrap_err(),
+            "embedded CUE write is supported for FLAC images this round"
+        );
+
+        let multi_file = TransferCarrier::EmbeddedCue {
+            image_path: std::path::PathBuf::from("/album/album.flac"),
+            cue_text: String::new(),
+            sheet,
+            multi_file_read_only: true,
+        };
+        assert!(preview_tag_transfer(
+            &source,
+            TransferDimension::Tracks(2),
+            &multi_file,
+            super::super::app::TagTransferScope::All,
+        )
+        .unwrap_err()
+        .contains("read-only transfer sources"));
+    }
+
+    #[test]
+    fn metadata_sidecar_member_failure_leaves_sidecar_byte_identical() {
+        let temp = tempfile::tempdir().expect("multi-FILE transfer tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        let alias = temp.path().join("02-alias.flac");
+        let cue = temp.path().join("album.cue");
+        write_test_flac(&first, "Old One");
+        write_test_flac(&second, "Old Two");
+        std::fs::hard_link(&second, &alias).expect("create hardlink refusal fixture");
+        let cue_text = concat!(
+            "FILE \"01.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Old One\"\n",
+            "    INDEX 01 00:00:00\n",
+            "FILE \"02.flac\" WAVE\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Old Two\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        std::fs::write(&cue, cue_text).expect("write multi-FILE CUE");
+        let before = std::fs::read(&cue).expect("snapshot sidecar");
+        let target = TransferCarrier::SidecarCue {
+            cue_path: cue.clone(),
+            image_paths: vec![first.clone(), second.clone()],
+            track_audio_paths: vec![first.clone(), second.clone()],
+            role: crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar,
+            write_method: SidecarCueWriteMethod::PerFileAndSidecar,
+            cue_text: cue_text.to_string(),
+            sheet: crate::convert::cue_parser::parse_cue(cue_text),
+        };
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let report = execute_tag_transfer_from_entries_to_carrier(
+            &[entry("TITLE", &["New One", "New Two"])],
+            TransferDimension::Files(2),
+            None,
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("member failure is reported in-band");
+
+        assert_eq!(merged_value(&first, "TITLE").as_deref(), Some("New One"));
+        assert_eq!(merged_value(&second, "TITLE").as_deref(), Some("Old Two"));
+        assert!(report.failed.iter().any(|(path, _)| path == &second));
+        assert!(report.failed.iter().any(|(path, reason)| {
+            path == &cue && reason.contains("sidecar left unchanged")
+        }));
+        assert_eq!(std::fs::read(&cue).expect("re-read sidecar"), before);
     }
 
 }
@@ -2087,7 +2356,12 @@ pub(crate) fn read_transfer_source_entries(
         .metadata_errors
         .iter()
         .enumerate()
-        .filter_map(|(index, issue)| issue.as_ref().map(|issue| (index, issue)))
+        .filter_map(|(index, issue)| {
+            issue
+                .as_ref()
+                .filter(|issue| issue.blocks_metadata_use())
+                .map(|issue| (index, issue))
+        })
         .collect::<Vec<_>>();
     if !source_failures.is_empty() {
         let (index, issue) = source_failures[0];
@@ -2107,6 +2381,90 @@ pub(crate) fn read_transfer_source_entries(
         .into_iter()
         .filter(|entry| transfer_entry_selected(entry, scope, TransferDimension::Files(source_paths.len())))
         .collect())
+}
+
+fn parse_transfer_track_number(value: &str) -> Option<u32> {
+    value
+        .trim()
+        .split_once('/')
+        .map(|(number, _)| number)
+        .unwrap_or_else(|| value.trim())
+        .parse::<u32>()
+        .ok()
+        .filter(|number| *number > 0)
+}
+
+fn carrier_authored_track_numbers(carrier: &TransferCarrier) -> Option<Vec<u32>> {
+    carrier.authored_track_numbers()
+}
+
+fn corroborate_file_track_order(
+    paths: &[std::path::PathBuf],
+    entries: &[TagEntry],
+    expected_track_numbers: &[u32],
+) -> Result<Option<String>, String> {
+    if paths.len() != expected_track_numbers.len() {
+        return Err(
+            "internal error: file/track corroboration cardinality mismatch".to_string(),
+        );
+    }
+    let tracknumber = entries.iter().find(|entry| {
+        super::probe::canonical_metadata_display_key(&entry.display_key) == "TRACKNUMBER"
+    });
+    let numbers = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let tagged = tracknumber
+                .and_then(|entry| entry.per_file_values.get(index))
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty());
+            match tagged {
+                // A present TRACKNUMBER is authoritative, including an
+                // invalid value: do not conceal it with a filename fallback.
+                Some(value) => parse_transfer_track_number(value),
+                None => crate::convert::processor::strict_track_number_from_dispatch_path(path)
+                    .or_else(|| crate::tui::preemphasis::metadata::leading_track_number(path)),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if numbers.iter().all(Option::is_some) {
+        let ordered = numbers
+            .iter()
+            .map(|number| number.expect("all numbers checked above"))
+            .collect::<Vec<_>>();
+        if ordered != expected_track_numbers {
+            return Err(
+                "file order and track numbers disagree; renumber or rename before transferring"
+                    .to_string(),
+            );
+        }
+        Ok(None)
+    } else {
+        Ok(Some(
+            "paired by filename order; no complete track-number sequence was available to corroborate the pairing"
+                .to_string(),
+        ))
+    }
+}
+
+pub(crate) fn corroborate_source_pairing(
+    source: &TransferCarrier,
+    target: &TransferCarrier,
+    source_entries: &[TagEntry],
+) -> Result<Option<String>, String> {
+    match (source, target) {
+        (
+            TransferCarrier::Files { paths },
+            TransferCarrier::SidecarCue { .. } | TransferCarrier::EmbeddedCue { .. },
+        ) if paths.len() == target.count() && paths.len() > 1 => {
+            let expected = carrier_authored_track_numbers(target)
+                .ok_or_else(|| "internal error: CUE target has no authored track order".to_string())?;
+            corroborate_file_track_order(paths, source_entries, &expected)
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)] // superseded by the prepared/classified round-7 flow; exercised by regression tests
@@ -2160,6 +2518,7 @@ where
     execute_tag_transfer_to_files_with_writer(
         source_entries,
         TransferDimension::Files(source_count),
+        None,
         target_paths,
         scope,
         verification,
@@ -2172,6 +2531,7 @@ where
 fn execute_tag_transfer_to_files_with_writer<F>(
     source_entries: &[TagEntry],
     source_dimension: TransferDimension,
+    source_track_numbers: Option<&[u32]>,
     target_paths: &[std::path::PathBuf],
     scope: super::app::TagTransferScope,
     verification: tui_file_picker::VerificationMode,
@@ -2204,6 +2564,23 @@ where
             "tag transfer cancelled while reading target metadata",
         )?;
 
+    let target_pairing_warning = if source_dimension.is_tracks()
+        && source_dimension.count() == target_paths.len()
+        && target_paths.len() > 1
+    {
+        match source_track_numbers {
+            Some(expected) => {
+                corroborate_file_track_order(target_paths, &target_merged.entries, expected)?
+            }
+            None => Some(
+                "paired by filename order; the track-dimensional source did not expose authored track numbers for corroboration"
+                    .to_string(),
+            ),
+        }
+    } else {
+        None
+    };
+
     let mut report = TagTransferReport {
         source_count: source_dimension.count(),
         target_count: target_paths.len(),
@@ -2221,6 +2598,9 @@ where
         cardinality_warnings: value_plan.cardinality_warnings,
         ..TagTransferReport::default()
     };
+    if let Some(warning) = target_pairing_warning {
+        report.cardinality_warnings.push(warning);
+    }
 
     let mut target_by_key = std::collections::HashMap::new();
     for entry in &target_merged.entries {
@@ -2247,6 +2627,7 @@ where
             .metadata_errors
             .get(target_index)
             .and_then(|issue| issue.as_ref())
+            .filter(|issue| issue.blocks_metadata_use())
         {
             report
                 .failed
@@ -2394,7 +2775,7 @@ fn transfer_path_identity(path: &std::path::Path) -> std::path::PathBuf {
 fn validate_sidecar_transfer_snapshot(
     cue_path: &std::path::Path,
     current_cue_text: &str,
-    expected_image: &std::path::Path,
+    expected_track_audio_paths: &[std::path::PathBuf],
     expected_sheet: &crate::convert::cue_parser::CueSheet,
 ) -> Result<(), String> {
     let current_sheet = crate::convert::cue_parser::parse_cue(current_cue_text);
@@ -2404,12 +2785,28 @@ fn validate_sidecar_transfer_snapshot(
             cue_path.display()
         )
     })?;
-    let mut referenced_by_identity = std::collections::BTreeMap::new();
-    for file_ref in current_sheet
-        .tracks
-        .iter()
-        .filter_map(|track| track.file.as_deref())
-    {
+    if current_sheet.tracks.len() != expected_track_audio_paths.len() {
+        return Err(format!(
+            "sidecar CUE '{}' changed track/image ownership after classification; left unchanged",
+            cue_path.display()
+        ));
+    }
+    let mut current_track_paths = Vec::with_capacity(current_sheet.tracks.len());
+    let mut seen_track_numbers = std::collections::BTreeSet::new();
+    for track in &current_sheet.tracks {
+        if track.number == 0 || !seen_track_numbers.insert(track.number) {
+            return Err(format!(
+                "sidecar CUE '{}' has invalid or duplicate authored TRACK numbers; left unchanged",
+                cue_path.display()
+            ));
+        }
+        let file_ref = track.file.as_deref().ok_or_else(|| {
+            format!(
+                "sidecar CUE '{}' track {} no longer has a FILE reference; left unchanged",
+                cue_path.display(),
+                track.number
+            )
+        })?;
         let resolved = super::accuraterip::resolve_cue_file_reference(parent, file_ref)
             .ok_or_else(|| {
                 format!(
@@ -2418,15 +2815,20 @@ fn validate_sidecar_transfer_snapshot(
                     file_ref
                 )
             })?;
-        referenced_by_identity
-            .entry(transfer_path_identity(&resolved))
-            .or_insert(resolved);
+        current_track_paths.push((track.number, transfer_path_identity(&resolved)));
     }
-    if referenced_by_identity.len() != 1
-        || !referenced_by_identity.contains_key(&transfer_path_identity(expected_image))
-    {
+    current_track_paths.sort_by_key(|(track_number, _)| *track_number);
+    let current_track_paths = current_track_paths
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>();
+    let expected_track_paths = expected_track_audio_paths
+        .iter()
+        .map(|path| transfer_path_identity(path))
+        .collect::<Vec<_>>();
+    if current_track_paths != expected_track_paths {
         return Err(format!(
-            "sidecar CUE '{}' no longer references the expected image; left unchanged",
+            "sidecar CUE '{}' no longer resolves to the expected per-track image set; left unchanged",
             cue_path.display()
         ));
     }
@@ -2467,7 +2869,12 @@ fn revalidate_embedded_transfer_target(
         || cancel.is_cancelled(),
         "tag transfer cancelled while re-admitting embedded CUE target",
     )?;
-    if let Some(issue) = merged.metadata_errors.first().and_then(|issue| issue.as_ref()) {
+    if let Some(issue) = merged
+        .metadata_errors
+        .first()
+        .and_then(|issue| issue.as_ref())
+        .filter(|issue| issue.blocks_metadata_use())
+    {
         return Err(format!(
             "embedded CUE target '{}' could not be re-read immediately before write; left unchanged: {}",
             image_path.display(),
@@ -2497,9 +2904,64 @@ fn revalidate_embedded_transfer_target(
     Ok(current_text)
 }
 
+fn write_sidecar_transfer(
+    cue_path: &std::path::Path,
+    track_audio_paths: &[std::path::PathBuf],
+    sheet: &crate::convert::cue_parser::CueSheet,
+    replacement: &str,
+) -> Result<Option<super::probe::MetadataWriteCommitReport>, String> {
+    crate::convert::cue_parser::rewrite_cue_sidecar_metadata_from_cuesheet_validated(
+        cue_path,
+        replacement,
+        |_raw, current_cue_text| {
+            validate_sidecar_transfer_snapshot(
+                cue_path,
+                current_cue_text,
+                track_audio_paths,
+                sheet,
+            )
+        },
+    )
+    .map(|outcome| match outcome {
+        crate::convert::cue_parser::CueSidecarWritebackOutcome::Unchanged => None,
+        crate::convert::cue_parser::CueSidecarWritebackOutcome::Rewritten { .. } => {
+            Some(super::probe::MetadataWriteCommitReport::default())
+        }
+        crate::convert::cue_parser::CueSidecarWritebackOutcome::RewrittenUtf8Fallback {
+            source_encoding,
+        } => Some(super::probe::MetadataWriteCommitReport {
+            durability_warnings: vec![format!(
+                "sidecar CUE encoding changed from {source_encoding} to UTF-8 because the requested metadata was not representable losslessly"
+            )],
+        }),
+    })
+}
+
+fn preflight_sidecar_transfer_snapshot(
+    cue_path: &std::path::Path,
+    track_audio_paths: &[std::path::PathBuf],
+    sheet: &crate::convert::cue_parser::CueSheet,
+) -> Result<(), String> {
+    let raw = std::fs::read(cue_path).map_err(|error| {
+        format!(
+            "read sidecar CUE '{}' before member writes: {error}",
+            cue_path.display()
+        )
+    })?;
+    let current = crate::convert::cue_parser::decode_cue_bytes_for_path(&raw, cue_path)
+        .map_err(|error| {
+            format!(
+                "decode sidecar CUE '{}' before member writes: {error}",
+                cue_path.display()
+            )
+        })?;
+    validate_sidecar_transfer_snapshot(cue_path, &current, track_audio_paths, sheet)
+}
+
 fn execute_tag_transfer_to_cue(
     source_entries: &[TagEntry],
     source_dimension: TransferDimension,
+    _source_track_numbers: Option<&[u32]>,
     target: &TransferCarrier,
     scope: super::app::TagTransferScope,
     verification: tui_file_picker::VerificationMode,
@@ -2507,7 +2969,7 @@ fn execute_tag_transfer_to_cue(
     progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
 ) -> Result<TagTransferReport, String> {
     let target_dimension = target.dimension();
-    let value_plan = plan_transfer_values_for_dimensions(
+    let cue_value_plan = plan_transfer_values_for_dimensions(
         source_entries,
         source_dimension,
         target_dimension,
@@ -2520,11 +2982,113 @@ fn execute_tag_transfer_to_cue(
             return Err("internal error: CUE writer received file carrier".to_string())
         }
     };
-    let replacement = cue_metadata_replacement_text(&value_plan, target_sheet)?;
+    let replacement = cue_metadata_replacement_text(&cue_value_plan, target_sheet)?;
+
+    if let TransferCarrier::SidecarCue {
+        cue_path,
+        track_audio_paths,
+        role,
+        write_method: SidecarCueWriteMethod::PerFileAndSidecar,
+        sheet,
+        ..
+    } = target
+    {
+        if *role != crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar {
+            return Err(
+                "internal error: per-file CUE fan-out requested for a synthetic album part"
+                    .to_string(),
+            );
+        }
+        if track_audio_paths.len() != sheet.tracks.len() {
+            return Err(
+                "internal error: per-file CUE fan-out track/image cardinality mismatch"
+                    .to_string(),
+            );
+        }
+        // Validate the complete sidecar ownership/geometry snapshot before
+        // mutating any member. The validated rewrite below repeats the same
+        // check immediately before commit, closing the intervening race.
+        preflight_sidecar_transfer_snapshot(cue_path, track_audio_paths, sheet)?;
+        let target_track_numbers = target
+            .authored_track_numbers()
+            .ok_or_else(|| "internal error: CUE target has no authored track order".to_string())?;
+        let combined_total = track_audio_paths.len() + 1;
+        let mapped_progress = |completed: usize, _total: usize, path: &std::path::Path| {
+            if let Some(progress) = progress {
+                progress(completed, combined_total, path);
+            }
+        };
+        let mut report = execute_tag_transfer_to_files_with_writer(
+            source_entries,
+            source_dimension,
+            Some(&target_track_numbers),
+            track_audio_paths,
+            scope,
+            verification,
+            cancel,
+            Some(&mapped_progress),
+            |path, changes, cancel, verification| {
+                super::probe::write_all_tags_for_transfer_at_verification(
+                    path,
+                    changes,
+                    cancel,
+                    verification,
+                )
+            },
+        )?;
+        let member_failures = report.failed.len();
+        report.target_carrier = Some("files + sidecar CUE".to_string());
+        report.target_count = sheet.tracks.len();
+        report.target_paths.insert(0, cue_path.clone());
+        report.written_fields += cue_value_plan.fields.len();
+        report.skipped_numbering_keys
+            .extend(cue_value_plan.skipped_numbering_keys.clone());
+        report.skipped_fields
+            .extend(cue_value_plan.skipped_fields.clone());
+        report.cardinality_warnings
+            .extend(cue_value_plan.cardinality_warnings.clone());
+
+        if member_failures > 0 {
+            report.failed.push((
+                cue_path.clone(),
+                format!(
+                    "sidecar left unchanged ({member_failures} member write(s) failed)"
+                ),
+            ));
+            if let Some(progress) = progress {
+                progress(combined_total, combined_total, cue_path);
+            }
+            return Ok(report);
+        }
+        if cancel.is_cancelled() {
+            report.failed.push((
+                cue_path.clone(),
+                "tag transfer cancelled after member writes; sidecar left unchanged".to_string(),
+            ));
+            if let Some(progress) = progress {
+                progress(combined_total, combined_total, cue_path);
+            }
+            return Ok(report);
+        }
+        match write_sidecar_transfer(cue_path, track_audio_paths, sheet, &replacement) {
+            Ok(Some(commit)) => {
+                report.written += 1;
+                report.written_paths.push(cue_path.clone());
+                report.durability_warnings.extend(commit.durability_warnings);
+            }
+            Ok(None) => report.unchanged += 1,
+            Err(error) => report.failed.push((cue_path.clone(), error)),
+        }
+        if let Some(progress) = progress {
+            progress(combined_total, combined_total, cue_path);
+        }
+        return Ok(report);
+    }
+
     let mut report = TagTransferReport {
         source_count: source_dimension.count(),
         target_count: target_dimension.count(),
-        written_fields: value_plan.fields.len(),
+        written_fields: cue_value_plan.fields.len(),
         source_carrier: Some(if source_dimension.is_tracks() {
             "CUE tracks".to_string()
         } else {
@@ -2532,10 +3096,10 @@ fn execute_tag_transfer_to_cue(
         }),
         target_carrier: Some(target.label().to_string()),
         target_paths: vec![target_path.to_path_buf()],
-        first_track_collapse: value_plan.first_track_collapse,
-        skipped_numbering_keys: value_plan.skipped_numbering_keys,
-        skipped_fields: value_plan.skipped_fields,
-        cardinality_warnings: value_plan.cardinality_warnings,
+        first_track_collapse: cue_value_plan.first_track_collapse,
+        skipped_numbering_keys: cue_value_plan.skipped_numbering_keys,
+        skipped_fields: cue_value_plan.skipped_fields,
+        cardinality_warnings: cue_value_plan.cardinality_warnings,
         ..TagTransferReport::default()
     };
 
@@ -2545,41 +3109,22 @@ fn execute_tag_transfer_to_cue(
     let write_result = match target {
         TransferCarrier::SidecarCue {
             cue_path,
-            image_path,
+            track_audio_paths,
             sheet,
             ..
-        } => {
-            crate::convert::cue_parser::rewrite_cue_sidecar_metadata_from_cuesheet_validated(
-                cue_path,
-                &replacement,
-                |_raw, current_cue_text| {
-                    validate_sidecar_transfer_snapshot(
-                        cue_path,
-                        current_cue_text,
-                        image_path,
-                        sheet,
-                    )
-                },
-            )
-            .map(|outcome| match outcome {
-                crate::convert::cue_parser::CueSidecarWritebackOutcome::Unchanged => None,
-                crate::convert::cue_parser::CueSidecarWritebackOutcome::Rewritten { .. } => {
-                    Some(super::probe::MetadataWriteCommitReport::default())
-                }
-                crate::convert::cue_parser::CueSidecarWritebackOutcome::RewrittenUtf8Fallback {
-                    source_encoding,
-                } => Some(super::probe::MetadataWriteCommitReport {
-                    durability_warnings: vec![format!(
-                        "sidecar CUE encoding changed from {source_encoding} to UTF-8 because the requested metadata was not representable losslessly"
-                    )],
-                }),
-            })
-        }
+        } => write_sidecar_transfer(cue_path, track_audio_paths, sheet, &replacement),
         TransferCarrier::EmbeddedCue {
             image_path,
             sheet,
+            multi_file_read_only,
             ..
         } => {
+            if *multi_file_read_only {
+                return Err(
+                    "multi-FILE embedded CUESHEET carriers are read-only transfer sources; a single member cannot authoritatively rewrite sibling references"
+                        .to_string(),
+                );
+            }
             let is_flac = image_path
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -2629,6 +3174,7 @@ fn execute_tag_transfer_to_cue(
 pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
     source_entries: &[TagEntry],
     source_dimension: TransferDimension,
+    source_track_numbers: Option<&[u32]>,
     target: &TransferCarrier,
     scope: super::app::TagTransferScope,
     verification: tui_file_picker::VerificationMode,
@@ -2639,6 +3185,7 @@ pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
         TransferCarrier::Files { paths } => execute_tag_transfer_to_files_with_writer(
             source_entries,
             source_dimension,
+            source_track_numbers,
             paths,
             scope,
             verification,
@@ -2657,6 +3204,7 @@ pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
             execute_tag_transfer_to_cue(
                 source_entries,
                 source_dimension,
+                source_track_numbers,
                 target,
                 scope,
                 verification,
@@ -2673,6 +3221,26 @@ pub(crate) fn preview_tag_transfer(
     target: &TransferCarrier,
     scope: super::app::TagTransferScope,
 ) -> Result<usize, String> {
+    if let TransferCarrier::EmbeddedCue {
+        image_path,
+        multi_file_read_only,
+        ..
+    } = target
+    {
+        if *multi_file_read_only {
+            return Err(
+                "multi-FILE embedded CUESHEET carriers are read-only transfer sources; a single member cannot authoritatively rewrite sibling references"
+                    .to_string(),
+            );
+        }
+        let is_flac = image_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"));
+        if !is_flac {
+            return Err("embedded CUE write is supported for FLAC images this round".to_string());
+        }
+    }
     Ok(plan_transfer_values_for_dimensions(
         source_entries,
         source_dimension,
@@ -2681,6 +3249,38 @@ pub(crate) fn preview_tag_transfer(
     )?
     .fields
     .len())
+}
+
+pub(crate) fn preview_tag_transfer_fanout(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    target: &TransferCarrier,
+    scope: super::app::TagTransferScope,
+) -> Result<(usize, Option<(usize, usize)>), String> {
+    let cue_or_file_count = preview_tag_transfer(
+        source_entries,
+        source_dimension,
+        target,
+        scope,
+    )?;
+    if let TransferCarrier::SidecarCue {
+        track_audio_paths,
+        write_method: SidecarCueWriteMethod::PerFileAndSidecar,
+        ..
+    } = target
+    {
+        let file_count = plan_transfer_values_for_dimensions(
+            source_entries,
+            source_dimension,
+            TransferDimension::Files(track_audio_paths.len()),
+            scope,
+        )?
+        .fields
+        .len();
+        Ok((file_count + cue_or_file_count, Some((file_count, cue_or_file_count))))
+    } else {
+        Ok((cue_or_file_count, None))
+    }
 }
 
 pub(crate) fn execute_tag_transfer_between_carriers(
@@ -2692,9 +3292,12 @@ pub(crate) fn execute_tag_transfer_between_carriers(
     progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
 ) -> Result<TagTransferReport, String> {
     let source_entries = read_transfer_carrier_entries(source, scope, cancel)?;
+    let source_pairing_warning = corroborate_source_pairing(source, target, &source_entries)?;
+    let source_track_numbers = carrier_authored_track_numbers(source);
     let mut report = execute_tag_transfer_from_entries_to_carrier(
         &source_entries,
         source.dimension(),
+        source_track_numbers.as_deref(),
         target,
         scope,
         verification,
@@ -2702,6 +3305,9 @@ pub(crate) fn execute_tag_transfer_between_carriers(
         progress,
     )?;
     report.source_carrier = Some(source.label().to_string());
+    if let Some(warning) = source_pairing_warning {
+        report.cardinality_warnings.push(warning);
+    }
     Ok(report)
 }
 
@@ -2957,6 +3563,36 @@ pub(crate) fn metadata_editor_transfer_snapshot(
         .map(|(_, entry)| entry.clone())
         .collect();
     (entries, dimension)
+}
+
+pub(crate) fn editor_snapshot_authored_track_numbers(
+    entries: &[TagEntry],
+    dimension: TransferDimension,
+) -> Option<Vec<u32>> {
+    let TransferDimension::Tracks(expected_count) = dimension else {
+        return None;
+    };
+    let cue_text = entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .and_then(|entry| {
+            entry
+                .per_file_values
+                .first()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| (!entry.value.trim().is_empty()).then_some(&entry.value))
+        })?;
+    let sheet = crate::convert::cue_parser::parse_cue(cue_text);
+    let mut numbers = sheet
+        .tracks
+        .iter()
+        .map(|track| track.number)
+        .collect::<Vec<_>>();
+    numbers.sort_unstable();
+    let unique_and_valid = numbers.len() == expected_count
+        && numbers.iter().all(|number| *number > 0)
+        && numbers.windows(2).all(|pair| pair[0] != pair[1]);
+    unique_and_valid.then_some(numbers)
 }
 
 pub(crate) fn metadata_editor_unsaved_edit_count(

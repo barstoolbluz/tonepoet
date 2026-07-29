@@ -218,9 +218,12 @@ mod tests {
                 "track.{}",
                 extension.to_ascii_uppercase()
             ));
-            assert!(
-                matches!(classify_file(&path), EntryKind::AudioFile(_)),
-                "canonical extension must classify as audio: {}",
+            let expected = audio_format_from_extension(extension)
+                .expect("table extension must map to a canonical format");
+            assert_eq!(
+                classify_file(&path),
+                EntryKind::AudioFile(expected),
+                "canonical extension must retain its exact format mapping: {}",
                 path.display()
             );
             assert!(is_audio_file_path(&path));

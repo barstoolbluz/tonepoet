@@ -3039,7 +3039,7 @@ pub enum Command {
     Fx(Vec<String>),
     Info,
     Tools,
-    Help,
+    Help(Option<String>),
     /// Sort command for the browse screen. Args: (field?, dir?)
     Sort(Option<String>, Option<String>),
     /// Toggle sort direction
@@ -3290,7 +3290,7 @@ impl std::fmt::Debug for Command {
             Command::Fx(args) => f.debug_tuple("Fx").field(args).finish(),
             Command::Info => f.write_str("Info"),
             Command::Tools => f.write_str("Tools"),
-            Command::Help => f.write_str("Help"),
+            Command::Help(topic) => f.debug_tuple("Help").field(topic).finish(),
             Command::Sort(field, dir) => f.debug_tuple("Sort").field(field).field(dir).finish(),
             Command::SortDir => f.write_str("SortDir"),
             Command::Filter(arg) => f.debug_tuple("Filter").field(arg).finish(),
@@ -3558,7 +3558,7 @@ pub fn parse_command(input: &str) -> Command {
         }
         "info" => Command::Info,
         "tools" => Command::Tools,
-        "h" | "help" => Command::Help,
+        "h" | "help" => Command::Help((!args.is_empty()).then(|| args.to_string())),
         "sort" => {
             let mut sort_parts = args.split_whitespace();
             let field = sort_parts.next().map(|s| s.to_string());
@@ -4351,11 +4351,43 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             app.current_screen = AppScreen::Config;
             app.set_status("Showing config/tools");
         }
-        Command::Help => {
-            app.active_overlay = ActiveOverlay::Help {
-                screen: app.current_screen,
-                scroll: 0,
-            };
+        Command::Help(topic) => {
+            match topic.as_deref().map(str::trim).filter(|topic| !topic.is_empty()) {
+                None => {
+                    app.active_overlay = ActiveOverlay::Help {
+                        screen: app.current_screen,
+                        scroll: 0,
+                    };
+                }
+                Some(topic)
+                    if topic.eq_ignore_ascii_case("clipboard")
+                        || topic.eq_ignore_ascii_case("tmux")
+                        || topic.eq_ignore_ascii_case("byobu") =>
+                {
+                    const CLIPBOARD_HELP: &str = "System clipboard publication over SSH
+
+Tonepoet always updates its in-app text clipboard. It also publishes copy and cut text to the outer terminal with OSC 52.
+
+For tmux or byobu, add both settings to ~/.tmux.conf (or the byobu tmux profile):
+
+  set -g set-clipboard on
+  set -g allow-passthrough on
+
+Reload the tmux configuration or restart the session. The terminal emulator must also permit OSC 52 clipboard writes. Payloads larger than 64 KiB remain available in Tonepoet's in-app clipboard but are not sent through OSC 52. System-clipboard reads are not available over this channel.";
+                    app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+                        super::app::CuePreviewState::new_readonly_help(
+                            "Clipboard help".to_string(),
+                            CLIPBOARD_HELP.to_string(),
+                            "SSH, tmux, byobu, and OSC 52 system-copy requirements".to_string(),
+                        ),
+                    ));
+                }
+                Some(topic) => {
+                    app.set_status(format!(
+                        "Unknown help topic '{topic}'. Available topic: :help clipboard"
+                    ));
+                }
+            }
         }
         Command::Sort(field, dir) => {
             execute_sort(app, field.as_deref(), dir.as_deref(), tx);
@@ -14828,6 +14860,11 @@ mod completion_tests {
 
     #[test]
     fn file_task_diagnostic_commands_parse_and_toggle_notice_policy() {
+        assert!(matches!(parse_command("help"), Command::Help(None)));
+        assert!(matches!(
+            parse_command("help clipboard"),
+            Command::Help(Some(topic)) if topic == "clipboard"
+        ));
         assert!(matches!(parse_command("messages"), Command::FileTaskMessages));
         assert!(matches!(parse_command("task-messages"), Command::FileTaskMessages));
         assert!(matches!(
@@ -14850,6 +14887,28 @@ mod completion_tests {
             &tx,
         );
         assert!(!app.file_task_verbose_degrade_notices);
+    }
+
+    #[test]
+    fn clipboard_help_is_an_in_app_read_only_tmux_byobu_surface() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        execute_command(
+            &mut app,
+            Command::Help(Some("clipboard".to_string())),
+            &tx,
+        );
+
+        let ActiveOverlay::CuePreview(preview) = &app.active_overlay else {
+            panic!("clipboard help must open an in-app read-only preview");
+        };
+        assert!(preview.read_only);
+        assert_eq!(preview.title_override.as_deref(), Some("Clipboard help"));
+        assert!(preview.content.contains("set -g set-clipboard on"));
+        assert!(preview.content.contains("set -g allow-passthrough on"));
+        assert!(preview.content.contains("byobu"));
+        assert!(preview.content.contains("64 KiB"));
     }
 
     #[test]
