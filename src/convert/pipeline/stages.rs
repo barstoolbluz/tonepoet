@@ -640,10 +640,43 @@ pub fn prepare_independent_single_file_album_batch_for_dispatch(
 /// Internal/test hook for constructing explicit old/new run identities. The
 /// production dispatch entry point above always generates a fresh id.
 fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
-    mut requests: Vec<PipelineRequest>,
+    requests: Vec<PipelineRequest>,
     conversion_log_batch_id: impl Into<String>,
     album_output_dir: PathBuf,
     source_grouping_root: PathBuf,
+) -> Result<AlbumBatchDispatch, RequestValidationError> {
+    prepare_independent_single_file_album_batch_for_dispatch_with_policy(
+        requests,
+        conversion_log_batch_id.into(),
+        album_output_dir,
+        source_grouping_root,
+        AlbumBatchOrdering::ProvenTrackOrder,
+        true,
+    )
+}
+
+pub(crate) fn prepare_independent_single_file_album_batch_for_completion_order_dispatch(
+    requests: Vec<PipelineRequest>,
+    album_output_dir: PathBuf,
+    source_grouping_root: PathBuf,
+) -> Result<AlbumBatchDispatch, RequestValidationError> {
+    prepare_independent_single_file_album_batch_for_dispatch_with_policy(
+        requests,
+        new_conversion_log_batch_id(),
+        album_output_dir,
+        source_grouping_root,
+        AlbumBatchOrdering::CompletionOrder,
+        false,
+    )
+}
+
+fn prepare_independent_single_file_album_batch_for_dispatch_with_policy(
+    mut requests: Vec<PipelineRequest>,
+    conversion_log_batch_id: String,
+    album_output_dir: PathBuf,
+    source_grouping_root: PathBuf,
+    ordering: AlbumBatchOrdering,
+    require_uniform_lifecycle: bool,
 ) -> Result<AlbumBatchDispatch, RequestValidationError> {
     if requests.is_empty() {
         return Err(RequestValidationError::InvalidStagePolicy(
@@ -651,21 +684,22 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
         ));
     }
 
-    let conversion_log_batch_id = conversion_log_batch_id.into();
     if !is_generated_conversion_log_batch_id(&conversion_log_batch_id) {
         return Err(RequestValidationError::InvalidStagePolicy(
             "conversion_log_batch_id must be generated per album dispatch attempt; deterministic album/path ids are not allowed".to_string(),
         ));
     }
 
-    let expected_lifecycle = independent_single_file_album_batch_lifecycle_key(&requests[0])?;
-    for request in requests.iter().skip(1) {
-        let lifecycle = independent_single_file_album_batch_lifecycle_key(request)?;
-        if lifecycle != expected_lifecycle {
-            return Err(RequestValidationError::InvalidStagePolicy(format!(
-                "independent single-file album batch contains incompatible action/lifecycle policy at {}; requests must be split before dispatch",
-                request.container.display()
-            )));
+    if require_uniform_lifecycle {
+        let expected_lifecycle = independent_single_file_album_batch_lifecycle_key(&requests[0])?;
+        for request in requests.iter().skip(1) {
+            let lifecycle = independent_single_file_album_batch_lifecycle_key(request)?;
+            if lifecycle != expected_lifecycle {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "independent single-file album batch contains incompatible action/lifecycle policy at {}; requests must be split before ordered-fragment dispatch",
+                    request.container.display()
+                )));
+            }
         }
     }
 
@@ -708,7 +742,9 @@ fn prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
     if let Some(identity) = resolved_identity {
         album_batch = album_batch.with_resolved_identity(identity);
     }
-    album_batch = album_batch.with_source_paths(batch_source_paths);
+    album_batch = album_batch
+        .with_source_paths(batch_source_paths)
+        .with_ordering(ordering);
 
     for req in requests.iter_mut() {
         let Some(dispatcher_track_context) = req.album_batch_track.clone() else {
@@ -2668,7 +2704,11 @@ pub fn plan_outputs(
         match &req.naming.folder_template {
             Some(tmpl) => {
                 let rendered = render_folder_template(tmpl, source, &req.settings);
-                output_root.join(rendered)
+                output_root.join(apply_windows_portable_path(
+                    rendered,
+                    req.naming.windows_portable,
+                    "Album",
+                ))
             }
             None => {
                 let album_component = sanitize_component(
@@ -2679,7 +2719,11 @@ pub fn plan_outputs(
                         .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
                         .unwrap_or("Album"),
                 );
-                output_root.join(album_component)
+                output_root.join(if req.naming.windows_portable {
+                    windows_portable_component(&album_component, "Album")
+                } else {
+                    album_component
+                })
             }
         }
     } else if req.naming.per_album_subdir && req.naming.folder_template.is_none() {
@@ -2691,7 +2735,11 @@ pub fn plan_outputs(
                 .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
                 .unwrap_or("Album"),
         );
-        output_root.join(album_component)
+        output_root.join(if req.naming.windows_portable {
+            windows_portable_component(&album_component, "Album")
+        } else {
+            album_component
+        })
     } else {
         output_root.clone()
     };
@@ -2709,7 +2757,11 @@ pub fn plan_outputs(
                 track.id.source_ordinal
             )));
         }
-        let rel = render_track_template(&req.naming.template, source, track, &req.settings)?;
+        let rel = apply_windows_portable_path(
+            render_track_template(&req.naming.template, source, track, &req.settings)?,
+            req.naming.windows_portable,
+            "untitled",
+        );
         reject_escaping_path(&rel).map_err(PlanError::InvalidTemplate)?;
 
         let album_dir_for_track = if req.naming.per_album_subdir && folder_template_uses_disc_tokens {
@@ -2719,7 +2771,11 @@ pub fn plan_outputs(
                 .as_deref()
                 .expect("folder_template_uses_disc_tokens requires a folder template");
             let rendered = render_folder_template_for_track(tmpl, source, track, &req.settings);
-            output_root.join(rendered)
+            output_root.join(apply_windows_portable_path(
+                rendered,
+                req.naming.windows_portable,
+                "Album",
+            ))
         } else {
             static_album_dir.clone()
         };
@@ -6692,6 +6748,7 @@ FILE "album.flac" WAVE
                 folder_template: None,
                 per_album_subdir: false,
                 collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
@@ -9243,7 +9300,9 @@ fn terminal_conversion_log_fragment_candidate(
     req: &PipelineRequest,
     artifacts: &ArtifactSet,
 ) -> bool {
-    req.album_batch.is_some()
+    req.album_batch
+        .as_ref()
+        .is_some_and(|batch| !batch.uses_completion_order())
         && req.album_batch_track.is_some()
         && source.kind == SourceKind::SingleFile
         && source.tracks.len() == 1
@@ -9549,7 +9608,12 @@ fn pre_materialization_conversion_log_fragment_candidate(
     req: &PipelineRequest,
     outcome: &AlbumOutcome,
 ) -> bool {
-    if req.album_batch.is_none() || req.album_batch_track.is_none() {
+    if req
+        .album_batch
+        .as_ref()
+        .is_none_or(AlbumBatchContext::uses_completion_order)
+        || req.album_batch_track.is_none()
+    {
         return false;
     }
     matches!(
@@ -10307,8 +10371,13 @@ fn should_stage_conversion_log_fragment(
     if !album_batch_fragment_source_kind(source.kind) || source.tracks.is_empty() {
         return false;
     }
-    if req.album_batch.is_none() || req.album_batch_track.is_none() {
-        // No dispatcher-supplied album batch/track contract means this is not
+    if req
+        .album_batch
+        .as_ref()
+        .is_none_or(AlbumBatchContext::uses_completion_order)
+        || req.album_batch_track.is_none()
+    {
+        // No dispatcher-supplied proven-order batch/track contract means this is not
         // the fragment-backed folder path. Fall back to the legacy per-job log
         // path instead of silently treating a source as a complete album or
         // emitting unordered pre-materialization failure fragments.
@@ -18184,6 +18253,7 @@ fn build_publish_plan_with_album_dir(
         AudioArtifacts::Merged(merged) => merged.source_tracks.len(),
     };
     let expected_album_track_count = artifact_set_conversion_log_fragment_expected_track_count(artifacts)?
+        .or_else(|| req.album_batch.as_ref().map(|batch| batch.expected_track_count))
         .unwrap_or(source_audio_track_count);
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
@@ -18240,6 +18310,10 @@ fn build_publish_plan_with_album_dir(
         source_audio_track_count,
         expected_album_track_count,
         suppress_incremental_conversion_log_append: req.suppress_incremental_conversion_log_append,
+        album_batch_completion_order: req
+            .album_batch
+            .as_ref()
+            .is_some_and(AlbumBatchContext::uses_completion_order),
         write_conversion_log: req.log.write_conversion_log,
     })
 }
@@ -19788,6 +19862,13 @@ fn is_incremental_single_audio_publish(plan: &PublishPlan) -> bool {
     // directory collision protection.
     if plan.source_audio_track_count > 1 {
         return false;
+    }
+
+    // Ordering-unprovable groups still carry a dispatcher-authored shared album
+    // batch. Under the album publication lock, each one-track payload appends to
+    // that shared root regardless of whether a visible conversion.log exists.
+    if plan.album_batch_completion_order {
+        return audio_entry_count <= 1;
     }
 
     let has_fragment = plan_has_conversion_log_fragment(plan);
@@ -28879,6 +28960,7 @@ mod companion_copy_hardening_tests {
                 folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
@@ -32530,10 +32612,16 @@ async fn finalize_report_with_binding(
         emit_stage_finished(reporter, &item_id, record).await;
     }
 
+    let warning_count = source.as_ref().map_or(0, |source| {
+        source.tracks.iter().fold(0_u32, |total, track| {
+            total.saturating_add(u32::try_from(track.warnings.len()).unwrap_or(u32::MAX))
+        })
+    });
     let status = terminal_status(
         &outcome,
         published.as_ref(),
         durable_log.as_deref(),
+        warning_count,
         terminal_error_override,
     );
     reporter
@@ -32778,6 +32866,7 @@ pub fn map_album_outcome(
     outcome: &AlbumOutcome,
     published: Option<&PublishedAlbum>,
     durable_log: Option<&Path>,
+    warning_count: u32,
 ) -> ConversionStatus {
     let output_path = published.map(|p| p.album_dir.clone()).unwrap_or_default();
     let log_path = durable_log.map(|p| p.to_path_buf());
@@ -32797,6 +32886,7 @@ pub fn map_album_outcome(
                 ConversionStatus::Completed {
                     output_path,
                     log_path,
+                    warning_count,
                 }
             } else {
                 ConversionStatus::CompletedWithActionErrors {
@@ -32856,7 +32946,7 @@ mod post_action_status_regressions {
             batch_completion: None,
         };
 
-        match map_album_outcome(&outcome, Some(&published), Some(&log)) {
+        match map_album_outcome(&outcome, Some(&published), Some(&log), 0) {
             ConversionStatus::CompletedWithActionErrors {
                 output_path,
                 log_path,
@@ -32906,6 +32996,7 @@ fn terminal_status(
     outcome: &AlbumOutcome,
     published: Option<&PublishedAlbum>,
     durable_log: Option<&Path>,
+    warning_count: u32,
     error_override: Option<String>,
 ) -> ConversionStatus {
     if let Some(error) = error_override {
@@ -32914,7 +33005,7 @@ fn terminal_status(
             log_path: durable_log.map(Path::to_path_buf),
         };
     }
-    map_album_outcome(outcome, published, durable_log)
+    map_album_outcome(outcome, published, durable_log, warning_count)
 }
 
 fn validate_root_dir(path: &Path, label: &str) -> Result<(), RequestValidationError> {
@@ -34994,10 +35085,14 @@ fn path_from_template_components(rendered: &str) -> PathBuf {
     let mut path = PathBuf::new();
     for component in rendered
         .split('/')
-        .map(|component| component.trim().trim_matches('.').trim())
+        .map(str::trim)
         .filter(|component| !component.is_empty())
     {
-        path.push(component);
+        path.push(if matches!(component, "." | "..") {
+            "untitled"
+        } else {
+            component
+        });
     }
     path
 }
@@ -35261,10 +35356,8 @@ fn sanitize_component(value: &str) -> String {
     let trimmed = sanitized
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
-        .trim_matches('.')
-        .to_string();
-    if trimmed.is_empty() {
+        .join(" ");
+    if trimmed.is_empty() || matches!(trimmed.as_str(), "." | "..") {
         "untitled".to_string()
     } else {
         trimmed
@@ -35297,10 +35390,8 @@ fn sanitize_title_extra_component(value: &str) -> String {
         .map(sanitize_slash_segment)
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
-        .join("  ")
-        .trim_matches('.')
-        .to_string();
-    if trimmed.is_empty() {
+        .join("  ");
+    if trimmed.is_empty() || matches!(trimmed.as_str(), "." | "..") {
         "untitled".to_string()
     } else {
         trimmed
@@ -35406,16 +35497,60 @@ fn append_default_extension(
     format: &PlannerAudioFormat,
     container_extension: Option<&str>,
 ) {
-    let ext = default_audio_container_extension(format, container_extension);
+    let ext = default_audio_container_extension(format, container_extension).trim_start_matches('.');
+    let suffix = format!(".{ext}");
     if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case(ext))
-        .unwrap_or(false)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() >= suffix.len()
+                && name
+                    .get(name.len() - suffix.len()..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(&suffix))
+        })
     {
         return;
     }
-    path.set_extension(ext);
+
+    // `PathBuf::set_extension` treats a trailing dot as an empty extension and
+    // consumes it. Append the separator and extension to the full generated file
+    // name so every metadata dot survives byte-for-byte.
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    file_name.push(".");
+    file_name.push(ext);
+    path.set_file_name(file_name);
+}
+
+fn windows_portable_component(value: &str, fallback: &str) -> String {
+    let stripped = value.trim_end_matches(['.', ' ']);
+    if stripped.is_empty() || matches!(stripped, "." | "..") {
+        fallback.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn apply_windows_portable_path(path: PathBuf, enabled: bool, fallback: &str) -> PathBuf {
+    if !enabled {
+        return path;
+    }
+    let mut portable = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value.to_string_lossy();
+                portable.push(windows_portable_component(&value, fallback));
+            }
+            Component::CurDir => portable.push(fallback),
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                portable.push(component.as_os_str());
+            }
+        }
+    }
+    portable
 }
 
 fn append_collision_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -38290,6 +38425,7 @@ mod pipeline_test_helpers {
                 folder_template: Some("%ARTIST%/%ALBUM%".to_string()),
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
@@ -39009,6 +39145,27 @@ mod conversion_log_tests {
         assert!(log.contains("Target format: FLAC"));
         assert!(log.contains("Result: Complete"));
         assert!(log.contains("Log generated by tonepoet"));
+    }
+
+    #[test]
+    fn build_conversion_log_discloses_tag_read_degradation_per_track() {
+        let mut source = log_test_source();
+        source.tracks[0].warnings.push(
+            "Tag read: FAILED (unsupported tag layout) - converted without metadata".to_string(),
+        );
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let artifacts = log_test_artifacts();
+
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Per-Track Results"));
+        assert!(log.contains(
+            "Warning: Tag read: FAILED (unsupported tag layout) - converted without metadata"
+        ));
     }
 
     #[test]
@@ -39960,6 +40117,7 @@ mod naming_template_tests {
                 folder_template,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
@@ -41166,6 +41324,69 @@ mod naming_template_tests {
     }
 
     #[test]
+    fn naming_preserves_leading_and_trailing_dot_runs_by_default() {
+        assert_eq!(
+            sanitize_component("Even in the Quietest Moments..."),
+            "Even in the Quietest Moments..."
+        );
+        assert_eq!(
+            sanitize_component("...And Then There Were Three..."),
+            "...And Then There Were Three..."
+        );
+        assert_eq!(
+            path_from_template_components("literal.../track..."),
+            PathBuf::from("literal.../track...")
+        );
+    }
+
+    #[test]
+    fn naming_guards_only_exact_dot_path_components() {
+        assert_eq!(sanitize_component("."), "untitled");
+        assert_eq!(sanitize_component(".."), "untitled");
+        assert_eq!(sanitize_component("..."), "...");
+        assert_eq!(
+            path_from_template_components("./../.../.hidden"),
+            PathBuf::from("untitled/untitled/.../.hidden")
+        );
+    }
+
+    #[test]
+    fn extension_append_does_not_consume_a_trailing_title_dot() {
+        let mut path = PathBuf::from("01 - Even in the Quietest Moments...");
+        append_default_extension(&mut path, &PlannerAudioFormat::Flac, None);
+        assert_eq!(
+            path,
+            PathBuf::from("01 - Even in the Quietest Moments....flac")
+        );
+    }
+
+    #[test]
+    fn windows_portable_mode_strips_only_trailing_dots_and_spaces_at_assembly() {
+        assert_eq!(
+            windows_portable_component("...Album...   ", "Album"),
+            "...Album"
+        );
+        assert_eq!(windows_portable_component(".hidden", "Album"), ".hidden");
+        assert_eq!(windows_portable_component("...", "Album"), "Album");
+        assert_eq!(
+            apply_windows_portable_path(
+                PathBuf::from("...Album.../01 - Track...   "),
+                true,
+                "untitled",
+            ),
+            PathBuf::from("...Album/01 - Track")
+        );
+    }
+
+    #[test]
+    fn conversion_action_component_sanitizer_retains_dot_runs() {
+        assert_eq!(
+            conversion_action_sanitize_component("...And Then There Were Three..."),
+            sanitize_component("...And Then There Were Three...")
+        );
+    }
+
+    #[test]
     fn sanitize_component_collapses_whitespace_after_separator_replacement() {
         assert_eq!(sanitize_component("LP / 24-192"), "LP 24-192");
     }
@@ -42311,6 +42532,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite,
@@ -43998,6 +44220,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         };
         let publish = fixture.album.req.publish.clone();
@@ -44033,6 +44256,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         };
 
@@ -44079,6 +44303,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         };
         let publish = fixture.album.req.publish.clone();
@@ -44138,6 +44363,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         }
     }
@@ -44172,6 +44398,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         }
     }
@@ -44865,6 +45092,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 source_audio_track_count,
                 expected_album_track_count: fragment.expected_track_count,
                 suppress_incremental_conversion_log_append: false,
+                album_batch_completion_order: false,
                 write_conversion_log: true,
             },
         )
@@ -46040,6 +46268,46 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert_eq!(failed_plan.source_audio_track_count, 0, "a failed-track fragment has no audio payload");
         assert_eq!(failed_plan.expected_album_track_count, 2);
         assert!(is_incremental_single_audio_publish(&failed_plan));
+    }
+
+    #[test]
+    fn completion_order_album_batch_shares_publish_root_when_logs_are_disabled() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let fragment = fragment_test_fragment(
+            &album_dir,
+            "completion-order-structure",
+            Some("settings-a"),
+            1,
+            7,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        let (_stage, mut plan) = incremental_fragment_test_plan(
+            temp.path(),
+            &album_dir,
+            "completion-order-structure",
+            &fragment,
+            Some(("01.flac", b"audio-one")),
+            b"standalone log disabled\n",
+        );
+        plan.entries
+            .retain(|entry| matches!(entry.role, PublishRole::Audio));
+        plan.album_batch_completion_order = true;
+        plan.write_conversion_log = false;
+        plan.expected_album_track_count = 7;
+
+        assert!(
+            is_incremental_single_audio_publish(&plan),
+            "completion-order membership, not conversion-log presence, owns shared-root publication"
+        );
+
+        plan.suppress_incremental_conversion_log_append = true;
+        assert!(
+            !is_incremental_single_audio_publish(&plan),
+            "the emergency fail-closed suppression remains authoritative"
+        );
     }
 
     #[test]
@@ -48504,6 +48772,7 @@ Source-aware setting: yes
             source_audio_track_count: 1,
             expected_album_track_count: 1,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         };
 
@@ -48889,6 +49158,7 @@ retry log
             source_audio_track_count: 2,
             expected_album_track_count: 2,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         };
 
@@ -48930,6 +49200,7 @@ retry log
             source_audio_track_count: 2,
             expected_album_track_count: 2,
             suppress_incremental_conversion_log_append: false,
+            album_batch_completion_order: false,
             write_conversion_log: true,
         };
 

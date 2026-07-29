@@ -1252,7 +1252,40 @@ fn first_resolved_member_audio_path_with_quote(parts: &[SyntheticCueAlbumPart]) 
 fn read_embedded_cuesheet_text_for_queue(path: &Path) -> Option<String> {
     use lofty::prelude::*;
 
-    let tagged = lofty::read_from_path(path).ok()?;
+    let tagged = match lofty::read_from_path(path) {
+        Ok(tagged) => tagged,
+        Err(error) if crate::metadata_persistence::native_ape_error_is_eligible(&error) => {
+            let outcome = match crate::metadata_persistence::read_native_ape_fallback(path) {
+                Ok(outcome) => outcome,
+                Err(native_error) => {
+                    log::warn!(
+                        "failed to read embedded CUE metadata from '{}': {error}; native APEv2 fallback refused: {native_error}",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            if let Some(warning) = outcome.warning {
+                log::warn!("{}", warning.message());
+            }
+            return outcome
+                .rows
+                .into_iter()
+                .find(|row| {
+                    !row.is_binary
+                        && (row.raw_key.eq_ignore_ascii_case("CUESHEET")
+                            || row.canonical_key.eq_ignore_ascii_case("CUESHEET"))
+                })
+                .map(|row| row.value);
+        }
+        Err(error) => {
+            log::warn!(
+                "failed to read embedded CUE metadata from '{}': {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
     for item in tag.items() {
         if let lofty::tag::ItemKey::Unknown(key) = item.key() {

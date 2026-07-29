@@ -104,6 +104,9 @@ pub enum ConversionStatus {
         /// Durable per-album run log, when one was written.
         #[serde(default)]
         log_path: Option<PathBuf>,
+        /// Number of non-fatal warnings disclosed for this completed item.
+        #[serde(default)]
+        warning_count: u32,
     },
     /// Audio publication completed, but one or more post-conversion actions
     /// failed. Published audio is retained; the action failures are terminal,
@@ -1892,6 +1895,7 @@ mod cue_sidecar_override_queue_tests {
         item.status = ConversionStatus::Completed {
             output_path: PathBuf::from("/tmp/output.flac"),
             log_path: None,
+            warning_count: 0,
         };
         let original_status = item.status.clone();
 

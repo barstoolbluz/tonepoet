@@ -113,7 +113,7 @@ impl super::stages::Materializer for ArchiveMaterializer {
             }
             let ordinal = (idx + 1) as u32;
             let (mut metadata, metadata_warnings) = read_track_metadata_with_warnings(path)?;
-            super::materializer_single::report_dsf_metadata_warnings(
+            super::materializer_single::report_metadata_warnings(
                 reporter,
                 &req.item_id,
                 path,
@@ -1793,95 +1793,9 @@ fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
 fn read_track_metadata_with_warnings(
     path: &Path,
 ) -> Result<(TrackMetadata, Vec<String>), MaterializeError> {
-    if crate::dsf_tags::is_dsf(path) {
-        let outcome = crate::dsf_tags::read_with_warnings(path)
-            .map_err(MaterializeError::Parse)?;
-        return Ok((
-            crate::dsf_tags::to_track_metadata(&outcome.snapshot),
-            outcome.warnings,
-        ));
-    }
-    use lofty::prelude::*;
-
-    let tagged = match lofty::read_from_path(path) {
-        Ok(t) => t,
-        Err(_) => return Ok((TrackMetadata::default(), Vec::new())),
-    };
-
-    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        Some(t) => t,
-        None => return Ok((TrackMetadata::default(), Vec::new())),
-    };
-
-    // Store album name in `extra` — TrackMetadata has no dedicated
-    // album field, but we need it for AlbumMetadata derivation.
-    let mut extra = BTreeMap::new();
-    if let Some(album) = tag.album() {
-        extra.insert("album".to_string(), album.to_string());
-    }
-
-    // Enumerate all text tag items into `extra` so naming templates can use
-    // arbitrary format-specific fields such as CATALOGNUMBER, BARCODE,
-    // MUSICBRAINZ_ALBUMID, and RELEASECOUNTRY. Keys are lowercased to match
-    // the template engine's fallthrough lookup.
-    let tag_type = tag.tag_type();
-    for item in tag.items() {
-        if let lofty::tag::ItemValue::Text(text) = item.value() {
-            let key = item_key_to_extra_key(item.key(), tag_type);
-            insert_source_text_tag(&mut extra, &key, text);
-        }
-    }
-
-    let pre_emphasis = source_text_tags_indicate_pre_emphasis(&extra);
-
-    Ok((TrackMetadata {
-        title: tag.title().map(|s| s.to_string()),
-        artist: tag.artist().map(|s| s.to_string()),
-        album_artist: tag
-            .get_string(&lofty::tag::ItemKey::AlbumArtist)
-            .map(|s| s.to_string()),
-        composer: tag
-            .get_string(&lofty::tag::ItemKey::Composer)
-            .map(|s| s.to_string()),
-        performer: tag
-            .get_string(&lofty::tag::ItemKey::Performer)
-            .map(|s| s.to_string()),
-        genre: tag.genre().map(|s| s.to_string()),
-        date: tag.year().map(|y| y.to_string()),
-        track_number: tag.track().map(|t| t as u32),
-        disc_number: tag.disk().map(|d| d as u32),
-        isrc: tag
-            .get_string(&lofty::tag::ItemKey::Isrc)
-            .map(|s| s.to_string()),
-        publisher: tag
-            .get_string(&lofty::tag::ItemKey::Publisher)
-            .map(|s| s.to_string()),
-        copyright: tag
-            .get_string(&lofty::tag::ItemKey::CopyrightMessage)
-            .map(|s| s.to_string()),
-        comment: tag.comment().map(|s| s.to_string()),
-        pre_emphasis,
-        extra,
-    }, Vec::new()))
+    super::materializer_single::read_track_metadata_with_warnings(path)
 }
 
-fn item_key_to_extra_key(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
-    if let Some(mapped) = key.map_key(tag_type, true) {
-        return mapped.to_lowercase();
-    }
-
-    match key {
-        lofty::tag::ItemKey::Unknown(value) => value.to_lowercase(),
-        _ => format!("{key:?}").to_lowercase(),
-    }
-}
-
-// =========================================================================
-// Track selection
-// =========================================================================
-
-/// Filter `tracks` according to `selection`. Operates on
-/// `source_ordinal` (1-based position), not `track_number`.
 fn apply_track_selection(
     tracks: Vec<PreparedTrack>,
     selection: &TrackSelection,
@@ -2258,6 +2172,7 @@ mod tests {
                 folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
+                windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,

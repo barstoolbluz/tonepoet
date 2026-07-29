@@ -60,8 +60,18 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 }
             }
         }
-        let (metadata, metadata_warnings) = read_track_metadata_with_warnings(&req.container)?;
-        report_dsf_metadata_warnings(
+        let (metadata, mut metadata_warnings) = read_track_metadata_with_warnings(&req.container)?;
+        if req
+            .album_batch
+            .as_ref()
+            .is_some_and(|batch| batch.uses_completion_order())
+        {
+            metadata_warnings.push(
+                "Track ordering unavailable; album publication is shared and the conversion log records tracks in completion order"
+                    .to_string(),
+            );
+        }
+        report_metadata_warnings(
             reporter,
             &req.item_id,
             &req.container,
@@ -214,7 +224,7 @@ pub(crate) fn read_track_metadata(path: &Path) -> Result<TrackMetadata, Material
     let (metadata, warnings) = read_track_metadata_with_warnings(path)?;
     for warning in &warnings {
         log::warn!(
-            "DSF metadata degraded for '{}'; audio conversion will continue: {}",
+            "metadata degraded for '{}'; audio conversion will continue: {}",
             path.display(),
             warning
         );
@@ -222,7 +232,7 @@ pub(crate) fn read_track_metadata(path: &Path) -> Result<TrackMetadata, Material
     Ok(metadata)
 }
 
-pub(crate) async fn report_dsf_metadata_warnings(
+pub(crate) async fn report_metadata_warnings(
     reporter: Option<&dyn PipelineReporter>,
     item_id: &str,
     path: &Path,
@@ -231,7 +241,7 @@ pub(crate) async fn report_dsf_metadata_warnings(
 ) {
     for warning in warnings {
         let message = format!(
-            "DSF metadata warning for '{}': {}; audio conversion will continue",
+            "Metadata warning for '{}': {}; audio conversion will continue",
             path.display(),
             warning
         );
@@ -262,14 +272,52 @@ pub(crate) fn read_track_metadata_with_warnings(
     }
     use lofty::prelude::*;
 
-    let tagged = match lofty::read_from_path(path) {
-        Ok(tagged) => tagged,
-        Err(_) => return Ok((TrackMetadata::default(), Vec::new())),
-    };
-    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        Some(tag) => tag,
-        None => return Ok((TrackMetadata::default(), Vec::new())),
-    };
+    match lofty::read_from_path(path) {
+        Ok(tagged) => {
+            let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+                return Ok((
+                    TrackMetadata::default(),
+                    vec![format!(
+                        "Tag read: FAILED (no readable metadata tag found in '{}') - converted without metadata",
+                        path.display()
+                    )],
+                ));
+            };
+            Ok((track_metadata_from_lofty_tag(tag), Vec::new()))
+        }
+        Err(lofty_error)
+            if crate::metadata_persistence::native_ape_error_is_eligible(&lofty_error) =>
+        {
+            match crate::metadata_persistence::read_native_ape_fallback(path) {
+                Ok(outcome) => {
+                    let metadata = track_metadata_from_neutral_ape_rows(&outcome.rows);
+                    let warning = outcome.warning.map(|warning| warning.message()).unwrap_or_else(|| {
+                        format!(
+                            "Lofty rejected the APEv2 tag in '{}': {lofty_error}; recovered all readable fields with the bounded native reader",
+                            path.display()
+                        )
+                    });
+                    Ok((metadata, vec![warning]))
+                }
+                Err(native_error) => Ok((
+                    TrackMetadata::default(),
+                    vec![format!(
+                        "Tag read: FAILED ({lofty_error}; native APEv2 fallback refused: {native_error}) - converted without metadata"
+                    )],
+                )),
+            }
+        }
+        Err(error) => Ok((
+            TrackMetadata::default(),
+            vec![format!(
+                "Tag read: FAILED ({error}) - converted without metadata"
+            )],
+        )),
+    }
+}
+
+fn track_metadata_from_lofty_tag(tag: &lofty::tag::Tag) -> TrackMetadata {
+    use lofty::prelude::*;
 
     let mut extra = BTreeMap::new();
     if let Some(album) = tag.album() {
@@ -295,7 +343,7 @@ pub(crate) fn read_track_metadata_with_warnings(
     }
     let pre_emphasis = source_text_tags_indicate_pre_emphasis(&extra);
 
-    Ok((TrackMetadata {
+    TrackMetadata {
         title: tag.title().map(|value| value.to_string()),
         artist: tag.artist().map(|value| value.to_string()),
         album_artist: tag
@@ -323,7 +371,60 @@ pub(crate) fn read_track_metadata_with_warnings(
         comment: tag.comment().map(|value| value.to_string()),
         pre_emphasis,
         extra,
-    }, Vec::new()))
+    }
+}
+
+fn track_metadata_from_neutral_ape_rows(
+    rows: &[crate::metadata_persistence::NeutralApeRow],
+) -> TrackMetadata {
+    let text = |canonical_key: &str| {
+        rows.iter()
+            .find(|row| row.canonical_key == canonical_key && !row.is_binary)
+            .map(|row| row.value.clone())
+    };
+    let number = |canonical_key: &str| {
+        text(canonical_key).and_then(|value| value.trim().parse::<u32>().ok())
+    };
+    let year = || {
+        let value = text("DATE")?;
+        let leading = value.trim().chars().take(4).collect::<String>();
+        (leading.len() == 4 && leading.chars().all(|character| character.is_ascii_digit()))
+            .then_some(leading)
+    };
+
+    let mut extra = BTreeMap::new();
+    for row in rows.iter().filter(|row| !row.is_binary) {
+        let key = match &row.item_key {
+            lofty::tag::ItemKey::Unknown(_) => row.raw_key.to_ascii_lowercase(),
+            key => item_key_to_extra_key(key, lofty::tag::TagType::Ape),
+        };
+        insert_source_text_tag(&mut extra, &key, &row.value);
+    }
+    if let Some(album) = text("ALBUM") {
+        extra.insert("album".to_string(), album);
+    }
+    if let Some(total) = text("DISCTOTAL") {
+        extra.insert("disctotal".to_string(), total);
+    }
+    let pre_emphasis = source_text_tags_indicate_pre_emphasis(&extra);
+
+    TrackMetadata {
+        title: text("TITLE"),
+        artist: text("ARTIST"),
+        album_artist: text("ALBUMARTIST"),
+        composer: text("COMPOSER"),
+        performer: text("PERFORMER"),
+        genre: text("GENRE"),
+        date: year(),
+        track_number: number("TRACKNUMBER"),
+        disc_number: number("DISCNUMBER"),
+        isrc: text("ISRC"),
+        publisher: text("PUBLISHER"),
+        copyright: text("COPYRIGHT"),
+        comment: text("COMMENT"),
+        pre_emphasis,
+        extra,
+    }
 }
 
 fn item_key_to_extra_key(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
@@ -382,7 +483,7 @@ mod tests {
         let path = PathBuf::from("quirky.dsf");
         let warning = "declared DSF file size does not match the readable file length".to_string();
 
-        report_dsf_metadata_warnings(
+        report_metadata_warnings(
             Some(&reporter),
             "queue-item-7",
             &path,
@@ -406,7 +507,7 @@ mod tests {
                 assert_eq!(
                     message.as_deref(),
                     Some(
-                        "DSF metadata warning for 'quirky.dsf': declared DSF file size does not match the readable file length; audio conversion will continue"
+                        "Metadata warning for 'quirky.dsf': declared DSF file size does not match the readable file length; audio conversion will continue"
                     )
                 );
             }
@@ -455,6 +556,66 @@ mod tests {
                 .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}pre_emphasis"))
                 .map(String::as_str),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn tolerant_ape_rows_populate_named_fields_and_full_provenance() {
+        use crate::metadata_persistence::NeutralApeRow;
+        use lofty::tag::ItemKey;
+
+        let rows = [
+            ("Title", "TITLE", ItemKey::TrackTitle, "Give a Little Bit"),
+            ("Artist", "ARTIST", ItemKey::TrackArtist, "Supertramp"),
+            (
+                "Album",
+                "ALBUM",
+                ItemKey::AlbumTitle,
+                "Even in the Quietest Moments...",
+            ),
+            ("Genre", "GENRE", ItemKey::Genre, "Rock"),
+            ("Year", "DATE", ItemKey::Year, "1977"),
+            (
+                "Comment",
+                "COMMENT",
+                ItemKey::Comment,
+                "US A&M SP-4634 LP",
+            ),
+            (
+                "MY_NOTE",
+                "MY_NOTE",
+                ItemKey::Unknown("MY_NOTE".to_string()),
+                "keep me",
+            ),
+        ]
+        .into_iter()
+        .map(|(raw_key, canonical_key, item_key, value)| NeutralApeRow {
+            raw_key: raw_key.to_string(),
+            canonical_key: canonical_key.to_string(),
+            item_key,
+            value: value.to_string(),
+            is_binary: false,
+        })
+        .collect::<Vec<_>>();
+
+        let metadata = track_metadata_from_neutral_ape_rows(&rows);
+
+        assert_eq!(metadata.title.as_deref(), Some("Give a Little Bit"));
+        assert_eq!(metadata.artist.as_deref(), Some("Supertramp"));
+        assert_eq!(
+            metadata.extra.get("album").map(String::as_str),
+            Some("Even in the Quietest Moments...")
+        );
+        assert_eq!(metadata.genre.as_deref(), Some("Rock"));
+        assert_eq!(metadata.date.as_deref(), Some("1977"));
+        assert_eq!(metadata.comment.as_deref(), Some("US A&M SP-4634 LP"));
+        assert_eq!(metadata.extra.get("my_note").map(String::as_str), Some("keep me"));
+        assert_eq!(
+            metadata
+                .extra
+                .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}my_note"))
+                .map(String::as_str),
+            Some("keep me")
         );
     }
 

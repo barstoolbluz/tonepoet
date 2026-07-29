@@ -297,6 +297,7 @@ fn base_request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> 
         merge: false,
         output_root,
         naming: NamingPolicy {
+            windows_portable: false,
             template: "%NN% - %TITLE%".to_string(),
             folder_template: None,
             per_album_subdir: false,

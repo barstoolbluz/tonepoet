@@ -269,20 +269,21 @@ impl TextInputState {
     }
 
     pub fn copy_selection(&mut self) -> bool {
-        let Some(range) = self.selection_range() else {
-            return false;
+        let copied = match self.selection_range() {
+            Some(range) => self.text[range].to_string(),
+            None if self.text.is_empty() => return false,
+            None => self.text.clone(),
         };
-        self.clipboard = self.text[range].to_string();
-        write_shared_text_clipboard(self.clipboard.clone());
+        self.clipboard = copied.clone();
+        write_shared_text_clipboard(copied);
         true
     }
 
     pub fn cut_selection(&mut self) -> bool {
-        if !self.copy_selection() {
+        if !self.has_selection() || !self.copy_selection() {
             return false;
         }
-        self.delete_selection();
-        true
+        self.delete_selection()
     }
 
     pub fn can_paste(&self) -> bool {
@@ -293,11 +294,9 @@ impl TextInputState {
     }
 
     pub fn paste_clipboard(&mut self) -> bool {
-        if self.clipboard.is_empty() {
-            let shared = read_shared_text_clipboard();
-            if !shared.is_empty() {
-                self.clipboard = shared;
-            }
+        let shared = read_shared_text_clipboard();
+        if !shared.is_empty() {
+            self.clipboard = shared;
         }
         if self.clipboard.is_empty() {
             return false;
@@ -1804,6 +1803,47 @@ mod tests {
             let payload = "TITLE\nBehind the Lines\nDuchess";
             write_shared_text_clipboard(payload);
             assert_eq!(read_shared_text_clipboard(), payload);
+        });
+    }
+
+    #[test]
+    fn copy_without_selection_publishes_the_whole_field() {
+        with_scoped_shared_text_clipboard("stale", || {
+            let mut input = TextInputState::new("whole field".to_string());
+            input.cursor = 3;
+
+            assert!(input.copy_selection());
+            assert_eq!(input.clipboard, "whole field");
+            assert_eq!(read_shared_text_clipboard(), "whole field");
+            assert_eq!(input.text, "whole field");
+            assert_eq!(input.cursor, 3);
+        });
+    }
+
+    #[test]
+    fn cut_without_selection_refuses_without_copying_or_mutating() {
+        with_scoped_shared_text_clipboard("shared", || {
+            let mut input = TextInputState::new("whole field".to_string());
+            input.clipboard = "local".to_string();
+            input.cursor = 4;
+
+            assert!(!input.cut_selection());
+            assert_eq!(input.text, "whole field");
+            assert_eq!(input.cursor, 4);
+            assert_eq!(input.clipboard, "local");
+            assert_eq!(read_shared_text_clipboard(), "shared");
+        });
+    }
+
+    #[test]
+    fn paste_prefers_newer_shared_text_over_stale_field_local_text() {
+        with_scoped_shared_text_clipboard("copied in field A", || {
+            let mut input = TextInputState::new_selected("field B".to_string());
+            input.clipboard = "stale field B copy".to_string();
+
+            assert!(input.paste_clipboard());
+            assert_eq!(input.text, "copied in field A");
+            assert_eq!(input.clipboard, "copied in field A");
         });
     }
 

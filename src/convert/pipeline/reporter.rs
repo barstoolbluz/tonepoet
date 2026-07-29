@@ -639,6 +639,7 @@ mod broadcast_reporter_tests {
             .emit(PipelineEvent::Terminal {
                 item_id: "item-1".to_string(),
                 status: crate::convert::ConversionStatus::Completed {
+                    warning_count: 0,
                     output_path: PathBuf::from("/tmp/out.flac"),
                     log_path: None,
                 },
@@ -785,6 +786,7 @@ mod broadcast_reporter_tests {
             .emit(PipelineEvent::Terminal {
                 item_id: "item-1".to_string(),
                 status: crate::convert::ConversionStatus::Completed {
+                    warning_count: 0,
                     output_path: PathBuf::from("/tmp/out.flac"),
                     log_path: None,
                 },
@@ -827,6 +829,7 @@ mod broadcast_reporter_tests {
             .emit(PipelineEvent::Terminal {
                 item_id: "item-1".to_string(),
                 status: crate::convert::ConversionStatus::Completed {
+                    warning_count: 0,
                     output_path: PathBuf::from("/tmp/out.flac"),
                     log_path: None,
                 },

@@ -1342,7 +1342,8 @@ fn confirmation_footer_hint_bg(
         "y" => match action {
             super::app::ConfirmAction::ArchiveDiscardStartupRecovery { .. }
             | super::app::ConfirmAction::ArchiveDiscardStaging { .. }
-            | super::app::ConfirmAction::DeleteEmbeddedCueSheet { .. } => theme.destructive,
+            | super::app::ConfirmAction::DeleteEmbeddedCueSheet { .. }
+            | super::app::ConfirmAction::RemoveInvalidApeKeys { .. } => theme.destructive,
             _ => theme.green,
         },
         "d" => theme.destructive,
@@ -1535,8 +1536,22 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: s
                 format!("{:.1}% - {}", progress, phase_name)
             }
         },
-        ConversionStatus::Completed { output_path, .. } => {
-            format!("Completed -> {}", output_path.display())
+        ConversionStatus::Completed {
+            output_path,
+            warning_count,
+            ..
+        } => {
+            if *warning_count == 0 {
+                format!("Completed -> {}", output_path.display())
+            } else {
+                let suffix = if *warning_count == 1 { "warning" } else { "warnings" };
+                format!(
+                    "Completed with {} {} -> {}",
+                    warning_count,
+                    suffix,
+                    output_path.display()
+                )
+            }
         }
         ConversionStatus::CompletedWithActionErrors {
             output_path, errors, ..
@@ -6142,8 +6157,13 @@ fn render_issue_rows(rows: &[super::metadata_view_models::IssueViewRow], theme: 
 }
 
 fn metadata_issue_line(label: &str, kind: &str, err: &str, theme: super::theme::Theme) -> Line<'static> {
+    let text = if kind.is_empty() {
+        format!("  {}: {}", label, err.trim())
+    } else {
+        format!("  {}: {}: {}", label, kind, err.trim())
+    };
     Line::from(Span::styled(
-        format!("  {}: {}: {}", label, kind, err.trim()),
+        text,
         Style::default().fg(theme.destructive),
     ))
 }

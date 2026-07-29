@@ -797,6 +797,7 @@ mod lifecycle_forwarder_tests {
             item_id: "item-1".to_string(),
             progress: 100.0,
             status: ConversionStatus::Completed {
+                warning_count: 0,
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
             },

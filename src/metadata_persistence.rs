@@ -20,6 +20,502 @@ const ID3V2_FOOTER_LEN: u64 = 10;
 /// allowing attacker-controlled offsets or unbounded allocation/seek behavior.
 pub(crate) const MAX_ID3V2_FLAC_PREFIX_LEN: u64 = 16 * 1024 * 1024;
 
+// --- Shared tolerant APEv2 reader -------------------------------------------------
+//
+// This parser is intentionally UI-neutral. It is the single bounded read seam used
+// by both metadata-editor wrappers and conversion materializers when Lofty rejects
+// an otherwise readable APEv2 tag (for example, because one physical key is outside
+// the APEv2 key grammar). Invalid physical keys are retained in `NativeApeTag` for
+// the recovery writer, but omitted from neutral rows and disclosed structurally.
+
+pub(crate) const APE_SIGNATURE: &[u8; 8] = b"APETAGEX";
+pub(crate) const APE_DESCRIPTOR_LEN: usize = 32;
+pub(crate) const APE_VERSION_2: u32 = 2_000;
+pub(crate) const APE_FLAG_HEADER_PRESENT: u32 = 1 << 31;
+pub(crate) const APE_FLAG_IS_HEADER: u32 = 1 << 29;
+pub(crate) const APE_ITEM_READ_ONLY: u32 = 1;
+pub(crate) const APE_ITEM_TYPE_MASK: u32 = 0b110;
+pub(crate) const APE_ITEM_TYPE_TEXT: u32 = 0;
+pub(crate) const APE_ITEM_TYPE_BINARY: u32 = 0b010;
+pub(crate) const APE_ITEM_TYPE_LOCATOR: u32 = 0b100;
+pub(crate) const MAX_NATIVE_APE_TAG_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NATIVE_APE_ITEMS: u32 = 1_000_000;
+const MIN_NATIVE_APE_ITEM_BYTES: usize = 9;
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeApeItem {
+    pub(crate) raw: Vec<u8>,
+    pub(crate) key_bytes: Vec<u8>,
+    pub(crate) key: Option<String>,
+    pub(crate) flags: u32,
+    pub(crate) value: Vec<u8>,
+}
+
+impl NativeApeItem {
+    pub(crate) fn item_type(&self) -> u32 {
+        self.flags & APE_ITEM_TYPE_MASK
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.flags & APE_ITEM_READ_ONLY != 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeApeTag {
+    pub(crate) replace_start: u64,
+    pub(crate) footer_end: u64,
+    pub(crate) had_header: bool,
+    pub(crate) items: Vec<NativeApeItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeutralApeRow {
+    pub(crate) raw_key: String,
+    pub(crate) canonical_key: String,
+    pub(crate) item_key: ItemKey,
+    pub(crate) value: String,
+    pub(crate) is_binary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeutralApeWarning {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) escaped_keys: Vec<String>,
+}
+
+impl NeutralApeWarning {
+    pub(crate) fn message(&self) -> String {
+        format!(
+            "{} invalid APE key{} skipped in '{}': {}",
+            self.escaped_keys.len(),
+            if self.escaped_keys.len() == 1 { "" } else { "s" },
+            self.path.display(),
+            self.escaped_keys
+                .iter()
+                .map(|key| format!("'{key}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NeutralApeReadOutcome {
+    pub(crate) rows: Vec<NeutralApeRow>,
+    pub(crate) warning: Option<NeutralApeWarning>,
+}
+
+fn u32_le_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "truncated APEv2 integer field".to_string())?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+pub(crate) fn native_ape_error_is_eligible(err: &lofty::error::LoftyError) -> bool {
+    use lofty::error::ErrorKind;
+
+    matches!(
+        err.kind(),
+        ErrorKind::FileDecoding(decoding)
+            if decoding.format() == Some(lofty::file::FileType::Ape)
+    )
+}
+
+pub(crate) fn ape_key_is_valid(key: &[u8]) -> bool {
+    if !(2..=255).contains(&key.len()) || !key.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+        return false;
+    }
+    ![b"ID3".as_slice(), b"TAG".as_slice(), b"OGGS".as_slice(), b"MP+".as_slice()]
+        .iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved))
+}
+
+pub(crate) fn display_escaped_ape_key(key: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(key) {
+        let mut escaped = String::new();
+        for ch in text.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '\'' => escaped.push_str("\\'"),
+                ch if ch.is_control() => escaped.extend(ch.escape_default()),
+                ch => escaped.push(ch),
+            }
+        }
+        return escaped;
+    }
+
+    key.iter()
+        .map(|byte| format!("\\x{byte:02X}"))
+        .collect::<String>()
+}
+
+pub(crate) fn optional_id3v1_start(
+    file: &mut std::fs::File,
+    file_len: u64,
+) -> Result<Option<u64>, String> {
+    if file_len < 128 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(file_len - 128))
+        .map_err(|error| format!("seek trailing ID3v1 probe: {error}"))?;
+    let mut signature = [0u8; 3];
+    file.read_exact(&mut signature)
+        .map_err(|error| format!("read trailing ID3v1 probe: {error}"))?;
+    Ok((&signature == b"TAG").then_some(file_len - 128))
+}
+
+
+fn native_ape_item_capacity(item_count: u32, region_len: usize) -> usize {
+    usize::try_from(item_count)
+        .unwrap_or(usize::MAX)
+        .min(region_len / MIN_NATIVE_APE_ITEM_BYTES)
+}
+
+pub(crate) fn read_native_ape_tag(path: &Path) -> Result<Option<NativeApeTag>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat '{}': {error}", path.display()))?
+        .len();
+    let footer_end = optional_id3v1_start(&mut file, file_len)?.unwrap_or(file_len);
+    if footer_end < APE_DESCRIPTOR_LEN as u64 {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(footer_end - APE_DESCRIPTOR_LEN as u64))
+        .map_err(|error| format!("seek APEv2 footer in '{}': {error}", path.display()))?;
+    let mut footer = [0u8; APE_DESCRIPTOR_LEN];
+    file.read_exact(&mut footer)
+        .map_err(|error| format!("read APEv2 footer in '{}': {error}", path.display()))?;
+    if &footer[..8] != APE_SIGNATURE {
+        return Ok(None);
+    }
+
+    let version = u32_le_at(&footer, 8)?;
+    if version != APE_VERSION_2 {
+        return Err(format!(
+            "unsupported APE tag version {version} in '{}'; native fallback accepts APEv2 only",
+            path.display()
+        ));
+    }
+    let tag_size = u64::from(u32_le_at(&footer, 12)?);
+    let item_count = u32_le_at(&footer, 16)?;
+    let footer_flags = u32_le_at(&footer, 20)?;
+    if tag_size < APE_DESCRIPTOR_LEN as u64
+        || tag_size > MAX_NATIVE_APE_TAG_BYTES
+        || tag_size > footer_end
+    {
+        return Err(format!(
+            "invalid APEv2 tag size {tag_size} in '{}'",
+            path.display()
+        ));
+    }
+    if item_count > MAX_NATIVE_APE_ITEMS {
+        return Err(format!(
+            "APEv2 item count {item_count} exceeds the native safety limit in '{}'",
+            path.display()
+        ));
+    }
+
+    let items_start = footer_end - tag_size;
+    let items_len = tag_size - APE_DESCRIPTOR_LEN as u64;
+    let had_header = footer_flags & APE_FLAG_HEADER_PRESENT != 0;
+    let replace_start = if had_header {
+        if items_start < APE_DESCRIPTOR_LEN as u64 {
+            return Err(format!("APEv2 header underflows file start in '{}'", path.display()));
+        }
+        let header_start = items_start - APE_DESCRIPTOR_LEN as u64;
+        file.seek(SeekFrom::Start(header_start))
+            .map_err(|error| format!("seek APEv2 header in '{}': {error}", path.display()))?;
+        let mut header = [0u8; APE_DESCRIPTOR_LEN];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read APEv2 header in '{}': {error}", path.display()))?;
+        if &header[..8] != APE_SIGNATURE
+            || u32_le_at(&header, 8)? != version
+            || u32_le_at(&header, 12)? != tag_size as u32
+            || u32_le_at(&header, 16)? != item_count
+            || u32_le_at(&header, 20)? & APE_FLAG_IS_HEADER == 0
+        {
+            return Err(format!(
+                "APEv2 footer claims a header but the matching header is absent or inconsistent in '{}'",
+                path.display()
+            ));
+        }
+        header_start
+    } else {
+        items_start
+    };
+
+    let items_len_usize = usize::try_from(items_len)
+        .map_err(|_| format!("APEv2 item region is too large in '{}'", path.display()))?;
+    file.seek(SeekFrom::Start(items_start))
+        .map_err(|error| format!("seek APEv2 items in '{}': {error}", path.display()))?;
+    let mut bytes = vec![0u8; items_len_usize];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read APEv2 items in '{}': {error}", path.display()))?;
+
+    // A physical item requires at least an 8-byte item header and a one-byte
+    // key terminator. Clamp attacker-controlled footer counts to the maximum
+    // number that could fit in the bounded region before allocating.
+    let mut items = Vec::with_capacity(native_ape_item_capacity(item_count, bytes.len()));
+    let mut cursor = 0usize;
+    for item_index in 0..item_count {
+        let item_start = cursor;
+        if cursor.checked_add(8).is_none_or(|end| end > bytes.len()) {
+            return Err(format!(
+                "truncated APEv2 item {item_index} header in '{}'",
+                path.display()
+            ));
+        }
+        let value_len = u32_le_at(&bytes, cursor)? as usize;
+        let flags = u32_le_at(&bytes, cursor + 4)?;
+        cursor += 8;
+        let key_end = bytes[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| cursor + offset)
+            .ok_or_else(|| {
+                format!(
+                    "unterminated APEv2 item {item_index} key in '{}'",
+                    path.display()
+                )
+            })?;
+        let key_bytes = bytes[cursor..key_end].to_vec();
+        cursor = key_end + 1;
+        let value_end = cursor.checked_add(value_len).ok_or_else(|| {
+            format!("APEv2 item {item_index} length overflow in '{}'", path.display())
+        })?;
+        if value_end > bytes.len() {
+            return Err(format!(
+                "truncated APEv2 item {item_index} value in '{}'",
+                path.display()
+            ));
+        }
+        let value = bytes[cursor..value_end].to_vec();
+        cursor = value_end;
+        let key = if ape_key_is_valid(&key_bytes) {
+            Some(String::from_utf8(key_bytes.clone()).map_err(|_| {
+                format!("ASCII APEv2 key decoded as invalid UTF-8 in '{}'", path.display())
+            })?)
+        } else {
+            None
+        };
+        items.push(NativeApeItem {
+            raw: bytes[item_start..cursor].to_vec(),
+            key_bytes,
+            key,
+            flags,
+            value,
+        });
+    }
+    if cursor != bytes.len() {
+        return Err(format!(
+            "APEv2 item count/size mismatch in '{}': {} unclaimed byte(s)",
+            path.display(),
+            bytes.len() - cursor
+        ));
+    }
+
+    Ok(Some(NativeApeTag {
+        replace_start,
+        footer_end,
+        had_header,
+        items,
+    }))
+}
+
+pub(crate) fn native_ape_canonical_key(raw_key: &str) -> String {
+    let normalized = raw_key.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "TRACK" | "TRACKNUMBER" => "TRACKNUMBER".to_string(),
+        "TRACKTOTAL" | "TOTALTRACKS" => "TRACKTOTAL".to_string(),
+        "DISK" | "DISC" | "DISKNUMBER" | "DISCNUMBER" => "DISCNUMBER".to_string(),
+        "DISKTOTAL" | "DISCTOTAL" | "TOTALDISCS" => "DISCTOTAL".to_string(),
+        "ALBUM ARTIST" | "ALBUMARTIST" => "ALBUMARTIST".to_string(),
+        "YEAR" | "DATE" => "DATE".to_string(),
+        "DESCRIPTION" | "COMMENT" => "COMMENT".to_string(),
+        "ENCODING TOOL" | "ENCODINGTOOL" => "ENCODINGTOOL".to_string(),
+        "MUSICBRAINZ ALBUM ID" | "MUSICBRAINZ RELEASE ID" | "MUSICBRAINZ_ALBUMID" => {
+            "MUSICBRAINZ_ALBUMID".to_string()
+        }
+        "MUSICBRAINZ ALBUM ARTIST ID" | "MUSICBRAINZ RELEASE ARTIST ID"
+        | "MUSICBRAINZ_ALBUMARTISTID" => "MUSICBRAINZ_ALBUMARTISTID".to_string(),
+        "MUSICBRAINZ RELEASE GROUP ID" | "MUSICBRAINZ_RELEASEGROUPID" => {
+            "MUSICBRAINZ_RELEASEGROUPID".to_string()
+        }
+        "MUSICBRAINZ TRACK ID" | "MUSICBRAINZ RECORDING ID" | "MUSICBRAINZ_TRACKID" => {
+            "MUSICBRAINZ_TRACKID".to_string()
+        }
+        "MUSICBRAINZ RELEASE TRACK ID" | "MUSICBRAINZ_RELEASETRACKID" => {
+            "MUSICBRAINZ_RELEASETRACKID".to_string()
+        }
+        "MUSICBRAINZ ARTIST ID" | "MUSICBRAINZ_ARTISTID" => {
+            "MUSICBRAINZ_ARTISTID".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn item_key_for_neutral_ape_row(canonical_key: &str) -> ItemKey {
+    match canonical_key {
+        "TITLE" => ItemKey::TrackTitle,
+        "ARTIST" => ItemKey::TrackArtist,
+        "ALBUM" => ItemKey::AlbumTitle,
+        "ALBUMARTIST" => ItemKey::AlbumArtist,
+        "TRACKNUMBER" => ItemKey::TrackNumber,
+        "TRACKTOTAL" => ItemKey::TrackTotal,
+        "DISCNUMBER" => ItemKey::DiscNumber,
+        "DISCTOTAL" => ItemKey::DiscTotal,
+        "DATE" => ItemKey::Year,
+        "GENRE" => ItemKey::Genre,
+        "COMMENT" => ItemKey::Comment,
+        "COMPOSER" => ItemKey::Composer,
+        "LYRICIST" => ItemKey::Lyricist,
+        "ARRANGER" => ItemKey::Arranger,
+        "PERFORMER" => ItemKey::Performer,
+        "ISRC" => ItemKey::Isrc,
+        "CATALOGNUMBER" => ItemKey::CatalogNumber,
+        "PUBLISHER" => ItemKey::Publisher,
+        "COPYRIGHT" => ItemKey::CopyrightMessage,
+        "ORIGINALDATE" => ItemKey::OriginalReleaseDate,
+        "MUSICBRAINZ_ALBUMID" => ItemKey::MusicBrainzReleaseId,
+        "MUSICBRAINZ_ALBUMARTISTID" => ItemKey::MusicBrainzReleaseArtistId,
+        "MUSICBRAINZ_RELEASEGROUPID" => ItemKey::MusicBrainzReleaseGroupId,
+        "MUSICBRAINZ_TRACKID" => ItemKey::MusicBrainzRecordingId,
+        "MUSICBRAINZ_RELEASETRACKID" => ItemKey::MusicBrainzTrackId,
+        "MUSICBRAINZ_ARTISTID" => ItemKey::MusicBrainzArtistId,
+        "REPLAYGAIN_TRACK_GAIN" => ItemKey::ReplayGainTrackGain,
+        "REPLAYGAIN_TRACK_PEAK" => ItemKey::ReplayGainTrackPeak,
+        "REPLAYGAIN_ALBUM_GAIN" => ItemKey::ReplayGainAlbumGain,
+        "REPLAYGAIN_ALBUM_PEAK" => ItemKey::ReplayGainAlbumPeak,
+        _ => ItemKey::Unknown(canonical_key.to_string()),
+    }
+}
+
+pub(crate) fn native_ape_numbering_rows(
+    raw_key: &str,
+    value: &str,
+) -> Option<Vec<(String, ItemKey, String)>> {
+    let normalized = raw_key.trim().to_ascii_uppercase();
+    let (number_key, total_key, number_item, total_item) = match normalized.as_str() {
+        "TRACK" => (
+            "TRACKNUMBER",
+            "TRACKTOTAL",
+            ItemKey::TrackNumber,
+            ItemKey::TrackTotal,
+        ),
+        "DISK" | "DISC" => (
+            "DISCNUMBER",
+            "DISCTOTAL",
+            ItemKey::DiscNumber,
+            ItemKey::DiscTotal,
+        ),
+        _ => return None,
+    };
+    let mut parts = value.split('/');
+    let number = parts.next().unwrap_or("").trim();
+    if number.parse::<u32>().is_err() {
+        return None;
+    }
+    let mut rows = vec![(number_key.to_string(), number_item, number.to_string())];
+    if let Some(total) = parts.next().map(str::trim).filter(|value| !value.is_empty()) {
+        if total.parse::<u32>().is_err() {
+            return None;
+        }
+        rows.push((total_key.to_string(), total_item, total.to_string()));
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(rows)
+}
+
+pub(crate) fn native_ape_rows(
+    tag: &NativeApeTag,
+    path: &Path,
+) -> Result<Vec<NeutralApeRow>, String> {
+    let mut rows = Vec::new();
+    for item in tag.items.iter().filter(|item| item.key.is_some()) {
+        let raw_key = item.key.as_deref().expect("filtered valid APE key");
+        let (value, is_binary) = match item.item_type() {
+            APE_ITEM_TYPE_TEXT | APE_ITEM_TYPE_LOCATOR => {
+                let value = std::str::from_utf8(&item.value).map_err(|_| {
+                    format!(
+                        "APEv2 item '{}' has invalid UTF-8 text in '{}'",
+                        raw_key,
+                        path.display()
+                    )
+                })?;
+                (value.split('\0').collect::<Vec<_>>().join("; "), false)
+            }
+            APE_ITEM_TYPE_BINARY => (format!("<binary, {} bytes>", item.value.len()), true),
+            _ => {
+                return Err(format!(
+                    "APEv2 item '{}' has reserved value type in '{}'",
+                    raw_key,
+                    path.display()
+                ));
+            }
+        };
+        if !is_binary {
+            if let Some(numbering_rows) = native_ape_numbering_rows(raw_key, &value) {
+                rows.extend(numbering_rows.into_iter().map(
+                    |(canonical_key, item_key, value)| NeutralApeRow {
+                        raw_key: raw_key.to_string(),
+                        canonical_key,
+                        item_key,
+                        value,
+                        is_binary: false,
+                    },
+                ));
+                continue;
+            }
+        }
+        let canonical_key = native_ape_canonical_key(raw_key);
+        rows.push(NeutralApeRow {
+            raw_key: raw_key.to_string(),
+            item_key: item_key_for_neutral_ape_row(&canonical_key),
+            canonical_key,
+            value,
+            is_binary,
+        });
+    }
+    Ok(rows)
+}
+
+pub(crate) fn read_native_ape_fallback(path: &Path) -> Result<NeutralApeReadOutcome, String> {
+    let tag = read_native_ape_tag(path)?.ok_or_else(|| {
+        format!(
+            "Lofty reported an APEv2 decoding failure for '{}', but no bounded trailing APEv2 footer was found",
+            path.display()
+        )
+    })?;
+    let rows = native_ape_rows(&tag, path)?;
+    let escaped_keys = tag
+        .items
+        .iter()
+        .filter(|item| item.key.is_none())
+        .map(|item| display_escaped_ape_key(&item.key_bytes))
+        .collect::<Vec<_>>();
+    let warning = (!escaped_keys.is_empty()).then(|| NeutralApeWarning {
+        path: path.to_path_buf(),
+        escaped_keys,
+    });
+    Ok(NeutralApeReadOutcome { rows, warning })
+}
+
+pub(crate) fn invalid_native_ape_keys(path: &Path) -> Result<Vec<String>, String> {
+    Ok(read_native_ape_tag(path)?
+        .into_iter()
+        .flat_map(|tag| tag.items)
+        .filter(|item| item.key.is_none())
+        .map(|item| display_escaped_ape_key(&item.key_bytes))
+        .collect())
+}
+
 /// Detect a native FLAC stream at byte zero or immediately after one bounded,
 /// well-formed ID3v2 tag. Returns `Ok(None)` for non-FLAC input and an error for
 /// a file that claims an ID3v2 prefix but cannot be parsed safely or is not
@@ -731,6 +1227,13 @@ mod tests {
             ((value >> 7) & 0x7f) as u8,
             (value & 0x7f) as u8,
         ]
+    }
+
+    #[test]
+    fn native_ape_item_capacity_clamps_untrusted_footer_counts() {
+        assert_eq!(native_ape_item_capacity(100_000_000, 90), 10);
+        assert_eq!(native_ape_item_capacity(3, 90), 3);
+        assert_eq!(native_ape_item_capacity(u32::MAX, 8), 0);
     }
 
     #[test]

@@ -31,6 +31,16 @@ pub struct TonepoetConfig {
     pub browsing: BrowsingConfig,
     #[serde(default)]
     pub file_operations: FileOperationsConfig,
+    #[serde(default)]
+    pub naming: NamingConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamingConfig {
+    /// Strip trailing dots and spaces from final path components for Windows
+    /// interoperability. Disabled by default so canonical metadata is lossless.
+    #[serde(default)]
+    pub windows_portable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -424,6 +434,7 @@ impl Default for TonepoetConfig {
             performance: PerformanceConfig::default(),
             browsing: BrowsingConfig::default(),
             file_operations: FileOperationsConfig::default(),
+            naming: NamingConfig::default(),
         }
     }
 }

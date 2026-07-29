@@ -115,6 +115,7 @@ mod tests {
             merge: false,
             output_root: PathBuf::from("/tmp/out"),
             naming: NamingPolicy {
+                windows_portable: false,
                 template: "%NN% - %TITLE%".into(),
                 folder_template: None,
                 per_album_subdir: true,

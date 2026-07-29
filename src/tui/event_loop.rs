@@ -388,6 +388,24 @@ fn defer_quit_for_browse_archive_metadata(
         return true;
     }
 
+    let invalid_ape_repair_cancel = match &mut app.active_overlay {
+        ActiveOverlay::MetadataEditor(state)
+            if state.phase == super::app::MetadataEditorPhase::Saving
+                && state.invalid_ape_repair.is_some() => Some(state.cancel_metadata_write()),
+        _ => None,
+    };
+    if let Some(requested) = invalid_ape_repair_cancel {
+        app.should_quit = false;
+        app.set_status(if requested {
+            "quit deferred: invalid-APE repair cancellation requested; waiting for the worker's classified completion ledger"
+                .to_string()
+        } else {
+            "quit deferred: invalid-APE repair has passed a cancellation point; waiting for its classified completion ledger"
+                .to_string()
+        });
+        return true;
+    }
+
     if let ActiveOverlay::MetadataEditor(state) = &app.active_overlay {
         let browse_archive_owned = state
             .archive_edit_context
@@ -920,7 +938,8 @@ fn reduce_file_picker_complete(
     path: Option<std::path::PathBuf>,
     paths: Vec<std::path::PathBuf>,
     tx: &mpsc::Sender<AppMessage>,
-) {
+) -> bool {
+    let mut consumed = true;
     match purpose.clone() {
         super::app::FilePickerPurpose::SelectArtwork { picture_type } => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
@@ -945,6 +964,7 @@ fn reduce_file_picker_complete(
                     }
 
                     if !matches_open_picker {
+                        consumed = false;
                         app.set_status("file picker: ignored stale metadata-artwork completion");
                     } else if let Some(path) = path {
                         super::metadata_editor_actions::dispatch_artwork_write(
@@ -961,6 +981,7 @@ fn reduce_file_picker_complete(
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                 }
                 other => {
+                    consumed = false;
                     app.active_overlay = other;
                     app.set_status("file picker: ignored metadata-artwork completion without an active editor");
                 }
@@ -986,6 +1007,7 @@ fn reduce_file_picker_complete(
                         state.file_picker = None;
                     }
                     if !matches_open_picker {
+                        consumed = false;
                         app.set_status("file picker: ignored stale tag-block completion");
                     } else if let Some(path) = path {
                         let editor_session = metadata_editor_session_guard(&state);
@@ -1023,6 +1045,7 @@ fn reduce_file_picker_complete(
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                 }
                 other => {
+                    consumed = false;
                     app.active_overlay = other;
                     app.set_status(
                         "file picker: ignored tag-block completion without an active editor",
@@ -1052,7 +1075,7 @@ fn reduce_file_picker_complete(
                     if !matches_open_picker {
                         app.set_status("file picker: ignored stale editor tag-transfer completion");
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                        return;
+                        return false;
                     }
                     let selected_roots = if paths.is_empty() {
                         path.into_iter().collect::<Vec<_>>()
@@ -1062,7 +1085,7 @@ fn reduce_file_picker_complete(
                     if selected_roots.is_empty() {
                         app.set_status("metadata editor: tag transfer cancelled");
                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                        return;
+                        return true;
                     }
                     let editor_session = metadata_editor_session_guard(&state);
                     let editor_fingerprint =
@@ -1137,6 +1160,7 @@ fn reduce_file_picker_complete(
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                 }
                 other => {
+                    consumed = false;
                     app.active_overlay = other;
                     app.set_status(
                         "file picker: ignored editor tag-transfer completion without an active editor",
@@ -1151,18 +1175,18 @@ fn reduce_file_picker_complete(
             let conflict_policy = matching_file_picker_conflict_policy(app, session_id, &purpose);
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status(format!("file picker: ignored stale {op} completion"));
-                return;
+                return false;
             }
             let Some(dest_dir) = path else {
                 app.set_status(format!("{op} cancelled"));
-                return;
+                return true;
             };
             if !dest_dir.is_dir() {
                 app.set_status(format!(
                     "{op} destination is not a directory: {}",
                     dest_dir.display()
                 ));
-                return;
+                return true;
             }
             let target = if is_move {
                 super::app::TextEditTarget::BrowseMove { sources, force }
@@ -1185,7 +1209,7 @@ fn reduce_file_picker_complete(
         } => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale tag-transfer completion");
-                return;
+                return false;
             }
             let selected_roots = if paths.is_empty() {
                 path.into_iter().collect::<Vec<_>>()
@@ -1194,7 +1218,7 @@ fn reduce_file_picker_complete(
             };
             if selected_roots.is_empty() {
                 app.set_status("Transfer tags cancelled");
-                return;
+                return true;
             }
             let (source_roots, target_roots) = match direction {
                 super::app::TagTransferDirection::To => (fixed_roots, selected_roots),
@@ -1211,7 +1235,7 @@ fn reduce_file_picker_complete(
         super::app::FilePickerPurpose::SelectDestination => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale destination completion");
-                return;
+                return false;
             }
             match path {
                 Some(path) if path.is_dir() => {
@@ -1228,18 +1252,19 @@ fn reduce_file_picker_complete(
         super::app::FilePickerPurpose::SelectPreset => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale preset completion");
-                return;
+                return false;
             }
             let Some(path) = path else {
                 app.set_status("preset load cancelled");
-                return;
+                return true;
             };
             let Some(name) = path.file_stem().and_then(|name| name.to_str()).map(str::to_string) else {
                 app.set_status(format!("invalid preset path: {}", path.display()));
-                return;
+                return true;
             };
             match super::presets::load_preset_from_path(&path) {
                 Ok(preset) => {
+                    let semantics = preset.resolved_semantics_summary();
                     let report = preset.apply_to_pills(
                         &mut app.convert.format,
                         &mut app.convert.output_options,
@@ -1248,9 +1273,10 @@ fn reduce_file_picker_complete(
                     app.preset.set_active_preset_path(name.clone(), path.clone());
                     app.preset.modified = false;
                     app.set_status(format!(
-                        "Loaded preset: {}{}",
+                        "Loaded preset: {}{} | {}",
                         path.display(),
-                        report.status_suffix()
+                        report.status_suffix(),
+                        semantics
                     ));
                 }
                 Err(e) => app.set_status(format!("Load failed: {}", e)),
@@ -1259,15 +1285,15 @@ fn reduce_file_picker_complete(
         super::app::FilePickerPurpose::SavePreset => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale preset-save completion");
-                return;
+                return false;
             }
             let Some(path) = path else {
                 app.set_status("preset save cancelled");
-                return;
+                return true;
             };
             let Some(name) = path.file_stem().and_then(|name| name.to_str()).map(str::to_string) else {
                 app.set_status(format!("invalid preset path: {}", path.display()));
-                return;
+                return true;
             };
             let preset = super::presets::TuiPreset::from_pill_state(
                 &name,
@@ -1279,7 +1305,11 @@ fn reduce_file_picker_complete(
                 Ok(()) => {
                     app.preset.set_active_preset_path(name.clone(), path.clone());
                     app.preset.modified = false;
-                    app.set_status(format!("Saved preset: {}", path.display()));
+                    app.set_status(format!(
+                        "Saved preset: {} | {}",
+                        path.display(),
+                        preset.resolved_semantics_summary()
+                    ));
                 }
                 Err(e) => app.set_status(format!("Save failed: {}", e)),
             }
@@ -1287,7 +1317,7 @@ fn reduce_file_picker_complete(
         super::app::FilePickerPurpose::Generic { id } => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status(format!("file picker purpose '{id}': ignored stale completion"));
-                return;
+                return false;
             }
             match path {
                 Some(path) => app.set_status(format!(
@@ -1300,7 +1330,7 @@ fn reduce_file_picker_complete(
         super::app::FilePickerPurpose::SelectFile | super::app::FilePickerPurpose::SelectDirectory => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale completion");
-                return;
+                return false;
             }
             match path {
                 Some(path) => app.set_status(format!("file picker selected {}", path.display())),
@@ -1308,6 +1338,8 @@ fn reduce_file_picker_complete(
             }
         }
     }
+    consumed
+
 }
 
 fn reduce_file_task_progress(
@@ -5233,9 +5265,12 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         } => {
             let selected_count = paths.len();
             let disclosure_purpose = purpose.clone();
-            reduce_file_picker_complete(app, session_id, purpose, path, paths, tx);
-            append_first_of_many_disclosure(app, &disclosure_purpose, selected_count);
-            append_ignored_directory_disclosure(app, ignored_directories);
+            let consumed =
+                reduce_file_picker_complete(app, session_id, purpose, path, paths, tx);
+            if consumed {
+                append_first_of_many_disclosure(app, &disclosure_purpose, selected_count);
+                append_ignored_directory_disclosure(app, ignored_directories);
+            }
         }
         AppMessage::FileTaskProgress { session_id, update } => {
             reduce_file_task_progress(app, session_id, update, tx);
@@ -5574,6 +5609,29 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             refreshed_entries,
         } => {
             if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
+                if taken
+                    .state
+                    .invalid_ape_repair_is_current(session_id, save_generation)
+                {
+                    if let Some(summary) =
+                        super::keybindings::apply_invalid_ape_repair_completion(
+                            app,
+                            &mut taken.state,
+                            session_id,
+                            save_generation,
+                            results,
+                            refreshed_entries,
+                        )
+                    {
+                        app.set_status(summary.status_line());
+                    } else {
+                        app.set_status(format!(
+                            "APE repair: ignored stale completion for session {session_id} generation {save_generation}"
+                        ));
+                    }
+                    restore_taken_metadata_editor(app, taken);
+                    return;
+                }
                 let mut restore_editor = true;
                 if let Some(summary) =
                     taken
@@ -5667,7 +5725,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             } else {
                 app.set_status(
-                    "metadata editor: save finished after editor closed; stale result ignored",
+                    "metadata editor: background write finished after the editor closed; disk changes may have committed, so reopen before retrying",
                 );
             }
         }
@@ -10049,6 +10107,32 @@ mod browse_archive_quit_lifecycle_tests {
     }
 
     #[test]
+    fn quit_requests_invalid_ape_repair_cancellation_and_keeps_editor_owned() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.should_quit = true;
+        let mut state = MetadataEditorState::for_files(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MetadataTechnicalDetails::default(),
+        );
+        let (_session_id, _generation, cancel) = state.begin_invalid_ape_repair(vec![(
+            std::path::PathBuf::from("album/track.wv"),
+            vec!["&год".to_string()],
+        )]);
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+
+        assert!(defer_quit_for_browse_archive_metadata(&mut app, &tx()));
+        assert!(!app.should_quit);
+        assert!(cancel.is_cancelled());
+        assert!(matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("repair cancellation requested")
+                && message.contains("classified completion ledger")
+        }));
+    }
+
+    #[test]
     fn quit_is_blocked_by_dirty_open_non_archive_editor() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.should_quit = true;
@@ -14320,8 +14404,8 @@ mod copy_move_file_picker_flow_tests {
                 session_id: active_session_id.saturating_add(1),
                 purpose,
                 path: Some(dest.clone()),
-                paths: Vec::new(),
-                ignored_directories: 0,
+                paths: vec![dest.join("one"), dest.join("two")],
+                ignored_directories: 3,
             },
             &tx(),
         );
@@ -14332,6 +14416,11 @@ mod copy_move_file_picker_flow_tests {
         assert!(
             status.unwrap_or_default().contains("ignored stale copy completion"),
             "unexpected status: {status:?}"
+        );
+        assert!(
+            !status.unwrap_or_default().contains("first of")
+                && !status.unwrap_or_default().contains("director"),
+            "discarded completions must not append selection disclosures: {status:?}"
         );
     }
 

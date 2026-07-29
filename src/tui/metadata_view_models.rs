@@ -894,37 +894,57 @@ fn metadata_file_issue_rows_for_files(
     include_probe_errors: bool,
     include_metadata_errors: bool,
 ) -> Vec<IssueViewRow> {
+    #[derive(Debug)]
+    struct PendingIssue {
+        label: String,
+        kind: String,
+        reason: String,
+        path: PathBuf,
+    }
+
     let include_file_label = files.len() > 1;
-    let mut rows = Vec::new();
+    let mut pending = Vec::new();
 
     for (idx, file) in files.iter().enumerate() {
         let label = metadata_issue_file_label(state, file, idx, include_file_label);
+        let path = file.file_facts.path.clone();
         if !file.issues.is_empty() {
             for issue in &file.issues {
-                match issue {
-                    MetadataIssue::Filesystem { reason, .. } => {
-                        rows.push(issue_view_row(&label, "filesystem", reason));
+                let row = match issue {
+                    MetadataIssue::Filesystem { path, reason } => {
+                        Some((path, "filesystem", reason))
                     }
-                    MetadataIssue::TagRead { reason, .. } if include_metadata_errors => {
-                        rows.push(issue_view_row(&label, "tags/artwork", reason));
+                    MetadataIssue::TagRead { path, reason }
+                    | MetadataIssue::RecoverableTagWarning { path, reason }
+                        if include_metadata_errors =>
+                    {
+                        Some((path, "tags/artwork", reason))
                     }
-                    MetadataIssue::Unsupported { reason, .. } if include_metadata_errors => {
-                        rows.push(issue_view_row(&label, "unsupported", reason));
+                    MetadataIssue::Unsupported { path, reason } if include_metadata_errors => {
+                        Some((path, "unsupported", reason))
                     }
-                    MetadataIssue::Probe { reason, .. } if include_probe_errors => {
-                        rows.push(issue_view_row(&label, "audio probe", reason));
+                    MetadataIssue::Probe { path, reason, .. } if include_probe_errors => {
+                        Some((path, "audio probe", reason))
                     }
-                    MetadataIssue::SaveBlocked { reason, .. }
+                    MetadataIssue::SaveBlocked { path, reason }
                         if include_probe_errors && include_metadata_errors =>
                     {
-                        rows.push(issue_view_row(&label, "save blocked", reason));
+                        Some((path, "save blocked", reason))
                     }
-                    MetadataIssue::Write { reason, .. }
+                    MetadataIssue::Write { path, reason }
                         if include_probe_errors && include_metadata_errors =>
                     {
-                        rows.push(issue_view_row(&label, "write", reason));
+                        Some((path, "write", reason))
                     }
-                    _ => {}
+                    _ => None,
+                };
+                if let Some((issue_path, kind, reason)) = row {
+                    pending.push(PendingIssue {
+                        label: label.clone(),
+                        kind: kind.to_string(),
+                        reason: elide_metadata_issue_path(reason, issue_path),
+                        path: issue_path.clone(),
+                    });
                 }
             }
             continue;
@@ -936,30 +956,97 @@ fn metadata_file_issue_rows_for_files(
             .as_ref()
             .filter(|err| !err.trim().is_empty())
         {
-            rows.push(issue_view_row(&label, "filesystem", err));
+            pending.push(PendingIssue {
+                label: label.clone(),
+                kind: "filesystem".to_string(),
+                reason: elide_metadata_issue_path(err, &path),
+                path: path.clone(),
+            });
         }
         if include_probe_errors {
             if let ProbeState::Failed { reason, .. } = &file.media_facts {
-                rows.push(issue_view_row(&label, "audio probe", reason));
+                pending.push(PendingIssue {
+                    label: label.clone(),
+                    kind: "audio probe".to_string(),
+                    reason: elide_metadata_issue_path(reason, &path),
+                    path: path.clone(),
+                });
             }
         }
         if include_probe_errors && include_metadata_errors {
             match &file.file_facts.read_state {
                 FileReadState::Readable => {}
-                FileReadState::Unreadable { reason } => {
-                    rows.push(issue_view_row(&label, "unreadable", reason));
-                }
-                FileReadState::Unsupported { reason } => {
-                    rows.push(issue_view_row(&label, "unsupported", reason));
-                }
+                FileReadState::Unreadable { reason } => pending.push(PendingIssue {
+                    label: label.clone(),
+                    kind: "unreadable".to_string(),
+                    reason: elide_metadata_issue_path(reason, &path),
+                    path: path.clone(),
+                }),
+                FileReadState::Unsupported { reason } => pending.push(PendingIssue {
+                    label: label.clone(),
+                    kind: "unsupported".to_string(),
+                    reason: elide_metadata_issue_path(reason, &path),
+                    path: path.clone(),
+                }),
             }
             if let Some(reason) = file.file_facts.write_eligibility.block_reason() {
-                rows.push(issue_view_row(&label, "save blocked", reason));
+                pending.push(PendingIssue {
+                    label: label.clone(),
+                    kind: "save blocked".to_string(),
+                    reason: elide_metadata_issue_path(reason, &path),
+                    path,
+                });
             }
         }
     }
 
+    let mut counts = BTreeMap::<(String, String), BTreeSet<PathBuf>>::new();
+    for issue in &pending {
+        counts
+            .entry((issue.kind.clone(), issue.reason.clone()))
+            .or_default()
+            .insert(issue.path.clone());
+    }
+
+    let mut emitted_collapsed = BTreeSet::new();
+    let mut rows = Vec::new();
+    for issue in pending {
+        let signature = (issue.kind.clone(), issue.reason.clone());
+        let count = counts.get(&signature).map_or(1, BTreeSet::len);
+        if count >= 2 {
+            if emitted_collapsed.insert(signature) {
+                rows.push(issue_view_row(
+                    &format!("{count} files"),
+                    "",
+                    &issue.reason,
+                ));
+            }
+        } else {
+            rows.push(issue_view_row(&issue.label, &issue.kind, &issue.reason));
+        }
+    }
     rows
+}
+
+fn elide_metadata_issue_path(reason: &str, path: &Path) -> String {
+    let displayed = path.display().to_string();
+    let mut value = reason.trim().to_string();
+    for needle in [
+        format!(" in '{displayed}'"),
+        format!(" from '{displayed}'"),
+        format!(" for '{displayed}'"),
+        format!(" '{}':", displayed),
+        format!("'{displayed}'"),
+        displayed,
+    ] {
+        value = value.replace(&needle, "");
+    }
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c: char| c == ':' || c.is_whitespace())
+        .to_string()
 }
 
 fn issue_view_row(label: &str, kind: &str, reason: &str) -> IssueViewRow {
@@ -1634,6 +1721,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             FileReadState::Readable,
             FileWriteEligibility::Writable,
             super::super::probe::SourceMetadata::default(),
@@ -1765,6 +1853,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             FileReadState::Readable,
             FileWriteEligibility::Writable,
             super::super::probe::SourceMetadata::default(),
@@ -1884,6 +1973,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             FileReadState::Readable,
             FileWriteEligibility::Writable,
             metadata,
@@ -1911,6 +2001,7 @@ mod tests {
         let mut file = MetadataFileDetails::from_open_cache(
             PathBuf::from("/tmp/twenty_four_bit.flac"),
             Some(100),
+            None,
             None,
             None,
             None,
@@ -1950,6 +2041,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             FileReadState::Readable,
             FileWriteEligibility::Writable,
             super::super::probe::SourceMetadata::default(),
@@ -1969,6 +2061,51 @@ mod tests {
         assert!(hdcd_applicable_for_file(&file));
         assert_eq!(hdcd_status_for_file(&file), "Not detected");
     }
+
+    #[test]
+    fn identical_recoverable_tag_warnings_collapse_without_repeating_paths() {
+        let paths = [PathBuf::from("/music/a.wv"), PathBuf::from("/music/b.wv")];
+        let mut files = paths
+            .iter()
+            .map(|path| {
+                MetadataFileDetails::from_open_cache(
+                    path.clone(),
+                    Some(100),
+                    None,
+                    None,
+                    None,
+                    None,
+                    FileReadState::Readable,
+                    FileWriteEligibility::Writable,
+                    super::super::probe::SourceMetadata::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for file in &mut files {
+            let path = file.file_facts.path.clone();
+            file.issues.push(MetadataIssue::RecoverableTagWarning {
+                path: path.clone(),
+                reason: format!(
+                    "1 invalid APE key skipped in '{}': '&год'",
+                    path.display()
+                ),
+            });
+        }
+        let state = MetadataEditorState::for_files(
+            paths.to_vec(),
+            Vec::new(),
+            Vec::new(),
+            super::super::app::MetadataTechnicalDetails::from_files(files.clone()),
+        );
+
+        let rows = metadata_file_issue_rows_for_files(&state, &files, true, true);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "2 files");
+        assert_eq!(rows[0].kind, "");
+        assert_eq!(rows[0].reason, "1 invalid APE key skipped: '&год'");
+        assert!(!rows[0].reason.contains("/music/"));
+    }
     #[test]
     fn artwork_type_label_has_numbered_fallback() {
         assert_eq!(artwork_type_label_from_id3_code(2), "Other Icon");
@@ -1984,6 +2121,7 @@ mod tests {
         let mut detected = MetadataFileDetails::from_open_cache(
             PathBuf::from("/tmp/detected.flac"),
             Some(100),
+            None,
             None,
             None,
             None,
@@ -2037,6 +2175,7 @@ mod tests {
         let mut not_scanned = MetadataFileDetails::from_open_cache(
             PathBuf::from("/tmp/unscanned.flac"),
             Some(100),
+            None,
             None,
             None,
             None,
@@ -2099,6 +2238,7 @@ mod tests {
             let mut file = MetadataFileDetails::from_open_cache(
                 PathBuf::from(path),
                 Some(100),
+                None,
                 None,
                 None,
                 None,

@@ -146,6 +146,10 @@ pub fn build_pipeline_request_from_settings(
             } else {
                 NamingCollisionPolicy::AppendStableSuffix
             },
+            // Direct compatibility callers have no TonepoetConfig handle.
+            // UI/CLI production paths attach a prebuilt request carrying the
+            // configured policy before this fallback is reached.
+            windows_portable: false,
         },
         publish: PublishPolicy {
             overwrite: if item.options.overwrite {

@@ -834,7 +834,37 @@ fn read_embedded_cuesheet(path: &Path) -> Result<Option<String>, MaterializeErro
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
-        Err(_) => return Ok(None),
+        Err(error) if crate::metadata_persistence::native_ape_error_is_eligible(&error) => {
+            let outcome = match crate::metadata_persistence::read_native_ape_fallback(path) {
+                Ok(outcome) => outcome,
+                Err(native_error) => {
+                    log::warn!(
+                        "embedded CUESHEET metadata unavailable for '{}': {error}; native APEv2 fallback refused: {native_error}",
+                        path.display()
+                    );
+                    return Ok(None);
+                }
+            };
+            if let Some(warning) = outcome.warning {
+                log::warn!("{}", warning.message());
+            }
+            return Ok(outcome
+                .rows
+                .into_iter()
+                .find(|row| {
+                    !row.is_binary
+                        && (row.raw_key.eq_ignore_ascii_case("CUESHEET")
+                            || row.canonical_key.eq_ignore_ascii_case("CUESHEET"))
+                })
+                .map(|row| row.value));
+        }
+        Err(error) => {
+            log::warn!(
+                "embedded CUESHEET metadata unavailable for '{}': {error}",
+                path.display()
+            );
+            return Ok(None);
+        }
     };
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return Ok(None);
@@ -3542,6 +3572,7 @@ FILE "album.flac" WAVE
                 folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,

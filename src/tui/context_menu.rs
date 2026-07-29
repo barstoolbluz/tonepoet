@@ -234,6 +234,8 @@ pub enum ContextAction {
     MetadataRestoreEntry,
     /// MetadataEditor: open the "add new field" input.
     MetadataAddField,
+    /// MetadataEditor: remove invalid-key APEv2 items from the open file set.
+    MetadataRemoveInvalidApeKeys,
     /// MetadataEditor row-level clipboard and selection actions.
     MetadataRowsCopy,
     MetadataRowsCut,
@@ -2868,6 +2870,47 @@ pub fn execute_context_action(
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
+        }
+        ContextAction::MetadataRemoveInvalidApeKeys => {
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.set_status("APE repair: owning metadata editor is no longer available");
+                return;
+            };
+            if state.phase == super::app::MetadataEditorPhase::Saving {
+                app.set_status("APE repair: another metadata write is already running");
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            if state.any_presentation_dirty() {
+                app.set_status(
+                    "APE repair: save or discard editor changes before repairing on-disk tags",
+                );
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            let targets = super::keybindings::metadata_editor_invalid_ape_repair_targets(&state);
+            if targets.is_empty() {
+                app.set_status("APE repair: no recoverable invalid-key warnings in the open set");
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            let details = targets
+                .iter()
+                .map(|(path, keys)| format!("{}: {}", path.display(), keys.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            app.pending_metadata_editor = Some(state);
+            app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                message: format!(
+                    "Remove invalid APE key(s) from {} file(s)? {}",
+                    targets.len(),
+                    details
+                ),
+                action: super::app::ConfirmAction::RemoveInvalidApeKeys {
+                    targets,
+                    verification: app.config.file_operations.verification,
+                },
+            };
         }
         ContextAction::MetadataAutoNumber(target, scheme) => {
             let Some(mut state) = app.pending_metadata_editor.take() else {

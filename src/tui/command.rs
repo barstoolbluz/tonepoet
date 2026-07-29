@@ -4058,7 +4058,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     Ok(_) => {
                         app.preset.set_active_preset_path(name.clone(), path.clone());
                         app.preset.modified = false;
-                        app.set_status(format!("Saved preset: {}", path.display()));
+                        app.set_status(format!(
+                            "Saved preset: {} | {}",
+                            path.display(),
+                            preset.resolved_semantics_summary()
+                        ));
                     }
                     Err(e) => app.set_status(format!("Save failed: {}", e)),
                 }
@@ -4106,9 +4110,14 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &app.convert.output_options,
                     &app.convert.metadata,
                 );
-                if super::presets::save_preset_to_path_with_db(&preset, &path, &app.db).is_ok() {
-                    app.preset.set_active_preset_path(name, path);
-                    app.preset.modified = false;
+                match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
+                    Ok(()) => {
+                        let summary = preset.resolved_semantics_summary();
+                        app.preset.set_active_preset_path(name, path.clone());
+                        app.preset.modified = false;
+                        app.set_status(format!("Saved preset: {} | {summary}", path.display()));
+                    }
+                    Err(error) => app.set_status(format!("Save failed: {error}")),
                 }
             }
             app.should_quit = true;
@@ -4277,6 +4286,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
             } else {
                 match super::presets::load_preset(&name) {
                     Ok(preset) => {
+                        let semantics = preset.resolved_semantics_summary();
                         let report = preset.apply_to_pills(
                             &mut app.convert.format,
                             &mut app.convert.output_options,
@@ -4286,9 +4296,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                             .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
                         app.preset.modified = false;
                         app.set_status(format!(
-                            "Loaded preset: {}{}",
+                            "Loaded preset: {}{} | {}",
                             name,
-                            report.status_suffix()
+                            report.status_suffix(),
+                            semantics
                         ));
                     }
                     Err(e) => app.set_status(format!("Load failed: {}", e)),
@@ -4310,7 +4321,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     Ok(_) => {
                         app.preset.set_active_preset_path(name.clone(), path.clone());
                         app.preset.modified = false;
-                        app.set_status(format!("Saved preset: {}", path.display()));
+                        app.set_status(format!(
+                            "Saved preset: {} | {}",
+                            path.display(),
+                            preset.resolved_semantics_summary()
+                        ));
                     }
                     Err(e) => app.set_status(format!("Save failed: {}", e)),
                 }
@@ -4373,7 +4388,11 @@ For tmux or byobu, add both settings to ~/.tmux.conf (or the byobu tmux profile)
   set -g set-clipboard on
   set -g allow-passthrough on
 
-Reload the tmux configuration or restart the session. The terminal emulator must also permit OSC 52 clipboard writes. Payloads larger than 64 KiB remain available in Tonepoet's in-app clipboard but are not sent through OSC 52. System-clipboard reads are not available over this channel.";
+Reload the tmux configuration or restart the session. Then copy a field in Tonepoet and paste into an application outside the terminal to test the path.
+
+When TERM=screen-256color, tmux/byobu must advertise the clipboard capability (`Ms`) for the outer terminal. Check `tmux info | grep Ms`; configure a terminal override when it is absent.
+
+The terminal emulator must also permit OSC 52 clipboard writes. Payloads larger than 64 KiB remain available in Tonepoet's in-app clipboard but are not sent through OSC 52. System-clipboard reads are not available over this channel.";
                     app.active_overlay = ActiveOverlay::CuePreview(Box::new(
                         super::app::CuePreviewState::new_readonly_help(
                             "Clipboard help".to_string(),
@@ -8733,6 +8752,7 @@ fn execute_commit_with_source_options_transform(
     // scan.
     let cue_artifact_audio = app.convert.source.cue_artifact_audio.clone();
     let source_synthetic_cue_artifacts = app.convert.source.synthetic_cue_artifacts.clone();
+    let windows_portable_naming = app.config.naming.windows_portable;
     let transaction = app.manager.commit_batch_with_cue_artifacts(
         &batch,
         &cue_artifact_audio,
@@ -8768,6 +8788,7 @@ fn execute_commit_with_source_options_transform(
                 existing_req.archive_metadata_overrides = item.archive_metadata_overrides.clone();
                 existing_req.naming.template = canonical_naming_template.clone();
                 existing_req.naming.folder_template = options.folder_template.clone();
+                existing_req.naming.windows_portable = windows_portable_naming;
                 existing_req.settings = pipeline_settings.clone();
                 existing_req.merge = options.merge_to_single;
                 existing_req.companion = companion_policy.clone();
@@ -8797,6 +8818,7 @@ fn execute_commit_with_source_options_transform(
                         folder_template: options.folder_template.clone(),
                         per_album_subdir: true,
                         collision_policy: NamingCollisionPolicy::Fail,
+                        windows_portable: windows_portable_naming,
                     },
                     publish: PublishPolicy {
                         overwrite: OverwritePolicy::FailIfExists,

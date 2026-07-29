@@ -48,6 +48,7 @@ use crate::convert::pipeline::{
 use crate::convert::pipeline::stages::{
     disk_staging_parent_for, independent_single_file_album_batch_lifecycle_key,
     pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
+    prepare_independent_single_file_album_batch_for_completion_order_dispatch,
 };
 use crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings;
 #[cfg(test)]
@@ -346,11 +347,12 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                 request.container_ffmpeg_flags,
             ),
             naming_key: format!(
-                "{}|{:?}|{}|{:?}",
+                "{}|{:?}|{}|{:?}|windows_portable={}",
                 request.naming.template,
                 request.naming.folder_template,
                 request.naming.per_album_subdir,
                 request.naming.collision_policy,
+                request.naming.windows_portable,
             ),
             // Constant: lifecycle policy participates in the MISMATCH
             // detector (suppression), never in group identity (see above).
@@ -422,7 +424,14 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                 source_grouping_root.display(),
                 mismatched.request.container.display()
             );
-            mark_queued_album_batch_as_ordering_unavailable(items, &group);
+            prepare_completion_order_album_batch(
+                items,
+                &group,
+                resolved_identity_by_key.get(&key),
+                &album_output_dir,
+                &source_grouping_root,
+                "conversion settings or action/lifecycle policy differ",
+            );
             continue;
         }
 
@@ -466,10 +475,16 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
         }
 
         if let Some(path) = missing_track_identity.or(ambiguous_track_identity) {
-            log::warn!(
-                "independent single-file album batch at {} cannot prove track-number ordering because {} has no TRACKNUMBER metadata and no strict filename track prefix; leaving legacy completion-order conversion.log append enabled for this batch",
-                source_grouping_root.display(),
-                path.display()
+            prepare_completion_order_album_batch(
+                items,
+                &group,
+                resolved_identity_by_key.get(&key),
+                &album_output_dir,
+                &source_grouping_root,
+                &format!(
+                    "{} has no unambiguous TRACKNUMBER metadata or strict filename track prefix",
+                    path.display()
+                ),
             );
             continue;
         }
@@ -489,13 +504,17 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
             } else {
                 disc_number.to_string()
             };
-            log::warn!(
-                "independent single-file album batch at {} has duplicate track identity disc={} track={} for {} and {}; leaving legacy completion-order conversion.log append enabled for this batch",
-                source_grouping_root.display(),
-                disc_label,
-                track_number,
-                first_path.display(),
-                duplicate_path.display()
+            prepare_completion_order_album_batch(
+                items,
+                &group,
+                resolved_identity_by_key.get(&key),
+                &album_output_dir,
+                &source_grouping_root,
+                &format!(
+                    "duplicate track identity disc={disc_label} track={track_number} for {} and {}",
+                    first_path.display(),
+                    duplicate_path.display()
+                ),
             );
             continue;
         }
@@ -561,35 +580,17 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
             }
             Err(err) => {
                 log::error!(
-                    "independent single-file album batch at {} could not enable ordered fragment logging because dispatch preparation failed: {err}; suppressing legacy conversion.log append for this batch",
+                    "independent single-file album batch at {} could not enable ordered fragment logging: {err}; falling back to structural completion-order publication",
                     source_grouping_root.display()
                 );
-                for item_index in item_indices {
-                    if let Some(item) = items.get_mut(item_index) {
-                        let mut request = match item.pipeline_request.clone() {
-                            Some(request) => request,
-                            None => match build_pipeline_request(item) {
-                                Ok(mut request) => {
-                                    apply_companion_policy_from_item(&mut request, item);
-                                    request
-                                },
-                                Err(err) => {
-                                    log::warn!(
-                                        "could not attach ordered-log suppression to {} after dispatch preparation failed: {err}",
-                                        item.id
-                                    );
-                                    continue;
-                                }
-                            },
-                        };
-                        apply_conversion_options_request_contract(&mut request, item);
-                        request.album_batch = None;
-                        request.album_batch_track = None;
-                        request.expected_album_track_count = None;
-                        request.suppress_incremental_conversion_log_append = true;
-                        item.pipeline_request = Some(request);
-                    }
-                }
+                prepare_completion_order_album_batch(
+                    items,
+                    &group,
+                    resolved_identity_by_key.get(&key),
+                    &album_output_dir,
+                    &source_grouping_root,
+                    &format!("ordered dispatch preparation failed: {err}"),
+                );
             }
         }
     }
@@ -1178,6 +1179,89 @@ fn disc_number_from_directory_name(name: &str) -> Option<u32> {
     None
 }
 
+fn prepare_completion_order_album_batch(
+    items: &mut [ConversionItem],
+    group: &[IndependentSingleFileBatchCandidate],
+    resolved_identity: Option<&BatchResolvedAlbumIdentity>,
+    provisional_album_output_dir: &Path,
+    source_grouping_root: &Path,
+    reason: &str,
+) {
+    let mut ordered = group.to_vec();
+    ordered.sort_by(|left, right| {
+        normalized_path_key(&left.request.container)
+            .cmp(&normalized_path_key(&right.request.container))
+            .then_with(|| left.item_index.cmp(&right.item_index))
+    });
+
+    let mut requests = Vec::with_capacity(ordered.len());
+    let mut item_indices = Vec::with_capacity(ordered.len());
+    for (index, candidate) in ordered.iter().enumerate() {
+        let ordinal = match u32::try_from(index + 1) {
+            Ok(ordinal) => ordinal,
+            Err(_) => {
+                log::error!(
+                    "independent single-file album batch at {} contains more participants than the durable u32 coordination identity can represent; failing closed",
+                    source_grouping_root.display()
+                );
+                mark_queued_album_batch_as_ordering_unavailable(items, group);
+                return;
+            }
+        };
+        let mut request = candidate.request.clone();
+        if let Some(identity) = resolved_identity {
+            request.batch_resolved_identity = Some(identity.clone());
+        }
+        // These unique ordinals are coordination identities only. The batch
+        // ordering mode prevents them from being rendered as track order.
+        request.album_batch_track = Some(AlbumBatchTrackContext::new(ordinal, None, ordinal));
+        request.suppress_incremental_conversion_log_append = false;
+        item_indices.push(candidate.item_index);
+        requests.push(request);
+    }
+
+    let planner_resolved_album_output_dir = planner_resolved_album_output_dir_for_dispatch(&requests);
+    let dispatch_album_output_dir = planner_resolved_album_output_dir
+        .clone()
+        .unwrap_or_else(|| provisional_album_output_dir.to_path_buf());
+
+    match prepare_independent_single_file_album_batch_for_completion_order_dispatch(
+        requests,
+        dispatch_album_output_dir.clone(),
+        source_grouping_root.to_path_buf(),
+    ) {
+        Ok(dispatch) => {
+            log::warn!(
+                "independent single-file album batch at {} cannot prove canonical track ordering ({reason}); publishing through one structural album batch and logging in completion order",
+                source_grouping_root.display()
+            );
+            for (item_index, mut request) in
+                item_indices.into_iter().zip(dispatch.requests.into_iter())
+            {
+                if planner_resolved_album_output_dir.is_some() {
+                    if let Some(batch) = request.album_batch.take() {
+                        request.album_batch = Some(
+                            batch.with_planner_resolved_album_output_dir(
+                                dispatch_album_output_dir.clone(),
+                            ),
+                        );
+                    }
+                }
+                if let Some(item) = items.get_mut(item_index) {
+                    item.pipeline_request = Some(request);
+                }
+            }
+        }
+        Err(error) => {
+            log::error!(
+                "independent single-file album batch at {} could not establish structural completion-order publication after {reason}: {error}; failing closed by suppressing incremental append",
+                source_grouping_root.display()
+            );
+            mark_queued_album_batch_as_ordering_unavailable(items, group);
+        }
+    }
+}
+
 fn mark_queued_album_batch_as_ordering_unavailable(
     items: &mut [ConversionItem],
     group: &[IndependentSingleFileBatchCandidate],
@@ -1669,8 +1753,8 @@ fn sanitize_album_batch_component(value: &str) -> String {
             ch => ch,
         })
         .collect();
-    let trimmed = sanitized.trim().trim_matches('.').to_string();
-    if trimmed.is_empty() {
+    let trimmed = sanitized.trim().to_string();
+    if trimmed.is_empty() || matches!(trimmed.as_str(), "." | "..") {
         "Album".to_string()
     } else {
         trimmed
@@ -2222,6 +2306,14 @@ impl SubmissionPump {
     }
 }
 
+fn source_warning_count(source: Option<&crate::convert::pipeline::PreparedSource>) -> u32 {
+    source.map_or(0, |source| {
+        source.tracks.iter().fold(0_u32, |total, track| {
+            total.saturating_add(u32::try_from(track.warnings.len()).unwrap_or(u32::MAX))
+        })
+    })
+}
+
 fn record_terminal_status(
     pool: &SharedWorkerPool<QueueWorkOutput>,
     status: &ConversionStatus,
@@ -2313,10 +2405,12 @@ async fn run_queue_with_shared_orchestrator(
                     Ok(QueueWorkOutput::Materialized { item_id, result }) => {
                         match result {
                             ScheduledMaterialization::Finished(report) => {
+                                let warning_count = source_warning_count(report.source.as_ref());
                                 let status = map_album_outcome(
                                     &report.outcome,
                                     report.published.as_ref(),
                                     report.durable_log.as_deref(),
+                                    warning_count,
                                 );
                                 if terminal.insert(item_id, status.clone()).is_none() {
                                     record_terminal_status(&pool, &status);
@@ -2633,10 +2727,12 @@ fn build_single_file_work(
                 Some(tool_concurrency_limits),
             )
             .await;
+            let warning_count = source_warning_count(report.source.as_ref());
             let status = map_album_outcome(
                 &report.outcome,
                 report.published.as_ref(),
                 report.durable_log.as_deref(),
+                warning_count,
             );
             Ok(QueueWorkOutput::PostProcessed { item_id, status })
         }),
@@ -3051,10 +3147,12 @@ async fn run_album_postprocess_work(
                 Some(tool_concurrency_limits),
             )
             .await;
+            let warning_count = source_warning_count(report.source.as_ref());
             let status = map_album_outcome(
                 &report.outcome,
                 report.published.as_ref(),
                 report.durable_log.as_deref(),
+                warning_count,
             );
             return QueueWorkOutput::PostProcessed { item_id, status };
         }
@@ -3099,10 +3197,12 @@ async fn run_album_postprocess_work(
     } else {
         report
     };
+    let warning_count = source_warning_count(report.source.as_ref());
     let status = map_album_outcome(
         &report.outcome,
         report.published.as_ref(),
         report.durable_log.as_deref(),
+        warning_count,
     );
     QueueWorkOutput::PostProcessed { item_id, status }
 }
@@ -3395,6 +3495,17 @@ pub async fn process_item_with_scratch_policy(
 mod tests {
 
     #[test]
+    fn album_batch_component_preserves_dot_runs_and_guards_only_navigation_tokens() {
+        assert_eq!(
+            sanitize_album_batch_component("...And Then There Were Three..."),
+            "...And Then There Were Three..."
+        );
+        assert_eq!(sanitize_album_batch_component("."), "Album");
+        assert_eq!(sanitize_album_batch_component(".."), "Album");
+        assert_eq!(sanitize_album_batch_component(" .hidden. "), ".hidden.");
+    }
+
+    #[test]
     fn unsupported_source_does_not_fall_through_to_generic_materialization() {
         let source = include_str!("processor.rs");
         // Only scan runtime code: the assertions below would otherwise match
@@ -3574,6 +3685,7 @@ mod tests {
                 folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
@@ -3879,7 +3991,7 @@ mod tests {
             QueueWorkOutput::PostProcessed { item_id, status } => {
                 assert_eq!(item_id, "scratch-retry-item");
                 match status {
-                    ConversionStatus::Completed { output_path, log_path } => {
+                    ConversionStatus::Completed { output_path, log_path, .. } => {
                         assert_eq!(output_path, disk_album_dir);
                         assert!(log_path.is_none(), "disk retry hook returned no durable log");
                     }
@@ -4194,7 +4306,7 @@ mod tests {
                 QueueWorkOutput::PostProcessed { item_id: actual_item_id, status } => {
                     assert_eq!(actual_item_id, item_id);
                     match status {
-                        ConversionStatus::Completed { output_path, log_path } => {
+                        ConversionStatus::Completed { output_path, log_path, .. } => {
                             assert_eq!(output_path, album_dir);
                             assert!(log_path.is_none(), "disk retry hook returned no durable log");
                         }
@@ -4590,7 +4702,7 @@ mod tests {
 
 
     #[test]
-    fn queued_folder_dispatch_suppresses_ordered_logging_when_conversion_settings_differ() {
+    fn queued_folder_dispatch_uses_structural_completion_order_when_conversion_settings_differ() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_root = temp.path().join("Artist").join("Album");
         std::fs::create_dir_all(&album_root).expect("album dir");
@@ -4625,18 +4737,116 @@ mod tests {
 
         prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
 
-        for item in &items {
-            let request = item
-                .pipeline_request
-                .as_ref()
-                .expect("heterogeneous item keeps explicit request");
-            assert!(request.album_batch.is_none());
-            assert!(request.album_batch_track.is_none());
-            assert!(
-                request.suppress_incremental_conversion_log_append,
-                "heterogeneous settings must not share a fragment batch or fall back to completion-order conversion.log append"
-            );
-        }
+        let batches = items
+            .iter()
+            .map(|item| {
+                let request = item
+                    .pipeline_request
+                    .as_ref()
+                    .expect("heterogeneous item keeps explicit request");
+                assert!(request.album_batch_track.is_some());
+                assert!(!request.suppress_incremental_conversion_log_append);
+                let batch = request
+                    .album_batch
+                    .as_ref()
+                    .expect("heterogeneous settings retain one structural publish batch");
+                assert!(batch.uses_completion_order());
+                batch
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches[0].conversion_log_batch_id,
+            batches[1].conversion_log_batch_id
+        );
+        assert_eq!(batches[0].expected_track_count, 2);
+    }
+
+    #[test]
+    fn ordering_unprovable_batch_stays_structural_with_conversion_logs_enabled() {
+        // §1.5 leg (a): the logs-ON regression pin. Before round 9 this
+        // shape survived only via the legacy standalone-log incremental
+        // escape; membership must now be structural regardless of logs.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Speak To Me.flac");
+        let track_b = album_root.join("Breathe.flac");
+        std::fs::write(&track_a, b"not real audio; dispatch test only").expect("track a");
+        std::fs::write(&track_b, b"not real audio; dispatch test only").expect("track b");
+
+        let req_a = processor_dispatch_request_for_path(temp.path(), "item-a", "job-a", track_a);
+        let req_b = processor_dispatch_request_for_path(temp.path(), "item-b", "job-b", track_b);
+        assert!(
+            req_a.log.write_conversion_log,
+            "leg (a) must exercise the logs-ON configuration"
+        );
+
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-a", req_a),
+            conversion_item_with_pipeline_request("item-b", req_b),
+        ];
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let batches = items
+            .iter()
+            .map(|item| {
+                let request = item.pipeline_request.as_ref().expect("request retained");
+                assert!(!request.suppress_incremental_conversion_log_append);
+                let batch = request
+                    .album_batch
+                    .as_ref()
+                    .expect("ordering-unprovable batch keeps structural membership with logs on");
+                assert!(batch.uses_completion_order());
+                batch
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches[0].conversion_log_batch_id,
+            batches[1].conversion_log_batch_id
+        );
+        assert_eq!(batches[0].expected_track_count, 2);
+    }
+
+    #[test]
+    fn vinyl_lettered_tracknumber_tags_dispatch_as_structural_completion_order() {
+        // §1.5 leg (d): the Mazzy Star field shape — A1/B2-style
+        // TRACKNUMBER tag VALUES present but lexically unparseable.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_a = album_root.join("Fade Into You.wv");
+        let track_b = album_root.join("Five String Serenade.wv");
+        std::fs::write(&track_a, fake_apev2_with_items(&[("Track", "A1")]))
+            .expect("track a apev2");
+        std::fs::write(&track_b, fake_apev2_with_items(&[("Track", "B2")]))
+            .expect("track b apev2");
+
+        let req_a = processor_dispatch_request_for_path(temp.path(), "item-a", "job-a", track_a);
+        let req_b = processor_dispatch_request_for_path(temp.path(), "item-b", "job-b", track_b);
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-a", req_a),
+            conversion_item_with_pipeline_request("item-b", req_b),
+        ];
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let batches = items
+            .iter()
+            .map(|item| {
+                let request = item.pipeline_request.as_ref().expect("request retained");
+                assert!(!request.suppress_incremental_conversion_log_append);
+                let batch = request
+                    .album_batch
+                    .as_ref()
+                    .expect("vinyl-lettered tags keep structural membership");
+                assert!(batch.uses_completion_order());
+                batch
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches[0].conversion_log_batch_id,
+            batches[1].conversion_log_batch_id
+        );
+        assert_eq!(batches[0].expected_track_count, 2);
     }
 
     #[test]
@@ -4688,12 +4898,24 @@ mod tests {
             .pipeline_request
             .as_ref()
             .expect("second request remains available");
-        assert!(first_request.album_batch.is_none());
-        assert!(second_request.album_batch.is_none());
         assert_ne!(
             independent_single_file_album_batch_lifecycle_key(first_request).unwrap(),
             independent_single_file_album_batch_lifecycle_key(second_request).unwrap(),
             "test setup must carry distinct canonical lifecycle contracts"
+        );
+        let first_batch = first_request
+            .album_batch
+            .as_ref()
+            .expect("first request retains structural batch membership");
+        let second_batch = second_request
+            .album_batch
+            .as_ref()
+            .expect("second request retains structural batch membership");
+        assert!(first_batch.uses_completion_order());
+        assert!(second_batch.uses_completion_order());
+        assert_eq!(
+            first_batch.conversion_log_batch_id,
+            second_batch.conversion_log_batch_id
         );
         assert_eq!(second_request.actions, destructive_pipeline);
     }
@@ -5583,7 +5805,7 @@ FILE "disc2.flac" WAVE
     }
 
     #[test]
-    fn queued_folder_dispatch_keeps_legacy_append_for_duplicate_track_identities() {
+    fn queued_folder_dispatch_uses_structural_completion_order_for_duplicate_track_identities() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_root = temp.path().join("Artist").join("Album");
         std::fs::create_dir_all(&album_root).expect("album dir");
@@ -5611,22 +5833,28 @@ FILE "disc2.flac" WAVE
 
         prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
 
-        for item in &items {
-            let request = item
-                .pipeline_request
-                .as_ref()
-                .expect("duplicate item keeps explicit request");
-            assert!(request.album_batch.is_none());
-            assert!(request.album_batch_track.is_none());
-            assert!(
-                !request.suppress_incremental_conversion_log_append,
-                "duplicate track identities are ambiguous, so fall back to completion-order append"
-            );
-        }
+        let batch_ids = items
+            .iter()
+            .map(|item| {
+                let request = item
+                    .pipeline_request
+                    .as_ref()
+                    .expect("duplicate item keeps explicit request");
+                assert!(request.album_batch_track.is_some());
+                assert!(!request.suppress_incremental_conversion_log_append);
+                let batch = request
+                    .album_batch
+                    .as_ref()
+                    .expect("duplicate identities still share the structural publish root");
+                assert!(batch.uses_completion_order());
+                batch.conversion_log_batch_id.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batch_ids[0], batch_ids[1]);
     }
 
     #[test]
-    fn queued_folder_dispatch_keeps_legacy_append_when_track_identity_is_absent() {
+    fn queued_folder_dispatch_uses_structural_completion_order_when_track_identity_is_absent() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_root = temp.path().join("Artist").join("Album");
         std::fs::create_dir_all(&album_root).expect("album dir");
@@ -5654,18 +5882,24 @@ FILE "disc2.flac" WAVE
 
         prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
 
-        for item in &items {
-            let request = item
-                .pipeline_request
-                .as_ref()
-                .expect("unproven item keeps explicit request");
-            assert!(request.album_batch.is_none());
-            assert!(request.album_batch_track.is_none());
-            assert!(
-                !request.suppress_incremental_conversion_log_append,
-                "when no track-number information exists, fall back to completion-order conversion.log append"
-            );
-        }
+        let batch_ids = items
+            .iter()
+            .map(|item| {
+                let request = item
+                    .pipeline_request
+                    .as_ref()
+                    .expect("unproven item keeps explicit request");
+                assert!(request.album_batch_track.is_some());
+                assert!(!request.suppress_incremental_conversion_log_append);
+                let batch = request
+                    .album_batch
+                    .as_ref()
+                    .expect("unproven order still has structural album membership");
+                assert!(batch.uses_completion_order());
+                batch.conversion_log_batch_id.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batch_ids[0], batch_ids[1]);
     }
 
     #[test]
@@ -5697,15 +5931,19 @@ FILE "disc2.flac" WAVE
 
         prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
 
-        assert!(items.iter().all(|item| item
-            .pipeline_request
-            .as_ref()
-            .map(|request| {
-                request.album_batch.is_none()
-                    && request.album_batch_track.is_none()
+        let batch_ids = items
+            .iter()
+            .map(|item| {
+                let request = item.pipeline_request.as_ref()?;
+                let batch = request.album_batch.as_ref()?;
+                (request.album_batch_track.is_some()
                     && !request.suppress_incremental_conversion_log_append
+                    && batch.uses_completion_order())
+                    .then(|| batch.conversion_log_batch_id.clone())
             })
-            .unwrap_or(false)));
+            .collect::<Option<Vec<_>>>()
+            .expect("embedded digits must route through one completion-order batch");
+        assert_eq!(batch_ids[0], batch_ids[1]);
     }
 
     fn prepared_track_for_processor_limit_test(root: &std::path::Path) -> PreparedTrack {

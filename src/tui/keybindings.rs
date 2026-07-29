@@ -623,6 +623,18 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
 // ── Convert screen keybindings ───────────────────────────────────────
 
 fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        if let Some(value) = convert_view_copy_value(app) {
+            if value.is_empty() {
+                app.set_status("field is empty; nothing copied");
+            } else {
+                super::context_menu::publish_text_clipboard(&value);
+                app.set_status(format!("Copied: {value}"));
+            }
+            return;
+        }
+    }
+
     if app.convert.focus == ConvertFocus::OutputOptions
         && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
     {
@@ -2892,6 +2904,84 @@ fn activate_browse_file_path(
     }
 }
 
+fn convert_view_copy_value(app: &AppState) -> Option<String> {
+    match app.convert.focus {
+        ConvertFocus::Metadata
+            if !app.convert.is_collapsed(ConvertFocus::Metadata)
+                && matches!(
+                    &app.convert.source.mode,
+                    SourceMode::Single { .. }
+                        | SourceMode::MultiTrack {
+                            archive_preview: Some(_),
+                            ..
+                        }
+                ) => Some(convert_metadata_field_value(
+                    app,
+                    app.convert.metadata.field_focus,
+                )),
+        ConvertFocus::Format if !app.convert.is_collapsed(ConvertFocus::Format) => {
+            Some(convert_format_field_value(app, app.convert.format.field_focus))
+        }
+        ConvertFocus::OutputOptions
+            if !app.convert.is_collapsed(ConvertFocus::OutputOptions) =>
+        {
+            convert_output_options_field_value(app, app.convert.output_options.field_focus)
+        }
+        ConvertFocus::Source | ConvertFocus::Metadata | ConvertFocus::Format
+        | ConvertFocus::OutputOptions => None,
+    }
+}
+
+fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
+    let format = &app.convert.format;
+    match field {
+        FormatField::Format => format.format.selected_label().to_string(),
+        FormatField::SampleRate | FormatField::DsdRate => {
+            format.sample_rate.selected_label().to_string()
+        }
+        FormatField::BitDepth => format.bit_depth.selected_label().to_string(),
+        FormatField::Resampler => format.resampler.selected_label().to_string(),
+        FormatField::Dither => format.dither.selected_label().to_string(),
+        FormatField::ReplayGain => format.replaygain.selected_label().to_string(),
+        FormatField::NoiseShaper => format.noise_shaper.selected_label().to_string(),
+        FormatField::ModulatorOrder => format.modulator_order.selected_label().to_string(),
+        FormatField::ConversionPreset => format.conversion_preset.selected_label().to_string(),
+        FormatField::DsdPath => format.dsd_pathway.selected_label().to_string(),
+        FormatField::DsdProfile => format.dsd_profile.selected_label().to_string(),
+        FormatField::DsdGain => format.dsd_gain_mode.selected_label().to_string(),
+        FormatField::DsdGainDb => format.dsd_gain_db.render(false),
+        FormatField::DsdNormalizeTarget => format.dsd_normalize_target_dbfs.render(false),
+    }
+}
+
+fn convert_output_options_field_value(
+    app: &AppState,
+    field: OutputOptionsField,
+) -> Option<String> {
+    let output = &app.convert.output_options;
+    match field {
+        OutputOptionsField::DestPath => Some(
+            output
+                .dest_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ),
+        OutputOptionsField::FolderTemplate => Some(output.folder_template.clone()),
+        OutputOptionsField::FilenameTemplate => Some(output.filename_template.clone()),
+        OutputOptionsField::MergeMode => Some(output.merge.selected_label().to_string()),
+        OutputOptionsField::CompanionExtensions => Some(output.companion_extensions.clone()),
+        OutputOptionsField::CompanionFolders => Some(output.companion_folders.clone()),
+        OutputOptionsField::ExcludeFiles => Some(output.companion_exclude_files.clone()),
+        OutputOptionsField::ForceEncode => Some(output.force_encode.selected_label().to_string()),
+        OutputOptionsField::DiscSubfolders => {
+            Some(output.disc_subfolders.selected_label().to_string())
+        }
+        OutputOptionsField::WriteLog => Some(output.write_log.selected_label().to_string()),
+        OutputOptionsField::Actions => None,
+    }
+}
+
 fn convert_metadata_inline_fields_visible(app: &AppState) -> bool {
     matches!(
         &app.convert.source.mode,
@@ -3019,6 +3109,31 @@ fn sync_convert_metadata_to_current_archive_preview(app: &mut AppState) {
     *album_artist = album.artist.clone();
 }
 
+fn report_scoped_text_clipboard_status(
+    app: &mut AppState,
+    key: &KeyEvent,
+    had_selection: bool,
+    was_empty: bool,
+    handled: bool,
+) {
+    if key.modifiers != KeyModifiers::CONTROL {
+        return;
+    }
+    match key.code {
+        KeyCode::Char('c') if !had_selection => {
+            if handled {
+                app.set_status("Copied entire field");
+            } else if was_empty {
+                app.set_status("field is empty; nothing copied");
+            }
+        }
+        KeyCode::Char('x') if !had_selection => {
+            app.set_status("nothing selected; nothing cut");
+        }
+        _ => {}
+    }
+}
+
 fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
     match (key.code, key.modifiers) {
         (KeyCode::Enter, KeyModifiers::NONE) => commit_convert_metadata_inline_edit(app),
@@ -3026,10 +3141,13 @@ fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
             app.convert.metadata.editing = None;
         }
         _ => {
-            let _ = super::text_input::handle_text_input_key(
+            let had_selection = app.convert.metadata.edit_input.has_selection();
+            let was_empty = app.convert.metadata.edit_input.text.is_empty();
+            let handled = super::text_input::handle_text_input_key(
                 &mut app.convert.metadata.edit_input,
                 &key,
             );
+            report_scoped_text_clipboard_status(app, &key, had_selection, was_empty, handled);
         }
     }
 }
@@ -3242,10 +3360,13 @@ fn handle_output_options_inline_edit_key(app: &mut AppState, key: KeyEvent) {
             }
         }
         _ => {
-            let _ = super::text_input::handle_text_input_key(
+            let had_selection = app.convert.output_options.edit_input.has_selection();
+            let was_empty = app.convert.output_options.edit_input.text.is_empty();
+            let handled = super::text_input::handle_text_input_key(
                 &mut app.convert.output_options.edit_input,
                 &key,
             );
+            report_scoped_text_clipboard_status(app, &key, had_selection, was_empty, handled);
         }
     }
 }
@@ -3532,11 +3653,17 @@ fn handle_browse_inline_edit_key(
         _ => {
             let attempted_paste = matches!(key.code, KeyCode::Char('v' | 'p'))
                 && key.modifiers == KeyModifiers::CONTROL;
+            let (had_selection, was_empty) = app
+                .browse_inline_edit
+                .as_ref()
+                .map(|state| (state.input.has_selection(), state.input.text.is_empty()))
+                .unwrap_or((false, true));
             let handled = app
                 .browse_inline_edit
                 .as_mut()
                 .map(|state| super::text_input::handle_text_input_key(&mut state.input, &key))
                 .unwrap_or(false);
+            report_scoped_text_clipboard_status(app, &key, had_selection, was_empty, handled);
             if attempted_paste && !handled {
                 app.set_status(
                     "text clipboard is empty; terminal clipboard paste arrives via bracketed paste",
@@ -4333,6 +4460,42 @@ mod inline_edit_behavior_tests {
         handle_key(&mut app, key(KeyCode::Enter), &tx);
         assert_eq!(app.convert.metadata.editing, None);
         assert_eq!(app.convert.metadata.artist.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn convert_metadata_view_ctrl_c_copies_focused_value_to_both_planes() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Metadata;
+        app.convert.source.mode = SourceMode::Single {
+            path: std::path::PathBuf::from("track.flac"),
+            info: None,
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: None,
+        };
+        app.convert.metadata.field_focus = ConvertMetadataField::Title;
+        app.convert.metadata.title = Some("Give a Little Bit".to_string());
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            || {
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+            },
+        );
+
+        assert_eq!(published.borrow().as_slice(), &["Give a Little Bit".to_string()]);
+        assert_eq!(tui_file_picker::read_shared_text_clipboard(), "Give a Little Bit");
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("Copied: Give a Little Bit")
+        );
     }
 
     #[test]
@@ -5149,7 +5312,11 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                         app.preset.modified = false;
                         app.preset.naming_input = None;
                         app.preset.overlay_open = false;
-                        app.set_status(format!("Saved preset: {}", name));
+                        app.set_status(format!(
+                            "Saved preset: {} | {}",
+                            name,
+                            preset.resolved_semantics_summary()
+                        ));
                     }
                     Err(e) => {
                         app.preset.naming_input = None;
@@ -5192,6 +5359,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
             {
                 match super::presets::load_preset(&name) {
                     Ok(preset) => {
+                        let semantics = preset.resolved_semantics_summary();
                         let report = preset.apply_to_pills(
                             &mut app.convert.format,
                             &mut app.convert.output_options,
@@ -5202,9 +5370,10 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                         app.preset.modified = false;
                         app.preset.overlay_open = false;
                         app.set_status(format!(
-                            "Loaded preset: {}{}",
+                            "Loaded preset: {}{} | {}",
                             name,
-                            report.status_suffix()
+                            report.status_suffix(),
+                            semantics
                         ));
                     }
                     Err(e) => {
@@ -5604,6 +5773,21 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             app.browse.clear_multi_selection();
             app.browse.cancel_range_selection();
             app.set_status("Selection cleared");
+            return;
+        }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            if matches!(app.browse_info_focus, Some(BrowseInfoFocus::Metadata(_))) =>
+        {
+            let Some(BrowseInfoFocus::Metadata(field)) = app.browse_info_focus else {
+                unreachable!("Browse Info copy guard requires metadata focus");
+            };
+            let value = current_browse_metadata_value(app, field);
+            if value.is_empty() {
+                app.set_status("field is empty; nothing copied");
+            } else {
+                super::context_menu::publish_text_clipboard(&value);
+                app.set_status(format!("Copied: {value}"));
+            }
             return;
         }
         (KeyCode::Char('c' | 'x' | 'v' | 'p'), KeyModifiers::CONTROL) => {
@@ -6291,6 +6475,12 @@ fn handle_browse_path_input_key(app: &mut AppState, key: KeyEvent) {
         _ => {
             let attempted_paste = matches!(key.code, KeyCode::Char('v' | 'p'))
                 && key.modifiers == KeyModifiers::CONTROL;
+            let (had_selection, was_empty) = app
+                .browse
+                .path_input
+                .as_ref()
+                .map(|input| (input.has_selection(), input.text.is_empty()))
+                .unwrap_or((false, true));
             let handled = app
                 .browse
                 .path_input
@@ -6303,6 +6493,7 @@ fn handle_browse_path_input_key(app: &mut AppState, key: KeyEvent) {
                     )
                 })
                 .unwrap_or(false);
+            report_scoped_text_clipboard_status(app, &key, had_selection, was_empty, handled);
             if attempted_paste && !handled {
                 app.set_status(
                     "text clipboard is empty; terminal clipboard paste arrives via bracketed paste",
@@ -10004,6 +10195,9 @@ pub(super) fn metadata_editor_save(
                         crate::tui::app::MetadataEditorWriteOutcome::Skipped { .. } => "skipped",
                         crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved { .. } => "sidecar saved",
                         crate::tui::app::MetadataEditorWriteOutcome::SidecarCueFailed { .. } => "sidecar failed",
+                        crate::tui::app::MetadataEditorWriteOutcome::InvalidApeRepair(_) => {
+                            "unexpected repair result"
+                        }
                     };
                     let _ = progress_tx.blocking_send(AppMessage::StatusMessage(format!(
                         "metadata save {done}/{total}: {file_name} {outcome}"
@@ -10466,12 +10660,24 @@ fn request_metadata_editor_close(
     _tx: &mpsc::Sender<AppMessage>,
 ) {
     if state.phase == super::app::MetadataEditorPhase::Saving {
+        let repairing_invalid_ape = state.invalid_ape_repair.is_some();
         let requested = state.cancel_metadata_write();
         app.active_overlay = ActiveOverlay::MetadataEditor(state.clone());
         if requested {
-            app.set_status("metadata editor: cancellation requested; current file will stop at the next safe point".to_string());
+            app.set_status(if repairing_invalid_ape {
+                "APE repair: cancellation requested; the current file will stop before commit at the next bounded copy checkpoint"
+                    .to_string()
+            } else {
+                "metadata editor: cancellation requested; current file will stop at the next safe point"
+                    .to_string()
+            });
         } else {
-            app.set_status("metadata editor: save in progress — waiting for completion".to_string());
+            app.set_status(if repairing_invalid_ape {
+                "APE repair is in progress; waiting for the worker completion message"
+                    .to_string()
+            } else {
+                "metadata editor: save in progress — waiting for completion".to_string()
+            });
         }
         return;
     }
@@ -13443,9 +13649,22 @@ fn handle_metadata_editor_key(
                     // For single-line values, Up/Down are no-ops.
                 }
                 _ => {
-                    if let Some(input) = state.edit_input.as_mut() {
-                        super::text_input::handle_text_input_key(input, &key);
-                    }
+                    let (had_selection, was_empty, handled) =
+                        if let Some(input) = state.edit_input.as_mut() {
+                            let had_selection = input.has_selection();
+                            let was_empty = input.text.is_empty();
+                            let handled = super::text_input::handle_text_input_key(input, &key);
+                            (had_selection, was_empty, handled)
+                        } else {
+                            (false, true, false)
+                        };
+                    report_scoped_text_clipboard_status(
+                        app,
+                        &key,
+                        had_selection,
+                        was_empty,
+                        handled,
+                    );
                 }
             }
         }
@@ -13525,7 +13744,16 @@ fn handle_metadata_editor_key(
                     }
                 }
                 _ => {
-                    super::text_input::handle_text_input_key(input, &key);
+                    let had_selection = input.has_selection();
+                    let was_empty = input.text.is_empty();
+                    let handled = super::text_input::handle_text_input_key(input, &key);
+                    report_scoped_text_clipboard_status(
+                        app,
+                        &key,
+                        had_selection,
+                        was_empty,
+                        handled,
+                    );
                 }
             }
         }
@@ -13557,9 +13785,22 @@ fn handle_metadata_editor_key(
                         metadata_editor_advance_detail_edit(app, state, reverse);
                     }
                     _ => {
-                        if let Some(input) = state.detail_edit.as_mut() {
-                            super::text_input::handle_text_input_key(input, &key);
-                        }
+                        let (had_selection, was_empty, handled) =
+                            if let Some(input) = state.detail_edit.as_mut() {
+                                let had_selection = input.has_selection();
+                                let was_empty = input.text.is_empty();
+                                let handled = super::text_input::handle_text_input_key(input, &key);
+                                (had_selection, was_empty, handled)
+                            } else {
+                                (false, true, false)
+                            };
+                        report_scoped_text_clipboard_status(
+                            app,
+                            &key,
+                            had_selection,
+                            was_empty,
+                            handled,
+                        );
                     }
                 }
                 return;
@@ -18466,6 +18707,7 @@ fn metadata_technical_details_for_paths_with_analysis(
                 modified,
                 filesystem_error,
                 metadata_error,
+                metadata_issue.map(|issue| issue.kind),
                 read_state,
                 write_eligibility,
                 metadata,
@@ -18995,6 +19237,7 @@ fn metadata_filesystem_details_for_unique_paths(
                 file_size,
                 modified,
                 filesystem_error,
+                None,
                 None,
                 read_state,
                 write_eligibility,
@@ -25087,6 +25330,903 @@ pub(super) fn metadata_editor_row_column_for_x(
     }
 }
 
+pub(super) fn metadata_editor_invalid_ape_repair_targets(
+    state: &super::app::MetadataEditorState,
+) -> Vec<(std::path::PathBuf, Vec<String>)> {
+    let recoverable_paths = state
+        .active_surface()
+        .technical_details
+        .files
+        .iter()
+        .filter(|file| {
+            file.issues.iter().any(|issue| {
+                matches!(issue, super::app::MetadataIssue::RecoverableTagWarning { .. })
+            })
+        })
+        .map(|file| file.file_facts.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    recoverable_paths
+        .into_iter()
+        .filter_map(|path| match crate::metadata_persistence::invalid_native_ape_keys(&path) {
+            Ok(keys) if !keys.is_empty() => Some((path, keys)),
+            Ok(_) => None,
+            Err(error) => {
+                log::warn!("APE repair eligibility check failed for '{}': {error}", path.display());
+                None
+            }
+        })
+        .collect()
+}
+
+fn metadata_editor_has_recoverable_invalid_ape_warnings(
+    state: &super::app::MetadataEditorState,
+) -> bool {
+    state
+        .active_surface()
+        .technical_details
+        .files
+        .iter()
+        .any(|file| {
+            file.issues.iter().any(|issue| {
+                matches!(issue, super::app::MetadataIssue::RecoverableTagWarning { .. })
+            })
+        })
+}
+
+const INVALID_APE_REPAIR_ISSUE_PREFIX: &str = "invalid APE repair: ";
+
+fn invalid_ape_repair_progress_detail(
+    file_index: usize,
+    file_total: usize,
+    path: &std::path::Path,
+    progress: super::probe::InvalidApeRepairProgress,
+) -> String {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if progress.bytes_total > 0 {
+        format!(
+            "Repairing {file_index}/{file_total}: {file_name} - {} {}/{}",
+            progress.phase.label(),
+            humansize::format_size(progress.bytes_done, humansize::BINARY),
+            humansize::format_size(progress.bytes_total, humansize::BINARY),
+        )
+    } else {
+        format!(
+            "Repairing {file_index}/{file_total}: {file_name} - {}",
+            progress.phase.label()
+        )
+    }
+}
+
+fn invalid_ape_repair_outcome_to_write_result(
+    outcome: super::probe::InvalidApeRepairOutcome,
+) -> crate::tui::app::MetadataEditorWriteResult {
+    use crate::tui::app::{
+        MetadataEditorWriteResult, MetadataInvalidApeRepairOutcome,
+    };
+    use super::probe::InvalidApeRepairOutcome;
+
+    match outcome {
+        InvalidApeRepairOutcome::NotModifiedFailure { path, reason } => {
+            MetadataEditorWriteResult::invalid_ape_repair(
+                path,
+                MetadataInvalidApeRepairOutcome::NotModified { reason },
+            )
+        }
+        InvalidApeRepairOutcome::CancelledBeforeCommit { path, reason } => {
+            MetadataEditorWriteResult::invalid_ape_repair(
+                path,
+                MetadataInvalidApeRepairOutcome::CancelledBeforeCommit { reason },
+            )
+        }
+        InvalidApeRepairOutcome::CommitStateUnknown { path, reason } => {
+            MetadataEditorWriteResult::invalid_ape_repair(
+                path,
+                MetadataInvalidApeRepairOutcome::CommitStateUnknown { reason },
+            )
+        }
+        InvalidApeRepairOutcome::CommittedAndVerified(commit) => {
+            MetadataEditorWriteResult::invalid_ape_repair(
+                commit.path,
+                MetadataInvalidApeRepairOutcome::CommittedAndVerified {
+                    removed_keys: commit.removed_keys,
+                    durability_warnings: commit.commit_report.durability_warnings,
+                },
+            )
+        }
+        InvalidApeRepairOutcome::CommittedButVerificationFailed { commit, reason } => {
+            MetadataEditorWriteResult::invalid_ape_repair(
+                commit.path,
+                MetadataInvalidApeRepairOutcome::CommittedButVerificationFailed {
+                    removed_keys: commit.removed_keys,
+                    durability_warnings: commit.commit_report.durability_warnings,
+                    reason,
+                },
+            )
+        }
+    }
+}
+
+fn invalid_ape_repair_result_label(
+    result: &crate::tui::app::MetadataEditorWriteResult,
+) -> &'static str {
+    use crate::tui::app::{
+        MetadataEditorWriteOutcome, MetadataInvalidApeRepairOutcome,
+    };
+
+    match &result.outcome {
+        MetadataEditorWriteOutcome::InvalidApeRepair(
+            MetadataInvalidApeRepairOutcome::NotModified { .. },
+        ) => "not modified",
+        MetadataEditorWriteOutcome::InvalidApeRepair(
+            MetadataInvalidApeRepairOutcome::CancelledBeforeCommit { .. },
+        ) => "cancelled before commit",
+        MetadataEditorWriteOutcome::InvalidApeRepair(
+            MetadataInvalidApeRepairOutcome::CommitStateUnknown { .. },
+        ) => "commit state unknown",
+        MetadataEditorWriteOutcome::InvalidApeRepair(
+            MetadataInvalidApeRepairOutcome::CommittedAndVerified {
+                durability_warnings,
+                ..
+            },
+        ) if !durability_warnings.is_empty() => {
+            "committed and verified with durability warning"
+        }
+        MetadataEditorWriteOutcome::InvalidApeRepair(
+            MetadataInvalidApeRepairOutcome::CommittedAndVerified { .. },
+        ) => "committed and verified",
+        MetadataEditorWriteOutcome::InvalidApeRepair(
+            MetadataInvalidApeRepairOutcome::CommittedButVerificationFailed { .. },
+        ) => "committed; verification failed",
+        MetadataEditorWriteOutcome::Saved
+        | MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        | MetadataEditorWriteOutcome::Failed { .. }
+        | MetadataEditorWriteOutcome::Skipped { .. }
+        | MetadataEditorWriteOutcome::SidecarCueSaved { .. }
+        | MetadataEditorWriteOutcome::SidecarCueFailed { .. } => "unexpected result",
+    }
+}
+
+fn run_invalid_ape_repair_batch(
+    targets: Vec<(std::path::PathBuf, Vec<String>)>,
+    verification: tui_file_picker::VerificationMode,
+    cancel: super::probe::MetadataWriteCancelFlag,
+    session_id: u64,
+    generation: u64,
+    tx: mpsc::Sender<AppMessage>,
+) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    let total = targets.len();
+    let mut results = Vec::with_capacity(total);
+    for (offset, (path, expected_keys)) in targets.into_iter().enumerate() {
+        let file_index = offset + 1;
+        let progress_tx = tx.clone();
+        let progress: super::probe::InvalidApeRepairProgressCallback =
+            std::sync::Arc::new(move |path, update| {
+                let _ = progress_tx.blocking_send(AppMessage::MetadataEditorWriteProgress {
+                    session_id,
+                    save_generation: generation,
+                    detail: invalid_ape_repair_progress_detail(
+                        file_index,
+                        total,
+                        path,
+                        update,
+                    ),
+                });
+            });
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::probe::remove_invalid_ape_items_atomic(
+                &path,
+                &expected_keys,
+                verification,
+                Some(&cancel),
+                Some(&progress),
+            )
+        })) {
+            Ok(outcome) => invalid_ape_repair_outcome_to_write_result(outcome),
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                crate::tui::app::MetadataEditorWriteResult::invalid_ape_repair(
+                    path.clone(),
+                    crate::tui::app::MetadataInvalidApeRepairOutcome::CommitStateUnknown {
+                        reason: format!(
+                            "repair worker panicked while processing '{}': {detail}",
+                            path.display()
+                        ),
+                    },
+                )
+            }
+        };
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let _ = tx.blocking_send(AppMessage::StatusMessage(format!(
+            "APE repair {file_index}/{total}: {file_name} {}",
+            invalid_ape_repair_result_label(&result)
+        )));
+        results.push(result);
+    }
+    results
+}
+
+pub(super) fn start_invalid_ape_repair(
+    app: &mut AppState,
+    mut state: Box<super::app::MetadataEditorState>,
+    targets: Vec<(std::path::PathBuf, Vec<String>)>,
+    verification: tui_file_picker::VerificationMode,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if targets.is_empty() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        app.set_status("APE repair: no confirmed targets remain");
+        return;
+    }
+    if state.phase == super::app::MetadataEditorPhase::Saving {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        app.set_status("APE repair: another metadata write is already running");
+        return;
+    }
+    if state.any_presentation_dirty() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        app.set_status(
+            "APE repair: save or discard editor changes before repairing on-disk tags",
+        );
+        return;
+    }
+
+    let refresh_paths = state.active_surface().paths.clone();
+    let worker_targets = targets.clone();
+    let panic_targets = targets.clone();
+    let (session_id, generation, cancel) = state.begin_invalid_ape_repair(targets);
+    state.model.metadata_save_progress = Some(format!(
+        "Repairing 0/{}: waiting for worker",
+        worker_targets.len()
+    ));
+    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+    app.set_status(format!(
+        "APE repair started for {} file{}; Esc/close requests cancellation at the next safe point",
+        worker_targets.len(),
+        if worker_targets.len() == 1 { "" } else { "s" }
+    ));
+
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let worker_tx = tx.clone();
+        let worker_result = tokio::task::spawn_blocking(move || {
+            let results = run_invalid_ape_repair_batch(
+                worker_targets,
+                verification,
+                cancel,
+                session_id,
+                generation,
+                worker_tx,
+            );
+            let refreshed_entries = match std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    super::probe::read_all_tags_merged(&refresh_paths)
+                }),
+            ) {
+                Ok(result) => result,
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    Err(format!("post-repair tag refresh panicked: {detail}"))
+                }
+            };
+            (results, Some(refreshed_entries))
+        })
+        .await;
+        let (results, refreshed_entries) = match worker_result {
+            Ok(result) => result,
+            Err(error) => (
+                panic_targets
+                    .into_iter()
+                    .map(|(path, _)| {
+                        crate::tui::app::MetadataEditorWriteResult::invalid_ape_repair(
+                            path,
+                            crate::tui::app::MetadataInvalidApeRepairOutcome::CommitStateUnknown {
+                                reason: format!(
+                                    "repair worker terminated before returning its per-file ledger: {error}"
+                                ),
+                            },
+                        )
+                    })
+                    .collect(),
+                None,
+            ),
+        };
+        let _ = tx
+            .send(AppMessage::MetadataEditorWriteComplete {
+                session_id,
+                save_generation: generation,
+                results,
+                refreshed_entries,
+            })
+            .await;
+    });
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct InvalidApeRepairCompletionSummary {
+    pub committed_verified: usize,
+    pub committed_unverified: usize,
+    pub not_modified: usize,
+    pub cancelled: usize,
+    pub commit_state_unknown: usize,
+    pub durability_warnings: usize,
+    pub ignored: usize,
+    pub refresh_failed: bool,
+}
+
+impl InvalidApeRepairCompletionSummary {
+    pub(super) fn status_line(&self) -> String {
+        let mut parts = vec![format!(
+            "{} committed and verified",
+            self.committed_verified
+        )];
+        if self.committed_unverified > 0 {
+            parts.push(format!(
+                "{} committed but verification failed",
+                self.committed_unverified
+            ));
+        }
+        if self.not_modified > 0 {
+            parts.push(format!("{} not modified", self.not_modified));
+        }
+        if self.cancelled > 0 {
+            parts.push(format!("{} cancelled before commit", self.cancelled));
+        }
+        if self.commit_state_unknown > 0 {
+            parts.push(format!(
+                "{} with unknown commit state",
+                self.commit_state_unknown
+            ));
+        }
+        if self.durability_warnings > 0 {
+            parts.push(format!(
+                "{} durability warning{}",
+                self.durability_warnings,
+                if self.durability_warnings == 1 { "" } else { "s" }
+            ));
+        }
+        if self.ignored > 0 {
+            parts.push(format!("{} stale/unexpected result(s) ignored", self.ignored));
+        }
+        if self.refresh_failed {
+            parts.push("editor refresh failed; reopen before trusting displayed rows".to_string());
+        }
+        format!("APE repair: {}", parts.join(", "))
+    }
+}
+
+pub(super) fn apply_invalid_ape_repair_completion(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+    session_id: u64,
+    generation: u64,
+    results: Vec<crate::tui::app::MetadataEditorWriteResult>,
+    refreshed_entries: Option<Result<Vec<super::probe::TagEntry>, String>>,
+) -> Option<InvalidApeRepairCompletionSummary> {
+    use crate::tui::app::{
+        MetadataEditorWriteOutcome, MetadataInvalidApeRepairOutcome, MetadataIssue,
+    };
+
+    let operation = state.finish_invalid_ape_repair(session_id, generation)?;
+    let expected_paths = operation
+        .targets
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen_paths = std::collections::BTreeSet::new();
+    let mut summary = InvalidApeRepairCompletionSummary::default();
+
+    for result in results {
+        if !expected_paths.contains(&result.path) || !seen_paths.insert(result.path.clone()) {
+            summary.ignored = summary.ignored.saturating_add(1);
+            continue;
+        }
+
+        let mut invalidate_probe = false;
+        let Some(file) = state
+            .active_surface_mut()
+            .technical_details
+            .files
+            .iter_mut()
+            .find(|file| file.file_facts.path == result.path)
+        else {
+            summary.ignored = summary.ignored.saturating_add(1);
+            continue;
+        };
+        file.issues.retain(|issue| {
+            !matches!(issue, MetadataIssue::Write { reason, .. } if reason.starts_with(INVALID_APE_REPAIR_ISSUE_PREFIX))
+        });
+
+        match result.outcome {
+            MetadataEditorWriteOutcome::InvalidApeRepair(
+                MetadataInvalidApeRepairOutcome::NotModified { reason },
+            ) => {
+                summary.not_modified = summary.not_modified.saturating_add(1);
+                file.issues.push(MetadataIssue::Write {
+                    path: result.path.clone(),
+                    reason: format!(
+                        "{INVALID_APE_REPAIR_ISSUE_PREFIX}not modified: {reason}"
+                    ),
+                });
+            }
+            MetadataEditorWriteOutcome::InvalidApeRepair(
+                MetadataInvalidApeRepairOutcome::CancelledBeforeCommit { reason },
+            ) => {
+                summary.cancelled = summary.cancelled.saturating_add(1);
+                file.issues.push(MetadataIssue::Write {
+                    path: result.path.clone(),
+                    reason: format!(
+                        "{INVALID_APE_REPAIR_ISSUE_PREFIX}cancelled before commit: {reason}"
+                    ),
+                });
+            }
+            MetadataEditorWriteOutcome::InvalidApeRepair(
+                MetadataInvalidApeRepairOutcome::CommitStateUnknown { reason },
+            ) => {
+                summary.commit_state_unknown =
+                    summary.commit_state_unknown.saturating_add(1);
+                file.issues.push(MetadataIssue::Write {
+                    path: result.path.clone(),
+                    reason: format!(
+                        "{INVALID_APE_REPAIR_ISSUE_PREFIX}commit state unknown; inspect before retrying: {reason}"
+                    ),
+                });
+                invalidate_probe = true;
+            }
+            MetadataEditorWriteOutcome::InvalidApeRepair(
+                MetadataInvalidApeRepairOutcome::CommittedAndVerified {
+                    removed_keys: _,
+                    durability_warnings,
+                },
+            ) => {
+                summary.committed_verified = summary.committed_verified.saturating_add(1);
+                file.issues.retain(|issue| {
+                    !matches!(issue, MetadataIssue::RecoverableTagWarning { .. })
+                });
+                summary.durability_warnings = summary
+                    .durability_warnings
+                    .saturating_add(durability_warnings.len());
+                for warning in durability_warnings {
+                    file.issues.push(MetadataIssue::Write {
+                        path: result.path.clone(),
+                        reason: format!("{INVALID_APE_REPAIR_ISSUE_PREFIX}{warning}"),
+                    });
+                }
+                invalidate_probe = true;
+            }
+            MetadataEditorWriteOutcome::InvalidApeRepair(
+                MetadataInvalidApeRepairOutcome::CommittedButVerificationFailed {
+                    removed_keys: _,
+                    durability_warnings,
+                    reason,
+                },
+            ) => {
+                summary.committed_unverified =
+                    summary.committed_unverified.saturating_add(1);
+                summary.durability_warnings = summary
+                    .durability_warnings
+                    .saturating_add(durability_warnings.len());
+                for warning in durability_warnings {
+                    file.issues.push(MetadataIssue::Write {
+                        path: result.path.clone(),
+                        reason: format!("{INVALID_APE_REPAIR_ISSUE_PREFIX}{warning}"),
+                    });
+                }
+                file.issues.push(MetadataIssue::Write {
+                    path: result.path.clone(),
+                    reason: format!(
+                        "{INVALID_APE_REPAIR_ISSUE_PREFIX}repair committed, but post-commit verification failed; inspect before retrying: {reason}"
+                    ),
+                });
+                invalidate_probe = true;
+            }
+            MetadataEditorWriteOutcome::Saved
+            | MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+            | MetadataEditorWriteOutcome::Failed { .. }
+            | MetadataEditorWriteOutcome::Skipped { .. }
+            | MetadataEditorWriteOutcome::SidecarCueSaved { .. }
+            | MetadataEditorWriteOutcome::SidecarCueFailed { .. } => {
+                summary.ignored = summary.ignored.saturating_add(1);
+                file.issues.push(MetadataIssue::Write {
+                    path: result.path.clone(),
+                    reason: format!(
+                        "{INVALID_APE_REPAIR_ISSUE_PREFIX}worker returned an unexpected non-repair outcome; commit state was not inferred"
+                    ),
+                });
+            }
+        }
+
+        if invalidate_probe {
+            app.browse.remove_probe_cache_entry(&result.path);
+            let _ = app.db.invalidate_probe(&result.path.display().to_string());
+        }
+    }
+
+    for missing_path in expected_paths.difference(&seen_paths) {
+        summary.commit_state_unknown = summary.commit_state_unknown.saturating_add(1);
+        if let Some(file) = state
+            .active_surface_mut()
+            .technical_details
+            .files
+            .iter_mut()
+            .find(|file| file.file_facts.path == *missing_path)
+        {
+            file.issues.push(MetadataIssue::Write {
+                path: missing_path.clone(),
+                reason: format!(
+                    "{INVALID_APE_REPAIR_ISSUE_PREFIX}worker returned no per-file result; commit state is unknown, inspect before retrying"
+                ),
+            });
+        }
+        app.browse.remove_probe_cache_entry(missing_path);
+        let _ = app.db.invalidate_probe(&missing_path.display().to_string());
+    }
+
+    if summary.committed_verified
+        + summary.committed_unverified
+        + summary.commit_state_unknown
+        > 0
+    {
+        state.mark_archive_staging_dirty();
+    }
+
+    match refreshed_entries {
+        Some(Ok(entries)) => {
+            let entries_len = {
+                let surface = state.active_surface_mut();
+                surface.entries = entries;
+                surface.deleted.clear();
+                surface.selected_rows.clear();
+                surface.dirty = false;
+                surface.refresh_failed = false;
+                surface.entries.len()
+            };
+            state.cursor = state.cursor.min(entries_len.saturating_sub(1));
+        }
+        Some(Err(reason)) => {
+            state.active_surface_mut().refresh_failed = true;
+            summary.refresh_failed = true;
+            if let Some(first_path) = expected_paths.iter().next() {
+                if let Some(file) = state
+                    .active_surface_mut()
+                    .technical_details
+                    .files
+                    .iter_mut()
+                    .find(|file| file.file_facts.path == *first_path)
+                {
+                    file.issues.push(MetadataIssue::Write {
+                        path: first_path.clone(),
+                        reason: format!(
+                            "{INVALID_APE_REPAIR_ISSUE_PREFIX}post-worker editor refresh failed: {reason}"
+                        ),
+                    });
+                }
+            }
+        }
+        None => {
+            state.active_surface_mut().refresh_failed = true;
+            summary.refresh_failed = true;
+            if let Some(first_path) = expected_paths.iter().next() {
+                if let Some(file) = state
+                    .active_surface_mut()
+                    .technical_details
+                    .files
+                    .iter_mut()
+                    .find(|file| file.file_facts.path == *first_path)
+                {
+                    file.issues.push(MetadataIssue::Write {
+                        path: first_path.clone(),
+                        reason: format!(
+                            "{INVALID_APE_REPAIR_ISSUE_PREFIX}worker completion omitted the post-repair editor refresh; reopen before trusting displayed rows"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    Some(summary)
+}
+
+
+#[cfg(test)]
+mod invalid_ape_repair_worker_contract_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{
+        ActiveOverlay, FileFacts, MetadataEditorPhase, MetadataEditorState,
+        MetadataEditorWriteResult, MetadataFileDetails, MetadataInvalidApeRepairOutcome,
+        MetadataIssue, MetadataTechnicalDetails,
+    };
+
+    fn editor_with_recoverable_warning(path: &std::path::Path) -> MetadataEditorState {
+        let details = MetadataFileDetails {
+            file_facts: FileFacts {
+                path: path.to_path_buf(),
+                ..FileFacts::default()
+            },
+            issues: vec![MetadataIssue::RecoverableTagWarning {
+                path: path.to_path_buf(),
+                reason: "1 invalid APE key skipped: '&год'".to_string(),
+            }],
+            ..MetadataFileDetails::default()
+        };
+        MetadataEditorState::for_files(
+            vec![path.to_path_buf()],
+            Vec::new(),
+            vec![path.display().to_string()],
+            MetadataTechnicalDetails::from_files(vec![details]),
+        )
+    }
+
+    fn issues_for<'a>(state: &'a MetadataEditorState, path: &std::path::Path) -> &'a [MetadataIssue] {
+        &state
+            .active_surface()
+            .technical_details
+            .files
+            .iter()
+            .find(|file| file.file_facts.path == path)
+            .expect("file details")
+            .issues
+    }
+
+    #[test]
+    fn repair_completion_preserves_commit_and_durability_distinctions() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-invalid-ape-repair-outcome-ledger",
+        );
+        let path = std::path::PathBuf::from("album/track.wv");
+        let mut state = editor_with_recoverable_warning(&path);
+        let (session_id, generation, _cancel) = state.begin_invalid_ape_repair(vec![(
+            path.clone(),
+            vec!["&год".to_string()],
+        )]);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        let summary = apply_invalid_ape_repair_completion(
+            &mut app,
+            &mut state,
+            session_id,
+            generation,
+            vec![MetadataEditorWriteResult::invalid_ape_repair(
+                path.clone(),
+                MetadataInvalidApeRepairOutcome::CommittedAndVerified {
+                    removed_keys: vec!["&год".to_string()],
+                    durability_warnings: vec!["parent directory sync unavailable".to_string()],
+                },
+            )],
+            Some(Ok(Vec::new())),
+        )
+        .expect("current repair completion");
+
+        assert_eq!(summary.committed_verified, 1);
+        assert_eq!(summary.durability_warnings, 1);
+        assert_eq!(state.phase, MetadataEditorPhase::Editing);
+        assert!(state.invalid_ape_repair.is_none());
+        let issues = issues_for(&state, &path);
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue,
+                MetadataIssue::RecoverableTagWarning { .. }
+            )),
+            "verified repair removes the stale recoverable warning"
+        );
+        assert!(issues.iter().any(|issue| matches!(
+            issue,
+            MetadataIssue::Write { reason, .. }
+                if reason.contains("parent directory sync unavailable")
+        )));
+    }
+
+    #[test]
+    fn committed_but_unverified_is_never_reported_as_an_unmodified_failure() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-invalid-ape-repair-committed-unverified",
+        );
+        let path = std::path::PathBuf::from("album/track.wv");
+        let mut state = editor_with_recoverable_warning(&path);
+        let (session_id, generation, _cancel) = state.begin_invalid_ape_repair(vec![(
+            path.clone(),
+            vec!["&год".to_string()],
+        )]);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        let summary = apply_invalid_ape_repair_completion(
+            &mut app,
+            &mut state,
+            session_id,
+            generation,
+            vec![MetadataEditorWriteResult::invalid_ape_repair(
+                path.clone(),
+                MetadataInvalidApeRepairOutcome::CommittedButVerificationFailed {
+                    removed_keys: vec!["&год".to_string()],
+                    durability_warnings: vec!["directory durability uncertain".to_string()],
+                    reason: "Lofty still rejected an unrelated tag".to_string(),
+                },
+            )],
+            Some(Err("refresh refused the carrier".to_string())),
+        )
+        .expect("current repair completion");
+
+        assert_eq!(summary.committed_unverified, 1);
+        assert_eq!(summary.not_modified, 0);
+        assert_eq!(summary.durability_warnings, 1);
+        assert!(summary.refresh_failed);
+        let issues = issues_for(&state, &path);
+        assert!(issues.iter().any(|issue| matches!(
+            issue,
+            MetadataIssue::RecoverableTagWarning { .. }
+        )));
+        assert!(issues.iter().any(|issue| matches!(
+            issue,
+            MetadataIssue::Write { reason, .. }
+                if reason.contains("repair committed, but post-commit verification failed")
+        )));
+        assert!(issues.iter().any(|issue| matches!(
+            issue,
+            MetadataIssue::Write { reason, .. }
+                if reason.contains("directory durability uncertain")
+        )));
+    }
+
+    #[test]
+    fn missing_worker_result_is_classified_as_unknown_commit_state() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-invalid-ape-repair-missing-ledger",
+        );
+        let path = std::path::PathBuf::from("album/track.wv");
+        let mut state = editor_with_recoverable_warning(&path);
+        let (session_id, generation, _cancel) = state.begin_invalid_ape_repair(vec![(
+            path.clone(),
+            vec!["&год".to_string()],
+        )]);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        let summary = apply_invalid_ape_repair_completion(
+            &mut app,
+            &mut state,
+            session_id,
+            generation,
+            Vec::new(),
+            None,
+        )
+        .expect("current repair completion");
+
+        assert_eq!(summary.commit_state_unknown, 1);
+        assert_eq!(summary.not_modified, 0);
+        assert!(issues_for(&state, &path).iter().any(|issue| matches!(
+            issue,
+            MetadataIssue::Write { reason, .. }
+                if reason.contains("worker returned no per-file result")
+                    && reason.contains("commit state is unknown")
+        )));
+    }
+
+    #[test]
+    fn stale_repair_completion_cannot_reconcile_a_newer_editor_operation() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-invalid-ape-repair-stale-completion",
+        );
+        let path = std::path::PathBuf::from("album/track.wv");
+        let mut state = editor_with_recoverable_warning(&path);
+        let (session_id, generation, _cancel) = state.begin_invalid_ape_repair(vec![(
+            path,
+            vec!["&год".to_string()],
+        )]);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        assert!(apply_invalid_ape_repair_completion(
+            &mut app,
+            &mut state,
+            session_id,
+            generation.saturating_add(1),
+            Vec::new(),
+            None,
+        )
+        .is_none());
+        assert_eq!(state.phase, MetadataEditorPhase::Saving);
+        assert!(state.invalid_ape_repair.is_some());
+    }
+
+    #[test]
+    fn cancelled_multi_file_worker_returns_one_precommit_result_per_target() {
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        cancel.cancel();
+        let paths = vec![
+            std::path::PathBuf::from("album/one.wv"),
+            std::path::PathBuf::from("album/two.wv"),
+        ];
+        let targets = paths
+            .iter()
+            .cloned()
+            .map(|path| (path, vec!["&год".to_string()]))
+            .collect();
+        let (tx, _rx) = mpsc::channel(32);
+
+        let results = run_invalid_ape_repair_batch(
+            targets,
+            tui_file_picker::VerificationMode::Strong,
+            cancel,
+            7,
+            11,
+            tx,
+        );
+
+        assert_eq!(results.len(), paths.len());
+        for (result, expected_path) in results.iter().zip(paths) {
+            assert_eq!(result.path, expected_path);
+            assert!(matches!(
+                &result.outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::InvalidApeRepair(
+                    MetadataInvalidApeRepairOutcome::CancelledBeforeCommit { .. }
+                )
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn production_dispatch_returns_control_and_close_requests_cancellation() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-invalid-ape-repair-async-dispatch",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("missing-worker-target.wv");
+        let state = Box::new(editor_with_recoverable_warning(&path));
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, mut rx) = mpsc::channel(32);
+
+        start_invalid_ape_repair(
+            &mut app,
+            state,
+            vec![(path, vec!["&год".to_string()])],
+            tui_file_picker::VerificationMode::Strong,
+            &tx,
+        );
+
+        let mut active = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
+            ActiveOverlay::MetadataEditor(state) => state,
+            _ => panic!("repair dispatch must return immediately to the editor"),
+        };
+        assert_eq!(active.phase, MetadataEditorPhase::Saving);
+        assert!(active.invalid_ape_repair.is_some());
+        assert!(active.cancel_metadata_write());
+        request_metadata_editor_close(&mut app, &mut active, &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("cancellation requested")
+        }));
+
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    let message = rx.recv().await.expect("repair worker message");
+                    if matches!(message, AppMessage::MetadataEditorWriteComplete { .. }) {
+                        break message;
+                    }
+                }
+            },
+        )
+        .await
+        .expect("worker completion without blocking the test runtime");
+        assert!(matches!(completion, AppMessage::MetadataEditorWriteComplete { .. }));
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))] // compatibility wrapper; production routes through the _for_column variant
 pub(super) fn build_metadata_row_context_menu(
     state: &super::app::MetadataEditorState,
@@ -25286,6 +26426,15 @@ pub(super) fn build_metadata_row_context_menu_for_column(
         entries.extend(automatic_actions);
     }
     entries.push(ContextMenuEntry::Separator);
+    entries.push(ContextMenuEntry::Item(ContextMenuItem {
+        label: "Remove invalid APE key(s)".to_string(),
+        action: ContextAction::MetadataRemoveInvalidApeKeys,
+        shortcut: None,
+        enabled: metadata_editor_has_recoverable_invalid_ape_warnings(state)
+            && !state.read_only
+            && state.phase == super::app::MetadataEditorPhase::Editing
+            && !state.any_presentation_dirty(),
+    }));
     entries.push(ContextMenuEntry::Item(ContextMenuItem {
         label: "Add new field".to_string(),
         action: ContextAction::MetadataAddField,
@@ -37803,6 +38952,9 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
         Some(ConfirmAction::DeleteEmbeddedCueSheet { .. }) => {
             app.set_status(":cuesheet-delete: cancelled; embedded CUESHEET unchanged".to_string());
         }
+        Some(ConfirmAction::RemoveInvalidApeKeys { .. }) => {
+            app.set_status("APE repair cancelled; files left unchanged".to_string());
+        }
         Some(ConfirmAction::ArchiveExternalConflict { context }) => {
             app.should_quit = false;
             app.quit_after_browse_archive_repackage = false;
@@ -38310,6 +39462,22 @@ fn execute_confirm_action(
                 }
             }
         }
+        ConfirmAction::RemoveInvalidApeKeys {
+            targets,
+            verification,
+        } => {
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.set_status("APE repair: editor state unavailable; no files changed");
+                return;
+            };
+            start_invalid_ape_repair(
+                app,
+                state,
+                targets.clone(),
+                *verification,
+                tx,
+            );
+        }
         ConfirmAction::ArchiveExternalConflict { context } => {
             let context = context.clone();
             super::event_loop::start_browse_archive_repackage_overwrite(app, context, tx);
@@ -38428,7 +39596,11 @@ fn execute_confirm_action(
                     app.preset.set_active_preset_path(name.clone(), path.clone());
                     app.preset.modified = false;
                     app.active_overlay = ActiveOverlay::None;
-                    app.set_status(format!("Saved preset: {}", path.display()));
+                    app.set_status(format!(
+                        "Saved preset: {} | {}",
+                        path.display(),
+                        preset.resolved_semantics_summary()
+                    ));
                 }
                 Err(e) => {
                     app.active_overlay = ActiveOverlay::None;
@@ -48111,16 +49283,29 @@ mod artwork_file_picker_handoff_tests {
     #[test]
     fn ignored_directory_disclosure_suffix_reaches_the_status_line() {
         // End-to-end pin: the "(N directories ignored)" suffix must survive
-        // handle_message (appended AFTER the reducer sets its own status).
+        // handle_message (appended AFTER the reducer sets its own status) —
+        // but ONLY for completions the reducer actually consumed (round-9
+        // consumed-flag gating): stale completions get NO suffix.
+        let temp = tempfile::tempdir().expect("picker tempdir");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let (tx, _rx) = channel();
+        let purpose = FilePickerPurpose::Generic {
+            id: "suffix-pin".to_string(),
+        };
+        let session = super::super::app::MetadataFilePickerState::new(
+            purpose.clone(),
+            tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+                start_dir: temp.path().to_path_buf(),
+                ..tui_file_picker::FilePickerConfig::default()
+            }),
+        );
+        let session_id = session.session_id;
+        app.active_overlay = super::super::app::ActiveOverlay::FilePicker(session);
         super::super::event_loop::handle_message(
             &mut app,
             AppMessage::FilePickerComplete {
-                session_id: 1,
-                purpose: FilePickerPurpose::Generic {
-                    id: "suffix-pin".to_string(),
-                },
+                session_id,
+                purpose: purpose.clone(),
                 path: Some(PathBuf::from("/music/01.flac")),
                 paths: vec![PathBuf::from("/music/01.flac")],
                 ignored_directories: 2,
@@ -48131,10 +49316,37 @@ mod artwork_file_picker_handoff_tests {
             .status_message
             .as_ref()
             .map(|(status, _)| status.clone())
-            .expect("completion must set a status");
+            .expect("consumed completion must set a status");
         assert!(
             status.contains("(2 directories ignored)"),
             "status must carry the disclosure suffix, got: {status}"
+        );
+
+        // Stale arm: no matching session anymore — the reducer discards the
+        // completion and the suffix must NOT be appended.
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::FilePickerComplete {
+                session_id: session_id + 1,
+                purpose,
+                path: Some(PathBuf::from("/music/02.flac")),
+                paths: vec![PathBuf::from("/music/02.flac")],
+                ignored_directories: 3,
+            },
+            &tx,
+        );
+        let stale_status = app
+            .status_message
+            .as_ref()
+            .map(|(status, _)| status.clone())
+            .expect("stale completion must set a status");
+        assert!(
+            stale_status.contains("ignored stale completion"),
+            "stale completion must be discarded, got: {stale_status}"
+        );
+        assert!(
+            !stale_status.contains("directories ignored"),
+            "stale completion must NOT carry the disclosure suffix, got: {stale_status}"
         );
     }
 
@@ -53755,7 +54967,7 @@ mod metadata_cue_source_coverage_tests {
         )
         .expect("rejected cue");
 
-        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
         for root in [&cue_less, &rejected] {
             let visit_error = classify_tag_transfer_roots_with_limits(
                 &[root.clone()],
@@ -53822,7 +55034,7 @@ mod metadata_cue_source_coverage_tests {
         let second = temp.path().join("02.flac");
         std::fs::write(&first, b"not a real FLAC").expect("first fixture");
         std::fs::write(&second, b"not a real FLAC").expect("second fixture");
-        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
         let _ = classify_tag_transfer_roots(&[first, second], &cancel);
 
         assert_eq!(
@@ -53857,7 +55069,7 @@ mod metadata_cue_source_coverage_tests {
 "#,
         )
         .expect("valid cue");
-        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
         let carrier = classify_tag_transfer_roots(std::slice::from_ref(&valid), &cancel)
             .expect("explicit cue carrier");
         assert!(matches!(
@@ -54016,7 +55228,7 @@ FILE "a.flac" WAVE
         )
         .expect("embedded cuesheet");
 
-        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
         let by_directory = classify_tag_transfer_roots(std::slice::from_ref(&album), &cancel)
             .expect("directory carrier");
         let by_cue = classify_tag_transfer_roots(std::slice::from_ref(&cue), &cancel)
@@ -54123,7 +55335,7 @@ FILE "a.flac" WAVE
         )
         .expect("multi-file cue");
 
-        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
         let by_folder = classify_tag_transfer_roots(std::slice::from_ref(&album), &cancel)
             .expect("folder carrier");
         let by_cue = classify_tag_transfer_roots(std::slice::from_ref(&cue), &cancel)
@@ -56053,6 +57265,69 @@ mod file_picker_browse_parity_regression_tests {
         let input = app.browse.path_input.as_ref().expect("path input");
         assert_eq!(input.clipboard, "/music/album");
         assert!(app.browse.filesystem_clipboard.is_none());
+    }
+
+    #[test]
+    fn browse_info_ctrl_c_precedes_filesystem_copy_and_publishes_field_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_audio_entry(file.clone())];
+        app.browse.insert_probe_cache_for_test(
+            file,
+            Some(std::sync::Arc::new(crate::tui::browse::CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    format_name: "FLAC".to_string(),
+                    codec: "flac".to_string(),
+                    bit_depth: Some(16),
+                    sample_rate: 44_100,
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: 0,
+                },
+                metadata: crate::tui::probe::SourceMetadata {
+                    album: Some("Even in the Quietest Moments...".to_string()),
+                    ..crate::tui::probe::SourceMetadata::default()
+                },
+            })),
+        );
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        app.browse_info_focus = Some(BrowseInfoFocus::Metadata(
+            crate::tui::probe::MetadataField::Album,
+        ));
+        let (tx, _rx) = mpsc::channel(4);
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            || {
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+            },
+        );
+
+        assert_eq!(
+            published.borrow().as_slice(),
+            &["Even in the Quietest Moments...".to_string()]
+        );
+        assert_eq!(
+            tui_file_picker::read_shared_text_clipboard(),
+            "Even in the Quietest Moments..."
+        );
+        assert!(app.browse.filesystem_clipboard.is_none());
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("Copied: Even in the Quietest Moments...")
+        );
     }
 
     #[test]

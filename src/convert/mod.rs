@@ -2940,6 +2940,7 @@ mod queue_json_secret_retirement_tests {
         let completed = item_with_status(ConversionStatus::Completed {
             output_path: PathBuf::from("album/output.dsf"),
             log_path: None,
+            warning_count: 0,
         });
         assert!(json_queue_item_is_persisted(&completed));
         assert_eq!(omitted_terminal_queue_secret_reference(&completed), None);
@@ -3046,6 +3047,7 @@ mod bluray_queue_admission_tests {
                 folder_template: None,
                 per_album_subdir: false,
                 collision_policy: NamingCollisionPolicy::Fail,
+                windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,
@@ -3473,6 +3475,7 @@ mod bluray_queue_admission_tests {
                 ConversionStatus::Completed {
                     output_path: PathBuf::from("/tmp/out.flac"),
                     log_path: None,
+                    warning_count: 0,
                 },
                 100.0,
             ),
@@ -3495,6 +3498,7 @@ mod bluray_queue_admission_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
             100.0,
         ));
@@ -3520,6 +3524,7 @@ mod bluray_queue_admission_tests {
             item.status = ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             };
         }
 
@@ -4106,6 +4111,7 @@ mod per_track_epoch_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
             100.0,
         ));
@@ -4164,6 +4170,7 @@ mod per_track_epoch_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
             100.0,
         ));
@@ -4225,6 +4232,7 @@ mod per_track_epoch_tests {
             item.status = ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             };
         }
 
@@ -4450,6 +4458,7 @@ mod per_track_epoch_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
             100.0,
         );
@@ -4498,6 +4507,7 @@ mod per_track_epoch_tests {
             item.status = ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             };
         }
 
@@ -4512,6 +4522,7 @@ mod per_track_epoch_tests {
                 ConversionStatus::Completed {
                     output_path: PathBuf::from("/tmp/out.flac"),
                     log_path: None,
+                    warning_count: 0,
                 },
                 100.0,
             )
@@ -4525,6 +4536,7 @@ mod per_track_epoch_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
             100.0,
         );
@@ -4600,6 +4612,7 @@ mod per_track_epoch_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
             100.0,
         ));
@@ -4630,6 +4643,7 @@ mod per_track_epoch_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
             100.0,
         ));
@@ -4659,6 +4673,7 @@ mod per_track_epoch_tests {
             ConversionStatus::Completed {
                 output_path: PathBuf::from("/tmp/out.flac"),
                 log_path: None,
+                warning_count: 0,
             },
         );
         manager

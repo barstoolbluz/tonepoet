@@ -7588,6 +7588,7 @@ mod tests {
             merge: false,
             output_root,
             naming: NamingPolicy {
+                windows_portable: false,
                 template: "%NN% - %TITLE%".to_string(),
                 folder_template: None,
                 per_album_subdir: true,

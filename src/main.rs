@@ -1392,6 +1392,7 @@ async fn run_convert(
         dvda_group.as_deref(),
         dvda_assume_decrypted,
         dvda_downmix,
+        config.naming.windows_portable,
     );
 
     // Build processor
@@ -1810,6 +1811,7 @@ fn build_pipeline_request_template(
     dvda_group: Option<&str>,
     dvda_assume_decrypted: bool,
     dvda_downmix: Option<DvdaDownmixPolicy>,
+    windows_portable: bool,
 ) -> Option<tonepoet::convert::pipeline::PipelineRequest> {
     use std::collections::BTreeSet;
     use tonepoet::convert::pipeline::*;
@@ -1827,7 +1829,8 @@ fn build_pipeline_request_template(
         || no_features
         || dvda_group.is_some()
         || dvda_assume_decrypted
-        || dvda_downmix.is_some();
+        || dvda_downmix.is_some()
+        || windows_portable;
 
     if !has_pipeline_flags {
         return None;
@@ -1910,6 +1913,7 @@ fn build_pipeline_request_template(
             folder_template: folder_naming.map(str::to_string),
             per_album_subdir: true,
             collision_policy: NamingCollisionPolicy::Fail,
+            windows_portable,
         },
         publish: PublishPolicy {
             overwrite: if overwrite_output {
@@ -3224,6 +3228,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         );
         assert!(result.is_none());
     }
@@ -3250,6 +3255,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(req.source.track_selection,
@@ -3279,6 +3285,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(
@@ -3309,6 +3316,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3339,6 +3347,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3369,6 +3378,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3399,6 +3409,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3429,6 +3440,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(req.naming.template, "{nn} - {title}");
@@ -3456,6 +3468,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3490,6 +3503,7 @@ mod pipeline_cli_tests {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3520,6 +3534,7 @@ mod pipeline_cli_tests {
             Some("stereo"),
             false,
             None,
+            false,
         );
         assert!(req.is_some());
         let req = req.unwrap();
@@ -3551,6 +3566,7 @@ mod pipeline_cli_tests {
             None,
             true,
             None,
+            false,
         );
         assert!(req.is_some());
         assert!(req.unwrap().source.dvda_assume_decrypted);
@@ -3578,6 +3594,7 @@ mod pipeline_cli_tests {
             None,
             false,
             Some(DvdaDownmixPolicy::FooInputDvdaCompatible),
+            false,
         );
         assert!(req.is_some());
         assert_eq!(
@@ -3639,6 +3656,7 @@ mod pipeline_cli_tests {
             Some("2"),
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3669,6 +3687,7 @@ mod pipeline_cli_tests {
             Some("all"),
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(

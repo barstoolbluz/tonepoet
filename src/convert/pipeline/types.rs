@@ -117,6 +117,14 @@ impl BatchResolvedAlbumIdentity {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlbumBatchOrdering {
+    #[default]
+    ProvenTrackOrder,
+    CompletionOrder,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlbumBatchContext {
     /// Explicit shared conversion-log batch id assigned once by the folder/album
@@ -174,6 +182,11 @@ pub struct AlbumBatchContext {
     /// individual worker's materialized source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) source_paths: Vec<PathBuf>,
+    /// Dispatcher-authored log ordering contract. Proven order uses durable
+    /// number-keyed fragments; completion order uses the serialized album
+    /// publication lock and never pretends synthetic ordinals are metadata.
+    #[serde(default)]
+    pub(crate) ordering: AlbumBatchOrdering,
 }
 
 impl AlbumBatchContext {
@@ -200,6 +213,7 @@ impl AlbumBatchContext {
             )),
             resolved_identity: None,
             source_paths: Vec::new(),
+            ordering: AlbumBatchOrdering::ProvenTrackOrder,
             source_grouping_root,
         }
     }
@@ -239,6 +253,17 @@ impl AlbumBatchContext {
     pub(crate) fn with_resolved_identity(mut self, identity: BatchResolvedAlbumIdentity) -> Self {
         self.resolved_identity = if identity.is_empty() { None } else { Some(identity) };
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_ordering(mut self, ordering: AlbumBatchOrdering) -> Self {
+        self.ordering = ordering;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn uses_completion_order(&self) -> bool {
+        self.ordering == AlbumBatchOrdering::CompletionOrder
     }
 
     #[must_use]
@@ -833,6 +858,8 @@ pub struct NamingPolicy {
     pub folder_template: Option<String>,
     pub per_album_subdir: bool,
     pub collision_policy: NamingCollisionPolicy,
+    #[serde(default)]
+    pub windows_portable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2253,12 +2280,16 @@ pub struct PublishPlan {
     /// fragment sidecar and may be greater than the current job's payload count.
     #[serde(default = "default_publish_track_count")]
     pub expected_album_track_count: usize,
-    /// True when the production dispatcher identified an independent multi-file
-    /// album group but could not prove canonical track identity. Such plans must
-    /// not use the legacy incremental conversion.log append path, because that
-    /// path writes in worker-completion order.
+    /// Emergency fail-closed switch for requests that cannot participate in
+    /// either dispatcher-authored ordering mode. Ordinary ordering-unprovable
+    /// batches use `album_batch_completion_order` instead of this switch.
     #[serde(default)]
     pub suppress_incremental_conversion_log_append: bool,
+    /// True for a dispatcher-authored shared album batch whose only truthful log
+    /// order is worker completion order. This keeps publication structural even
+    /// when visible conversion logs are disabled.
+    #[serde(default)]
+    pub album_batch_completion_order: bool,
     /// False when the user disabled the conversion log. Fragments still flow
     /// and coordinate album-batch completion, but publish must consume them
     /// silently instead of assembling a visible conversion.log.

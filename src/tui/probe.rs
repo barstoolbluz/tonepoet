@@ -603,10 +603,25 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
 
     flac_metadata_writer::recover_before_read(path)?;
 
-    let tagged_file = lofty::read_from_path(path)
-        .map_err(|e| format!("Failed to read tags from '{}': {}", path.display(), e))?;
-
-    Ok(source_metadata_from_tags(path, tagged_file.tags(), true))
+    match lofty::read_from_path(path) {
+        Ok(tagged_file) => Ok(source_metadata_from_tags(path, tagged_file.tags(), true)),
+        Err(error) if native_ape_error_is_eligible(&error) => {
+            let outcome = read_native_ape_fallback(path).map_err(|native_error| {
+                format!(
+                    "Failed to read tags from '{}': {error}; native APEv2 fallback also refused: {native_error}",
+                    path.display()
+                )
+            })?;
+            if let Some(warning) = &outcome.warning {
+                log::warn!("{}", warning.reason);
+            }
+            Ok(outcome.metadata)
+        }
+        Err(error) => Err(format!(
+            "Failed to read tags from '{}': {error}",
+            path.display()
+        )),
+    }
 }
 
 /// Lazily read raw embedded artwork bytes for one picture type.
@@ -7266,45 +7281,16 @@ fn source_metadata_from_tags(
     meta
 }
 
-const APE_SIGNATURE: &[u8; 8] = b"APETAGEX";
-const APE_DESCRIPTOR_LEN: usize = 32;
-const APE_VERSION_2: u32 = 2_000;
-const APE_FLAG_HEADER_PRESENT: u32 = 1 << 31;
-const APE_FLAG_IS_HEADER: u32 = 1 << 29;
-const APE_ITEM_READ_ONLY: u32 = 1;
-const APE_ITEM_TYPE_MASK: u32 = 0b110;
-const APE_ITEM_TYPE_TEXT: u32 = 0;
-const APE_ITEM_TYPE_BINARY: u32 = 0b010;
-const APE_ITEM_TYPE_LOCATOR: u32 = 0b100;
-const MAX_NATIVE_APE_TAG_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_NATIVE_APE_ITEMS: u32 = 1_000_000;
-
-#[derive(Debug, Clone)]
-struct NativeApeItem {
-    raw: Vec<u8>,
-    key_bytes: Vec<u8>,
-    key: Option<String>,
-    flags: u32,
-    value: Vec<u8>,
-}
-
-impl NativeApeItem {
-    fn item_type(&self) -> u32 {
-        self.flags & APE_ITEM_TYPE_MASK
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.flags & APE_ITEM_READ_ONLY != 0
-    }
-}
-
-#[derive(Debug, Clone)]
-struct NativeApeTag {
-    replace_start: u64,
-    footer_end: u64,
-    had_header: bool,
-    items: Vec<NativeApeItem>,
-}
+use crate::metadata_persistence::{
+    ape_key_is_valid, native_ape_canonical_key, native_ape_error_is_eligible,
+    native_ape_rows, optional_id3v1_start,
+    read_native_ape_fallback as read_neutral_native_ape_fallback, read_native_ape_tag,
+    NativeApeTag, APE_DESCRIPTOR_LEN, APE_FLAG_HEADER_PRESENT, APE_FLAG_IS_HEADER,
+    APE_ITEM_TYPE_LOCATOR, APE_ITEM_TYPE_TEXT,
+    APE_SIGNATURE, APE_VERSION_2, MAX_NATIVE_APE_TAG_BYTES,
+};
+#[cfg(test)]
+use crate::metadata_persistence::{native_ape_numbering_rows, APE_ITEM_READ_ONLY};
 
 #[derive(Debug)]
 struct NativeApeReadOutcome {
@@ -7313,315 +7299,21 @@ struct NativeApeReadOutcome {
     warning: Option<MetadataReadIssue>,
 }
 
-fn u32_le_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    let value = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| "truncated APEv2 integer field".to_string())?;
-    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-}
-
-fn native_ape_error_is_eligible(err: &lofty::error::LoftyError) -> bool {
-    use lofty::error::ErrorKind;
-
-    matches!(
-        err.kind(),
-        ErrorKind::FileDecoding(decoding)
-            if decoding.format() == Some(lofty::file::FileType::Ape)
-    )
-}
-
-fn ape_key_is_valid(key: &[u8]) -> bool {
-    if !(2..=255).contains(&key.len()) || !key.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
-        return false;
-    }
-    ![b"ID3".as_slice(), b"TAG".as_slice(), b"OGGS".as_slice(), b"MP+".as_slice()]
-        .iter()
-        .any(|reserved| key.eq_ignore_ascii_case(reserved))
-}
-
-fn display_escaped_ape_key(key: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(key) {
-        let mut escaped = String::new();
-        for ch in text.chars() {
-            match ch {
-                '\\' => escaped.push_str("\\\\"),
-                '\'' => escaped.push_str("\\'"),
-                ch if ch.is_control() => escaped.extend(ch.escape_default()),
-                ch => escaped.push(ch),
-            }
-        }
-        return escaped;
-    }
-
-    key.iter()
-        .map(|byte| format!("\\x{byte:02X}"))
-        .collect::<String>()
-}
-
-fn optional_id3v1_start(file: &mut std::fs::File, file_len: u64) -> Result<Option<u64>, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    if file_len < 128 {
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(file_len - 128))
-        .map_err(|error| format!("seek trailing ID3v1 probe: {error}"))?;
-    let mut signature = [0u8; 3];
-    file.read_exact(&mut signature)
-        .map_err(|error| format!("read trailing ID3v1 probe: {error}"))?;
-    Ok((&signature == b"TAG").then_some(file_len - 128))
-}
-
-fn read_native_ape_tag(path: &std::path::Path) -> Result<Option<NativeApeTag>, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("open '{}': {error}", path.display()))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| format!("stat '{}': {error}", path.display()))?
-        .len();
-    let footer_end = optional_id3v1_start(&mut file, file_len)?.unwrap_or(file_len);
-    if footer_end < APE_DESCRIPTOR_LEN as u64 {
-        return Ok(None);
-    }
-
-    file.seek(SeekFrom::Start(footer_end - APE_DESCRIPTOR_LEN as u64))
-        .map_err(|error| format!("seek APEv2 footer in '{}': {error}", path.display()))?;
-    let mut footer = [0u8; APE_DESCRIPTOR_LEN];
-    file.read_exact(&mut footer)
-        .map_err(|error| format!("read APEv2 footer in '{}': {error}", path.display()))?;
-    if &footer[..8] != APE_SIGNATURE {
-        return Ok(None);
-    }
-
-    let version = u32_le_at(&footer, 8)?;
-    if version != APE_VERSION_2 {
-        return Err(format!(
-            "unsupported APE tag version {version} in '{}'; native fallback accepts APEv2 only",
-            path.display()
-        ));
-    }
-    let tag_size = u64::from(u32_le_at(&footer, 12)?);
-    let item_count = u32_le_at(&footer, 16)?;
-    let footer_flags = u32_le_at(&footer, 20)?;
-    if tag_size < APE_DESCRIPTOR_LEN as u64
-        || tag_size > MAX_NATIVE_APE_TAG_BYTES
-        || tag_size > footer_end
-    {
-        return Err(format!(
-            "invalid APEv2 tag size {tag_size} in '{}'",
-            path.display()
-        ));
-    }
-    if item_count > MAX_NATIVE_APE_ITEMS {
-        return Err(format!(
-            "APEv2 item count {item_count} exceeds the native safety limit in '{}'",
-            path.display()
-        ));
-    }
-
-    let items_start = footer_end - tag_size;
-    let items_len = tag_size - APE_DESCRIPTOR_LEN as u64;
-    let had_header = footer_flags & APE_FLAG_HEADER_PRESENT != 0;
-    let replace_start = if had_header {
-        if items_start < APE_DESCRIPTOR_LEN as u64 {
-            return Err(format!("APEv2 header underflows file start in '{}'", path.display()));
-        }
-        let header_start = items_start - APE_DESCRIPTOR_LEN as u64;
-        file.seek(SeekFrom::Start(header_start))
-            .map_err(|error| format!("seek APEv2 header in '{}': {error}", path.display()))?;
-        let mut header = [0u8; APE_DESCRIPTOR_LEN];
-        file.read_exact(&mut header)
-            .map_err(|error| format!("read APEv2 header in '{}': {error}", path.display()))?;
-        if &header[..8] != APE_SIGNATURE
-            || u32_le_at(&header, 8)? != version
-            || u32_le_at(&header, 12)? != tag_size as u32
-            || u32_le_at(&header, 16)? != item_count
-            || u32_le_at(&header, 20)? & APE_FLAG_IS_HEADER == 0
-        {
-            return Err(format!(
-                "APEv2 footer claims a header but the matching header is absent or inconsistent in '{}'",
-                path.display()
-            ));
-        }
-        header_start
-    } else {
-        items_start
-    };
-
-    let items_len_usize = usize::try_from(items_len)
-        .map_err(|_| format!("APEv2 item region is too large in '{}'", path.display()))?;
-    file.seek(SeekFrom::Start(items_start))
-        .map_err(|error| format!("seek APEv2 items in '{}': {error}", path.display()))?;
-    let mut bytes = vec![0u8; items_len_usize];
-    file.read_exact(&mut bytes)
-        .map_err(|error| format!("read APEv2 items in '{}': {error}", path.display()))?;
-
-    let mut items = Vec::with_capacity(item_count as usize);
-    let mut cursor = 0usize;
-    for item_index in 0..item_count {
-        let item_start = cursor;
-        if cursor.checked_add(8).is_none_or(|end| end > bytes.len()) {
-            return Err(format!(
-                "truncated APEv2 item {item_index} header in '{}'",
-                path.display()
-            ));
-        }
-        let value_len = u32_le_at(&bytes, cursor)? as usize;
-        let flags = u32_le_at(&bytes, cursor + 4)?;
-        cursor += 8;
-        let key_end = bytes[cursor..]
-            .iter()
-            .position(|byte| *byte == 0)
-            .map(|offset| cursor + offset)
-            .ok_or_else(|| {
-                format!(
-                    "unterminated APEv2 item {item_index} key in '{}'",
-                    path.display()
-                )
-            })?;
-        let key_bytes = bytes[cursor..key_end].to_vec();
-        cursor = key_end + 1;
-        let value_end = cursor.checked_add(value_len).ok_or_else(|| {
-            format!("APEv2 item {item_index} length overflow in '{}'", path.display())
-        })?;
-        if value_end > bytes.len() {
-            return Err(format!(
-                "truncated APEv2 item {item_index} value in '{}'",
-                path.display()
-            ));
-        }
-        let value = bytes[cursor..value_end].to_vec();
-        cursor = value_end;
-        let key = if ape_key_is_valid(&key_bytes) {
-            Some(String::from_utf8(key_bytes.clone()).map_err(|_| {
-                format!("ASCII APEv2 key decoded as invalid UTF-8 in '{}'", path.display())
-            })?)
-        } else {
-            None
-        };
-        items.push(NativeApeItem {
-            raw: bytes[item_start..cursor].to_vec(),
-            key_bytes,
-            key,
-            flags,
-            value,
-        });
-    }
-    if cursor != bytes.len() {
-        return Err(format!(
-            "APEv2 item count/size mismatch in '{}': {} unclaimed byte(s)",
-            path.display(),
-            bytes.len() - cursor
-        ));
-    }
-
-    Ok(Some(NativeApeTag {
-        replace_start,
-        footer_end,
-        had_header,
-        items,
-    }))
-}
-
-fn native_ape_canonical_key(raw_key: &str) -> String {
-    match raw_key.trim().to_ascii_uppercase().as_str() {
-        "TRACK" => "TRACKNUMBER".to_string(),
-        "DISK" | "DISC" => "DISCNUMBER".to_string(),
-        "ALBUM ARTIST" | "ALBUMARTIST" => "ALBUMARTIST".to_string(),
-        "YEAR" => "DATE".to_string(),
-        other => canonical_metadata_display_key(other),
-    }
-}
-
-fn native_ape_numbering_rows(
-    raw_key: &str,
-    value: &str,
-) -> Option<Vec<(String, lofty::tag::ItemKey, String)>> {
-    let normalized = raw_key.trim().to_ascii_uppercase();
-    let (number_key, total_key, number_item, total_item) = match normalized.as_str() {
-        "TRACK" => (
-            "TRACKNUMBER",
-            "TRACKTOTAL",
-            lofty::tag::ItemKey::TrackNumber,
-            lofty::tag::ItemKey::TrackTotal,
-        ),
-        "DISK" | "DISC" => (
-            "DISCNUMBER",
-            "DISCTOTAL",
-            lofty::tag::ItemKey::DiscNumber,
-            lofty::tag::ItemKey::DiscTotal,
-        ),
-        _ => return None,
-    };
-    let mut parts = value.split('/');
-    let number = parts.next().unwrap_or("").trim();
-    if number.parse::<u32>().is_err() {
-        return None;
-    }
-    let mut rows = vec![(number_key.to_string(), number_item, number.to_string())];
-    if let Some(total) = parts.next().map(str::trim).filter(|value| !value.is_empty()) {
-        if total.parse::<u32>().is_err() {
-            return None;
-        }
-        rows.push((total_key.to_string(), total_item, total.to_string()));
-    }
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(rows)
-}
-
-fn native_ape_fields(tag: &NativeApeTag, path: &std::path::Path) -> Result<Vec<CanonicalEditorTagField>, String> {
+fn native_ape_fields(
+    tag: &NativeApeTag,
+    path: &std::path::Path,
+) -> Result<Vec<CanonicalEditorTagField>, String> {
     let mut fields = Vec::new();
     let mut indexes = std::collections::HashMap::<String, usize>::new();
-    for item in tag.items.iter().filter(|item| item.key.is_some()) {
-        let key = item.key.as_deref().expect("filtered valid APE key");
-        let (value, is_binary) = match item.item_type() {
-            APE_ITEM_TYPE_TEXT | APE_ITEM_TYPE_LOCATOR => {
-                let value = std::str::from_utf8(&item.value).map_err(|_| {
-                    format!(
-                        "APEv2 item '{}' has invalid UTF-8 text in '{}'",
-                        key,
-                        path.display()
-                    )
-                })?;
-                (value.split('\0').collect::<Vec<_>>().join("; "), false)
-            }
-            APE_ITEM_TYPE_BINARY => (format!("<binary, {} bytes>", item.value.len()), true),
-            _ => {
-                return Err(format!(
-                    "APEv2 item '{}' has reserved value type in '{}'",
-                    key,
-                    path.display()
-                ));
-            }
-        };
-        if !is_binary {
-            if let Some(rows) = native_ape_numbering_rows(key, &value) {
-                for (display_key, item_key, row_value) in rows {
-                    merge_editor_field(
-                        &mut fields,
-                        &mut indexes,
-                        display_key,
-                        item_key,
-                        row_value,
-                        false,
-                    );
-                }
-                continue;
-            }
-        }
-        let display_key = native_ape_canonical_key(key);
-        let item_key = item_key_for_new_editor_row(&display_key);
+    for row in native_ape_rows(tag, path)? {
+        let display_key = canonical_metadata_display_key(&row.canonical_key);
         merge_editor_field(
             &mut fields,
             &mut indexes,
             display_key,
-            item_key,
-            value,
-            is_binary,
+            row.item_key,
+            row.value,
+            row.is_binary,
         );
     }
     Ok(fields)
@@ -7655,28 +7347,23 @@ fn source_metadata_from_canonical_fields(fields: &[CanonicalEditorTagField]) -> 
 }
 
 fn read_native_ape_fallback(path: &std::path::Path) -> Result<NativeApeReadOutcome, String> {
-    let tag = read_native_ape_tag(path)?.ok_or_else(|| {
-        format!(
-            "Lofty reported an APEv2 decoding failure for '{}', but no bounded trailing APEv2 footer was found",
-            path.display()
-        )
-    })?;
-    let fields = native_ape_fields(&tag, path)?;
-    let invalid_keys = tag
-        .items
-        .iter()
-        .filter(|item| item.key.is_none())
-        .map(|item| format!("'{}'", display_escaped_ape_key(&item.key_bytes)))
-        .collect::<Vec<_>>();
-    let warning = (!invalid_keys.is_empty()).then(|| MetadataReadIssue {
+    let outcome = read_neutral_native_ape_fallback(path)?;
+    let mut fields = Vec::new();
+    let mut indexes = std::collections::HashMap::<String, usize>::new();
+    for row in outcome.rows {
+        let display_key = canonical_metadata_display_key(&row.canonical_key);
+        merge_editor_field(
+            &mut fields,
+            &mut indexes,
+            display_key,
+            row.item_key,
+            row.value,
+            row.is_binary,
+        );
+    }
+    let warning = outcome.warning.map(|warning| MetadataReadIssue {
         kind: MetadataReadIssueKind::RecoverableTagWarning,
-        reason: format!(
-            "{} invalid APE key{} skipped in '{}': {}",
-            invalid_keys.len(),
-            if invalid_keys.len() == 1 { "" } else { "s" },
-            path.display(),
-            invalid_keys.join(", ")
-        ),
+        reason: warning.message(),
     });
     let metadata = source_metadata_from_canonical_fields(&fields);
     Ok(NativeApeReadOutcome {
@@ -9144,6 +8831,7 @@ pub(crate) fn inject_invalid_ape_key_item_for_test(
 fn prepare_native_ape_replacement(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
+    drop_invalid_items: bool,
 ) -> Result<(u64, u64, Vec<u8>, bool), String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -9180,7 +8868,9 @@ fn prepare_native_ape_replacement(
     if let Some(tag) = &existing {
         for item in &tag.items {
             let Some(key) = item.key.as_deref() else {
-                output_items.push(item.raw.clone());
+                if !drop_invalid_items {
+                    output_items.push(item.raw.clone());
+                }
                 continue;
             };
             let identity = native_ape_canonical_key(key);
@@ -9241,25 +8931,309 @@ fn prepare_native_ape_replacement(
     Ok((replace_start, footer_end, replacement, unchanged))
 }
 
-fn copy_exact_prefix(
+const INVALID_APE_REPAIR_COPY_CHUNK_BYTES: usize = 1024 * 1024;
+const INVALID_APE_REPAIR_PROGRESS_STEP_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidApeRepairPhase {
+    Inspecting,
+    CopyingPrefix,
+    WritingReplacementTag,
+    CopyingSuffix,
+    SyncingReplacement,
+    VerifyingCommit,
+}
+
+impl InvalidApeRepairPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inspecting => "inspecting tag",
+            Self::CopyingPrefix => "copying audio prefix",
+            Self::WritingReplacementTag => "writing repaired tag",
+            Self::CopyingSuffix => "copying file suffix",
+            Self::SyncingReplacement => "syncing replacement",
+            Self::VerifyingCommit => "verifying committed repair",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidApeRepairProgress {
+    pub phase: InvalidApeRepairPhase,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+pub type InvalidApeRepairProgressCallback = std::sync::Arc<
+    dyn Fn(&std::path::Path, InvalidApeRepairProgress) + Send + Sync,
+>;
+
+#[derive(Debug, Clone)]
+pub struct InvalidApeRepairCommit {
+    pub path: std::path::PathBuf,
+    pub removed_keys: Vec<String>,
+    pub commit_report: MetadataWriteCommitReport,
+}
+
+#[derive(Debug, Clone)]
+pub enum InvalidApeRepairOutcome {
+    NotModifiedFailure {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    CancelledBeforeCommit {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    CommitStateUnknown {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    CommittedAndVerified(InvalidApeRepairCommit),
+    CommittedButVerificationFailed {
+        commit: InvalidApeRepairCommit,
+        reason: String,
+    },
+}
+
+impl InvalidApeRepairOutcome {
+    pub fn path(&self) -> &std::path::Path {
+        match self {
+            Self::NotModifiedFailure { path, .. }
+            | Self::CancelledBeforeCommit { path, .. }
+            | Self::CommitStateUnknown { path, .. } => path,
+            Self::CommittedAndVerified(commit)
+            | Self::CommittedButVerificationFailed { commit, .. } => &commit.path,
+        }
+    }
+
+    pub fn committed(&self) -> bool {
+        matches!(
+            self,
+            Self::CommittedAndVerified(_) | Self::CommittedButVerificationFailed { .. }
+        )
+    }
+}
+
+fn report_invalid_ape_repair_progress(
+    progress: Option<&InvalidApeRepairProgressCallback>,
+    path: &std::path::Path,
+    phase: InvalidApeRepairPhase,
+    bytes_done: u64,
+    bytes_total: u64,
+) {
+    if let Some(progress) = progress {
+        progress(
+            path,
+            InvalidApeRepairProgress {
+                phase,
+                bytes_done,
+                bytes_total,
+            },
+        );
+    }
+}
+
+fn copy_metadata_region_with_cancel_progress(
     source: &mut std::fs::File,
     destination: &mut std::fs::File,
     bytes: u64,
     path: &std::path::Path,
+    context: &str,
+    cancel: Option<&MetadataWriteCancelFlag>,
+    progress: Option<&InvalidApeRepairProgressCallback>,
+    phase: InvalidApeRepairPhase,
+    copied_before: u64,
+    bytes_total: u64,
 ) -> Result<u64, String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Read, Write};
 
-    source.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("rewind '{}': {error}", path.display()))?;
-    let copied = std::io::copy(&mut source.take(bytes), destination)
-        .map_err(|error| format!("copy metadata carrier prefix '{}': {error}", path.display()))?;
-    if copied != bytes {
-        return Err(format!(
-            "short read while copying metadata carrier prefix '{}': expected {bytes}, copied {copied}",
-            path.display()
-        ));
+    let mut remaining = bytes;
+    let mut copied = 0u64;
+    let mut buffer = vec![0u8; INVALID_APE_REPAIR_COPY_CHUNK_BYTES];
+    while remaining > 0 {
+        check_metadata_write_cancel(cancel, context)?;
+        let request = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded repair copy chunk fits usize");
+        let read = source
+            .read(&mut buffer[..request])
+            .map_err(|error| format!("{context} '{}': {error}", path.display()))?;
+        if read == 0 {
+            return Err(format!(
+                "short read while {context} '{}': expected {bytes} bytes, copied {copied}",
+                path.display()
+            ));
+        }
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("{context} '{}': {error}", path.display()))?;
+        let read = read as u64;
+        copied = copied.saturating_add(read);
+        remaining -= read;
+        let total_done = copied_before.saturating_add(copied);
+        let previous_done = total_done.saturating_sub(read);
+        if copied == bytes
+            || total_done == bytes_total
+            || total_done / INVALID_APE_REPAIR_PROGRESS_STEP_BYTES
+                != previous_done / INVALID_APE_REPAIR_PROGRESS_STEP_BYTES
+        {
+            report_invalid_ape_repair_progress(
+                progress,
+                path,
+                phase,
+                total_done,
+                bytes_total,
+            );
+        }
     }
     Ok(copied)
+}
+
+fn invalid_ape_repair_precommit_failure(
+    path: &std::path::Path,
+    cancel: Option<&MetadataWriteCancelFlag>,
+    reason: String,
+) -> InvalidApeRepairOutcome {
+    if cancel.is_some_and(|flag| flag.observation_count() > 0) {
+        InvalidApeRepairOutcome::CancelledBeforeCommit {
+            path: path.to_path_buf(),
+            reason,
+        }
+    } else {
+        InvalidApeRepairOutcome::NotModifiedFailure {
+            path: path.to_path_buf(),
+            reason,
+        }
+    }
+}
+
+/// Remove only the invalid-key APEv2 items named by a frozen confirmation
+/// snapshot. The mutation reuses the metadata writer's path-local snapshot,
+/// journal authority, cancellation, atomic replacement, and durability path.
+///
+/// The returned outcome never conflates a pre-commit failure with a committed
+/// mutation whose post-commit verification failed. Callers can therefore tell
+/// users whether the carrier changed even when a subsequent read-back check
+/// could not be completed.
+pub fn remove_invalid_ape_items_atomic(
+    path: &std::path::Path,
+    expected_keys: &[String],
+    verification: tui_file_picker::VerificationMode,
+    cancel: Option<&MetadataWriteCancelFlag>,
+    progress: Option<&InvalidApeRepairProgressCallback>,
+) -> InvalidApeRepairOutcome {
+    let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
+    let cancel = operation_cancel.as_ref();
+    report_invalid_ape_repair_progress(
+        progress,
+        path,
+        InvalidApeRepairPhase::Inspecting,
+        0,
+        0,
+    );
+    if let Err(reason) = check_metadata_write_cancel(cancel, "before inspecting invalid APE keys") {
+        return invalid_ape_repair_precommit_failure(path, cancel, reason);
+    }
+
+    let before = match crate::metadata_persistence::read_native_ape_fallback(path) {
+        Ok(outcome) => outcome,
+        Err(reason) => return invalid_ape_repair_precommit_failure(path, cancel, reason),
+    };
+    let current_keys = before
+        .warning
+        .as_ref()
+        .map(|warning| warning.escaped_keys.clone())
+        .unwrap_or_default();
+    if current_keys.is_empty() {
+        return InvalidApeRepairOutcome::NotModifiedFailure {
+            path: path.to_path_buf(),
+            reason: format!(
+                "repair is not applicable to '{}': no invalid APEv2 keys were found",
+                path.display()
+            ),
+        };
+    }
+    let expected_key_set = expected_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let current_key_set = current_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if current_key_set != expected_key_set {
+        return InvalidApeRepairOutcome::NotModifiedFailure {
+            path: path.to_path_buf(),
+            reason: format!(
+                "invalid-key set changed after confirmation opened for '{}': expected [{}], found [{}]",
+                path.display(),
+                expected_keys.join(", "),
+                current_keys.join(", ")
+            ),
+        };
+    }
+
+    let commit_report = match write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
+        path,
+        &[],
+        cancel,
+        true,
+        progress,
+    ) {
+        Ok(report) => report,
+        Err(NativeApeWriteFailure::NotCommitted(reason)) => {
+            return invalid_ape_repair_precommit_failure(path, cancel, reason)
+        }
+        Err(NativeApeWriteFailure::CommitStateUnknown(reason)) => {
+            return InvalidApeRepairOutcome::CommitStateUnknown {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+    };
+    let commit = InvalidApeRepairCommit {
+        path: path.to_path_buf(),
+        removed_keys: current_keys,
+        commit_report,
+    };
+
+    report_invalid_ape_repair_progress(
+        progress,
+        path,
+        InvalidApeRepairPhase::VerifyingCommit,
+        0,
+        0,
+    );
+    let verification_result = (|| -> Result<(), String> {
+        let remaining = crate::metadata_persistence::invalid_native_ape_keys(path)?;
+        if !remaining.is_empty() {
+            return Err(format!(
+                "invalid APEv2 keys remain ({})",
+                remaining.join(", ")
+            ));
+        }
+        lofty::read_from_path(path).map_err(|error| {
+            format!("Lofty still cannot read the repaired tag: {error}")
+        })?;
+        if verification == tui_file_picker::VerificationMode::Strong {
+            let after = crate::metadata_persistence::read_native_ape_fallback(path)?.rows;
+            if after != before.rows {
+                return Err("valid APEv2 rows changed during strong verification".to_string());
+            }
+        }
+        Ok(())
+    })();
+
+    match verification_result {
+        Ok(()) => InvalidApeRepairOutcome::CommittedAndVerified(commit),
+        Err(reason) => InvalidApeRepairOutcome::CommittedButVerificationFailed {
+            commit,
+            reason: format!(
+                "repair committed for '{}', but post-commit verification failed: {reason}",
+                path.display()
+            ),
+        },
+    }
 }
 
 fn wavpack_requires_native_ape_writer(path: &std::path::Path) -> Result<bool, String> {
@@ -9273,12 +9247,65 @@ fn wavpack_requires_native_ape_writer(path: &std::path::Path) -> Result<bool, St
     }
 }
 
-fn write_all_tags_native_wavpack_ape_atomic(
+#[derive(Debug, Clone)]
+enum NativeApeWriteFailure {
+    NotCommitted(String),
+    CommitStateUnknown(String),
+}
+
+impl NativeApeWriteFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::NotCommitted(message) | Self::CommitStateUnknown(message) => message,
+        }
+    }
+}
+
+impl From<String> for NativeApeWriteFailure {
+    fn from(message: String) -> Self {
+        Self::NotCommitted(message)
+    }
+}
+
+#[cfg(windows)]
+fn classify_native_ape_replace_failure(message: String) -> NativeApeWriteFailure {
+    // ReplaceFileW has failure classes in which the original may have moved or
+    // the replacement may have inherited streams before the API reports an
+    // error. The generic replacement helper already preserves the recovery
+    // carrier and explains the exact Windows state; classify every Windows
+    // commit-call failure conservatively rather than claiming no mutation.
+    NativeApeWriteFailure::CommitStateUnknown(message)
+}
+
+#[cfg(not(windows))]
+fn classify_native_ape_replace_failure(message: String) -> NativeApeWriteFailure {
+    NativeApeWriteFailure::NotCommitted(message)
+}
+
+fn write_all_tags_native_wavpack_ape_atomic_with_policy(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
     cancel: Option<&MetadataWriteCancelFlag>,
+    drop_invalid_items: bool,
 ) -> Result<MetadataWriteCommitReport, String> {
-    use std::io::{Seek, SeekFrom, Write};
+    write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
+        path,
+        changes,
+        cancel,
+        drop_invalid_items,
+        None,
+    )
+    .map_err(NativeApeWriteFailure::into_message)
+}
+
+fn write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    drop_invalid_items: bool,
+    repair_progress: Option<&InvalidApeRepairProgressCallback>,
+) -> Result<MetadataWriteCommitReport, NativeApeWriteFailure> {
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     crate::metadata_persistence::validate_numbering_changes_for_backend(
         crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
@@ -9286,8 +9313,6 @@ fn write_all_tags_native_wavpack_ape_atomic(
     )?;
     let snapshot = GenericMetadataReplacementSnapshot::capture(path)?;
     {
-        use std::io::Read;
-
         let mut source = std::fs::File::open(path)
             .map_err(|error| format!("open WavPack carrier '{}': {error}", path.display()))?;
         let mut magic = [0u8; 4];
@@ -9301,7 +9326,8 @@ fn write_all_tags_native_wavpack_ape_atomic(
             return Err(format!(
                 "refusing native APEv2 write to '{}': file does not begin with a WavPack block signature",
                 path.display()
-            ));
+            )
+            .into());
         }
     }
     check_metadata_write_cancel(cancel, "before checking WavPack metadata recovery authority")?;
@@ -9314,18 +9340,48 @@ fn write_all_tags_native_wavpack_ape_atomic(
 
     check_metadata_write_cancel(cancel, "before parsing native WavPack/APEv2 metadata")?;
     let (replace_start, footer_end, replacement, unchanged) =
-        prepare_native_ape_replacement(path, changes)?;
+        prepare_native_ape_replacement(path, changes, drop_invalid_items)?;
     if unchanged {
         return Ok(MetadataWriteCommitReport::clean());
     }
+    let suffix_len = snapshot.len().checked_sub(footer_end).ok_or_else(|| {
+        format!(
+            "native APEv2 footer end {} exceeds carrier length {} for '{}'",
+            footer_end,
+            snapshot.len(),
+            path.display()
+        )
+    })?;
+    let bytes_total = replace_start.saturating_add(suffix_len);
 
     check_metadata_write_cancel(cancel, "before creating WavPack metadata replacement")?;
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let mut temp = create_standard_metadata_temp(parent, path)?;
     let mut source = std::fs::File::open(path)
         .map_err(|error| format!("open WavPack carrier '{}': {error}", path.display()))?;
-    let prefix_bytes = copy_exact_prefix(&mut source, temp.as_file_mut(), replace_start, path)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind '{}': {error}", path.display()))?;
+    let prefix_bytes = copy_metadata_region_with_cancel_progress(
+        &mut source,
+        temp.as_file_mut(),
+        replace_start,
+        path,
+        "copying metadata carrier prefix",
+        cancel,
+        repair_progress,
+        InvalidApeRepairPhase::CopyingPrefix,
+        0,
+        bytes_total,
+    )?;
     record_metadata_source_copy(prefix_bytes);
+    report_invalid_ape_repair_progress(
+        repair_progress,
+        path,
+        InvalidApeRepairPhase::WritingReplacementTag,
+        prefix_bytes,
+        bytes_total,
+    );
     temp.as_file_mut()
         .write_all(&replacement)
         .map_err(|error| format!("write native APEv2 replacement for '{}': {error}", path.display()))?;
@@ -9333,24 +9389,46 @@ fn write_all_tags_native_wavpack_ape_atomic(
     source
         .seek(SeekFrom::Start(footer_end))
         .map_err(|error| format!("seek WavPack metadata suffix in '{}': {error}", path.display()))?;
-    let suffix_bytes = std::io::copy(&mut source, temp.as_file_mut())
-        .map_err(|error| format!("copy WavPack metadata suffix '{}': {error}", path.display()))?;
+    let suffix_bytes = copy_metadata_region_with_cancel_progress(
+        &mut source,
+        temp.as_file_mut(),
+        suffix_len,
+        path,
+        "copying WavPack metadata suffix",
+        cancel,
+        repair_progress,
+        InvalidApeRepairPhase::CopyingSuffix,
+        prefix_bytes,
+        bytes_total,
+    )?;
     record_metadata_source_copy(suffix_bytes);
     record_metadata_replacement_copy(prefix_bytes + suffix_bytes);
 
+    check_metadata_write_cancel(cancel, "before flushing WavPack metadata replacement")?;
     temp.as_file_mut()
         .flush()
         .map_err(|error| format!("flush WavPack metadata temp for '{}': {error}", path.display()))?;
     snapshot.apply_to_temp(temp.path())?;
+    report_invalid_ape_repair_progress(
+        repair_progress,
+        path,
+        InvalidApeRepairPhase::SyncingReplacement,
+        bytes_total,
+        bytes_total,
+    );
     record_metadata_file_sync();
     temp.as_file()
         .sync_all()
         .map_err(|error| format!("sync WavPack metadata temp for '{}': {error}", path.display()))?;
     check_metadata_write_cancel(cancel, "before committing WavPack metadata replacement")?;
     snapshot.validate_unchanged(path)?;
-    replace_generic_metadata_file(temp.into_temp_path(), path).map_err(|error| {
-        format!("commit WavPack metadata replacement for '{}': {error}", path.display())
-    })?;
+    replace_generic_metadata_file(temp.into_temp_path(), path)
+        .map_err(|error| {
+            classify_native_ape_replace_failure(format!(
+                "commit WavPack metadata replacement for '{}': {error}",
+                path.display()
+            ))
+        })?;
     record_metadata_directory_sync();
     Ok(MetadataWriteCommitReport::from_warnings(
         flac_metadata_writer::post_commit_parent_sync_warning(
@@ -9486,7 +9564,12 @@ fn write_all_tags_with_cancel_report_at_verification(
         }
         crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
             if wavpack_requires_native_ape_writer(path)? {
-                return write_all_tags_native_wavpack_ape_atomic(path, changes, cancel);
+                return write_all_tags_native_wavpack_ape_atomic_with_policy(
+                    path,
+                    changes,
+                    cancel,
+                    false,
+                );
             }
             // Healthy WavPack files retain the pre-Round-8 Lofty writer. The
             // native serializer is a recovery path only for typed APE decode
@@ -11894,6 +11977,9 @@ mod tests {
 
     #[test]
     fn native_wavpack_write_preserves_invalid_ape_item_byte_exactly() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-invalid-preserve",
+        );
         let (_temp, path) = copy_numbering_fixture("invalid-key-write.wv", APE_NUMBERING_FIXTURE);
         let invalid_raw = append_invalid_key_ape_item(&path);
 
@@ -11928,7 +12014,127 @@ mod tests {
     }
 
     #[test]
+    fn invalid_ape_repair_removes_only_invalid_items_and_restores_lofty_route() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-invalid-repair",
+        );
+        let (_temp, path) = copy_numbering_fixture("invalid-key-repair.wv", APE_NUMBERING_FIXTURE);
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::TrackTitle,
+                Some("Even in the Quietest Moments...".to_string()),
+            )],
+        )
+        .expect("seed a valid TITLE through the healthy route");
+        append_invalid_key_ape_item(&path);
+        let before = crate::metadata_persistence::read_native_ape_fallback(&path)
+            .expect("read valid rows before repair")
+            .rows;
+
+        let expected_keys = vec!["&год".to_string()];
+        let result = remove_invalid_ape_items_atomic(
+            &path,
+            &expected_keys,
+            tui_file_picker::VerificationMode::Strong,
+            None,
+            None,
+        );
+        let result = match result {
+            InvalidApeRepairOutcome::CommittedAndVerified(result) => result,
+            other => panic!("repair should commit and verify: {other:?}"),
+        };
+
+        assert_eq!(result.removed_keys, expected_keys);
+        assert!(crate::metadata_persistence::invalid_native_ape_keys(&path)
+            .expect("re-read invalid keys")
+            .is_empty());
+        assert_eq!(
+            crate::metadata_persistence::read_native_ape_fallback(&path)
+                .expect("read valid rows after repair")
+                .rows,
+            before,
+            "repair must not alter valid APEv2 rows"
+        );
+        assert!(lofty::read_from_path(&path).is_ok(), "native Lofty read must recover");
+        assert!(
+            !wavpack_requires_native_ape_writer(&path).expect("route classification"),
+            "healthy files must return to the ordinary Lofty writer"
+        );
+        let merged = read_all_tags_merged_with_metadata(&[path])
+            .expect("read repaired WavPack through ordinary editor path");
+        assert!(merged.metadata_errors[0].is_none());
+    }
+
+    #[test]
+    fn invalid_ape_repair_honors_precommit_cancellation_without_mutation() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-invalid-repair-cancel",
+        );
+        let (_temp, path) = copy_numbering_fixture(
+            "invalid-key-repair-cancel.wv",
+            APE_NUMBERING_FIXTURE,
+        );
+        append_invalid_key_ape_item(&path);
+        let before = std::fs::read(&path).expect("read carrier before cancelled repair");
+        let cancel = MetadataWriteCancelFlag::new();
+        cancel.cancel();
+        let outcome = remove_invalid_ape_items_atomic(
+            &path,
+            &["&год".to_string()],
+            tui_file_picker::VerificationMode::Strong,
+            Some(&cancel),
+            None,
+        );
+        assert!(
+            matches!(&outcome, InvalidApeRepairOutcome::CancelledBeforeCommit { .. }),
+            "pre-cancelled repair must report a no-commit cancellation: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read carrier after cancelled repair"),
+            before,
+            "pre-commit cancellation must leave the carrier byte-identical"
+        );
+    }
+
+    #[test]
+    fn invalid_ape_repair_reports_bounded_copy_and_verification_progress() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-invalid-repair-progress",
+        );
+        let (_temp, path) = copy_numbering_fixture(
+            "invalid-key-repair-progress.wv",
+            APE_NUMBERING_FIXTURE,
+        );
+        append_invalid_key_ape_item(&path);
+        let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&phases);
+        let progress: InvalidApeRepairProgressCallback = std::sync::Arc::new(
+            move |_path, update| captured.lock().expect("progress lock").push(update.phase),
+        );
+        let outcome = remove_invalid_ape_items_atomic(
+            &path,
+            &["&год".to_string()],
+            tui_file_picker::VerificationMode::Standard,
+            None,
+            Some(&progress),
+        );
+        assert!(
+            matches!(&outcome, InvalidApeRepairOutcome::CommittedAndVerified(_)),
+            "repair should commit: {outcome:?}"
+        );
+        let phases = phases.lock().expect("progress lock");
+        assert!(phases.contains(&InvalidApeRepairPhase::Inspecting));
+        assert!(phases.contains(&InvalidApeRepairPhase::CopyingPrefix));
+        assert!(phases.contains(&InvalidApeRepairPhase::SyncingReplacement));
+        assert!(phases.contains(&InvalidApeRepairPhase::VerifyingCommit));
+    }
+
+    #[test]
     fn native_wavpack_empty_string_deletes_ordinary_ape_item() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-empty-delete",
+        );
         let (_temp, path) = copy_numbering_fixture("empty-delete-title.wv", APE_NUMBERING_FIXTURE);
         // The shared fixture carries only an `encoder` item; seed TITLE
         // through the healthy Lofty route before forcing native fallback.
@@ -11965,6 +12171,9 @@ mod tests {
 
     #[test]
     fn native_wavpack_empty_numbering_deletes_or_reduces_combined_item() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-numbering-delete",
+        );
         let (_temp, path) = copy_numbering_fixture("empty-delete-numbering.wv", APE_NUMBERING_FIXTURE);
         append_invalid_key_ape_item(&path);
         write_all_tags(
@@ -12048,6 +12257,9 @@ mod tests {
 
     #[test]
     fn native_wavpack_write_is_byte_idempotent_for_matching_read_only_item() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-idempotent",
+        );
         let (_temp, path) = copy_numbering_fixture("read-only-title.wv", APE_NUMBERING_FIXTURE);
         // The shared fixture has no TITLE; seed one through the healthy
         // Lofty route so a read-only TITLE item exists to protect.
@@ -13752,6 +13964,9 @@ mod tests {
 
     #[test]
     fn inline_wavpack_dispatch_bypasses_legacy_database_and_selects_serializer() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-inline-dispatch",
+        );
         let db = crate::db::Database::open_memory().expect("memory database");
         let (temp, healthy) = copy_numbering_fixture("inline-healthy.wv", APE_NUMBERING_FIXTURE);
         let malformed = temp.path().join("inline-malformed.wv");

@@ -5901,6 +5901,13 @@ pub struct CueImportChange {
 }
 
 /// Phase of the metadata editor workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataInvalidApeRepairOperation {
+    pub session_id: u64,
+    pub generation: u64,
+    pub targets: Vec<(std::path::PathBuf, Vec<String>)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataEditorPhase {
     /// Browsing / editing fields.
@@ -6461,6 +6468,7 @@ impl Clone for ArtworkPreviewCache {
 pub enum MetadataIssue {
     Filesystem { path: std::path::PathBuf, reason: String },
     TagRead { path: std::path::PathBuf, reason: String },
+    RecoverableTagWarning { path: std::path::PathBuf, reason: String },
     Unsupported { path: std::path::PathBuf, reason: String },
     Probe { path: std::path::PathBuf, reason: String, retryable: bool },
     SaveBlocked { path: std::path::PathBuf, reason: String },
@@ -6525,6 +6533,28 @@ pub struct MetadataDetailsProbeFileResult {
 /// and real write failures. Status text is a summary only; durable per-file
 /// issues are attached to `MetadataFileDetails` for failed/skipped paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataInvalidApeRepairOutcome {
+    NotModified {
+        reason: String,
+    },
+    CancelledBeforeCommit {
+        reason: String,
+    },
+    CommitStateUnknown {
+        reason: String,
+    },
+    CommittedAndVerified {
+        removed_keys: Vec<String>,
+        durability_warnings: Vec<String>,
+    },
+    CommittedButVerificationFailed {
+        removed_keys: Vec<String>,
+        durability_warnings: Vec<String>,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEditorWriteOutcome {
     Saved,
     /// The file mutation committed and should be treated as saved for all
@@ -6539,6 +6569,11 @@ pub enum MetadataEditorWriteOutcome {
         rewritten_as_utf8: bool,
     },
     SidecarCueFailed { cue_path: std::path::PathBuf, reason: String },
+    /// Typed result from the invalid-APEv2 repair worker. This remains a
+    /// dedicated outcome through the worker/message boundary so committed,
+    /// unverified, cancelled, and unknown-commit states are never inferred
+    /// from human-readable warning strings.
+    InvalidApeRepair(MetadataInvalidApeRepairOutcome),
 }
 
 /// Path-keyed result from the async metadata-editor save worker.
@@ -6599,14 +6634,42 @@ impl MetadataEditorWriteResult {
         }
     }
 
+    pub fn invalid_ape_repair(
+        path: std::path::PathBuf,
+        outcome: MetadataInvalidApeRepairOutcome,
+    ) -> Self {
+        Self {
+            path,
+            outcome: MetadataEditorWriteOutcome::InvalidApeRepair(outcome),
+        }
+    }
+
     pub fn into_legacy_result(self) -> (std::path::PathBuf, Result<(), String>) {
         match self.outcome {
             MetadataEditorWriteOutcome::Saved
             | MetadataEditorWriteOutcome::SavedWithWarnings { .. }
-            | MetadataEditorWriteOutcome::SidecarCueSaved { .. } => (self.path, Ok(())),
+            | MetadataEditorWriteOutcome::SidecarCueSaved { .. }
+            | MetadataEditorWriteOutcome::InvalidApeRepair(
+                MetadataInvalidApeRepairOutcome::CommittedAndVerified { .. },
+            ) => (self.path, Ok(())),
             MetadataEditorWriteOutcome::Failed { reason }
             | MetadataEditorWriteOutcome::Skipped { reason }
             | MetadataEditorWriteOutcome::SidecarCueFailed { reason, .. } => (self.path, Err(reason)),
+            MetadataEditorWriteOutcome::InvalidApeRepair(outcome) => {
+                let reason = match outcome {
+                    MetadataInvalidApeRepairOutcome::NotModified { reason }
+                    | MetadataInvalidApeRepairOutcome::CancelledBeforeCommit { reason }
+                    | MetadataInvalidApeRepairOutcome::CommitStateUnknown { reason }
+                    | MetadataInvalidApeRepairOutcome::CommittedButVerificationFailed {
+                        reason,
+                        ..
+                    } => reason,
+                    MetadataInvalidApeRepairOutcome::CommittedAndVerified { .. } => {
+                        unreachable!("committed-and-verified repair handled above")
+                    }
+                };
+                (self.path, Err(reason))
+            }
         }
     }
 }
@@ -6818,6 +6881,7 @@ impl MetadataFileDetails {
         modified: Option<std::time::SystemTime>,
         filesystem_error: Option<String>,
         metadata_error: Option<String>,
+        metadata_issue_kind: Option<crate::tui::probe::MetadataReadIssueKind>,
         read_state: FileReadState,
         write_eligibility: FileWriteEligibility,
         metadata: SourceMetadata,
@@ -6847,6 +6911,7 @@ impl MetadataFileDetails {
         let issues = metadata_issues_from_facts(
             &file_facts,
             metadata_error.as_deref(),
+            metadata_issue_kind,
             None,
         );
         Self {
@@ -6868,6 +6933,7 @@ impl MetadataFileDetails {
         modified: Option<std::time::SystemTime>,
         filesystem_error: Option<String>,
         metadata_error: Option<String>,
+        metadata_issue_kind: Option<crate::tui::probe::MetadataReadIssueKind>,
         read_state: FileReadState,
         write_eligibility: FileWriteEligibility,
         metadata: SourceMetadata,
@@ -6878,6 +6944,7 @@ impl MetadataFileDetails {
             modified,
             filesystem_error,
             metadata_error,
+            metadata_issue_kind,
             read_state,
             write_eligibility,
             metadata,
@@ -6992,6 +7059,7 @@ impl FileFacts {
 fn metadata_issues_from_facts(
     file_facts: &FileFacts,
     metadata_error: Option<&str>,
+    metadata_issue_kind: Option<crate::tui::probe::MetadataReadIssueKind>,
     probe_error: Option<&str>,
 ) -> Vec<MetadataIssue> {
     let mut issues = Vec::new();
@@ -7023,10 +7091,19 @@ fn metadata_issues_from_facts(
             FileReadState::Unreadable { .. } | FileReadState::Unsupported { .. }
         );
         if !already_reported_read_state {
-            issues.push(MetadataIssue::TagRead {
-                path: path.clone(),
-                reason: reason.trim().to_string(),
-            });
+            let issue = match metadata_issue_kind {
+                Some(crate::tui::probe::MetadataReadIssueKind::RecoverableTagWarning) => {
+                    MetadataIssue::RecoverableTagWarning {
+                        path: path.clone(),
+                        reason: reason.trim().to_string(),
+                    }
+                }
+                _ => MetadataIssue::TagRead {
+                    path: path.clone(),
+                    reason: reason.trim().to_string(),
+                },
+            };
+            issues.push(issue);
         }
     }
     if let Some(reason) = probe_error.filter(|reason| !reason.trim().is_empty()) {
@@ -7783,8 +7860,16 @@ pub struct MetadataEditorState {
     /// tab without losing editor context.
     pub close_after_successful_save: bool,
 
-    /// Cooperative cancellation flag for the active tag-grid save, if any.
+    /// Cooperative cancellation flag for the active tag-grid save or invalid-APE
+    /// repair, if any. Both operations use the same worker completion protocol
+    /// and safe cancellation points.
     pub metadata_write_cancel: Option<crate::tui::probe::MetadataWriteCancelFlag>,
+
+    /// Identity and frozen target snapshot for an invalid-APE repair currently
+    /// running through the metadata-write worker protocol. The snapshot is kept
+    /// in editor state so ordinary save completions cannot be mistaken for repair
+    /// completions, and stale worker messages cannot mutate a reopened editor.
+    pub invalid_ape_repair: Option<MetadataInvalidApeRepairOperation>,
 
     /// Cooperative cancellation flag for the active artwork write/remove, if any.
     pub artwork_write_cancel: Option<crate::tui::probe::MetadataWriteCancelFlag>,
@@ -7820,6 +7905,7 @@ impl MetadataEditorState {
             archive_staging_dirty: false,
             close_after_successful_save: true,
             metadata_write_cancel: None,
+            invalid_ape_repair: None,
             artwork_write_cancel: None,
             model,
         }
@@ -8720,6 +8806,44 @@ impl MetadataEditorState {
         (session_id, generation, cancel)
     }
 
+    pub fn begin_invalid_ape_repair(
+        &mut self,
+        targets: Vec<(std::path::PathBuf, Vec<String>)>,
+    ) -> (u64, u64, crate::tui::probe::MetadataWriteCancelFlag) {
+        self.phase = MetadataEditorPhase::Saving;
+        let (session_id, generation, cancel) = self.begin_cancellable_write();
+        self.invalid_ape_repair = Some(MetadataInvalidApeRepairOperation {
+            session_id,
+            generation,
+            targets,
+        });
+        (session_id, generation, cancel)
+    }
+
+    pub fn invalid_ape_repair_is_current(&self, session_id: u64, generation: u64) -> bool {
+        self.invalid_ape_repair.as_ref().is_some_and(|operation| {
+            operation.session_id == session_id && operation.generation == generation
+        })
+    }
+
+    pub fn finish_invalid_ape_repair(
+        &mut self,
+        session_id: u64,
+        generation: u64,
+    ) -> Option<MetadataInvalidApeRepairOperation> {
+        if !self.invalid_ape_repair_is_current(session_id, generation) {
+            return None;
+        }
+        let operation = self.invalid_ape_repair.take();
+        self.clear_metadata_write_cancel();
+        self.model.metadata_save_progress = None;
+        self.phase = MetadataEditorPhase::Editing;
+        if self.active_surface().technical_details.active_save_generation == Some(generation) {
+            self.active_surface_mut().technical_details.active_save_generation = None;
+        }
+        operation
+    }
+
     pub fn apply_metadata_save_progress(
         &mut self,
         session_id: u64,
@@ -9013,6 +9137,19 @@ fn apply_write_results_to_tab(
                     summary.first_problem = Some(reason.clone());
                 }
                 attach_write_issue(tab, idx, MetadataIssue::SaveBlocked { path, reason });
+            }
+            MetadataEditorWriteOutcome::InvalidApeRepair(_) => {
+                // Repair completions are reduced by the operation-specific
+                // event-loop path. Reaching the ordinary save reducer means the
+                // operation identity is stale or missing; never mutate editor
+                // rows from such a result.
+                summary.ignored = summary.ignored.saturating_add(1);
+                if summary.first_problem.is_none() {
+                    summary.first_problem = Some(format!(
+                        "ignored stale invalid-APE repair result for '{}'",
+                        path.display()
+                    ));
+                }
             }
         }
     }
@@ -10335,6 +10472,12 @@ pub enum ConfirmAction {
     /// tombstone, and persistence still flows through the metadata-editor save
     /// path.
     DeleteEmbeddedCueSheet { path: PathBuf },
+    /// Atomically remove invalid-key APEv2 items from the frozen open-set
+    /// targets after a blocking confirmation.
+    RemoveInvalidApeKeys {
+        targets: Vec<(PathBuf, Vec<String>)>,
+        verification: tui_file_picker::VerificationMode,
+    },
     RemoveSelected,
     ClearCompleted,
     ClearFinished,
@@ -10465,6 +10608,11 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         ConfirmationFooterHint { label: "N cancel", key: "n" },
         ConfirmationFooterHint { label: "Esc cancel", key: "esc" },
     ];
+    const REMOVE_INVALID_APE_KEYS: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y remove", key: "y" },
+        ConfirmationFooterHint { label: "N cancel", key: "n" },
+        ConfirmationFooterHint { label: "Esc cancel", key: "esc" },
+    ];
 
     match action {
         ConfirmAction::ArchiveStartupRecovery { .. } => ARCHIVE_STARTUP_RECOVERY,
@@ -10473,6 +10621,7 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         | ConfirmAction::ArchiveRepackageFailure { .. } => ARCHIVE_RETRY_OR_DISCARD,
         ConfirmAction::ArchiveDiscardStaging { .. } => ARCHIVE_DISCARD_STAGING,
         ConfirmAction::DeleteEmbeddedCueSheet { .. } => DELETE_EMBEDDED_CUESHEET,
+        ConfirmAction::RemoveInvalidApeKeys { .. } => REMOVE_INVALID_APE_KEYS,
         _ => DEFAULT,
     }
 }
@@ -16110,6 +16259,7 @@ mod metadata_presentation_tab_tests {
             None,
             None,
             None,
+            None,
             FileReadState::Readable,
             FileWriteEligibility::Writable,
             SourceMetadata::default(),
@@ -16120,6 +16270,7 @@ mod metadata_presentation_tab_tests {
         MetadataFileDetails::from_open_cache(
             std::path::PathBuf::from(path),
             Some(100),
+            None,
             None,
             None,
             None,

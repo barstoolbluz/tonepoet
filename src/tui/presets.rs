@@ -329,6 +329,34 @@ impl PresetApplyReport {
 }
 
 impl TuiPreset {
+    /// Render the effective rate/depth/dither policy captured by this preset.
+    /// This deliberately describes sentinels as policy rather than resolving
+    /// them against whichever source happens to be loaded now.
+    pub fn resolved_semantics_summary(&self) -> String {
+        let rate = if self.sample_rate == SOURCE_SAMPLE_RATE_SENTINEL {
+            "keep source".to_string()
+        } else if self.sample_rate % 1_000 == 0 {
+            format!("{} kHz", self.sample_rate / 1_000)
+        } else {
+            format!("{:.1} kHz", self.sample_rate as f64 / 1_000.0)
+        };
+        let depth = match self.bit_depth.trim().to_ascii_lowercase().as_str() {
+            "source" => "keep source".to_string(),
+            "16" => "16-bit".to_string(),
+            "24" => "24-bit".to_string(),
+            "32" => "32-bit".to_string(),
+            "32f" => "32-bit float".to_string(),
+            "64f" => "64-bit float".to_string(),
+            _ => self.bit_depth.clone(),
+        };
+        let dither = if self.dither.eq_ignore_ascii_case("none") {
+            "none".to_string()
+        } else {
+            self.dither.clone()
+        };
+        format!("rate: {rate} | depth: {depth} | dither: {dither}")
+    }
+
     /// Capture current pill state into a preset
     pub fn from_pill_state(
         name: &str,
@@ -1901,6 +1929,44 @@ merge = "multi-file"
         assert!(restored_format.resampler_overridden);
         assert_eq!(restored_format.source_derived_sample_rate, None);
         assert_eq!(restored_format.source_derived_bit_depth, None);
+    }
+
+    #[test]
+    fn resolved_semantics_discloses_source_coupling_and_explicit_dither_off() {
+        let mut format = FormatState::new();
+        assert!(format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Source));
+        assert!(format.dither.select_value(&DitherType::None));
+        let preset = TuiPreset::from_pill_state(
+            "source-coupled-summary",
+            &format,
+            &OutputOptionsState::new(),
+            &MetadataState::default(),
+        );
+
+        assert_eq!(
+            preset.resolved_semantics_summary(),
+            "rate: keep source | depth: keep source | dither: none"
+        );
+    }
+
+    #[test]
+    fn resolved_semantics_discloses_explicit_192khz_and_depth_label() {
+        let mut format = FormatState::new();
+        assert!(format.sample_rate.select_value(&192_000));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int32));
+        assert!(format.dither.select_value(&DitherType::TPDF));
+        let preset = TuiPreset::from_pill_state(
+            "explicit-summary",
+            &format,
+            &OutputOptionsState::new(),
+            &MetadataState::default(),
+        );
+
+        assert_eq!(
+            preset.resolved_semantics_summary(),
+            "rate: 192 kHz | depth: 32-bit | dither: tpdf"
+        );
     }
 
 }
