@@ -26,6 +26,15 @@ pub fn draw_queue_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
     draw_action_bar(f, chunks[1], app, theme);
 }
 
+
+fn completed_status_label(warning_count: u32) -> String {
+    match warning_count {
+        0 => "Completed".to_string(),
+        1 => "Completed (1 warning)".to_string(),
+        count => format!("Completed ({count} warnings)"),
+    }
+}
+
 /// Draw the scrollable queue item list
 fn draw_item_list(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     let block = Block::default()
@@ -355,10 +364,14 @@ fn render_item_status(item: &ConversionItem, _width: u16, theme: super::theme::T
                 Style::default(),
             )
         }
-        ConversionStatus::Completed { .. } => (
+        ConversionStatus::Completed { warning_count, .. } => (
             vec![Span::styled(
-                "Completed",
-                Style::default().fg(theme.green),
+                completed_status_label(*warning_count),
+                if *warning_count == 0 {
+                    Style::default().fg(theme.green)
+                } else {
+                    Style::default().fg(theme.warning)
+                },
             )],
             Style::default(),
         ),
@@ -479,4 +492,17 @@ fn draw_action_bar(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::
 
     let bar = Paragraph::new(Line::from(spans));
     f.render_widget(bar, area);
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::completed_status_label;
+
+    #[test]
+    fn completed_queue_status_discloses_warning_count() {
+        assert_eq!(completed_status_label(0), "Completed");
+        assert_eq!(completed_status_label(1), "Completed (1 warning)");
+        assert_eq!(completed_status_label(2), "Completed (2 warnings)");
+    }
 }

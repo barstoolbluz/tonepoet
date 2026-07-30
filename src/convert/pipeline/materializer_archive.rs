@@ -1793,7 +1793,12 @@ fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
 fn read_track_metadata_with_warnings(
     path: &Path,
 ) -> Result<(TrackMetadata, Vec<String>), MaterializeError> {
-    super::materializer_single::read_track_metadata_with_warnings(path)
+    // The archive path is not a fallback-recovered SingleFile source, so the
+    // recovery-authority flag is intentionally discarded here; §1 authority is
+    // scoped to marked SingleFile sources in the single-file materializer.
+    let (metadata, warnings, _recovered_by_fallback) =
+        super::materializer_single::read_track_metadata_with_warnings(path)?;
+    Ok((metadata, warnings))
 }
 
 fn apply_track_selection(

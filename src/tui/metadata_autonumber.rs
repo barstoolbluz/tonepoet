@@ -494,9 +494,8 @@ fn scheme_representation(
         NumberingScheme::NOverNN | NumberingScheme::NNOverNN => {
             MetadataNumberingRepresentation::NumericFraction
         }
-        NumberingScheme::NN | NumberingScheme::SN | NumberingScheme::SNN => {
-            MetadataNumberingRepresentation::Lexical
-        }
+        NumberingScheme::NN => MetadataNumberingRepresentation::PaddedUnsigned,
+        NumberingScheme::SN | NumberingScheme::SNN => MetadataNumberingRepresentation::Lexical
     }
 }
 
@@ -545,6 +544,9 @@ impl NumberingTargetContext {
         let requirement = match representation {
             crate::metadata_persistence::MetadataNumberingRepresentation::PlainUnsigned => {
                 "plain unsigned numbering values"
+            }
+            crate::metadata_persistence::MetadataNumberingRepresentation::PaddedUnsigned => {
+                "padded unsigned numbering values"
             }
             crate::metadata_persistence::MetadataNumberingRepresentation::NumericFraction => {
                 "numeric fraction numbering values"
@@ -1382,6 +1384,34 @@ mod tests {
     }
 
     #[test]
+    fn ape_menu_exposes_plain_padded_and_fraction_schemes_but_not_custom() {
+        let state = state(
+            &["track.wv", "track-2.wv"],
+            vec![entry("TRACKNUMBER", ItemKey::TrackNumber, &["9", "9"])],
+        );
+        let eligibility = numbering_menu_eligibility(&state, NumberingTarget::Track)
+            .expect("WavPack/APEv2 should expose its proven numeric spelling capabilities");
+
+        assert_eq!(
+            eligibility.immediate,
+            vec![
+                NumberingScheme::N,
+                NumberingScheme::NN,
+                NumberingScheme::NOverNN,
+                NumberingScheme::NNOverNN,
+            ]
+        );
+        assert!(!eligibility.custom);
+        assert!(numbering_scheme_capability(
+            &state,
+            NumberingTarget::Track,
+            NumberingScheme::SNN,
+        )
+        .unwrap_err()
+        .contains("requires lexical numbering values"));
+    }
+
+    #[test]
     fn side_prefix_validation_rejects_digits_and_path_punctuation() {
         for prefix in ["B2", "../B", "B-C", ""] {
             assert!(format_numbering_values(
@@ -1674,7 +1704,8 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error.contains("requires lexical numbering values")
+                error.contains("requires padded unsigned numbering values")
+                    || error.contains("requires lexical numbering values")
                     || error.contains("requires numeric fraction numbering values")
             );
         }

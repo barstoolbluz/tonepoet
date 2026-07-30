@@ -42,6 +42,7 @@ use tonepoet_pipeline::{
 /// - resample_quality: High
 /// - nyquist_transition: BrickWall
 /// - dither_type: Gesemann
+/// - dither_explicit: true
 /// - preferred_tool: Custom("sentinel-tool")
 /// - force_encode: true
 /// - flac.compression_level: 5
@@ -155,6 +156,7 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
         resample_quality: ResampleQuality::High,
         nyquist_transition: NyquistTransition::BrickWall,
         dither_type: DitherType::Gesemann,
+        dither_explicit: true,
         preferred_tool: PreferredTool::Custom("sentinel-tool".to_string()),
         force_encode: true,
         flac: FlacSettings {
@@ -290,6 +292,7 @@ fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
     assert_eq!(&actual.resample_quality, &expected.resample_quality, "resample_quality");
     assert_eq!(&actual.nyquist_transition, &expected.nyquist_transition, "nyquist_transition");
     assert_eq!(&actual.dither_type, &expected.dither_type, "dither_type");
+    assert_eq!(&actual.dither_explicit, &expected.dither_explicit, "dither_explicit");
     assert_eq!(&actual.preferred_tool, &expected.preferred_tool, "preferred_tool");
     assert_eq!(&actual.force_encode, &expected.force_encode, "force_encode");
     assert_eq!(&actual.flac.compression_level, &expected.flac.compression_level, "flac.compression_level");
@@ -385,6 +388,7 @@ const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
     SentinelFieldInventoryRow { path: "resample_quality", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "nyquist_transition", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "dither_type", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
+    SentinelFieldInventoryRow { path: "dither_explicit", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "preferred_tool", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "force_encode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
     SentinelFieldInventoryRow { path: "flac.compression_level", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
@@ -464,6 +468,7 @@ fn field_differs_from_default(
         "resample_quality" => settings.resample_quality != default.resample_quality,
         "nyquist_transition" => settings.nyquist_transition != default.nyquist_transition,
         "dither_type" => settings.dither_type != default.dither_type,
+        "dither_explicit" => settings.dither_explicit != default.dither_explicit,
         "preferred_tool" => settings.preferred_tool != default.preferred_tool,
         "force_encode" => settings.force_encode != default.force_encode,
         "flac.compression_level" => settings.flac.compression_level != default.flac.compression_level,
@@ -605,6 +610,7 @@ fn raw_single_sentinel_sets_every_field_away_from_default() {
     assert_covered_by_non_default!(default, raw, raw, resample_quality, "resample_quality");
     assert_covered_by_non_default!(default, raw, raw, nyquist_transition, "nyquist_transition");
     assert_covered_by_non_default!(default, raw, raw, dither_type, "dither_type");
+    assert_covered_by_non_default!(default, raw, raw, dither_explicit, "dither_explicit");
     assert_covered_by_non_default!(default, raw, raw, preferred_tool, "preferred_tool");
     assert_covered_by_non_default!(default, raw, raw, force_encode, "force_encode");
     assert_covered_by_non_default!(default, raw, raw, flac.compression_level, "flac.compression_level");
@@ -688,6 +694,7 @@ fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
     assert_covered_by_non_default!(default, flac, custom, resample_quality, "resample_quality");
     assert_covered_by_non_default!(default, flac, custom, nyquist_transition, "nyquist_transition");
     assert_covered_by_non_default!(default, flac, custom, dither_type, "dither_type");
+    assert_covered_by_non_default!(default, flac, custom, dither_explicit, "dither_explicit");
     assert_covered_by_non_default!(default, flac, custom, preferred_tool, "preferred_tool");
     assert_covered_by_non_default!(default, flac, custom, force_encode, "force_encode");
     assert_covered_by_non_default!(default, flac, custom, flac.compression_level, "flac.compression_level");
@@ -845,6 +852,7 @@ const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
     ("resample_quality", LegacyProjectionStatus::Translated),
     ("nyquist_transition", LegacyProjectionStatus::Translated),
     ("dither_type", LegacyProjectionStatus::Translated),
+    ("dither_explicit", LegacyProjectionStatus::Defaulted),
     ("preferred_tool", LegacyProjectionStatus::Translated),
     ("force_encode", LegacyProjectionStatus::Translated),
     ("flac.compression_level", LegacyProjectionStatus::Translated),
@@ -1034,6 +1042,7 @@ fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "resample_quality", flac.resample_quality, ResampleQuality::High);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "nyquist_transition", flac.nyquist_transition, NyquistTransition::BrickWall);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "dither_type", flac.dither_type, DitherType::Gesemann);
+    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "dither_explicit", flac.dither_explicit, false);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "preferred_tool", flac.preferred_tool, PreferredTool::Sox);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "force_encode", flac.force_encode, true);
     assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "flac.compression_level", flac.flac.compression_level, 8);

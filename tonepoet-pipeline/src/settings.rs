@@ -34,6 +34,10 @@ pub struct PipelineSettings {
     pub nyquist_transition: NyquistTransition,
     /// Exact dither algorithm. No wrapper collapses this value.
     pub dither_type: DitherType,
+    /// Whether the current dither selection was explicitly chosen by the user
+    /// (including preset restoration), rather than selected by policy.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dither_explicit: bool,
     /// Tool preference used by the registry when the preferred tool supports the operation.
     pub preferred_tool: PreferredTool,
     /// Encode even when the planner would otherwise choose passthrough copy.
@@ -73,6 +77,7 @@ impl Default for PipelineSettings {
             resample_quality: ResampleQuality::Ultra,
             nyquist_transition: NyquistTransition::Gentle,
             dither_type: DitherType::None,
+            dither_explicit: false,
             preferred_tool: PreferredTool::Auto,
             force_encode: false,
             flac: FlacSettings::default(),
@@ -1376,12 +1381,15 @@ fn settings_may_emit_ssrc_integer_dither(settings: &PipelineSettings) -> bool {
     let uses_ssrc = matches!(settings.preferred_tool, PreferredTool::Ssrc)
         || settings.ssrc.force
         || matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
-    let integer_or_unknown_output = !matches!(
+    let ditherable_integer_or_unknown_output = matches!(
         settings.target_bit_depth,
-        BitDepthTarget::Pcm(PcmBitDepth::Float32) | BitDepthTarget::Pcm(PcmBitDepth::Float64)
+        BitDepthTarget::Source
+            | BitDepthTarget::Pcm(
+                PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24,
+            )
     );
 
-    uses_ssrc && integer_or_unknown_output
+    uses_ssrc && ditherable_integer_or_unknown_output
 }
 
 /// Verification settings consumed after encoding.
@@ -1566,6 +1574,21 @@ mod ssrc_rate_dependent_dither_validation_tests {
         assert!(settings.validate().is_ok());
     }
 
+
+    #[test]
+    fn skips_ssrc_dither_mapping_validation_for_int32_output() {
+        let mut settings = PipelineSettings::default();
+        // Int32 PCM is valid for WAV; keep this pin focused on SSRC dither
+        // validation rather than container depth support.
+        settings.target_format = AudioFormat::Wav;
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::HighShibata;
+        settings.dither_explicit = true;
+        assert!(settings.validate().is_ok());
+    }
+
     #[test]
     fn skips_derived_ssrc_dither_validation_for_explicit_float_output() {
         let mut settings = PipelineSettings::default();
@@ -1647,5 +1670,24 @@ mod legacy_dsd_gain_mutation_tests {
             .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, Some(1.0))
             .is_err());
         assert!(settings.is_native_v2());
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod pipeline_settings_serde_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_pipeline_settings_without_dither_explicit_default_to_automatic() {
+        let mut value = serde_json::to_value(PipelineSettings::default())
+            .expect("serialize current pipeline settings");
+        value
+            .as_object_mut()
+            .expect("pipeline settings serialize as a map")
+            .remove("dither_explicit");
+
+        let decoded: PipelineSettings =
+            serde_json::from_value(value).expect("deserialize legacy pipeline settings");
+        assert!(!decoded.dither_explicit);
     }
 }

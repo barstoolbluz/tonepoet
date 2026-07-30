@@ -323,9 +323,10 @@ pub struct AlbumBatchTrackContext {
     /// unknown; it must not split the album batch identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disc_number: Option<u32>,
-    /// Dispatcher-owned track number for this file within its disc or album.
-    /// This lets corrupt/unsupported files that fail before `PreparedSource`
-    /// still contribute a forensic failure fragment in the correct position.
+    /// Dispatcher-owned ordinal for this file within its disc or album.
+    /// For untagged completion-order single-file sources it may be rendered as
+    /// the filename number. It is never written as TRACKNUMBER metadata and
+    /// never changes conversion-log ordering semantics.
     pub track_number: u32,
 }
 
@@ -1657,6 +1658,56 @@ pub const CUE_ARTWORK_PATH_EXTRA_KEY: &str = "tonepoet_cue_artwork_path";
 pub const CUE_ARTWORK_MIME_EXTRA_KEY: &str = "tonepoet_cue_artwork_mime";
 pub const CUE_ARTWORK_SOURCE_EXTRA_KEY: &str = "tonepoet_cue_artwork_source";
 pub const CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY: &str = "tonepoet_cue_artwork_unsupported";
+
+/// Reserved AlbumMetadata.extra marker proving that the bounded native APEv2
+/// fallback supplied the authoritative source tag set. This key is internal
+/// pipeline state and must never be emitted as user metadata.
+pub const FALLBACK_RECOVERED_METADATA_EXTRA_KEY: &str =
+    "tonepoet_fallback_recovered_metadata";
+
+/// Reserved TrackMetadata/AlbumMetadata.extra prefix containing the immutable
+/// canonical tag values read by the bounded APEv2 fallback. Later label,
+/// batch-identity, and path-enrichment passes may mutate the ordinary metadata
+/// model for naming and organization, but must never mutate this source-authority
+/// snapshot. The leading NUL makes the namespace impossible for a real APEv2
+/// text key and therefore ineligible for output.
+pub const FALLBACK_SOURCE_TAG_EXTRA_PREFIX: &str =
+    "\0tonepoet_fallback_source_tag:";
+
+pub fn insert_fallback_source_tag(
+    extra: &mut BTreeMap<String, String>,
+    canonical_key: &str,
+    value: &str,
+) {
+    let canonical_key = canonical_key.trim().to_ascii_uppercase();
+    let value = value.trim();
+    if canonical_key.is_empty() || value.is_empty() {
+        return;
+    }
+    extra
+        .entry(format!("{FALLBACK_SOURCE_TAG_EXTRA_PREFIX}{canonical_key}"))
+        .or_insert_with(|| value.to_string());
+}
+
+#[must_use]
+pub fn fallback_source_tag_key_from_extra(key: &str) -> Option<&str> {
+    key.strip_prefix(FALLBACK_SOURCE_TAG_EXTRA_PREFIX)
+        .filter(|canonical_key| !canonical_key.is_empty())
+}
+
+#[must_use]
+pub fn fallback_source_tag_value<'a>(
+    extra: &'a BTreeMap<String, String>,
+    canonical_key: &str,
+) -> Option<&'a str> {
+    let canonical_key = canonical_key.trim().to_ascii_uppercase();
+    if canonical_key.is_empty() {
+        return None;
+    }
+    extra
+        .get(&format!("{FALLBACK_SOURCE_TAG_EXTRA_PREFIX}{canonical_key}"))
+        .map(String::as_str)
+}
 
 /// Reserved TrackMetadata.extra prefix recording that a value came from an
 /// actual source text tag rather than from a pipeline-derived naming hint.

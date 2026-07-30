@@ -18269,6 +18269,33 @@ mod conversion_actions_tests {
     }
 
     #[test]
+    fn rename_planner_invokes_production_sanitizer_and_retains_dot_runs() {
+        let fixture = Fixture::new();
+        let source = fixture.album_dir.join("plain.txt");
+        fs::write(&source, b"plain").unwrap();
+        let mut context = fixture.context(ActionPhase::Post);
+        context.semantics = crate::convert::pipeline::stages::action_semantics();
+        let action = ConversionAction::Rename(RenameAction {
+            targeting: targeting(&["plain.txt"]),
+            mode: RenameMode::Template,
+            template: "...%STEM%...".to_string(),
+        });
+        let runner = RecordingRunner::default();
+        let plan = engine(&runner)
+            .preview_action(0, &action, &context)
+            .expect("template rename should plan");
+
+        let destination = plan.operations.iter().find_map(|operation| match operation {
+            PlannedOperation::Rename { destination, .. } => Some(destination),
+            _ => None,
+        }).expect("rename operation");
+        assert_eq!(
+            destination.file_name().and_then(|name| name.to_str()),
+            Some("...plain....txt")
+        );
+    }
+
+    #[test]
     fn sr3_protected_source_is_refused_per_path_while_other_matches_remain_planned() {
         let fixture = Fixture::new();
         let protected = fixture.album_dir.join("source.flac");

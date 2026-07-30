@@ -637,35 +637,48 @@ pub enum MetadataPersistenceBackend {
 pub struct MetadataNumberingCapabilities {
     /// Canonical positive unsigned decimal values such as `1` or `17`.
     pub plain_unsigned: bool,
+    /// Zero-padded positive unsigned values such as `01` or `017`.
+    pub padded_unsigned: bool,
     /// Fraction representations such as `1/17` and padded variants.
     pub numeric_fraction: bool,
-    /// Lexical representations whose spelling matters, including `01` and
-    /// side-prefixed values such as `A01`.
+    /// Non-numeric lexical representations whose spelling matters, such as
+    /// side-prefixed values like `A01`.
     pub lexical: bool,
 }
 
 impl MetadataNumberingCapabilities {
     pub const NONE: Self = Self {
         plain_unsigned: false,
+        padded_unsigned: false,
         numeric_fraction: false,
         lexical: false,
     };
 
     pub const TEXTUAL: Self = Self {
         plain_unsigned: true,
+        padded_unsigned: true,
         numeric_fraction: true,
         lexical: true,
     };
 
     pub const PLAIN_UNSIGNED_ONLY: Self = Self {
         plain_unsigned: true,
+        padded_unsigned: false,
         numeric_fraction: false,
+        lexical: false,
+    };
+
+    pub const APE_NUMERIC: Self = Self {
+        plain_unsigned: true,
+        padded_unsigned: true,
+        numeric_fraction: true,
         lexical: false,
     };
 
     pub const fn intersection(self, other: Self) -> Self {
         Self {
             plain_unsigned: self.plain_unsigned && other.plain_unsigned,
+            padded_unsigned: self.padded_unsigned && other.padded_unsigned,
             numeric_fraction: self.numeric_fraction && other.numeric_fraction,
             lexical: self.lexical && other.lexical,
         }
@@ -674,6 +687,7 @@ impl MetadataNumberingCapabilities {
     pub const fn supports(self, representation: MetadataNumberingRepresentation) -> bool {
         match representation {
             MetadataNumberingRepresentation::PlainUnsigned => self.plain_unsigned,
+            MetadataNumberingRepresentation::PaddedUnsigned => self.padded_unsigned,
             MetadataNumberingRepresentation::NumericFraction => self.numeric_fraction,
             MetadataNumberingRepresentation::Lexical => self.lexical,
         }
@@ -684,6 +698,7 @@ impl MetadataNumberingCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataNumberingRepresentation {
     PlainUnsigned,
+    PaddedUnsigned,
     NumericFraction,
     Lexical,
 }
@@ -695,12 +710,11 @@ impl MetadataPersistenceBackend {
         match self {
             Self::NativeFlacVorbis | Self::LoftyVorbisComments => {
                 MetadataNumberingCapabilities::TEXTUAL
-            }
-            Self::NativeDsfId3
-            | Self::NativeWavPackApe
-            | Self::LoftyId3v2
-            | Self::LoftyApe
-            | Self::LoftyMp4Ilst => MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY,
+            },
+            Self::NativeWavPackApe | Self::LoftyApe => MetadataNumberingCapabilities::APE_NUMERIC,
+            Self::NativeDsfId3 | Self::LoftyId3v2 | Self::LoftyMp4Ilst => {
+                MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY
+            },
             Self::ReadOnlyApeFamily | Self::UnsupportedDff | Self::UnclassifiedLofty => {
                 MetadataNumberingCapabilities::NONE
             }
@@ -1098,6 +1112,13 @@ fn numbering_value_representation(value: &str) -> MetadataNumberingRepresentatio
     if is_canonical_positive_unsigned(value) {
         return MetadataNumberingRepresentation::PlainUnsigned;
     }
+    if value.len() > 1
+        && value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u32>().ok().is_some_and(|parsed| parsed > 0)
+    {
+        return MetadataNumberingRepresentation::PaddedUnsigned;
+    }
     if let Some((number, total)) = value.split_once('/') {
         if !total.contains('/')
             && !number.is_empty()
@@ -1140,11 +1161,14 @@ pub(crate) fn validate_numbering_changes_for_backend(
         }
         let requirement = match representation {
             MetadataNumberingRepresentation::PlainUnsigned => "plain unsigned",
+            MetadataNumberingRepresentation::PaddedUnsigned => "padded unsigned",
             MetadataNumberingRepresentation::NumericFraction => "numeric fraction",
             MetadataNumberingRepresentation::Lexical => "lexical",
         };
         let supported = if capabilities == MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY {
             "supported representation: canonical positive unsigned numbering values"
+        } else if capabilities == MetadataNumberingCapabilities::APE_NUMERIC {
+            "supported representations: plain unsigned, padded unsigned, and numeric fraction numbering values"
         } else if capabilities == MetadataNumberingCapabilities::NONE {
             "this backend has no declared numbering capability"
         } else {
@@ -1322,16 +1346,24 @@ mod tests {
             );
         }
         for backend in [
-            MetadataPersistenceBackend::NativeDsfId3,
             MetadataPersistenceBackend::NativeWavPackApe,
-            MetadataPersistenceBackend::LoftyId3v2,
             MetadataPersistenceBackend::LoftyApe,
+        ] {
+            assert_eq!(
+                backend.numbering_capabilities(),
+                MetadataNumberingCapabilities::APE_NUMERIC,
+                "unexpected APE numbering capabilities for {backend:?}"
+            );
+        }
+        for backend in [
+            MetadataPersistenceBackend::NativeDsfId3,
+            MetadataPersistenceBackend::LoftyId3v2,
             MetadataPersistenceBackend::LoftyMp4Ilst,
         ] {
             assert_eq!(
                 backend.numbering_capabilities(),
                 MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY,
-                "unexpected numeric capabilities for {backend:?}"
+                "unexpected plain-only capabilities for {backend:?}"
             );
         }
         for backend in [
@@ -1355,19 +1387,30 @@ mod tests {
         ] {
             let capabilities = backend.numbering_capabilities();
             assert!(capabilities.supports(MetadataNumberingRepresentation::PlainUnsigned));
+            assert!(capabilities.supports(MetadataNumberingRepresentation::PaddedUnsigned));
             assert!(capabilities.supports(MetadataNumberingRepresentation::NumericFraction));
             assert!(capabilities.supports(MetadataNumberingRepresentation::Lexical));
         }
 
         for backend in [
-            MetadataPersistenceBackend::NativeDsfId3,
             MetadataPersistenceBackend::NativeWavPackApe,
-            MetadataPersistenceBackend::LoftyId3v2,
             MetadataPersistenceBackend::LoftyApe,
+        ] {
+            let capabilities = backend.numbering_capabilities();
+            assert!(capabilities.supports(MetadataNumberingRepresentation::PlainUnsigned));
+            assert!(capabilities.supports(MetadataNumberingRepresentation::PaddedUnsigned));
+            assert!(capabilities.supports(MetadataNumberingRepresentation::NumericFraction));
+            assert!(!capabilities.supports(MetadataNumberingRepresentation::Lexical));
+        }
+
+        for backend in [
+            MetadataPersistenceBackend::NativeDsfId3,
+            MetadataPersistenceBackend::LoftyId3v2,
             MetadataPersistenceBackend::LoftyMp4Ilst,
         ] {
             let capabilities = backend.numbering_capabilities();
             assert!(capabilities.supports(MetadataNumberingRepresentation::PlainUnsigned));
+            assert!(!capabilities.supports(MetadataNumberingRepresentation::PaddedUnsigned));
             assert!(!capabilities.supports(MetadataNumberingRepresentation::NumericFraction));
             assert!(!capabilities.supports(MetadataNumberingRepresentation::Lexical));
         }
@@ -1772,7 +1815,11 @@ mod tests {
             numbering_value_representation("01/17"),
             MetadataNumberingRepresentation::NumericFraction
         );
-        for lexical in ["01", "A01", "0", "+7", " 7 ", "7/not-a-total"] {
+        assert_eq!(
+            numbering_value_representation("01"),
+            MetadataNumberingRepresentation::PaddedUnsigned
+        );
+        for lexical in ["A01", "0", "+7", " 7 ", "7/not-a-total"] {
             assert_eq!(
                 numbering_value_representation(lexical),
                 MetadataNumberingRepresentation::Lexical,
@@ -1849,6 +1896,31 @@ mod tests {
             &unrelated,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn ape_persistence_boundary_accepts_exact_numeric_spellings_only() {
+        for backend in [
+            MetadataPersistenceBackend::NativeWavPackApe,
+            MetadataPersistenceBackend::LoftyApe,
+        ] {
+            for accepted in ["7", "01", "7/17", "01/17"] {
+                assert!(
+                    validate_numbering_changes_for_backend(
+                        backend,
+                        &[(ItemKey::TrackNumber, Some(accepted.to_string()))],
+                    )
+                    .is_ok(),
+                    "{backend:?} rejected {accepted:?}"
+                );
+            }
+            let error = validate_numbering_changes_for_backend(
+                backend,
+                &[(ItemKey::TrackNumber, Some("A01".to_string()))],
+            )
+            .expect_err("APE numbering must remain non-lexical");
+            assert!(error.contains("lexical"), "{error}");
+        }
     }
 
     #[test]
@@ -1932,6 +2004,11 @@ mod tests {
                 MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY,
             ),
             MetadataNumberingCapabilities::PLAIN_UNSIGNED_ONLY
+        );
+        assert_eq!(
+            MetadataNumberingCapabilities::TEXTUAL
+                .intersection(MetadataNumberingCapabilities::APE_NUMERIC),
+            MetadataNumberingCapabilities::APE_NUMERIC
         );
         assert_eq!(
             MetadataNumberingCapabilities::TEXTUAL

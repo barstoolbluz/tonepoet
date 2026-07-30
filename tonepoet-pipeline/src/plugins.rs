@@ -355,8 +355,11 @@ impl ToolPlugin for SsrcPlugin {
                 "--profile".into(),
                 profile.as_arg().into(),
             ];
-            let needs_dither = match *target_bit_depth {
-                Some(depth) => pcm_conversion_reduces_depth(context.request.source.authoritative_pcm_depth(), depth),
+            let needs_dither = match effective_target_depth(context, *target_bit_depth) {
+                Some(depth) => pcm_conversion_reduces_depth(
+                    context.request.source.authoritative_pcm_depth(),
+                    depth,
+                ),
                 None => true,
             };
             // SSRC treats `--dither` and `--pdf` as parameters of the terminal
@@ -1326,14 +1329,23 @@ fn ffmpeg_audio_filter(
                 context.request.source.authoritative_pcm_depth(), depth),
         },
     };
-    if settings.dither_type != DitherType::None && ffmpeg_needs_dither {
-        let method = mapping::soxr_dither_method(settings.dither_type).ok_or_else(|| {
-            PlanningError::invalid_settings(
-                "dither_type",
-                "selected dither is not supported by FFmpeg/SoXR; select SoX or Auto",
-            )
-        })?;
-        opts.push(format!("dither_method={method}"));
+    if settings.dither_type != DitherType::None {
+        let explicit_int32 = explicit_int32_dither_requested(
+            settings,
+            effective_target_depth(context, target_depth),
+        );
+        match mapping::soxr_dither_method(settings.dither_type) {
+            Some(method) if ffmpeg_needs_dither || explicit_int32 => {
+                opts.push(format!("dither_method={method}"));
+            }
+            None if ffmpeg_needs_dither => {
+                return Err(PlanningError::invalid_settings(
+                    "dither_type",
+                    "selected dither is not supported by FFmpeg/SoXR; select SoX or Auto",
+                ));
+            }
+            _ => {}
+        }
     }
     if let Some(depth) = target_depth {
         opts.push(format!(
@@ -1543,8 +1555,19 @@ fn add_sox_pcm_effects(
         }
         args.push(rate.to_string());
     }
-    let depth_allows_dither = match target_depth {
-        Some(depth) => pcm_conversion_reduces_depth(context.request.source.authoritative_pcm_depth(), depth),
+    let effective_depth = effective_target_depth(context, target_depth);
+    // Ordinary SoX is not behavior-qualified for 32-bit integer dither. SoX
+    // 14.4.2 accepts a trailing `dither` effect for s32 output while producing
+    // byte-identical PCM, so command syntax is not evidence that the DSP stage
+    // occurred. Keep the established <=24-bit reduction path, but fail closed
+    // for Int32 until runtime tool identity and a successful behavior probe can
+    // be bound to planning. The separately qualified DSD Reference path does
+    // not use this ordinary builder.
+    let depth_allows_dither = match effective_depth {
+        Some(depth) => pcm_conversion_reduces_depth(
+            context.request.source.authoritative_pcm_depth(),
+            depth,
+        ),
         None => true,
     };
     let should_dither =
@@ -1678,6 +1701,10 @@ fn add_sox_dsd_to_pcm_effects(
         }
     }
     add_sox_dsd_to_pcm_gain(&context.request.settings.dsd, args)?;
+    // See add_sox_pcm_effects: ordinary SoX Int32 dither is deliberately
+    // fail-closed because supported installations may accept the effect while
+    // producing no sample-level change. Qualified DSD Reference processing is
+    // a separate, identity-bound path.
     if target_depth_needs_dither(target_depth)
         && context.request.settings.dither_type != DitherType::None
     {
@@ -1686,6 +1713,25 @@ fn add_sox_dsd_to_pcm_effects(
         ));
     }
     Ok(())
+}
+
+fn effective_target_depth(
+    context: &PlanContext<'_>,
+    target_depth: Option<PcmBitDepth>,
+) -> Option<PcmBitDepth> {
+    target_depth.or_else(|| match context.request.settings.target_bit_depth {
+        BitDepthTarget::Pcm(depth) => Some(depth),
+        BitDepthTarget::Source => context.request.source.authoritative_pcm_depth(),
+    })
+}
+
+fn explicit_int32_dither_requested(
+    settings: &crate::settings::PipelineSettings,
+    target_depth: Option<PcmBitDepth>,
+) -> bool {
+    settings.dither_explicit
+        && settings.dither_type != DitherType::None
+        && target_depth == Some(PcmBitDepth::Int32)
 }
 
 /// True when the target depth is low enough to benefit from dither.
@@ -1902,6 +1948,237 @@ mod tests {
 
     fn assert_no_arg(args: &[String], flag: &str) {
         assert!(arg_value(args, flag).is_none(), "unexpected {flag} in {args:?}");
+    }
+
+    fn pcm_request_with(
+        settings: PipelineSettings,
+        source_depth: PcmBitDepth,
+    ) -> PlanRequest {
+        let source_is_float = source_depth.is_float();
+        PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+            input_path: PathBuf::from("source.wav"),
+            output_path: PathBuf::from("output.wav"),
+            source: SourceInfo {
+                dsd_source_kind: None,
+                format: AudioFormat::Wav,
+                codec: if source_is_float {
+                    crate::enums::AudioCodec::PcmFloat
+                } else {
+                    crate::enums::AudioCodec::PcmSigned
+                },
+                sample_rate_hz: Some(96_000),
+                bit_depth: Some(source_depth),
+                true_source_depth: Some(source_depth),
+                source_representation: Default::default(),
+                sample_kind: Some(if source_is_float {
+                    crate::enums::SampleKind::Float
+                } else {
+                    crate::enums::SampleKind::SignedInteger
+                }),
+                channels: Some(2),
+                duration: None,
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_int32_dither_is_emitted_by_ffmpeg_for_float_requantization() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        let request = pcm_request_with(settings, PcmBitDepth::Float32);
+
+        let filter = ffmpeg_audio_filter(
+            &request.context(),
+            None,
+            Some(PcmBitDepth::Int32),
+        )
+        .expect("explicit Int32 FFmpeg filter");
+
+        assert!(filter.contains("dither_method=triangular"), "{filter}");
+        assert!(filter.contains("out_sample_fmt=s32"), "{filter}");
+    }
+
+    #[test]
+    fn ffmpeg_int32_explicitness_uses_settings_depth_when_step_depth_is_absent() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        let request = pcm_request_with(settings, PcmBitDepth::Float32);
+
+        let filter = ffmpeg_audio_filter(&request.context(), None, None)
+            .expect("depth-carried-elsewhere FFmpeg filter");
+
+        assert!(filter.contains("dither_method=triangular"), "{filter}");
+    }
+
+    #[test]
+    fn automatic_int32_dither_stays_disabled_for_ffmpeg_and_sox() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        let request = pcm_request_with(settings, PcmBitDepth::Float32);
+
+        let filter = ffmpeg_audio_filter(
+            &request.context(),
+            None,
+            Some(PcmBitDepth::Int32),
+        )
+        .expect("automatic Int32 FFmpeg filter");
+        assert!(!filter.contains("dither_method="), "{filter}");
+        assert!(filter.contains("out_sample_fmt=s32"), "{filter}");
+
+        let mut sox_args = Vec::new();
+        add_sox_pcm_effects(
+            &request.context(),
+            &mut sox_args,
+            None,
+            Some(PcmBitDepth::Int32),
+        );
+        assert!(!sox_args.iter().any(|arg| arg == "dither"), "{sox_args:?}");
+
+        let mut depth_carried_elsewhere_args = Vec::new();
+        add_sox_pcm_effects(
+            &request.context(),
+            &mut depth_carried_elsewhere_args,
+            None,
+            None,
+        );
+        assert!(
+            !depth_carried_elsewhere_args.iter().any(|arg| arg == "dither"),
+            "{depth_carried_elsewhere_args:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_int32_dither_is_refused_by_unqualified_sox_pcm_builders() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        let request = pcm_request_with(settings, PcmBitDepth::Int24);
+
+        for step_depth in [Some(PcmBitDepth::Int32), None] {
+            let mut args = Vec::new();
+            add_sox_pcm_effects(
+                &request.context(),
+                &mut args,
+                None,
+                step_depth,
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "dither"),
+                "ordinary SoX Int32 dither must remain fail-closed: {args:?}"
+            );
+        }
+
+        let mut source_settings = PipelineSettings::default();
+        source_settings.target_bit_depth = BitDepthTarget::Source;
+        source_settings.dither_type = DitherType::Tpdf;
+        source_settings.dither_explicit = true;
+        let source_preserved = pcm_request_with(source_settings, PcmBitDepth::Int32);
+        let mut source_preserved_args = Vec::new();
+        add_sox_pcm_effects(
+            &source_preserved.context(),
+            &mut source_preserved_args,
+            None,
+            None,
+        );
+        assert!(
+            !source_preserved_args.iter().any(|arg| arg == "dither"),
+            "source-preserved Int32 SoX dither must remain fail-closed: {source_preserved_args:?}"
+        );
+
+        let mut dsd_to_pcm_args = Vec::new();
+        add_sox_dsd_to_pcm_effects(
+            &request.context(),
+            &mut dsd_to_pcm_args,
+            88_200,
+            PcmBitDepth::Int32,
+            DsdLowpassMethod::Auto,
+        )
+        .expect("explicit Int32 SoX DSD-to-PCM effects");
+        assert!(
+            !dsd_to_pcm_args.iter().any(|arg| arg == "dither"),
+            "ordinary SoX DSD-to-PCM Int32 dither must remain fail-closed: {dsd_to_pcm_args:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_gesemann_int32_plans_without_ffmpeg_dither() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Gesemann;
+        settings.dither_explicit = true;
+        let request = pcm_request_with(settings, PcmBitDepth::Float32);
+
+        let filter = ffmpeg_audio_filter(
+            &request.context(),
+            None,
+            Some(PcmBitDepth::Int32),
+        )
+        .expect("unsupported explicit Int32 dither must not become a planning failure");
+
+        assert!(!filter.contains("dither_method="), "{filter}");
+        assert!(filter.contains("out_sample_fmt=s32"), "{filter}");
+    }
+
+    #[test]
+    fn explicit_dither_is_never_emitted_for_float_targets() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        let request = pcm_request_with(settings, PcmBitDepth::Int24);
+
+        let filter = ffmpeg_audio_filter(
+            &request.context(),
+            None,
+            Some(PcmBitDepth::Float32),
+        )
+        .expect("float FFmpeg filter");
+        assert!(!filter.contains("dither_method="), "{filter}");
+
+        let mut sox_args = Vec::new();
+        add_sox_pcm_effects(
+            &request.context(),
+            &mut sox_args,
+            None,
+            Some(PcmBitDepth::Float32),
+        );
+        assert!(!sox_args.iter().any(|arg| arg == "dither"), "{sox_args:?}");
+    }
+
+    #[test]
+    fn explicit_int32_dither_is_not_emitted_by_ssrc() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+
+        let command = ssrc_resample_command_with(
+            settings.clone(),
+            44_100,
+            Some(PcmBitDepth::Int32),
+        )
+        .expect("SSRC Int32 command");
+
+        assert_no_arg(&command.args, "--dither");
+        assert_no_arg(&command.args, "--pdf");
+
+        let depth_carried_elsewhere = ssrc_resample_command_with(settings, 44_100, None)
+            .expect("SSRC Int32 command with settings-carried depth");
+        assert_no_arg(&depth_carried_elsewhere.args, "--dither");
+        assert_no_arg(&depth_carried_elsewhere.args, "--pdf");
     }
 
     #[test]

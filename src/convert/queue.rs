@@ -1516,6 +1516,34 @@ mod cue_sidecar_override_queue_tests {
     }
 
     #[test]
+    fn legacy_completed_status_without_warning_count_defaults_to_zero() {
+        let status = ConversionStatus::Completed {
+            output_path: PathBuf::from("/tmp/out.flac"),
+            log_path: Some(PathBuf::from("/tmp/conversion.log")),
+            warning_count: 3,
+        };
+        let mut value = serde_json::to_value(&status).expect("serialize completed status");
+        value
+            .as_object_mut()
+            .expect("externally tagged enum serializes as an object")
+            .get_mut("Completed")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("Completed payload serializes as an object")
+            .remove("warning_count");
+
+        let decoded: ConversionStatus =
+            serde_json::from_value(value).expect("deserialize legacy completed status");
+        assert_eq!(
+            decoded,
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("/tmp/out.flac"),
+                log_path: Some(PathBuf::from("/tmp/conversion.log")),
+                warning_count: 0,
+            }
+        );
+    }
+
+    #[test]
     fn legacy_queue_item_without_actions_deserializes_with_empty_pipeline() {
         let mut item = ConversionItem::default();
         item.id = "serde-legacy-no-actions".to_string();

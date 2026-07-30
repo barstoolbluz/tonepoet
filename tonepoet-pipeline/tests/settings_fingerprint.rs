@@ -136,6 +136,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
         resample_quality: ResampleQuality::Ultra,
         nyquist_transition: NyquistTransition::BrickWall,
         dither_type: DitherType::Gesemann,
+        dither_explicit: false,
         preferred_tool: PreferredTool::Custom("sentinel-tool".to_string()),
         force_encode: true,
         flac: FlacSettings {
@@ -209,7 +210,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
 
 #[test]
 fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
-    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 70);
+    assert_eq!(SETTINGS_FINGERPRINT_FIELD_COUNT, 71);
 
     let mut sorted = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
     sorted.sort_unstable();

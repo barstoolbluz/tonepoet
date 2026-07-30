@@ -9823,6 +9823,49 @@ fn typed_numbering_accessor_value(
     }
 }
 
+fn raw_numbering_item_text(
+    tag: &lofty::tag::Tag,
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    target: &str,
+) -> Option<String> {
+    use lofty::tag::ItemValue;
+
+    tag.items()
+        .find(|item| {
+            crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+                backend,
+                item.key(),
+            ) == Some(target)
+        })
+        .and_then(|item| match item.value() {
+            ItemValue::Text(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+fn exact_padded_numbering_value(
+    tag: &lofty::tag::Tag,
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    target: &str,
+    expected: &str,
+) -> Option<String> {
+    let current = raw_numbering_item_text(tag, backend, target)?;
+    if backend != crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe
+        || !expected.contains('/')
+        || current.contains('/')
+    {
+        return Some(current);
+    }
+
+    let total_target = match target {
+        "TRACKNUMBER" => "TRACKTOTAL",
+        "DISCNUMBER" => "DISCTOTAL",
+        _ => return Some(current),
+    };
+    let total = raw_numbering_item_text(tag, backend, total_target)?;
+    Some(format!("{current}/{total}"))
+}
+
 fn typed_lofty_change_already_satisfied(
     tag: &lofty::tag::Tag,
     backend: crate::metadata_persistence::MetadataPersistenceBackend,
@@ -9848,10 +9891,21 @@ fn typed_lofty_change_already_satisfied(
         if matching_count > 1 {
             return false;
         }
-        let current = typed_numbering_accessor_value(tag, backend, &change.persistence_key);
+        let capabilities = backend.numbering_capabilities();
         return match change.value.as_deref() {
-            Some(expected) => current.as_deref() == Some(expected),
-            None => current.is_none() && matching_count == 0,
+            Some(expected) if capabilities.padded_unsigned => {
+                exact_padded_numbering_value(tag, backend, target, expected).as_deref()
+                    == Some(expected)
+            }
+            Some(expected) => {
+                typed_numbering_accessor_value(tag, backend, &change.persistence_key).as_deref()
+                    == Some(expected)
+            }
+            None => {
+                matching_count == 0
+                    && typed_numbering_accessor_value(tag, backend, &change.persistence_key)
+                        .is_none()
+            }
         };
     }
 
@@ -11976,6 +12030,9 @@ mod tests {
     }
 
     #[test]
+    // Strong-mode writes consult the metadata journal DB; isolate
+    // XDG dirs (and serialize with other env-redirecting tests) so a
+    // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_write_preserves_invalid_ape_item_byte_exactly() {
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-invalid-preserve",
@@ -12131,6 +12188,9 @@ mod tests {
     }
 
     #[test]
+    // Strong-mode writes consult the metadata journal DB; isolate
+    // XDG dirs (and serialize with other env-redirecting tests) so a
+    // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_empty_string_deletes_ordinary_ape_item() {
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-empty-delete",
@@ -12170,6 +12230,9 @@ mod tests {
     }
 
     #[test]
+    // Strong-mode writes consult the metadata journal DB; isolate
+    // XDG dirs (and serialize with other env-redirecting tests) so a
+    // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_empty_numbering_deletes_or_reduces_combined_item() {
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-numbering-delete",
@@ -12256,6 +12319,45 @@ mod tests {
     }
 
     #[test]
+    fn healthy_wavpack_lofty_deletion_observes_combined_numbering_state() {
+        let (_temp, path) =
+            copy_numbering_fixture("healthy-lofty-numbering-delete.wv", APE_NUMBERING_FIXTURE);
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                    Some("7".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+                    Some("12".to_string()),
+                ),
+            ],
+        )
+        .expect("seed healthy Lofty APE combined numbering");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        assert_eq!(editor_numbering_value(&path, "TRACKTOTAL"), "12");
+
+        let delete_total = [(
+            lofty::tag::ItemKey::Unknown("TRACKTOTAL".to_string()),
+            Some(String::new()),
+        )];
+        write_all_tags(&path, &delete_total)
+            .expect("deleting a combined APE total must not be skipped by the preflight");
+        assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
+        assert_eq!(editor_value(&path, "TRACKTOTAL").as_deref(), Some(""));
+        assert_lofty_repetition_skips_transaction(
+            &path,
+            &delete_total,
+            "already-deleted healthy APE TRACKTOTAL",
+        );
+    }
+
+    #[test]
+    // Strong-mode writes consult the metadata journal DB; isolate
+    // XDG dirs (and serialize with other env-redirecting tests) so a
+    // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_write_is_byte_idempotent_for_matching_read_only_item() {
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-idempotent",
@@ -12871,6 +12973,69 @@ mod tests {
         }
     }
 
+    fn assert_ape_numbering_backend_round_trip(
+        file_name: &str,
+        fixture: &[u8],
+        expected_backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    ) {
+        let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+        let capability =
+            crate::metadata_persistence::metadata_numbering_capability_for_path(&path)
+                .expect("classify real APE-family fixture");
+        assert_eq!(capability.backend, expected_backend);
+        assert_eq!(
+            capability.capabilities,
+            crate::metadata_persistence::MetadataNumberingCapabilities::APE_NUMERIC
+        );
+
+        for display_key in ["TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+            for accepted in ["7", "01", "7/17", "01/17"] {
+                let change = [(
+                    lofty::tag::ItemKey::Unknown(display_key.to_string()),
+                    Some(accepted.to_string()),
+                )];
+                write_all_tags(&path, &change).unwrap_or_else(|error| {
+                    panic!(
+                        "APE backend must accept {display_key}={accepted:?}: {error}"
+                    )
+                });
+                assert_eq!(
+                    editor_numbering_value(&path, display_key),
+                    accepted,
+                    "APE backend must preserve the exact accepted spelling"
+                );
+                assert_lofty_repetition_skips_transaction(
+                    &path,
+                    &change,
+                    &format!("APE {display_key}={accepted:?}"),
+                );
+            }
+
+            let before = std::fs::read(&path).expect("snapshot APE before lexical refusal");
+            let error = write_all_tags(
+                &path,
+                &[(
+                    lofty::tag::ItemKey::Unknown(display_key.to_string()),
+                    Some("A01".to_string()),
+                )],
+            )
+            .expect_err("APE backend must refuse side-prefixed lexical numbering");
+            assert!(
+                error.contains(display_key) && error.contains("lexical"),
+                "unexpected APE lexical refusal for {display_key}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read APE after lexical refusal"),
+                before,
+                "refused APE lexical numbering must not mutate the carrier"
+            );
+            assert!(
+                !crate::db::Database::backup_path_for(&path).exists(),
+                "refused APE lexical numbering must not allocate a rollback backup"
+            );
+        }
+    }
+
     #[test]
     fn lofty_vorbis_numbering_capability_matches_production_round_trip() {
         assert_textual_numbering_backend_round_trip(
@@ -13283,7 +13448,7 @@ mod tests {
 
     #[test]
     fn ape_numbering_capability_matches_production_round_trip() {
-        assert_plain_unsigned_numbering_backend_round_trip(
+        assert_ape_numbering_backend_round_trip(
             "numbering.wv",
             APE_NUMBERING_FIXTURE,
             crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
@@ -13963,6 +14128,9 @@ mod tests {
     }
 
     #[test]
+    // Strong-mode writes consult the metadata journal DB; isolate
+    // XDG dirs (and serialize with other env-redirecting tests) so a
+    // concurrent guard user cannot swap the journal path mid-write.
     fn inline_wavpack_dispatch_bypasses_legacy_database_and_selects_serializer() {
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-inline-dispatch",

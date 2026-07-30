@@ -83,6 +83,7 @@ use super::tool::{
 use super::types::*;
 use crate::convert::cap_fs::PinnedDirectoryCapability;
 use crate::convert::ConversionStatus;
+use crate::metadata_persistence::native_ape_canonical_key;
 use tonepoet_pipeline::{
     AacProfile, AudioFormat as PlannerAudioFormat, BitDepthTarget, DitherType,
     DsdLowpassMethod, DsdRate, DsdToPcmGainMode, Mp3Mode, NyquistTransition,
@@ -4393,6 +4394,10 @@ const PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY: &str =
     "tonepoet_preserved_source_naming_artist";
 const LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY: &str = "album_tag_override";
 const LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY: &str = "album_artist_tag_override";
+const EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY: &str =
+    "\0tonepoet_explicit_metadata_override:ALBUMARTIST";
+const EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY: &str =
+    "\0tonepoet_explicit_metadata_clear:ALBUMARTIST";
 
 fn is_internal_metadata_extra_key(key: &str) -> bool {
     key == PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY
@@ -4400,6 +4405,10 @@ fn is_internal_metadata_extra_key(key: &str) -> bool {
         || key == PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY
         || key == LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY
         || key == LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY
+        || key == FALLBACK_RECOVERED_METADATA_EXTRA_KEY
+        || key.starts_with(FALLBACK_SOURCE_TAG_EXTRA_PREFIX)
+        || key == EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY
+        || key == EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY
         || key == CUE_ARTWORK_PATH_EXTRA_KEY
         || key == CUE_ARTWORK_MIME_EXTRA_KEY
         || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
@@ -4420,12 +4429,37 @@ fn source_text_tag_output_key(key: &str) -> Option<String> {
     Some(key.to_ascii_uppercase())
 }
 
-fn source_text_tag_is_writer_owned(key: &str, pre_emphasis: bool) -> bool {
+fn authoritative_cue_writer_owned_canonical_keys() -> &'static BTreeSet<String> {
+    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        AUTHORITATIVE_CUE_MANAGED_TAG_KEYS
+            .iter()
+            .map(|key| native_ape_canonical_key(key))
+            .collect()
+    })
+}
+
+fn authoritative_cue_writer_owned_canonical_key(key: &str) -> bool {
+    authoritative_cue_writer_owned_canonical_keys()
+        .contains(&native_ape_canonical_key(key))
+}
+
+fn source_text_tag_is_writer_owned(
+    key: &str,
+    pre_emphasis: bool,
+    album_artist_authoritative: bool,
+) -> bool {
     let key = normalize_metadata_key(key);
+    if key == "ALBUM ARTIST" {
+        // The raw APE/Vorbis alias is writer-owned when the canonical value is
+        // written OR explicitly cleared. Otherwise a source-text provenance
+        // entry could silently reintroduce the alias after a clear request.
+        return album_artist_authoritative;
+    }
     if matches!(key.as_str(), "PRE_EMPHASIS" | "CUE_FLAGS") {
         return pre_emphasis;
     }
-    AUTHORITATIVE_CUE_MANAGED_TAG_KEYS.contains(&key.as_str())
+    authoritative_cue_writer_owned_canonical_key(&key)
 }
 
 fn source_text_extra_keys(extra: &BTreeMap<String, String>) -> BTreeSet<String> {
@@ -4449,156 +4483,359 @@ fn album_extra_real_tag_key(key: &str) -> Option<&'static str> {
     }
 }
 
-fn authoritative_metadata_tags(meta: &TrackMetadata, album: &AlbumMetadata) -> Vec<(String, String)> {
+fn fallback_authoritative_source_value<'a>(
+    meta: &'a TrackMetadata,
+    album: &'a AlbumMetadata,
+    canonical_key: &str,
+) -> Option<&'a str> {
+    fallback_source_tag_value(&meta.extra, canonical_key)
+        .or_else(|| fallback_source_tag_value(&album.extra, canonical_key))
+}
+
+fn fallback_authoritative_positive_number(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    canonical_key: &str,
+) -> Option<u32> {
+    fallback_authoritative_source_value(meta, album, canonical_key).and_then(|value| {
+        value
+            .split_once('/')
+            .map_or(value, |(number, _)| number)
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|number| *number > 0)
+    })
+}
+
+fn authoritative_canonical_value<'a>(
+    fallback_recovered: bool,
+    meta: &'a TrackMetadata,
+    album: &'a AlbumMetadata,
+    canonical_key: &str,
+    ordinary: Option<&'a str>,
+) -> Option<&'a str> {
+    if fallback_recovered {
+        fallback_authoritative_source_value(meta, album, canonical_key)
+    } else {
+        ordinary
+    }
+}
+
+fn explicit_album_artist_clear_requested(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+) -> bool {
+    meta.extra
+        .contains_key(EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY)
+        || album
+            .extra
+            .contains_key(EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY)
+}
+
+pub(crate) fn authoritative_metadata_tags(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+) -> Vec<(String, String)> {
     let mut tags: Vec<(String, String)> = Vec::new();
     let source_track_keys = source_text_extra_keys(&meta.extra);
     let source_album_keys = source_text_extra_keys(&album.extra);
-    if let Some(ref v) = meta.title {
+    let fallback_recovered = album
+        .extra
+        .contains_key(FALLBACK_RECOVERED_METADATA_EXTRA_KEY);
+
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "TITLE",
+        meta.title.as_deref(),
+    ) {
         push_tag_value(&mut tags, "TITLE", v);
     }
-    if let Some(ref v) = meta.artist {
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "ARTIST",
+        meta.artist.as_deref(),
+    ) {
         push_tag_value(&mut tags, "ARTIST", v);
     }
 
-    // Written album-artist metadata has an intentionally separate contract from
-    // batch-resolved organizational identity:
-    //   1. track-level album artist is authoritative. In normal operation this
-    //      is source metadata; when the user sets a request override, the
-    //      override is applied to every track before writing;
-    //   2. otherwise, an internal preserved-source value wins when the batch
-    //      identity mutated AlbumMetadata for folder/log planning;
-    //   3. otherwise, use the source album metadata as materialized.
-    // Legacy `album_artist_tag_override` is deliberately not consulted here; it
-    // is an internal sentinel key only and must never outrank real metadata.
-    if let Some(v) = meta
-        .album_artist
-        .as_ref()
-        .or_else(|| album.extra.get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY))
-        .or(album.album_artist.as_ref())
-    {
+    // Batch identity and label enrichment are organizational facts, not source
+    // tag authority. For a fallback-recovered source, ALBUMARTIST therefore
+    // comes only from the immutable source snapshot or from the explicit
+    // request-level override contract. A clear override must suppress the
+    // source value as well.
+    let explicit_album_artist_clear =
+        explicit_album_artist_clear_requested(meta, album);
+    let explicit_album_artist = meta
+        .extra
+        .get(EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY)
+        .or_else(|| album.extra.get(EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY))
+        .map(String::as_str);
+    let album_artist_tag = if fallback_recovered {
+        if explicit_album_artist_clear {
+            None
+        } else {
+            explicit_album_artist.or_else(|| {
+                fallback_authoritative_source_value(meta, album, "ALBUMARTIST")
+            })
+        }
+    } else {
+        meta.album_artist
+            .as_deref()
+            .or_else(|| {
+                album
+                    .extra
+                    .get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
+                    .map(String::as_str)
+            })
+            .or(album.album_artist.as_deref())
+    };
+    if let Some(v) = album_artist_tag {
         push_tag_value(&mut tags, "ALBUMARTIST", v);
     }
 
-    // ALBUM follows the same organization-vs-tags split. A resolved batch album
-    // may drive folder rendering, but the writer keeps the source album tag
-    // unless an explicit metadata-edit path supplied a per-track album value.
-    let album_tag = album
-        .extra
-        .get(PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY)
-        .or_else(|| album.extra.get(LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY))
-        .or_else(|| meta.extra.get("album"))
-        .or(album.album.as_ref());
+    // ALBUM is source-gated for fallback recovery. In particular, preserved
+    // organizational values captured after label enrichment are not accepted as
+    // source evidence; only the immutable fallback snapshot can authorize it.
+    let album_tag = if fallback_recovered {
+        fallback_authoritative_source_value(meta, album, "ALBUM")
+    } else {
+        album
+            .extra
+            .get(PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY)
+            .or_else(|| album.extra.get(LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY))
+            .or_else(|| meta.extra.get("album"))
+            .or(album.album.as_ref())
+            .map(String::as_str)
+    };
     if let Some(v) = album_tag {
         push_tag_value(&mut tags, "ALBUM", v);
     }
-    if let Some(ref v) = meta.genre {
-        push_tag_value(&mut tags, "GENRE", v);
-    } else if let Some(ref v) = album.genre {
+
+    let ordinary_genre = meta.genre.as_deref().or(album.genre.as_deref());
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "GENRE",
+        ordinary_genre,
+    ) {
         push_tag_value(&mut tags, "GENRE", v);
     }
-    if let Some(ref v) = meta.date {
-        push_tag_value(&mut tags, "DATE", v);
-    } else if let Some(ref v) = album.date {
+    let ordinary_date = meta.date.as_deref().or(album.date.as_deref());
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "DATE",
+        ordinary_date,
+    ) {
         push_tag_value(&mut tags, "DATE", v);
     }
-    if let Some(n) = meta.track_number {
+
+    if fallback_recovered {
+        if let Some(number) = fallback_authoritative_positive_number(meta, album, "TRACKNUMBER") {
+            push_tag_value(&mut tags, "TRACKNUMBER", &number.to_string());
+        } else if let Some((_, sequence)) = fallback_authoritative_source_value(
+            meta,
+            album,
+            "TRACKNUMBER",
+        )
+        .and_then(strict_side_prefixed_track_number)
+        {
+            push_tag_value(&mut tags, "TRACKNUMBER", &sequence.to_string());
+        }
+    } else if let Some(n) = meta.track_number {
         push_tag_value(&mut tags, "TRACKNUMBER", &n.to_string());
     } else if let Some((_, sequence)) = source_side_prefixed_track_number(meta) {
         // Side-prefixed source values remain raw for filename rendering, while
         // format-specific metadata writers receive a valid numeric atom.
         push_tag_value(&mut tags, "TRACKNUMBER", &sequence.to_string());
     }
-    if let Some(n) = meta.disc_number.or(album.disc_number) {
+
+    if fallback_recovered {
+        if let Some(number) = fallback_authoritative_positive_number(meta, album, "DISCNUMBER") {
+            push_tag_value(&mut tags, "DISCNUMBER", &number.to_string());
+        }
+    } else if let Some(n) = meta.disc_number.or(album.disc_number) {
         push_tag_value(&mut tags, "DISCNUMBER", &n.to_string());
     }
-    if let Some(ref v) = meta.comment {
+
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "COMMENT",
+        meta.comment.as_deref(),
+    ) {
         push_tag_value(&mut tags, "COMMENT", v);
     }
-
-    // PR 8 CUE-specific metadata. The materializer preserves these fields in
-    // TrackMetadata/AlbumMetadata, and the metadata stage writes them through
-    // so published split files remain self-describing.
-    if let Some(ref v) = meta.composer {
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "COMPOSER",
+        meta.composer.as_deref(),
+    ) {
         push_tag_value(&mut tags, "COMPOSER", v);
     }
-    if let Some(ref v) = meta.performer {
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "PERFORMER",
+        meta.performer.as_deref(),
+    ) {
         push_tag_value(&mut tags, "PERFORMER", v);
     }
-    if let Some(ref v) = meta.isrc {
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "ISRC",
+        meta.isrc.as_deref(),
+    ) {
         push_tag_value(&mut tags, "ISRC", v);
     }
-    if let Some(ref v) = meta.publisher {
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "PUBLISHER",
+        meta.publisher.as_deref(),
+    ) {
         push_tag_value(&mut tags, "PUBLISHER", v);
     }
-    if let Some(ref v) = meta.copyright {
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "COPYRIGHT",
+        meta.copyright.as_deref(),
+    ) {
         push_tag_value(&mut tags, "COPYRIGHT", v);
     }
     if meta.pre_emphasis {
         push_tag_value(&mut tags, "PRE_EMPHASIS", "1");
         push_tag_value(&mut tags, "CUE_FLAGS", "PRE");
     }
-    if album.total_tracks > 0 {
-        // foobar2000/flac convention; legacy TOTALTRACKS remains accepted on
-        // read and is superseded by the authoritative-key sweep on re-runs.
-        push_tag_value(&mut tags, "TRACKTOTAL", &album.total_tracks.to_string());
+
+    let total_tracks = if fallback_recovered {
+        fallback_authoritative_positive_number(meta, album, "TRACKTOTAL")
+            .or_else(|| fallback_authoritative_positive_number(meta, album, "TOTALTRACKS"))
+    } else {
+        (album.total_tracks > 0).then_some(album.total_tracks)
+    };
+    if let Some(total_tracks) = total_tracks {
+        push_tag_value(&mut tags, "TRACKTOTAL", &total_tracks.to_string());
     }
-    if let Some(n) = album.total_discs {
-        push_tag_value(&mut tags, "DISCTOTAL", &n.to_string());
+    let total_discs = if fallback_recovered {
+        fallback_authoritative_positive_number(meta, album, "DISCTOTAL")
+            .or_else(|| fallback_authoritative_positive_number(meta, album, "TOTALDISCS"))
+    } else {
+        album.total_discs
+    };
+    if let Some(total_discs) = total_discs {
+        push_tag_value(&mut tags, "DISCTOTAL", &total_discs.to_string());
     }
-    if let Some(v) = album.extra.get("catalog") {
+
+    if let Some(v) = authoritative_canonical_value(
+        fallback_recovered,
+        meta,
+        album,
+        "CATALOG",
+        album.extra.get("catalog").map(String::as_str),
+    ) {
         push_tag_value(&mut tags, "CATALOG", v);
     }
 
-    // Re-emit user-originated text tags under their raw source keys. Canonical
-    // fields remain writer-owned, so source copies cannot override an explicit
-    // metadata edit. PRE_EMPHASIS/CUE_FLAGS are owned only when the materializer
-    // promoted affirmative source evidence to TrackMetadata.pre_emphasis.
-    for (key, value) in &meta.extra {
-        let Some(source_key) = source_text_tag_key_from_extra(&meta.extra, key, value) else {
-            continue;
-        };
-        if source_text_tag_is_writer_owned(source_key, meta.pre_emphasis) {
-            continue;
+    let album_artist_authoritative =
+        tag_value(&tags, "ALBUMARTIST").is_some() || explicit_album_artist_clear;
+
+    // Re-emit source text under source/canonical keys. The fallback path
+    // consumes its immutable snapshot directly, so later enrichment cannot
+    // overwrite or invalidate a source custom tag. Other materializers retain
+    // the paired-plain-key provenance contract.
+    if fallback_recovered {
+        for extra in [&meta.extra, &album.extra] {
+            for (key, value) in extra {
+                let Some(source_key) = fallback_source_tag_key_from_extra(key) else {
+                    continue;
+                };
+                if source_text_tag_is_writer_owned(
+                    source_key,
+                    meta.pre_emphasis,
+                    album_artist_authoritative,
+                ) {
+                    continue;
+                }
+                if let Some(tag_key) = source_text_tag_output_key(source_key) {
+                    push_tag_value(&mut tags, &tag_key, value);
+                }
+            }
         }
-        if let Some(tag_key) = source_text_tag_output_key(source_key) {
-            push_tag_value(&mut tags, &tag_key, value);
+    } else {
+        for (key, value) in &meta.extra {
+            let Some(source_key) = source_text_tag_key_from_extra(&meta.extra, key, value) else {
+                continue;
+            };
+            if source_text_tag_is_writer_owned(
+                source_key,
+                meta.pre_emphasis,
+                album_artist_authoritative,
+            ) {
+                continue;
+            }
+            if let Some(tag_key) = source_text_tag_output_key(source_key) {
+                push_tag_value(&mut tags, &tag_key, value);
+            }
         }
-    }
-    // Album materializers promote text tags shared by every track. Re-emit
-    // those provenance markers as a fallback for album-only metadata models;
-    // track-level values win because push_tag_value is first-writer-wins.
-    for (key, value) in &album.extra {
-        let Some(source_key) = source_text_tag_key_from_extra(&album.extra, key, value) else {
-            continue;
-        };
-        if source_text_tag_is_writer_owned(source_key, meta.pre_emphasis) {
-            continue;
-        }
-        if let Some(tag_key) = source_text_tag_output_key(source_key) {
-            push_tag_value(&mut tags, &tag_key, value);
+        for (key, value) in &album.extra {
+            let Some(source_key) = source_text_tag_key_from_extra(&album.extra, key, value) else {
+                continue;
+            };
+            if source_text_tag_is_writer_owned(
+                source_key,
+                meta.pre_emphasis,
+                album_artist_authoritative,
+            ) {
+                continue;
+            }
+            if let Some(tag_key) = source_text_tag_output_key(source_key) {
+                push_tag_value(&mut tags, &tag_key, value);
+            }
         }
     }
 
-    for (key, value) in &album.extra {
-        if is_internal_metadata_extra_key(key)
-            || key == "catalog"
-            || source_album_keys.contains(key)
-        {
-            continue;
+    // For fallback recovery, every ordinary extra may have been introduced by
+    // label or batch organization. Source extras have already been emitted via
+    // their immutable provenance pairs above, so unpaired extras are excluded.
+    if !fallback_recovered {
+        for (key, value) in &album.extra {
+            if is_internal_metadata_extra_key(key)
+                || key == "catalog"
+                || source_album_keys.contains(key)
+            {
+                continue;
+            }
+            if let Some(tag_key) = album_extra_real_tag_key(key) {
+                push_tag_value(&mut tags, tag_key, value);
+                continue;
+            }
+            let tag_key = cue_extra_tag_key("ALBUM", key);
+            push_tag_value(&mut tags, &tag_key, value);
         }
-        if let Some(tag_key) = album_extra_real_tag_key(key) {
-            push_tag_value(&mut tags, tag_key, value);
-            continue;
+        for (key, value) in &meta.extra {
+            if is_internal_metadata_extra_key(key) || source_track_keys.contains(key) {
+                continue;
+            }
+            let tag_key = cue_extra_tag_key("TRACK", key);
+            push_tag_value(&mut tags, &tag_key, value);
         }
-        let tag_key = cue_extra_tag_key("ALBUM", key);
-        push_tag_value(&mut tags, &tag_key, value);
-    }
-    for (key, value) in &meta.extra {
-        if is_internal_metadata_extra_key(key) || source_track_keys.contains(key) {
-            continue;
-        }
-        let tag_key = cue_extra_tag_key("TRACK", key);
-        push_tag_value(&mut tags, &tag_key, value);
     }
 
     tags
@@ -4770,6 +5007,9 @@ fn authoritative_cue_managed_tag_delete_keys(
     let mut keys = Vec::new();
     let mut seen = BTreeSet::new();
 
+    // Canonical writer-owned fields are removed unconditionally so positive
+    // rewrites and explicit clears share the same convergence boundary.
+    let writer_owned_canonical = authoritative_cue_writer_owned_canonical_keys();
     for key in AUTHORITATIVE_CUE_MANAGED_TAG_KEYS {
         let key = normalize_metadata_key(key);
         if seen.insert(key.clone()) {
@@ -4777,23 +5017,34 @@ fn authoritative_cue_managed_tag_delete_keys(
         }
     }
 
-    // Current tags include dynamically modeled CUE extras such as
-    // TONEPOET_ALBUM_* and TONEPOET_TRACK_*. They are authoritative for this
-    // run and must be rewritten without duplicates.
+    // Outgoing custom fields are authoritative for their complete reader
+    // equivalence class as well. Derive that class with the reader's canonical
+    // function rather than maintaining a second alias table that can drift.
+    let outgoing_canonical = tags
+        .iter()
+        .map(|(key, _)| native_ape_canonical_key(key))
+        .collect::<BTreeSet<_>>();
+
+    for existing in existing_keys {
+        let canonical = native_ape_canonical_key(existing);
+        if (writer_owned_canonical.contains(&canonical)
+            || outgoing_canonical.contains(&canonical)
+            || is_tonepoet_managed_dynamic_tag_key(existing))
+            && seen.insert(existing.clone())
+        {
+            // Delete the discovered physical spelling, not merely its canonical
+            // identity. This removes raw aliases copied by an earlier encoder.
+            keys.push(existing.clone());
+        }
+    }
+
+    // Delete the preferred outgoing spelling even when it was not discovered
+    // by the preflight list command; native tools tolerate absent keys and this
+    // preserves deterministic replace semantics.
     for (key, _) in tags {
         let key = normalize_metadata_key(key);
         if seen.insert(key.clone()) {
             keys.push(key);
-        }
-    }
-
-    // Changed-input convergence requires deleting old Tonepoet-owned dynamic
-    // keys that are present on the file but absent from this run's payload.
-    // Do not delete arbitrary user tags; only the owned prefixes below are
-    // considered managed dynamic CUE metadata.
-    for key in existing_keys {
-        if is_tonepoet_managed_dynamic_tag_key(key) && seen.insert(key.clone()) {
-            keys.push(key.clone());
         }
     }
 
@@ -5203,6 +5454,14 @@ pub struct ProductionMetadataMutationOutcome {
     pub m4a_freeform_mutator_applied: bool,
 }
 
+fn authoritative_metadata_mutation_required(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    tags: &[(String, String)],
+) -> bool {
+    !tags.is_empty() || explicit_album_artist_clear_requested(meta, album)
+}
+
 async fn tag_audio_file(
     path: &Path,
     meta: &TrackMetadata,
@@ -5218,7 +5477,7 @@ async fn tag_audio_file(
         .to_lowercase();
 
     let tags = authoritative_metadata_tags(meta, album);
-    if tags.is_empty() {
+    if !authoritative_metadata_mutation_required(meta, album, &tags) {
         return Ok(None);
     }
 
@@ -5326,6 +5585,12 @@ mod metadata_writer_command_tests {
         );
     }
 
+    fn pair_count(args: &[String], left: &str, right: &str) -> usize {
+        args.windows(2)
+            .filter(|window| window[0] == left && window[1] == right)
+            .count()
+    }
+
     fn sample_metadata() -> (TrackMetadata, AlbumMetadata) {
         let mut album_extra = BTreeMap::new();
         album_extra.insert("catalog".to_string(), "ABC-123".to_string());
@@ -5389,12 +5654,18 @@ mod metadata_writer_command_tests {
             "TONEPOET_TRACK_TONEPOET_PRESERVED_SOURCE_ALBUM_ARTIST_TAG",
             "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_PATH",
             "TONEPOET_ALBUM_TONEPOET_CUE_ARTWORK_MIME",
+            "TONEPOET_ALBUM_TONEPOET_FALLBACK_RECOVERED_METADATA",
+            "TONEPOET_TRACK_TONEPOET_FALLBACK_RECOVERED_METADATA",
         ] {
             assert!(
                 !tags.iter().any(|(key, _)| key == forbidden),
                 "internal metadata key {forbidden} leaked into {tags:?}"
             );
         }
+        assert!(
+            !tags.iter().any(|(key, _)| key.contains("FALLBACK_SOURCE_TAG")),
+            "fallback source snapshot keys must remain internal: {tags:?}"
+        );
     }
 
     #[test]
@@ -5414,6 +5685,195 @@ mod metadata_writer_command_tests {
         assert!(tags.contains(&("CATALOG".to_string(), "ABC-123".to_string())));
         assert!(tags.contains(&("PERFORMER".to_string(), "Cue Performer".to_string())));
         assert!(tags.contains(&("PRE_EMPHASIS".to_string(), "1".to_string())));
+        assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn fallback_recovered_untagged_track_uses_ordinal_filename_without_fabricating_tag() {
+        let mut track = TrackMetadata {
+            title: Some("Give a Little Bit".to_string()),
+            artist: Some("Supertramp".to_string()),
+            genre: Some("Rock".to_string()),
+            date: Some("2001".to_string()),
+            disc_number: Some(2),
+            comment: Some("US A&M SP-4634".to_string()),
+            track_number: None,
+            ..TrackMetadata::default()
+        };
+        insert_source_text_tag(&mut track.extra, "ALBUM ARTIST", "Supertramp");
+        insert_source_text_tag(&mut track.extra, "TRACKTOTAL", "7");
+        for (key, value) in [
+            ("TITLE", "Give a Little Bit"),
+            ("ARTIST", "Supertramp"),
+            ("ALBUM", "Even in the Quietest Moments..."),
+            ("ALBUMARTIST", "Supertramp"),
+            ("GENRE", "Rock"),
+            ("DATE", "1977"),
+            ("COMMENT", "US A&M SP-4634"),
+            ("DISCNUMBER", "1"),
+            ("TRACKTOTAL", "7"),
+        ] {
+            insert_fallback_source_tag(&mut track.extra, key, value);
+        }
+        let mut album = AlbumMetadata {
+            album: Some("Batch-Resolved Album".to_string()),
+            album_artist: Some("Batch-Resolved Artist".to_string()),
+            date: Some("2001".to_string()),
+            total_tracks: 99,
+            total_discs: Some(2),
+            disc_number: Some(2),
+            ..AlbumMetadata::default()
+        };
+        album.extra.insert(
+            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+            "native-apev2".to_string(),
+        );
+        let ordinal = crate::convert::pipeline::materializer_single::single_file_filename_track_number(
+            None,
+            Some(&AlbumBatchTrackContext::new(2, None, 2)),
+        );
+        let tags = authoritative_metadata_tags(&track, &album);
+
+        assert_eq!(ordinal, 2);
+        for expected in [
+            ("TITLE", "Give a Little Bit"),
+            ("ARTIST", "Supertramp"),
+            ("ALBUM", "Even in the Quietest Moments..."),
+            ("ALBUMARTIST", "Supertramp"),
+            ("GENRE", "Rock"),
+            ("DATE", "1977"),
+            ("COMMENT", "US A&M SP-4634"),
+            ("DISCNUMBER", "1"),
+            ("TRACKTOTAL", "7"),
+        ] {
+            assert!(
+                tags.iter().any(|(key, value)| key == expected.0 && value == expected.1),
+                "missing authoritative recovered tag {expected:?}: {tags:?}"
+            );
+        }
+        assert!(
+            !tags.iter().any(|(key, _)| key == "TRACKNUMBER"),
+            "dispatch ordinals are filename-only"
+        );
+        assert!(
+            !tags.iter().any(|(key, _)| key == "ALBUM ARTIST"),
+            "the raw ffmpeg/APE alias must converge to canonical ALBUMARTIST"
+        );
+        let delete_keys = authoritative_cue_managed_tag_delete_keys(
+            &tags,
+            &BTreeSet::from(["ALBUM ARTIST".to_string()]),
+        );
+        assert!(delete_keys.contains(&"ALBUM ARTIST".to_string()));
+        assert_no_internal_metadata_tags(&tags);
+    }
+
+    #[test]
+    fn fallback_explicit_album_artist_clear_converges_raw_alias_across_native_writers() {
+        let mut track = TrackMetadata::default();
+        insert_source_text_tag(&mut track.extra, "ALBUM ARTIST", "Source Album Artist");
+        insert_fallback_source_tag(
+            &mut track.extra,
+            "ALBUMARTIST",
+            "Source Album Artist",
+        );
+        track.extra.insert(
+            EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY.to_string(),
+            "1".to_string(),
+        );
+        let mut album = AlbumMetadata::default();
+        album.extra.insert(
+            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+            "native-apev2".to_string(),
+        );
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        assert!(
+            authoritative_metadata_mutation_required(&track, &album, &tags),
+            "a clear-only request must not be skipped merely because its positive payload is empty"
+        );
+        assert!(
+            !tags
+                .iter()
+                .any(|(key, _)| key == "ALBUMARTIST" || key == "ALBUM ARTIST"),
+            "neither canonical nor raw album-artist metadata may be written after Clear: {tags:?}"
+        );
+
+        let existing = BTreeSet::from(["ALBUM ARTIST".to_string()]);
+
+        let flac = metaflac_tag_args(Path::new("track.flac"), &tags, &existing);
+        assert!(flac.iter().any(|arg| arg == "--remove-tag=ALBUM ARTIST"));
+        assert!(!flac.iter().any(|arg| {
+            arg.starts_with("--set-tag=ALBUMARTIST=")
+                || arg.starts_with("--set-tag=ALBUM ARTIST=")
+        }));
+
+        let opus = opustags_tag_args(Path::new("track.opus"), &tags, &existing);
+        assert_pair(&opus, "--delete", "ALBUM ARTIST");
+        assert!(!opus.windows(2).any(|pair| {
+            pair[0] == "-s"
+                && (pair[1].starts_with("ALBUMARTIST=")
+                    || pair[1].starts_with("ALBUM ARTIST="))
+        }));
+
+        let wavpack = wvtag_tag_args(Path::new("track.wv"), &tags, &existing);
+        assert_pair(&wavpack, "-d", "ALBUM ARTIST");
+        assert!(!wavpack.windows(2).any(|pair| {
+            pair[0] == "-w"
+                && (pair[1].starts_with("ALBUMARTIST=")
+                    || pair[1].starts_with("ALBUM ARTIST="))
+        }));
+    }
+
+    #[test]
+    fn fallback_authority_rejects_unproven_organizational_metadata() {
+        let mut track = TrackMetadata {
+            artist: Some("Solo Artist".to_string()),
+            date: Some("1999".to_string()),
+            disc_number: Some(3),
+            extra: BTreeMap::from([(
+                "inferred_track_note".to_string(),
+                "planning-only".to_string(),
+            )]),
+            ..TrackMetadata::default()
+        };
+        insert_fallback_source_tag(&mut track.extra, "ARTIST", "Solo Artist");
+        let album = AlbumMetadata {
+            album: Some("Resolved Batch Album".to_string()),
+            album_artist: Some("Resolved Batch Artist".to_string()),
+            date: Some("1999".to_string()),
+            total_tracks: 1,
+            total_discs: Some(3),
+            disc_number: Some(3),
+            extra: BTreeMap::from([
+                (
+                    FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+                    "native-apev2".to_string(),
+                ),
+                ("label".to_string(), "Inferred Label".to_string()),
+                ("catalog".to_string(), "INFERRED-001".to_string()),
+            ]),
+            ..AlbumMetadata::default()
+        };
+
+        let tags = authoritative_metadata_tags(&track, &album);
+
+        assert!(tags.iter().any(|(key, value)| key == "ARTIST" && value == "Solo Artist"));
+        for forbidden in [
+            "ALBUM",
+            "ALBUMARTIST",
+            "DATE",
+            "DISCNUMBER",
+            "TRACKTOTAL",
+            "DISCTOTAL",
+            "CATALOG",
+            "TONEPOET_ALBUM_LABEL",
+            "TONEPOET_TRACK_INFERRED_TRACK_NOTE",
+        ] {
+            assert!(
+                !tags.iter().any(|(key, _)| key == forbidden),
+                "organizational value {forbidden} leaked into fallback output: {tags:?}"
+            );
+        }
         assert_no_internal_metadata_tags(&tags);
     }
 
@@ -5915,6 +6375,65 @@ mod metadata_writer_command_tests {
     }
 
     #[test]
+    fn authoritative_tags_canonicalize_managed_source_aliases_without_reemission() {
+        let mut track = TrackMetadata {
+            album_artist: Some("Album Artist".to_string()),
+            date: Some("1977".to_string()),
+            comment: Some("Comment".to_string()),
+            track_number: Some(3),
+            disc_number: Some(2),
+            ..TrackMetadata::default()
+        };
+        for (key, value) in [
+            ("ALBUM ARTIST", "Album Artist"),
+            ("YEAR", "1977"),
+            ("DESCRIPTION", "Comment"),
+            ("TRACK", "3"),
+            ("DISC", "2"),
+            ("DISK", "2"),
+            ("DISKNUMBER", "2"),
+            ("DISKTOTAL", "2"),
+        ] {
+            insert_source_text_tag(&mut track.extra, key, value);
+        }
+        let album = AlbumMetadata {
+            total_discs: Some(2),
+            ..AlbumMetadata::default()
+        };
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        for alias in [
+            "ALBUM ARTIST",
+            "YEAR",
+            "DESCRIPTION",
+            "TRACK",
+            "TOTALTRACKS",
+            "DISC",
+            "DISK",
+            "DISKNUMBER",
+            "DISKTOTAL",
+        ] {
+            assert!(
+                !tags.iter().any(|(key, _)| key == alias),
+                "managed alias {alias} was re-emitted beside its canonical field: {tags:?}"
+            );
+        }
+        for canonical in [
+            "ALBUMARTIST",
+            "DATE",
+            "COMMENT",
+            "TRACKNUMBER",
+            "DISCNUMBER",
+            "DISCTOTAL",
+        ] {
+            assert!(
+                tags.iter().any(|(key, _)| key == canonical),
+                "missing canonical field {canonical}: {tags:?}"
+            );
+        }
+    }
+
+    #[test]
     fn native_managed_dynamic_key_discovery_is_prefix_scoped() {
         let keys = parse_native_tag_keys(
             "TITLE=Old\nTONEPOET_ALBUM_STALE=old\nTONEPOET_TRACK_OLD=old\nUSER_NOTE=keep\nVendor String: ignored\n",
@@ -5933,51 +6452,189 @@ mod metadata_writer_command_tests {
     }
 
     #[test]
-    fn native_writer_commands_delete_full_managed_universe_before_writing_present_values() {
-        let tags = vec![
-            ("TITLE".to_string(), "Cue Track".to_string()),
-            ("ARTIST".to_string(), "Cue Performer".to_string()),
-        ];
+    fn fallback_native_writer_commands_delete_reader_aliases_before_one_canonical_write() {
+        let mut track = TrackMetadata::default();
+        for (key, value) in [
+            ("TITLE", "Cue Track"),
+            ("ARTIST", "Cue Performer"),
+            ("ENCODINGTOOL", "Tonepoet"),
+            ("MUSICBRAINZ_ALBUMID", "album-123"),
+            ("MUSICBRAINZ_ALBUMARTISTID", "album-artist-234"),
+            ("MUSICBRAINZ_RELEASEGROUPID", "release-group-345"),
+            ("MUSICBRAINZ_TRACKID", "recording-456"),
+            ("MUSICBRAINZ_RELEASETRACKID", "release-track-567"),
+            ("MUSICBRAINZ_ARTISTID", "artist-678"),
+        ] {
+            insert_fallback_source_tag(&mut track.extra, key, value);
+        }
+        let mut album = AlbumMetadata::default();
+        album.extra.insert(
+            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+            "native-apev2".to_string(),
+        );
+        let tags = authoritative_metadata_tags(&track, &album);
 
         let existing = BTreeSet::from([
+            "ALBUM ARTIST".to_string(),
+            "YEAR".to_string(),
+            "DESCRIPTION".to_string(),
+            "TRACK".to_string(),
+            "TOTALTRACKS".to_string(),
+            "DISC".to_string(),
+            "DISK".to_string(),
+            "DISKNUMBER".to_string(),
+            "DISKTOTAL".to_string(),
+            "TOTALDISCS".to_string(),
+            "ENCODING TOOL".to_string(),
+            "MUSICBRAINZ ALBUM ID".to_string(),
+            "MUSICBRAINZ RELEASE ID".to_string(),
+            "MUSICBRAINZ ALBUM ARTIST ID".to_string(),
+            "MUSICBRAINZ RELEASE ARTIST ID".to_string(),
+            "MUSICBRAINZ RELEASE GROUP ID".to_string(),
+            "MUSICBRAINZ TRACK ID".to_string(),
+            "MUSICBRAINZ RECORDING ID".to_string(),
+            "MUSICBRAINZ RELEASE TRACK ID".to_string(),
+            "MUSICBRAINZ ARTIST ID".to_string(),
             "TONEPOET_ALBUM_STALE_DYNAMIC".to_string(),
             "USER_NOTE".to_string(),
         ]);
+        let reader_aliases = [
+            "ALBUM ARTIST",
+            "YEAR",
+            "DESCRIPTION",
+            "TRACK",
+            "DISC",
+            "DISK",
+            "DISKNUMBER",
+            "DISKTOTAL",
+            "TOTALDISCS",
+            "ENCODING TOOL",
+            "MUSICBRAINZ ALBUM ID",
+            "MUSICBRAINZ RELEASE ID",
+            "MUSICBRAINZ ALBUM ARTIST ID",
+            "MUSICBRAINZ RELEASE ARTIST ID",
+            "MUSICBRAINZ RELEASE GROUP ID",
+            "MUSICBRAINZ TRACK ID",
+            "MUSICBRAINZ RECORDING ID",
+            "MUSICBRAINZ RELEASE TRACK ID",
+            "MUSICBRAINZ ARTIST ID",
+        ];
+        let canonical_writes = [
+            ("ENCODINGTOOL", "Tonepoet"),
+            ("MUSICBRAINZ_ALBUMID", "album-123"),
+            ("MUSICBRAINZ_ALBUMARTISTID", "album-artist-234"),
+            ("MUSICBRAINZ_RELEASEGROUPID", "release-group-345"),
+            ("MUSICBRAINZ_TRACKID", "recording-456"),
+            ("MUSICBRAINZ_RELEASETRACKID", "release-track-567"),
+            ("MUSICBRAINZ_ARTISTID", "artist-678"),
+        ];
+        for alias in reader_aliases {
+            assert!(
+                !tags.iter().any(|(key, _)| key == alias),
+                "fallback payload re-emitted raw reader alias {alias}: {tags:?}"
+            );
+        }
+        for (key, value) in canonical_writes {
+            assert_eq!(
+                tags.iter()
+                    .filter(|(candidate, candidate_value)| {
+                        candidate == key && candidate_value == value
+                    })
+                    .count(),
+                1,
+                "fallback payload must contain canonical {key} exactly once: {tags:?}"
+            );
+        }
+
         let flac = metaflac_tag_args(Path::new("track.flac"), &tags, &existing);
         assert!(flac.iter().any(|arg| arg == "--remove-tag=COMMENT"));
         assert!(flac.iter().any(|arg| arg == "--remove-tag=CATALOG"));
-        assert!(flac.iter().any(|arg| arg == "--remove-tag=TONEPOET_ALBUM_STALE_DYNAMIC"));
+        assert!(flac
+            .iter()
+            .any(|arg| arg == "--remove-tag=TONEPOET_ALBUM_STALE_DYNAMIC"));
+        for alias in reader_aliases {
+            assert!(
+                flac.iter().any(|arg| arg == &format!("--remove-tag={alias}")),
+                "metaflac did not delete reader alias {alias}: {flac:?}"
+            );
+        }
         assert!(!flac.iter().any(|arg| arg == "--remove-tag=USER_NOTE"));
-        assert_pair(&flac, "--set-tag=TITLE=Cue Track", "--set-tag=ARTIST=Cue Performer");
+        for (key, value) in canonical_writes {
+            let argument = format!("--set-tag={key}={value}");
+            assert_eq!(
+                flac.iter().filter(|candidate| *candidate == &argument).count(),
+                1,
+                "metaflac must write canonical {key} exactly once: {flac:?}"
+            );
+        }
         assert!(
-            flac.iter().position(|arg| arg == "--remove-tag=COMMENT").unwrap()
-                < flac.iter().position(|arg| arg == "--set-tag=TITLE=Cue Track").unwrap(),
-            "metaflac must delete stale managed keys before setting current values"
+            flac.iter().position(|arg| arg == "--remove-tag=MUSICBRAINZ RELEASE ID").unwrap()
+                < flac
+                    .iter()
+                    .position(|arg| arg == "--set-tag=MUSICBRAINZ_ALBUMID=album-123")
+                    .unwrap(),
+            "metaflac must delete stale aliases before canonical writes"
         );
 
         let opus = opustags_tag_args(Path::new("track.opus"), &tags, &existing);
         assert_pair(&opus, "--delete", "COMMENT");
         assert_pair(&opus, "--delete", "CATALOG");
         assert_pair(&opus, "--delete", "TONEPOET_ALBUM_STALE_DYNAMIC");
-        assert!(!opus.windows(2).any(|pair| pair[0] == "--delete" && pair[1] == "USER_NOTE"));
-        assert_pair(&opus, "-s", "TITLE=Cue Track");
+        for alias in reader_aliases {
+            assert_pair(&opus, "--delete", alias);
+        }
+        assert!(!opus
+            .windows(2)
+            .any(|pair| pair[0] == "--delete" && pair[1] == "USER_NOTE"));
+        for (key, value) in canonical_writes {
+            assert_eq!(
+                pair_count(&opus, "-s", &format!("{key}={value}")),
+                1,
+                "opustags must write canonical {key} exactly once: {opus:?}"
+            );
+        }
         assert!(
-            opus.iter().position(|arg| arg == "--delete").unwrap()
-                < opus.iter().position(|arg| arg == "-s").unwrap(),
-            "opustags must delete stale managed keys before setting current values"
+            opus.windows(2)
+                .position(|pair| {
+                    pair[0] == "--delete" && pair[1] == "MUSICBRAINZ RELEASE ID"
+                })
+                .unwrap()
+                < opus
+                    .windows(2)
+                    .position(|pair| pair[0] == "-s" && pair[1] == "MUSICBRAINZ_ALBUMID=album-123")
+                    .unwrap(),
+            "opustags must delete stale aliases before canonical writes"
         );
 
         let wavpack = wvtag_tag_args(Path::new("track.wv"), &tags, &existing);
         assert_pair(&wavpack, "-d", "COMMENT");
         assert_pair(&wavpack, "-d", "CATALOG");
         assert_pair(&wavpack, "-d", "TONEPOET_ALBUM_STALE_DYNAMIC");
-        assert!(!wavpack.windows(2).any(|pair| pair[0] == "-d" && pair[1] == "USER_NOTE"));
-        assert_pair(&wavpack, "-w", "TITLE=Cue Track");
-        assert_pair(&wavpack, "-w", "ARTIST=Cue Performer");
+        for alias in reader_aliases {
+            assert_pair(&wavpack, "-d", alias);
+        }
+        assert!(!wavpack
+            .windows(2)
+            .any(|pair| pair[0] == "-d" && pair[1] == "USER_NOTE"));
+        for (key, value) in canonical_writes {
+            assert_eq!(
+                pair_count(&wavpack, "-w", &format!("{key}={value}")),
+                1,
+                "wvtag must write canonical {key} exactly once: {wavpack:?}"
+            );
+        }
         assert!(
-            wavpack.iter().position(|arg| arg == "-d").unwrap()
-                < wavpack.iter().position(|arg| arg == "-w").unwrap(),
-            "wvtag must delete stale managed keys before setting current values"
+            wavpack
+                .windows(2)
+                .position(|pair| pair[0] == "-d" && pair[1] == "MUSICBRAINZ RELEASE ID")
+                .unwrap()
+                < wavpack
+                    .windows(2)
+                    .position(|pair| {
+                        pair[0] == "-w" && pair[1] == "MUSICBRAINZ_ALBUMID=album-123"
+                    })
+                    .unwrap(),
+            "wvtag must delete stale aliases before canonical writes"
         );
     }
 
@@ -9824,7 +10481,7 @@ fn build_conversion_log_at_with_runner(
     let metadata_stage_result = metadata_stage_outcome(outcome);
     let resampling_applies = resampling_applies_for_source(source, &req.settings);
     let bit_depth_change_applies = bit_depth_change_applies_for_source(source, &req.settings);
-    let dithering_applies = dithering_applies_for_source(source, &req.settings);
+    let dithering_applies = dithering_applies_for_source(source, &req.settings, &tracks);
     let successful_count = tracks
         .iter()
         .filter(|track| matches!(track.outcome, TrackOutcome::Ok))
@@ -10599,7 +11256,7 @@ fn build_conversion_log_common_fragment_with_runner(
         replaygain_stage_outcome(outcome),
         resampling_applies_for_source(source, &req.settings),
         bit_depth_change_applies_for_source(source, &req.settings),
-        dithering_applies_for_source(source, &req.settings),
+        dithering_applies_for_source(source, &req.settings, &tracks),
     );
 
     ConversionLogCommonFragment {
@@ -16020,10 +16677,18 @@ fn append_track_log(
         push_kv_line(
             log,
             "  Conversion",
-            conversion_summary(track, req, record.verified_output_bit_depth),
+            conversion_summary(
+                track,
+                req,
+                record.verified_output_bit_depth,
+                Some(command_records_prove_dither_for_track(track, record, &req.settings)),
+            ),
         );
         for warning in &track.warnings {
             push_kv_line(log, "  Warning", warning);
+        }
+        if let Some(disclosure) = per_track_dither_disclosure(track, record, req) {
+            push_kv_line(log, "  Warning", disclosure);
         }
     }
 
@@ -16233,24 +16898,21 @@ fn append_conversion_settings_section(
 ) {
     let settings = &req.settings;
     push_kv_line(log, "Target format", settings.target_format.display_name());
-    if resampling_applies {
-        push_kv_line(
-            log,
-            "Target sample rate",
-            target_sample_rate_setting_label(source, settings),
-        );
-        push_kv_line(log, "Resampler", actual_resampler_label(tracks, settings));
-    }
-    if bit_depth_change_applies {
-        push_kv_line(
-            log,
-            "Target bit depth",
-            bit_depth_target_label(settings.target_bit_depth),
-        );
-    }
-    if dithering_applies {
-        push_kv_line(log, "Dither type", dither_type_label(settings.dither_type));
-    }
+    push_kv_line(
+        log,
+        "Resampling",
+        resampling_log_line(source, settings, tracks, resampling_applies),
+    );
+    push_kv_line(
+        log,
+        "Bit-depth conversion",
+        bit_depth_conversion_log_line(source, settings, tracks, bit_depth_change_applies),
+    );
+    push_kv_line(
+        log,
+        "Dither",
+        dither_log_line(source, settings, tracks, dithering_applies),
+    );
     push_kv_line(log, "Force encode", yes_no(settings.force_encode));
     push_kv_line(log, "Merge mode", yes_no(req.merge));
 
@@ -16289,6 +16951,616 @@ fn append_conversion_settings_section(
         None => push_kv_line(log, "Folder template", "album-name fallback"),
     }
     push_kv_line(log, "Filename template", &req.naming.template);
+}
+
+fn sample_rate_transition_log_label(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> String {
+    let transitions = source
+        .tracks
+        .iter()
+        .filter_map(|track| {
+            let source_rate = track.scalar_sample_rate()?;
+            let target_rate = resolved_target_rate_hz(track, settings)?;
+            (source_rate != target_rate).then(|| {
+                let source_label = source_track_dsd_rate(track)
+                    .map(dsd_rate_label)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format_sample_rate(source_rate));
+                let target_label = if settings.target_format.is_dsd() {
+                    DsdRate::from_hz(target_rate)
+                        .map(dsd_rate_label)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format_sample_rate(target_rate))
+                } else {
+                    format_sample_rate(target_rate)
+                };
+                format!("{source_label} → {target_label}")
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if transitions.is_empty() {
+        target_sample_rate_setting_label(source, settings)
+    } else {
+        transitions.into_iter().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn resampling_log_line(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+    tracks: &[&TrackRecord],
+    applies: bool,
+) -> String {
+    if !applies {
+        return "no (source rate preserved)".to_string();
+    }
+
+    let transition = sample_rate_transition_log_label(source, settings);
+    if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, source_is_dsd(source)) {
+        return format!("yes (sox_ng rate, Reference policy, {transition})");
+    }
+    let detail = match actual_resampler_label(tracks, settings) {
+        "soxr" => {
+            let precision = tonepoet_pipeline::mapping::soxr_precision(settings.resample_quality);
+            let cutoff = settings
+                .soxr_resampler
+                .cutoff
+                .unwrap_or_else(|| {
+                    tonepoet_pipeline::mapping::ffmpeg_cutoff(settings.nyquist_transition)
+                });
+            let mut fields = vec![
+                "soxr via ffmpeg aresample".to_string(),
+                format!("precision={precision}"),
+                format!("cutoff={cutoff:.3}"),
+            ];
+            if settings.soxr_resampler.chebyshev {
+                fields.push("cheby=1".to_string());
+            }
+            if let Some(phase) = settings.soxr_resampler.phase {
+                fields.push(format!("phase_shift={phase}"));
+            }
+            fields.join(", ")
+        }
+        "SoX" => {
+            let sox = settings.sox_resampler;
+            let mut fields = vec![format!(
+                "SoX rate {}",
+                tonepoet_pipeline::mapping::sox_rate_quality_flag(settings.resample_quality)
+            )];
+            if sox.chebyshev {
+                fields.push("chebyshev".to_string());
+            } else if let Some(bandwidth) = sox.bandwidth_pct {
+                fields.push(format!("bandwidth={}", decimal_label(bandwidth)));
+            } else if let Some(bandwidth) =
+                tonepoet_pipeline::mapping::sox_bandwidth_percent(settings.nyquist_transition)
+            {
+                fields.push(format!("bandwidth={bandwidth}"));
+            }
+            if let Some(phase) = sox.phase {
+                fields.push(format!("phase={phase}"));
+            }
+            if sox.allow_aliasing {
+                fields.push("allow_aliasing=yes".to_string());
+            }
+            if let Some(taps) = sox.sinc_taps {
+                fields.push(format!("sinc_taps={taps}"));
+            }
+            if let Some(attenuation) = sox.sinc_attenuation_db {
+                fields.push(format!("sinc_attenuation={attenuation} dB"));
+            }
+            if let Some(passband) = sox.sinc_passband_hz {
+                fields.push(format!("sinc_passband={} Hz", decimal_label(passband)));
+            }
+            if let Some(transition) = sox.sinc_transition_hz {
+                fields.push(format!(
+                    "sinc_transition={} Hz",
+                    decimal_label(transition)
+                ));
+            }
+            if let Some(beta) = sox.sinc_kaiser_beta {
+                fields.push(format!("sinc_kaiser_beta={}", decimal_label(beta)));
+            }
+            if let Some(phase) = sox.sinc_phase {
+                fields.push(format!("sinc_phase={}", sox_sinc_phase_label(phase)));
+            }
+            fields.join(", ")
+        }
+        "SSRC" => {
+            let mut fields = vec![format!(
+                "SSRC profile={}",
+                ssrc_profile_label(
+                    settings.ssrc.profile,
+                    settings.resample_quality,
+                    settings.ssrc.insane_mode,
+                )
+            )];
+            if let Some(attenuation) = settings.ssrc.attenuation_db {
+                fields.push(format!(
+                    "attenuation={} dB",
+                    decimal_label(attenuation)
+                ));
+            }
+            fields.push(format!(
+                "phase={}",
+                if settings.ssrc.min_phase {
+                    "minimum"
+                } else {
+                    "linear"
+                }
+            ));
+            fields.join(", ")
+        }
+        other => other.to_string(),
+    };
+    format!("yes ({detail}, {transition})")
+}
+
+fn bit_depth_transition_log_label(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> String {
+    let transitions = source
+        .tracks
+        .iter()
+        .filter_map(|track| {
+            let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+                .or_else(|| {
+                    source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)
+                })?;
+            let target_label = pcm_bit_depth_label(target_depth);
+            match super::plan_bridge::resolve_source_pcm_depth(track) {
+                Some(source_depth) if source_depth != target_depth => Some(format!(
+                    "{} → {target_label}",
+                    pcm_bit_depth_label(source_depth)
+                )),
+                Some(_) => None,
+                None => match track
+                    .source_audio
+                    .coding
+                    .unwrap_or(SourceAudioCoding::Unknown)
+                {
+                    SourceAudioCoding::Dsd => Some(format!("DSD → {target_label}")),
+                    SourceAudioCoding::Lossy => {
+                        Some(format!("decoded lossy source → {target_label}"))
+                    }
+                    SourceAudioCoding::Pcm
+                    | SourceAudioCoding::DvdaUnknown
+                    | SourceAudioCoding::Unknown => (settings.target_bit_depth
+                        != BitDepthTarget::Source)
+                        .then(|| format!("unknown source depth → {target_label}")),
+                },
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    if transitions.is_empty() {
+        bit_depth_target_label(settings.target_bit_depth)
+    } else {
+        transitions.into_iter().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn command_record_emits_dither(command: &CommandRecord) -> bool {
+    match command.binary {
+        ToolBinary::Ffmpeg => command
+            .sanitized_args
+            .iter()
+            .any(|arg| arg.contains("dither_method=")),
+        ToolBinary::Sox => command.sanitized_args.iter().any(|arg| arg == "dither"),
+        ToolBinary::Ssrc => {
+            let dither_id = command
+                .sanitized_args
+                .windows(2)
+                .find(|pair| pair[0] == "--dither")
+                .map(|pair| pair[1].as_str());
+            let has_pdf = command
+                .sanitized_args
+                .windows(2)
+                .any(|pair| pair[0] == "--pdf");
+            // SSRC ID 99 is the no-shaper terminal quantizer. It represents
+            // actual dither only when paired with an explicit PDF; all other
+            // IDs select a dither/noise-shaping stage themselves.
+            dither_id.is_some_and(|id| id != "99" || has_pdf)
+        }
+        _ => false,
+    }
+}
+
+fn command_record_proves_dither_for_target(
+    command: &CommandRecord,
+    target_depth: Option<tonepoet_pipeline::PcmBitDepth>,
+    reference_dsd: bool,
+) -> bool {
+    // A trailing SoX `dither` token is not sufficient evidence for ordinary
+    // Int32 output: SoX 14.4.2 accepts that command while producing
+    // byte-identical samples. The qualified DSD Reference route is separately
+    // identity-bound and may use command evidence for its policy-fixed stage.
+    if command.binary == ToolBinary::Sox
+        && target_depth == Some(tonepoet_pipeline::PcmBitDepth::Int32)
+        && !reference_dsd
+    {
+        return false;
+    }
+    command_record_emits_dither(command)
+}
+
+fn command_records_prove_dither_for_track(
+    track: &PreparedTrack,
+    record: &TrackRecord,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+        .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
+    let reference_dsd = tonepoet_pipeline::selects_reference_dsd_to_pcm(
+        settings,
+        track.source_audio.coding == Some(SourceAudioCoding::Dsd),
+    );
+    record
+        .commands
+        .iter()
+        .any(|command| command_record_proves_dither_for_target(command, target_depth, reference_dsd))
+}
+
+fn command_records_prove_dither_for_source(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+    tracks: &[&TrackRecord],
+) -> bool {
+    tracks.iter().enumerate().any(|(index, record)| {
+        if let Some(prepared) = source.tracks.get(index) {
+            return command_records_prove_dither_for_track(prepared, record, settings);
+        }
+        // A malformed or partial record/source pairing must not let an
+        // unqualified SoX Int32 token become affirmative evidence. Fall back
+        // to the global target only, with no Reference-policy exemption.
+        let target_depth = source_has_int32_target(source, settings)
+            .then_some(tonepoet_pipeline::PcmBitDepth::Int32);
+        record.commands.iter().any(|command| {
+            command_record_proves_dither_for_target(command, target_depth, false)
+        })
+    })
+}
+
+fn command_records_use_tool(tracks: &[&TrackRecord], binary: ToolBinary) -> bool {
+    tracks
+        .iter()
+        .any(|track| track.commands.iter().any(|command| command.binary == binary))
+}
+
+fn processing_tool_label(
+    tracks: &[&TrackRecord],
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> &'static str {
+    // Prefer the terminal resampler over preparatory decode commands. SSRC
+    // pipelines commonly contain an ffmpeg decode before the SSRC process,
+    // and Reference/SoX paths may likewise contain auxiliary commands.
+    if command_records_use_tool(tracks, ToolBinary::Ssrc) {
+        return "SSRC";
+    }
+    for track in tracks {
+        for command in &track.commands {
+            if !command_record_performs_resampling(command) {
+                continue;
+            }
+            return match command.binary {
+                ToolBinary::Sox => "SoX",
+                ToolBinary::Ffmpeg => "ffmpeg aresample",
+                ToolBinary::Ssrc => "SSRC",
+                _ => preferred_resampler_label(settings),
+            };
+        }
+    }
+    if command_records_use_tool(tracks, ToolBinary::Sox) {
+        "SoX"
+    } else if command_records_use_tool(tracks, ToolBinary::Ffmpeg) {
+        "ffmpeg aresample"
+    } else {
+        match preferred_resampler_family(settings) {
+            ResamplerFamily::Sox => "SoX",
+            ResamplerFamily::Ssrc => "SSRC",
+            ResamplerFamily::Soxr | ResamplerFamily::Auto => "ffmpeg aresample",
+        }
+    }
+}
+
+fn applied_dither_tool_label(
+    source: &PreparedSource,
+    tracks: &[&TrackRecord],
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> String {
+    let mut tools = BTreeSet::new();
+    for (index, record) in tracks.iter().enumerate() {
+        let prepared = source.tracks.get(index);
+        let target_depth = prepared
+            .and_then(|track| resolved_target_pcm_depth(track, settings.target_bit_depth)
+                .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)))
+            .or_else(|| source_has_int32_target(source, settings)
+                .then_some(tonepoet_pipeline::PcmBitDepth::Int32));
+        let reference_dsd = prepared.is_some_and(|track| {
+            tonepoet_pipeline::selects_reference_dsd_to_pcm(
+                settings,
+                track.source_audio.coding == Some(SourceAudioCoding::Dsd),
+            )
+        });
+        for command in &record.commands {
+            if command_record_proves_dither_for_target(command, target_depth, reference_dsd) {
+                tools.insert(match command.binary {
+                    ToolBinary::Ffmpeg => "ffmpeg aresample",
+                    ToolBinary::Sox => "SoX",
+                    ToolBinary::Ssrc => "SSRC",
+                    _ => unreachable!("only dither-capable tools are inserted"),
+                });
+            }
+        }
+    }
+    if tools.is_empty() {
+        processing_tool_label(tracks, settings).to_string()
+    } else {
+        tools.into_iter().collect::<Vec<_>>().join(" + ")
+    }
+}
+
+fn ssrc_dither_command_settings(command: &CommandRecord) -> Option<String> {
+    if command.binary != ToolBinary::Ssrc || !command_record_emits_dither(command) {
+        return None;
+    }
+    let dither_id = command
+        .sanitized_args
+        .windows(2)
+        .find(|pair| pair[0] == "--dither")
+        .map(|pair| pair[1].as_str())?;
+    let mut fields = vec![format!("dither_id={dither_id}")];
+    if let Some(pdf) = command
+        .sanitized_args
+        .windows(2)
+        .find(|pair| pair[0] == "--pdf")
+        .map(|pair| pair[1].as_str())
+    {
+        fields.push(format!("pdf={pdf}"));
+    }
+    Some(fields.join(", "))
+}
+
+fn applied_dither_description(
+    source: &PreparedSource,
+    tracks: &[&TrackRecord],
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> String {
+    let algorithm = if settings.dither_type == DitherType::None {
+        "command-selected dither/noise shaping".to_string()
+    } else {
+        dither_type_label(settings.dither_type).to_string()
+    };
+    let tools = applied_dither_tool_label(source, tracks, settings);
+    let ssrc_settings = tracks
+        .iter()
+        .flat_map(|track| track.commands.iter())
+        .filter_map(ssrc_dither_command_settings)
+        .collect::<BTreeSet<_>>();
+    let mut description = format!("{algorithm} via {tools}");
+    if !ssrc_settings.is_empty() {
+        if let Some(note) =
+            tonepoet_pipeline::mapping::ssrc_dither_approximation_note(settings.dither_type)
+        {
+            description.push_str("; ");
+            description.push_str(note);
+        }
+        description.push_str(", ");
+        description.push_str(&ssrc_settings.into_iter().collect::<Vec<_>>().join(" + "));
+    }
+    description
+}
+
+fn bit_depth_processing_label(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+    tracks: &[&TrackRecord],
+) -> String {
+    let tool = processing_tool_label(tracks, settings);
+    let mut all_known_integer_changes_are_widening = true;
+    let mut saw_known_integer_change = false;
+    let mut has_float_target = false;
+
+    for track in &source.tracks {
+        let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+            .or_else(|| {
+                source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)
+            });
+        let Some(target_depth) = target_depth else {
+            continue;
+        };
+        if target_depth.is_float() {
+            has_float_target = true;
+            continue;
+        }
+        match super::plan_bridge::resolve_source_pcm_depth(track) {
+            Some(source_depth) if source_depth != target_depth => {
+                saw_known_integer_change = true;
+                if target_depth.bits() <= source_depth.bits() {
+                    all_known_integer_changes_are_widening = false;
+                }
+            }
+            Some(_) => {}
+            None => {
+                // DSD, decoded lossy, and unknown-width PCM sources require an
+                // actual terminal integer quantization step, not mere widening.
+                all_known_integer_changes_are_widening = false;
+            }
+        }
+    }
+
+    if has_float_target {
+        match tool {
+            "SoX" => "SoX floating-point sample-format conversion".to_string(),
+            "SSRC" => "SSRC floating-point sample-format conversion".to_string(),
+            _ => "swresample floating-point sample-format conversion".to_string(),
+        }
+    } else if saw_known_integer_change && all_known_integer_changes_are_widening {
+        match tool {
+            "SoX" => "SoX integer widening".to_string(),
+            "SSRC" => "SSRC integer widening".to_string(),
+            _ => "swresample integer widening".to_string(),
+        }
+    } else {
+        match tool {
+            "SoX" => "SoX output quantization".to_string(),
+            "SSRC" => "SSRC quantization".to_string(),
+            _ => "swresample quantization".to_string(),
+        }
+    }
+}
+
+fn bit_depth_conversion_log_line(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+    tracks: &[&TrackRecord],
+    applies: bool,
+) -> String {
+    if settings.target_format.is_dsd() {
+        return "no (PCM bit depth not applicable — DSD target)".to_string();
+    }
+    if settings.target_format.is_lossy() {
+        return "no (not applicable — lossy encoder has no fixed PCM output depth)".to_string();
+    }
+    if !applies {
+        return "no (source depth preserved)".to_string();
+    }
+    format!(
+        "yes ({}, {})",
+        bit_depth_transition_log_label(source, settings),
+        bit_depth_processing_label(source, settings, tracks)
+    )
+}
+
+fn source_has_float_target(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    source.tracks.iter().any(|track| {
+        resolved_target_pcm_depth(track, settings.target_bit_depth)
+            .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth))
+            .is_some_and(PcmBitDepth::is_float)
+    })
+}
+
+fn source_has_int32_target(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    source.tracks.iter().any(|track| {
+        resolved_target_pcm_depth(track, settings.target_bit_depth)
+            .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth))
+            == Some(PcmBitDepth::Int32)
+    })
+}
+
+fn track_depth_reduction_requires_dither(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+        .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
+    let Some(target) = target_depth else {
+        return false;
+    };
+    if !matches!(
+        target,
+        tonepoet_pipeline::PcmBitDepth::Int8
+            | tonepoet_pipeline::PcmBitDepth::Int16
+            | tonepoet_pipeline::PcmBitDepth::Int24
+    ) {
+        return false;
+    }
+    super::plan_bridge::resolve_dither_source_pcm_depth(track)
+        .map(|source| target.bits() < source.bits())
+        .unwrap_or(true)
+}
+
+fn source_depth_reduction_requires_dither(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    source
+        .tracks
+        .iter()
+        .any(|track| track_depth_reduction_requires_dither(track, settings))
+}
+
+fn dither_log_line(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+    tracks: &[&TrackRecord],
+    applies: bool,
+) -> String {
+    if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, source_is_dsd(source)) {
+        if source_has_float_target(source, settings) {
+            return "no (float terminal; Reference policy)".to_string();
+        }
+        if !tracks.is_empty() && !applies {
+            return "requested (TPDF, Reference policy) — not applied (executed command did not emit the policy dither stage)"
+                .to_string();
+        }
+        return "yes (TPDF, sox_ng, Reference policy)".to_string();
+    }
+    if applies {
+        return format!("yes ({})", applied_dither_description(source, tracks, settings));
+    }
+    if settings.dither_type == DitherType::None {
+        return "no (not requested)".to_string();
+    }
+    let requested = dither_type_label(settings.dither_type);
+    if settings.target_format.is_dsd() {
+        return format!(
+            "requested ({requested}) — not applied (PCM dither is not applicable to a DSD target)"
+        );
+    }
+    if settings.target_format.is_lossy() {
+        return format!(
+            "requested ({requested}) — not applied (lossy encoder has no fixed PCM target depth)"
+        );
+    }
+    if source_has_float_target(source, settings) {
+        return format!(
+            "requested ({requested}) — not applied (float targets are not dithered)"
+        );
+    }
+    if source_has_int32_target(source, settings) {
+        if !settings.dither_explicit {
+            return format!(
+                "requested ({requested}) — not applied (32-bit default gate; selection was not explicit)"
+            );
+        }
+        let tool = processing_tool_label(tracks, settings);
+        if tool == "SSRC" {
+            return format!(
+                "requested ({requested}) — not applied (SSRC has no 32-bit dither stage)"
+            );
+        }
+        if tool == "SoX" {
+            return format!(
+                "requested ({requested}) — not applied (ordinary SoX Int32 dither is not behavior-qualified)"
+            );
+        }
+        if tool == "ffmpeg aresample"
+            && tonepoet_pipeline::mapping::soxr_dither_method(settings.dither_type).is_none()
+        {
+            return format!(
+                "requested ({requested}) — not applied (not supported by the ffmpeg/soxr resampler)"
+            );
+        }
+        return format!(
+            "requested ({requested}) — not applied (executed command did not emit a dither stage)"
+        );
+    }
+    if source_depth_reduction_requires_dither(source, settings) {
+        return format!(
+            "requested ({requested}) — not applied (executed command did not emit a dither stage)"
+        );
+    }
+    format!(
+        "requested ({requested}) — not applied (not needed — no bit-depth reduction)"
+    )
 }
 
 fn append_target_format_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
@@ -16772,10 +18044,78 @@ fn metadata_dimension_labels(value: PlannedMetadataSatisfaction) -> Vec<&'static
     labels
 }
 
+fn per_track_dither_disclosure(
+    track: &PreparedTrack,
+    record: &TrackRecord,
+    req: &PipelineRequest,
+) -> Option<String> {
+    let settings = &req.settings;
+    if settings.dither_type == DitherType::None
+        || tonepoet_pipeline::selects_reference_dsd_to_pcm(
+            settings,
+            track.source_audio.coding == Some(SourceAudioCoding::Dsd),
+        )
+    {
+        return None;
+    }
+
+    let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+        .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
+    if command_records_prove_dither_for_track(track, record, settings) {
+        return None;
+    }
+
+    let requested = dither_type_label(settings.dither_type);
+    if settings.target_format.is_dsd() {
+        return Some(format!(
+            "Dither requested ({requested}) — not applied (PCM dither is not applicable to a DSD target)"
+        ));
+    }
+    if settings.target_format.is_lossy() {
+        return Some(format!(
+            "Dither requested ({requested}) — not applied (lossy encoder has no fixed PCM target depth)"
+        ));
+    }
+
+    let reason = match target_depth {
+        Some(depth) if depth.is_float() => "float targets are not dithered",
+        Some(tonepoet_pipeline::PcmBitDepth::Int32) if !settings.dither_explicit => {
+            "32-bit default gate; selection was not explicit"
+        }
+        Some(tonepoet_pipeline::PcmBitDepth::Int32)
+            if command_records_use_tool(&[record], ToolBinary::Ssrc) =>
+        {
+            "SSRC has no 32-bit dither stage"
+        }
+        Some(tonepoet_pipeline::PcmBitDepth::Int32)
+            if command_records_use_tool(&[record], ToolBinary::Sox) =>
+        {
+            "ordinary SoX Int32 dither is not behavior-qualified"
+        }
+        Some(tonepoet_pipeline::PcmBitDepth::Int32)
+            if command_records_use_tool(&[record], ToolBinary::Ffmpeg)
+                && tonepoet_pipeline::mapping::soxr_dither_method(settings.dither_type).is_none() =>
+        {
+            "not supported by the ffmpeg/soxr resampler"
+        }
+        Some(tonepoet_pipeline::PcmBitDepth::Int32) if settings.dither_explicit => {
+            "executed command did not emit a dither stage"
+        }
+        _ if track_depth_reduction_requires_dither(track, settings) => {
+            "executed command did not emit a dither stage"
+        }
+        _ => "not needed — no bit-depth reduction",
+    };
+    Some(format!(
+        "Dither requested ({requested}) — not applied ({reason})"
+    ))
+}
+
 fn conversion_summary(
     track: &PreparedTrack,
     req: &PipelineRequest,
     verified_output_bit_depth: Option<tonepoet_pipeline::PcmBitDepth>,
+    actual_dither_applied: Option<bool>,
 ) -> String {
     let source_rate = track.scalar_sample_rate();
     let source_depth_bits = track.bit_depth.or(track.source_audio.bit_depth);
@@ -16849,12 +18189,30 @@ fn conversion_summary(
             transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
         }
     }
-    if dither_applies(
-        super::plan_bridge::resolve_dither_source_pcm_depth(track),
-        planned_target_pcm_depth,
-        req.settings.dither_type,
-    ) {
-        transforms.push(format!("{} dither", dither_type_label(req.settings.dither_type)));
+    let dither_applied = actual_dither_applied.unwrap_or_else(|| {
+        dither_applies(
+            super::plan_bridge::resolve_dither_source_pcm_depth(track),
+            planned_target_pcm_depth,
+            req.settings.dither_type,
+            req.settings.dither_explicit,
+            preferred_resampler_family(&req.settings),
+        )
+    });
+    if dither_applied {
+        let label = if req.settings.dither_type == DitherType::None {
+            "command-selected".to_string()
+        } else {
+            dither_type_label(req.settings.dither_type).to_string()
+        };
+        transforms.push(format!("{label} dither"));
+    } else if actual_dither_applied == Some(false)
+        && req.settings.dither_type != DitherType::None
+        && !tonepoet_pipeline::selects_reference_dsd_to_pcm(
+            &req.settings,
+            track.source_audio.coding == Some(SourceAudioCoding::Dsd),
+        )
+    {
+        transforms.push("dither requested but not applied".to_string());
     }
     if !transforms.is_empty() {
         summary.push_str(&format!(" ({})", transforms.join(", ")));
@@ -16932,17 +18290,29 @@ fn bit_depth_change_applies_for_source(
     source: &PreparedSource,
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
-    if settings.target_format.is_dsd() || settings.target_bit_depth == BitDepthTarget::Source {
+    if settings.target_format.is_dsd() {
         return false;
     }
     source.tracks.iter().any(|track| {
-        match (
-            super::plan_bridge::resolve_source_pcm_depth(track),
-            resolved_target_pcm_depth(track, settings.target_bit_depth)
-                .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)),
-        ) {
-            (Some(source_depth), Some(target_depth)) => source_depth != target_depth,
-            _ => false,
+        let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+            .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
+        let Some(target_depth) = target_depth else {
+            return false;
+        };
+        match super::plan_bridge::resolve_source_pcm_depth(track) {
+            Some(source_depth) => source_depth != target_depth,
+            None => match track
+                .source_audio
+                .coding
+                .unwrap_or(SourceAudioCoding::Unknown)
+            {
+                SourceAudioCoding::Dsd | SourceAudioCoding::Lossy => true,
+                SourceAudioCoding::Pcm
+                | SourceAudioCoding::DvdaUnknown
+                | SourceAudioCoding::Unknown => {
+                    settings.target_bit_depth != BitDepthTarget::Source
+                }
+            },
         }
     })
 }
@@ -16950,9 +18320,21 @@ fn bit_depth_change_applies_for_source(
 fn dithering_applies_for_source(
     source: &PreparedSource,
     settings: &tonepoet_pipeline::PipelineSettings,
+    tracks: &[&TrackRecord],
 ) -> bool {
     if settings.target_format.is_dsd() {
         return false;
+    }
+    if !tracks.is_empty() {
+        return command_records_prove_dither_for_source(source, settings, tracks);
+    }
+    if source.tracks.iter().any(|track| {
+        tonepoet_pipeline::selects_reference_dsd_to_pcm(
+            settings,
+            track.source_audio.coding == Some(SourceAudioCoding::Dsd),
+        )
+    }) {
+        return !source_has_float_target(source, settings);
     }
     source.tracks.iter().any(|track| {
         dither_applies(
@@ -16960,6 +18342,8 @@ fn dithering_applies_for_source(
             resolved_target_pcm_depth(track, settings.target_bit_depth)
                 .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)),
             settings.dither_type,
+            settings.dither_explicit,
+            preferred_resampler_family(settings),
         )
     })
 }
@@ -16968,6 +18352,8 @@ fn dither_applies(
     source_depth: Option<tonepoet_pipeline::PcmBitDepth>,
     target_depth: Option<tonepoet_pipeline::PcmBitDepth>,
     dither: DitherType,
+    dither_explicit: bool,
+    resampler: ResamplerFamily,
 ) -> bool {
     if dither == DitherType::None {
         return false;
@@ -16980,9 +18366,18 @@ fn dither_applies(
         ) => source_depth
             .map(|source| target.bits() < source.bits())
             .unwrap_or(true),
+        Some(tonepoet_pipeline::PcmBitDepth::Int32) => {
+            // Ordinary SoX Int32 dither is not behavior-qualified: supported
+            // installations may accept the effect while producing unchanged
+            // samples. Only the mapped ffmpeg/soxr path may claim application
+            // without executed command records. Reference DSD is handled by
+            // its separate qualified-policy branch above.
+            dither_explicit
+                && matches!(resampler, ResamplerFamily::Soxr | ResamplerFamily::Auto)
+                && tonepoet_pipeline::mapping::soxr_dither_method(dither).is_some()
+        }
         Some(
-            tonepoet_pipeline::PcmBitDepth::Int32
-            | tonepoet_pipeline::PcmBitDepth::Float32
+            tonepoet_pipeline::PcmBitDepth::Float32
             | tonepoet_pipeline::PcmBitDepth::Float64,
         )
         | None => false,
@@ -17195,10 +18590,34 @@ fn preferred_resampler_label(settings: &tonepoet_pipeline::PipelineSettings) -> 
 
 /// Derive the actual resampler tool from executed track commands.
 ///
-/// Scans track records for the command that performed resampling or DSD→PCM
-/// conversion and returns its tool name. Falls back to the user's preference
+/// Scans track records for the command that performed PCM resampling, DSD→PCM,
+/// or PCM→DSD rate conversion and returns its tool name. Falls back to the user's preference
 /// if no resampling command is found (defensive — shouldn't happen when
 /// `resampling_applies` is true).
+fn command_record_performs_resampling(command: &CommandRecord) -> bool {
+    let description_matches = command
+        .description
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|description| {
+            description.contains("resampl")
+                || description.contains("dsd to pcm")
+                || description.contains("pcm to dsd")
+        });
+    if description_matches {
+        return true;
+    }
+
+    match command.binary {
+        ToolBinary::Ssrc => true,
+        ToolBinary::Sox => command.sanitized_args.iter().any(|arg| arg == "rate"),
+        ToolBinary::Ffmpeg => command.sanitized_args.iter().any(|arg| {
+            arg.contains("aresample=") || arg.contains("out_sample_rate=")
+        }),
+        _ => false,
+    }
+}
+
 fn actual_resampler_label(
     tracks: &[&TrackRecord],
     settings: &tonepoet_pipeline::PipelineSettings,
@@ -17207,24 +18626,24 @@ fn actual_resampler_label(
     // Check this first to avoid false-matching on preprocessing commands
     // like "Decode to PCM for SSRC" which use ffmpeg, not SSRC itself.
     for track in tracks {
-        if track.commands.iter().any(|c| matches!(c.binary, ToolBinary::Ssrc)) {
+        if track
+            .commands
+            .iter()
+            .any(|command| command.binary == ToolBinary::Ssrc)
+        {
             return "SSRC";
         }
     }
-    // Look for DSD→PCM or resampling commands by description.
     for track in tracks {
         for command in &track.commands {
-            let desc = match command.description.as_deref() {
-                Some(d) => d,
-                None => continue,
-            };
-            if desc.contains("DSD to PCM") || desc.contains("resampl") || desc.contains("Resampl") {
-                return match command.binary {
-                    ToolBinary::Sox => "SoX",
-                    ToolBinary::Ffmpeg => "soxr",
-                    _ => preferred_resampler_label(settings),
-                };
+            if !command_record_performs_resampling(command) {
+                continue;
             }
+            return match command.binary {
+                ToolBinary::Sox => "SoX",
+                ToolBinary::Ffmpeg => "soxr",
+                _ => preferred_resampler_label(settings),
+            };
         }
     }
     preferred_resampler_label(settings)
@@ -20849,7 +22268,7 @@ fn action_coordination_dir(req: &PipelineRequest) -> PathBuf {
     })
 }
 
-fn action_semantics() -> ActionSemantics {
+pub(crate) fn action_semantics() -> ActionSemantics {
     ActionSemantics {
         wildcard_matches: conversion_action_wildcard_matches,
         render_template: conversion_action_render_template,
@@ -22096,8 +23515,24 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
         MetadataTextOverride::Clear => {
             source.album_metadata.album_artist = None;
             remove_preserved_source_album_artist_tag(&mut source.album_metadata);
+            source
+                .album_metadata
+                .extra
+                .remove(EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY);
+            source.album_metadata.extra.insert(
+                EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY.to_string(),
+                "1".to_string(),
+            );
             for track in &mut source.tracks {
                 track.metadata.album_artist = None;
+                track
+                    .metadata
+                    .extra
+                    .remove(EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY);
+                track.metadata.extra.insert(
+                    EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY.to_string(),
+                    "1".to_string(),
+                );
             }
         }
         MetadataTextOverride::Set(value) => {
@@ -22105,8 +23540,24 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
             if !value.is_empty() {
                 source.album_metadata.album_artist = Some(value.to_string());
                 remove_preserved_source_album_artist_tag(&mut source.album_metadata);
+                source
+                    .album_metadata
+                    .extra
+                    .remove(EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY);
+                source.album_metadata.extra.insert(
+                    EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY.to_string(),
+                    value.to_string(),
+                );
                 for track in &mut source.tracks {
                     track.metadata.album_artist = Some(value.to_string());
+                    track
+                        .metadata
+                        .extra
+                        .remove(EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY);
+                    track.metadata.extra.insert(
+                        EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY.to_string(),
+                        value.to_string(),
+                    );
                 }
             }
         }
@@ -29005,6 +30456,148 @@ mod companion_copy_hardening_tests {
     }
 
     #[test]
+    fn fallback_authority_survives_real_batch_identity_mutation_without_tag_fabrication() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("untagged-invalid-ape.wv");
+        let identity_key = source_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+
+        let make_source = || {
+            let mut metadata = TrackMetadata {
+                title: Some("Source Title".to_string()),
+                artist: Some("Source Artist".to_string()),
+                ..TrackMetadata::default()
+            };
+            insert_fallback_source_tag(&mut metadata.extra, "TITLE", "Source Title");
+            insert_fallback_source_tag(&mut metadata.extra, "ARTIST", "Source Artist");
+            insert_fallback_source_tag(&mut metadata.extra, "LABEL", "Source Label");
+            PreparedSource {
+                container: source_path.clone(),
+                kind: SourceKind::SingleFile,
+                tracks: vec![PreparedTrack {
+                    id: TrackId {
+                        source_ordinal: 1,
+                        disc_number: None,
+                        track_number: 1,
+                    },
+                    source_ref: TrackSourceRef::StagedFile(source_path.clone()),
+                    metadata,
+                    expected_samples: None,
+                    sample_rate: Some(44_100),
+                    bit_depth: Some(24),
+                    source_audio: SourceAudioDescriptor::from_scalar(
+                        Some(44_100),
+                        Some(24),
+                        Some(SourceAudioCoding::Pcm),
+                    ),
+                    warnings: Vec::new(),
+                }],
+                // These values simulate label/path enrichment that occurred
+                // before batch identity was applied. None is source authority.
+                album_metadata: AlbumMetadata {
+                    album: Some("Label-Inferred Album".to_string()),
+                    album_artist: Some("Label-Inferred Artist".to_string()),
+                    date: Some("1988".to_string()),
+                    total_tracks: 1,
+                    total_discs: Some(2),
+                    disc_number: Some(1),
+                    extra: BTreeMap::from([
+                        (
+                            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+                            "native-apev2".to_string(),
+                        ),
+                        ("label".to_string(), "Inferred Label".to_string()),
+                        ("catalog".to_string(), "INFERRED-001".to_string()),
+                    ]),
+                    ..AlbumMetadata::default()
+                },
+                provenance: ExtractionProvenance {
+                    source_kind: SourceKind::SingleFile,
+                    source_sha256: None,
+                    tool_versions: BTreeMap::new(),
+                    extracted_at: chrono::Utc::now(),
+                },
+            }
+        };
+
+        let mut request = test_request(temp.path(), source_path.clone());
+        request.batch_resolved_identity = Some(BatchResolvedAlbumIdentity {
+            album: Some("Batch Album".to_string()),
+            album_artist: Some("Batch Artist".to_string()),
+            date: Some("2001".to_string()),
+            total_discs: Some(2),
+            source_disc_numbers: BTreeMap::from([(identity_key.clone(), 2)]),
+        });
+
+        let mut source = make_source();
+        apply_batch_identity_and_request_metadata(&mut source, &request);
+        assert_eq!(source.album_metadata.album.as_deref(), Some("Batch Album"));
+        assert_eq!(source.album_metadata.date.as_deref(), Some("2001"));
+        assert_eq!(source.tracks[0].metadata.disc_number, Some(2));
+        let tags = authoritative_metadata_tags(
+            &source.tracks[0].metadata,
+            &source.album_metadata,
+        );
+        assert!(tags.contains(&("TITLE".to_string(), "Source Title".to_string())));
+        assert!(tags.contains(&("ARTIST".to_string(), "Source Artist".to_string())));
+        assert!(tags.contains(&("LABEL".to_string(), "Source Label".to_string())));
+        assert!(!tags.contains(&("LABEL".to_string(), "Inferred Label".to_string())));
+        for forbidden in [
+            "ALBUM",
+            "ALBUMARTIST",
+            "DATE",
+            "DISCNUMBER",
+            "DISCTOTAL",
+            "CATALOG",
+            "TONEPOET_ALBUM_LABEL",
+        ] {
+            assert!(
+                !tags.iter().any(|(key, _)| key == forbidden),
+                "organizational value {forbidden} leaked after the real mutation path: {tags:?}"
+            );
+        }
+
+        let mut overridden_request = request.clone();
+        overridden_request.metadata_overrides.album_artist =
+            MetadataTextOverride::Set("Explicit User Artist".to_string());
+        let mut overridden_source = make_source();
+        apply_batch_identity_and_request_metadata(&mut overridden_source, &overridden_request);
+        let overridden_tags = authoritative_metadata_tags(
+            &overridden_source.tracks[0].metadata,
+            &overridden_source.album_metadata,
+        );
+        assert!(overridden_tags.contains(&(
+            "ALBUMARTIST".to_string(),
+            "Explicit User Artist".to_string(),
+        )));
+        assert!(!overridden_tags.iter().any(|(key, _)| key == "ALBUM"));
+        assert!(!overridden_tags.iter().any(|(key, _)| key == "DATE"));
+        assert!(!overridden_tags.iter().any(|(key, _)| key == "DISCNUMBER"));
+
+        let mut cleared_request = request.clone();
+        cleared_request.metadata_overrides.album_artist = MetadataTextOverride::Clear;
+        let mut cleared_source = make_source();
+        cleared_source.tracks[0].metadata.album_artist =
+            Some("Source Album Artist".to_string());
+        insert_fallback_source_tag(
+            &mut cleared_source.tracks[0].metadata.extra,
+            "ALBUMARTIST",
+            "Source Album Artist",
+        );
+        apply_batch_identity_and_request_metadata(&mut cleared_source, &cleared_request);
+        let cleared_tags = authoritative_metadata_tags(
+            &cleared_source.tracks[0].metadata,
+            &cleared_source.album_metadata,
+        );
+        assert!(
+            !cleared_tags.iter().any(|(key, _)| key == "ALBUMARTIST"),
+            "an explicit clear must suppress the immutable source snapshot: {cleared_tags:?}"
+        );
+    }
+
+    #[test]
     fn actionless_publish_preflight_stages_only_recoverable_identity_invalidation() {
         let temp = tempfile::tempdir().expect("temp dir");
         let source_path = temp.path().join("source.flac");
@@ -34671,6 +36264,29 @@ mod side_prefixed_track_number_tests {
             key == "TRACKNUMBER" && value == "B11"
         }));
     }
+
+
+    #[test]
+    fn fallback_snapshot_side_number_keeps_output_metadata_numeric() {
+        let mut meta = TrackMetadata::default();
+        insert_fallback_source_tag(&mut meta.extra, "TRACKNUMBER", "A01");
+        let album = AlbumMetadata {
+            extra: BTreeMap::from([(
+                FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+                "native-apev2".to_string(),
+            )]),
+            ..AlbumMetadata::default()
+        };
+
+        let tags = authoritative_metadata_tags(&meta, &album);
+
+        assert!(tags.iter().any(|(key, value)| {
+            key == "TRACKNUMBER" && value == "1"
+        }));
+        assert!(!tags.iter().any(|(key, value)| {
+            key == "TRACKNUMBER" && value == "A01"
+        }));
+    }
 }
 
 fn template_track_number(source: &PreparedSource, track: &PreparedTrack) -> u32 {
@@ -39297,7 +40913,7 @@ mod conversion_log_tests {
     }
 
     #[test]
-    fn resampler_settings_are_printed_only_for_actual_rate_changes() {
+    fn dsp_settings_are_affirmative_and_resampler_details_follow_actual_rate_changes() {
         let source = log_test_source();
         let artifacts = log_test_artifacts();
         let outcome = AlbumOutcome::Complete {
@@ -39307,7 +40923,9 @@ mod conversion_log_tests {
 
         let req = log_test_request();
         let no_resample_log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-        assert!(!no_resample_log.contains("Resampler:"));
+        assert!(no_resample_log.contains("Resampling: no (source rate preserved)"));
+        assert!(no_resample_log.contains("Bit-depth conversion: no (source depth preserved)"));
+        assert!(no_resample_log.contains("Dither: no (not requested)"));
         assert!(!no_resample_log.contains("SSRC profile"));
 
         let mut resample_req = log_test_request();
@@ -39318,11 +40936,43 @@ mod conversion_log_tests {
         resample_req.settings.ssrc.dither_id = Some(2);
         resample_req.settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
         let resample_log = build_conversion_log(&outcome, &source, &resample_req, &artifacts, None);
-        assert!(resample_log.contains("Resampler: SSRC"));
+        assert!(resample_log.contains("Resampling: yes (SSRC profile="));
+        assert!(resample_log.contains("attenuation=1.5 dB, phase=minimum"));
+        assert!(resample_log.contains("96kHz → 48kHz"));
+        assert!(resample_log.contains("Bit-depth conversion: no (source depth preserved)"));
+        assert!(resample_log.contains("Dither: no (not requested)"));
         assert!(resample_log.contains("SSRC attenuation: 1.5 dB"));
         assert!(resample_log.contains("SSRC minimum phase: Yes"));
         assert!(resample_log.contains("SSRC dither ID: 2"));
         assert!(resample_log.contains("SSRC PDF type: triangular"));
+
+        let mut sox_req = log_test_request();
+        sox_req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
+        sox_req.settings.preferred_tool = PreferredTool::Sox;
+        sox_req.settings.sox_resampler.allow_aliasing = true;
+        sox_req.settings.sox_resampler.sinc_taps = Some(4096);
+        sox_req.settings.sox_resampler.sinc_attenuation_db = Some(120);
+        sox_req.settings.sox_resampler.sinc_passband_hz = Some(20_000.0);
+        sox_req.settings.sox_resampler.sinc_transition_hz = Some(2_000.0);
+        sox_req.settings.sox_resampler.sinc_kaiser_beta = Some(8.5);
+        sox_req.settings.sox_resampler.sinc_phase = Some(SoxSincPhase::Linear);
+        let sox_log = build_conversion_log(&outcome, &source, &sox_req, &artifacts, None);
+        let sox_line = sox_log
+            .lines()
+            .find(|line| line.starts_with("Resampling: yes (SoX rate"))
+            .expect("affirmative SoX resampling line");
+        for expected in [
+            "allow_aliasing=yes",
+            "sinc_taps=4096",
+            "sinc_attenuation=120 dB",
+            "sinc_passband=20000 Hz",
+            "sinc_transition=2000 Hz",
+            "sinc_kaiser_beta=8.5",
+            "sinc_phase=linear",
+            "96kHz → 48kHz",
+        ] {
+            assert!(sox_line.contains(expected), "missing {expected:?} in {sox_line}");
+        }
     }
 
     #[test]
@@ -39342,7 +40992,9 @@ mod conversion_log_tests {
         req.settings.soxr_resampler.phase = Some(45);
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Resampler: soxr"));
+        assert!(log.contains(
+            "Resampling: yes (soxr via ffmpeg aresample, precision=28, cutoff=0.970, phase_shift=45, 96kHz → 48kHz)"
+        ));
         assert!(log.contains("Soxr quality preset: very high"));
         assert!(log.contains("Soxr cutoff override: 0.97"));
         assert!(log.contains("Soxr phase response: 45"));
@@ -39564,6 +41216,13 @@ mod conversion_log_tests {
         let artifacts = log_test_artifacts();
         let mut record = ok_record();
         record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
+        record.commands = vec![command_record_for(ToolBinary::Ssrc)];
+        record.commands[0].sanitized_args = vec![
+            "--dither".to_string(),
+            "99".to_string(),
+            "--pdf".to_string(),
+            "1".to_string(),
+        ];
         let outcome = AlbumOutcome::Complete {
             tracks: vec![record],
             stages: stage_records(),
@@ -39574,9 +41233,131 @@ mod conversion_log_tests {
             "Conversion: 24-bit/96kHz FLAC → 16-bit/44.1kHz FLAC (SSRC resampling, TPDF dither)"
         ));
         assert!(!log.contains("output depth unverified"));
-        assert!(log.contains("Target sample rate: 44.1kHz"));
-        assert!(log.contains("Target bit depth: 16-bit"));
-        assert!(log.contains("Dither type: TPDF"));
+        assert!(log.contains("Resampling: yes (SSRC profile="));
+        assert!(log.contains("96kHz → 44.1kHz"));
+        assert!(log.contains("Bit-depth conversion: yes (24-bit → 16-bit, SSRC quantization)"));
+        assert!(log.contains("Dither: yes (TPDF via SSRC"));
+        assert!(log.contains("dither_id=99, pdf=1"));
+    }
+
+    #[test]
+    fn requested_but_unapplied_dither_is_disclosed_by_settings_and_track_lines() {
+        fn render(
+            source: &PreparedSource,
+            req: &PipelineRequest,
+            record: TrackRecord,
+        ) -> String {
+            build_conversion_log(
+                &AlbumOutcome::Complete {
+                    tracks: vec![record],
+                    stages: stage_records(),
+                },
+                source,
+                req,
+                &log_test_artifacts(),
+                None,
+            )
+        }
+
+        let source = log_test_source();
+
+        let mut automatic_int32 = log_test_request();
+        automatic_int32.settings.target_bit_depth =
+            BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        automatic_int32.settings.dither_type = DitherType::Tpdf;
+        automatic_int32.settings.preferred_tool = PreferredTool::Ffmpeg;
+        let mut automatic_record = ok_record();
+        automatic_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
+        let automatic_log = render(&source, &automatic_int32, automatic_record);
+        assert!(automatic_log.contains(
+            "Dither: requested (TPDF) — not applied (32-bit default gate; selection was not explicit)"
+        ));
+        assert!(automatic_log.contains(
+            "Warning: Dither requested (TPDF) — not applied (32-bit default gate; selection was not explicit)"
+        ));
+        assert!(automatic_log.contains("dither requested but not applied"));
+
+        let mut ssrc_int32 = automatic_int32.clone();
+        ssrc_int32.settings.dither_explicit = true;
+        ssrc_int32.settings.preferred_tool = PreferredTool::Ssrc;
+        let mut ssrc_record = ok_record();
+        ssrc_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
+        ssrc_record.commands = vec![command_record_for(ToolBinary::Ssrc)];
+        let ssrc_log = render(&source, &ssrc_int32, ssrc_record);
+        assert!(ssrc_log.contains(
+            "Dither: requested (TPDF) — not applied (SSRC has no 32-bit dither stage)"
+        ));
+        assert!(ssrc_log.contains(
+            "Warning: Dither requested (TPDF) — not applied (SSRC has no 32-bit dither stage)"
+        ));
+
+        let mut sox_int32 = automatic_int32.clone();
+        sox_int32.settings.dither_explicit = true;
+        sox_int32.settings.preferred_tool = PreferredTool::Sox;
+        let mut sox_record = ok_record();
+        sox_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
+        sox_record.commands = vec![command_record_for(ToolBinary::Sox)];
+        sox_record.commands[0].sanitized_args = vec!["dither".to_string()];
+        let sox_log = render(&source, &sox_int32, sox_record);
+        assert!(sox_log.contains(
+            "Dither: requested (TPDF) — not applied (ordinary SoX Int32 dither is not behavior-qualified)"
+        ));
+        assert!(sox_log.contains(
+            "Warning: Dither requested (TPDF) — not applied (ordinary SoX Int32 dither is not behavior-qualified)"
+        ));
+        assert!(!sox_log.contains("Dither: yes (TPDF via SoX)"));
+
+        let mut gesemann_int32 = automatic_int32.clone();
+        gesemann_int32.settings.dither_explicit = true;
+        gesemann_int32.settings.dither_type = DitherType::Gesemann;
+        let mut gesemann_record = ok_record();
+        gesemann_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
+        gesemann_record.commands = vec![command_record_for(ToolBinary::Ffmpeg)];
+        let gesemann_log = render(&source, &gesemann_int32, gesemann_record);
+        assert!(gesemann_log.contains(
+            "Dither: requested (Gesemann) — not applied (not supported by the ffmpeg/soxr resampler)"
+        ));
+        assert!(gesemann_log.contains(
+            "Warning: Dither requested (Gesemann) — not applied (not supported by the ffmpeg/soxr resampler)"
+        ));
+
+        let mut float_target = automatic_int32.clone();
+        float_target.settings.dither_explicit = true;
+        float_target.settings.target_bit_depth =
+            BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        let mut float_record = ok_record();
+        float_record.verified_output_bit_depth = Some(PcmBitDepth::Float32);
+        let float_log = render(&source, &float_target, float_record);
+        assert!(float_log.contains(
+            "Dither: requested (TPDF) — not applied (float targets are not dithered)"
+        ));
+        assert!(float_log.contains(
+            "Warning: Dither requested (TPDF) — not applied (float targets are not dithered)"
+        ));
+
+        let mut missing_reduction_stage = log_test_request();
+        missing_reduction_stage.settings.target_bit_depth =
+            BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        missing_reduction_stage.settings.dither_type = DitherType::Tpdf;
+        let mut missing_stage_record = ok_record();
+        missing_stage_record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
+        missing_stage_record.commands.clear();
+        let missing_stage_log = render(&source, &missing_reduction_stage, missing_stage_record);
+        assert!(missing_stage_log.contains(
+            "Dither: requested (TPDF) — not applied (executed command did not emit a dither stage)"
+        ));
+        assert!(missing_stage_log.contains(
+            "Warning: Dither requested (TPDF) — not applied (executed command did not emit a dither stage)"
+        ));
+
+        let mut unchanged_depth = log_test_request();
+        unchanged_depth.settings.target_bit_depth =
+            BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        unchanged_depth.settings.dither_type = DitherType::Tpdf;
+        let unchanged_log = render(&source, &unchanged_depth, ok_record());
+        assert!(unchanged_log.contains(
+            "Dither: requested (TPDF) — not applied (not needed — no bit-depth reduction)"
+        ));
     }
 
     #[test]
@@ -39589,7 +41370,7 @@ mod conversion_log_tests {
         req.settings.target_format = PlannerAudioFormat::WavPack;
         req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
 
-        let summary = conversion_summary(&source.tracks[0], &req, None);
+        let summary = conversion_summary(&source.tracks[0], &req, None, None);
 
         assert!(summary.contains("requested 32-bit/96kHz WavPack"), "{summary}");
         assert!(summary.contains("[output depth unverified]"), "{summary}");
@@ -39617,14 +41398,23 @@ mod conversion_log_tests {
         req.settings.target_sample_rate = RateTarget::Source;
 
         let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.commands = vec![command_record_for(ToolBinary::Sox)];
+        record.commands[0].description = Some("Reference DSD to PCM conversion".to_string());
+        record.commands[0].sanitized_args = vec![
+            "rate".to_string(),
+            "88200".to_string(),
+            "dither".to_string(),
+        ];
         let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
+            tracks: vec![record],
             stages: stage_records(),
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Target sample rate: 88.2kHz"));
-        assert!(log.contains("Resampler:"));
+        assert!(log.contains("Resampling: yes (sox_ng rate, Reference policy, DSD64 → 88.2kHz)"));
+        assert!(log.contains("Bit-depth conversion: yes (DSD → 24-bit"));
+        assert!(log.contains("Dither: yes (TPDF, sox_ng, Reference policy)"));
         // The record has no verified output depth, so the PCM-lossless target
         // is labelled as requested and flagged unverified (D6 honesty).
         assert!(
@@ -39682,13 +41472,20 @@ mod conversion_log_tests {
         req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd128);
 
         let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.commands = vec![command_record_for(ToolBinary::Sox)];
+        record.commands[0].description = Some("Convert PCM to DSD".to_string());
+        record.commands[0].sanitized_args = vec!["rate".to_string(), "5644800".to_string()];
         let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
+            tracks: vec![record],
             stages: stage_records(),
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Target sample rate: DSD128"));
+        assert!(log.contains("Resampling: yes (SoX rate"));
+        assert!(log.contains("96kHz → DSD128"));
+        assert!(log.contains("Bit-depth conversion: no (PCM bit depth not applicable — DSD target)"));
+        assert!(log.contains("Dither: no (not requested)"));
         assert!(log.contains("Conversion: 24-bit/96kHz WAV → DSD128 DSF"));
         assert!(!log.contains("Conversion: 24-bit/96kHz WAV → 5644.8kHz DSF"));
     }
@@ -39705,13 +41502,20 @@ mod conversion_log_tests {
         req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd64);
 
         let artifacts = log_test_artifacts();
+        let mut record = ok_record();
+        record.commands = vec![command_record_for(ToolBinary::Sox)];
+        record.commands[0].description = Some("Convert PCM to DSD".to_string());
+        record.commands[0].sanitized_args = vec!["rate".to_string(), "2822400".to_string()];
         let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
+            tracks: vec![record],
             stages: stage_records(),
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Target sample rate: DSD64"));
+        assert!(log.contains("Resampling: yes (SoX rate"));
+        assert!(log.contains("96kHz → DSD64"));
+        assert!(log.contains("Bit-depth conversion: no (PCM bit depth not applicable — DSD target)"));
+        assert!(log.contains("Dither: no (not requested)"));
         assert!(log.contains("Conversion: 24-bit/96kHz WAV → DSD64 DSF"));
         assert!(!log.contains("2822.4kHz DSF"));
     }
@@ -40166,6 +41970,89 @@ mod naming_template_tests {
             container_ffmpeg_flags: Vec::new(),
             companion: CompanionCopyPolicy::default(),
         }
+    }
+
+    #[test]
+    fn untagged_completion_order_preview_matches_actual_ordinal_filenames() {
+        let mut names = Vec::new();
+        for (ordinal, title) in [(1, "First"), (2, "Second"), (3, "Third")] {
+            let mut req = template_request(None);
+            req.container = PathBuf::from(format!("/music/{title}.wv"));
+            req.naming.template = "%TRACKNN% - %TITLE%".to_string();
+            req.album_batch_track = Some(AlbumBatchTrackContext::new(
+                ordinal,
+                None,
+                ordinal,
+            ));
+            let metadata = TrackMetadata {
+                title: Some(title.to_string()),
+                track_number: None,
+                extra: BTreeMap::from([("album".to_string(), "Untagged Album".to_string())]),
+                ..TrackMetadata::default()
+            };
+
+            let preview = prepared_source_from_dispatch_metadata(
+                &req,
+                SourceKind::SingleFile,
+                metadata.clone(),
+            );
+            let preview_plan = plan_outputs(&preview, &req).expect("preview output plan");
+
+            let actual_track_number =
+                crate::convert::pipeline::materializer_single::single_file_filename_track_number(
+                    metadata.track_number,
+                    req.album_batch_track.as_ref(),
+                );
+            let actual = PreparedSource {
+                container: req.container.clone(),
+                kind: SourceKind::SingleFile,
+                tracks: vec![PreparedTrack {
+                    id: TrackId {
+                        source_ordinal: ordinal,
+                        disc_number: None,
+                        track_number: actual_track_number,
+                    },
+                    source_ref: TrackSourceRef::StagedFile(req.container.clone()),
+                    metadata,
+                    expected_samples: None,
+                    sample_rate: None,
+                    bit_depth: None,
+                    source_audio: SourceAudioDescriptor::default(),
+                    warnings: Vec::new(),
+                }],
+                album_metadata: AlbumMetadata {
+                    album: Some("Untagged Album".to_string()),
+                    total_tracks: 1,
+                    ..AlbumMetadata::default()
+                },
+                provenance: ExtractionProvenance {
+                    source_kind: SourceKind::SingleFile,
+                    source_sha256: None,
+                    tool_versions: BTreeMap::new(),
+                    extracted_at: chrono::Utc::now(),
+                },
+            };
+            let actual_plan = plan_outputs(&actual, &req).expect("actual output plan");
+
+            assert_eq!(preview_plan.entries[0].final_path, actual_plan.entries[0].final_path);
+            names.push(
+                actual_plan.entries[0]
+                    .final_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("rendered file name")
+                    .to_string(),
+            );
+        }
+
+        assert_eq!(
+            names,
+            vec![
+                "01 - First.flac".to_string(),
+                "02 - Second.flac".to_string(),
+                "03 - Third.flac".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -49937,6 +51824,7 @@ mod validate_encoded_output_tests {
             &track,
             &req,
             Some(tonepoet_pipeline::PcmBitDepth::Float32),
+            None,
         );
 
         assert!(summary.contains("24-bit/192kHz WAV"), "{summary}");
@@ -49947,6 +51835,7 @@ mod validate_encoded_output_tests {
             &track,
             &req,
             Some(tonepoet_pipeline::PcmBitDepth::Float32),
+            None,
         );
 
         assert!(

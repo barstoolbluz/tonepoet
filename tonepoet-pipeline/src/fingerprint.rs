@@ -69,6 +69,7 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "resample_quality",
     "nyquist_transition",
     "dither_type",
+    "dither_explicit",
     "preferred_tool",
     "force_encode",
     "flac.compression_level",
@@ -474,6 +475,9 @@ fn push_pipeline_settings(writer: &mut FingerprintWriter, settings: &PipelineSet
         nyquist_transition(settings.nyquist_transition),
     );
     writer.field_static("dither_type", dither_type(settings.dither_type));
+    if settings.dither_explicit {
+        writer.field_static("dither_explicit", "true");
+    }
     writer.field_string("preferred_tool", preferred_tool(&settings.preferred_tool));
     writer.field_static("force_encode", bool_value(settings.force_encode));
     push_flac(writer, &settings.flac);
@@ -497,6 +501,9 @@ fn push_pipeline_settings_v2(writer: &mut FingerprintWriter, settings: &Pipeline
     writer.field_static("resample_quality", resample_quality(settings.resample_quality));
     writer.field_static("nyquist_transition", nyquist_transition(settings.nyquist_transition));
     writer.field_static("dither_type", dither_type(settings.dither_type));
+    if settings.dither_explicit {
+        writer.field_static("dither_explicit", "true");
+    }
     writer.field_string("preferred_tool", preferred_tool(&settings.preferred_tool));
     writer.field_static("force_encode", bool_value(settings.force_encode));
     push_flac(writer, &settings.flac);
@@ -1198,6 +1205,24 @@ mod tests {
                 execution_fingerprint_v1(behavior, semantic, qualification, &changed),
             );
         }
+    }
+
+    #[test]
+    fn dither_explicit_is_mode_scoped_in_the_settings_fingerprint() {
+        let automatic = fingerprint_with(|settings| {
+            settings.dither_type = DitherType::Tpdf;
+            settings.dither_explicit = false;
+        });
+        let explicit = fingerprint_with(|settings| {
+            settings.dither_type = DitherType::Tpdf;
+            settings.dither_explicit = true;
+        });
+        let automatic_again = fingerprint_with(|settings| {
+            settings.dither_type = DitherType::Tpdf;
+        });
+
+        assert_eq!(automatic, automatic_again);
+        assert_ne!(automatic, explicit);
     }
 
     #[test]

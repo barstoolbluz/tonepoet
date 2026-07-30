@@ -446,6 +446,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         resample_quality: format.resample_quality,
         nyquist_transition,
         dither_type,
+        dither_explicit: !is_dsd && format.dither_overridden,
         preferred_tool,
         force_encode: false,
         flac: tonepoet_pipeline::FlacSettings {
@@ -1046,13 +1047,34 @@ mod lifecycle_forwarder_tests {
     }
 
     #[test]
-    fn format_state_to_pipeline_settings_preserves_dither_choice() {
+    fn format_state_to_pipeline_settings_preserves_dither_choice_and_explicitness() {
         let mut format = FormatState::new();
-        format.dither.select_value(&crate::convert::simple_wizard::DitherType::Shibata);
+        format
+            .dither
+            .select_value(&crate::convert::simple_wizard::DitherType::Shibata);
+        format.dither_overridden = true;
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
         assert_eq!(settings.dither_type, pipeline_enums::DitherType::Shibata);
+        assert!(settings.dither_explicit);
+
+        format.dither_overridden = false;
+        let automatic = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(automatic.dither_type, pipeline_enums::DitherType::Shibata);
+        assert!(!automatic.dither_explicit);
+    }
+
+    #[test]
+    fn dsd_targets_never_forward_pcm_dither_explicitness() {
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Dsf);
+        format.dither_overridden = true;
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+
+        assert_eq!(settings.dither_type, pipeline_enums::DitherType::None);
+        assert!(!settings.dither_explicit);
     }
 
     #[test]

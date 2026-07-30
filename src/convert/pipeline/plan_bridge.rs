@@ -23,7 +23,7 @@ use super::errors::ConvertError;
 use super::types::{
     AlbumMetadata, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource, PreparedTrack,
     CueSegmentCarrier, SourceAudioCoding, SourceKind, StageRequirement, TrackMetadata,
-    TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
+    TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
 };
 
 fn planned_riff_non_audio_upper_bound(
@@ -695,7 +695,12 @@ pub fn orchestrator_metadata_stage_required(
 
 #[must_use]
 pub fn source_needs_authoritative_metadata(source: &PreparedSource) -> bool {
-    matches!(source.kind, SourceKind::CueImage | SourceKind::SacdIso | SourceKind::DvdVideo)
+    (matches!(source.kind, SourceKind::CueImage | SourceKind::SacdIso | SourceKind::DvdVideo)
+        || (matches!(source.kind, SourceKind::SingleFile)
+            && source
+                .album_metadata
+                .extra
+                .contains_key(FALLBACK_RECOVERED_METADATA_EXTRA_KEY)))
         && prepared_source_has_metadata(source)
 }
 
@@ -713,10 +718,16 @@ fn album_metadata_has_tags(album: &AlbumMetadata) -> bool {
         || has_non_empty_text(&album.album_artist)
         || has_non_empty_text(&album.genre)
         || has_non_empty_text(&album.date)
-        || album.total_tracks > 0
+        || (album.total_tracks > 0
+            && !album
+                .extra
+                .contains_key(FALLBACK_RECOVERED_METADATA_EXTRA_KEY))
         || album.total_discs.is_some()
         || album.disc_number.is_some()
-        || !album.extra.is_empty()
+        || album
+            .extra
+            .keys()
+            .any(|key| key != FALLBACK_RECOVERED_METADATA_EXTRA_KEY)
 }
 
 fn track_metadata_has_tags(track: &TrackMetadata) -> bool {
@@ -1112,6 +1123,7 @@ mod tests {
         PipelineRequest, PreparedSource, PreparedTrack, PublishPolicy, SacdArea,
         SourceAudioDescriptor, SourceKind, SourceOptions, StagePolicy, StageRequirement, TrackId,
         TrackMetadata, TrackSelection, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
+        FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
     };
 
     fn request(root: &Path) -> PipelineRequest {
@@ -2295,6 +2307,51 @@ mod tests {
                 "standalone/staged {ext} keeps its source metadata transfer path: {commands:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_fallback_recovered_single_files_require_authoritative_metadata() {
+        let temp = TempDir::new().expect("temp dir");
+        let req = request(temp.path());
+        let mut recovered = source(
+            SourceKind::SingleFile,
+            track(TrackSourceRef::StagedFile(temp.path().join("recovered.wv"))),
+            temp.path(),
+        );
+        recovered.album_metadata.extra.insert(
+            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+            "native-apev2".to_string(),
+        );
+
+        assert!(source_needs_authoritative_metadata(&recovered));
+        let obligations = metadata_obligations_for_request(&req, &recovered);
+        assert!(obligations.authoritative_tags_applied);
+        assert!(orchestrator_metadata_stage_required(
+            PlannedMetadataSatisfaction::none(),
+            req.stages.metadata,
+            obligations,
+        ));
+
+        let healthy = source(
+            SourceKind::SingleFile,
+            track(TrackSourceRef::StagedFile(temp.path().join("healthy.wv"))),
+            temp.path(),
+        );
+        assert!(!source_needs_authoritative_metadata(&healthy));
+        assert!(!metadata_obligations_for_request(&req, &healthy).authoritative_tags_applied);
+
+        let mut marker_only = recovered;
+        marker_only.tracks[0].metadata = TrackMetadata::default();
+        marker_only.album_metadata.album = None;
+        marker_only.album_metadata.album_artist = None;
+        assert_eq!(
+            marker_only.album_metadata.total_tracks, 1,
+            "single-file planning still carries its organizational count"
+        );
+        assert!(
+            !source_needs_authoritative_metadata(&marker_only),
+            "the recovery marker must not bypass the existing metadata-present conjunct"
+        );
     }
 
     #[test]

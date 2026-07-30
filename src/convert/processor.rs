@@ -755,7 +755,7 @@ fn dispatch_track_metadata_for_output_planning(
         // fail-closed read.
         SourceKind::SingleFile => read_track_metadata_with_warnings(&req.container)
             .ok()
-            .map(|(metadata, _warnings)| metadata),
+            .map(|(metadata, _warnings, _recovered_by_fallback)| metadata),
         SourceKind::CueImage => {
             let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(
                 &req.container,
@@ -820,7 +820,8 @@ fn single_file_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
     // The dispatcher only uses these fields as conservative organizational
     // evidence; written metadata still comes from the materialized source and
     // explicit request overrides.
-    let (metadata, _warnings) = read_track_metadata_with_warnings(path).ok()?;
+    let (metadata, _warnings, _recovered_by_fallback) =
+        read_track_metadata_with_warnings(path).ok()?;
     batch_identity_probe_from_track_metadata(&metadata)
 }
 
@@ -1212,8 +1213,9 @@ fn prepare_completion_order_album_batch(
         if let Some(identity) = resolved_identity {
             request.batch_resolved_identity = Some(identity.clone());
         }
-        // These unique ordinals are coordination identities only. The batch
-        // ordering mode prevents them from being rendered as track order.
+        // These unique ordinals are coordination identities and may be rendered
+        // as filename numbers only for untagged completion-order tracks. They
+        // are never promoted to TRACKNUMBER metadata or conversion-log ordering.
         request.album_batch_track = Some(AlbumBatchTrackContext::new(ordinal, None, ordinal));
         request.suppress_incremental_conversion_log_append = false;
         item_indices.push(candidate.item_index);

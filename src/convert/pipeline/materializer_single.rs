@@ -60,16 +60,17 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 }
             }
         }
-        let (metadata, mut metadata_warnings) = read_track_metadata_with_warnings(&req.container)?;
+        let (metadata, mut metadata_warnings, metadata_recovered_by_fallback) =
+            read_track_metadata_with_warnings(&req.container)?;
         if req
             .album_batch
             .as_ref()
             .is_some_and(|batch| batch.uses_completion_order())
         {
-            metadata_warnings.push(
-                "Track ordering unavailable; album publication is shared and the conversion log records tracks in completion order"
-                    .to_string(),
-            );
+            metadata_warnings.push(completion_order_metadata_warning(
+                metadata.track_number,
+                req.album_batch_track.as_ref(),
+            ));
         }
         report_metadata_warnings(
             reporter,
@@ -79,7 +80,10 @@ impl super::stages::Materializer for SingleFileMaterializer {
             0.5,
         )
         .await;
-        let track_number = metadata.track_number.unwrap_or(1).max(1);
+        let track_number = single_file_filename_track_number(
+            metadata.track_number,
+            req.album_batch_track.as_ref(),
+        );
         let track = PreparedTrack {
             id: TrackId {
                 source_ordinal: 1,
@@ -100,7 +104,10 @@ impl super::stages::Materializer for SingleFileMaterializer {
         };
 
         let tracks = apply_track_selection(vec![track], &req.source.track_selection)?;
-        let album_metadata = derive_album_metadata(&tracks);
+        let album_metadata = derive_single_file_album_metadata(
+            &tracks,
+            metadata_recovered_by_fallback,
+        );
         Ok(PreparedSource {
             container: req.container.clone(),
             kind: SourceKind::SingleFile,
@@ -114,6 +121,58 @@ impl super::stages::Materializer for SingleFileMaterializer {
             },
         })
     }
+}
+
+
+fn derive_single_file_album_metadata(
+    tracks: &[PreparedTrack],
+    metadata_recovered_by_fallback: bool,
+) -> AlbumMetadata {
+    let mut album_metadata = derive_album_metadata(tracks);
+    if metadata_recovered_by_fallback {
+        if let Some(source_total) = tracks.first().and_then(|track| {
+            ["tracktotal", "totaltracks"].iter().find_map(|key| {
+                track
+                    .metadata
+                    .extra
+                    .get(*key)
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .filter(|value| *value > 0)
+            })
+        }) {
+            album_metadata.total_tracks = source_total;
+        }
+        album_metadata.extra.insert(
+            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+            "native-apev2".to_string(),
+        );
+    }
+    album_metadata
+}
+
+fn completion_order_metadata_warning(
+    metadata_track_number: Option<u32>,
+    batch_track: Option<&AlbumBatchTrackContext>,
+) -> String {
+    let mut warning =
+        "Track ordering unavailable; album publication is shared and the conversion log records tracks in completion order"
+            .to_string();
+    if metadata_track_number.is_none() && batch_track.is_some() {
+        warning.push_str(
+            "; filenames numbered by dispatch order; no TRACKNUMBER tags written",
+        );
+    }
+    warning
+}
+
+pub(crate) fn single_file_filename_track_number(
+    metadata_track_number: Option<u32>,
+    batch_track: Option<&AlbumBatchTrackContext>,
+) -> u32 {
+    metadata_track_number
+        .or_else(|| batch_track.map(|track| track.track_number))
+        .unwrap_or(1)
+        .max(1)
 }
 
 struct ProbeResult {
@@ -221,7 +280,7 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
 
 #[cfg(test)]
 pub(crate) fn read_track_metadata(path: &Path) -> Result<TrackMetadata, MaterializeError> {
-    let (metadata, warnings) = read_track_metadata_with_warnings(path)?;
+    let (metadata, warnings, _) = read_track_metadata_with_warnings(path)?;
     for warning in &warnings {
         log::warn!(
             "metadata degraded for '{}'; audio conversion will continue: {}",
@@ -261,13 +320,14 @@ pub(crate) async fn report_metadata_warnings(
 
 pub(crate) fn read_track_metadata_with_warnings(
     path: &Path,
-) -> Result<(TrackMetadata, Vec<String>), MaterializeError> {
+) -> Result<(TrackMetadata, Vec<String>, bool), MaterializeError> {
     if crate::dsf_tags::is_dsf(path) {
         let outcome = crate::dsf_tags::read_with_warnings(path)
             .map_err(MaterializeError::Parse)?;
         return Ok((
             crate::dsf_tags::to_track_metadata(&outcome.snapshot),
             outcome.warnings,
+            false,
         ));
     }
     use lofty::prelude::*;
@@ -281,9 +341,10 @@ pub(crate) fn read_track_metadata_with_warnings(
                         "Tag read: FAILED (no readable metadata tag found in '{}') - converted without metadata",
                         path.display()
                     )],
+                    false,
                 ));
             };
-            Ok((track_metadata_from_lofty_tag(tag), Vec::new()))
+            Ok((track_metadata_from_lofty_tag(tag), Vec::new(), false))
         }
         Err(lofty_error)
             if crate::metadata_persistence::native_ape_error_is_eligible(&lofty_error) =>
@@ -297,13 +358,14 @@ pub(crate) fn read_track_metadata_with_warnings(
                             path.display()
                         )
                     });
-                    Ok((metadata, vec![warning]))
+                    Ok((metadata, vec![warning], true))
                 }
                 Err(native_error) => Ok((
                     TrackMetadata::default(),
                     vec![format!(
                         "Tag read: FAILED ({lofty_error}; native APEv2 fallback refused: {native_error}) - converted without metadata"
                     )],
+                    false,
                 )),
             }
         }
@@ -312,6 +374,7 @@ pub(crate) fn read_track_metadata_with_warnings(
             vec![format!(
                 "Tag read: FAILED ({error}) - converted without metadata"
             )],
+            false,
         )),
     }
 }
@@ -399,6 +462,10 @@ fn track_metadata_from_neutral_ape_rows(
             key => item_key_to_extra_key(key, lofty::tag::TagType::Ape),
         };
         insert_source_text_tag(&mut extra, &key, &row.value);
+        // Capture the fallback reader's immutable canonical source value before
+        // any album-label, batch-identity, or path-derived enrichment can alter
+        // the ordinary metadata model used for naming and organization.
+        insert_fallback_source_tag(&mut extra, &row.canonical_key, &row.value);
     }
     if let Some(album) = text("ALBUM") {
         extra.insert("album".to_string(), album);
@@ -513,6 +580,200 @@ mod tests {
             }
             other => panic!("expected materialization progress warning, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_ape_fallback_marks_recovery_and_preserves_full_valid_tag_set() {
+        use lofty::tag::ItemKey;
+
+        let temp = tempfile::tempdir().expect("invalid APE materializer tempdir");
+        let path = temp.path().join("supertramp-invalid-key.wv");
+        std::fs::write(
+            &path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/metadata_persistence/ape.wv"
+            )),
+        )
+        .expect("write APE fixture");
+        crate::tui::probe::write_all_tags(
+            &path,
+            &[
+                (ItemKey::TrackTitle, Some("Give a Little Bit".to_string())),
+                (ItemKey::TrackArtist, Some("Supertramp".to_string())),
+                (ItemKey::AlbumTitle, Some("Even in the Quietest Moments...".to_string())),
+                (ItemKey::Genre, Some("Rock".to_string())),
+                (ItemKey::Year, Some("1977".to_string())),
+                (ItemKey::Comment, Some("US A&M SP-4634".to_string())),
+                (ItemKey::TrackNumber, Some("1".to_string())),
+                (ItemKey::TrackTotal, Some("7".to_string())),
+                (
+                    ItemKey::Unknown("ALBUM ARTIST".to_string()),
+                    Some("Supertramp".to_string()),
+                ),
+            ],
+        )
+        .expect("seed valid APE fields");
+        crate::tui::probe::inject_invalid_ape_key_item_for_test(
+            &path,
+            "&год".as_bytes(),
+            b"invalid",
+        )
+        .expect("inject invalid APE key");
+
+        let (metadata, warnings, recovered) =
+            read_track_metadata_with_warnings(&path).expect("tolerant fallback read");
+
+        assert!(recovered, "the native fallback must set the recovery authority bit");
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("invalid APE key skipped") && warning.contains("&год")
+        }));
+        assert_eq!(metadata.title.as_deref(), Some("Give a Little Bit"));
+        assert_eq!(metadata.artist.as_deref(), Some("Supertramp"));
+        assert_eq!(metadata.album_artist.as_deref(), Some("Supertramp"));
+        assert_eq!(metadata.genre.as_deref(), Some("Rock"));
+        assert_eq!(metadata.date.as_deref(), Some("1977"));
+        assert_eq!(metadata.comment.as_deref(), Some("US A&M SP-4634"));
+        assert_eq!(metadata.track_number, Some(1));
+        assert_eq!(
+            metadata.extra.get("album").map(String::as_str),
+            Some("Even in the Quietest Moments...")
+        );
+        for (key, expected) in [
+            ("TITLE", "Give a Little Bit"),
+            ("ARTIST", "Supertramp"),
+            ("ALBUM", "Even in the Quietest Moments..."),
+            ("ALBUMARTIST", "Supertramp"),
+            ("GENRE", "Rock"),
+            ("DATE", "1977"),
+            ("COMMENT", "US A&M SP-4634"),
+            ("TRACKNUMBER", "1"),
+            ("TRACKTOTAL", "7"),
+        ] {
+            assert_eq!(
+                fallback_source_tag_value(&metadata.extra, key),
+                Some(expected),
+                "fallback source-authority snapshot missing {key}"
+            );
+        }
+
+        let track = PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: metadata.disc_number,
+                track_number: metadata.track_number.unwrap_or(1),
+            },
+            source_ref: TrackSourceRef::StagedFile(path.clone()),
+            metadata,
+            expected_samples: None,
+            sample_rate: Some(44_100),
+            bit_depth: Some(24),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            warnings,
+        };
+        let tracks = vec![track];
+        let album_metadata = derive_single_file_album_metadata(&tracks, recovered);
+        assert_eq!(album_metadata.total_tracks, 7);
+        assert_eq!(album_metadata.album_artist.as_deref(), Some("Supertramp"));
+        let prepared = PreparedSource {
+            container: path,
+            kind: SourceKind::SingleFile,
+            album_metadata,
+            tracks,
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SingleFile,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        assert!(
+            crate::convert::pipeline::plan_bridge::source_needs_authoritative_metadata(&prepared),
+            "the actual invalid-APEv2 recovery result must require the authoritative metadata stage"
+        );
+        let tags = crate::convert::pipeline::stages::authoritative_metadata_tags(
+            &prepared.tracks[0].metadata,
+            &prepared.album_metadata,
+        );
+        for expected in [
+            ("TITLE", "Give a Little Bit"),
+            ("ARTIST", "Supertramp"),
+            ("ALBUM", "Even in the Quietest Moments..."),
+            ("ALBUMARTIST", "Supertramp"),
+            ("GENRE", "Rock"),
+            ("DATE", "1977"),
+            ("COMMENT", "US A&M SP-4634"),
+            ("TRACKNUMBER", "1"),
+            ("TRACKTOTAL", "7"),
+        ] {
+            assert!(
+                tags.iter().any(|(key, value)| key == expected.0 && value == expected.1),
+                "the authoritative writer did not receive recovered {expected:?}: {tags:?}"
+            );
+        }
+        assert!(!tags.iter().any(|(key, _)| {
+            key == "ALBUM ARTIST" || key == "TONEPOET_FALLBACK_RECOVERED_METADATA"
+        }));
+    }
+
+    #[test]
+    fn fallback_authority_does_not_promote_single_file_planning_defaults_to_tags() {
+        let track = PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: Some(1),
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from("untagged.wv")),
+            metadata: TrackMetadata {
+                artist: Some("Solo Artist".to_string()),
+                disc_number: Some(1),
+                extra: BTreeMap::from([("album".to_string(), "Source Album".to_string())]),
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: Some(44_100),
+            bit_depth: Some(24),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            warnings: Vec::new(),
+        };
+
+        let album = derive_single_file_album_metadata(&[track], true);
+
+        // Planning metadata retains the established single-file defaults. The
+        // authoritative writer is responsible for distinguishing these
+        // organizational values from source-evidenced tags.
+        assert_eq!(album.album.as_deref(), Some("Source Album"));
+        assert_eq!(album.album_artist.as_deref(), Some("Solo Artist"));
+        assert_eq!(album.total_tracks, 1);
+        assert_eq!(album.total_discs, Some(1));
+        assert!(album.extra.contains_key(FALLBACK_RECOVERED_METADATA_EXTRA_KEY));
+    }
+
+    #[test]
+    fn dispatch_ordinal_is_filename_only_fallback_for_untagged_tracks() {
+        let batch_track = AlbumBatchTrackContext::new(7, None, 7);
+        assert_eq!(
+            single_file_filename_track_number(None, Some(&batch_track)),
+            7
+        );
+        assert_eq!(
+            single_file_filename_track_number(Some(3), Some(&batch_track)),
+            3,
+            "source TRACKNUMBER remains authoritative"
+        );
+        assert!(completion_order_metadata_warning(None, Some(&batch_track))
+            .contains("filenames numbered by dispatch order; no TRACKNUMBER tags written"));
+        assert!(!completion_order_metadata_warning(Some(3), Some(&batch_track))
+            .contains("filenames numbered by dispatch order"));
     }
 
     #[test]

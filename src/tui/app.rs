@@ -2670,6 +2670,30 @@ mod clamp_pill_tests {
     }
 
     #[test]
+    fn changing_bit_depth_resets_dither_explicitness_before_auto_selection() {
+        use super::{BitDepthChoice, DitherType, FormatField};
+
+        let mut format = FormatState::new();
+        format.bit_depth.select_value(&BitDepthChoice::Int24);
+        format.dither.select_value(&DitherType::TPDF);
+        format.dither_overridden = true;
+        let before_format = format.format.selected_value().clone();
+        let before_depth = *format.bit_depth.selected_value();
+        format.bit_depth.select_value(&BitDepthChoice::Int32);
+
+        format.after_user_selection(
+            FormatField::BitDepth,
+            before_format,
+            before_depth,
+            Some(32),
+            Some(96_000),
+        );
+
+        assert!(!format.dither_overridden);
+        assert_eq!(*format.dither.selected_value(), DitherType::None);
+    }
+
+    #[test]
     fn failed_probe_preserves_deliberate_source_policy_and_explicit_overrides() {
         let mut format = FormatState::new();
         assert_source_policy_survives_unknown_source_reset(&mut format);
