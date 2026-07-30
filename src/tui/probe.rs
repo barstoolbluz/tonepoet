@@ -12988,41 +12988,22 @@ mod tests {
             crate::metadata_persistence::MetadataNumberingCapabilities::APE_NUMERIC
         );
 
-        for display_key in ["TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
-            for accepted in ["7", "01", "7/17", "01/17"] {
-                let change = [(
-                    lofty::tag::ItemKey::Unknown(display_key.to_string()),
-                    Some(accepted.to_string()),
-                )];
-                write_all_tags(&path, &change).unwrap_or_else(|error| {
-                    panic!(
-                        "APE backend must accept {display_key}={accepted:?}: {error}"
-                    )
-                });
-                assert_eq!(
-                    editor_numbering_value(&path, display_key),
-                    accepted,
-                    "APE backend must preserve the exact accepted spelling"
-                );
-                assert_lofty_repetition_skips_transaction(
-                    &path,
-                    &change,
-                    &format!("APE {display_key}={accepted:?}"),
-                );
-            }
-
+        // Side-prefixed lexical numbering ("A01") is refused for a field, and
+        // the refusal must not mutate the carrier or allocate a rollback backup.
+        let assert_lexical_refusal = |field_key: &str| {
+            let (_temp, path) = copy_numbering_fixture(file_name, fixture);
             let before = std::fs::read(&path).expect("snapshot APE before lexical refusal");
             let error = write_all_tags(
                 &path,
                 &[(
-                    lofty::tag::ItemKey::Unknown(display_key.to_string()),
+                    lofty::tag::ItemKey::Unknown(field_key.to_string()),
                     Some("A01".to_string()),
                 )],
             )
             .expect_err("APE backend must refuse side-prefixed lexical numbering");
             assert!(
-                error.contains(display_key) && error.contains("lexical"),
-                "unexpected APE lexical refusal for {display_key}: {error}"
+                error.contains(field_key) && error.contains("lexical"),
+                "unexpected APE lexical refusal for {field_key}: {error}"
             );
             assert_eq!(
                 std::fs::read(&path).expect("read APE after lexical refusal"),
@@ -13033,6 +13014,78 @@ mod tests {
                 !crate::db::Database::backup_path_for(&path).exists(),
                 "refused APE lexical numbering must not allocate a rollback backup"
             );
+        };
+
+        // Number fields (TRACKNUMBER / DISCNUMBER) accept plain, zero-padded,
+        // and fraction spellings. A fraction written to the number field is
+        // decomposed into the canonical number + total pair — tonepoet's
+        // two-field numbering model, applied consistently across every carrier.
+        // It is non-lossy: the total is preserved in its own field and a re-save
+        // recombines them; other applications read the stored value directly.
+        // Each case runs on a fresh fixture so there is no cumulative coupling.
+        for (number_key, total_key) in [("TRACKNUMBER", "TRACKTOTAL"), ("DISCNUMBER", "DISCTOTAL")] {
+            for (input, number, total) in [
+                ("7", "7", None),
+                ("01", "01", None),
+                ("7/17", "7", Some("17")),
+                ("01/17", "01", Some("17")),
+            ] {
+                let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+                let change = [(
+                    lofty::tag::ItemKey::Unknown(number_key.to_string()),
+                    Some(input.to_string()),
+                )];
+                write_all_tags(&path, &change).unwrap_or_else(|error| {
+                    panic!("APE backend must accept {number_key}={input:?}: {error}")
+                });
+                assert_eq!(
+                    editor_numbering_value(&path, number_key),
+                    number,
+                    "APE {number_key}={input:?} must preserve the number spelling"
+                );
+                if let Some(total) = total {
+                    assert_eq!(
+                        editor_numbering_value(&path, total_key),
+                        total,
+                        "APE {number_key}={input:?} must decompose the total into {total_key}"
+                    );
+                }
+                assert_lofty_repetition_skips_transaction(
+                    &path,
+                    &change,
+                    &format!("APE {number_key}={input:?}"),
+                );
+            }
+            assert_lexical_refusal(number_key);
+        }
+
+        // Total fields (TRACKTOTAL / DISCTOTAL) accept plain and zero-padded
+        // counts. A total is a single count, not a number/total fraction, so
+        // fraction spellings are intentionally not exercised here: writing a
+        // fraction into a total field is invalid input rather than a supported
+        // round trip. Persisting a total synthesizes a zero number when absent.
+        for total_key in ["TRACKTOTAL", "DISCTOTAL"] {
+            for input in ["7", "01"] {
+                let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+                let change = [(
+                    lofty::tag::ItemKey::Unknown(total_key.to_string()),
+                    Some(input.to_string()),
+                )];
+                write_all_tags(&path, &change).unwrap_or_else(|error| {
+                    panic!("APE backend must accept {total_key}={input:?}: {error}")
+                });
+                assert_eq!(
+                    editor_numbering_value(&path, total_key),
+                    input,
+                    "APE {total_key}={input:?} must preserve the total spelling"
+                );
+                assert_lofty_repetition_skips_transaction(
+                    &path,
+                    &change,
+                    &format!("APE {total_key}={input:?}"),
+                );
+            }
+            assert_lexical_refusal(total_key);
         }
     }
 
