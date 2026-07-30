@@ -281,6 +281,11 @@ fn every_conversion_affecting_field_changes_the_fingerprint() {
     assert_mutation_changes_fingerprint!(covered, base, "dither_type", |settings| {
         settings.dither_type = DitherType::HighShibata;
     });
+    // Mode-scoped field: emitted only when true, so mutate the sentinel's false
+    // default to true to trigger a fingerprint change.
+    assert_mutation_changes_fingerprint!(covered, base, "dither_explicit", |settings| {
+        settings.dither_explicit = true;
+    });
     assert_mutation_changes_fingerprint!(covered, base, "preferred_tool", |settings| {
         settings.preferred_tool = PreferredTool::Ssrc;
     });
@@ -567,12 +572,12 @@ fn serde_recursive_field_count_matches_checked_inventory_for_known_shapes() {
     let default = serde_json::to_value(PipelineSettings::default()).unwrap();
     let sentinel = serde_json::to_value(flac_md5_sentinel()).unwrap();
 
-    assert_eq!(recursive_object_key_count(&default), 80);
+    assert_eq!(recursive_object_key_count(&default), 81);
     // The sentinel helper deliberately deserializes the frozen flat-v1 DSD
     // wire (see `sentinel_dsd_settings`), so it re-serializes the legacy
-    // shape: 80 default keys + 7 sentinel-specific non-default nested keys,
+    // shape: 81 default keys + 7 sentinel-specific non-default nested keys,
     // NOT the native-v2 shape that would be five keys larger.
-    assert_eq!(recursive_object_key_count(&sentinel), 87);
+    assert_eq!(recursive_object_key_count(&sentinel), 88);
 }
 
 #[cfg(feature = "serde")]

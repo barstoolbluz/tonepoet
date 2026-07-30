@@ -130,17 +130,27 @@ fn derive_single_file_album_metadata(
 ) -> AlbumMetadata {
     let mut album_metadata = derive_album_metadata(tracks);
     if metadata_recovered_by_fallback {
-        if let Some(source_total) = tracks.first().and_then(|track| {
-            ["tracktotal", "totaltracks"].iter().find_map(|key| {
-                track
-                    .metadata
-                    .extra
-                    .get(*key)
-                    .and_then(|value| value.trim().parse::<u32>().ok())
-                    .filter(|value| *value > 0)
+        // Recovered numeric totals live in the immutable fallback snapshot under
+        // the NUL-prefixed canonical namespace, not the ordinary `extra` map, so
+        // the planning-side album counts must be sourced from there. Later label,
+        // batch-identity, or path enrichment cannot invalidate these source-proven
+        // values. `album`, `genre`, `date`, `album_artist`, and `disc_number` are
+        // already carried by the ordinary/typed fields the fallback reader
+        // populates, so only the totals need snapshot sourcing here.
+        let snapshot_total = |canonical_keys: &[&str]| {
+            tracks.first().and_then(|track| {
+                canonical_keys.iter().find_map(|key| {
+                    fallback_source_tag_value(&track.metadata.extra, key)
+                        .and_then(|value| value.trim().parse::<u32>().ok())
+                        .filter(|value| *value > 0)
+                })
             })
-        }) {
+        };
+        if let Some(source_total) = snapshot_total(&["TRACKTOTAL", "TOTALTRACKS"]) {
             album_metadata.total_tracks = source_total;
+        }
+        if let Some(source_disc_total) = snapshot_total(&["DISCTOTAL", "TOTALDISCS"]) {
+            album_metadata.total_discs = Some(source_disc_total);
         }
         album_metadata.extra.insert(
             FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),

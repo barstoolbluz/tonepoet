@@ -1069,6 +1069,13 @@ mod lifecycle_forwarder_tests {
     fn dsd_targets_never_forward_pcm_dither_explicitness() {
         let mut format = FormatState::new();
         format.format.select_value(&AudioFormat::Dsf);
+        // Mirror the UI cascade so a valid DSD target rate is armed; without it
+        // the sample-rate pill keeps its PCM default (44.1 kHz) and settings
+        // conversion fails before the DSD dither-explicitness guard under test
+        // is ever reached.
+        format.apply_format_constraints();
+        // Arm the override AFTER the cascade so the test genuinely exercises the
+        // `!is_dsd && dither_overridden` guard rather than an empty override.
         format.dither_overridden = true;
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();

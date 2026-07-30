@@ -40992,8 +40992,11 @@ mod conversion_log_tests {
         req.settings.soxr_resampler.phase = Some(45);
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
+        // The log fixture (log_test_source) carries two tracks at 44.1 kHz and
+        // 96 kHz; targeting 48 kHz renders both distinct transitions in sorted
+        // order after the soxr label detail.
         assert!(log.contains(
-            "Resampling: yes (soxr via ffmpeg aresample, precision=28, cutoff=0.970, phase_shift=45, 96kHz → 48kHz)"
+            "Resampling: yes (soxr via ffmpeg aresample, precision=28, cutoff=0.970, phase_shift=45, 44.1kHz → 48kHz, 96kHz → 48kHz)"
         ));
         assert!(log.contains("Soxr quality preset: very high"));
         assert!(log.contains("Soxr cutoff override: 0.97"));
@@ -41396,6 +41399,11 @@ mod conversion_log_tests {
         let mut req = log_test_request();
         req.settings.target_format = PlannerAudioFormat::Flac;
         req.settings.target_sample_rate = RateTarget::Source;
+        // Reference-policy log labels are gated on the native-v2 DSD origin
+        // (selects_reference_dsd_to_pcm requires is_native_v2). Without it the
+        // planner would treat this as an ordinary SoX DSD→PCM conversion and the
+        // log would omit the "Reference policy" wording under test.
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
 
         let artifacts = log_test_artifacts();
         let mut record = ok_record();
