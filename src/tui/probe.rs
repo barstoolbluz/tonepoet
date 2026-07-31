@@ -13183,9 +13183,26 @@ mod tests {
         use lofty::file::AudioFile;
         use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 
-        let mut tagged = lofty::read_from_path(path).expect("read MP3 fixture");
-        let _ = tagged.remove(TagType::Id3v2);
-        let _ = tagged.remove(TagType::Id3v1);
+        // Lofty does not remove an existing on-disk ID3v2 merely because it
+        // is absent from the in-memory TaggedFile. Strip the length-prefixed
+        // fixture tag first so the subsequent save starts from bare MP3 data.
+        let bytes = std::fs::read(path).expect("read ID3v2 MP3 fixture bytes");
+        assert!(bytes.len() >= 10 && &bytes[..3] == b"ID3");
+        assert!(bytes[6..10].iter().all(|byte| *byte & 0x80 == 0));
+        let payload_len = bytes[6..10]
+            .iter()
+            .fold(0usize, |size, byte| (size << 7) | usize::from(*byte));
+        let footer_len = if bytes[5] & 0x10 != 0 { 10 } else { 0 };
+        let audio_start = 10usize
+            .checked_add(payload_len)
+            .and_then(|offset| offset.checked_add(footer_len))
+            .expect("ID3v2 fixture prefix length overflow");
+        assert!(audio_start < bytes.len());
+        std::fs::write(path, &bytes[audio_start..]).expect("strip ID3v2 fixture prefix");
+
+        let mut tagged = lofty::read_from_path(path).expect("read tagless MP3 fixture");
+        assert!(tagged.tag(TagType::Id3v2).is_none());
+        assert!(tagged.tag(TagType::Id3v1).is_none());
         let mut id3v1 = Tag::new(TagType::Id3v1);
         id3v1.insert_unchecked(TagItem::new(
             ItemKey::TrackTitle,
@@ -13342,7 +13359,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
     fn all_view_edits_unsuffixed_title_in_id3v1_only_mp3_without_creating_id3v2() {
         use lofty::tag::{ItemKey, TagType};
 
@@ -13390,7 +13406,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
+    #[ignore = "round-11 clusterB round-2: test EXPECTATION wrong, not fixture — read_all_tags always synthesizes empty core rows (delete), and ensure_standard_fields_present keys synthetic std fields as Unknown so new GENRE lands in TXXX not typed TCON (new-field). Bounced: see docs/round11-clusterB-round2-bounce.md"]
     fn all_view_deletes_unsuffixed_title_from_id3v1_only_mp3() {
         use lofty::tag::{ItemKey, TagType};
 
@@ -13439,7 +13455,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
+    #[ignore = "round-11 clusterB round-2: test EXPECTATION wrong, not fixture — read_all_tags always synthesizes empty core rows (delete), and ensure_standard_fields_present keys synthetic std fields as Unknown so new GENRE lands in TXXX not typed TCON (new-field). Bounced: see docs/round11-clusterB-round2-bounce.md"]
     fn all_view_new_field_on_id3v1_only_mp3_uses_normal_id3v2_primary() {
         use lofty::tag::{ItemKey, TagType};
 
@@ -13492,7 +13508,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
     fn all_view_mixed_mp3_edit_targets_each_files_existing_preferred_container() {
         use lofty::tag::{ItemKey, TagType};
 
