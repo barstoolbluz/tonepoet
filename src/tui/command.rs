@@ -20005,6 +20005,7 @@ mod source_relative_set_command_tests {
         app.convert.source.mode = SourceMode::Single {
             path: std::path::PathBuf::from("source.flac"),
             info: Some(SourceInfo {
+                sample_format_is_float: None,
                 format_name: "FLAC".to_string(),
                 codec: "flac".to_string(),
                 bit_depth: Some(24),

@@ -130,6 +130,16 @@ pub fn with_scoped_shared_text_clipboard_publish_hook<R>(
 /// The cursor is a byte offset into `text` that is always on a UTF-8 char boundary.
 /// Movement methods (`cursor_left`, `cursor_right`, `backspace`, `delete`, etc.)
 /// walk char boundaries to avoid panics on multibyte input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextInputSnapshot {
+    text: String,
+    cursor: usize,
+    select_all: bool,
+    selection_anchor: Option<usize>,
+}
+
+const TEXT_INPUT_HISTORY_LIMIT: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct TextInputState {
     pub text: String,
@@ -145,6 +155,8 @@ pub struct TextInputState {
     /// Internal per-field clipboard for terminal environments where the host
     /// clipboard is unavailable to the TUI.
     pub clipboard: String,
+    undo_history: Vec<TextInputSnapshot>,
+    redo_history: Vec<TextInputSnapshot>,
 }
 
 /// Completion strategy for an inline text field.
@@ -205,6 +217,8 @@ impl TextInputState {
             select_all: false,
             selection_anchor: None,
             clipboard: String::new(),
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
         }
     }
 
@@ -217,12 +231,81 @@ impl TextInputState {
             select_all: true,
             selection_anchor: Some(0),
             clipboard: String::new(),
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
         }
     }
 
     /// Create an empty input.
     pub fn empty() -> Self {
         Self::new(String::new())
+    }
+
+    fn snapshot(&self) -> TextInputSnapshot {
+        TextInputSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            select_all: self.select_all,
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: TextInputSnapshot) {
+        self.text = snapshot.text;
+        self.cursor = snapshot.cursor.min(self.text.len());
+        while self.cursor > 0 && !self.text.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+        self.select_all = snapshot.select_all;
+        self.selection_anchor = snapshot
+            .selection_anchor
+            .filter(|anchor| *anchor <= self.text.len() && self.text.is_char_boundary(*anchor));
+    }
+
+    fn push_bounded(history: &mut Vec<TextInputSnapshot>, snapshot: TextInputSnapshot) {
+        if history.len() == TEXT_INPUT_HISTORY_LIMIT {
+            history.remove(0);
+        }
+        history.push(snapshot);
+    }
+
+    fn record_edit(&mut self, before: TextInputSnapshot) -> bool {
+        if before.text == self.text {
+            return false;
+        }
+        Self::push_bounded(&mut self.undo_history, before);
+        self.redo_history.clear();
+        true
+    }
+
+    /// Undo the most recent text mutation in this field.
+    pub fn undo(&mut self) -> bool {
+        let Some(previous) = self.undo_history.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        Self::push_bounded(&mut self.redo_history, current);
+        self.restore_snapshot(previous);
+        true
+    }
+
+    /// Redo the most recently undone text mutation in this field.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_history.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        Self::push_bounded(&mut self.undo_history, current);
+        self.restore_snapshot(next);
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_history.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_history.is_empty()
     }
 
     pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
@@ -283,7 +366,9 @@ impl TextInputState {
         if !self.has_selection() || !self.copy_selection() {
             return false;
         }
-        self.delete_selection()
+        let before = self.snapshot();
+        self.delete_selection();
+        self.record_edit(before)
     }
 
     pub fn can_paste(&self) -> bool {
@@ -314,6 +399,7 @@ impl TextInputState {
         &mut self,
         transform: impl FnOnce(&str) -> String,
     ) -> bool {
+        let before = self.snapshot();
         let had_selection = self.has_selection();
         let range = self.selection_range().unwrap_or(0..self.text.len());
         if !self.text.is_char_boundary(range.start) || !self.text.is_char_boundary(range.end) {
@@ -325,21 +411,28 @@ impl TextInputState {
         self.selection_anchor = Some(start);
         self.cursor = start + replacement.len();
         self.select_all = !had_selection && start == 0 && self.cursor == self.text.len();
-        true
+        self.record_edit(before)
     }
 
     /// Insert a character at the cursor and advance the cursor.
     pub fn insert_char(&mut self, c: char) {
+        let before = self.snapshot();
         self.delete_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.record_edit(before);
     }
 
     /// Insert a string at the cursor and advance the cursor past it.
     pub fn insert_string(&mut self, s: &str) {
+        if s.is_empty() && !self.has_selection() {
+            return;
+        }
+        let before = self.snapshot();
         self.delete_selection();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.record_edit(before);
     }
 
 
@@ -354,40 +447,50 @@ impl TextInputState {
         {
             return;
         }
+        let before = self.snapshot();
         self.text.replace_range(range.clone(), replacement);
         self.cursor = range.start + replacement.len();
         self.clear_selection();
+        self.record_edit(before);
     }
 
     /// Replace the full text and clamp the cursor to a valid char boundary.
     pub fn set_text_and_cursor(&mut self, text: String, cursor: usize) {
+        let before = self.snapshot();
         self.text = text;
         self.cursor = cursor.min(self.text.len());
         while self.cursor > 0 && !self.text.is_char_boundary(self.cursor) {
             self.cursor -= 1;
         }
         self.clear_selection();
+        self.record_edit(before);
     }
 
     /// Delete the character before the cursor (Backspace behavior).
     pub fn backspace(&mut self) {
+        let before = self.snapshot();
         if self.delete_selection() {
+            self.record_edit(before);
             return;
         }
         if let Some(prev) = self.prev_char_boundary() {
             self.text.remove(prev);
             self.cursor = prev;
         }
+        self.record_edit(before);
     }
 
     /// Delete the character at the cursor (Delete key behavior).
     pub fn delete(&mut self) {
+        let before = self.snapshot();
         if self.delete_selection() {
+            self.record_edit(before);
             return;
         }
         if self.cursor < self.text.len() {
             self.text.remove(self.cursor);
         }
+        self.record_edit(before);
     }
 
     /// Move cursor one char left.
@@ -605,7 +708,9 @@ impl TextInputState {
     /// Walk back from `cursor` skipping whitespace then non-whitespace,
     /// then delete the resulting range. Implements readline `unix-word-rubout`.
     pub fn delete_word_back(&mut self) {
+        let before = self.snapshot();
         if self.delete_selection() {
+            self.record_edit(before);
             return;
         }
         if self.cursor == 0 {
@@ -633,12 +738,15 @@ impl TextInputState {
         }
 
         self.text.drain(self.cursor..original);
+        self.record_edit(before);
     }
 
     /// Walk forward from `cursor` skipping non-whitespace then whitespace,
     /// then delete the resulting range. Cursor stays at its current position.
     pub fn delete_word_forward(&mut self) {
+        let before = self.snapshot();
         if self.delete_selection() {
+            self.record_edit(before);
             return;
         }
         if self.cursor >= self.text.len() {
@@ -667,11 +775,14 @@ impl TextInputState {
         }
 
         self.text.drain(start..end);
+        self.record_edit(before);
     }
 
     /// Delete everything from cursor back to the start of the input.
     pub fn kill_to_start(&mut self) {
+        let before = self.snapshot();
         if self.delete_selection() {
+            self.record_edit(before);
             return;
         }
         if self.cursor == 0 {
@@ -679,16 +790,20 @@ impl TextInputState {
         }
         self.text.drain(..self.cursor);
         self.cursor = 0;
+        self.record_edit(before);
     }
 
     /// Delete everything from cursor to the end of the input.
     pub fn kill_to_end(&mut self) {
+        let before = self.snapshot();
         if self.delete_selection() {
+            self.record_edit(before);
             return;
         }
         if self.cursor < self.text.len() {
             self.text.truncate(self.cursor);
         }
+        self.record_edit(before);
     }
 
     /// Number of terminal display columns from the start of the text to the
@@ -853,6 +968,7 @@ fn next_boundary_after(text: &str, pos: usize) -> Option<usize> {
 /// Plain keys: Char, Backspace, Delete, Left, Right, Home, End.
 /// Standard selection plus readline-style Ctrl bindings (case-insensitive):
 ///   Ctrl+A or Alt+L=select all; Ctrl+/ or Ctrl+_=deselect;
+///   Ctrl+Z or Alt+Z=undo; Ctrl+Y, Ctrl+Shift+Z, or Alt+Y=redo;
 ///   Ctrl+E=end, Ctrl+B=left, Ctrl+F=right,
 ///   Ctrl+H=backspace, Ctrl+D=delete-fwd,
 ///   Ctrl+W=delete-prev-word, Ctrl+U=kill-to-start, Ctrl+K=kill-to-end.
@@ -881,16 +997,15 @@ pub fn handle_text_input_key_with_boundaries(
     if input.select_all {
         match key.code {
             KeyCode::Char(c) if !ctrl && !alt => {
-                input.text.clear();
-                input.cursor = 0;
-                input.clear_selection();
                 input.insert_char(c);
                 return true;
             }
-            KeyCode::Backspace | KeyCode::Delete => {
-                input.text.clear();
-                input.cursor = 0;
-                input.clear_selection();
+            KeyCode::Backspace => {
+                input.backspace();
+                return true;
+            }
+            KeyCode::Delete => {
+                input.delete();
                 return true;
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End if !shift => {
@@ -917,6 +1032,29 @@ pub fn handle_text_input_key_with_boundaries(
         // without moving the cursor.
         (true, false, _, KeyCode::Char('/')) | (true, false, _, KeyCode::Char('_')) => {
             input.clear_selection();
+            true
+        }
+
+        // Per-field edit history. Ctrl+Shift+Z and Ctrl+Y redo; Alt+Z/Y
+        // provide terminal-multiplexer-safe alternatives.
+        (true, false, true, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'z') => {
+            input.redo();
+            true
+        }
+        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'z') => {
+            input.undo();
+            true
+        }
+        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'y') => {
+            input.redo();
+            true
+        }
+        (false, true, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'z') => {
+            input.undo();
+            true
+        }
+        (false, true, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'y') => {
+            input.redo();
             true
         }
 
@@ -1547,6 +1685,57 @@ mod tests {
             ),
         );
         assert_eq!(s.selection_range(), Some(0..5));
+    }
+
+    #[test]
+    fn text_edit_history_undo_redo_is_utf8_safe() {
+        let mut s = TextInputState::new("café".to_string());
+        s.insert_char('日');
+        assert_eq!(s.text, "café日");
+        assert!(s.can_undo());
+        assert!(s.undo());
+        assert_eq!(s.text, "café");
+        assert_eq!(s.cursor, "café".len());
+        assert!(s.redo());
+        assert_eq!(s.text, "café日");
+        assert_eq!(s.cursor, "café日".len());
+    }
+
+    #[test]
+    fn new_edit_after_undo_invalidates_redo() {
+        let mut s = TextInputState::new("one".to_string());
+        s.insert_string(" two");
+        assert!(s.undo());
+        s.insert_string(" three");
+        assert!(!s.can_redo());
+        assert!(!s.redo());
+        assert_eq!(s.text, "one three");
+    }
+
+    #[test]
+    fn selection_replacement_is_one_undo_step() {
+        let mut s = TextInputState::new_selected("old".to_string());
+        s.insert_string("new");
+        assert_eq!(s.text, "new");
+        assert!(s.undo());
+        assert_eq!(s.text, "old");
+        assert_eq!(s.selection_range(), Some(0..3));
+    }
+
+    #[test]
+    fn ctrl_and_alt_history_bindings_are_available() {
+        let mut s = TextInputState::new("a".to_string());
+        s.insert_char('b');
+        assert!(handle_text_input_key(
+            &mut s,
+            &key(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        ));
+        assert_eq!(s.text, "a");
+        assert!(handle_text_input_key(
+            &mut s,
+            &key(KeyCode::Char('y'), KeyModifiers::ALT),
+        ));
+        assert_eq!(s.text, "ab");
     }
 
     #[test]

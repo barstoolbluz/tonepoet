@@ -365,6 +365,10 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         .pending_metadata_editor
         .as_ref()
         .is_some_and(|state| state.any_presentation_dirty());
+    let parked_metadata_maximized = app
+        .pending_metadata_editor
+        .as_ref()
+        .is_some_and(|state| state.maximized);
 
     if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
         let image_picker_generation = app.image_picker_generation;
@@ -426,7 +430,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
                 image_repaint_generation,
                 theme,
             );
-            dim_metadata_editor_backdrop(f, theme);
+            dim_metadata_editor_backdrop(f, parked.maximized, theme);
             app.pending_metadata_editor = Some(parked);
         }
     }
@@ -463,6 +467,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             f,
             state,
             parked_metadata_dirty,
+            parked_metadata_maximized,
             &mut app.button_map,
             theme,
         );
@@ -831,8 +836,16 @@ fn render_menu_panel_at(
     popup
 }
 
-fn dim_metadata_editor_backdrop(f: &mut Frame, theme: super::theme::Theme) {
-    let area = metadata_editor_layout_for_area(f.size()).popup;
+fn metadata_editor_backdrop_area(area: Rect, maximized: bool) -> Rect {
+    metadata_editor_layout_for_area_with_maximized(area, maximized).popup
+}
+
+fn dim_metadata_editor_backdrop(
+    f: &mut Frame,
+    maximized: bool,
+    theme: super::theme::Theme,
+) {
+    let area = metadata_editor_backdrop_area(f.size(), maximized);
     let buffer = f.buffer_mut();
     for y in area.y..area.y.saturating_add(area.height) {
         for x in area.x..area.x.saturating_add(area.width) {
@@ -852,17 +865,22 @@ fn metadata_autonumber_border_color(
     }
 }
 
+fn metadata_autonumber_parent_area(area: Rect, maximized: bool) -> Rect {
+    metadata_editor_layout_for_area_with_maximized(area, maximized).popup
+}
+
 fn draw_metadata_autonumber(
     f: &mut Frame,
     state: &mut super::metadata_autonumber::AutoNumberOverlayState,
     owner_dirty: bool,
+    owner_maximized: bool,
     button_map: &mut super::button_map::ButtonRenderMap,
     theme: super::theme::Theme,
 ) {
     use super::metadata_autonumber::NumberingScheme;
 
     let parent = f.size();
-    let editor_popup = metadata_editor_layout_for_area(parent).popup;
+    let editor_popup = metadata_autonumber_parent_area(parent, owner_maximized);
     let inset_popup = editor_popup.inner(&ratatui::layout::Margin {
         horizontal: 2,
         vertical: 1,
@@ -1343,7 +1361,11 @@ fn confirmation_footer_hint_bg(
             super::app::ConfirmAction::ArchiveDiscardStartupRecovery { .. }
             | super::app::ConfirmAction::ArchiveDiscardStaging { .. }
             | super::app::ConfirmAction::DeleteEmbeddedCueSheet { .. }
-            | super::app::ConfirmAction::RemoveInvalidApeKeys { .. } => theme.destructive,
+            | super::app::ConfirmAction::RemoveInvalidApeKeys { .. }
+            | super::app::ConfirmAction::TagMaintenance {
+                kind: super::probe::TagMaintenanceKind::RemoveAll,
+                ..
+            } => theme.destructive,
             _ => theme.green,
         },
         "d" => theme.destructive,
@@ -4232,6 +4254,40 @@ fn draw_content_tabs(
             Paragraph::new(Line::from(Span::styled(line2, border_style))),
             Rect::new(area.x, area.y + 1, area.width, 1),
         );
+
+        if state.content_tab == super::app::ContentTab::Metadata && area.width >= 29 {
+            let canonical_style = if state.metadata_view == super::app::MetadataEditorView::Canonical {
+                active_label_style
+            } else {
+                inactive_label_style
+            };
+            let all_style = if state.metadata_view == super::app::MetadataEditorView::All {
+                active_label_style
+            } else {
+                inactive_label_style
+            };
+            let spans = Line::from(vec![
+                Span::styled(" View: ", border_style),
+                Span::styled("Canonical", canonical_style),
+                Span::styled(" | ", border_style),
+                Span::styled("All", all_style),
+                Span::styled(" ", border_style),
+            ]);
+            let selector_width = 24u16.min(area.width);
+            let selector_x = area.x.saturating_add(area.width.saturating_sub(selector_width));
+            f.render_widget(
+                Paragraph::new(spans).alignment(Alignment::Right),
+                Rect::new(selector_x, area.y + 1, selector_width, 1),
+            );
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataEditorViewCanonical,
+                Rect::new(selector_x.saturating_add(7), area.y + 1, 9, 1),
+            );
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataEditorViewAll,
+                Rect::new(selector_x.saturating_add(19), area.y + 1, 3, 1),
+            );
+        }
     }
 }
 
@@ -4840,15 +4896,26 @@ pub(crate) struct MetadataEditorLayout {
 /// same rectangles for scroll bounds and hit testing so row math cannot drift
 /// from what the renderer actually paints.
 pub(crate) fn metadata_editor_layout_for_area(area: Rect) -> MetadataEditorLayout {
-    let w = (area.width * 85 / 100)
-        .max(50)
-        .min(area.width.saturating_sub(2));
-    let h = (area.height * 85 / 100)
-        .max(14)
-        .min(area.height.saturating_sub(2));
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let popup = Rect::new(x, y, w, h);
+    metadata_editor_layout_for_area_with_maximized(area, false)
+}
+
+pub(crate) fn metadata_editor_layout_for_area_with_maximized(
+    area: Rect,
+    maximized: bool,
+) -> MetadataEditorLayout {
+    let popup = if maximized {
+        area
+    } else {
+        let w = (area.width * 85 / 100)
+            .max(50)
+            .min(area.width.saturating_sub(2));
+        let h = (area.height * 85 / 100)
+            .max(14)
+            .min(area.height.saturating_sub(2));
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height.saturating_sub(h) / 2;
+        Rect::new(x, y, w, h)
+    };
     let inner = Rect::new(
         popup.x.saturating_add(1),
         popup.y.saturating_add(1),
@@ -4900,13 +4967,15 @@ fn draw_metadata_editor(
 ) {
     use super::app::{ContentTab, MetadataEditorPhase};
 
-    let layout = metadata_editor_layout_for_area(f.size());
+    let layout = metadata_editor_layout_for_area_with_maximized(f.size(), state.maximized);
     let popup = layout.popup;
     let inner = layout.inner;
 
     f.render_widget(Clear, popup);
 
-    let title = editor_title(state);
+    let base_title = editor_title(state);
+    let indicator = if state.maximized { "▾" } else { "▸" };
+    let title = format!(" {indicator}{}", base_title);
     let border_color = if state.any_presentation_dirty() {
         theme.amber
     } else {
@@ -4914,20 +4983,28 @@ fn draw_metadata_editor(
     };
     let block = super::draw::solid_title_block(popup, title, border_color, theme);
     f.render_widget(block, popup);
+    button_map.record_button(
+        super::button_map::TuiButton::MetadataEditorTitle,
+        Rect::new(
+            popup.x.saturating_add(1),
+            popup.y,
+            popup.width.saturating_sub(4),
+            1,
+        ),
+    );
 
     if state.shows_presentation_control() {
-        let title_width = super::display_width::width(&editor_title(state)) as u16;
+        let title_width = super::display_width::width(&base_title) as u16;
         button_map.record_button(
             super::button_map::TuiButton::MetadataPresentationSelectorToggle,
             Rect::new(
-                popup.x.saturating_add(2),
+                popup.x.saturating_add(4),
                 popup.y,
-                title_width.min(popup.width.saturating_sub(4)),
+                title_width.min(popup.width.saturating_sub(7)),
                 1,
             ),
         );
     }
-
     if inner.height < 4 {
         return;
     }
@@ -4976,13 +5053,16 @@ fn draw_metadata_editor(
 
     let key_col_w = METADATA_EDITOR_KEY_COL_W;
 
-    // Build content lines.
-    let total_rows = state.active_surface().entries.len() + 1; // +1 for "+ Add field..."
+    // Build content lines. Canonical view is a projection over the complete
+    // embedded-tag model; row buttons continue to carry raw entry indices.
+    let visible_entries = state.visible_metadata_entry_indices();
+    let total_rows = visible_entries.len() + 1; // +1 for "+ Add field..."
     let scroll = state.scroll.min(total_rows.saturating_sub(content_h));
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for (i, entry) in state.active_surface().entries.iter().enumerate() {
+    for (visible_index, i) in visible_entries.iter().copied().enumerate() {
+        let entry = &state.active_surface().entries[i];
         let is_cursor = i == state.cursor;
         let is_selected = state.active_surface().selected_rows.contains(&i);
         let is_deleted = state.active_surface().deleted.contains(&i);
@@ -5119,8 +5199,8 @@ fn draw_metadata_editor(
                             ]));
                         }
                     }
-                    let visible_row = i.saturating_sub(scroll);
-                    if i >= scroll && visible_row < content_h {
+                    let visible_row = visible_index.saturating_sub(scroll);
+                    if visible_index >= scroll && visible_row < content_h {
                         button_map.record_button(
                             super::button_map::TuiButton::MetadataEditorInput,
                             Rect::new(
@@ -5147,12 +5227,12 @@ fn draw_metadata_editor(
                     val_max,
                     theme,
                 ));
-                if i >= scroll && i < scroll + content_h {
+                if visible_index >= scroll && visible_index < scroll + content_h {
                     button_map.record_button(
                         super::button_map::TuiButton::MetadataEditorInput,
                         Rect::new(
                             content_area.x.saturating_add(key_chars as u16),
-                            content_area.y.saturating_add((i - scroll) as u16),
+                            content_area.y.saturating_add((visible_index - scroll) as u16),
                             val_max as u16,
                             1,
                         ),
@@ -5265,8 +5345,8 @@ fn draw_metadata_editor(
             // Register the pill rect(s) for click. Visible row index =
             // entries-row-index minus scroll. Out-of-view rows still
             // register but the click handler will reject by row range.
-            if i >= scroll && i < scroll + content_h {
-                let visible_row = (i - scroll) as u16;
+            if visible_index >= scroll && visible_index < scroll + content_h {
+                let visible_row = (visible_index - scroll) as u16;
                 let view_screen_x = content_area.x + (key_chars + val_for_pill) as u16;
                 if view_w > 0 {
                     button_map.record_button(
@@ -5292,6 +5372,7 @@ fn draw_metadata_editor(
 
     // "+ Add field..." row
     let add_row = state.active_surface().entries.len();
+    let add_visible_index = visible_entries.len();
     let is_cursor_add = state.cursor == add_row;
     if state.phase == MetadataEditorPhase::AddingKey {
         if let Some(ref input) = state.add_key_input {
@@ -5304,12 +5385,12 @@ fn draw_metadata_editor(
                 inner_w.saturating_sub(4),
                 theme,
             ));
-            if add_row >= scroll && add_row < scroll + content_h {
+            if add_visible_index >= scroll && add_visible_index < scroll + content_h {
                 button_map.record_button(
                     super::button_map::TuiButton::MetadataEditorInput,
                     Rect::new(
                         content_area.x.saturating_add(3),
-                        content_area.y.saturating_add((add_row - scroll) as u16),
+                        content_area.y.saturating_add((add_visible_index - scroll) as u16),
                         content_area.width.saturating_sub(4),
                         1,
                     ),
@@ -8549,6 +8630,21 @@ mod tests {
 
 
 
+
+    #[test]
+    fn metadata_editor_maximized_geometry_is_the_shared_owner_popup() {
+        let area = Rect::new(3, 4, 120, 30);
+        let normal = metadata_editor_layout_for_area_with_maximized(area, false);
+        let maximized = metadata_editor_layout_for_area_with_maximized(area, true);
+
+        assert_eq!(maximized.popup, area);
+        assert!(maximized.content_area.width > normal.content_area.width);
+        assert!(maximized.content_area.height > normal.content_area.height);
+        assert_eq!(metadata_editor_backdrop_area(area, true), maximized.popup);
+        assert_eq!(metadata_autonumber_parent_area(area, true), maximized.popup);
+        assert_eq!(metadata_editor_backdrop_area(area, false), normal.popup);
+        assert_eq!(metadata_autonumber_parent_area(area, false), normal.popup);
+    }
 
 #[test]
     fn metadata_editor_layout_is_shared_content_body_geometry() {

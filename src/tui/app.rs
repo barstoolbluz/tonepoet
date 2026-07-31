@@ -5957,6 +5957,23 @@ pub enum ContentTab {
     Artwork,
 }
 
+/// Which embedded-tag rows the Metadata tab surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetadataEditorView {
+    #[default]
+    Canonical,
+    All,
+}
+
+impl MetadataEditorView {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Canonical => "Canonical",
+            Self::All => "All",
+        }
+    }
+}
+
 impl ContentTab {
     pub const COUNT: usize = 4;
 
@@ -6320,6 +6337,7 @@ pub struct MediaFacts {
     pub format_name: String,
     pub codec: String,
     pub bit_depth: Option<u32>,
+    pub sample_format_is_float: Option<bool>,
     pub sample_rate: u32,
     pub channels: u32,
     pub channel_layout: String,
@@ -6333,6 +6351,7 @@ impl From<SourceInfo> for MediaFacts {
             format_name: info.format_name,
             codec: info.codec,
             bit_depth: info.bit_depth,
+            sample_format_is_float: info.sample_format_is_float,
             sample_rate: info.sample_rate,
             channels: info.channels,
             channel_layout: info.channel_layout,
@@ -6348,6 +6367,7 @@ impl From<&SourceInfo> for MediaFacts {
             format_name: info.format_name.clone(),
             codec: info.codec.clone(),
             bit_depth: info.bit_depth,
+            sample_format_is_float: info.sample_format_is_float,
             sample_rate: info.sample_rate,
             channels: info.channels,
             channel_layout: info.channel_layout.clone(),
@@ -6363,6 +6383,7 @@ impl From<MediaFacts> for SourceInfo {
             format_name: facts.format_name,
             codec: facts.codec,
             bit_depth: facts.bit_depth,
+            sample_format_is_float: facts.sample_format_is_float,
             sample_rate: facts.sample_rate,
             channels: facts.channels,
             channel_layout: facts.channel_layout,
@@ -7661,6 +7682,8 @@ pub struct MetadataEditorModel {
     pub cursor: usize,
     pub scroll: usize,
     pub content_tab: ContentTab,
+    pub metadata_view: MetadataEditorView,
+    pub maximized: bool,
     pub content_tab_scrolls: [usize; ContentTab::COUNT],
     pub last_click: Option<(usize, std::time::Instant)>,
     pub edit_input: Option<crate::tui::text_input::TextInputState>,
@@ -7715,6 +7738,8 @@ impl Default for MetadataEditorModel {
             cursor: 0,
             scroll: 0,
             content_tab: ContentTab::Metadata,
+            metadata_view: MetadataEditorView::Canonical,
+            maximized: false,
             content_tab_scrolls: [0; ContentTab::COUNT],
             last_click: None,
             edit_input: None,
@@ -7787,6 +7812,55 @@ impl MetadataEditorModel {
             let idx = self.active_tab.min(self.presentation_tabs.len().saturating_sub(1));
             &mut self.presentation_tabs[idx]
         }
+    }
+
+    pub fn metadata_entry_is_visible(&self, index: usize) -> bool {
+        let Some(entry) = self.active_surface().entries.get(index) else {
+            return false;
+        };
+        self.metadata_view == MetadataEditorView::All
+            || crate::tui::probe::STANDARD_KEY_ORDER.iter().any(|known| {
+                *known == crate::tui::probe::canonical_metadata_display_key(&entry.display_key)
+            })
+    }
+
+    pub fn visible_metadata_entry_indices(&self) -> Vec<usize> {
+        (0..self.active_surface().entries.len())
+            .filter(|index| self.metadata_entry_is_visible(*index))
+            .collect()
+    }
+
+    pub fn visible_metadata_rows(&self) -> Vec<usize> {
+        let mut rows = self.visible_metadata_entry_indices();
+        rows.push(self.active_surface().entries.len());
+        rows
+    }
+
+    pub fn set_metadata_view(&mut self, view: MetadataEditorView) {
+        if self.metadata_view == view {
+            return;
+        }
+        self.metadata_view = view;
+        if view == MetadataEditorView::All {
+            self.maximized = true;
+        }
+        let rows = self.visible_metadata_rows();
+        if !rows.contains(&self.cursor) {
+            self.cursor = rows.first().copied().unwrap_or(0);
+        }
+        self.scroll = 0;
+    }
+
+    pub fn toggle_metadata_view(&mut self) {
+        let next = match self.metadata_view {
+            MetadataEditorView::Canonical => MetadataEditorView::All,
+            MetadataEditorView::All => MetadataEditorView::Canonical,
+        };
+        self.set_metadata_view(next);
+    }
+
+    pub fn toggle_metadata_editor_maximized(&mut self) {
+        self.maximized = !self.maximized;
     }
 
     /// Apply a background Details probe completion to the matching editor
@@ -10502,6 +10576,12 @@ pub enum ConfirmAction {
         targets: Vec<(PathBuf, Vec<String>)>,
         verification: tui_file_picker::VerificationMode,
     },
+    TagMaintenance {
+        kind: crate::tui::probe::TagMaintenanceKind,
+        roots: Vec<PathBuf>,
+        from_metadata_editor: bool,
+        verification: tui_file_picker::VerificationMode,
+    },
     RemoveSelected,
     ClearCompleted,
     ClearFinished,
@@ -10637,6 +10717,16 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         ConfirmationFooterHint { label: "N cancel", key: "n" },
         ConfirmationFooterHint { label: "Esc cancel", key: "esc" },
     ];
+    const REPAIR_TAGS: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y repair", key: "y" },
+        ConfirmationFooterHint { label: "N cancel", key: "n" },
+        ConfirmationFooterHint { label: "Esc cancel", key: "esc" },
+    ];
+    const REMOVE_ALL_TAGS: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y remove", key: "y" },
+        ConfirmationFooterHint { label: "N cancel", key: "n" },
+        ConfirmationFooterHint { label: "Esc cancel", key: "esc" },
+    ];
 
     match action {
         ConfirmAction::ArchiveStartupRecovery { .. } => ARCHIVE_STARTUP_RECOVERY,
@@ -10646,6 +10736,14 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         ConfirmAction::ArchiveDiscardStaging { .. } => ARCHIVE_DISCARD_STAGING,
         ConfirmAction::DeleteEmbeddedCueSheet { .. } => DELETE_EMBEDDED_CUESHEET,
         ConfirmAction::RemoveInvalidApeKeys { .. } => REMOVE_INVALID_APE_KEYS,
+        ConfirmAction::TagMaintenance {
+            kind: crate::tui::probe::TagMaintenanceKind::Repair,
+            ..
+        } => REPAIR_TAGS,
+        ConfirmAction::TagMaintenance {
+            kind: crate::tui::probe::TagMaintenanceKind::RemoveAll,
+            ..
+        } => REMOVE_ALL_TAGS,
         _ => DEFAULT,
     }
 }
@@ -14895,6 +14993,7 @@ mod cue_proxy_probe_tests {
             format_name: "FLAC".to_string(),
             codec: "FLAC".to_string(),
             bit_depth,
+            sample_format_is_float: None,
             sample_rate,
             channels,
             channel_layout: if channels == 2 { "stereo".to_string() } else { format!("{} ch", channels) },
@@ -15519,6 +15618,7 @@ mod source_default_reset_tests {
             format_name: "FLAC".to_string(),
             codec: "FLAC".to_string(),
             bit_depth,
+            sample_format_is_float: None,
             sample_rate,
             channels: 2,
             channel_layout: "stereo".to_string(),
@@ -17083,6 +17183,7 @@ mod metadata_presentation_tab_tests {
             format_name: "FLAC".to_string(),
             codec: "FLAC".to_string(),
             bit_depth: Some(24),
+            sample_format_is_float: None,
             sample_rate: 96_000,
             channels: 2,
             channel_layout: "stereo".to_string(),
@@ -17513,6 +17614,7 @@ mod metadata_presentation_tab_tests {
             format_name: "flac".to_string(),
             codec: "FLAC".to_string(),
             bit_depth: Some(24),
+            sample_format_is_float: None,
             sample_rate: 96_000,
             channels: 2,
             channel_layout: "stereo".to_string(),
@@ -17547,6 +17649,48 @@ mod metadata_presentation_tab_tests {
         assert!(matches!(details.files[1].media_facts, ProbeState::NotLoaded), "failed probe becomes retryable");
         assert!(details.files[1].issues.iter().all(|issue| !matches!(issue, MetadataIssue::Probe { .. })));
         assert!(matches!(details.details_probe_state, MetadataDetailsProbeState::Unloaded));
+    }
+
+    #[test]
+    fn metadata_editor_view_projects_canonical_rows_and_all_expands() {
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/album/track.flac")],
+            vec![
+                tag("TITLE", "Song", vec!["Song"]),
+                tag("TITLE [ID3v1]", "Legacy Song", vec!["Legacy Song"]),
+                tag("X-CUSTOM", "diagnostic", vec!["diagnostic"]),
+            ],
+            vec!["track.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+
+        assert_eq!(state.metadata_view, MetadataEditorView::Canonical);
+        assert_eq!(state.visible_metadata_entry_indices(), vec![0]);
+        assert!(!state.maximized);
+
+        state.set_metadata_view(MetadataEditorView::All);
+        assert_eq!(state.visible_metadata_entry_indices(), vec![0, 1, 2]);
+        assert!(state.maximized, "All view must expand the editor");
+    }
+
+    #[test]
+    fn switching_to_canonical_rehomes_a_hidden_custom_cursor() {
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/album/track.flac")],
+            vec![
+                tag("TITLE", "Song", vec!["Song"]),
+                tag("X-CUSTOM", "diagnostic", vec!["diagnostic"]),
+            ],
+            vec!["track.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.set_metadata_view(MetadataEditorView::All);
+        state.cursor = 1;
+
+        state.set_metadata_view(MetadataEditorView::Canonical);
+
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.visible_metadata_rows(), vec![0, 2]);
     }
 
 }

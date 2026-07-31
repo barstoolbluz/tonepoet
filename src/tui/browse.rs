@@ -11939,6 +11939,7 @@ mod tests {
     fn test_cached_info(file_size: u64, title: &str) -> CachedInfo {
         CachedInfo {
             source: crate::tui::probe::SourceInfo {
+                sample_format_is_float: None,
                 format_name: "FLAC".to_string(),
                 codec: "flac".to_string(),
                 bit_depth: Some(16),
@@ -14822,6 +14823,7 @@ mod tests {
                 identity,
                 std::sync::Arc::new(CachedInfo {
                     source: crate::tui::probe::SourceInfo {
+                        sample_format_is_float: None,
                         format_name: "FLAC".to_string(),
                         codec: "flac".to_string(),
                         bit_depth: Some(16),

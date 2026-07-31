@@ -151,6 +151,13 @@ pub enum AppMessage {
     FilesScanned { paths: Vec<std::path::PathBuf> },
     /// Status message to show in the status bar
     StatusMessage(String),
+    TagMaintenanceComplete {
+        kind: crate::tui::probe::TagMaintenanceKind,
+        session_id: Option<u64>,
+        save_generation: Option<u64>,
+        result: Result<Vec<crate::tui::probe::TagMaintenanceFileResult>, String>,
+        refreshed_entries: Option<Result<Vec<crate::tui::probe::TagEntry>, String>>,
+    },
     /// Completion of the single active session tag-clipboard worker. The
     /// generation binds ownership so stale completions only drain the worker
     /// slot and launch the latest coalesced request; they never publish data.

@@ -163,6 +163,11 @@ pub enum TuiButton {
     /// 0-based index into `MetadataEditorState.presentation_tabs`.
     MetadataPresentationSelectorRow(usize),
 
+    /// MetadataEditor title bar. A double click toggles maximization.
+    MetadataEditorTitle,
+    /// MetadataEditor tag-list view selector.
+    MetadataEditorViewCanonical,
+    MetadataEditorViewAll,
     /// Active MetadataEditor inline/add/detail input field.
     MetadataEditorInput,
     /// Active GNUDB/CUE-review inline input field.
@@ -406,6 +411,9 @@ impl TuiButton {
             | Self::OverlayCancel
             | Self::OverlayTextInput
             | Self::MetadataEditorInput
+            | Self::MetadataEditorTitle
+            | Self::MetadataEditorViewCanonical
+            | Self::MetadataEditorViewAll
             | Self::GnudbEditorInput
             | Self::MetadataEditorTab(_)
             | Self::MetadataEditorContentTab(_)

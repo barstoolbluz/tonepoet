@@ -744,6 +744,7 @@ pub fn source_info_for_presentation(
     let file_size = std::fs::metadata(&contents.source_path).map(|m| m.len()).unwrap_or(0);
     let fmt = &presentation.format;
     SourceInfo {
+        sample_format_is_float: None,
         format_name: match contents.format {
             DiscFormat::DvdAudio => "DVD-Audio".to_string(),
             DiscFormat::Sacd => "SACD ISO".to_string(),

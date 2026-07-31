@@ -212,6 +212,8 @@ pub enum ContextAction {
         direction: TagTransferDirection,
         scope: TagTransferScope,
     },
+    BrowseRepairTags,
+    BrowseRemoveAllTags,
     /// Metadata editor footer popup: launch one of the tag lookup/apply flows.
     MetadataTagsMusicBrainz,
     MetadataTagsGnudb,
@@ -222,6 +224,8 @@ pub enum ContextAction {
         direction: TagTransferDirection,
         scope: TagTransferScope,
     },
+    MetadataRepairTags,
+    MetadataRemoveAllTags,
     /// MetadataEditor: toggle the cursor row between MB-proposed and
     /// the file's pre-MB value. No-op when the row was not modified by
     /// MB or has been manually edited.
@@ -731,17 +735,20 @@ fn build_tagging_submenu(has_cue: bool) -> ContextMenuEntry {
     children.push(separator());
     children.push(copy_tags);
     children.push(transfer_tags);
+    children.push(separator());
+    children.push(item("Repair tags", ContextAction::BrowseRepairTags));
+    children.push(separator());
+    children.push(item(
+        "Remove all tags",
+        ContextAction::BrowseRemoveAllTags,
+    ));
     ContextMenuEntry::Submenu {
         label: "Tags & Tagging".to_string(),
         children,
     }
 }
 
-/// "Disc Tools" submenu — AccurateRip and CUETools DB lookups, both
-/// of which only return useful results for redbook CD rips (16-bit /
-/// 44.1 kHz with a known TOC).
-
-/// Build the metadata editor's bottom-anchored `tags` popup. The eight leaf
+/// Build the metadata editor's bottom-anchored `tags` popup. The ten leaf
 /// actions are deliberately explicit so dispatch tests can pin each route.
 pub(crate) fn build_metadata_tags_popup() -> Vec<ContextMenuEntry> {
     vec![
@@ -792,9 +799,16 @@ pub(crate) fn build_metadata_tags_popup() -> Vec<ContextMenuEntry> {
                 ),
             ],
         },
+        separator(),
+        item("Repair tags", ContextAction::MetadataRepairTags),
+        separator(),
+        item("Remove all tags", ContextAction::MetadataRemoveAllTags),
     ]
 }
 
+/// "Disc Tools" submenu — AccurateRip and CUETools DB lookups, both
+/// of which only return useful results for redbook CD rips (16-bit /
+/// 44.1 kHz with a known TOC).
 fn build_disk_tools_submenu() -> ContextMenuEntry {
     ContextMenuEntry::Submenu {
         label: "Disc Tools".to_string(),
@@ -1373,6 +1387,9 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         ContextAction::QueryGnudb | ContextAction::TagsFromMb => Some("tag lookup"),
         ContextAction::CopyTags(_) => Some("tag copying"),
         ContextAction::BrowseTransferTags { .. } => Some("tag transfer"),
+        ContextAction::BrowseRepairTags | ContextAction::BrowseRemoveAllTags => {
+            Some("tag maintenance")
+        }
         ContextAction::ViewFile(_) | ContextAction::EditFile(_) => Some("text file view/edit"),
         _ => None,
     }
@@ -2649,6 +2666,30 @@ pub fn execute_context_action(
         ContextAction::BrowseTransferTags { direction, scope } => {
             open_browse_tag_transfer_picker(app, direction, scope);
         }
+        kind_action @ (ContextAction::BrowseRepairTags | ContextAction::BrowseRemoveAllTags) => {
+            let kind = match kind_action {
+                ContextAction::BrowseRepairTags => crate::tui::probe::TagMaintenanceKind::Repair,
+                ContextAction::BrowseRemoveAllTags => crate::tui::probe::TagMaintenanceKind::RemoveAll,
+                _ => unreachable!("tag-maintenance match is exhaustive"),
+            };
+            let roots = super::command::current_bulk_guard_paths(app);
+            if roots.is_empty() {
+                app.set_status(format!("{}: no files selected", kind.label()));
+                return;
+            }
+            app.active_overlay = ActiveOverlay::Confirmation {
+                message: format!(
+                    "{} for the selected file/folder set?",
+                    kind.label()
+                ),
+                action: crate::tui::app::ConfirmAction::TagMaintenance {
+                    kind,
+                    roots,
+                    from_metadata_editor: false,
+                    verification: app.config.file_operations.verification,
+                },
+            };
+        }
         ContextAction::MetadataTagsMusicBrainz => {
             if let Some(state) = app.pending_metadata_editor.take() {
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -2727,6 +2768,47 @@ pub fn execute_context_action(
                 TagTransferDirection::From => "metadata editor: choose a tag source",
                 TagTransferDirection::To => "metadata editor: choose a tag-transfer target",
             });
+        }
+        kind_action @ (ContextAction::MetadataRepairTags | ContextAction::MetadataRemoveAllTags) => {
+            let kind = match kind_action {
+                ContextAction::MetadataRepairTags => crate::tui::probe::TagMaintenanceKind::Repair,
+                ContextAction::MetadataRemoveAllTags => crate::tui::probe::TagMaintenanceKind::RemoveAll,
+                _ => unreachable!("tag-maintenance match is exhaustive"),
+            };
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.set_status("metadata editor: tag popup lost its editor session");
+                return;
+            };
+            if state.phase == super::app::MetadataEditorPhase::Saving {
+                app.set_status(format!("{}: another metadata write is already running", kind.label()));
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            if state.any_presentation_dirty() {
+                app.set_status(format!(
+                    "{}: save or discard editor changes before mutating on-disk tags",
+                    kind.label()
+                ));
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                return;
+            }
+            let roots = state.active_surface().paths.clone();
+            let count = roots.len();
+            app.pending_metadata_editor = Some(state);
+            app.active_overlay = ActiveOverlay::Confirmation {
+                message: format!(
+                    "{} for {} open file{}?",
+                    kind.label(),
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ),
+                action: crate::tui::app::ConfirmAction::TagMaintenance {
+                    kind,
+                    roots,
+                    from_metadata_editor: true,
+                    verification: app.config.file_operations.verification,
+                },
+            };
         }
         ContextAction::MetadataRowsCopy => {
             if let Some(state) = app.pending_metadata_editor.take() {
@@ -4353,7 +4435,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_tags_popup_exposes_exactly_eight_leaf_routes() {
+    fn metadata_tags_popup_exposes_exactly_ten_leaf_routes() {
         fn collect<'a>(entries: &'a [ContextMenuEntry], out: &mut Vec<(&'a str, &'a ContextAction)>) {
             for entry in entries {
                 match entry {
@@ -4367,7 +4449,7 @@ mod tests {
         let popup = build_metadata_tags_popup();
         let mut leaves = Vec::new();
         collect(&popup, &mut leaves);
-        assert_eq!(leaves.len(), 8);
+        assert_eq!(leaves.len(), 10);
         assert!(leaves.iter().any(|(label, action)| {
             *label == "MusicBrainz" && matches!(action, ContextAction::MetadataTagsMusicBrainz)
         }));
@@ -4391,6 +4473,13 @@ mod tests {
                 )));
             }
         }
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "Repair tags" && matches!(action, ContextAction::MetadataRepairTags)
+        }));
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "Remove all tags"
+                && matches!(action, ContextAction::MetadataRemoveAllTags)
+        }));
     }
 
     fn parked_test_editor(paths: Vec<std::path::PathBuf>) -> Box<MetadataEditorState> {
@@ -4410,8 +4499,32 @@ mod tests {
         ))
     }
 
+    fn assert_tag_maintenance_tail(entries: &[ContextMenuEntry]) {
+        assert!(entries.len() >= 3);
+        let tail = &entries[entries.len() - 3..];
+        assert!(matches!(
+            &tail[0],
+            ContextMenuEntry::Item(ContextMenuItem { label, .. }) if label == "Repair tags"
+        ));
+        assert!(matches!(tail[1], ContextMenuEntry::Separator));
+        assert!(matches!(
+            &tail[2],
+            ContextMenuEntry::Item(ContextMenuItem { label, .. }) if label == "Remove all tags"
+        ));
+    }
+
     #[test]
-    fn metadata_tags_popup_all_eight_leaf_actions_execute_their_dispatch_routes() {
+    fn tag_maintenance_entries_are_bottom_aligned_with_destructive_separator() {
+        assert_tag_maintenance_tail(&build_metadata_tags_popup());
+
+        let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(false) else {
+            panic!("tagging menu must be a submenu");
+        };
+        assert_tag_maintenance_tail(&children);
+    }
+
+    #[test]
+    fn metadata_tags_popup_all_ten_leaf_actions_execute_their_dispatch_routes() {
         tui_file_picker::with_scoped_shared_text_clipboard("TITLE\nDuke", || {
             let tx = {
                 let (tx, _rx) = mpsc::channel(16);
@@ -4512,6 +4625,35 @@ mod tests {
                         }) if *actual_direction == direction && *actual_scope == scope
                     ));
                 }
+            }
+
+            for (action, expected_kind) in [
+                (
+                    ContextAction::MetadataRepairTags,
+                    crate::tui::probe::TagMaintenanceKind::Repair,
+                ),
+                (
+                    ContextAction::MetadataRemoveAllTags,
+                    crate::tui::probe::TagMaintenanceKind::RemoveAll,
+                ),
+            ] {
+                let mut maintenance = AppState::new_for_test(TonepoetConfig::default());
+                maintenance.pending_metadata_editor = Some(parked_test_editor(vec![
+                    std::path::PathBuf::from("/tmp/editor.flac"),
+                ]));
+                execute_context_action(&mut maintenance, action, &tx, false);
+                assert!(matches!(
+                    &maintenance.active_overlay,
+                    ActiveOverlay::Confirmation {
+                        action: crate::tui::app::ConfirmAction::TagMaintenance {
+                            kind,
+                            from_metadata_editor: true,
+                            ..
+                        },
+                        ..
+                    } if *kind == expected_kind
+                ));
+                assert!(maintenance.pending_metadata_editor.is_some());
             }
         });
     }
@@ -4662,8 +4804,16 @@ mod tests {
         .content_area
         .height
         .max(1) as usize;
-        assert!(state.cursor >= state.scroll);
-        assert!(state.cursor < state.scroll.saturating_add(visible));
+        // Item 6 (canonical/all view): scroll tracks the cursor's position within
+        // the view-filtered visible rows, not the raw entry index. Assert the
+        // cursor's visible position is on-screen.
+        let cursor_pos = state
+            .visible_metadata_rows()
+            .iter()
+            .position(|&row| row == state.cursor)
+            .expect("cursor row must be visible after add-field");
+        assert!(cursor_pos >= state.scroll);
+        assert!(cursor_pos < state.scroll.saturating_add(visible));
     }
 
     #[test]

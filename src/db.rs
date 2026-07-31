@@ -3396,6 +3396,7 @@ impl CachedProbeRow {
         use crate::tui::probe::{SourceInfo, SourceMetadata};
         Some(crate::tui::browse::CachedInfo {
             source: SourceInfo {
+                sample_format_is_float: None,
                 format_name: self.format_name.clone()?,
                 codec: self.codec.clone().unwrap_or_default(),
                 bit_depth: self.bit_depth,

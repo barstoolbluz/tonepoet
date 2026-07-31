@@ -5729,6 +5729,100 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 );
             }
         }
+        AppMessage::TagMaintenanceComplete {
+            kind,
+            session_id,
+            save_generation,
+            result,
+            refreshed_entries,
+        } => {
+            let mut refresh_failed = false;
+            let changed_paths = result
+                .as_ref()
+                .map(|results| {
+                    results
+                        .iter()
+                        .filter(|entry| entry.changed || entry.commit_state_unknown)
+                        .map(|entry| entry.path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            for path in &changed_paths {
+                app.browse.remove_probe_cache_entry(path);
+                let _ = app.db.invalidate_probe(&path.display().to_string());
+            }
+
+            if let (Some(session_id), Some(save_generation)) = (session_id, save_generation) {
+                if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
+                    let is_current = taken.state.phase == super::app::MetadataEditorPhase::Saving
+                        && taken.state.model.editor_save_generation == save_generation
+                        && taken.state.active_surface().technical_details.session_id == session_id
+                        && taken
+                            .state
+                            .active_surface()
+                            .technical_details
+                            .active_save_generation
+                            == Some(save_generation);
+                    if is_current {
+                        taken.state.clear_metadata_write_cancel();
+                        taken.state.model.metadata_save_progress = None;
+                        taken.state.phase = super::app::MetadataEditorPhase::Editing;
+                        taken
+                            .state
+                            .active_surface_mut()
+                            .technical_details
+                            .active_save_generation = None;
+                        if !changed_paths.is_empty() {
+                            taken.state.mark_archive_staging_dirty();
+                        }
+                        if let Some(refresh) = refreshed_entries {
+                            match refresh {
+                                Ok(entries) => {
+                                    if !taken
+                                        .state
+                                        .replace_saved_surface_entries(session_id, entries)
+                                    {
+                                        refresh_failed = true;
+                                    }
+                                }
+                                Err(_) => {
+                                    refresh_failed = true;
+                                    let _ = taken
+                                        .state
+                                        .mark_saved_surface_refresh_failed(session_id);
+                                }
+                            }
+                        }
+                        app.set_status(super::keybindings::tag_maintenance_status_line(
+                            kind,
+                            &result,
+                            refresh_failed,
+                        ));
+                    } else {
+                        app.set_status(format!(
+                            "{}: ignored stale completion for session {session_id} generation {save_generation}",
+                            kind.label()
+                        ));
+                    }
+                    restore_taken_metadata_editor(app, taken);
+                } else {
+                    app.set_status(format!(
+                        "{} finished after the metadata editor closed",
+                        kind.label()
+                    ));
+                }
+            } else {
+                app.browse.refresh_with_search(Some(tx));
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                app.set_status(super::keybindings::tag_maintenance_status_line(
+                    kind,
+                    &result,
+                    false,
+                ));
+            }
+        }
         AppMessage::MetadataEditorWriteProgress {
             session_id,
             save_generation,
@@ -9857,6 +9951,7 @@ mod sentinel_clamp_status_tests {
                 format_name: "FLAC".to_string(),
                 codec: "flac".to_string(),
                 bit_depth: Some(24),
+                sample_format_is_float: None,
                 sample_rate: 96_000,
                 channels: 2,
                 channel_layout: "stereo".to_string(),
@@ -14780,6 +14875,7 @@ mod async_message_drain_tests {
                 format_name: "FLAC".to_string(),
                 codec: "flac".to_string(),
                 bit_depth: Some(16),
+                sample_format_is_float: None,
                 sample_rate: 44_100,
                 channels: 2,
                 channel_layout: "stereo".to_string(),

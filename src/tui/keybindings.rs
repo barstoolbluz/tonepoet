@@ -4796,6 +4796,7 @@ mod inline_edit_behavior_tests {
                     format_name: "FLAC".to_string(),
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
+                    sample_format_is_float: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),
@@ -9827,7 +9828,7 @@ fn metadata_editor_has_audio_save_work(
 
 fn metadata_editor_entries_snapshot_for_save(
     state: &super::app::MetadataEditorState,
-) -> Vec<(lofty::tag::ItemKey, crate::tui::probe::RowScope, Vec<String>, Vec<String>)> {
+) -> Vec<crate::tui::probe::MetadataEditorTagSnapshot> {
     let surface = state.active_surface();
     let suppress_sidecar_shadow_cuesheet =
         surface.sidecar_cuesheet_shadow_present && !surface.embedded_cuesheet_present;
@@ -9836,6 +9837,7 @@ fn metadata_editor_entries_snapshot_for_save(
         .entries
         .iter()
         .map(|entry| {
+            let row_scope = entry.effective_row_scope(surface.paths.len());
             let originals = entry.per_file_originals.clone();
             let values = if suppress_sidecar_shadow_cuesheet
                 && entry.display_key.eq_ignore_ascii_case("CUESHEET")
@@ -9848,12 +9850,20 @@ fn metadata_editor_entries_snapshot_for_save(
             } else {
                 entry.per_file_values.clone()
             };
-            (
-                entry.item_key.clone(),
-                entry.effective_row_scope(surface.paths.len()),
+            crate::tui::probe::MetadataEditorTagSnapshot {
+                item_key: entry.item_key.clone(),
+                row_scope,
+                tag_type: crate::tui::probe::editor_tag_origin(&entry.display_key),
+                existed: if row_scope == crate::tui::probe::RowScope::File {
+                    (0..surface.paths.len())
+                        .map(|idx| entry.stored_value_count_for_slot(idx) > 0)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 values,
                 originals,
-            )
+            }
         })
         .collect()
 }
@@ -9874,14 +9884,19 @@ fn metadata_editor_audio_tag_changes_required_for_sidecar_writeback(
     metadata_editor_entries_snapshot_for_save(state)
         .into_iter()
         .enumerate()
-        .any(|(entry_idx, (_key, row_scope, values, originals))| {
-            if row_scope == crate::tui::probe::RowScope::Track {
+        .any(|(entry_idx, entry)| {
+            if entry.row_scope == crate::tui::probe::RowScope::Track {
                 return false;
             }
-            if values.len() != path_count || originals.len() != path_count {
+            if entry.values.len() != path_count || entry.originals.len() != path_count {
                 return false;
             }
-            deleted.contains(&entry_idx) || values.iter().zip(originals.iter()).any(|(v, o)| v != o)
+            deleted.contains(&entry_idx)
+                || entry
+                    .values
+                    .iter()
+                    .zip(entry.originals.iter())
+                    .any(|(value, original)| value != original)
         })
 }
 
@@ -10204,7 +10219,7 @@ pub(super) fn metadata_editor_save(
                     )));
                 },
             );
-            let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            let mut results = crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
                 &paths,
                 &entries_snap,
                 &deleted,
@@ -10594,7 +10609,7 @@ fn metadata_editor_switch_content_tab(
         if let Some(status) = metadata_editor_apply_content_tab_progress(state) {
             app.set_status(status);
         } else {
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
             app.set_status(metadata_editor_status_for_content_tab(&**state));
         }
     }
@@ -10603,15 +10618,13 @@ fn metadata_editor_switch_content_tab(
 fn metadata_editor_cycle_field_in_current_tab(
     app: &mut AppState,
     state: &mut Box<super::app::MetadataEditorState>,
-    total_rows: usize,
+    _total_rows: usize,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     match state.content_tab {
         crate::tui::app::ContentTab::Metadata => {
-            if total_rows > 0 {
-                state.cursor = (state.cursor + 1) % total_rows;
-                ensure_cursor_visible(state);
-            }
+            metadata_editor_move_visible_cursor(state, 1, true);
+            ensure_cursor_visible(state);
         }
         crate::tui::app::ContentTab::ReplayGain => {
             handle_metadata_replaygain_key(
@@ -10630,7 +10643,7 @@ fn metadata_editor_cycle_field_in_current_tab(
             );
         }
         crate::tui::app::ContentTab::Details => {
-            scroll_metadata_read_only_tab(state, 1, metadata_editor_read_only_visible_rows());
+            scroll_metadata_read_only_tab_for_current_layout(state, 1);
         }
     }
 }
@@ -10751,20 +10764,20 @@ fn handle_metadata_replaygain_key(
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
             state.move_replaygain_cursor(-1);
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.move_replaygain_cursor(1);
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::Home => {
             state.replaygain_cursor = 0;
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::End => {
             state.replaygain_cursor = crate::tui::metadata_view_models::replaygain_action_row_count(state)
                 .saturating_sub(1);
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('*') => {
             app.set_status(
@@ -10789,7 +10802,7 @@ fn handle_metadata_replaygain_key(
             );
         }
         _ => {
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
     }
 }
@@ -10910,21 +10923,21 @@ fn handle_metadata_artwork_key(
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
             state.move_artwork_cursor(-1);
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.move_artwork_cursor(1);
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::Home => {
             state.set_artwork_cursor(0);
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::End => {
             let last = crate::tui::metadata_view_models::artwork_action_row_count(state)
                 .saturating_sub(1);
             state.set_artwork_cursor(last);
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
         KeyCode::Enter | KeyCode::Char('+') => {
             if state.read_only {
@@ -10940,7 +10953,7 @@ fn handle_metadata_artwork_key(
             metadata_editor_dispatch_artwork_remove(app, state, tx);
         }
         _ => {
-            clamp_metadata_read_only_scroll(state, metadata_editor_read_only_visible_rows());
+            clamp_metadata_read_only_scroll_for_current_layout(state);
         }
     }
 }
@@ -13056,6 +13069,44 @@ fn metadata_editor_handle_alt_commit_action(
     true
 }
 
+fn metadata_editor_visible_cursor_position(
+    state: &super::app::MetadataEditorState,
+    rows: &[usize],
+) -> usize {
+    rows.iter()
+        .position(|row| *row == state.cursor)
+        .unwrap_or(0)
+}
+
+fn metadata_editor_move_visible_cursor(
+    state: &mut super::app::MetadataEditorState,
+    delta: isize,
+    wrap: bool,
+) {
+    let rows = state.visible_metadata_rows();
+    if rows.is_empty() {
+        state.cursor = 0;
+        return;
+    }
+    let current = metadata_editor_visible_cursor_position(state, &rows);
+    let next = if wrap {
+        (current as isize + delta).rem_euclid(rows.len() as isize) as usize
+    } else {
+        (current as isize + delta).clamp(0, rows.len().saturating_sub(1) as isize) as usize
+    };
+    state.cursor = rows[next];
+}
+
+fn metadata_editor_set_visible_cursor_position(
+    state: &mut super::app::MetadataEditorState,
+    position: usize,
+) {
+    let rows = state.visible_metadata_rows();
+    if let Some(row) = rows.get(position.min(rows.len().saturating_sub(1))) {
+        state.cursor = *row;
+    }
+}
+
 fn metadata_editor_effective_selected_rows(
     state: &super::app::MetadataEditorState,
 ) -> Vec<usize> {
@@ -13065,7 +13116,7 @@ fn metadata_editor_effective_selected_rows(
         .selected_rows
         .iter()
         .copied()
-        .filter(|index| *index < len)
+        .filter(|index| *index < len && state.metadata_entry_is_visible(*index))
         .collect::<Vec<_>>();
     if selected.is_empty() && state.cursor < len {
         vec![state.cursor]
@@ -13077,18 +13128,21 @@ fn metadata_editor_effective_selected_rows(
 pub(super) fn metadata_editor_select_all_rows(
     state: &mut super::app::MetadataEditorState,
 ) -> usize {
-    let len = state.active_surface().entries.len();
-    state.active_surface_mut().selected_rows = (0..len).collect();
-    len
+    let visible = state.visible_metadata_entry_indices();
+    let count = visible.len();
+    state.active_surface_mut().selected_rows = visible.into_iter().collect();
+    count
 }
 
 pub(super) fn metadata_editor_invert_row_selection(
     state: &mut super::app::MetadataEditorState,
 ) -> usize {
-    let len = state.active_surface().entries.len();
+    let visible = state.visible_metadata_entry_indices();
     let prior = state.active_surface().selected_rows.clone();
-    state.active_surface_mut().selected_rows =
-        (0..len).filter(|index| !prior.contains(index)).collect();
+    state.active_surface_mut().selected_rows = visible
+        .into_iter()
+        .filter(|index| !prior.contains(index))
+        .collect();
     state.active_surface().selected_rows.len()
 }
 
@@ -13290,7 +13344,7 @@ fn handle_metadata_editor_key(
 ) {
     use super::app::MetadataEditorPhase;
 
-    let total_rows = state.active_surface().entries.len() + 1; // +1 for "Add field" row
+    let total_rows = state.visible_metadata_rows().len(); // includes the "Add field" row
 
     if metadata_editor_handle_alt_commit_action(app, state, &key, tx) {
         return;
@@ -13436,39 +13490,19 @@ fn handle_metadata_editor_key(
                         crate::tui::app::ContentTab::Details => {
                             match key.code {
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    scroll_metadata_read_only_tab(
-                                        state,
-                                        -1,
-                                        metadata_editor_read_only_visible_rows(),
-                                    );
+                                    scroll_metadata_read_only_tab_for_current_layout(state, -1);
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    scroll_metadata_read_only_tab(
-                                        state,
-                                        1,
-                                        metadata_editor_read_only_visible_rows(),
-                                    );
+                                    scroll_metadata_read_only_tab_for_current_layout(state, 1);
                                 }
                                 KeyCode::PageUp => {
-                                    scroll_metadata_read_only_tab(
-                                        state,
-                                        -5,
-                                        metadata_editor_read_only_visible_rows(),
-                                    );
+                                    scroll_metadata_read_only_tab_for_current_layout(state, -5);
                                 }
                                 KeyCode::PageDown => {
-                                    scroll_metadata_read_only_tab(
-                                        state,
-                                        5,
-                                        metadata_editor_read_only_visible_rows(),
-                                    );
+                                    scroll_metadata_read_only_tab_for_current_layout(state, 5);
                                 }
                                 KeyCode::Home => {
-                                    set_metadata_read_only_scroll(
-                                        state,
-                                        0,
-                                        metadata_editor_read_only_visible_rows(),
-                                    );
+                                    set_metadata_read_only_scroll_for_current_layout(state, 0);
                                 }
                                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                     let status = metadata_editor_retry_details_probe(state, tx);
@@ -13478,10 +13512,7 @@ fn handle_metadata_editor_key(
                                     metadata_editor_start_details_analysis(app, state, tx);
                                 }
                                 _ => {
-                                    clamp_metadata_read_only_scroll(
-                                        state,
-                                        metadata_editor_read_only_visible_rows(),
-                                    );
+                                    clamp_metadata_read_only_scroll_for_current_layout(state);
                                 }
                             }
                         }
@@ -13536,30 +13567,41 @@ fn handle_metadata_editor_key(
                         app.set_status(reason);
                     }
                 }
+                KeyCode::Char('v') if key.modifiers.is_empty() => {
+                    state.toggle_metadata_view();
+                    ensure_cursor_visible(state);
+                    app.set_status(format!(
+                        "metadata editor view: {}",
+                        state.metadata_view.label()
+                    ));
+                }
+                KeyCode::Char('m') if key.modifiers == KeyModifiers::ALT => {
+                    state.toggle_metadata_editor_maximized();
+                    ensure_cursor_visible(state);
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    state.cursor = state.cursor.saturating_sub(1);
+                    metadata_editor_move_visible_cursor(state, -1, false);
                     ensure_cursor_visible(state);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if state.cursor + 1 < total_rows {
-                        state.cursor += 1;
-                    }
+                    metadata_editor_move_visible_cursor(state, 1, false);
                     ensure_cursor_visible(state);
                 }
                 KeyCode::PageUp => {
-                    state.cursor = state.cursor.saturating_sub(10);
+                    metadata_editor_move_visible_cursor(state, -10, false);
                     ensure_cursor_visible(state);
                 }
                 KeyCode::PageDown => {
-                    state.cursor = (state.cursor + 10).min(total_rows.saturating_sub(1));
+                    metadata_editor_move_visible_cursor(state, 10, false);
                     ensure_cursor_visible(state);
                 }
                 KeyCode::Home => {
-                    state.cursor = 0;
+                    metadata_editor_set_visible_cursor_position(state, 0);
                     ensure_cursor_visible(state);
                 }
                 KeyCode::End => {
-                    state.cursor = total_rows.saturating_sub(1);
+                    let last = state.visible_metadata_rows().len().saturating_sub(1);
+                    metadata_editor_set_visible_cursor_position(state, last);
                     ensure_cursor_visible(state);
                 }
                 KeyCode::Enter => {
@@ -13624,6 +13666,7 @@ fn handle_metadata_editor_key(
                 // Up/Down: move the cursor to the same terminal display
                 // column on the adjacent hard-wrapped row.
                 KeyCode::Up | KeyCode::Down => {
+                    let maximized = state.maximized;
                     let Some(input) = state.edit_input.as_mut() else {
                         state.phase = MetadataEditorPhase::Editing;
                         return;
@@ -13631,10 +13674,10 @@ fn handle_metadata_editor_key(
                     let has_nl = input.text.contains('\n') || input.text.contains('\r');
                     let display_len = super::display_width::width(&input.text);
                     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-                    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
-                    let inner_w = layout.content_area.width as usize;
-                    let key_col_w = super::draw_overlays::METADATA_EDITOR_KEY_COL_W;
-                    let value_width = inner_w.saturating_sub(key_col_w + 1);
+                    let value_width = metadata_editor_inline_value_width_for_area(
+                        Rect::new(0, 0, width, height),
+                        maximized,
+                    );
 
                     if (display_len > super::draw_overlays::MULTILINE_EDIT_THRESHOLD || has_nl)
                         && value_width > 0
@@ -19155,10 +19198,63 @@ fn metadata_editor_details_path_has_extension(
 }
 
 
-fn metadata_editor_read_only_visible_rows() -> usize {
+fn metadata_editor_inline_value_width_for_area(area: Rect, maximized: bool) -> usize {
+    let layout = super::draw_overlays::metadata_editor_layout_for_area_with_maximized(
+        area,
+        maximized,
+    );
+    (layout.content_area.width as usize)
+        .saturating_sub(super::draw_overlays::METADATA_EDITOR_KEY_COL_W + 1)
+}
+
+fn metadata_editor_read_only_visible_rows_for_area(
+    state: &crate::tui::app::MetadataEditorState,
+    area: Rect,
+) -> usize {
+    metadata_editor_visible_rows_for_area(area, state.maximized)
+}
+
+fn metadata_editor_read_only_visible_rows(
+    state: &crate::tui::app::MetadataEditorState,
+) -> usize {
     let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    let layout = super::draw_overlays::metadata_editor_layout_for_area(Rect::new(0, 0, width, height));
-    layout.content_area.height.max(1) as usize
+    metadata_editor_read_only_visible_rows_for_area(
+        state,
+        Rect::new(0, 0, width, height),
+    )
+}
+
+fn clamp_metadata_read_only_scroll_for_current_layout(
+    state: &mut crate::tui::app::MetadataEditorState,
+) -> bool {
+    let visible_rows = metadata_editor_read_only_visible_rows(state);
+    clamp_metadata_read_only_scroll(state, visible_rows)
+}
+
+fn scroll_metadata_read_only_tab_for_current_layout(
+    state: &mut crate::tui::app::MetadataEditorState,
+    delta: isize,
+) -> bool {
+    let visible_rows = metadata_editor_read_only_visible_rows(state);
+    scroll_metadata_read_only_tab(state, delta, visible_rows)
+}
+
+#[cfg(test)]
+fn set_metadata_read_only_scroll_for_area(
+    state: &mut crate::tui::app::MetadataEditorState,
+    scroll: usize,
+    area: Rect,
+) -> bool {
+    let visible_rows = metadata_editor_read_only_visible_rows_for_area(state, area);
+    set_metadata_read_only_scroll(state, scroll, visible_rows)
+}
+
+fn set_metadata_read_only_scroll_for_current_layout(
+    state: &mut crate::tui::app::MetadataEditorState,
+    scroll: usize,
+) -> bool {
+    let visible_rows = metadata_editor_read_only_visible_rows(state);
+    set_metadata_read_only_scroll(state, scroll, visible_rows)
 }
 
 fn metadata_read_only_total_lines(state: &crate::tui::app::MetadataEditorState) -> usize {
@@ -25656,6 +25752,283 @@ pub(super) fn start_invalid_ape_repair(
     });
 }
 
+pub(super) fn start_tag_maintenance(
+    app: &mut AppState,
+    mut editor: Option<Box<super::app::MetadataEditorState>>,
+    roots: Vec<std::path::PathBuf>,
+    kind: super::probe::TagMaintenanceKind,
+    verification: tui_file_picker::VerificationMode,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if roots.is_empty() {
+        if let Some(state) = editor.take() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        app.set_status(format!("{}: no targets remain", kind.label()));
+        return;
+    }
+
+    let from_metadata_editor = editor.is_some();
+    let (session_id, save_generation, cancel) = if let Some(state) = editor.as_mut() {
+        if state.phase == super::app::MetadataEditorPhase::Saving {
+            app.active_overlay = ActiveOverlay::MetadataEditor(editor.take().expect("checked"));
+            app.set_status(format!("{}: another metadata write is already running", kind.label()));
+            return;
+        }
+        if state.any_presentation_dirty() {
+            app.active_overlay = ActiveOverlay::MetadataEditor(editor.take().expect("checked"));
+            app.set_status(format!(
+                "{}: save or discard editor changes before changing on-disk tags",
+                kind.label()
+            ));
+            return;
+        }
+        state.phase = super::app::MetadataEditorPhase::Saving;
+        let (session_id, generation, cancel) = state.begin_cancellable_write();
+        state.model.metadata_save_progress = Some(format!(
+            "{} 0/{}",
+            kind.progress_verb(),
+            roots.len()
+        ));
+        (Some(session_id), Some(generation), Some(cancel))
+    } else {
+        (None, None, None)
+    };
+
+    if let Some(state) = editor.take() {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+    }
+    app.set_status(format!(
+        "{} started for {} target{}",
+        kind.label(),
+        roots.len(),
+        if roots.len() == 1 { "" } else { "s" }
+    ));
+
+    let panic_roots = roots.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let worker_tx = tx.clone();
+        let worker_cancel = cancel.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let paths = if from_metadata_editor {
+                roots
+            } else {
+                super::command::expand_audio_paths_for_metadata_limited(
+                    &roots,
+                    super::context_menu::TAG_CLIPBOARD_COPY_MAX_VISITED,
+                    super::context_menu::TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+                    || false,
+                )?
+            };
+            if paths.is_empty() {
+                return Err(format!("{}: selection contains no audio files", kind.label()));
+            }
+
+            let total = paths.len();
+            let mut results = Vec::with_capacity(total);
+            for (index, path) in paths.iter().enumerate() {
+                let detail = format!(
+                    "{} {}/{}: {}",
+                    kind.progress_verb(),
+                    index + 1,
+                    total,
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                );
+                if let (Some(session_id), Some(save_generation)) =
+                    (session_id, save_generation)
+                {
+                    let _ = worker_tx.blocking_send(AppMessage::MetadataEditorWriteProgress {
+                        session_id,
+                        save_generation,
+                        detail,
+                    });
+                } else {
+                    let _ = worker_tx.blocking_send(AppMessage::StatusMessage(detail));
+                }
+
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::probe::run_tag_maintenance(
+                        path,
+                        kind,
+                        verification,
+                        worker_cancel.as_ref(),
+                    )
+                })) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let detail = payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        super::probe::TagMaintenanceFileResult {
+                            path: path.clone(),
+                            changed: false,
+                            changes: Vec::new(),
+                            durability_warnings: Vec::new(),
+                            error: Some(format!(
+                                "{} worker panicked while processing '{}': {detail}",
+                                kind.label(),
+                                path.display()
+                            )),
+                            cancelled: false,
+                            commit_state_unknown: true,
+                        }
+                    }
+                };
+                results.push(result);
+            }
+
+            let refreshed_entries = if from_metadata_editor {
+                Some(super::probe::read_all_tags_merged(&paths))
+            } else {
+                None
+            };
+            Ok((results, refreshed_entries))
+        })
+        .await;
+
+        let (result, refreshed_entries) = match worker {
+            Ok(Ok((results, refreshed_entries))) => (Ok(results), refreshed_entries),
+            Ok(Err(error)) => (Err(error), None),
+            Err(error) => (
+                Err(format!(
+                    "{} worker terminated before returning results for {} target{}: {error}",
+                    kind.label(),
+                    panic_roots.len(),
+                    if panic_roots.len() == 1 { "" } else { "s" }
+                )),
+                None,
+            ),
+        };
+        let _ = tx
+            .send(AppMessage::TagMaintenanceComplete {
+                kind,
+                session_id,
+                save_generation,
+                result,
+                refreshed_entries,
+            })
+            .await;
+    });
+}
+
+pub(super) fn tag_maintenance_status_line(
+    kind: super::probe::TagMaintenanceKind,
+    result: &Result<Vec<super::probe::TagMaintenanceFileResult>, String>,
+    refresh_failed: bool,
+) -> String {
+    let Ok(results) = result else {
+        return format!(
+            "{} failed: {}",
+            kind.label(),
+            result.as_ref().err().expect("checked error")
+        );
+    };
+    let changed = results.iter().filter(|result| result.changed).count();
+    let clean = results
+        .iter()
+        .filter(|result| !result.changed && result.error.is_none())
+        .count();
+    let cancelled = results.iter().filter(|result| result.cancelled).count();
+    let commit_unknown = results
+        .iter()
+        .filter(|result| result.commit_state_unknown)
+        .count();
+    let failed = results
+        .iter()
+        .filter(|result| {
+            result.error.is_some() && !result.cancelled && !result.commit_state_unknown
+        })
+        .count();
+    let warnings = results
+        .iter()
+        .map(|result| result.durability_warnings.len())
+        .sum::<usize>();
+    let mut parts = if kind == super::probe::TagMaintenanceKind::Repair
+        && changed == 0
+        && failed == 0
+        && cancelled == 0
+        && commit_unknown == 0
+    {
+        vec![format!(
+            "{}: nothing to repair ({} unchanged)",
+            kind.label(), clean
+        )]
+    } else {
+        vec![format!(
+            "{}: {} changed, {} unchanged",
+            kind.label(), changed, clean
+        )]
+    };
+    if cancelled > 0 {
+        parts.push(format!("{} cancelled", cancelled));
+    }
+    if commit_unknown > 0 {
+        parts.push(format!("{} commit state unknown", commit_unknown));
+    }
+    if failed > 0 {
+        parts.push(format!("{} failed", failed));
+    }
+    if warnings > 0 {
+        parts.push(format!(
+            "{} durability warning{}",
+            warnings,
+            if warnings == 1 { "" } else { "s" }
+        ));
+    }
+    if refresh_failed {
+        parts.push("display refresh failed".to_string());
+    }
+    parts.join(", ")
+}
+
+#[cfg(test)]
+mod tag_maintenance_status_tests {
+    use super::*;
+
+    fn result(changed: bool, error: Option<&str>) -> super::super::probe::TagMaintenanceFileResult {
+        super::super::probe::TagMaintenanceFileResult {
+            path: std::path::PathBuf::from("track.flac"),
+            changed,
+            changes: Vec::new(),
+            durability_warnings: Vec::new(),
+            error: error.map(str::to_string),
+            cancelled: false,
+            commit_state_unknown: false,
+        }
+    }
+
+    #[test]
+    fn clean_repair_reports_nothing_to_repair() {
+        let results = Ok(vec![result(false, None)]);
+        assert_eq!(
+            tag_maintenance_status_line(
+                super::super::probe::TagMaintenanceKind::Repair,
+                &results,
+                false,
+            ),
+            "Repair tags: nothing to repair (1 unchanged)"
+        );
+    }
+
+    #[test]
+    fn remove_all_summary_keeps_changed_and_failed_counts_distinct() {
+        let results = Ok(vec![result(true, None), result(false, Some("failed"))]);
+        assert_eq!(
+            tag_maintenance_status_line(
+                super::super::probe::TagMaintenanceKind::RemoveAll,
+                &results,
+                false,
+            ),
+            "Remove all tags: 1 changed, 0 unchanged, 1 failed"
+        );
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct InvalidApeRepairCompletionSummary {
     pub committed_verified: usize,
@@ -28161,32 +28534,25 @@ fn handle_metadata_editor_mouse_in_area(
 ) {
     use super::app::MetadataEditorPhase;
 
-    let layout = super::draw_overlays::metadata_editor_layout_for_area(area);
-    let popup_x = layout.popup.x;
-    let popup_y = layout.popup.y;
-    let w = layout.popup.width;
-    let h = layout.popup.height;
-    let inner_x = layout.inner.x;
-    let inner_w = layout.inner.width;
-    let content_y = layout.content_area.y;
-    let content_h = layout.content_area.height as usize;
-    let footer_y = layout.footer_area.y;
-
     let mx = mouse.column;
     let my = mouse.row;
 
-    // Region checks.
-    let in_popup = mx >= popup_x && mx < popup_x + w && my >= popup_y && my < popup_y + h;
-    let _in_content = mx >= inner_x
-        && mx < inner_x + inner_w
-        && my >= content_y
-        && my < content_y + content_h as u16;
-    let _in_footer = mx >= inner_x && mx < inner_x + inner_w && my == footer_y;
-
     let overlay = app.active_overlay.clone();
     if let ActiveOverlay::MetadataEditor(mut state) = overlay {
-        let total_rows = state.active_surface().entries.len() + 1;
-
+        let layout = super::draw_overlays::metadata_editor_layout_for_area_with_maximized(
+            area,
+            state.maximized,
+        );
+        let popup_x = layout.popup.x;
+        let popup_y = layout.popup.y;
+        let w = layout.popup.width;
+        let h = layout.popup.height;
+        let inner_x = layout.inner.x;
+        let inner_w = layout.inner.width;
+        let content_y = layout.content_area.y;
+        let content_h = layout.content_area.height as usize;
+        let footer_y = layout.footer_area.y;
+        let in_popup = mx >= popup_x && mx < popup_x + w && my >= popup_y && my < popup_y + h;
         if state.file_picker.is_some() {
             handle_metadata_file_picker_mouse(app, mouse, &mut state, tx, layout.popup);
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -28201,6 +28567,33 @@ fn handle_metadata_editor_mouse_in_area(
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             match app.button_map.find_button_at(mx, my) {
+                Some(super::button_map::TuiButton::MetadataEditorTitle) => {
+                    if app.double_click.register_click(
+                        super::button_map::TuiButton::MetadataEditorTitle,
+                        mx,
+                        my,
+                        tui_file_picker::DOUBLE_CLICK_WINDOW,
+                    ) {
+                        state.toggle_metadata_editor_maximized();
+                        ensure_cursor_visible_for_area(&mut state, area);
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataEditorViewCanonical) => {
+                    state.set_metadata_view(super::app::MetadataEditorView::Canonical);
+                    ensure_cursor_visible_for_area(&mut state, area);
+                    app.set_status("metadata editor view: Canonical");
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataEditorViewAll) => {
+                    state.set_metadata_view(super::app::MetadataEditorView::All);
+                    ensure_cursor_visible_for_area(&mut state, area);
+                    app.set_status("metadata editor view: All");
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
                 Some(super::button_map::TuiButton::MetadataPresentationSelectorToggle) => {
                     if state.presentation_selector_open {
                         state.close_presentation_selector();
@@ -28240,7 +28633,7 @@ fn handle_metadata_editor_mouse_in_area(
                         if let Some(status) = metadata_editor_apply_content_tab_progress(&mut state) {
                                 app.set_status(status);
                             } else {
-                                clamp_metadata_read_only_scroll(&mut state, metadata_editor_read_only_visible_rows());
+                                clamp_metadata_read_only_scroll_for_current_layout(&mut state);
                                 app.set_status(metadata_editor_status_for_content_tab(state.as_ref()));
                             }
                     }
@@ -28293,7 +28686,7 @@ fn handle_metadata_editor_mouse_in_area(
                 Some(super::button_map::TuiButton::MetadataArtworkRow(idx)) => {
                     if state.content_tab == crate::tui::app::ContentTab::Artwork {
                         state.set_artwork_cursor(idx);
-                        clamp_metadata_read_only_scroll(&mut state, metadata_editor_read_only_visible_rows());
+                        clamp_metadata_read_only_scroll_for_current_layout(&mut state);
                     }
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     return;
@@ -28370,14 +28763,12 @@ fn handle_metadata_editor_mouse_in_area(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
             MouseEventKind::ScrollUp if state.phase == MetadataEditorPhase::Editing => {
-                state.cursor = state.cursor.saturating_sub(1);
+                metadata_editor_move_visible_cursor(&mut state, -1, false);
                 ensure_cursor_visible(&mut state);
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
             MouseEventKind::ScrollDown if state.phase == MetadataEditorPhase::Editing => {
-                if state.cursor + 1 < total_rows {
-                    state.cursor += 1;
-                }
+                metadata_editor_move_visible_cursor(&mut state, 1, false);
                 ensure_cursor_visible(&mut state);
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
@@ -28465,9 +28856,10 @@ fn handle_metadata_editor_mouse_in_area(
                     MetadataEditorPhase::Editing
                         if in_content && state.content_tab == crate::tui::app::ContentTab::Metadata =>
                     {
-                        // Compute the clicked row (entry index).
-                        let row = (my - content_y) as usize + state.scroll;
-                        if row < state.active_surface().entries.len() {
+                        // Map the visible row back to the complete embedded-tag model.
+                        let visible_row = (my - content_y) as usize + state.scroll;
+                        let row = state.visible_metadata_rows().get(visible_row).copied();
+                        if let Some(row) = row.filter(|row| *row < state.active_surface().entries.len()) {
                             state.cursor = row;
                             let column = metadata_editor_row_column_for_x(inner_x, mx);
                             let entries = build_metadata_row_context_menu_for_column(
@@ -28481,7 +28873,7 @@ fn handle_metadata_editor_mouse_in_area(
                                 origin: (mx, my),
                                 anchor_bottom: false,
                             };
-                        } else if row == state.active_surface().entries.len() {
+                        } else if row == Some(state.active_surface().entries.len()) {
                             // Only the rendered "+ Add field..." row is
                             // actionable. Empty content below it is a no-op.
                             let entries = vec![crate::tui::context_menu::ContextMenuEntry::Item(
@@ -28592,7 +28984,8 @@ fn handle_metadata_editor_mouse_in_area(
                         _ => {}
                     }
                 }
-                let row = (my - content_y) as usize + state.scroll;
+                let visible_row = (my - content_y) as usize + state.scroll;
+                let row = state.visible_metadata_rows().get(visible_row).copied();
 
                 // Detail overlay: click moves detail_cursor, double-click edits.
                 if state.phase == MetadataEditorPhase::DetailEdit {
@@ -28680,7 +29073,9 @@ fn handle_metadata_editor_mouse_in_area(
                     };
 
                     // Visual row range of the edited field within the content area.
-                    let edit_visual_start = state.cursor.saturating_sub(state.scroll);
+                    let visible_rows = state.visible_metadata_rows();
+                    let edit_visual_start = metadata_editor_visible_cursor_position(&state, &visible_rows)
+                        .saturating_sub(state.scroll);
                     let edit_visual_end = edit_visual_start + drop_rows;
                     let click_visual_row = (my - content_y) as usize;
 
@@ -28727,7 +29122,11 @@ fn handle_metadata_editor_mouse_in_area(
                     recalc_dirty(&mut state);
                 }
 
-                // Double-click detection: same row within 400ms.
+                // Double-click detection: same visible model row within 400ms.
+                let Some(row) = row else {
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                };
                 let now = std::time::Instant::now();
                 let is_double = state
                     .last_click
@@ -28751,10 +29150,7 @@ fn handle_metadata_editor_mouse_in_area(
                     }
                     state.last_click = None;
                 } else {
-                    // Single click: move cursor.
-                    if row < total_rows {
-                        state.cursor = row;
-                    }
+                    state.cursor = row;
                     state.last_click = Some((row, now));
                 }
                 ensure_cursor_visible(&mut state);
@@ -29179,8 +29575,11 @@ fn metadata_editor_terminal_area() -> Rect {
     Rect::new(0, 0, width, height)
 }
 
-fn metadata_editor_visible_rows_for_area(area: Rect) -> usize {
-    super::draw_overlays::metadata_editor_layout_for_area(area)
+fn metadata_editor_visible_rows_for_area(
+    area: Rect,
+    maximized: bool,
+) -> usize {
+    super::draw_overlays::metadata_editor_layout_for_area_with_maximized(area, maximized)
         .content_area
         .height
         .max(1) as usize
@@ -29190,11 +29589,13 @@ fn metadata_editor_visible_rows_for_area(area: Rect) -> usize {
 /// used by the renderer. Keeping this area-parameterized makes the geometry
 /// invariant directly testable at short and conventional terminal heights.
 fn ensure_cursor_visible_for_area(state: &mut super::app::MetadataEditorState, area: Rect) {
-    let visible = metadata_editor_visible_rows_for_area(area);
-    if state.cursor < state.scroll {
-        state.scroll = state.cursor;
-    } else if state.cursor >= state.scroll.saturating_add(visible) {
-        state.scroll = state.cursor.saturating_sub(visible.saturating_sub(1));
+    let visible = metadata_editor_visible_rows_for_area(area, state.maximized);
+    let rows = state.visible_metadata_rows();
+    let position = metadata_editor_visible_cursor_position(state, &rows);
+    if position < state.scroll {
+        state.scroll = position;
+    } else if position >= state.scroll.saturating_add(visible) {
+        state.scroll = position.saturating_sub(visible.saturating_sub(1));
     }
 }
 
@@ -29205,7 +29606,7 @@ fn ensure_cursor_visible(state: &mut super::app::MetadataEditorState) {
 /// Ensure the detail cursor is visible in the exact metadata-editor content
 /// window. The detail view adds a two-line header inside that same content area.
 fn ensure_detail_visible_for_area(state: &mut super::app::MetadataEditorState, area: Rect) {
-    let visible = metadata_editor_visible_rows_for_area(area);
+    let visible = metadata_editor_visible_rows_for_area(area, state.maximized);
     let header_offset = 2usize;
     let cursor_line = state.detail_cursor.saturating_add(header_offset);
     if cursor_line < state.detail_scroll {
@@ -34139,29 +34540,34 @@ impl FileTaskWorker {
                 }
                 self.io_counters.rename_attempts =
                     self.io_counters.rename_attempts.saturating_add(1);
-                if let Err(error) = tui_file_picker::rename_path_no_replace(
+                let publication_mode = match try_no_clobber_rename(
                     &staging_payload,
                     &node.target,
                 ) {
-                    self.rollback_unpublished_staging_progress(totals_before);
-                    cleanup_file_task_staging_directory(&staging_container);
-                    return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        format!(
-                            "destination appeared before directory publication: {}",
-                            node.target.display()
-                        )
-                    } else if error.kind() == std::io::ErrorKind::Unsupported {
-                        format!(
-                            "copy refused because {} cannot atomically publish a new directory without replacement; no undoable destination was created",
-                            node.target.display()
-                        )
-                    } else {
-                        format!(
-                            "publish staged directory {} -> {} atomically without replacement: {error}",
-                            staging_payload.display(),
-                            node.target.display()
-                        )
-                    });
+                    Ok(mode) => mode,
+                    Err(error) => {
+                        self.rollback_unpublished_staging_progress(totals_before);
+                        cleanup_file_task_staging_directory(&staging_container);
+                        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            format!(
+                                "destination appeared before directory publication: {}",
+                                node.target.display()
+                            )
+                        } else {
+                            format!(
+                                "publish staged directory {} -> {} without replacement: {error}",
+                                staging_payload.display(),
+                                node.target.display()
+                            )
+                        });
+                    }
+                };
+                if matches!(publication_mode, NoClobberRenameMode::CheckedBestEffort) {
+                    self.io_counters.rename_fallbacks =
+                        self.io_counters.rename_fallbacks.saturating_add(1);
+                }
+                if let Some(warning) = publication_mode.degraded_warning() {
+                    self.record_active_root_degrade_notice(&node.source, warning.to_string());
                 }
                 // Child copy operations already own the source proof.
                 // Renaming this exact private staging root preserves those
@@ -38955,6 +39361,9 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
         Some(ConfirmAction::RemoveInvalidApeKeys { .. }) => {
             app.set_status("APE repair cancelled; files left unchanged".to_string());
         }
+        Some(ConfirmAction::TagMaintenance { kind, .. }) => {
+            app.set_status(format!("{} cancelled; files left unchanged", kind.label()));
+        }
         Some(ConfirmAction::ArchiveExternalConflict { context }) => {
             app.should_quit = false;
             app.quit_after_browse_archive_repackage = false;
@@ -39474,6 +39883,35 @@ fn execute_confirm_action(
                 app,
                 state,
                 targets.clone(),
+                *verification,
+                tx,
+            );
+        }
+        ConfirmAction::TagMaintenance {
+            kind,
+            roots,
+            from_metadata_editor,
+            verification,
+        } => {
+            let editor = if *from_metadata_editor {
+                match app.pending_metadata_editor.take() {
+                    Some(state) => Some(state),
+                    None => {
+                        app.set_status(format!(
+                            "{}: editor state unavailable; no files changed",
+                            kind.label()
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            start_tag_maintenance(
+                app,
+                editor,
+                roots.clone(),
+                *kind,
                 *verification,
                 tx,
             );
@@ -41947,6 +42385,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             // a stale rect and deliberately does nothing.
             TuiButton::OverlayTextInput
             | TuiButton::MetadataEditorInput
+            | TuiButton::MetadataEditorTitle
+            | TuiButton::MetadataEditorViewCanonical
+            | TuiButton::MetadataEditorViewAll
             | TuiButton::GnudbEditorInput
             | TuiButton::TemplateBuilderInput
             | TuiButton::BulkRenameTemplateInput => {}
@@ -42746,7 +43187,7 @@ mod phase4_tests {
         );
         assert!(!crate::tui::probe::metadata_editor_has_changes(&untouched));
         let untouched_snapshot = metadata_editor_entries_snapshot_for_save(&untouched);
-        assert_eq!(untouched_snapshot[0].2, untouched_snapshot[0].3);
+        assert_eq!(untouched_snapshot[0].values, untouched_snapshot[0].originals);
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut multi_state = make_state();
@@ -46376,9 +46817,9 @@ mod phase4_tests {
         );
 
         let entries_snap = metadata_editor_entries_snapshot_for_save(&state);
-        let (_key, _scope, snapshot_values, snapshot_originals) = &entries_snap[cue_entry_idx];
+        let snapshot_entry = &entries_snap[cue_entry_idx];
         assert_eq!(
-            snapshot_values, snapshot_originals,
+            snapshot_entry.values, snapshot_entry.originals,
             "ordinary lofty save snapshot must not materialize a sidecar shadow as an embedded CUESHEET tag"
         );
 
@@ -51423,7 +51864,14 @@ mod single_image_metadata_editor_regression_tests {
     fn metadata_mouse_double_click_edit_refuses_unpersistable_unified_per_track_key() {
         let mut state = unified_cue_album_edit_state();
         let composer_idx = append_unpersistable_unified_composer_row(&mut state);
-        state.scroll = composer_idx;
+        // Item 6: scroll is a visible-row offset, not a raw entry index. Scroll so
+        // the (canonical, therefore visible) COMPOSER row is the top rendered row,
+        // so the top-of-content double-click lands on it.
+        state.scroll = state
+            .visible_metadata_rows()
+            .iter()
+            .position(|&row| row == composer_idx)
+            .expect("composer row must be visible in canonical view");
         state.cursor = 0;
 
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
@@ -52627,7 +53075,7 @@ mod single_image_metadata_editor_regression_tests {
 
         let sidecar_plan = cue_sidecar_writeback_plan_for_state(&state);
         let snapshot = metadata_editor_entries_snapshot_for_save(&state);
-        let mut results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
+        let mut results = crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes(
             &[audio_a.clone(), audio_b.clone()],
             &snapshot,
             &[],
@@ -52857,11 +53305,11 @@ mod single_image_metadata_editor_regression_tests {
         let snapshot = metadata_editor_entries_snapshot_for_save(&state);
         let title_snapshot = snapshot
             .iter()
-            .find(|(key, _, _, _)| matches!(key, lofty::tag::ItemKey::TrackTitle))
+            .find(|entry| matches!(entry.item_key, lofty::tag::ItemKey::TrackTitle))
             .expect("TITLE snapshot");
-        assert_eq!(title_snapshot.1, crate::tui::probe::RowScope::Track);
+        assert_eq!(title_snapshot.row_scope, crate::tui::probe::RowScope::Track);
 
-        let results = crate::tui::probe::apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
+        let results = crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes(
             &[audio_a.clone(), audio_b.clone()],
             &snapshot,
             &[],
@@ -55972,7 +56420,7 @@ mod metadata_editor_inline_navigation_tests {
         ] {
             state.scroll = 0;
             ensure_cursor_visible_for_area(&mut state, area);
-            let visible = metadata_editor_visible_rows_for_area(area);
+            let visible = metadata_editor_visible_rows_for_area(area, false);
             assert_eq!(
                 visible,
                 super::super::draw_overlays::metadata_editor_layout_for_area(area)
@@ -55980,9 +56428,70 @@ mod metadata_editor_inline_navigation_tests {
                     .height
                     .max(1) as usize,
             );
-            assert!(state.cursor >= state.scroll);
-            assert!(state.cursor < state.scroll.saturating_add(visible));
+            // Item 6: scroll tracks the cursor's visible-row position, not the
+            // raw entry index. Assert the cursor's visible position is on-screen.
+            let cursor_pos = state
+                .visible_metadata_rows()
+                .iter()
+                .position(|&row| row == state.cursor)
+                .expect("cursor row must be visible");
+            assert!(cursor_pos >= state.scroll);
+            assert!(cursor_pos < state.scroll.saturating_add(visible));
         }
+    }
+
+    #[test]
+    fn maximized_inline_vertical_navigation_uses_full_width_wrap() {
+        let area = Rect::new(0, 0, 120, 30);
+        let normal_width = metadata_editor_inline_value_width_for_area(area, false);
+        let maximized_width = metadata_editor_inline_value_width_for_area(area, true);
+        assert!(
+            maximized_width > normal_width,
+            "maximized editor must expose a wider value column"
+        );
+
+        let text = "x".repeat(maximized_width.saturating_mul(2).saturating_add(16));
+        let cursor = 7;
+        let maximized_down = super::super::draw_overlays::move_multiline_cursor_vertical(
+            &text,
+            cursor,
+            maximized_width,
+            true,
+        );
+        let normal_down = super::super::draw_overlays::move_multiline_cursor_vertical(
+            &text,
+            cursor,
+            normal_width,
+            true,
+        );
+
+        assert_eq!(maximized_down, cursor + maximized_width);
+        assert_ne!(
+            maximized_down, normal_down,
+            "the fixture must distinguish 85%-width from full-width wrapping"
+        );
+    }
+
+    #[test]
+    fn maximized_read_only_bottom_clamps_to_full_height_window() {
+        let area = Rect::new(0, 0, 120, 14);
+        let mut state = editor(vec![], 30);
+        state.content_tab = crate::tui::app::ContentTab::Details;
+
+        state.maximized = false;
+        let normal_visible = metadata_editor_read_only_visible_rows_for_area(&state, area);
+        state.maximized = true;
+        let maximized_visible = metadata_editor_read_only_visible_rows_for_area(&state, area);
+        assert!(maximized_visible > normal_visible);
+
+        let total_lines = metadata_read_only_total_lines(&state);
+        assert!(total_lines > maximized_visible, "fixture must be scrollable");
+        assert!(set_metadata_read_only_scroll_for_area(
+            &mut state,
+            usize::MAX,
+            area,
+        ));
+        assert_eq!(state.scroll, total_lines - maximized_visible);
     }
 
     #[test]
@@ -56004,7 +56513,7 @@ mod metadata_editor_inline_navigation_tests {
         for area in [Rect::new(0, 0, 80, 14), Rect::new(0, 0, 120, 24)] {
             state.detail_scroll = 0;
             ensure_detail_visible_for_area(&mut state, area);
-            let visible = metadata_editor_visible_rows_for_area(area);
+            let visible = metadata_editor_visible_rows_for_area(area, false);
             let cursor_line = state.detail_cursor + 2;
             assert!(cursor_line >= state.detail_scroll);
             assert!(cursor_line < state.detail_scroll.saturating_add(visible));
@@ -56291,6 +56800,7 @@ mod file_picker_browse_parity_regression_tests {
                     format_name: "FLAC".to_string(),
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
+                    sample_format_is_float: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),
@@ -57283,6 +57793,7 @@ mod file_picker_browse_parity_regression_tests {
                     format_name: "FLAC".to_string(),
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
+                    sample_format_is_float: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),

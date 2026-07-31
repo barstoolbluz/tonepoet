@@ -9,6 +9,9 @@ pub struct SourceInfo {
     pub format_name: String,
     pub codec: String,
     pub bit_depth: Option<u32>,
+    /// Source storage class when the decoder preserves it. `None` means the
+    /// carrier does not expose a trustworthy integer/float distinction.
+    pub sample_format_is_float: Option<bool>,
     pub sample_rate: u32,
     pub channels: u32,
     pub channel_layout: String,
@@ -226,7 +229,11 @@ impl SourceInfo {
             return self.codec.clone();
         }
         if let Some(depth) = self.bit_depth {
-            format!("{} {}-bit", self.codec, depth)
+            match self.sample_format_is_float {
+                Some(true) => format!("{} {}-bit float", self.codec, depth),
+                Some(false) => format!("{} {}-bit int", self.codec, depth),
+                None => format!("{} {}-bit", self.codec, depth),
+            }
         } else {
             self.codec.clone()
         }
@@ -419,6 +426,9 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     let probed_sample_rate = audio.rate();
     let channels = audio.channels() as u32;
 
+    let decoded_sample_format = audio.format();
+    let classifier_sample_fmt = classifier_sample_format(&decoded_sample_format);
+
     // Bit depth: try bits_per_raw_sample from stream parameters, then sample format
     let bit_depth = {
         // bits_per_raw_sample from codec parameters (most reliable for PCM/FLAC)
@@ -430,8 +440,7 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
             Some(raw_bits as u32)
         } else {
             // Fall back to sample format byte size
-            let fmt = audio.format();
-            let bytes = fmt.bytes();
+            let bytes = decoded_sample_format.bytes();
             if bytes > 0 {
                 Some((bytes as u32) * 8)
             } else {
@@ -471,8 +480,9 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     // once at the TUI probe boundary so display and DSD-to-PCM cascades use
     // the same true-rate facts as the conversion pipeline. Reuse the pipeline
     // classifier so losslessly compressed DFF/DST is treated as DSD too.
-    let (sample_rate, bit_depth) = normalize_tui_dsd_probe_facts(
+    let (sample_rate, bit_depth, sample_format_is_float) = normalize_tui_source_probe_facts(
         &codec_name,
+        classifier_sample_fmt,
         probed_sample_rate,
         bit_depth,
     );
@@ -481,6 +491,7 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
         format_name,
         codec,
         bit_depth,
+        sample_format_is_float,
         sample_rate,
         channels,
         channel_layout,
@@ -489,14 +500,36 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     })
 }
 
-fn normalize_tui_dsd_probe_facts(
+fn classifier_sample_format(format: &impl std::fmt::Debug) -> Option<&'static str> {
+    // Keep this UI probe loosely coupled to ffmpeg-next's public enum path;
+    // the stable Debug spelling still distinguishes packed/planar F32/F64.
+    let spelling = format!("{format:?}").to_ascii_lowercase();
+    if spelling.starts_with("f32") {
+        Some("flt")
+    } else if spelling.starts_with("f64") {
+        Some("dbl")
+    } else if spelling.starts_with("i32") {
+        Some("s32")
+    } else if spelling.starts_with("i16") {
+        Some("s16")
+    } else if spelling.starts_with("i64") {
+        Some("s64")
+    } else if spelling.starts_with("u8") {
+        Some("u8")
+    } else {
+        None
+    }
+}
+
+fn normalize_tui_source_probe_facts(
     codec_name: &str,
+    sample_fmt: Option<&str>,
     probed_sample_rate: u32,
     probed_bit_depth: Option<u32>,
-) -> (u32, Option<u32>) {
-    let (coding, _) = crate::convert::pipeline::classify_source_audio_probe(
+) -> (u32, Option<u32>, Option<bool>) {
+    let (coding, classified_depth) = crate::convert::pipeline::classify_source_audio_probe(
         Some(codec_name),
-        None,
+        sample_fmt,
         probed_bit_depth,
     );
     let (sample_rate, _) = crate::convert::pipeline::normalize_dsd_probe_rate(
@@ -504,12 +537,18 @@ fn normalize_tui_dsd_probe_facts(
         probed_sample_rate,
         None,
     );
-    let bit_depth = if coding == crate::convert::pipeline::SourceAudioCoding::Dsd {
-        Some(1)
-    } else {
-        probed_bit_depth
-    };
-    (sample_rate, bit_depth)
+    if coding == crate::convert::pipeline::SourceAudioCoding::Dsd {
+        return (sample_rate, Some(1), None);
+    }
+
+    match classified_depth {
+        Some(320) => (probed_sample_rate, Some(32), Some(true)),
+        Some(640) => (probed_sample_rate, Some(64), Some(true)),
+        Some(depth) if coding == crate::convert::pipeline::SourceAudioCoding::Pcm => {
+            (probed_sample_rate, Some(depth), Some(false))
+        }
+        _ => (probed_sample_rate, probed_bit_depth, None),
+    }
 }
 
 /// Synthesize a `SourceInfo` for a SACD ISO. Defaults to surfacing
@@ -576,6 +615,7 @@ fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
         format_name,
         codec,
         bit_depth: Some(1),
+        sample_format_is_float: None,
         sample_rate: super::sacd::SACD_SAMPLE_RATE_HZ,
         channels,
         channel_layout,
@@ -791,6 +831,7 @@ mod flac_metadata_writer {
     const BLOCK_STREAMINFO: u8 = 0;
     const BLOCK_PADDING: u8 = 1;
     const BLOCK_VORBIS_COMMENT: u8 = 4;
+    const BLOCK_CUESHEET: u8 = 5;
     const BLOCK_PICTURE: u8 = 6;
     const BLOCK_HEADER_LEN: usize = 4;
     const MAX_BLOCK_BODY_LEN: usize = 0x00ff_ffff;
@@ -1211,6 +1252,125 @@ mod flac_metadata_writer {
             report.durability_warnings.push(warning);
         }
         Ok(report)
+    }
+
+    pub(super) fn strip_legacy_id3v2_prefix(
+        path: &Path,
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+    ) -> Result<Option<FlacWriteReport>, String> {
+        if !is_probably_flac(path) {
+            return Ok(None);
+        }
+        reject_symlink_native_write(path, "tag repair")?;
+        let mut write_claim = acquire_common_write_claim(path, "tag repair")?;
+        recover_metadata_journal(path)?;
+        recover_artwork_rollback_journal_before_native_write(path, "tag repair")?;
+        reject_hardlinked_native_write(path, "tag repair")?;
+        let metadata = read_flac_metadata(path)?;
+        if metadata.stream_offset == 0 {
+            let mut report = FlacWriteReport::clean();
+            if let Some(warning) = write_claim.release_with_warning(
+                "FLAC common write lock removal after no-op tag repair",
+            ) {
+                report.durability_warnings.push(warning);
+            }
+            return Ok(None);
+        }
+
+        let commit = stream_rewrite_with_prefix_policy(
+            path,
+            metadata.stream_offset,
+            metadata.audio_start,
+            &metadata.blocks,
+            cancel,
+            false,
+        )?;
+        let verified = read_flac_metadata(path)?;
+        if verified.stream_offset != 0 {
+            return Err(format!(
+                "FLAC tag repair committed for '{}', but the legacy ID3v2 prefix is still present",
+                path.display()
+            ));
+        }
+        let mut report = FlacWriteReport::clean();
+        if let Some(warning) = commit.durability_warning {
+            report.durability_warnings.push(warning);
+        }
+        if let Some(warning) = write_claim.release_with_warning(
+            "FLAC common write lock removal after tag repair",
+        ) {
+            report.durability_warnings.push(warning);
+        }
+        Ok(Some(report))
+    }
+
+    pub(super) fn clear_all_tags(
+        path: &Path,
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+    ) -> Result<Option<FlacWriteReport>, String> {
+        if !is_probably_flac(path) {
+            return Ok(None);
+        }
+        reject_symlink_native_write(path, "remove all tags")?;
+        let mut write_claim = acquire_common_write_claim(path, "remove all tags")?;
+        recover_metadata_journal(path)?;
+        recover_artwork_rollback_journal_before_native_write(path, "remove all tags")?;
+        reject_hardlinked_native_write(path, "remove all tags")?;
+        let metadata = read_flac_metadata(path)?;
+        let replacement = metadata
+            .blocks
+            .iter()
+            .filter(|block| {
+                !matches!(
+                    block.block_type,
+                    BLOCK_VORBIS_COMMENT | BLOCK_CUESHEET | BLOCK_PICTURE
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = metadata.stream_offset != 0 || replacement.len() != metadata.blocks.len();
+        if !changed {
+            let mut report = FlacWriteReport::clean();
+            if let Some(warning) = write_claim.release_with_warning(
+                "FLAC common write lock removal after no-op remove-all-tags",
+            ) {
+                report.durability_warnings.push(warning);
+            }
+            return Ok(None);
+        }
+
+        let commit = stream_rewrite_with_prefix_policy(
+            path,
+            metadata.stream_offset,
+            metadata.audio_start,
+            &replacement,
+            cancel,
+            false,
+        )?;
+        let verified = read_flac_metadata(path)?;
+        if verified.stream_offset != 0
+            || verified.blocks.iter().any(|block| {
+                matches!(
+                    block.block_type,
+                    BLOCK_VORBIS_COMMENT | BLOCK_CUESHEET | BLOCK_PICTURE
+                )
+            })
+        {
+            return Err(format!(
+                "remove all tags committed for '{}', but tag payload remains",
+                path.display()
+            ));
+        }
+        let mut report = FlacWriteReport::clean();
+        if let Some(warning) = commit.durability_warning {
+            report.durability_warnings.push(warning);
+        }
+        if let Some(warning) = write_claim.release_with_warning(
+            "FLAC common write lock removal after remove-all-tags",
+        ) {
+            report.durability_warnings.push(warning);
+        }
+        Ok(Some(report))
     }
 
     pub(super) fn recover_before_read(path: &Path) -> Result<(), String> {
@@ -2193,6 +2353,24 @@ mod flac_metadata_writer {
         blocks: &[FlacBlock],
         cancel: Option<&super::MetadataWriteCancelFlag>,
     ) -> Result<StreamRewriteCommit, String> {
+        stream_rewrite_with_prefix_policy(
+            path,
+            stream_offset,
+            old_audio_start,
+            blocks,
+            cancel,
+            true,
+        )
+    }
+
+    fn stream_rewrite_with_prefix_policy(
+        path: &Path,
+        stream_offset: u64,
+        old_audio_start: u64,
+        blocks: &[FlacBlock],
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+        preserve_prefix: bool,
+    ) -> Result<StreamRewriteCommit, String> {
         super::check_metadata_write_cancel(cancel, "before starting FLAC overflow rewrite")?;
         reject_symlink_overflow_rewrite(path)?;
         let _overflow_rewrite_permit = acquire_overflow_rewrite_permit(path, cancel)?;
@@ -2241,7 +2419,9 @@ mod flac_metadata_writer {
         }
         let mut output = create_restrictive_rewrite_temp(&tmp_path)
             .map_err(|err| format!("create FLAC rewrite temp '{}': {err}", tmp_path.display()))?;
-        copy_stream_prefix(path, &mut input, &mut output, stream_offset, cancel)?;
+        if preserve_prefix {
+            copy_stream_prefix(path, &mut input, &mut output, stream_offset, cancel)?;
+        }
         output
             .write_all(FLAC_MAGIC)
             .map_err(|err| format!("write FLAC magic '{}': {err}", tmp_path.display()))?;
@@ -7001,6 +7181,17 @@ pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "MUSICBRAINZ_TRACKID",
     "MUSICBRAINZ_RELEASETRACKID",
     "MUSICBRAINZ_ARTISTID",
+    // ReplayGain, embedded cue sheet, and curated custom fields promoted into
+    // the canonical (default) editor view. Keys pass through canonicalization
+    // uppercased with underscores preserved, so these match their stored form.
+    "REPLAYGAIN_TRACK_GAIN",
+    "REPLAYGAIN_TRACK_PEAK",
+    "REPLAYGAIN_ALBUM_GAIN",
+    "REPLAYGAIN_ALBUM_PEAK",
+    "REPLAYGAIN_REFERENCE_LOUDNESS",
+    "CUESHEET",
+    "LINEAGE",
+    "DISCOGS_URL",
 ];
 
 /// Core fields that should always appear in the metadata editor,
@@ -7373,21 +7564,98 @@ fn read_native_ape_fallback(path: &std::path::Path) -> Result<NativeApeReadOutco
     })
 }
 
-fn read_canonical_metadata_file(
+fn editor_tag_type_label(tag_type: lofty::tag::TagType) -> &'static str {
+    use lofty::tag::TagType;
+    match tag_type {
+        TagType::Ape => "APEv2",
+        TagType::Id3v1 => "ID3v1",
+        TagType::Id3v2 => "ID3v2",
+        TagType::Mp4Ilst => "MP4",
+        TagType::VorbisComments => "Vorbis",
+        TagType::RiffInfo => "RIFF INFO",
+        TagType::AiffText => "AIFF Text",
+        _ => "Other",
+    }
+}
+
+fn editor_tag_type_from_label(label: &str) -> Option<lofty::tag::TagType> {
+    use lofty::tag::TagType;
+    match label {
+        "APEv2" => Some(TagType::Ape),
+        "ID3v1" => Some(TagType::Id3v1),
+        "ID3v2" => Some(TagType::Id3v2),
+        "MP4" => Some(TagType::Mp4Ilst),
+        "Vorbis" => Some(TagType::VorbisComments),
+        "RIFF INFO" => Some(TagType::RiffInfo),
+        "AIFF Text" => Some(TagType::AiffText),
+        _ => None,
+    }
+}
+
+fn editor_display_key_with_origin(
+    display_key: &str,
+    tag_type: lofty::tag::TagType,
+) -> String {
+    format!("{} [{}]", display_key, editor_tag_type_label(tag_type))
+}
+
+/// Return the secondary Lofty container encoded in an All-view row label.
+/// Preferred-container and native rows intentionally return `None`, which
+/// means "write through the established primary/native route".
+pub(crate) fn editor_tag_origin(display_key: &str) -> Option<lofty::tag::TagType> {
+    let (_, suffix) = display_key.rsplit_once(" [")?;
+    let label = suffix.strip_suffix(']')?;
+    editor_tag_type_from_label(label)
+}
+
+fn editor_fields_from_tagged_file(
+    path: &std::path::Path,
+    tagged: &lofty::file::TaggedFile,
+) -> Vec<CanonicalEditorTagField> {
+    use lofty::file::TaggedFileExt;
+
+    let enumerate_all_containers = matches!(
+        crate::metadata_persistence::metadata_persistence_route_for_path(path),
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty
+            | crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
+    );
+    if !enumerate_all_containers {
+        return tagged
+            .primary_tag()
+            .or_else(|| tagged.first_tag())
+            .map(canonical_editor_fields_from_tag)
+            .unwrap_or_default();
+    }
+
+    let preferred_tag_type = tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .map(|tag| tag.tag_type());
+    let mut fields = Vec::new();
+    for tag in tagged.tags() {
+        let preferred = preferred_tag_type == Some(tag.tag_type());
+        for mut field in canonical_editor_fields_from_tag(tag) {
+            if !preferred {
+                field.display_key =
+                    editor_display_key_with_origin(&field.display_key, tag.tag_type());
+            }
+            fields.push(field);
+        }
+    }
+    fields
+}
+
+fn read_editor_metadata_file(
     path: &std::path::Path,
 ) -> Result<(Vec<CanonicalEditorTagField>, SourceMetadata, Option<MetadataReadIssue>), MetadataReadIssue> {
     use lofty::file::TaggedFileExt;
 
     match lofty::read_from_path(path) {
-        Ok(tagged) => Ok((
-            tagged
-                .primary_tag()
-                .or_else(|| tagged.first_tag())
-                .map(canonical_editor_fields_from_tag)
-                .unwrap_or_default(),
-            source_metadata_from_tags(path, tagged.tags(), false),
-            None,
-        )),
+        Ok(tagged) => {
+            let metadata = source_metadata_from_tags(path, tagged.tags(), false);
+            let fields = editor_fields_from_tagged_file(path, &tagged);
+            Ok((fields, metadata, None))
+        }
         Err(err) if native_ape_error_is_eligible(&err) => match read_native_ape_fallback(path) {
             Ok(outcome) => Ok((outcome.fields, outcome.metadata, outcome.warning)),
             Err(native_error) => Err(MetadataReadIssue {
@@ -7432,9 +7700,9 @@ fn tag_entries_from_canonical_fields(
     entries
 }
 
-
-/// Read all tags from an audio file's primary tag.
-/// Returns entries sorted: standard fields first, then alphabetical.
+/// Read every displayable tag row. Preferred-container rows keep their
+/// established labels; secondary-container rows carry a stable origin suffix
+/// such as `TITLE [ID3v1]` so All-view edits can target the correct carrier.
 pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
     if crate::dsf_tags::is_dsf(path) {
         let outcome = crate::dsf_tags::read_with_warnings(path)?;
@@ -7445,7 +7713,7 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
     }
     flac_metadata_writer::recover_before_read(path)?;
     let (fields, _metadata, warning) =
-        read_canonical_metadata_file(path).map_err(|issue| issue.reason)?;
+        read_editor_metadata_file(path).map_err(|issue| issue.reason)?;
     if let Some(warning) = warning {
         log::warn!("{}", warning.reason);
     }
@@ -7546,6 +7814,21 @@ pub struct MergedTagsAndMetadata {
     pub metadata_errors: Vec<Option<MetadataReadIssue>>,
 }
 
+/// One editor row captured for save. `tag_type` is populated only for a
+/// secondary Lofty container exposed by All view. For unsuffixed rows,
+/// `existed[file_idx]` distinguishes an existing value in that file's
+/// preferred container from a newly added value that belongs in the format's
+/// normal primary container.
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataEditorTagSnapshot {
+    pub(crate) item_key: lofty::tag::ItemKey,
+    pub(crate) row_scope: RowScope,
+    pub(crate) tag_type: Option<lofty::tag::TagType>,
+    pub(crate) existed: Vec<bool>,
+    pub(crate) values: Vec<String>,
+    pub(crate) originals: Vec<String>,
+}
+
 /// Read and merge tags from multiple audio files.
 ///
 /// For each `ItemKey` present in any file, collects per-file values.
@@ -7601,7 +7884,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         }
         flac_metadata_writer::recover_before_read(path)?;
         let (fields, _metadata, warning) =
-            read_canonical_metadata_file(path).map_err(|issue| issue.reason)?;
+            read_editor_metadata_file(path).map_err(|issue| issue.reason)?;
         if let Some(warning) = warning {
             log::warn!("{}", warning.reason);
         }
@@ -7759,7 +8042,7 @@ where
         if cancelled() {
             return Err(cancelled_message());
         }
-        let (fields, metadata, warning) = match read_canonical_metadata_file(path) {
+        let (fields, metadata, warning) = match read_editor_metadata_file(path) {
             Ok(read) => read,
             Err(issue) => {
                 return Ok(MergedTagsAndMetadata {
@@ -7843,7 +8126,7 @@ where
         if cancelled() {
             return Err(cancelled_message());
         }
-        let (fields, source_metadata, warning) = match read_canonical_metadata_file(path) {
+        let (fields, source_metadata, warning) = match read_editor_metadata_file(path) {
             Ok(read) => read,
             Err(issue) => {
                 metadata_errors[file_idx] = Some(issue);
@@ -8192,35 +8475,147 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_v
     forced_deletes: &[(usize, lofty::tag::ItemKey)],
     verification: tui_file_picker::VerificationMode,
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    let normalized = entries_snap
+        .iter()
+        .map(|(item_key, row_scope, values, originals)| MetadataEditorTagSnapshot {
+            item_key: item_key.clone(),
+            row_scope: *row_scope,
+            tag_type: None,
+            // This compatibility entry point intentionally retains its
+            // established primary-container semantics. The metadata editor's
+            // richer snapshot below carries real per-file existence.
+            existed: vec![false; values.len()],
+            values: values.clone(),
+            originals: originals.clone(),
+        })
+        .collect::<Vec<_>>();
+    apply_metadata_editor_tag_changes_internal(
+        paths,
+        &normalized,
+        deleted,
+        save_block_reasons,
+        progress,
+        byte_progress,
+        cancel,
+        forced_deletes,
+        verification,
+    )
+}
+
+pub(crate) fn apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[MetadataEditorTagSnapshot],
+    deleted: &[usize],
+    save_block_reasons: &[Option<String>],
+    progress: Option<MetadataWriteProgressCallback>,
+    byte_progress: Option<MetadataWriteByteProgressCallback>,
+    cancel: Option<MetadataWriteCancelFlag>,
+    forced_deletes: &[(usize, lofty::tag::ItemKey)],
+) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+        paths,
+        entries_snap,
+        deleted,
+        save_block_reasons,
+        progress,
+        byte_progress,
+        cancel,
+        forced_deletes,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+pub(crate) fn apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[MetadataEditorTagSnapshot],
+    deleted: &[usize],
+    save_block_reasons: &[Option<String>],
+    progress: Option<MetadataWriteProgressCallback>,
+    byte_progress: Option<MetadataWriteByteProgressCallback>,
+    cancel: Option<MetadataWriteCancelFlag>,
+    forced_deletes: &[(usize, lofty::tag::ItemKey)],
+    verification: tui_file_picker::VerificationMode,
+) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+    apply_metadata_editor_tag_changes_internal(
+        paths,
+        entries_snap,
+        deleted,
+        save_block_reasons,
+        progress,
+        byte_progress,
+        cancel,
+        forced_deletes,
+        verification,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct EditorTagChange {
+    tag_type: Option<lofty::tag::TagType>,
+    existed: bool,
+    item_key: lofty::tag::ItemKey,
+    value: Option<String>,
+}
+
+fn apply_metadata_editor_tag_changes_internal(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[MetadataEditorTagSnapshot],
+    deleted: &[usize],
+    save_block_reasons: &[Option<String>],
+    progress: Option<MetadataWriteProgressCallback>,
+    byte_progress: Option<MetadataWriteByteProgressCallback>,
+    cancel: Option<MetadataWriteCancelFlag>,
+    forced_deletes: &[(usize, lofty::tag::ItemKey)],
+    verification: tui_file_picker::VerificationMode,
+) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+
     #[derive(Debug)]
     struct PlannedWrite {
         original_index: usize,
         write_ordinal: usize,
         path: std::path::PathBuf,
-        changes: Vec<(lofty::tag::ItemKey, Option<String>)>,
+        changes: Vec<EditorTagChange>,
     }
 
     let mut planned = Vec::new();
     let mut immediate_results: Vec<(usize, crate::tui::app::MetadataEditorWriteResult)> = Vec::new();
 
     for (file_idx, path) in paths.iter().enumerate() {
-        let mut changes: Vec<(lofty::tag::ItemKey, Option<String>)> = Vec::new();
-        for (entry_idx, (key, row_scope, vals, origs)) in entries_snap.iter().enumerate() {
+        let mut changes: Vec<EditorTagChange> = Vec::new();
+        for (entry_idx, entry) in entries_snap.iter().enumerate() {
             // Track-scoped rows round-trip through the regenerated CUESHEET
             // model instead of through whole-file tag writes. The explicit
             // marker is required when track and file dimensions are equal.
-            if *row_scope == RowScope::Track {
+            if entry.row_scope == RowScope::Track {
                 continue;
             }
             if deleted.contains(&entry_idx) {
-                changes.push((key.clone(), None));
-            } else if file_idx < vals.len() && file_idx < origs.len() && vals[file_idx] != origs[file_idx] {
-                changes.push((key.clone(), Some(vals[file_idx].clone())));
+                changes.push(EditorTagChange {
+                    tag_type: entry.tag_type,
+                    existed: entry.existed.get(file_idx).copied().unwrap_or(false),
+                    item_key: entry.item_key.clone(),
+                    value: None,
+                });
+            } else if file_idx < entry.values.len()
+                && file_idx < entry.originals.len()
+                && entry.values[file_idx] != entry.originals[file_idx]
+            {
+                changes.push(EditorTagChange {
+                    tag_type: entry.tag_type,
+                    existed: entry.existed.get(file_idx).copied().unwrap_or(false),
+                    item_key: entry.item_key.clone(),
+                    value: Some(entry.values[file_idx].clone()),
+                });
             }
         }
         for (target_idx, key) in forced_deletes {
             if *target_idx == file_idx {
-                changes.push((key.clone(), None));
+                changes.push(EditorTagChange {
+                    tag_type: None,
+                    existed: false,
+                    item_key: key.clone(),
+                    value: None,
+                });
             }
         }
 
@@ -8296,7 +8691,7 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_v
                                 progress(write.write_ordinal, total, path, update);
                             }
                         };
-                    match write_all_tags_with_cancel_report_classified_at_verification(
+                    match write_editor_tag_changes_with_cancel_report_classified_at_verification(
                         &write.path,
                         &write.changes,
                         cancel.as_ref().as_ref(),
@@ -8472,6 +8867,97 @@ fn write_all_tags_with_cancel_report_classified(
     )
 }
 
+fn write_editor_tag_changes_with_cancel_report_classified_at_verification(
+    path: &std::path::Path,
+    changes: &[EditorTagChange],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
+    let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
+    write_editor_tag_changes_with_cancel_report_at_verification(
+        path,
+        changes,
+        operation_cancel.as_ref(),
+        byte_progress,
+        verification,
+    )
+    .map_err(|message| {
+        if operation_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.observation_count() > 0)
+        {
+            MetadataWriteFailure::Cancelled(message)
+        } else {
+            MetadataWriteFailure::Failed(message)
+        }
+    })
+}
+
+fn write_editor_tag_changes_with_cancel_report_at_verification(
+    path: &std::path::Path,
+    changes: &[EditorTagChange],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, String> {
+    let route = crate::metadata_persistence::metadata_persistence_route_for_path(path);
+    let has_explicit_container = changes.iter().any(|change| change.tag_type.is_some());
+    let use_editor_aware_lofty_writer = match route {
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty => true,
+        crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+            if wavpack_requires_native_ape_writer(path)? {
+                if has_explicit_container {
+                    return Err(format!(
+                        "cannot target a secondary tag container in '{}': the file requires the native APEv2 recovery writer",
+                        path.display()
+                    ));
+                }
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    };
+
+    if !use_editor_aware_lofty_writer {
+        if has_explicit_container {
+            return Err(format!(
+                "cannot target a secondary tag container in '{}' through {:?}",
+                path.display(),
+                route
+            ));
+        }
+        let primary_changes = changes
+            .iter()
+            .map(|change| (change.item_key.clone(), change.value.clone()))
+            .collect::<Vec<_>>();
+        return write_all_tags_with_cancel_report_at_verification(
+            path,
+            &primary_changes,
+            cancel,
+            byte_progress,
+            verification,
+        );
+    }
+
+    check_metadata_write_cancel(cancel, "before starting origin-aware metadata rewrite")?;
+
+    if verification == tui_file_picker::VerificationMode::Standard {
+        write_editor_tags_lofty_standard_atomic(path, changes, cancel)
+    } else {
+        let cleanup_warning = write_editor_tags_lofty_with_backup(path, changes)?;
+        Ok(MetadataWriteCommitReport::from_warnings(
+            cleanup_warning.into_iter().collect(),
+        ))
+    }
+}
+
 fn write_all_tags_with_cancel_report_classified_at_verification(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
@@ -8515,6 +9001,396 @@ pub(crate) fn write_all_tags_for_transfer_at_verification(
         verification,
     )
     .map_err(MetadataWriteFailure::into_message)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagMaintenanceKind {
+    Repair,
+    RemoveAll,
+}
+
+impl TagMaintenanceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Repair => "Repair tags",
+            Self::RemoveAll => "Remove all tags",
+        }
+    }
+
+    pub fn progress_verb(self) -> &'static str {
+        match self {
+            Self::Repair => "Repairing",
+            Self::RemoveAll => "Removing tags from",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TagMaintenanceFileResult {
+    pub path: std::path::PathBuf,
+    pub changed: bool,
+    pub changes: Vec<String>,
+    pub durability_warnings: Vec<String>,
+    pub error: Option<String>,
+    pub cancelled: bool,
+    pub commit_state_unknown: bool,
+}
+
+impl TagMaintenanceFileResult {
+    fn new(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            changed: false,
+            changes: Vec::new(),
+            durability_warnings: Vec::new(),
+            error: None,
+            cancelled: false,
+            commit_state_unknown: false,
+        }
+    }
+
+    fn fail(mut self, error: impl Into<String>) -> Self {
+        self.error = Some(error.into());
+        self
+    }
+}
+
+fn tag_entry_has_stored_value(entry: &TagEntry) -> bool {
+    entry.per_file_stored_value_counts.iter().any(|count| *count > 0)
+        || (entry.per_file_stored_value_counts.is_empty()
+            && (entry.has_multiple_stored_values || !entry.original.is_empty()))
+}
+
+fn removal_changes_for_entries(
+    entries: &[TagEntry],
+) -> Vec<(lofty::tag::ItemKey, Option<String>)> {
+    let mut changes = Vec::new();
+    for entry in entries {
+        if !tag_entry_has_stored_value(entry) {
+            continue;
+        }
+        if changes
+            .iter()
+            .any(|(key, _): &(lofty::tag::ItemKey, Option<String>)| key == &entry.item_key)
+        {
+            continue;
+        }
+        changes.push((entry.item_key.clone(), None));
+    }
+    changes
+}
+
+fn has_id3v1_tag(path: &std::path::Path) -> Result<bool, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("stat '{}': {error}", path.display()))?
+        .len();
+    optional_id3v1_start(&mut file, len).map(|start| start.is_some())
+}
+
+fn clear_all_lofty_tags_at_verification(
+    path: &std::path::Path,
+    verification: tui_file_picker::VerificationMode,
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> Result<MetadataWriteCommitReport, String> {
+    match verification {
+        tui_file_picker::VerificationMode::Standard => {
+            clear_all_tags_lofty_standard_atomic(path, cancel)
+        }
+        tui_file_picker::VerificationMode::Strong => {
+            let warning = clear_all_tags_lofty_with_backup(path)?;
+            Ok(MetadataWriteCommitReport::from_warnings(
+                warning.into_iter().collect(),
+            ))
+        }
+    }
+}
+
+fn repair_tags_atomic(
+    path: &std::path::Path,
+    verification: tui_file_picker::VerificationMode,
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> TagMaintenanceFileResult {
+    let mut result = TagMaintenanceFileResult::new(path);
+    if let Err(error) = check_metadata_write_cancel(cancel, "before repairing tags") {
+        result.cancelled = true;
+        return result.fail(error);
+    }
+
+    let invalid_keys = match crate::metadata_persistence::invalid_native_ape_keys(path) {
+        Ok(keys) => keys,
+        Err(error) => return result.fail(error),
+    };
+    if !invalid_keys.is_empty() {
+        match remove_invalid_ape_items_atomic(path, &invalid_keys, verification, cancel, None) {
+            InvalidApeRepairOutcome::NotModifiedFailure { reason, .. } => {
+                return result.fail(reason);
+            }
+            InvalidApeRepairOutcome::CancelledBeforeCommit { reason, .. } => {
+                result.cancelled = true;
+                return result.fail(reason);
+            }
+            InvalidApeRepairOutcome::CommitStateUnknown { reason, .. } => {
+                result.commit_state_unknown = true;
+                return result.fail(reason);
+            }
+            InvalidApeRepairOutcome::CommittedAndVerified(commit) => {
+                result.changed = true;
+                result.changes.push(format!(
+                    "removed {} invalid APEv2 key{}",
+                    commit.removed_keys.len(),
+                    if commit.removed_keys.len() == 1 { "" } else { "s" }
+                ));
+                result
+                    .durability_warnings
+                    .extend(commit.commit_report.durability_warnings);
+            }
+            InvalidApeRepairOutcome::CommittedButVerificationFailed { commit, reason } => {
+                result.changed = true;
+                result.changes.push(format!(
+                    "removed {} invalid APEv2 key{}",
+                    commit.removed_keys.len(),
+                    if commit.removed_keys.len() == 1 { "" } else { "s" }
+                ));
+                result
+                    .durability_warnings
+                    .extend(commit.commit_report.durability_warnings);
+                return result.fail(reason);
+            }
+        }
+    }
+
+    if let Err(error) = check_metadata_write_cancel(cancel, "before checking FLAC tag prefix") {
+        result.cancelled = true;
+        return result.fail(error);
+    }
+    match flac_metadata_writer::strip_legacy_id3v2_prefix(path, cancel) {
+        Ok(Some(report)) => {
+            result.changed = true;
+            result
+                .changes
+                .push("stripped legacy ID3v2 prefix before the FLAC stream".to_string());
+            result
+                .durability_warnings
+                .extend(report.durability_warnings);
+        }
+        Ok(None) => {}
+        Err(error) => return result.fail(error),
+    }
+    result
+}
+
+fn remove_all_tags_atomic(
+    path: &std::path::Path,
+    verification: tui_file_picker::VerificationMode,
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> TagMaintenanceFileResult {
+    use lofty::file::TaggedFileExt;
+
+    let mut result = TagMaintenanceFileResult::new(path);
+    if let Err(error) = check_metadata_write_cancel(cancel, "before removing all tags") {
+        result.cancelled = true;
+        return result.fail(error);
+    }
+
+    let route = crate::metadata_persistence::metadata_persistence_route_for_path(path);
+    let mutation: Result<bool, String> = match route {
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => {
+            flac_metadata_writer::clear_all_tags(path, cancel).map(|report| {
+                if let Some(report) = report {
+                    result
+                        .durability_warnings
+                        .extend(report.durability_warnings);
+                    true
+                } else {
+                    false
+                }
+            })
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3 => {
+            let entries = match read_all_tags(path) {
+                Ok(entries) => entries,
+                Err(error) => return result.fail(error),
+            };
+            let artwork_types = match read_metadata(path) {
+                Ok(metadata) => {
+                    let mut types = Vec::new();
+                    for artwork in metadata.artwork {
+                        if !types.iter().any(|existing: &lofty::picture::PictureType| {
+                            existing.as_u8() == artwork.picture_type.as_u8()
+                        }) {
+                            types.push(artwork.picture_type);
+                        }
+                    }
+                    types
+                }
+                Err(error) => return result.fail(error),
+            };
+            let changes = removal_changes_for_entries(&entries);
+            let had_tags = !changes.is_empty()
+                || entries.iter().any(|entry| entry.is_binary && tag_entry_has_stored_value(entry))
+                || !artwork_types.is_empty();
+            if !changes.is_empty() {
+                match write_all_tags_for_transfer_at_verification(
+                    path,
+                    &changes,
+                    cancel,
+                    verification,
+                ) {
+                    Ok(report) => result
+                        .durability_warnings
+                        .extend(report.durability_warnings),
+                    Err(error) => return result.fail(error),
+                }
+            }
+            for picture_type in artwork_types {
+                match remove_artwork_from_files_with_cancel(
+                    std::slice::from_ref(&result.path),
+                    picture_type,
+                    cancel,
+                ) {
+                    Ok(report) => result
+                        .durability_warnings
+                        .extend(report.durability_warnings),
+                    Err(error) => return result.fail(error),
+                }
+            }
+            Ok(had_tags)
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+            match wavpack_requires_native_ape_writer(path) {
+                Ok(true) => {
+                    let had_tags = match crate::metadata_persistence::read_native_ape_tag(path) {
+                        Ok(tag) => {
+                            let has_ape = tag.is_some_and(|tag| !tag.items.is_empty());
+                            match has_id3v1_tag(path) {
+                                Ok(has_id3v1) => has_ape || has_id3v1,
+                                Err(error) => return result.fail(error),
+                            }
+                        }
+                        Err(error) => return result.fail(error),
+                    };
+                    match clear_all_tags_native_wavpack_ape_atomic(path, cancel) {
+                        Ok(report) => {
+                            result
+                                .durability_warnings
+                                .extend(report.durability_warnings);
+                            Ok(had_tags)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Ok(false) => {
+                    let had_tags = match lofty::read_from_path(path) {
+                        Ok(tagged) => !tagged.tags().is_empty(),
+                        Err(error) => return result.fail(format!(
+                            "failed to read '{}': {error}",
+                            path.display()
+                        )),
+                    };
+                    clear_all_lofty_tags_at_verification(path, verification, cancel).map(
+                        |report| {
+                            result
+                                .durability_warnings
+                                .extend(report.durability_warnings);
+                            had_tags
+                        },
+                    )
+                }
+                Err(error) => Err(error),
+            }
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {
+            let had_tags = match lofty::read_from_path(path) {
+                Ok(tagged) => !tagged.tags().is_empty(),
+                Err(error) => {
+                    return result.fail(format!("failed to read '{}': {error}", path.display()))
+                }
+            };
+            clear_all_lofty_tags_at_verification(path, verification, cancel).map(|report| {
+                result
+                    .durability_warnings
+                    .extend(report.durability_warnings);
+                had_tags
+            })
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily => {
+            Err(format!(
+                "remove all tags is unavailable for '{}': this carrier is read-only",
+                path.display()
+            ))
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => Err(format!(
+            "remove all tags is unavailable for '{}': DFF metadata writes are unsupported",
+            path.display()
+        )),
+    };
+
+    match mutation {
+        Ok(true) => {
+            result.changed = true;
+            result.changes.push("removed all embedded tags".to_string());
+        }
+        Ok(false) => {}
+        Err(error) => return result.fail(error),
+    }
+
+    if result.changed {
+        let verify = match route {
+            crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => Ok(()),
+            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
+                if wavpack_requires_native_ape_writer(path).unwrap_or(false) =>
+            {
+                crate::metadata_persistence::read_native_ape_tag(path).and_then(|tag| {
+                    if tag.is_some_and(|tag| !tag.items.is_empty()) {
+                        return Err("APEv2 items remain after remove-all-tags".to_string());
+                    }
+                    if has_id3v1_tag(path)? {
+                        return Err("ID3v1 tag remains after remove-all-tags".to_string());
+                    }
+                    Ok(())
+                })
+            }
+            crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3 => {
+                read_all_tags(path).and_then(|entries| {
+                    let remaining = entries.iter().any(tag_entry_has_stored_value);
+                    let artwork_remaining = !read_metadata(path)?.artwork.is_empty();
+                    if remaining || artwork_remaining {
+                        Err("embedded tag payload remains after remove-all-tags".to_string())
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+            _ => lofty::read_from_path(path)
+                .map_err(|error| format!("failed to verify '{}': {error}", path.display()))
+                .and_then(|tagged| {
+                    if tagged.tags().is_empty() {
+                        Ok(())
+                    } else {
+                        Err("embedded tags remain after remove-all-tags".to_string())
+                    }
+                }),
+        };
+        if let Err(error) = verify {
+            return result.fail(error);
+        }
+    }
+    result
+}
+
+pub fn run_tag_maintenance(
+    path: &std::path::Path,
+    kind: TagMaintenanceKind,
+    verification: tui_file_picker::VerificationMode,
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> TagMaintenanceFileResult {
+    match kind {
+        TagMaintenanceKind::Repair => repair_tags_atomic(path, verification, cancel),
+        TagMaintenanceKind::RemoveAll => remove_all_tags_atomic(path, verification, cancel),
+    }
 }
 
 /// Compare-and-write path for embedded FLAC CUESHEET transfer. The expected
@@ -8832,6 +9708,7 @@ fn prepare_native_ape_replacement(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
     drop_invalid_items: bool,
+    clear_all_items: bool,
 ) -> Result<(u64, u64, Vec<u8>, bool), String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -8841,7 +9718,8 @@ fn prepare_native_ape_replacement(
         .metadata()
         .map_err(|error| format!("stat '{}': {error}", path.display()))?
         .len();
-    let insertion_point = optional_id3v1_start(&mut file, file_len)?.unwrap_or(file_len);
+    let id3v1_start = optional_id3v1_start(&mut file, file_len)?;
+    let insertion_point = id3v1_start.unwrap_or(file_len);
     let existing = read_native_ape_tag(path)?;
     let fields = match existing.as_ref() {
         Some(tag) => native_ape_fields(tag, path)?,
@@ -8867,6 +9745,12 @@ fn prepare_native_ape_replacement(
     let mut output_items = Vec::new();
     if let Some(tag) = &existing {
         for item in &tag.items {
+            if clear_all_items {
+                // The user explicitly confirmed removal of the complete tag
+                // payload. The APEv2 read-only bit constrains ordinary field
+                // edits; it must not leave hidden residue after Remove all tags.
+                continue;
+            }
             let Some(key) = item.key.as_deref() else {
                 if !drop_invalid_items {
                     output_items.push(item.raw.clone());
@@ -8911,10 +9795,13 @@ fn prepare_native_ape_replacement(
 
     let with_header = existing.as_ref().map_or(true, |tag| tag.had_header);
     let replacement = serialize_native_ape_tag(&output_items, with_header)?;
-    let (replace_start, footer_end) = existing
+    let (replace_start, mut footer_end) = existing
         .as_ref()
         .map(|tag| (tag.replace_start, tag.footer_end))
         .unwrap_or((insertion_point, insertion_point));
+    if clear_all_items && id3v1_start == Some(footer_end) {
+        footer_end = file_len;
+    }
     let original_len = footer_end
         .checked_sub(replace_start)
         .ok_or_else(|| "native APEv2 replacement range underflow".to_string())?;
@@ -9178,6 +10065,7 @@ pub fn remove_invalid_ape_items_atomic(
         &[],
         cancel,
         true,
+        false,
         progress,
     ) {
         Ok(report) => report,
@@ -9293,6 +10181,22 @@ fn write_all_tags_native_wavpack_ape_atomic_with_policy(
         changes,
         cancel,
         drop_invalid_items,
+        false,
+        None,
+    )
+    .map_err(NativeApeWriteFailure::into_message)
+}
+
+fn clear_all_tags_native_wavpack_ape_atomic(
+    path: &std::path::Path,
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> Result<MetadataWriteCommitReport, String> {
+    write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
+        path,
+        &[],
+        cancel,
+        true,
+        true,
         None,
     )
     .map_err(NativeApeWriteFailure::into_message)
@@ -9303,6 +10207,7 @@ fn write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
     changes: &[(lofty::tag::ItemKey, Option<String>)],
     cancel: Option<&MetadataWriteCancelFlag>,
     drop_invalid_items: bool,
+    clear_all_items: bool,
     repair_progress: Option<&InvalidApeRepairProgressCallback>,
 ) -> Result<MetadataWriteCommitReport, NativeApeWriteFailure> {
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -9340,7 +10245,7 @@ fn write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
 
     check_metadata_write_cancel(cancel, "before parsing native WavPack/APEv2 metadata")?;
     let (replace_start, footer_end, replacement, unchanged) =
-        prepare_native_ape_replacement(path, changes, drop_invalid_items)?;
+        prepare_native_ape_replacement(path, changes, drop_invalid_items, clear_all_items)?;
     if unchanged {
         return Ok(MetadataWriteCommitReport::clean());
     }
@@ -10016,29 +10921,10 @@ fn normalize_ape_combined_disc(tag: &mut lofty::tag::Tag) {
     }
 }
 
-fn prepare_all_tags_lofty(
-    path: &std::path::Path,
+fn apply_changes_to_lofty_tag(
+    tag: &mut lofty::tag::Tag,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
-) -> Result<Option<lofty::file::TaggedFile>, String> {
-    let tagged = lofty::read_from_path(path)
-        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
-    prepare_all_tags_lofty_from_tagged(tagged, changes)
-}
-
-fn prepare_all_tags_lofty_from_tagged(
-    mut tagged: lofty::file::TaggedFile,
-    changes: &[(lofty::tag::ItemKey, Option<String>)],
-) -> Result<Option<lofty::file::TaggedFile>, String> {
-    use lofty::file::TaggedFileExt;
-
-    if tagged.primary_tag().is_none() {
-        let tag_type = tagged.primary_tag_type();
-        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
-    }
-    let tag = tagged
-        .primary_tag_mut()
-        .ok_or_else(|| "failed to create primary tag".to_string())?;
-
+) -> Result<bool, String> {
     let backend = crate::metadata_persistence::metadata_backend_for_lofty_tag_type(
         tag.tag_type(),
     );
@@ -10109,8 +10995,153 @@ fn prepare_all_tags_lofty_from_tagged(
         }
         changed
     };
+    Ok(changed)
+}
 
-    Ok(changed.then_some(tagged))
+fn truncate_utf8_to_byte_limit(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+/// Lofty's ID3v1 writer truncates fixed-width strings by byte index. Normalize
+/// only over-limit text to a valid UTF-8 boundary before any multi-container
+/// save so an unrelated APE/ID3v2 edit cannot trigger the dependency panic.
+fn sanitize_id3v1_for_lofty_save(tagged: &mut lofty::file::TaggedFile) -> bool {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::{ItemKey, ItemValue, TagItem, TagType};
+
+    let Some(tag) = tagged.tag_mut(TagType::Id3v1) else {
+        return false;
+    };
+    let has_track_number = tag.items().any(|item| item.key() == &ItemKey::TrackNumber);
+    let replacements = tag
+        .items()
+        .filter_map(|item| {
+            let limit = match item.key() {
+                ItemKey::TrackTitle | ItemKey::TrackArtist | ItemKey::AlbumTitle => 30,
+                ItemKey::Comment => if has_track_number { 28 } else { 30 },
+                ItemKey::Year => 4,
+                _ => return None,
+            };
+            let ItemValue::Text(value) = item.value() else {
+                return None;
+            };
+            (value.len() > limit).then(|| {
+                (
+                    item.key().clone(),
+                    truncate_utf8_to_byte_limit(value, limit),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for (key, value) in &replacements {
+        tag.remove_key(key);
+        tag.insert_unchecked(TagItem::new(key.clone(), ItemValue::Text(value.clone())));
+    }
+    !replacements.is_empty()
+}
+
+fn prepare_all_tags_lofty(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<Option<lofty::file::TaggedFile>, String> {
+    let tagged = lofty::read_from_path(path)
+        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+    prepare_all_tags_lofty_from_tagged(tagged, changes, false)
+}
+
+fn prepare_all_tags_lofty_from_tagged(
+    mut tagged: lofty::file::TaggedFile,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    clear_all: bool,
+) -> Result<Option<lofty::file::TaggedFile>, String> {
+    use lofty::file::TaggedFileExt;
+
+    if clear_all {
+        let changed = !tagged.tags().is_empty();
+        tagged.clear();
+        return Ok(changed.then_some(tagged));
+    }
+
+    if tagged.primary_tag().is_none() {
+        let tag_type = tagged.primary_tag_type();
+        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+    let tag = tagged
+        .primary_tag_mut()
+        .ok_or_else(|| "failed to create primary tag".to_string())?;
+    let changed = apply_changes_to_lofty_tag(tag, changes)?;
+    if !changed {
+        return Ok(None);
+    }
+    sanitize_id3v1_for_lofty_save(&mut tagged);
+    Ok(Some(tagged))
+}
+
+fn prepare_editor_tags_lofty_from_tagged(
+    mut tagged: lofty::file::TaggedFile,
+    changes: &[EditorTagChange],
+) -> Result<Option<lofty::file::TaggedFile>, String> {
+    use lofty::file::TaggedFileExt;
+
+    let existing_preferred_type = tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .map(|tag| tag.tag_type());
+    let normal_primary_type = tagged.primary_tag_type();
+    let mut groups = Vec::<(
+        lofty::tag::TagType,
+        Vec<(lofty::tag::ItemKey, Option<String>)>,
+    )>::new();
+    for change in changes {
+        let target_type = change.tag_type.unwrap_or_else(|| {
+            if change.existed {
+                existing_preferred_type.unwrap_or(normal_primary_type)
+            } else {
+                normal_primary_type
+            }
+        });
+        if let Some((_, grouped)) = groups
+            .iter_mut()
+            .find(|(tag_type, _)| *tag_type == target_type)
+        {
+            grouped.push((change.item_key.clone(), change.value.clone()));
+        } else {
+            groups.push((
+                target_type,
+                vec![(change.item_key.clone(), change.value.clone())],
+            ));
+        }
+    }
+
+    let mut changed = false;
+    for (tag_type, grouped) in groups {
+        if tagged.tag(tag_type).is_none() {
+            if grouped.iter().all(|(_, value)| value.is_none()) {
+                continue;
+            }
+            tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+        }
+        let tag = tagged.tag_mut(tag_type).ok_or_else(|| {
+            format!(
+                "metadata carrier does not support writing the {} tag container",
+                editor_tag_type_label(tag_type)
+            )
+        })?;
+        changed |= apply_changes_to_lofty_tag(tag, &grouped)?;
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    sanitize_id3v1_for_lofty_save(&mut tagged);
+    Ok(Some(tagged))
 }
 
 fn save_prepared_lofty_tags(
@@ -10120,9 +11151,16 @@ fn save_prepared_lofty_tags(
     use lofty::config::WriteOptions;
     use lofty::file::AudioFile;
 
-    tagged
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|error| format!("failed to save '{}': {error}", path.display()))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tagged.save_to_path(path, WriteOptions::default())
+    }))
+    .map_err(|_| {
+        format!(
+            "failed to save '{}': metadata dependency panicked while serializing tags",
+            path.display()
+        )
+    })?
+    .map_err(|error| format!("failed to save '{}': {error}", path.display()))
 }
 
 fn write_all_tags_lofty_in_place(
@@ -11116,9 +12154,66 @@ fn copy_large_metadata_carrier_into_temp(
     Ok((source_bytes, replacement_bytes))
 }
 
+#[derive(Clone, Copy)]
+enum LoftyWriteMode<'a> {
+    Primary(&'a [(lofty::tag::ItemKey, Option<String>)]),
+    Editor(&'a [EditorTagChange]),
+    ClearAll,
+}
+
+fn prepare_lofty_write(
+    tagged: lofty::file::TaggedFile,
+    mode: LoftyWriteMode<'_>,
+) -> Result<Option<lofty::file::TaggedFile>, String> {
+    match mode {
+        LoftyWriteMode::Primary(changes) => {
+            prepare_all_tags_lofty_from_tagged(tagged, changes, false)
+        }
+        LoftyWriteMode::Editor(changes) => {
+            prepare_editor_tags_lofty_from_tagged(tagged, changes)
+        }
+        LoftyWriteMode::ClearAll => prepare_all_tags_lofty_from_tagged(tagged, &[], true),
+    }
+}
+
 fn write_all_tags_lofty_standard_atomic(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> Result<MetadataWriteCommitReport, String> {
+    write_all_tags_lofty_standard_atomic_with_mode(
+        path,
+        LoftyWriteMode::Primary(changes),
+        cancel,
+    )
+}
+
+fn clear_all_tags_lofty_standard_atomic(
+    path: &std::path::Path,
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> Result<MetadataWriteCommitReport, String> {
+    write_all_tags_lofty_standard_atomic_with_mode(
+        path,
+        LoftyWriteMode::ClearAll,
+        cancel,
+    )
+}
+
+fn write_editor_tags_lofty_standard_atomic(
+    path: &std::path::Path,
+    changes: &[EditorTagChange],
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> Result<MetadataWriteCommitReport, String> {
+    write_all_tags_lofty_standard_atomic_with_mode(
+        path,
+        LoftyWriteMode::Editor(changes),
+        cancel,
+    )
+}
+
+fn write_all_tags_lofty_standard_atomic_with_mode(
+    path: &std::path::Path,
+    mode: LoftyWriteMode<'_>,
     cancel: Option<&MetadataWriteCancelFlag>,
 ) -> Result<MetadataWriteCommitReport, String> {
     use lofty::config::WriteOptions;
@@ -11156,15 +12251,22 @@ fn write_all_tags_lofty_standard_atomic(
         let tagged = probe
             .read()
             .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
-        let Some(tagged) = prepare_all_tags_lofty_from_tagged(tagged, changes)? else {
+        let Some(tagged) = prepare_lofty_write(tagged, mode)? else {
             return Ok(MetadataWriteCommitReport::clean());
         };
         let mut carrier = std::io::Cursor::new(bytes);
-        tagged
-            .save_to(&mut carrier, WriteOptions::default())
-            .map_err(|error| {
-                format!("failed to serialize metadata for '{}': {error}", path.display())
-            })?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tagged.save_to(&mut carrier, WriteOptions::default())
+        }))
+        .map_err(|_| {
+            format!(
+                "failed to serialize metadata for '{}': metadata dependency panicked",
+                path.display()
+            )
+        })?
+        .map_err(|error| {
+            format!("failed to serialize metadata for '{}': {error}", path.display())
+        })?;
         record_standard_metadata_write_strategy(strategy);
         PreparedReplacement::InMemory(carrier.into_inner())
     } else {
@@ -11178,7 +12280,7 @@ fn write_all_tags_lofty_standard_atomic(
             .read()
             .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
         record_metadata_source_parse(source.bytes_read());
-        let Some(tagged) = prepare_all_tags_lofty_from_tagged(tagged, changes)? else {
+        let Some(tagged) = prepare_lofty_write(tagged, mode)? else {
             return Ok(MetadataWriteCommitReport::clean());
         };
         record_standard_metadata_write_strategy(strategy);
@@ -11209,14 +12311,21 @@ fn write_all_tags_lofty_standard_atomic(
             let rewritten_bytes = {
                 let mut replacement =
                     MetadataReplacementWriteCounter::new(temp.as_file_mut());
-                tagged
-                    .save_to(&mut replacement, WriteOptions::default())
-                    .map_err(|error| {
-                        format!(
-                            "failed to serialize metadata for '{}': {error}",
-                            path.display(),
-                        )
-                    })?;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tagged.save_to(&mut replacement, WriteOptions::default())
+                }))
+                .map_err(|_| {
+                    format!(
+                        "failed to serialize metadata for '{}': metadata dependency panicked",
+                        path.display()
+                    )
+                })?
+                .map_err(|error| {
+                    format!(
+                        "failed to serialize metadata for '{}': {error}",
+                        path.display(),
+                    )
+                })?;
                 replacement.bytes_written()
             };
             // Count the bytes Lofty actually writes through the temporary
@@ -11259,6 +12368,29 @@ fn write_all_tags_lofty_with_backup(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
 ) -> Result<Option<String>, String> {
+    write_all_tags_lofty_with_backup_mode(
+        path,
+        LoftyWriteMode::Primary(changes),
+    )
+}
+
+fn clear_all_tags_lofty_with_backup(
+    path: &std::path::Path,
+) -> Result<Option<String>, String> {
+    write_all_tags_lofty_with_backup_mode(path, LoftyWriteMode::ClearAll)
+}
+
+fn write_editor_tags_lofty_with_backup(
+    path: &std::path::Path,
+    changes: &[EditorTagChange],
+) -> Result<Option<String>, String> {
+    write_all_tags_lofty_with_backup_mode(path, LoftyWriteMode::Editor(changes))
+}
+
+fn write_all_tags_lofty_with_backup_mode(
+    path: &std::path::Path,
+    mode: LoftyWriteMode<'_>,
+) -> Result<Option<String>, String> {
     reject_unsupported_dff_metadata_write(path, "writing")?;
     // Non-FLAC formats keep the existing file-scope rollback path until they
     // receive native metadata-region writers. FLACs must not silently enter
@@ -11268,7 +12400,10 @@ fn write_all_tags_lofty_with_backup(
     // fallback transaction. A semantically satisfied request therefore
     // performs no carrier write, invokes no fallback hook, and creates no
     // transient or residual backup artifact.
-    if prepare_all_tags_lofty(path, changes)?.is_none() {
+    let tagged = lofty::read_from_path(path)
+        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+    let prepared = prepare_lofty_write(tagged, mode)?;
+    if prepared.is_none() {
         return Ok(None);
     }
 
@@ -11282,7 +12417,15 @@ fn write_all_tags_lofty_with_backup(
     // Re-read after the rollback copy is armed. The initial preparation is a
     // no-op preflight only; never serialize a stale in-memory view if another
     // actor changed the carrier before the transaction began.
-    match write_all_tags_lofty_in_place(path, changes) {
+    let write_result = (|| {
+        let tagged = lofty::read_from_path(path)
+            .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+        let Some(tagged) = prepare_lofty_write(tagged, mode)? else {
+            return Ok(());
+        };
+        save_prepared_lofty_tags(path, &tagged)
+    })();
+    match write_result {
         Ok(_) => match std::fs::remove_file(&backup) {
             Ok(()) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
@@ -12002,9 +13145,482 @@ mod tests {
         (temp, path)
     }
 
+    fn seed_mp3_tag_containers(
+        path: &std::path::Path,
+        id3v2_title: &str,
+        id3v1_title: Option<&str>,
+    ) {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile;
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tagged = lofty::read_from_path(path).expect("read MP3 fixture");
+        let mut id3v2 = Tag::new(TagType::Id3v2);
+        id3v2.insert_unchecked(TagItem::new(
+            ItemKey::TrackTitle,
+            ItemValue::Text(id3v2_title.to_string()),
+        ));
+        tagged.insert_tag(id3v2);
+
+        if let Some(title) = id3v1_title {
+            let mut id3v1 = Tag::new(TagType::Id3v1);
+            id3v1.insert_unchecked(TagItem::new(
+                ItemKey::TrackTitle,
+                ItemValue::Text(title.to_string()),
+            ));
+            tagged.insert_tag(id3v1);
+        } else {
+            let _ = tagged.remove(TagType::Id3v1);
+        }
+
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .expect("save MP3 multi-container fixture");
+    }
+
+    fn seed_id3v1_only_mp3(path: &std::path::Path, title: &str) {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile;
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tagged = lofty::read_from_path(path).expect("read MP3 fixture");
+        let _ = tagged.remove(TagType::Id3v2);
+        let _ = tagged.remove(TagType::Id3v1);
+        let mut id3v1 = Tag::new(TagType::Id3v1);
+        id3v1.insert_unchecked(TagItem::new(
+            ItemKey::TrackTitle,
+            ItemValue::Text(title.to_string()),
+        ));
+        tagged.insert_tag(id3v1);
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .expect("save ID3v1-only MP3 fixture");
+
+        let tagged = lofty::read_from_path(path).expect("reopen ID3v1-only MP3 fixture");
+        assert!(tagged.tag(TagType::Id3v2).is_none());
+        assert_eq!(
+            tagged
+                .tag(TagType::Id3v1)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some(title)
+        );
+    }
+
+    fn editor_snapshots(entries: &[TagEntry]) -> Vec<MetadataEditorTagSnapshot> {
+        entries
+            .iter()
+            .map(|entry| MetadataEditorTagSnapshot {
+                item_key: entry.item_key.clone(),
+                row_scope: entry.row_scope,
+                tag_type: editor_tag_origin(&entry.display_key),
+                existed: (0..entry.per_file_values.len())
+                    .map(|idx| entry.stored_value_count_for_slot(idx) > 0)
+                    .collect(),
+                values: entry.per_file_values.clone(),
+                originals: entry.per_file_originals.clone(),
+            })
+            .collect()
+    }
+
     fn append_invalid_key_ape_item(path: &std::path::Path) -> Vec<u8> {
         inject_invalid_ape_key_item_for_test(path, "&год".as_bytes(), b"1977")
             .expect("write invalid-key APEv2 fixture")
+    }
+
+    #[test]
+    fn id3v1_utf8_truncation_stops_on_a_character_boundary() {
+        let value = "é".repeat(20);
+        let truncated = truncate_utf8_to_byte_limit(&value, 31);
+        assert_eq!(truncated.len(), 30);
+        assert_eq!(truncated, "é".repeat(15));
+    }
+
+    #[test]
+    fn all_view_reads_edits_and_deletes_only_the_selected_id3_container() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let (_temp, path) = copy_numbering_fixture("multi-container.mp3", ID3V2_NUMBERING_FIXTURE);
+        seed_mp3_tag_containers(&path, "Modern title", Some("Legacy title"));
+
+        let mut entries = read_all_tags(&path).expect("read all MP3 tag containers");
+        let modern_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "TITLE")
+            .expect("preferred ID3v2 TITLE row");
+        let legacy_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "TITLE [ID3v1]")
+            .expect("secondary ID3v1 TITLE row");
+        assert_eq!(entries[modern_idx].value, "Modern title");
+        assert_eq!(entries[legacy_idx].value, "Legacy title");
+
+        let mut editor = crate::tui::app::MetadataEditorState::for_files(
+            vec![path.clone()],
+            entries.clone(),
+            vec![path.display().to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        assert!(editor.metadata_entry_is_visible(modern_idx));
+        assert!(
+            !editor.metadata_entry_is_visible(legacy_idx),
+            "Canonical view must hide the secondary container"
+        );
+        editor.set_metadata_view(crate::tui::app::MetadataEditorView::All);
+        assert!(editor.metadata_entry_is_visible(legacy_idx));
+
+        entries[legacy_idx].value = "Updated legacy title".to_string();
+        entries[legacy_idx].per_file_values[0] = "Updated legacy title".to_string();
+        let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path),
+            &editor_snapshots(&entries),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+
+        let tagged = lofty::read_from_path(&path).expect("reopen edited MP3");
+        assert_eq!(
+            tagged
+                .tag(TagType::Id3v2)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some("Modern title")
+        );
+        assert_eq!(
+            tagged
+                .tag(TagType::Id3v1)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some("Updated legacy title")
+        );
+
+        let entries = read_all_tags(&path).expect("reopen all MP3 tag containers");
+        let legacy_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "TITLE [ID3v1]")
+            .expect("updated secondary ID3v1 TITLE row");
+        let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path),
+            &editor_snapshots(&entries),
+            &[legacy_idx],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+
+        let tagged = lofty::read_from_path(&path).expect("reopen MP3 after origin delete");
+        assert_eq!(
+            tagged
+                .tag(TagType::Id3v2)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some("Modern title")
+        );
+        assert!(
+            tagged
+                .tag(TagType::Id3v1)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle))
+                .is_none(),
+            "deleting the All-view ID3v1 row must not delete ID3v2"
+        );
+    }
+
+    #[test]
+    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
+    fn all_view_edits_unsuffixed_title_in_id3v1_only_mp3_without_creating_id3v2() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let (_temp, path) = copy_numbering_fixture("id3v1-only-edit.mp3", ID3V2_NUMBERING_FIXTURE);
+        seed_id3v1_only_mp3(&path, "Legacy title");
+
+        let mut entries = read_all_tags(&path).expect("read ID3v1-only MP3");
+        let title_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "TITLE")
+            .expect("preferred fallback TITLE row remains unsuffixed");
+        assert_eq!(entries[title_idx].per_file_stored_value_counts, vec![1]);
+        entries[title_idx].value = "Updated legacy title".to_string();
+        entries[title_idx].per_file_values[0] = "Updated legacy title".to_string();
+
+        let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path),
+            &editor_snapshots(&entries),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+
+        let tagged = lofty::read_from_path(&path).expect("reopen edited ID3v1-only MP3");
+        assert!(
+            tagged.tag(TagType::Id3v2).is_none(),
+            "editing an existing unsuffixed fallback row must not create ID3v2"
+        );
+        assert_eq!(
+            tagged
+                .tag(TagType::Id3v1)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some("Updated legacy title")
+        );
+    }
+
+    #[test]
+    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
+    fn all_view_deletes_unsuffixed_title_from_id3v1_only_mp3() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let (_temp, path) = copy_numbering_fixture("id3v1-only-delete.mp3", ID3V2_NUMBERING_FIXTURE);
+        seed_id3v1_only_mp3(&path, "Legacy title");
+
+        let entries = read_all_tags(&path).expect("read ID3v1-only MP3");
+        let title_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "TITLE")
+            .expect("preferred fallback TITLE row remains unsuffixed");
+        let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path),
+            &editor_snapshots(&entries),
+            &[title_idx],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+
+        let tagged = lofty::read_from_path(&path).expect("reopen MP3 after ID3v1 deletion");
+        assert!(tagged.tag(TagType::Id3v2).is_none());
+        assert!(
+            tagged
+                .tag(TagType::Id3v1)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle))
+                .is_none(),
+            "deleting the visible unsuffixed row must remove the ID3v1 value"
+        );
+        assert!(
+            read_all_tags(&path)
+                .expect("reopen All view after deletion")
+                .iter()
+                .all(|entry| entry.display_key != "TITLE"),
+            "the deleted ID3v1 TITLE row must stay absent after reopen"
+        );
+    }
+
+    #[test]
+    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
+    fn all_view_new_field_on_id3v1_only_mp3_uses_normal_id3v2_primary() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let (_temp, path) = copy_numbering_fixture("id3v1-only-new-field.mp3", ID3V2_NUMBERING_FIXTURE);
+        seed_id3v1_only_mp3(&path, "Legacy title");
+
+        let mut entries = read_all_tags(&path).expect("read ID3v1-only MP3");
+        ensure_standard_fields_present(&mut entries, 1);
+        let genre_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "GENRE")
+            .expect("synthetic empty GENRE row");
+        assert_eq!(entries[genre_idx].per_file_stored_value_counts, vec![0]);
+        entries[genre_idx].value = "Progressive Rock".to_string();
+        entries[genre_idx].per_file_values[0] = "Progressive Rock".to_string();
+
+        let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path),
+            &editor_snapshots(&entries),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+
+        let tagged = lofty::read_from_path(&path).expect("reopen MP3 after adding new field");
+        assert_eq!(
+            tagged
+                .tag(TagType::Id3v2)
+                .and_then(|tag| tag.get_string(&ItemKey::Genre)),
+            Some("Progressive Rock"),
+            "a genuinely new row must use the format's normal primary container"
+        );
+        assert_eq!(
+            tagged
+                .tag(TagType::Id3v1)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some("Legacy title"),
+            "creating ID3v2 must preserve the existing ID3v1 payload"
+        );
+    }
+
+    #[test]
+    #[ignore = "round-11: seed_id3v1_only_mp3 fixture is impossible with lofty default save (does not strip an existing on-disk ID3v2); bounced to reasoning model, see docs/round11-clusterB-bounce.md"]
+    fn all_view_mixed_mp3_edit_targets_each_files_existing_preferred_container() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let (_temp_a, path_a) = copy_numbering_fixture("mixed-id3v1.mp3", ID3V2_NUMBERING_FIXTURE);
+        let (_temp_b, path_b) = copy_numbering_fixture("mixed-id3v2.mp3", ID3V2_NUMBERING_FIXTURE);
+        seed_id3v1_only_mp3(&path_a, "Legacy title");
+        seed_mp3_tag_containers(&path_b, "Modern title", None);
+
+        let mut entries = read_all_tags_merged(&[path_a.clone(), path_b.clone()])
+            .expect("merge ID3v1-only and ID3v2-only MP3s");
+        let title_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "TITLE")
+            .expect("shared unsuffixed preferred TITLE row");
+        assert_eq!(entries[title_idx].per_file_stored_value_counts, vec![1, 1]);
+        entries[title_idx].value = "Unified title".to_string();
+        entries[title_idx].per_file_values = vec!["Unified title".to_string(); 2];
+
+        let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            &[path_a.clone(), path_b.clone()],
+            &editor_snapshots(&entries),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| matches!(
+            &result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        )));
+
+        let legacy = lofty::read_from_path(&path_a).expect("reopen edited ID3v1-only MP3");
+        assert!(legacy.tag(TagType::Id3v2).is_none());
+        assert_eq!(
+            legacy
+                .tag(TagType::Id3v1)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some("Unified title")
+        );
+
+        let modern = lofty::read_from_path(&path_b).expect("reopen edited ID3v2-only MP3");
+        assert_eq!(
+            modern
+                .tag(TagType::Id3v2)
+                .and_then(|tag| tag.get_string(&ItemKey::TrackTitle)),
+            Some("Unified title")
+        );
+        assert!(modern.tag(TagType::Id3v1).is_none());
+    }
+
+    #[test]
+    fn all_view_preserves_primary_custom_field_edits() {
+        let (_temp, path) = copy_numbering_fixture("custom-field.wv", APE_NUMBERING_FIXTURE);
+        let key = lofty::tag::ItemKey::Unknown("MOOD".to_string());
+        write_all_tags_with_cancel_report_at_verification(
+            &path,
+            &[(key.clone(), Some("Reflective".to_string()))],
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("seed custom APEv2 field");
+
+        let mut entries = read_all_tags(&path).expect("read custom field through All seam");
+        let custom_idx = entries
+            .iter()
+            .position(|entry| entry.display_key == "MOOD")
+            .expect("custom field is displayable in All view");
+        let mut editor = crate::tui::app::MetadataEditorState::for_files(
+            vec![path.clone()],
+            entries.clone(),
+            vec![path.display().to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        assert!(
+            !editor.metadata_entry_is_visible(custom_idx),
+            "Canonical view must hide custom fields"
+        );
+        editor.set_metadata_view(crate::tui::app::MetadataEditorView::All);
+        assert!(editor.metadata_entry_is_visible(custom_idx));
+
+        entries[custom_idx].value = "Restless".to_string();
+        entries[custom_idx].per_file_values[0] = "Restless".to_string();
+
+        let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path),
+            &editor_snapshots(&entries),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+        assert_eq!(editor_value(&path, "MOOD").as_deref(), Some("Restless"));
+    }
+
+    #[test]
+    fn merged_all_view_retains_secondary_container_value_present_in_one_file() {
+        let (_temp_a, path_a) = copy_numbering_fixture("secondary-a.mp3", ID3V2_NUMBERING_FIXTURE);
+        let (_temp_b, path_b) = copy_numbering_fixture("secondary-b.mp3", ID3V2_NUMBERING_FIXTURE);
+        seed_mp3_tag_containers(&path_a, "Shared modern title", Some("Only legacy title"));
+        seed_mp3_tag_containers(&path_b, "Shared modern title", None);
+
+        let merged = read_all_tags_merged_with_metadata(&[path_a, path_b])
+            .expect("merge multi-container MP3s");
+        let legacy = merged
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE [ID3v1]")
+            .expect("merged secondary-container row");
+        assert_eq!(
+            legacy.per_file_values,
+            vec!["Only legacy title".to_string(), String::new()]
+        );
+        assert!(legacy.is_mixed);
     }
 
     #[test]
@@ -14041,8 +15657,40 @@ mod tests {
 
     #[test]
     fn dst_probe_is_normalized_as_one_bit_dsd() {
-        assert_eq!(normalize_tui_dsd_probe_facts("dst", 352_800, Some(8)), (2_822_400, Some(1)));
-        assert_eq!(normalize_tui_dsd_probe_facts("pcm_s24le", 96_000, Some(24)), (96_000, Some(24)));
+        assert_eq!(
+            normalize_tui_source_probe_facts("dst", None, 352_800, Some(8)),
+            (2_822_400, Some(1), None)
+        );
+        assert_eq!(
+            normalize_tui_source_probe_facts("pcm_s24le", Some("s32"), 96_000, Some(24)),
+            (96_000, Some(24), Some(false))
+        );
+    }
+
+    #[test]
+    fn wavpack_source_display_distinguishes_integer_and_float() {
+        let (_, integer_depth, integer_float) =
+            normalize_tui_source_probe_facts("wavpack", Some("s32"), 96_000, Some(32));
+        let (_, float_depth, float_float) =
+            normalize_tui_source_probe_facts("wavpack", Some("fltp"), 96_000, Some(32));
+        let integer = SourceInfo {
+            format_name: "WavPack".to_string(),
+            codec: "WavPack".to_string(),
+            bit_depth: integer_depth,
+            sample_format_is_float: integer_float,
+            sample_rate: 96_000,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 0.0,
+            file_size: 0,
+        };
+        let float = SourceInfo {
+            bit_depth: float_depth,
+            sample_format_is_float: float_float,
+            ..integer.clone()
+        };
+        assert_eq!(integer.codec_display(), "WavPack 32-bit int");
+        assert_eq!(float.codec_display(), "WavPack 32-bit float");
     }
 
     #[test]
@@ -15127,6 +16775,190 @@ mod tests {
             .into_iter()
             .filter_map(|(ty, data)| (ty == block_type).then_some(data))
             .collect()
+    }
+
+    #[test]
+    fn repair_tags_is_a_no_op_for_clean_flac() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-repair-tags-clean-flac",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("clean.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Clean")], 64, 256);
+
+        let result = run_tag_maintenance(
+            &path,
+            TagMaintenanceKind::Repair,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+
+        assert!(!result.changed);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.changes.is_empty());
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&path, "TITLE")
+                .expect("read title"),
+            vec!["Clean".to_string()]
+        );
+    }
+
+    #[test]
+    fn repair_tags_strips_flac_id3_prefix_without_changing_tags_or_audio() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-repair-tags-prefixed-flac",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("prefixed.flac");
+        let audio = write_synthetic_flac(&path, &[("TITLE", "Still Here")], 128, 4096);
+        prepend_id3v23_prefix(&path, 73);
+        assert!(
+            flac_metadata_writer::test_read_stream_offset(&path)
+                .expect("prefixed stream offset")
+                > 0
+        );
+
+        let result = run_tag_maintenance(
+            &path,
+            TagMaintenanceKind::Repair,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+
+        assert!(result.changed);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            flac_metadata_writer::test_read_stream_offset(&path)
+                .expect("repaired stream offset"),
+            0
+        );
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(&path, "TITLE")
+                .expect("title after repair"),
+            vec!["Still Here".to_string()]
+        );
+        let audio_start = flac_metadata_writer::test_read_audio_start(&path)
+            .expect("audio start after repair");
+        let bytes = std::fs::read(&path).expect("read repaired FLAC");
+        assert_eq!(&bytes[audio_start as usize..], audio.as_slice());
+    }
+
+    #[test]
+    fn remove_all_tags_from_flac_preserves_technical_blocks_and_audio() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-remove-all-tags-flac",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("remove-all.flac");
+        let application = b"tpst-application-data".to_vec();
+        let unknown = b"private-metadata".to_vec();
+        let blocks = vec![
+            (0, vec![0u8; 34]),
+            (2, application.clone()),
+            (4, vorbis_block_body("tonepoet-test", &[("TITLE", "Remove Me")])),
+            (5, vec![0x22u8; 396]),
+            (
+                6,
+                synthetic_picture_block(
+                    lofty::picture::PictureType::CoverFront,
+                    b"picture-data",
+                ),
+            ),
+            (127, unknown.clone()),
+            (1, vec![0u8; 32]),
+        ];
+        let audio = write_synthetic_flac_with_blocks(&path, &blocks, 8192);
+        prepend_id3v23_prefix(&path, 41);
+
+        let result = run_tag_maintenance(
+            &path,
+            TagMaintenanceKind::RemoveAll,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+
+        assert!(result.changed);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            flac_metadata_writer::test_read_stream_offset(&path)
+                .expect("stream offset after removal"),
+            0
+        );
+        assert!(payloads_for_type(&path, 4).is_empty());
+        assert!(payloads_for_type(&path, 5).is_empty());
+        assert!(payloads_for_type(&path, 6).is_empty());
+        assert_eq!(payloads_for_type(&path, 2), vec![application]);
+        assert_eq!(payloads_for_type(&path, 127), vec![unknown]);
+        let audio_start = flac_metadata_writer::test_read_audio_start(&path)
+            .expect("audio start after removal");
+        let bytes = std::fs::read(&path).expect("read tag-free FLAC");
+        assert_eq!(&bytes[audio_start as usize..], audio.as_slice());
+    }
+
+    #[test]
+    fn repair_tags_removes_invalid_ape_keys_and_preserves_valid_rows() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-repair-tags-invalid-ape",
+        );
+        let (_temp, path) = copy_numbering_fixture(
+            "repair-invalid-key.wv",
+            APE_NUMBERING_FIXTURE,
+        );
+        append_invalid_key_ape_item(&path);
+
+        let before = crate::metadata_persistence::read_native_ape_fallback(&path)
+            .expect("fallback before repair");
+        let result = run_tag_maintenance(
+            &path,
+            TagMaintenanceKind::Repair,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+
+        assert!(result.changed);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(
+            crate::metadata_persistence::invalid_native_ape_keys(&path)
+                .expect("invalid keys after repair")
+                .is_empty()
+        );
+        let after = crate::metadata_persistence::read_native_ape_fallback(&path)
+            .expect("fallback after repair");
+        assert_eq!(after.rows, before.rows);
+    }
+
+    #[test]
+    fn remove_all_tags_drops_the_complete_native_wavpack_ape_payload() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-remove-all-tags-native-ape",
+        );
+        let (_temp, path) = copy_numbering_fixture(
+            "remove-all-invalid-key.wv",
+            APE_NUMBERING_FIXTURE,
+        );
+        append_invalid_key_ape_item(&path);
+        let mut bytes = std::fs::read(&path).expect("read WavPack fixture");
+        let mut id3v1 = [0u8; 128];
+        id3v1[..3].copy_from_slice(b"TAG");
+        id3v1[3..15].copy_from_slice(b"legacy title");
+        bytes.extend_from_slice(&id3v1);
+        std::fs::write(&path, bytes).expect("append ID3v1 fixture tag");
+
+        let result = run_tag_maintenance(
+            &path,
+            TagMaintenanceKind::RemoveAll,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+
+        assert!(result.changed);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(
+            crate::metadata_persistence::read_native_ape_tag(&path)
+                .expect("read native APE after removal")
+                .map_or(true, |tag| tag.items.is_empty())
+        );
+        assert!(!has_id3v1_tag(&path).expect("check ID3v1 after removal"));
     }
 
     #[test]

@@ -1727,6 +1727,7 @@ mod tests {
             super::super::probe::SourceMetadata::default(),
         );
         file.set_probe_ready(SourceInfo {
+            sample_format_is_float: None,
             format_name: format_name.to_string(),
             codec: codec.to_string(),
             sample_rate: 44_100,
@@ -1866,6 +1867,7 @@ mod tests {
         assert!(details_analyze_applicable(&state)); // PRE metadata scan is still valid for this source.
 
         state.active_surface_mut().technical_details.files[0].set_probe_ready(SourceInfo {
+            sample_format_is_float: None,
             format_name: "flac".to_string(),
             codec: "flac".to_string(),
             sample_rate: 44_100,
@@ -1899,6 +1901,7 @@ mod tests {
     #[test]
     fn mixed_encoding_is_not_collapsed_to_lossy() {
         let flac = SourceInfo {
+            sample_format_is_float: None,
             format_name: "flac".to_string(),
             codec: "flac".to_string(),
             sample_rate: 44_100,
@@ -1909,6 +1912,7 @@ mod tests {
             file_size: 100,
         };
         let mp3 = SourceInfo {
+            sample_format_is_float: None,
             format_name: "mp3".to_string(),
             codec: "mp3".to_string(),
             sample_rate: 44_100,
@@ -2019,6 +2023,7 @@ mod tests {
         assert_eq!(hdcd_status_for_file(&file), "N/A");
 
         file.set_probe_ready(SourceInfo {
+            sample_format_is_float: None,
             format_name: "flac".to_string(),
             codec: "flac".to_string(),
             sample_rate: 96_000,
@@ -2048,6 +2053,7 @@ mod tests {
         );
         file.analysis_facts.hdcd_detected = Some(false);
         file.set_probe_ready(SourceInfo {
+            sample_format_is_float: None,
             format_name: "flac".to_string(),
             codec: "flac".to_string(),
             sample_rate: 44_100,
@@ -2196,6 +2202,7 @@ mod tests {
             (
                 "/tmp/lossy.mp3",
                 SourceInfo {
+                    sample_format_is_float: None,
                     format_name: "mp3".to_string(),
                     codec: "mp3".to_string(),
                     sample_rate: 44_100,
@@ -2209,6 +2216,7 @@ mod tests {
             (
                 "/tmp/dsd.dsf",
                 SourceInfo {
+                    sample_format_is_float: None,
                     format_name: "dsf".to_string(),
                     codec: "dsd".to_string(),
                     sample_rate: 2_822_400,
@@ -2222,6 +2230,7 @@ mod tests {
             (
                 "/tmp/disc.iso",
                 SourceInfo {
+                    sample_format_is_float: None,
                     format_name: "wav".to_string(),
                     codec: "pcm_s16le".to_string(),
                     sample_rate: 44_100,
