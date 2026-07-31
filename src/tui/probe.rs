@@ -7224,7 +7224,7 @@ pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usiz
             entries.push(TagEntry {
                 row_scope: crate::tui::probe::RowScope::File,
                 display_key: field.to_string(),
-                item_key: lofty::tag::ItemKey::Unknown(field.to_string()),
+                item_key: item_key_for_new_editor_row(field),
                 value: String::new(),
                 original: String::new(),
                 is_binary: false,
@@ -13406,7 +13406,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "round-11 clusterB round-2: test EXPECTATION wrong, not fixture — read_all_tags always synthesizes empty core rows (delete), and ensure_standard_fields_present keys synthetic std fields as Unknown so new GENRE lands in TXXX not typed TCON (new-field). Bounced: see docs/round11-clusterB-round2-bounce.md"]
     fn all_view_deletes_unsuffixed_title_from_id3v1_only_mp3() {
         use lofty::tag::{ItemKey, TagType};
 
@@ -13445,17 +13444,16 @@ mod tests {
                 .is_none(),
             "deleting the visible unsuffixed row must remove the ID3v1 value"
         );
-        assert!(
-            read_all_tags(&path)
-                .expect("reopen All view after deletion")
-                .iter()
-                .all(|entry| entry.display_key != "TITLE"),
-            "the deleted ID3v1 TITLE row must stay absent after reopen"
-        );
+        let reopened_entries = read_all_tags(&path).expect("reopen All view after deletion");
+        let title = reopened_entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("All view must retain its synthetic core TITLE row");
+        assert_eq!(title.value, "");
+        assert_eq!(title.per_file_stored_value_counts, vec![0]);
     }
 
     #[test]
-    #[ignore = "round-11 clusterB round-2: test EXPECTATION wrong, not fixture — read_all_tags always synthesizes empty core rows (delete), and ensure_standard_fields_present keys synthetic std fields as Unknown so new GENRE lands in TXXX not typed TCON (new-field). Bounced: see docs/round11-clusterB-round2-bounce.md"]
     fn all_view_new_field_on_id3v1_only_mp3_uses_normal_id3v2_primary() {
         use lofty::tag::{ItemKey, TagType};
 
