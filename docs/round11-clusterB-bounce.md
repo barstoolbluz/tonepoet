@@ -37,12 +37,26 @@ ID3v2 tag that exists on disk merely because it was removed from the in-memory
 `TaggedFile`. Starting from an ID3v2-bearing fixture, you cannot produce an ID3v1-only MP3
 this way.
 
+## Fixture inventory (important — there is NO tagless MP3 to start from)
+
+The repo has exactly **one** MP3 fixture: `tests/fixtures/metadata_persistence/id3v2.mp3`
+(bound as `ID3V2_NUMBERING_FIXTURE` in probe.rs:13125), and it **carries an ID3v2 tag**.
+There is no tagless / ID3v1-only MP3 fixture anywhere, and no existing helper that
+synthesizes a bare MP3. So you cannot simply "start from a tagless base" — one does not
+exist. This is why `seed_id3v1_only_mp3`'s remove+save approach fails.
+
 ## What we need from you (two parts)
 
-1. **A workable ID3v1-only fixture.** Construct the ID3v1-only MP3 from a base that has **no
-   ID3v2** (e.g. a minimal/tagless MP3 fixture), or physically strip the ID3v2 prefix, or use
-   whatever lofty `WriteOptions`/`Probe` path actually yields an ID3v1-only file. The goal
-   fixture: an MP3 whose only tag is ID3v1, verified by reopen.
+1. **A workable ID3v1-only fixture — you must create the tagless base.** Options, your call:
+   (a) **strip the ID3v2 prefix** from `ID3V2_NUMBERING_FIXTURE` to the first MPEG frame sync
+   (ID3v2 is a length-prefixed header at the front of the file; the existing
+   `detect_flac_stream_offset` is the FLAC analogue — for MP3 the ID3v2 size is the syncsafe
+   header length), then write an ID3v1 tag onto those frames; or
+   (b) **synthesize a minimal bare MP3** (a few valid MPEG audio frames, no tags) as a new
+   helper or a new committed `tests/fixtures/...` file, then add ID3v1; or
+   (c) whatever lofty `WriteOptions`/`Probe`/`remove` path actually yields an ID3v1-only file
+   if one exists (the default-save path does not — proven above).
+   The goal fixture: an MP3 whose only tag is ID3v1, verified by reopen (`tag(Id3v2).is_none()`).
 
 2. **Confirm the feature's intended contract, which these tests are the spec for.** The test
    names assert that all-view editing of an ID3v1-only MP3 **targets the existing preferred
