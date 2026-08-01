@@ -92,6 +92,12 @@ impl Materializer for CueImageMaterializer {
         let cue_input = resolve_cue_input(req)?;
         let track_images = resolve_track_image_paths(&cue_input)?;
         let unique_images = unique_existing_paths(&track_images);
+        let mut track_count_by_image = HashMap::new();
+        for image_path in &track_images {
+            *track_count_by_image
+                .entry(path_identity(image_path))
+                .or_insert(0usize) += 1;
+        }
 
         let mut probes = HashMap::new();
         let mut decode_paths = HashMap::new();
@@ -210,6 +216,7 @@ impl Materializer for CueImageMaterializer {
                 cue_track,
                 &cue_input.sheet,
                 image_metadata_for_track,
+                track_count_by_image.get(&image_key) == Some(&1),
                 cue_annotations.track_pre_emphasis(cue_track.number),
                 track_number_plan[idx],
             );
@@ -2682,6 +2689,12 @@ struct ImageAlbumMetadata {
     artist: Option<String>,
     genre: Option<String>,
     date: Option<String>,
+    composer: Option<String>,
+    performer: Option<String>,
+    isrc: Option<String>,
+    publisher: Option<String>,
+    copyright: Option<String>,
+    comment: Option<String>,
     total_discs: Option<u32>,
     disc_number: Option<u32>,
     extra: BTreeMap<String, String>,
@@ -2719,6 +2732,24 @@ fn merge_image_album_metadata(
         }
         if merged.date.is_none() {
             merged.date = metadata.date.clone();
+        }
+        if merged.composer.is_none() {
+            merged.composer = metadata.composer.clone();
+        }
+        if merged.performer.is_none() {
+            merged.performer = metadata.performer.clone();
+        }
+        if merged.isrc.is_none() {
+            merged.isrc = metadata.isrc.clone();
+        }
+        if merged.publisher.is_none() {
+            merged.publisher = metadata.publisher.clone();
+        }
+        if merged.copyright.is_none() {
+            merged.copyright = metadata.copyright.clone();
+        }
+        if merged.comment.is_none() {
+            merged.comment = metadata.comment.clone();
         }
         if merged.total_discs.is_none() {
             merged.total_discs = metadata.total_discs;
@@ -2799,17 +2830,36 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
     };
 
     let mut metadata = ImageAlbumMetadata::default();
+    let tag_type = tag.tag_type();
     for item in tag.items() {
         let key = normalized_lofty_item_key(item.key());
         let Some(value) = item.value().text().map(str::trim).filter(|value| !value.is_empty()) else {
             continue;
         };
+
+        // Keep the source text-tag provenance contract used by the single-file
+        // materializer. Structural/per-track CUE keys are intentionally not
+        // promoted album-wide when an image is split into output tracks.
+        if !cue_image_tag_is_structural_or_track_scoped(&key) {
+            let source_key = super::materializer_single::item_key_to_extra_key(item.key(), tag_type);
+            insert_source_text_tag(&mut metadata.extra, &source_key, value);
+        }
+
         match cue_image_tag_field(&key) {
             Some(ImageTagField::Album) => set_if_empty(&mut metadata.album, value),
             Some(ImageTagField::AlbumArtist) => set_if_empty(&mut metadata.album_artist, value),
             Some(ImageTagField::Artist) => set_if_empty(&mut metadata.artist, value),
             Some(ImageTagField::Genre) => set_if_empty(&mut metadata.genre, value),
             Some(ImageTagField::Date) => set_if_empty(&mut metadata.date, value),
+            Some(ImageTagField::Composer) => set_if_empty(&mut metadata.composer, value),
+            Some(ImageTagField::Performer) => {
+                set_if_empty(&mut metadata.performer, value);
+                set_if_empty(&mut metadata.artist, value);
+            }
+            Some(ImageTagField::Isrc) => set_if_empty(&mut metadata.isrc, value),
+            Some(ImageTagField::Publisher) => set_if_empty(&mut metadata.publisher, value),
+            Some(ImageTagField::Copyright) => set_if_empty(&mut metadata.copyright, value),
+            Some(ImageTagField::Comment) => set_if_empty(&mut metadata.comment, value),
             Some(ImageTagField::DiscNumber) => {
                 if metadata.disc_number.is_none() {
                     metadata.disc_number = parse_tag_number(value);
@@ -2833,6 +2883,12 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
         || metadata.artist.is_some()
         || metadata.genre.is_some()
         || metadata.date.is_some()
+        || metadata.composer.is_some()
+        || metadata.performer.is_some()
+        || metadata.isrc.is_some()
+        || metadata.publisher.is_some()
+        || metadata.copyright.is_some()
+        || metadata.comment.is_some()
         || metadata.total_discs.is_some()
         || metadata.disc_number.is_some()
         || !metadata.extra.is_empty()
@@ -2849,6 +2905,12 @@ enum ImageTagField {
     Artist,
     Genre,
     Date,
+    Composer,
+    Performer,
+    Isrc,
+    Publisher,
+    Copyright,
+    Comment,
     DiscNumber,
     TotalDiscs,
 }
@@ -2859,13 +2921,35 @@ fn cue_image_tag_field(key: &str) -> Option<ImageTagField> {
         "albumartist" | "albumartistsort" | "albumartistsortorder" | "tpe2" => {
             Some(ImageTagField::AlbumArtist)
         }
-        "artist" | "trackartist" | "performer" | "tpe1" => Some(ImageTagField::Artist),
+        "artist" | "trackartist" | "tpe1" => Some(ImageTagField::Artist),
         "genre" | "tcon" => Some(ImageTagField::Genre),
         "date" | "year" | "recordingdate" | "tdrc" | "tyer" => Some(ImageTagField::Date),
+        "composer" | "tcom" => Some(ImageTagField::Composer),
+        "performer" => Some(ImageTagField::Performer),
+        "isrc" | "tsrc" => Some(ImageTagField::Isrc),
+        "publisher" | "label" | "tpub" => Some(ImageTagField::Publisher),
+        "copyright" | "copyrightmessage" | "tcop" => Some(ImageTagField::Copyright),
+        "comment" | "description" | "comm" => Some(ImageTagField::Comment),
         "discnumber" | "disc" | "partofset" | "tpos" => Some(ImageTagField::DiscNumber),
         "totaldiscs" | "disctotal" => Some(ImageTagField::TotalDiscs),
         _ => None,
     }
+}
+
+fn cue_image_tag_is_structural_or_track_scoped(key: &str) -> bool {
+    matches!(
+        key,
+        "cuesheet"
+            | "title"
+            | "tracktitle"
+            | "tracknumber"
+            | "track"
+            | "tracktotal"
+            | "totaltracks"
+            | "musicbrainztrackid"
+            | "musicbrainzrecordingid"
+            | "musicbrainzreleasetrackid"
+    ) || key.starts_with("replaygaintrack")
 }
 
 fn normalized_lofty_item_key(key: &lofty::tag::ItemKey) -> String {
@@ -2941,6 +3025,7 @@ fn cue_track_metadata(
     cue_track: &crate::tui::cue_parser::CueTrack,
     sheet: &CueSheet,
     image: &ImageAlbumMetadata,
+    image_is_track_unique: bool,
     pre_emphasis: bool,
     numbering: CueTrackNumberPlan,
 ) -> TrackMetadata {
@@ -2968,6 +3053,7 @@ fn cue_track_metadata(
         .performer
         .clone()
         .or_else(|| sheet.performer.clone())
+        .or_else(|| image.performer.clone())
         .or_else(|| image.artist.clone())
         .or_else(|| image.album_artist.clone());
     let album_artist = sheet
@@ -2980,16 +3066,19 @@ fn cue_track_metadata(
         title: cue_track.title.clone(),
         artist: performer.clone(),
         album_artist,
-        composer: None,
+        composer: image.composer.clone(),
         performer,
         genre: sheet.genre.clone().or_else(|| image.genre.clone()),
         date: sheet.date.clone().or_else(|| image.date.clone()),
         track_number: Some(numbering.output_number),
         disc_number: None,
-        isrc: cue_track.isrc.clone(),
-        publisher: None,
-        copyright: None,
-        comment: None,
+        isrc: cue_track
+            .isrc
+            .clone()
+            .or_else(|| image_is_track_unique.then(|| image.isrc.clone()).flatten()),
+        publisher: image.publisher.clone(),
+        copyright: image.copyright.clone(),
+        comment: image.comment.clone(),
         pre_emphasis,
         extra,
     }
@@ -5234,7 +5323,7 @@ FILE "side-b.flac" WAVE
         );
 
         let numbering = cue_track_number_plan(&sheet);
-        let track = cue_track_metadata(&sheet.tracks[0], &sheet, &image, false, numbering[0]);
+        let track = cue_track_metadata(&sheet.tracks[0], &sheet, &image, true, false, numbering[0]);
         let album = cue_album_metadata(&sheet, &image, sheet.tracks.len() as u32);
 
         assert_eq!(track.artist.as_deref(), Some("Cue Artist"));
@@ -5710,7 +5799,14 @@ FILE "lofty-image.flac" WAVE
                 ("MUSICBRAINZ_ALBUMID", "mb-album"),
                 ("MUSICBRAINZ_ALBUMARTISTID", "mb-album-artist"),
                 ("MUSICBRAINZ_RELEASEGROUPID", "mb-release-group"),
+                ("COMPOSER", "Rick Davies"),
+                ("PERFORMER", "Supertramp"),
                 ("ISRC", "USRC17607839"),
+                ("PUBLISHER", "A&M Records"),
+                ("COPYRIGHT", "1974 A&M Records"),
+                ("COMMENT", "Japan first-press LP"),
+                ("LINEAGE", "LP > ADC > WavPack"),
+                ("DISCOGS_URL", "https://www.discogs.com/release/123"),
                 ("MUSICBRAINZ_TRACKID", "mb-track-must-not-copy"),
                 ("CUESHEET", cue),
             ],
@@ -5741,7 +5837,26 @@ FILE "lofty-image.flac" WAVE
         assert_eq!(image_metadata.extra.get("musicbrainz_albumid").map(String::as_str), Some("mb-album"));
         assert_eq!(image_metadata.extra.get("musicbrainz_albumartistid").map(String::as_str), Some("mb-album-artist"));
         assert_eq!(image_metadata.extra.get("musicbrainz_releasegroupid").map(String::as_str), Some("mb-release-group"));
-        assert!(!image_metadata.extra.contains_key("isrc"), "per-track ISRC must not be copied as album metadata");
+        assert_eq!(image_metadata.composer.as_deref(), Some("Rick Davies"));
+        assert_eq!(image_metadata.performer.as_deref(), Some("Supertramp"));
+        assert_eq!(image_metadata.isrc.as_deref(), Some("USRC17607839"));
+        assert_eq!(image_metadata.publisher.as_deref(), Some("A&M Records"));
+        assert_eq!(image_metadata.copyright.as_deref(), Some("1974 A&M Records"));
+        assert_eq!(image_metadata.comment.as_deref(), Some("Japan first-press LP"));
+        assert_eq!(
+            image_metadata
+                .extra
+                .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}lineage"))
+                .map(String::as_str),
+            Some("LP > ADC > WavPack"),
+        );
+        assert_eq!(
+            image_metadata
+                .extra
+                .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}discogs_url"))
+                .map(String::as_str),
+            Some("https://www.discogs.com/release/123"),
+        );
         assert!(!image_metadata.extra.contains_key("musicbrainz_trackid"), "per-track MusicBrainz IDs must not be copied as album metadata");
 
         let mut sheet = crate::tui::cue_parser::parse_cue(cue);
@@ -5756,6 +5871,54 @@ FILE "lofty-image.flac" WAVE
             "lofty canonicalizes Vorbis ORIGINALYEAR to OriginalReleaseDate on read"
         );
         assert_eq!(album.extra.get("musicbrainz_albumid").map(String::as_str), Some("mb-album"));
+
+        let track = cue_track_metadata(
+            &sheet.tracks[0],
+            &sheet,
+            &image_metadata,
+            true,
+            false,
+            CueTrackNumberPlan {
+                output_number: 1,
+                cue_number: 1,
+            },
+        );
+        let tags = crate::convert::pipeline::stages::authoritative_metadata_tags(&track, &album);
+        let tag_value = |key: &str| {
+            tags.iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(tag_value("COMMENT"), Some("Japan first-press LP"));
+        assert_eq!(tag_value("COMPOSER"), Some("Rick Davies"));
+        // CUE-sheet PERFORMER is authoritative (like CATALOG/TITLE); a distinct
+        // image-tag PERFORMER does not override the sheet at track level.
+        assert_eq!(tag_value("PERFORMER"), Some("Embedded Cue Artist"));
+        assert_eq!(tag_value("ISRC"), Some("USRC17607839"));
+        let shared_image_track = cue_track_metadata(
+            &sheet.tracks[0],
+            &sheet,
+            &image_metadata,
+            false,
+            false,
+            CueTrackNumberPlan {
+                output_number: 1,
+                cue_number: 1,
+            },
+        );
+        assert_eq!(
+            shared_image_track.isrc, None,
+            "one image-level ISRC must not be broadcast across multiple CUE tracks",
+        );
+        assert_eq!(tag_value("PUBLISHER"), Some("A&M Records"));
+        assert_eq!(tag_value("COPYRIGHT"), Some("1974 A&M Records"));
+        assert_eq!(tag_value("LINEAGE"), Some("LP > ADC > WavPack"));
+        assert_eq!(
+            tag_value("DISCOGS_URL"),
+            Some("https://www.discogs.com/release/123"),
+        );
+        assert_eq!(tag_value("CUESHEET"), None);
+        assert_eq!(tag_value("MUSICBRAINZ_TRACKID"), None);
 
         let embedded = read_embedded_cuesheet(&image)
             .expect("lofty read should succeed")
@@ -5787,13 +5950,15 @@ FILE "lofty-image.flac" WAVE
     }
 
     #[test]
-    fn album_extra_whitelist_rejects_track_scoped_keys() {
+    fn album_extra_aliases_and_structural_exclusions_are_explicit() {
         assert_eq!(cue_image_extra_key(&normalize_tag_key("CATALOGNUMBER")), Some("catalognumber"));
         assert_eq!(cue_image_extra_key(&normalize_tag_key("RELEASECOUNTRY")), Some("releasecountry"));
         assert_eq!(cue_image_extra_key(&normalize_tag_key("MUSICBRAINZ_ALBUMID")), Some("musicbrainz_albumid"));
-        assert_eq!(cue_image_extra_key(&normalize_tag_key("ISRC")), None);
-        assert_eq!(cue_image_extra_key(&normalize_tag_key("MUSICBRAINZ_TRACKID")), None);
-        assert_eq!(cue_image_extra_key(&normalize_tag_key("MUSICBRAINZ_RELEASETRACKID")), None);
+        assert!(!cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("COMMENT")));
+        assert!(!cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("LINEAGE")));
+        assert!(cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("CUESHEET")));
+        assert!(cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("MUSICBRAINZ_TRACKID")));
+        assert!(cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("MUSICBRAINZ_RELEASETRACKID")));
     }
 
     // ── Category G: probe failure ──

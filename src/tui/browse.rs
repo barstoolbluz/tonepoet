@@ -2363,6 +2363,17 @@ impl PreparedTagTransfer {
                 if self.field_count == 1 { "" } else { "s" },
                 sheet.tracks.len(),
             ),
+            crate::tui::tag_interchange::TransferCarrier::EmbeddedCues { carriers } => format!(
+                "Write {} field{} to {} embedded CUE{} ({} tracks)?",
+                self.field_count,
+                if self.field_count == 1 { "" } else { "s" },
+                carriers.len(),
+                if carriers.len() == 1 { "" } else { "s" },
+                carriers
+                    .iter()
+                    .map(|carrier| carrier.sheet.tracks.len())
+                    .sum::<usize>(),
+            ),
         }
     }
 }
@@ -12087,6 +12098,30 @@ mod tests {
         assert_eq!(
             embedded.confirmation_prompt(),
             "Write 4 fields to embedded CUE (2 tracks)?"
+        );
+
+        let embedded_set = prepared_transfer_for_prompt(
+            3,
+            crate::tui::tag_interchange::TransferCarrier::EmbeddedCues {
+                carriers: vec![
+                    crate::tui::tag_interchange::EmbeddedCueCarrier {
+                        image_path: PathBuf::from("/music/disc-1.flac"),
+                        cue_text: String::new(),
+                        sheet: transfer_test_sheet(2),
+                        multi_file_read_only: false,
+                    },
+                    crate::tui::tag_interchange::EmbeddedCueCarrier {
+                        image_path: PathBuf::from("/music/disc-2.flac"),
+                        cue_text: String::new(),
+                        sheet: transfer_test_sheet(3),
+                        multi_file_read_only: false,
+                    },
+                ],
+            },
+        );
+        assert_eq!(
+            embedded_set.confirmation_prompt(),
+            "Write 3 fields to 2 embedded CUEs (5 tracks)?"
         );
     }
 

@@ -628,6 +628,38 @@ impl Default for ArtistCanonicalizer {
 static ARTIST_CANONICALIZER: LazyLock<ArtistCanonicalizer> =
     LazyLock::new(ArtistCanonicalizer::new);
 
+static CANONICAL_ARTIST_CANDIDATES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut candidates = CANONICAL_ARTISTS_REFERENCE
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| candidate.to_ascii_lowercase());
+    candidates.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    candidates
+});
+
+static CANONICAL_COUNTRY_CANDIDATES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut candidates = CANONICAL_COUNTRY_VARIANTS
+        .iter()
+        .map(|(canonical, _)| (*canonical).to_string())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| candidate.to_ascii_lowercase());
+    candidates.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    candidates
+});
+
+/// Sorted canonical names embedded for artist-like metadata completion.
+pub fn canonical_artist_candidates() -> &'static [String] {
+    CANONICAL_ARTIST_CANDIDATES.as_slice()
+}
+
+/// Sorted canonical country labels emitted by the dictionary resolver.
+pub fn canonical_country_candidates() -> &'static [String] {
+    CANONICAL_COUNTRY_CANDIDATES.as_slice()
+}
+
 pub fn canonicalize_artist(artist: &str) -> String {
     ARTIST_CANONICALIZER.canonicalize(artist)
 }
@@ -976,6 +1008,21 @@ pub fn contains_metadata_identifier(text: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn completion_candidate_sources_are_sorted_unique_and_canonical() {
+        let artists = canonical_artist_candidates();
+        assert!(artists.len() > 2_000);
+        assert!(artists.windows(2).all(|pair| {
+            pair[0].to_ascii_lowercase() < pair[1].to_ascii_lowercase()
+        }));
+        assert!(artists.iter().any(|artist| artist == "Supertramp"));
+
+        let countries = canonical_country_candidates();
+        assert_eq!(countries.len(), CANONICAL_COUNTRY_VARIANTS.len());
+        assert!(countries.iter().any(|country| country == "Japan"));
+        assert!(countries.iter().any(|country| country == "US"));
+    }
 
     fn metadata_with_extra(extra: &[(&str, &str)]) -> AlbumMetadata {
         AlbumMetadata {

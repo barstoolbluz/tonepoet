@@ -1790,6 +1790,10 @@ fn open_browse_tag_transfer_picker(
             direction,
             scope,
             fixed_roots,
+            metadata_target_priority:
+                crate::config::normalized_aggregate_metadata_target_priority(
+                    &app.config.conversion.aggregate_metadata_target_priority,
+                ),
         },
         picker,
     ));
@@ -1884,6 +1888,10 @@ fn launch_tag_transfer(
         verification,
         require_browse_confirmation,
     } = request;
+    let metadata_target_priority =
+        crate::config::normalized_aggregate_metadata_target_priority(
+            &app.config.conversion.aggregate_metadata_target_priority,
+        );
     let cancel = super::probe::MetadataWriteCancelFlag::new();
     app.browse.tag_transfer_active_generation = Some(generation);
     app.browse.tag_transfer_cancel = Some(cancel.clone());
@@ -1897,6 +1905,7 @@ fn launch_tag_transfer(
     tokio::spawn(async move {
         if require_browse_confirmation {
             let worker_cancel = cancel.clone();
+            let worker_priority = metadata_target_priority.clone();
             let prepared = tokio::task::spawn_blocking(move || {
                 let super::browse::PendingTagTransferSource::Roots(source_roots) = source else {
                     return Err(
@@ -1912,10 +1921,12 @@ fn launch_tag_transfer(
                 };
                 let source_carrier = super::keybindings::classify_tag_transfer_roots(
                     &source_roots,
+                    &worker_priority,
                     &worker_cancel,
                 )?;
                 let target = super::keybindings::classify_tag_transfer_roots(
                     &target_roots,
+                    &worker_priority,
                     &worker_cancel,
                 )?;
                 let source_entries = super::tag_interchange::read_transfer_carrier_entries(
@@ -1967,6 +1978,7 @@ fn launch_tag_transfer(
                 .await;
         } else {
             let worker_cancel = cancel.clone();
+            let worker_priority = metadata_target_priority.clone();
             let progress_tx = worker_tx.clone();
             let completion = tokio::task::spawn_blocking(move || {
                 let progress = |completed: usize, total: usize, path: &std::path::Path| {
@@ -1983,6 +1995,7 @@ fn launch_tag_transfer(
                     super::browse::PendingTagTransferTarget::Roots(target_roots) => {
                         super::keybindings::classify_tag_transfer_roots(
                             &target_roots,
+                            &worker_priority,
                             &worker_cancel,
                         )?
                     }
@@ -1992,6 +2005,7 @@ fn launch_tag_transfer(
                     super::browse::PendingTagTransferSource::Roots(source_roots) => {
                         let source = super::keybindings::classify_tag_transfer_roots(
                             &source_roots,
+                            &worker_priority,
                             &worker_cancel,
                         )?;
                         super::tag_interchange::execute_tag_transfer_between_carriers(
@@ -2065,6 +2079,7 @@ pub(crate) fn handle_tag_transfer_prepared(
 
 fn reverify_prepared_files_target(
     prepared: &super::browse::PreparedTagTransfer,
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
     cancel: &super::probe::MetadataWriteCancelFlag,
 ) -> Result<(), String> {
     let super::tag_interchange::TransferCarrier::Files { paths: prepared_paths } =
@@ -2079,6 +2094,7 @@ fn reverify_prepared_files_target(
     }
     let current = super::keybindings::classify_tag_transfer_roots(
         &prepared.target_roots,
+        metadata_target_priority,
         cancel,
     )?;
     let super::tag_interchange::TransferCarrier::Files {
@@ -2119,6 +2135,10 @@ pub(crate) fn launch_prepared_tag_transfer(
     app.active_overlay = ActiveOverlay::None;
     app.set_status("Transfer tags: writing confirmed carrier...");
 
+    let metadata_target_priority =
+        crate::config::normalized_aggregate_metadata_target_priority(
+            &app.config.conversion.aggregate_metadata_target_priority,
+        );
     let worker_tx = tx.clone();
     tokio::spawn(async move {
         let progress_tx = worker_tx.clone();
@@ -2133,7 +2153,7 @@ pub(crate) fn launch_prepared_tag_transfer(
                     });
                 }
             };
-            reverify_prepared_files_target(&prepared, &cancel)?;
+            reverify_prepared_files_target(&prepared, &metadata_target_priority, &cancel)?;
             let mut report = super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
                 &prepared.source_entries,
                 prepared.source_dimension,
@@ -4384,12 +4404,13 @@ mod tests {
             pairing_warnings: Vec::new(),
         };
         let cancel = super::super::probe::MetadataWriteCancelFlag::new();
-        reverify_prepared_files_target(&prepared, &cancel)
+        let priority = crate::config::default_aggregate_metadata_target_priority();
+        reverify_prepared_files_target(&prepared, &priority, &cancel)
             .expect("unchanged target membership re-verifies");
 
         std::fs::write(&third, b"three").expect("third target");
         assert_eq!(
-            reverify_prepared_files_target(&prepared, &cancel).unwrap_err(),
+            reverify_prepared_files_target(&prepared, &priority, &cancel).unwrap_err(),
             "target folder changed since the confirmation was prepared; retry"
         );
     }
@@ -4622,6 +4643,7 @@ mod tests {
                         Some(FilePickerPurpose::MetadataTagTransfer {
                             direction: actual_direction,
                             scope: actual_scope,
+                            ..
                         }) if *actual_direction == direction && *actual_scope == scope
                     ));
                 }

@@ -5448,12 +5448,38 @@ fn draw_metadata_editor(
             spans.push(footer_pill("Esc close", theme.purple, theme));
             Line::from(spans)
         }
-        MetadataEditorPhase::InlineEdit => Line::from(vec![
-            footer_pill("Enter confirm", theme.green, theme),
-            pill_gap(),
-            footer_pill("Esc cancel", theme.purple, theme),
-        ]),
+        MetadataEditorPhase::InlineEdit => {
+            let inline_completion_available = state
+                .active_surface()
+                .entries
+                .get(state.cursor)
+                .map(|entry| {
+                    matches!(
+                        super::probe::canonical_metadata_display_key(&entry.display_key).as_str(),
+                        "ARTIST"
+                            | "ALBUMARTIST"
+                            | "GENRE"
+                            | "PERFORMER"
+                            | "COUNTRY"
+                            | "RELEASECOUNTRY"
+                            | "COMPOSER"
+                    )
+                })
+                .unwrap_or(false);
+            let mut spans = vec![
+                footer_pill("Enter confirm", theme.green, theme),
+                pill_gap(),
+            ];
+            if inline_completion_available {
+                spans.push(footer_pill("Up/Down complete", theme.cyan, theme));
+                spans.push(pill_gap());
+            }
+            spans.push(footer_pill("Esc cancel", theme.purple, theme));
+            Line::from(spans)
+        }
         MetadataEditorPhase::AddingKey => Line::from(vec![
+            footer_pill("Tab complete", theme.cyan, theme),
+            pill_gap(),
             footer_pill("Enter confirm", theme.green, theme),
             pill_gap(),
             footer_pill("Esc cancel", theme.purple, theme),

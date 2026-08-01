@@ -39,6 +39,17 @@ pub enum SidecarCueWriteMethod {
 }
 
 #[derive(Debug, Clone)]
+pub struct EmbeddedCueCarrier {
+    pub(crate) image_path: std::path::PathBuf,
+    #[allow(dead_code)]
+    pub(crate) cue_text: String,
+    pub(crate) sheet: crate::convert::cue_parser::CueSheet,
+    /// A multi-FILE embedded CUESHEET may be read as a source, but one
+    /// member image cannot authoritatively rewrite sibling references.
+    pub(crate) multi_file_read_only: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum TransferCarrier {
     Files { paths: Vec<std::path::PathBuf> },
     SidecarCue {
@@ -54,15 +65,47 @@ pub enum TransferCarrier {
         cue_text: String,
         sheet: crate::convert::cue_parser::CueSheet,
     },
+    /// One explicitly selected image with a usable embedded CUESHEET.
     EmbeddedCue {
         image_path: std::path::PathBuf,
         #[allow(dead_code)]
         cue_text: String,
         sheet: crate::convert::cue_parser::CueSheet,
-        /// A multi-FILE embedded CUESHEET may be read as a source, but one
-        /// member image cannot authoritatively rewrite sibling references.
         multi_file_read_only: bool,
     },
+    /// Ordered aggregate representation selected from a directory, or from
+    /// multiple explicitly selected images that all carry usable embedded CUEs.
+    EmbeddedCues { carriers: Vec<EmbeddedCueCarrier> },
+}
+
+/// Availability facts consumed by ordered aggregate-target resolution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AggregateMetadataAvailability {
+    pub individual_files: bool,
+    pub sidecar_cue: bool,
+    pub embedded_cue: bool,
+}
+
+/// Resolve the first configured target accepted by a caller-supplied probe.
+pub fn resolve_aggregate_metadata_target_by(
+    priority: &[crate::config::AggregateMetadataTarget],
+    mut is_available: impl FnMut(crate::config::AggregateMetadataTarget) -> bool,
+) -> Option<crate::config::AggregateMetadataTarget> {
+    crate::config::normalized_aggregate_metadata_target_priority(priority)
+        .into_iter()
+        .find(|target| is_available(*target))
+}
+
+/// Resolve the first available target in normalized configured order.
+pub fn resolve_aggregate_metadata_target(
+    priority: &[crate::config::AggregateMetadataTarget],
+    availability: AggregateMetadataAvailability,
+) -> Option<crate::config::AggregateMetadataTarget> {
+    resolve_aggregate_metadata_target_by(priority, |target| match target {
+        crate::config::AggregateMetadataTarget::IndividualFiles => availability.individual_files,
+        crate::config::AggregateMetadataTarget::SidecarCue => availability.sidecar_cue,
+        crate::config::AggregateMetadataTarget::EmbeddedCue => availability.embedded_cue,
+    })
 }
 
 impl TransferCarrier {
@@ -72,6 +115,12 @@ impl TransferCarrier {
             Self::SidecarCue { sheet, .. } | Self::EmbeddedCue { sheet, .. } => {
                 TransferDimension::Tracks(sheet.tracks.len())
             }
+            Self::EmbeddedCues { carriers } => TransferDimension::Tracks(
+                carriers
+                    .iter()
+                    .map(|carrier| carrier.sheet.tracks.len())
+                    .sum(),
+            ),
         }
     }
 
@@ -83,24 +132,30 @@ impl TransferCarrier {
         match self {
             Self::Files { .. } => "files",
             Self::SidecarCue { .. } => "sidecar CUE",
-            Self::EmbeddedCue { .. } => "embedded CUE",
+            Self::EmbeddedCue { .. } | Self::EmbeddedCues { .. } => "embedded CUE",
         }
     }
 
     pub(crate) fn authored_track_numbers(&self) -> Option<Vec<u32>> {
-        let sheet = match self {
-            Self::SidecarCue { sheet, .. } | Self::EmbeddedCue { sheet, .. } => sheet,
-            Self::Files { .. } => return None,
-        };
-        let mut numbers = sheet
-            .tracks
-            .iter()
-            .map(|track| track.number)
-            .collect::<Vec<_>>();
-        numbers.sort_unstable();
-        Some(numbers)
+        match self {
+            Self::Files { .. } => None,
+            Self::SidecarCue { sheet, .. } | Self::EmbeddedCue { sheet, .. } => {
+                let mut numbers = sheet
+                    .tracks
+                    .iter()
+                    .map(|track| track.number)
+                    .collect::<Vec<_>>();
+                numbers.sort_unstable();
+                Some(numbers)
+            }
+            Self::EmbeddedCues { carriers } => Some(
+                carriers
+                    .iter()
+                    .flat_map(|carrier| carrier.sheet.tracks.iter().map(|track| track.number))
+                    .collect(),
+            ),
+        }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,6 +472,51 @@ pub fn value_for_target<'a>(
 mod tests {
     use super::*;
     use crate::tui::probe::RowScope;
+
+    #[test]
+    fn aggregate_target_resolver_honors_order_and_normalizes_partial_config() {
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+
+        let all = AggregateMetadataAvailability {
+            individual_files: true,
+            sidecar_cue: true,
+            embedded_cue: true,
+        };
+        assert_eq!(
+            resolve_aggregate_metadata_target(&[IndividualFiles, SidecarCue, EmbeddedCue], all),
+            Some(IndividualFiles),
+        );
+        assert_eq!(
+            resolve_aggregate_metadata_target(&[EmbeddedCue, SidecarCue, IndividualFiles], all),
+            Some(EmbeddedCue),
+        );
+        assert_eq!(
+            resolve_aggregate_metadata_target(
+                &[SidecarCue, SidecarCue],
+                AggregateMetadataAvailability {
+                    individual_files: true,
+                    sidecar_cue: false,
+                    embedded_cue: false,
+                },
+            ),
+            Some(IndividualFiles),
+            "missing targets are appended in the stable default order",
+        );
+        assert_eq!(
+            resolve_aggregate_metadata_target(&[], all),
+            Some(SidecarCue),
+            "an empty configured list normalizes to the stable default order",
+        );
+        assert_eq!(
+            resolve_aggregate_metadata_target(
+                &[],
+                AggregateMetadataAvailability::default(),
+            ),
+            None,
+        );
+    }
 
     fn entry(key: &str, values: &[&str]) -> TagEntry {
         TagEntry {
@@ -1376,7 +1476,29 @@ mod tests {
     }
 
     #[test]
-    fn embedded_cue_writes_fail_closed_for_non_flac_targets() {
+    fn embedded_cue_metadata_target_applicability_matches_existing_writer_routes() {
+        assert!(embedded_cue_metadata_target_is_writable(
+            std::path::Path::new("disc.flac")
+        ));
+        assert!(embedded_cue_metadata_target_is_writable(
+            std::path::Path::new("disc.wv")
+        ));
+        assert!(embedded_cue_metadata_target_is_writable(
+            std::path::Path::new("disc.ogg")
+        ));
+        assert!(!embedded_cue_metadata_target_is_writable(
+            std::path::Path::new("disc.ape")
+        ));
+        assert!(!embedded_cue_metadata_target_is_writable(
+            std::path::Path::new("disc.mpc")
+        ));
+        assert!(!embedded_cue_metadata_target_is_writable(
+            std::path::Path::new("disc.dff")
+        ));
+    }
+
+    #[test]
+    fn embedded_cue_writes_fail_closed_for_read_only_targets() {
         let source = vec![entry("TITLE", &["One", "Two"])];
         let sheet = crate::convert::cue_parser::CueSheet {
             tracks: vec![
@@ -1394,7 +1516,7 @@ mod tests {
             ..Default::default()
         };
         let target = TransferCarrier::EmbeddedCue {
-            image_path: std::path::PathBuf::from("image.wav"),
+            image_path: std::path::PathBuf::from("image.ape"),
             cue_text: concat!(
                 "FILE \"image.wav\" WAVE\n",
                 "  TRACK 01 AUDIO\n",
@@ -1416,10 +1538,10 @@ mod tests {
             &super::super::probe::MetadataWriteCancelFlag::new(),
             None,
         )
-        .expect_err("non-FLAC embedded writes must fail closed");
+        .expect_err("read-only embedded writes must fail closed");
         assert_eq!(
             error,
-            "embedded CUE write is supported for FLAC images this round",
+            "embedded CUE write is not supported for this audio carrier",
         );
     }
 
@@ -1599,6 +1721,136 @@ mod tests {
     }
 
     #[test]
+    fn embedded_wavpack_cue_transfer_uses_existing_metadata_writer() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-embedded-wavpack-cue-transfer",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("disc.wv");
+        std::fs::write(&image, APE_NUMBERING_FIXTURE).expect("WavPack fixture");
+        let original = concat!(
+            "TITLE \"Old Album\"\n",
+            "FILE \"disc.wv\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Old One\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Old Two\"\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        super::super::probe::write_all_tags(
+            &image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(original.to_string()),
+            )],
+        )
+        .expect("seed WavPack embedded CUESHEET");
+
+        let target = TransferCarrier::EmbeddedCue {
+            image_path: image.clone(),
+            cue_text: original.to_string(),
+            sheet: crate::convert::cue_parser::parse_cue(original),
+            multi_file_read_only: false,
+        };
+        let report = execute_tag_transfer_from_entries_to_carrier(
+            &[
+                entry("ALBUM", &["New Album", "New Album"]),
+                entry("TITLE", &["New One", "New Two"]),
+            ],
+            TransferDimension::Tracks(2),
+            Some(&[1, 2]),
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &super::super::probe::MetadataWriteCancelFlag::new(),
+            None,
+        )
+        .expect("embedded WavPack CUE transfer");
+        assert_eq!(report.written, 1);
+        assert!(report.failed.is_empty());
+
+        let rewritten = super::super::probe::read_all_tags_merged(&[image])
+            .expect("read WavPack transfer result")
+            .into_iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .and_then(|entry| entry.per_file_values.into_iter().next())
+            .expect("WavPack embedded CUESHEET");
+        assert!(rewritten.contains("TITLE \"New Album\""));
+        assert!(rewritten.contains("TITLE \"New One\""));
+        assert!(rewritten.contains("TITLE \"New Two\""));
+    }
+
+    #[test]
+    fn embedded_cue_set_transfer_writes_each_carrier_without_crossing_sheet_boundaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut carriers = Vec::new();
+        for (name, first_track) in [("disc-1.flac", 1_u32), ("disc-2.flac", 1_u32)] {
+            let image = temp.path().join(name);
+            let cue = format!(
+                "TITLE \"Old Album\"\nFILE \"{name}\" FLAC\n  TRACK {first_track:02} AUDIO\n    TITLE \"Old First\"\n    INDEX 01 00:00:00\n  TRACK {:02} AUDIO\n    TITLE \"Old Second\"\n    INDEX 01 00:00:03\n",
+                first_track + 1,
+            );
+            let mut bytes = b"fLaC".to_vec();
+            bytes.extend_from_slice(&flac_block(0, false, &[0; 34]));
+            bytes.extend_from_slice(&flac_block(
+                4,
+                false,
+                &vorbis_block_body(&[("TITLE", "Image"), ("CUESHEET", cue.as_str())]),
+            ));
+            bytes.extend_from_slice(&flac_block(1, true, &[0; 4096]));
+            bytes.extend((0..4096).map(|index| (index % 251) as u8));
+            std::fs::write(&image, bytes).expect("synthetic FLAC image");
+            carriers.push(EmbeddedCueCarrier {
+                image_path: image,
+                cue_text: cue.clone(),
+                sheet: crate::convert::cue_parser::parse_cue(&cue),
+                multi_file_read_only: false,
+            });
+        }
+        let target = TransferCarrier::EmbeddedCues {
+            carriers: carriers.clone(),
+        };
+        let source = vec![
+            entry("ALBUM", &["New Album", "New Album", "New Album", "New Album"]),
+            entry("TITLE", &["D1 One", "D1 Two", "D2 One", "D2 Two"]),
+        ];
+        let report = execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            TransferDimension::Tracks(4),
+            Some(&[1, 2, 3, 4]),
+            &target,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &super::super::probe::MetadataWriteCancelFlag::new(),
+            None,
+        )
+        .expect("embedded CUE set transfer");
+        assert_eq!(report.written, 2);
+        assert_eq!(report.target_paths.len(), 2);
+        assert!(report.status().contains("2 embedded CUE carriers"));
+
+        for (index, carrier) in carriers.iter().enumerate() {
+            let cue = super::super::probe::read_all_tags_merged(&[carrier.image_path.clone()])
+                .expect("read embedded transfer result")
+                .into_iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+                .and_then(|entry| entry.per_file_values.into_iter().next())
+                .expect("embedded CUESHEET");
+            assert!(cue.contains("TITLE \"New Album\""));
+            if index == 0 {
+                assert!(cue.contains("TITLE \"D1 One\""));
+                assert!(cue.contains("TITLE \"D1 Two\""));
+                assert!(!cue.contains("D2 One"));
+            } else {
+                assert!(cue.contains("TITLE \"D2 One\""));
+                assert!(cue.contains("TITLE \"D2 Two\""));
+                assert!(!cue.contains("D1 One"));
+            }
+        }
+    }
+
+    #[test]
     fn sidecar_write_re_admission_detects_target_identity_and_complete_track_geometry() {
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("album.flac");
@@ -1754,8 +2006,8 @@ mod tests {
             "  TRACK 02 AUDIO\n",
             "    INDEX 01 03:00:00\n",
         ));
-        let non_flac = TransferCarrier::EmbeddedCue {
-            image_path: std::path::PathBuf::from("/album/album.wav"),
+        let read_only = TransferCarrier::EmbeddedCue {
+            image_path: std::path::PathBuf::from("/album/album.ape"),
             cue_text: String::new(),
             sheet: sheet.clone(),
             multi_file_read_only: false,
@@ -1764,11 +2016,11 @@ mod tests {
             preview_tag_transfer(
                 &source,
                 TransferDimension::Tracks(2),
-                &non_flac,
+                &read_only,
                 super::super::app::TagTransferScope::All,
             )
             .unwrap_err(),
-            "embedded CUE write is supported for FLAC images this round"
+            "embedded CUE write is not supported for this audio carrier"
         );
 
         let multi_file = TransferCarrier::EmbeddedCue {
@@ -1863,6 +2115,9 @@ pub struct TagTransferReport {
 
 impl TagTransferReport {
     fn cue_target_description(&self, target_carrier: &str) -> String {
+        if target_carrier == "embedded CUE" && self.target_paths.len() > 1 {
+            return format!("{} embedded CUE carriers", self.target_paths.len());
+        }
         let path = self
             .target_paths
             .first()
@@ -2316,6 +2571,38 @@ pub(crate) fn cue_sheet_transfer_entries(
     entries
 }
 
+fn embedded_cue_set_transfer_entries(carriers: &[EmbeddedCueCarrier]) -> Vec<TagEntry> {
+    let specs = [
+        ("TITLE", lofty::tag::ItemKey::TrackTitle),
+        ("ARTIST", lofty::tag::ItemKey::TrackArtist),
+        ("ISRC", lofty::tag::ItemKey::Isrc),
+        ("ALBUM", lofty::tag::ItemKey::AlbumTitle),
+        ("ALBUMARTIST", lofty::tag::ItemKey::AlbumArtist),
+        ("DATE", lofty::tag::ItemKey::Year),
+        ("GENRE", lofty::tag::ItemKey::Genre),
+        ("CATALOGNUMBER", lofty::tag::ItemKey::CatalogNumber),
+    ];
+    specs
+        .into_iter()
+        .filter_map(|(display_key, item_key)| {
+            let mut values = Vec::new();
+            for carrier in carriers {
+                let track_count = carrier.sheet.tracks.len();
+                let local = cue_sheet_transfer_entries(&carrier.sheet);
+                if let Some(entry) = local
+                    .iter()
+                    .find(|entry| entry.display_key.eq_ignore_ascii_case(display_key))
+                {
+                    values.extend(entry.per_file_values.iter().cloned());
+                } else {
+                    values.extend(std::iter::repeat(String::new()).take(track_count));
+                }
+            }
+            cue_transfer_entry(display_key, item_key, values)
+        })
+        .collect()
+}
+
 pub(crate) fn read_transfer_carrier_entries(
     carrier: &TransferCarrier,
     scope: super::app::TagTransferScope,
@@ -2326,6 +2613,21 @@ pub(crate) fn read_transfer_carrier_entries(
         TransferCarrier::SidecarCue { sheet, .. }
         | TransferCarrier::EmbeddedCue { sheet, .. } => {
             let entries = cue_sheet_transfer_entries(sheet);
+            Ok(entries
+                .into_iter()
+                .filter(|entry| match scope {
+                    super::app::TagTransferScope::Canonical => {
+                        super::context_menu::tag_entry_matches_copy_selection(
+                            entry,
+                            super::context_menu::TagCopySelection::CanonicalOnly,
+                        )
+                    }
+                    super::app::TagTransferScope::All => true,
+                })
+                .collect())
+        }
+        TransferCarrier::EmbeddedCues { carriers } => {
+            let entries = embedded_cue_set_transfer_entries(carriers);
             Ok(entries
                 .into_iter()
                 .filter(|entry| match scope {
@@ -2457,7 +2759,9 @@ pub(crate) fn corroborate_source_pairing(
     match (source, target) {
         (
             TransferCarrier::Files { paths },
-            TransferCarrier::SidecarCue { .. } | TransferCarrier::EmbeddedCue { .. },
+            TransferCarrier::SidecarCue { .. }
+            | TransferCarrier::EmbeddedCue { .. }
+            | TransferCarrier::EmbeddedCues { .. },
         ) if paths.len() == target.count() && paths.len() > 1 => {
             let expected = carrier_authored_track_numbers(target)
                 .ok_or_else(|| "internal error: CUE target has no authored track order".to_string())?;
@@ -2958,6 +3262,194 @@ fn preflight_sidecar_transfer_snapshot(
     validate_sidecar_transfer_snapshot(cue_path, &current, track_audio_paths, sheet)
 }
 
+/// Whether the carrier has an existing metadata writer that can persist an
+/// embedded CUESHEET. Aggregate transfer and editor resolution share this gate
+/// so a representation cannot win priority and then fail categorically on save.
+pub(crate) fn embedded_cue_metadata_target_is_writable(path: &std::path::Path) -> bool {
+    matches!(
+        crate::metadata_persistence::metadata_persistence_route_for_path(path),
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
+            | crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3
+            | crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
+            | crate::metadata_persistence::MetadataPersistenceRoute::Lofty
+    )
+}
+
+fn validate_embedded_cue_transfer_target(
+    carrier: &EmbeddedCueCarrier,
+) -> Result<(), String> {
+    if carrier.multi_file_read_only {
+        return Err(
+            "multi-FILE embedded CUESHEET carriers are read-only transfer sources; a single member cannot authoritatively rewrite sibling references"
+                .to_string(),
+        );
+    }
+    if !embedded_cue_metadata_target_is_writable(&carrier.image_path) {
+        return Err("embedded CUE write is not supported for this audio carrier".to_string());
+    }
+    Ok(())
+}
+
+fn write_embedded_cue_transfer(
+    carrier: &EmbeddedCueCarrier,
+    replacement: &str,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<Option<super::probe::MetadataWriteCommitReport>, String> {
+    validate_embedded_cue_transfer_target(carrier)?;
+    let current_cue_text = revalidate_embedded_transfer_target(
+        &carrier.image_path,
+        &carrier.sheet,
+        cancel,
+    )?;
+    let composed = crate::convert::cue_parser::compose_cue_metadata_replacement(
+        &current_cue_text,
+        replacement,
+    )?;
+    if composed == current_cue_text {
+        return Ok(None);
+    }
+
+    let report = match crate::metadata_persistence::metadata_persistence_route_for_path(
+        &carrier.image_path,
+    ) {
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => {
+            super::probe::write_embedded_cuesheet_for_transfer_at_verification(
+                &carrier.image_path,
+                &current_cue_text,
+                composed,
+                Some(cancel),
+                verification,
+            )
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3
+        | crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
+        | crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {
+            super::probe::write_all_tags_for_transfer_at_verification(
+                &carrier.image_path,
+                &[(
+                    lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                    Some(composed),
+                )],
+                Some(cancel),
+                verification,
+            )
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily
+        | crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => Err(
+            "embedded CUE write is not supported for this audio carrier".to_string(),
+        ),
+    }?;
+    Ok(Some(report))
+}
+
+fn transfer_value_plan_slice(
+    plan: &TransferValuePlan,
+    start: usize,
+    len: usize,
+) -> Result<TransferValuePlan, String> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| "internal error: embedded CUE carrier range overflow".to_string())?;
+    let mut fields = Vec::with_capacity(plan.fields.len());
+    for field in &plan.fields {
+        let values = field.values.get(start..end).ok_or_else(|| {
+            format!(
+                "internal error: embedded CUE field '{}' has inconsistent carrier cardinality",
+                field.canonical_key
+            )
+        })?;
+        fields.push(PlannedTransferField {
+            canonical_key: field.canonical_key.clone(),
+            item_key: field.item_key.clone(),
+            values: values.to_vec(),
+        });
+    }
+    Ok(TransferValuePlan {
+        fields,
+        first_track_collapse: plan.first_track_collapse,
+        ..TransferValuePlan::default()
+    })
+}
+
+fn execute_tag_transfer_to_embedded_cues(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    carriers: &[EmbeddedCueCarrier],
+    scope: super::app::TagTransferScope,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+) -> Result<TagTransferReport, String> {
+    if carriers.is_empty() {
+        return Err("internal error: embedded CUE carrier set is empty".to_string());
+    }
+    for carrier in carriers {
+        validate_embedded_cue_transfer_target(carrier)?;
+    }
+    let target_dimension = TransferDimension::Tracks(
+        carriers
+            .iter()
+            .map(|carrier| carrier.sheet.tracks.len())
+            .sum(),
+    );
+    let plan = plan_transfer_values_for_dimensions(
+        source_entries,
+        source_dimension,
+        target_dimension,
+        scope,
+    )?;
+    let mut report = TagTransferReport {
+        source_count: source_dimension.count(),
+        target_count: target_dimension.count(),
+        written_fields: plan.fields.len(),
+        source_carrier: Some(if source_dimension.is_tracks() {
+            "CUE tracks".to_string()
+        } else {
+            "files".to_string()
+        }),
+        target_carrier: Some("embedded CUE".to_string()),
+        target_paths: carriers
+            .iter()
+            .map(|carrier| carrier.image_path.clone())
+            .collect(),
+        first_track_collapse: plan.first_track_collapse,
+        skipped_numbering_keys: plan.skipped_numbering_keys.clone(),
+        skipped_fields: plan.skipped_fields.clone(),
+        cardinality_warnings: plan.cardinality_warnings.clone(),
+        ..TagTransferReport::default()
+    };
+
+    let total = carriers.len();
+    let mut offset = 0usize;
+    for (index, carrier) in carriers.iter().enumerate() {
+        let track_count = carrier.sheet.tracks.len();
+        if cancel.is_cancelled() {
+            report.failed.push((
+                carrier.image_path.clone(),
+                "tag transfer cancelled before embedded CUE write".to_string(),
+            ));
+        } else {
+            let local_plan = transfer_value_plan_slice(&plan, offset, track_count)?;
+            let replacement = cue_metadata_replacement_text(&local_plan, &carrier.sheet)?;
+            match write_embedded_cue_transfer(carrier, &replacement, verification, cancel) {
+                Ok(Some(commit)) => {
+                    report.written += 1;
+                    report.written_paths.push(carrier.image_path.clone());
+                    report.durability_warnings.extend(commit.durability_warnings);
+                }
+                Ok(None) => report.unchanged += 1,
+                Err(error) => report.failed.push((carrier.image_path.clone(), error)),
+            }
+        }
+        offset += track_count;
+        if let Some(progress) = progress {
+            progress(index + 1, total, &carrier.image_path);
+        }
+    }
+    Ok(report)
+}
+
 fn execute_tag_transfer_to_cue(
     source_entries: &[TagEntry],
     source_dimension: TransferDimension,
@@ -2968,6 +3460,31 @@ fn execute_tag_transfer_to_cue(
     cancel: &super::probe::MetadataWriteCancelFlag,
     progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
 ) -> Result<TagTransferReport, String> {
+    if let TransferCarrier::EmbeddedCues { carriers } = target {
+        return execute_tag_transfer_to_embedded_cues(
+            source_entries,
+            source_dimension,
+            carriers,
+            scope,
+            verification,
+            cancel,
+            progress,
+        );
+    }
+    if let TransferCarrier::EmbeddedCue {
+        image_path,
+        cue_text,
+        sheet,
+        multi_file_read_only,
+    } = target
+    {
+        validate_embedded_cue_transfer_target(&EmbeddedCueCarrier {
+            image_path: image_path.clone(),
+            cue_text: cue_text.clone(),
+            sheet: sheet.clone(),
+            multi_file_read_only: *multi_file_read_only,
+        })?;
+    }
     let target_dimension = target.dimension();
     let cue_value_plan = plan_transfer_values_for_dimensions(
         source_entries,
@@ -2978,8 +3495,8 @@ fn execute_tag_transfer_to_cue(
     let (target_sheet, target_path) = match target {
         TransferCarrier::SidecarCue { cue_path, sheet, .. } => (sheet, cue_path.as_path()),
         TransferCarrier::EmbeddedCue { image_path, sheet, .. } => (sheet, image_path.as_path()),
-        TransferCarrier::Files { .. } => {
-            return Err("internal error: CUE writer received file carrier".to_string())
+        TransferCarrier::Files { .. } | TransferCarrier::EmbeddedCues { .. } => {
+            return Err("internal error: CUE writer received unsupported carrier".to_string())
         }
     };
     let replacement = cue_metadata_replacement_text(&cue_value_plan, target_sheet)?;
@@ -3115,45 +3632,21 @@ fn execute_tag_transfer_to_cue(
         } => write_sidecar_transfer(cue_path, track_audio_paths, sheet, &replacement),
         TransferCarrier::EmbeddedCue {
             image_path,
+            cue_text,
             sheet,
             multi_file_read_only,
-            ..
-        } => {
-            if *multi_file_read_only {
-                return Err(
-                    "multi-FILE embedded CUESHEET carriers are read-only transfer sources; a single member cannot authoritatively rewrite sibling references"
-                        .to_string(),
-                );
-            }
-            let is_flac = image_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"));
-            if !is_flac {
-                return Err(
-                    "embedded CUE write is supported for FLAC images this round".to_string(),
-                );
-            }
-            let current_cue_text =
-                revalidate_embedded_transfer_target(image_path, sheet, cancel)?;
-            let composed = crate::convert::cue_parser::compose_cue_metadata_replacement(
-                &current_cue_text,
-                &replacement,
-            )?;
-            if composed == current_cue_text {
-                Ok(None)
-            } else {
-                super::probe::write_embedded_cuesheet_for_transfer_at_verification(
-                    image_path,
-                    &current_cue_text,
-                    composed,
-                    Some(cancel),
-                    verification,
-                )
-                .map(Some)
-            }
-        }
-        TransferCarrier::Files { .. } => unreachable!(),
+        } => write_embedded_cue_transfer(
+            &EmbeddedCueCarrier {
+                image_path: image_path.clone(),
+                cue_text: cue_text.clone(),
+                sheet: sheet.clone(),
+                multi_file_read_only: *multi_file_read_only,
+            },
+            &replacement,
+            verification,
+            cancel,
+        ),
+        TransferCarrier::Files { .. } | TransferCarrier::EmbeddedCues { .. } => unreachable!(),
     };
 
     match write_result {
@@ -3200,7 +3693,9 @@ pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
                 )
             },
         ),
-        TransferCarrier::SidecarCue { .. } | TransferCarrier::EmbeddedCue { .. } => {
+        TransferCarrier::SidecarCue { .. }
+        | TransferCarrier::EmbeddedCue { .. }
+        | TransferCarrier::EmbeddedCues { .. } => {
             execute_tag_transfer_to_cue(
                 source_entries,
                 source_dimension,
@@ -3221,25 +3716,27 @@ pub(crate) fn preview_tag_transfer(
     target: &TransferCarrier,
     scope: super::app::TagTransferScope,
 ) -> Result<usize, String> {
-    if let TransferCarrier::EmbeddedCue {
-        image_path,
-        multi_file_read_only,
-        ..
-    } = target
-    {
-        if *multi_file_read_only {
-            return Err(
-                "multi-FILE embedded CUESHEET carriers are read-only transfer sources; a single member cannot authoritatively rewrite sibling references"
-                    .to_string(),
-            );
+    match target {
+        TransferCarrier::EmbeddedCue {
+            image_path,
+            cue_text,
+            sheet,
+            multi_file_read_only,
+        } => validate_embedded_cue_transfer_target(&EmbeddedCueCarrier {
+            image_path: image_path.clone(),
+            cue_text: cue_text.clone(),
+            sheet: sheet.clone(),
+            multi_file_read_only: *multi_file_read_only,
+        })?,
+        TransferCarrier::EmbeddedCues { carriers } => {
+            if carriers.is_empty() {
+                return Err("internal error: embedded CUE carrier set is empty".to_string());
+            }
+            for carrier in carriers {
+                validate_embedded_cue_transfer_target(carrier)?;
+            }
         }
-        let is_flac = image_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"));
-        if !is_flac {
-            return Err("embedded CUE write is supported for FLAC images this round".to_string());
-        }
+        TransferCarrier::Files { .. } | TransferCarrier::SidecarCue { .. } => {}
     }
     Ok(plan_transfer_values_for_dimensions(
         source_entries,

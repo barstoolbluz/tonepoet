@@ -3367,7 +3367,7 @@ impl OutputOptionsField {
         )
     }
 
-    pub fn completion_mode(self) -> crate::tui::text_input::CompletionMode {
+    pub fn completion_mode(self) -> crate::tui::text_input::CompletionMode<'static> {
         match self {
             Self::DestPath => crate::tui::text_input::CompletionMode::Path,
             Self::FolderTemplate | Self::FilenameTemplate => {
@@ -6222,6 +6222,9 @@ pub enum FilePickerPurpose {
         direction: TagTransferDirection,
         scope: TagTransferScope,
         fixed_roots: Vec<PathBuf>,
+        /// Frozen active order for classifying a directory selected by this
+        /// transfer operation.
+        metadata_target_priority: Vec<crate::config::AggregateMetadataTarget>,
     },
     /// Read field blocks from a text file into the currently open editor.
     MetadataTagBlocksFile,
@@ -6229,6 +6232,9 @@ pub enum FilePickerPurpose {
     MetadataTagTransfer {
         direction: TagTransferDirection,
         scope: TagTransferScope,
+        /// Frozen active order for classifying a directory selected by this
+        /// transfer operation.
+        metadata_target_priority: Vec<crate::config::AggregateMetadataTarget>,
     },
     Generic {
         id: String,
@@ -7430,9 +7436,9 @@ pub struct CueAlbumTrackSource {
 
 /// State carried by a unified synthetic split-CUE album surface.
 ///
-/// `audio_paths` is the save dimension: the generated CUESHEET is written
-/// identically to every member image through the normal metadata-editor tag
-/// writer. `track_sources` is the row dimension: one entry per visible track.
+/// `audio_paths` is the save dimension and `track_sources` is the row
+/// dimension. Ordinary unified sidecar albums regenerate one shared sheet;
+/// aggregate embedded-CUE sets retain one generated sheet per member image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CueAlbumSyntheticSheet {
     pub cue_paths: Vec<std::path::PathBuf>,
@@ -7526,9 +7532,13 @@ pub struct PresentationTab {
     /// upgrade, but save-time routing still follows this retained identity
     /// instead of rediscovering or guessing another source.
     pub cue_source: Option<MetadataCueSource>,
-    /// Unified split-CUE album state. Present only for same-folder CUE groups
-    /// that the album-grouping ladder merged into one album surface.
+    /// Unified multi-surface CUE state. Used by grouped sidecar albums and by
+    /// selected sets of independent embedded-CUE carriers.
     pub cue_album_synthetic_sheet: Option<CueAlbumSyntheticSheet>,
+    /// Regenerate one CUESHEET per member image rather than projecting one
+    /// unified physical sheet to every path. Used only for selected sets of
+    /// independent embedded-CUE carriers.
+    pub per_carrier_embedded_cuesheets: bool,
     /// File-indexed managed whole-file track-scoped tags observed on load that
     /// must be deleted during the next successful unified-album save. This is a
     /// migration/cleanup plan for F2-era polluted files, not an unconditional
@@ -7566,6 +7576,7 @@ impl Default for PresentationTab {
             pending_embedded_cuesheet_delete: false,
             cue_source: None,
             cue_album_synthetic_sheet: None,
+            per_carrier_embedded_cuesheets: false,
             cue_album_forced_cleanup: Vec::new(),
         }
     }
@@ -7648,6 +7659,7 @@ impl PresentationTab {
         tab.pending_embedded_cuesheet_delete = active.pending_embedded_cuesheet_delete;
         tab.cue_source = active.cue_source.clone();
         tab.cue_album_synthetic_sheet = active.cue_album_synthetic_sheet.clone();
+        tab.per_carrier_embedded_cuesheets = active.per_carrier_embedded_cuesheets;
         tab
     }
 }

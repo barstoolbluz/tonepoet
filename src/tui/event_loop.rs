@@ -1053,7 +1053,11 @@ fn reduce_file_picker_complete(
                 }
             }
         }
-        super::app::FilePickerPurpose::MetadataTagTransfer { direction, scope } => {
+        super::app::FilePickerPurpose::MetadataTagTransfer {
+            direction,
+            scope,
+            metadata_target_priority,
+        } => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             match overlay {
                 ActiveOverlay::MetadataEditor(mut state) => {
@@ -1097,11 +1101,13 @@ fn reduce_file_picker_complete(
                             let (source_entries, source_dimension) =
                                 super::tag_interchange::metadata_editor_transfer_snapshot(&state);
                             let worker_tx = tx.clone();
+                            let worker_priority = metadata_target_priority.clone();
                             app.set_status("metadata editor: resolving tag-transfer target carrier...");
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     super::keybindings::classify_tag_transfer_roots(
                                         &selected_roots,
+                                        &worker_priority,
                                         &prepare_cancel,
                                     )
                                 })
@@ -1124,11 +1130,13 @@ fn reduce_file_picker_complete(
                         }
                         super::app::TagTransferDirection::From => {
                             let worker_tx = tx.clone();
+                            let worker_priority = metadata_target_priority.clone();
                             app.set_status("metadata editor: reading tag-transfer source carrier...");
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     let carrier = super::keybindings::classify_tag_transfer_roots(
                                         &selected_roots,
+                                        &worker_priority,
                                         &prepare_cancel,
                                     )?;
                                     let dimension = carrier.dimension();
@@ -1206,6 +1214,7 @@ fn reduce_file_picker_complete(
             direction,
             scope,
             fixed_roots,
+            ..
         } => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale tag-transfer completion");

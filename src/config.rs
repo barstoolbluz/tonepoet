@@ -349,6 +349,44 @@ impl Default for UiConfig {
     }
 }
 
+/// Writable representation selected for aggregate album metadata operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AggregateMetadataTarget {
+    /// Write ordinary tags on the selected audio files.
+    IndividualFiles,
+    /// Rewrite an external CUE sheet.
+    SidecarCue,
+    /// Rewrite a CUESHEET tag embedded in an audio image.
+    EmbeddedCue,
+}
+
+/// Preserve the pre-round-12 preference while making it explicit and ordered.
+pub fn default_aggregate_metadata_target_priority() -> Vec<AggregateMetadataTarget> {
+    vec![
+        AggregateMetadataTarget::SidecarCue,
+        AggregateMetadataTarget::EmbeddedCue,
+        AggregateMetadataTarget::IndividualFiles,
+    ]
+}
+
+/// Deduplicate a configured order and append any omitted targets stably.
+pub fn normalized_aggregate_metadata_target_priority(
+    configured: &[AggregateMetadataTarget],
+) -> Vec<AggregateMetadataTarget> {
+    let mut normalized = Vec::with_capacity(3);
+    for target in configured
+        .iter()
+        .copied()
+        .chain(default_aggregate_metadata_target_priority())
+    {
+        if !normalized.contains(&target) {
+            normalized.push(target);
+        }
+    }
+    normalized
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionSettings {
     /// Preferred backend: "ffmpeg" or "sox"
@@ -386,6 +424,9 @@ pub struct ConversionSettings {
     /// Default ordered pre/post conversion action pipeline.
     #[serde(default, skip_serializing_if = "crate::convert::pipeline::ActionPipeline::is_empty")]
     pub actions: crate::convert::pipeline::ActionPipeline,
+    /// Ordered preference for directory/album metadata write targets.
+    #[serde(default = "default_aggregate_metadata_target_priority")]
+    pub aggregate_metadata_target_priority: Vec<AggregateMetadataTarget>,
     /// Append content from Lineage.txt to COMMENT tag
     pub append_lineage_to_comment: bool,
 }
@@ -421,6 +462,7 @@ impl Default for ConversionSettings {
             archive_password: None,
             archive_password_ref: None,
             actions: crate::convert::pipeline::ActionPipeline::default(),
+            aggregate_metadata_target_priority: default_aggregate_metadata_target_priority(),
             append_lineage_to_comment: false,
         }
     }
@@ -2058,6 +2100,49 @@ fn require_durable_config_save(outcome: ConfigSaveOutcome) -> anyhow::Result<()>
 #[cfg(test)]
 mod theme_config_tests {
     use super::*;
+
+    #[test]
+    fn aggregate_metadata_target_priority_defaults_and_normalizes_stably() {
+        use AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        assert_eq!(
+            default_aggregate_metadata_target_priority(),
+            vec![SidecarCue, EmbeddedCue, IndividualFiles],
+        );
+        assert_eq!(
+            normalized_aggregate_metadata_target_priority(&[
+                IndividualFiles,
+                IndividualFiles,
+                EmbeddedCue,
+            ]),
+            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+        );
+        assert_eq!(
+            normalized_aggregate_metadata_target_priority(&[]),
+            default_aggregate_metadata_target_priority(),
+        );
+
+        let serialized = toml::to_string_pretty(&TonepoetConfig::default())
+            .expect("serialize aggregate metadata priority");
+        assert!(serialized.contains("aggregate_metadata_target_priority"));
+        assert!(serialized.contains("sidecar-cue"));
+
+        let mut legacy_value: toml::Value =
+            toml::from_str(&serialized).expect("parse serialized config as TOML value");
+        legacy_value
+            .get_mut("conversion")
+            .and_then(toml::Value::as_table_mut)
+            .expect("conversion table")
+            .remove("aggregate_metadata_target_priority");
+        let legacy = toml::to_string_pretty(&legacy_value)
+            .expect("serialize legacy config without aggregate metadata priority");
+        let parsed: TonepoetConfig = toml::from_str(&legacy)
+            .expect("deserialize legacy config without aggregate metadata priority");
+        assert_eq!(
+            parsed.conversion.aggregate_metadata_target_priority,
+            default_aggregate_metadata_target_priority(),
+        );
+    }
 
     struct PublicSaveInjectionGuard;
 

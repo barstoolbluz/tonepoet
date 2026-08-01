@@ -161,12 +161,23 @@ pub struct TextInputState {
 
 /// Completion strategy for an inline text field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionMode {
+pub enum CompletionMode<'a> {
     None,
     /// Complete filesystem paths in the current process working directory.
     Path,
     /// Complete Tonepoet filename/folder-template variables such as `%ARTIST%`.
     TemplateVariable,
+    /// Complete the entire field against a caller-provided candidate list.
+    Candidates(&'a [String]),
+}
+
+/// Direction used when cycling a finite candidate set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDirection {
+    /// Advance to the next candidate.
+    Forward,
+    /// Move to the previous candidate.
+    Backward,
 }
 
 /// Boundary semantics for modified cursor/selection movement.
@@ -1213,12 +1224,108 @@ pub fn handle_text_input_key_with_boundaries(
 
 /// Apply tab completion according to `mode`. Returns true when the Tab key was
 /// consumed, even if no candidate could be inserted.
-pub fn apply_tab_completion(input: &mut TextInputState, mode: CompletionMode) -> bool {
+pub fn apply_tab_completion(input: &mut TextInputState, mode: CompletionMode<'_>) -> bool {
     match mode {
         CompletionMode::None => false,
         CompletionMode::Path => apply_path_completion(input, None, true),
         CompletionMode::TemplateVariable => apply_template_variable_completion(input),
+        CompletionMode::Candidates(candidates) => {
+            apply_candidate_completion(input, candidates, CompletionDirection::Forward)
+        }
     }
+}
+
+/// Complete a whole-field value against a candidate list. Matching is
+/// case-insensitive and prefix-based. Repeated forward/backward completion
+/// cycles exact matches without requiring extra persistent UI state.
+pub fn apply_candidate_completion(
+    input: &mut TextInputState,
+    candidates: &[String],
+    direction: CompletionDirection,
+) -> bool {
+    if let Some(completed) = complete_candidate_text(&input.text, candidates, direction) {
+        let cursor = completed.len();
+        input.set_text_and_cursor(completed, cursor);
+    }
+    true
+}
+
+fn complete_candidate_text(
+    text: &str,
+    candidates: &[String],
+    direction: CompletionDirection,
+) -> Option<String> {
+    let query = text.trim();
+    let ordered = candidates
+        .iter()
+        .map(String::as_str)
+        .filter(|candidate| !candidate.trim().is_empty())
+        .collect::<Vec<_>>();
+    if ordered.is_empty() {
+        return None;
+    }
+
+    if let Some(index) = ordered
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(query))
+    {
+        let next = match direction {
+            CompletionDirection::Forward => (index + 1) % ordered.len(),
+            CompletionDirection::Backward => (index + ordered.len() - 1) % ordered.len(),
+        };
+        return Some(ordered[next].to_string());
+    }
+
+    let matches = ordered
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate
+                .get(..query.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+    if query.is_empty() {
+        return Some(match direction {
+            CompletionDirection::Forward => matches[0],
+            CompletionDirection::Backward => matches[matches.len() - 1],
+        }
+        .to_string());
+    }
+
+    let first = matches[0];
+    let mut common_len = first.len();
+    for candidate in matches.iter().skip(1) {
+        common_len = first
+            .as_bytes()
+            .iter()
+            .zip(candidate.as_bytes())
+            .take(common_len)
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+        while common_len > 0 && !first.is_char_boundary(common_len) {
+            common_len -= 1;
+        }
+    }
+    if common_len > query.len() {
+        let prefix = &first[..common_len];
+        // Only extend when the field is not already sitting exactly at the
+        // common prefix. `query` is trimmed, so it drops the prefix's own
+        // trailing space; comparing against the (leading-trimmed) text keeps
+        // that space and lets a second completion fall through to cycling.
+        if !text.trim_start().eq_ignore_ascii_case(prefix) {
+            return Some(prefix.to_string());
+        }
+    }
+
+    Some(match direction {
+        CompletionDirection::Forward => matches[0],
+        CompletionDirection::Backward => matches[matches.len() - 1],
+    }
+    .to_string())
 }
 
 /// Complete a filesystem path. `base_dir` lets callers complete a bare filename
@@ -1736,6 +1843,52 @@ mod tests {
             &key(KeyCode::Char('y'), KeyModifiers::ALT),
         ));
         assert_eq!(s.text, "ab");
+    }
+
+    #[test]
+    fn candidate_completion_extends_common_prefix_then_cycles() {
+        let candidates = vec![
+            "Progressive Metal".to_string(),
+            "Progressive Rock".to_string(),
+            "Punk".to_string(),
+        ];
+        let mut input = TextInputState::new("pro".to_string());
+        assert!(apply_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Progressive ");
+        assert!(apply_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Progressive Metal");
+        assert!(apply_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Progressive Rock");
+        assert!(apply_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Backward,
+        ));
+        assert_eq!(input.text, "Progressive Metal");
+    }
+
+    #[test]
+    fn candidate_completion_is_case_insensitive_and_replaces_whole_field() {
+        let candidates = vec!["DISCOGS_URL".to_string(), "LINEAGE".to_string()];
+        let mut input = TextInputState::new("disc".to_string());
+        assert!(apply_tab_completion(
+            &mut input,
+            CompletionMode::Candidates(&candidates),
+        ));
+        assert_eq!(input.text, "DISCOGS_URL");
+        assert_eq!(input.cursor, input.text.len());
     }
 
     #[test]

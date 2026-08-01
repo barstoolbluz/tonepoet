@@ -504,7 +504,10 @@ fn track_metadata_from_neutral_ape_rows(
     }
 }
 
-fn item_key_to_extra_key(key: &lofty::tag::ItemKey, tag_type: lofty::tag::TagType) -> String {
+pub(super) fn item_key_to_extra_key(
+    key: &lofty::tag::ItemKey,
+    tag_type: lofty::tag::TagType,
+) -> String {
     if let Some(mapped) = key.map_key(tag_type, true) {
         return mapped.to_lowercase();
     }
