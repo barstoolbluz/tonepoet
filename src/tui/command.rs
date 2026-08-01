@@ -4457,7 +4457,10 @@ The terminal emulator must also permit OSC 52 clipboard writes. Payloads larger 
                     let previous = app.config.file_operations.status_verbosity;
                     app.config.file_operations.status_verbosity =
                         crate::config::FileOperationStatusVerbosity::Quiet;
-                    match app.config.save() {
+                    match app.config.update(|latest| {
+                        latest.file_operations.status_verbosity =
+                            crate::config::FileOperationStatusVerbosity::Quiet;
+                    }) {
                         Ok(()) => {
                             app.file_task_verbose_degrade_notices = false;
                             app.set_status("file-operation status verbosity: quiet");
@@ -4474,7 +4477,10 @@ The terminal emulator must also permit OSC 52 clipboard writes. Payloads larger 
                     let previous = app.config.file_operations.status_verbosity;
                     app.config.file_operations.status_verbosity =
                         crate::config::FileOperationStatusVerbosity::Verbose;
-                    match app.config.save() {
+                    match app.config.update(|latest| {
+                        latest.file_operations.status_verbosity =
+                            crate::config::FileOperationStatusVerbosity::Verbose;
+                    }) {
                         Ok(()) => {
                             app.file_task_verbose_degrade_notices = true;
                             app.set_status("file-operation status verbosity: verbose");
@@ -14166,7 +14172,9 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             let previous = app.config.file_operations.verification;
             app.config.file_operations.verification = verification;
-            match app.config.save() {
+            match app.config.update(|latest| {
+                latest.file_operations.verification = verification;
+            }) {
                 Ok(()) => app.set_status(format!(
                     "verification = {}",
                     if verification == tui_file_picker::VerificationMode::Strong {

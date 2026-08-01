@@ -14,8 +14,9 @@ use crate::convert::ConversionStatus;
 
 
 fn persist_browse_config(app: &mut AppState) {
-    app.config.browsing = app.browse.capture_browsing_config();
-    if let Err(err) = app.config.save() {
+    let browsing = app.browse.capture_browsing_config();
+    app.config.browsing = browsing.clone();
+    if let Err(err) = app.config.update(|latest| latest.browsing = browsing.clone()) {
         app.set_status(format!("browse settings changed, but config save failed: {err}"));
     }
 }

@@ -377,8 +377,9 @@ fn apply_theme_builder_state(app: &mut AppState, state: &mut super::theme_builde
             crate::tui::theme::ThemeDraftSource::NewCustom => false,
         };
     if persisted_library_theme {
-        app.config.ui.theme = state.palette.slug.clone();
-        if let Err(err) = app.config.save() {
+        let theme_slug = state.palette.slug.clone();
+        app.config.ui.theme = theme_slug.clone();
+        if let Err(err) = app.config.update(|latest| latest.ui.theme = theme_slug.clone()) {
             app.set_status(format!("Theme applied, but config save failed: {err}"));
         } else {
             app.set_status(format!("Theme applied: {}", state.palette.name));
@@ -400,8 +401,9 @@ fn reconcile_deleted_theme_config(app: &mut AppState, state: &mut super::theme_b
         return;
     }
 
-    app.config.ui.theme = crate::tui::theme::default_theme_slug().to_string();
-    match app.config.save() {
+    let theme_slug = crate::tui::theme::default_theme_slug().to_string();
+    app.config.ui.theme = theme_slug.clone();
+    match app.config.update(|latest| latest.ui.theme = theme_slug.clone()) {
         Ok(()) => {
             let note = format!(
                 "Deleted configured theme '{deleted_slug}'; config reset to {}",
@@ -561,7 +563,9 @@ fn handle_config_key(app: &mut AppState, key: KeyEvent) {
         }
         (KeyCode::Char('0'), KeyModifiers::NONE) if app.config_focus == ConfigFocus::Performance => {
             app.config.performance.browsing.archive_listing_timeout = 0;
-            if let Err(error) = app.config.save() {
+            if let Err(error) = app.config.update(|latest| {
+                latest.performance.browsing.archive_listing_timeout = 0;
+            }) {
                 app.set_status(format!(
                     "archive listing timeout changed, but config save failed: {error}"
                 ));
@@ -1201,8 +1205,9 @@ fn clear_browse_info_focus(app: &mut AppState) {
 }
 
 pub(crate) fn persist_browse_config(app: &mut AppState) -> bool {
-    app.config.browsing = app.browse.capture_browsing_config();
-    if let Err(err) = app.config.save() {
+    let browsing = app.browse.capture_browsing_config();
+    app.config.browsing = browsing.clone();
+    if let Err(err) = app.config.update(|latest| latest.browsing = browsing.clone()) {
         app.set_status(format!("browse settings changed, but config save failed: {err}"));
         false
     } else {
@@ -2773,12 +2778,15 @@ fn set_browse_filter_choice(
 }
 
 fn set_archive_listing_choice(app: &mut AppState, choice: usize) {
-    app.config.performance.browsing.archive_listing = match choice {
+    let archive_listing = match choice {
         1 => "always".to_string(),
         2 => "never".to_string(),
         _ => "auto".to_string(),
     };
-    if let Err(err) = app.config.save() {
+    app.config.performance.browsing.archive_listing = archive_listing.clone();
+    if let Err(err) = app.config.update(|latest| {
+        latest.performance.browsing.archive_listing = archive_listing.clone();
+    }) {
         app.set_status(format!("archive listing mode changed, but config save failed: {err}"));
     } else {
         app.set_status(format!("archive listing mode: {}", app.config.performance.browsing.archive_listing));
@@ -5453,8 +5461,11 @@ fn cycle_archive_listing_mode(app: &mut AppState, forward: bool) {
         &app.config.performance.browsing.archive_listing,
     );
     let next = if forward { current.next() } else { current.previous() };
-    app.config.performance.browsing.archive_listing = next.config_value().to_string();
-    match app.config.save() {
+    let archive_listing = next.config_value().to_string();
+    app.config.performance.browsing.archive_listing = archive_listing.clone();
+    match app.config.update(|latest| {
+        latest.performance.browsing.archive_listing = archive_listing.clone();
+    }) {
         Ok(()) => app.set_status(format!("archive listing: {}", next.display_label())),
         Err(err) => app.set_status(format!("archive listing updated but config save failed: {}", err)),
     }
@@ -5469,7 +5480,9 @@ fn adjust_archive_listing_timeout(app: &mut AppState, delta: i64) {
     } else {
         format!("{}s", next)
     };
-    match app.config.save() {
+    match app.config.update(|latest| {
+        latest.performance.browsing.archive_listing_timeout = next;
+    }) {
         Ok(()) => app.set_status(format!("archive listing timeout: {}", label)),
         Err(err) => app.set_status(format!("archive listing timeout updated but config save failed: {}", err)),
     }
@@ -7395,7 +7408,10 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.config.file_operations.verification = state.verification;
                     app.config.file_operations.status_verbosity = state.status_verbosity;
                     app.config.file_operations.auto_close_progress = state.auto_close_progress;
-                    match app.config.save() {
+                    let file_operations = app.config.file_operations.clone();
+                    match app.config.update(|latest| {
+                        latest.file_operations = file_operations.clone();
+                    }) {
                         Ok(()) => {
                             app.file_task_verbose_degrade_notices = matches!(
                                 state.status_verbosity,
@@ -11431,7 +11447,7 @@ pub(crate) fn file_picker_theme_from_theme(theme: &super::theme::Theme) -> tui_f
 mod progress_dialog_theme_tests {
     use super::{
         complete_theme_builder_action, file_picker_theme_from_theme, handle_config_key,
-        handle_overlay_key, save_browse_layout,
+        handle_overlay_key, persist_browse_config, save_browse_layout,
     };
     use crate::tui::test_support::XdgConfigHomeGuard;
     use crate::tui::theme;
@@ -11954,6 +11970,61 @@ mod progress_dialog_theme_tests {
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn browse_persistence_merges_with_newer_unrelated_config() {
+        use crate::config::{AggregateMetadataTarget, TonepoetConfig};
+        use crate::tui::app::AppState;
+        use crate::tui::browse::BrowsePaneId;
+
+        let _config_home = XdgConfigHomeGuard::new("tonepoet-browse-config-merge-test");
+        let mut initial = TonepoetConfig::default();
+        initial.browsing.show_hidden = true;
+        initial.save().expect("save initial config");
+
+        let stale = TonepoetConfig::load().expect("load stale browse app config");
+        let stale_settings = TonepoetConfig::load().expect("load stale settings app config");
+        let mut app = AppState::new_for_test(stale);
+        let mut settings_app = AppState::new_for_test(stale_settings);
+
+        let mut newer = TonepoetConfig::load().expect("load newer config writer");
+        newer.conversion.aggregate_metadata_target_priority = vec![
+            AggregateMetadataTarget::IndividualFiles,
+            AggregateMetadataTarget::EmbeddedCue,
+            AggregateMetadataTarget::SidecarCue,
+        ];
+        newer.save().expect("save newer unrelated setting");
+
+        app.browse.toggle_hidden_with_search(None);
+        app.browse.toggle_pane_enabled(BrowsePaneId::Explore);
+        assert!(persist_browse_config(&mut app));
+
+        use crate::tui::app::{AppScreen, ConfigFocus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        settings_app.current_screen = AppScreen::Config;
+        settings_app.set_config_focus(ConfigFocus::Performance);
+        handle_config_key(
+            &mut settings_app,
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+        );
+
+        let reloaded = TonepoetConfig::load().expect("reload merged config");
+        assert!(!reloaded.browsing.show_hidden);
+        assert!(!reloaded.browsing.layout_explore_enabled);
+        assert_eq!(
+            reloaded.conversion.aggregate_metadata_target_priority,
+            vec![
+                AggregateMetadataTarget::IndividualFiles,
+                AggregateMetadataTarget::EmbeddedCue,
+                AggregateMetadataTarget::SidecarCue,
+            ],
+        );
+        assert_eq!(reloaded.performance.browsing.archive_listing_timeout, 35);
+
+        let restarted = AppState::new_for_test(reloaded);
+        assert!(!restarted.browse.show_hidden);
+        assert!(!restarted.browse.explore_enabled);
     }
 
     #[test]
@@ -12577,7 +12648,11 @@ fn apply_conversion_actions_wizard_result(
             app.set_status("Conversion actions saved to Output Options");
         }
         super::conversion_actions_ui::WizardKeyResult::CommitDefault(state) => {
-            commit_conversion_actions_default_with_save(app, state, |config| config.save_with_outcome());
+            commit_conversion_actions_default_with_save(app, state, |config, pipeline| {
+                config.update_with_outcome(|latest| {
+                    latest.conversion.actions = pipeline.clone();
+                })
+            });
         }
         super::conversion_actions_ui::WizardKeyResult::Cancel => {
             app.active_overlay = ActiveOverlay::None;
@@ -12592,15 +12667,16 @@ fn commit_conversion_actions_default_with_save<F>(
     save: F,
 )
 where
-    F: FnOnce(&crate::config::TonepoetConfig) -> anyhow::Result<crate::config::ConfigSaveOutcome>,
+    F: FnOnce(
+        &mut crate::config::TonepoetConfig,
+        &crate::convert::pipeline::ActionPipeline,
+    ) -> anyhow::Result<crate::config::ConfigSaveOutcome>,
 {
     let pipeline = state.draft.clone();
-    let mut next_config = app.config.clone();
-    next_config.conversion.actions = pipeline.clone();
 
-    match save(&next_config) {
+    match save(&mut app.config, &pipeline) {
         Ok(outcome) => {
-            app.config = next_config;
+            app.config.conversion.actions = pipeline.clone();
             app.convert.output_options.actions = pipeline;
             app.preset.modified = true;
             app.active_overlay = ActiveOverlay::None;
@@ -12660,8 +12736,10 @@ mod conversion_actions_default_commit_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let state = wizard_state_with_pipeline(folder_pipeline("written-default"));
 
-        commit_conversion_actions_default_with_save(&mut app, state, |config| {
-            config.save_to_path_with_outcome(&config_path)
+        commit_conversion_actions_default_with_save(&mut app, state, |config, pipeline| {
+            config.update_to_path_with_outcome(&config_path, |latest| {
+                latest.conversion.actions = pipeline.clone();
+            })
         });
 
         let encoded = std::fs::read_to_string(&config_path).expect("saved config");
@@ -12678,8 +12756,8 @@ mod conversion_actions_default_commit_tests {
         let state = wizard_state_with_pipeline(folder_pipeline("saved-default"));
         let mut saved_pipeline_len = None;
 
-        commit_conversion_actions_default_with_save(&mut app, state, |config| {
-            saved_pipeline_len = Some(config.conversion.actions.post.len());
+        commit_conversion_actions_default_with_save(&mut app, state, |_config, pipeline| {
+            saved_pipeline_len = Some(pipeline.post.len());
             Ok(crate::config::ConfigSaveOutcome::Durable)
         });
 
@@ -12886,7 +12964,7 @@ mod conversion_actions_default_commit_tests {
         app.preset.modified = false;
         let state = wizard_state_with_pipeline(folder_pipeline("draft-not-written"));
 
-        commit_conversion_actions_default_with_save(&mut app, state, |_config| {
+        commit_conversion_actions_default_with_save(&mut app, state, |_config, _pipeline| {
             Err(anyhow::anyhow!("disk full"))
         });
 
@@ -12918,7 +12996,7 @@ mod conversion_actions_default_commit_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let state = wizard_state_with_pipeline(folder_pipeline("durability-warning"));
 
-        commit_conversion_actions_default_with_save(&mut app, state, |_config| {
+        commit_conversion_actions_default_with_save(&mut app, state, |_config, _pipeline| {
             Ok(crate::config::ConfigSaveOutcome::ReplacedButDurabilityUnconfirmed(
                 "parent sync failed".to_string(),
             ))
@@ -13047,7 +13125,9 @@ fn handle_file_task_user_action(
             }
             let previous = app.config.file_operations.auto_close_progress;
             app.config.file_operations.auto_close_progress = enabled;
-            if let Err(error) = app.config.save() {
+            if let Err(error) = app.config.update(|latest| {
+                latest.file_operations.auto_close_progress = enabled;
+            }) {
                 app.config.file_operations.auto_close_progress = previous;
                 session.progress.set_auto_close(previous);
                 app.set_status(format!(
@@ -43749,10 +43829,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::BrowseOptionsArchiveListing => app.browse.options_menu = super::browse::BrowseOptionsMenu::ArchiveListing,
             TuiButton::BrowseOptionsSaveLayout => save_browse_layout(app),
             TuiButton::BrowseOptionsRestoreDefaults => {
-                app.config.browsing = crate::config::BrowsingConfig::default().normalized();
+                let browsing = crate::config::BrowsingConfig::default().normalized();
+                app.config.browsing = browsing.clone();
                 app.browse.apply_browsing_config_with_search(&app.config.browsing, Some(tx));
                 repair_browse_focus_visibility(app);
-                if let Err(err) = app.config.save() {
+                if let Err(err) = app.config.update(|latest| latest.browsing = browsing.clone()) {
                     app.set_status(format!("browse defaults restored, but config save failed: {err}"));
                 } else {
                     app.set_status("browse defaults restored");

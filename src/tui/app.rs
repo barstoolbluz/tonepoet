@@ -12445,9 +12445,10 @@ impl AppState {
         );
 
         self.theme = next_theme;
-        self.config.ui.theme = draft.slug.clone();
+        let theme_slug = draft.slug.clone();
+        self.config.ui.theme = theme_slug.clone();
         self.retheme_open_file_picker_surfaces();
-        if let Err(err) = self.config.save() {
+        if let Err(err) = self.config.update(|latest| latest.ui.theme = theme_slug.clone()) {
             self.set_status(format!("Theme changed, but config save failed: {}", err));
         } else {
             self.set_status(format!("Theme: {}", draft.name));

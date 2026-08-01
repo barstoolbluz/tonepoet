@@ -1858,7 +1858,10 @@ impl TonepoetConfig {
         self.conversion.archive_password_ref = None;
     }
 
-    /// Save config to the default path.
+    /// Save config to the default path as an explicit whole-snapshot replacement.
+    ///
+    /// Callers persisting only selected settings must use [`TonepoetConfig::update`]
+    /// instead, so an older snapshot cannot overwrite unrelated on-disk values.
     ///
     /// This convenience API requires confirmed durable publication. If the
     /// destination was replaced but its parent-directory update could not be
@@ -1891,17 +1894,77 @@ impl TonepoetConfig {
         self.save_to_path_with_outcome_impl(config_path.as_ref(), || Ok(()))
     }
 
+    /// Atomically update selected settings at the default config path.
+    ///
+    /// Unlike [`TonepoetConfig::save`], this refreshes the authoritative file
+    /// while holding the store lock, applies only the caller's intended change,
+    /// and republishes the merged config. UI persistence paths should use this
+    /// method so an older in-memory snapshot cannot clobber unrelated settings.
+    ///
+    /// `apply` runs against both the latest on-disk config and a clone of `self`
+    /// before publication. It must therefore be deterministic and free of
+    /// externally visible side effects.
+    pub(crate) fn update<F>(&mut self, apply: F) -> anyhow::Result<()>
+    where
+        F: Fn(&mut Self),
+    {
+        require_durable_config_save(self.update_with_outcome(apply)?)
+    }
+
+    pub(crate) fn update_with_outcome<F>(&mut self, apply: F) -> anyhow::Result<ConfigSaveOutcome>
+    where
+        F: Fn(&mut Self),
+    {
+        self.update_to_path_with_outcome(Self::config_path(), apply)
+    }
+
+    /// Atomically update selected settings at an explicit path.
+    pub(crate) fn update_to_path_with_outcome<P, F>(
+        &mut self,
+        config_path: P,
+        apply: F,
+    ) -> anyhow::Result<ConfigSaveOutcome>
+    where
+        P: AsRef<Path>,
+        F: Fn(&mut Self),
+    {
+        let (_lock, target_path) = StoreFileLock::acquire_for_path(config_path.as_ref())?;
+        recover_config_artifacts_locked(&target_path)?;
+
+        let mut authoritative = Self::load_from_locked_path(&target_path)?;
+        let mut updated_self = self.clone();
+        apply(&mut authoritative);
+        apply(&mut updated_self);
+        let outcome = authoritative.save_to_locked_path_with_outcome_impl(
+            &target_path,
+            || Ok(()),
+        )?;
+        *self = updated_self;
+        Ok(outcome)
+    }
+
     fn save_to_path_with_outcome_impl<F>(
         &self,
         config_path: &Path,
-        mut after_secret_stored: F,
+        after_secret_stored: F,
     ) -> anyhow::Result<ConfigSaveOutcome>
     where
         F: FnMut() -> anyhow::Result<()>,
     {
         let (_lock, target_path) = StoreFileLock::acquire_for_path(config_path)?;
         recover_config_artifacts_locked(&target_path)?;
-        let published_references = reconcile_config_secret_publication_locked(&target_path)?;
+        self.save_to_locked_path_with_outcome_impl(&target_path, after_secret_stored)
+    }
+
+    fn save_to_locked_path_with_outcome_impl<F>(
+        &self,
+        target_path: &Path,
+        mut after_secret_stored: F,
+    ) -> anyhow::Result<ConfigSaveOutcome>
+    where
+        F: FnMut() -> anyhow::Result<()>,
+    {
+        let published_references = reconcile_config_secret_publication_locked(target_path)?;
         let published_reference = published_references.first().cloned();
 
         let mut persisted = self.clone();
@@ -1932,11 +1995,11 @@ impl TonepoetConfig {
                     Some(reference) => reference,
                     None => {
                         let reference = next_config_secret_reference(
-                            &target_path,
+                            target_path,
                             published_reference.as_deref(),
                         )?;
                         crate::secret_store::begin_pending_publication_with_retirement(
-                            &target_path,
+                            target_path,
                             std::slice::from_ref(&reference),
                             &published_references,
                         )
@@ -1945,7 +2008,7 @@ impl TonepoetConfig {
                         if let Err(store_error) = crate::secret_store::set(&reference, secret) {
                             let primary = anyhow::anyhow!(store_error);
                             return match crate::secret_store::abort_pending_publication(
-                                &target_path,
+                                target_path,
                                 std::slice::from_ref(&reference),
                             ) {
                                 Ok(()) => Err(primary),
@@ -1956,7 +2019,7 @@ impl TonepoetConfig {
                         }
                         if let Err(hook_error) = after_secret_stored() {
                             return match crate::secret_store::abort_pending_publication(
-                                &target_path,
+                                target_path,
                                 std::slice::from_ref(&reference),
                             ) {
                                 Ok(()) => Err(hook_error),
@@ -1987,7 +2050,7 @@ impl TonepoetConfig {
                 persisted.conversion.archive_password_ref = None;
                 if !published_references.is_empty() {
                     crate::secret_store::begin_pending_publication_with_retirement(
-                        &target_path,
+                        target_path,
                         &[],
                         &published_references,
                     )
@@ -2006,19 +2069,19 @@ impl TonepoetConfig {
 
         let result = toml::to_string_pretty(&persisted)
             .map_err(anyhow::Error::new)
-            .and_then(|content| atomic_write_config_locked(&target_path, content.as_bytes()));
+            .and_then(|content| atomic_write_config_locked(target_path, content.as_bytes()));
         match result {
             Ok(ConfigSaveOutcome::Durable) => {
                 if pending_transaction {
                     match crate::secret_store::reconcile_pending_publication_classified(
-                        &target_path,
+                        target_path,
                         &desired_references,
                     ) {
                         Ok(()) => {}
                         Err(error) if error.is_backend_unavailable() => {
                             let warning = format!(
                                 "configuration is durable, but archive-password cleanup is deferred because the secret backend is unavailable; pending journal '{}': {}",
-                                crate::secret_store::pending_publication_path(&target_path).display(),
+                                crate::secret_store::pending_publication_path(target_path).display(),
                                 error
                             );
                             log::warn!("{warning}");
@@ -2045,7 +2108,7 @@ impl TonepoetConfig {
             Err(save_error) => {
                 if let Some(reference) = newly_stored_reference {
                     return match crate::secret_store::abort_pending_publication(
-                        &target_path,
+                        target_path,
                         std::slice::from_ref(&reference),
                     ) {
                         Ok(()) => Err(save_error),
@@ -2056,7 +2119,7 @@ impl TonepoetConfig {
                 }
                 if pending_transaction {
                     return match crate::secret_store::reconcile_pending_publication(
-                        &target_path,
+                        target_path,
                         &published_references,
                     ) {
                         Ok(()) => Err(save_error),
@@ -2142,6 +2205,105 @@ mod theme_config_tests {
             parsed.conversion.aggregate_metadata_target_priority,
             default_aggregate_metadata_target_priority(),
         );
+    }
+
+    struct ConfigPathOverrideGuard;
+
+    impl ConfigPathOverrideGuard {
+        fn install(path: PathBuf) -> Self {
+            TEST_CONFIG_PATH_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(path));
+            Self
+        }
+    }
+
+    impl Drop for ConfigPathOverrideGuard {
+        fn drop(&mut self) {
+            TEST_CONFIG_PATH_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn saved_browsing_and_metadata_priority_round_trip_losslessly() {
+        use AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let _override = ConfigPathOverrideGuard::install(path.clone());
+
+        let mut initial = TonepoetConfig::default();
+        initial.browsing.show_hidden = true;
+        initial.save().expect("save initial config");
+
+        let mut configured = TonepoetConfig::load().expect("load initial config");
+        configured.browsing.show_hidden = false;
+        configured.browsing.layout_explore_enabled = false;
+        configured.browsing.layout_explore = "collapsed".to_string();
+        configured.conversion.aggregate_metadata_target_priority =
+            vec![IndividualFiles, EmbeddedCue, SidecarCue];
+        configured.save().expect("save configured values");
+
+        let reloaded = TonepoetConfig::load().expect("reload configured values");
+        assert!(!reloaded.browsing.show_hidden);
+        assert!(!reloaded.browsing.layout_explore_enabled);
+        assert_eq!(reloaded.browsing.layout_explore, "collapsed");
+        assert_eq!(
+            reloaded.conversion.aggregate_metadata_target_priority,
+            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+        );
+
+        let once = std::fs::read(&path).expect("first serialized config");
+        reloaded.save().expect("repeat idempotent save");
+        let twice = std::fs::read(&path).expect("second serialized config");
+        assert_eq!(twice, once, "an unchanged save must be byte-idempotent");
+    }
+
+    #[test]
+    fn narrow_update_does_not_clobber_newer_unrelated_settings() {
+        use AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let _override = ConfigPathOverrideGuard::install(path.clone());
+
+        let mut initial = TonepoetConfig::default();
+        initial.browsing.show_hidden = true;
+        initial.save().expect("save initial config");
+
+        let mut browse_writer = TonepoetConfig::load().expect("load browse writer");
+        let mut stale_writer = TonepoetConfig::load().expect("load stale writer");
+
+        browse_writer.browsing.show_hidden = false;
+        browse_writer.browsing.layout_explore_enabled = false;
+        browse_writer.browsing.layout_explore = "collapsed".to_string();
+        browse_writer.conversion.aggregate_metadata_target_priority =
+            vec![IndividualFiles, EmbeddedCue, SidecarCue];
+        browse_writer.save().expect("save newer user settings");
+
+        stale_writer.performance.browsing.archive_listing_timeout = 45;
+        stale_writer
+            .update(|latest| {
+                latest.performance.browsing.archive_listing_timeout = 45;
+            })
+            .expect("save unrelated setting from stale snapshot");
+
+        let reloaded = TonepoetConfig::load().expect("reload merged config");
+        assert!(!reloaded.browsing.show_hidden);
+        assert!(!reloaded.browsing.layout_explore_enabled);
+        assert_eq!(reloaded.browsing.layout_explore, "collapsed");
+        assert_eq!(
+            reloaded.conversion.aggregate_metadata_target_priority,
+            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+        );
+        assert_eq!(reloaded.performance.browsing.archive_listing_timeout, 45);
+
+        let once = std::fs::read(&path).expect("first merged config");
+        stale_writer
+            .update(|latest| {
+                latest.performance.browsing.archive_listing_timeout = 45;
+            })
+            .expect("repeat identical narrow update");
+        let twice = std::fs::read(&path).expect("second merged config");
+        assert_eq!(twice, once, "an identical narrow update must be byte-idempotent");
     }
 
     struct PublicSaveInjectionGuard;
