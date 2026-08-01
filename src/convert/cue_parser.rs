@@ -432,12 +432,47 @@ pub fn compose_cue_metadata_replacement(
     template_cuesheet: &str,
     replacement_cuesheet: &str,
 ) -> Result<String, String> {
-    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet)?;
+    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, true)?;
     let desired = explicit_cue_metadata(replacement_cuesheet);
     if desired.tracks.is_empty() {
         return Err("replacement CUESHEET has no audio tracks".to_string());
     }
-    rewrite_cue_metadata_text(template_cuesheet, &desired)
+    rewrite_cue_metadata_text(
+        template_cuesheet,
+        &desired,
+        CueMetadataRewriteMode::PreserveAbsent,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueMetadataRewriteMode {
+    PreserveAbsent,
+    AuthoritativeProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueMetadataFieldAction<'a> {
+    Preserve,
+    Set(&'a str),
+    Delete,
+}
+
+fn cue_metadata_field_action(
+    desired: Option<&str>,
+    authoritative: bool,
+) -> CueMetadataFieldAction<'_> {
+    if authoritative
+        && match desired {
+            Some(value) => value.trim().is_empty(),
+            None => true,
+        }
+    {
+        CueMetadataFieldAction::Delete
+    } else if let Some(value) = desired {
+        CueMetadataFieldAction::Set(value)
+    } else {
+        CueMetadataFieldAction::Preserve
+    }
 }
 
 /// Rewrite only editable metadata fields in a sidecar CUE file using the
@@ -453,8 +488,10 @@ pub fn compose_cue_metadata_replacement(
 /// from line-preserved text so the BOM remains byte 0 even when album metadata
 /// must be inserted before the first logical CUE line.
 /// Album-level CATALOG is rewritten because conversion treats the preferred
-/// sidecar as authoritative for that editable field. Track-level ISRC and all
-/// structural commands remain untouched. If a legacy source encoding cannot
+/// sidecar as authoritative for that editable field. The authoritative entry
+/// point also owns track-level ISRC and explicit deletion of editor-owned
+/// fields; the legacy entry point preserves absent fields. Structural commands remain
+/// untouched. If a legacy source encoding cannot
 /// represent the corrected metadata, write UTF-8 without a BOM rather than
 /// lossy replacement.
 /// Values that cannot be represented losslessly in CUE syntax, such as embedded
@@ -468,10 +505,26 @@ pub fn rewrite_cue_sidecar_metadata_from_cuesheet(
     cue_path: &Path,
     replacement_cuesheet: &str,
 ) -> Result<CueSidecarWritebackOutcome, String> {
-    rewrite_cue_sidecar_metadata_from_cuesheet_validated(
+    rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode(
         cue_path,
         replacement_cuesheet,
         |_raw, _decoded| Ok(()),
+        CueMetadataRewriteMode::PreserveAbsent,
+    )
+}
+
+/// Rewrite the editor-owned CUE metadata surface as an authoritative
+/// projection. Missing or blank supported fields are deleted; unsupported
+/// directives and structure are preserved byte-for-byte whenever possible.
+pub fn rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+) -> Result<CueSidecarWritebackOutcome, String> {
+    rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode(
+        cue_path,
+        replacement_cuesheet,
+        |_raw, _decoded| Ok(()),
+        CueMetadataRewriteMode::AuthoritativeProjection,
     )
 }
 
@@ -489,19 +542,42 @@ pub fn rewrite_cue_sidecar_metadata_from_cuesheet_validated<F>(
 where
     F: FnOnce(&[u8], &str) -> Result<(), String>,
 {
+    rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode(
+        cue_path,
+        replacement_cuesheet,
+        validate_snapshot,
+        CueMetadataRewriteMode::PreserveAbsent,
+    )
+}
+
+fn rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode<F>(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+    validate_snapshot: F,
+    mode: CueMetadataRewriteMode,
+) -> Result<CueSidecarWritebackOutcome, String>
+where
+    F: FnOnce(&[u8], &str) -> Result<(), String>,
+{
     let raw = std::fs::read(cue_path)
         .map_err(|e| format!("failed to read sidecar CUE '{}': {}", cue_path.display(), e))?;
     let decoded = decode_cue_bytes_with_context_for_write(&raw, cue_path.parent())?;
     validate_snapshot(&raw, &decoded.text)?;
-    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet)?;
+    validate_replacement_cuesheet_quoted_metadata(
+        replacement_cuesheet,
+        mode != CueMetadataRewriteMode::AuthoritativeProjection,
+    )?;
     let desired = explicit_cue_metadata(replacement_cuesheet);
     if desired.tracks.is_empty() {
         return Err("replacement CUESHEET has no audio tracks".to_string());
     }
 
-    let rewrite = rewrite_cue_metadata_preserving_bytes(&raw, &decoded, &desired)?;
+    let rewrite = rewrite_cue_metadata_preserving_bytes(&raw, &decoded, &desired, mode)?;
     let (bytes, encoding_outcome) = match rewrite {
         CueByteRewrite::Unchanged => {
+            if mode == CueMetadataRewriteMode::AuthoritativeProjection {
+                validate_authoritative_cue_projection(&decoded.text, &desired)?;
+            }
             ensure_sidecar_snapshot_unchanged(cue_path, &raw)?;
             return Ok(CueSidecarWritebackOutcome::Unchanged);
         }
@@ -512,13 +588,25 @@ where
         ),
     };
 
+    if mode == CueMetadataRewriteMode::AuthoritativeProjection {
+        let rewritten = decode_cue_bytes_with_context_for_write(&bytes, cue_path.parent())?;
+        validate_authoritative_cue_projection(&rewritten.text, &desired)?;
+    }
+
     let metadata = std::fs::metadata(cue_path)
         .map_err(|e| format!("failed to stat sidecar CUE '{}': {}", cue_path.display(), e))?;
     if metadata.permissions().readonly() {
-        return Err(format!(
-            "sidecar CUE '{}' is read-only; image tags were saved but the CUE was left stale",
-            cue_path.display()
-        ));
+        return Err(if mode == CueMetadataRewriteMode::AuthoritativeProjection {
+            format!(
+                "sidecar CUE '{}' is read-only; no audio image or sidecar was changed",
+                cue_path.display()
+            )
+        } else {
+            format!(
+                "sidecar CUE '{}' is read-only; image tags were saved but the CUE was left stale",
+                cue_path.display()
+            )
+        });
     }
 
     atomic_replace_if_unchanged(cue_path, &bytes, Some(&raw))?;
@@ -540,9 +628,13 @@ struct ExplicitCueScopeMetadata {
     date: Option<String>,
     genre: Option<String>,
     catalog: Option<String>,
+    isrc: Option<String>,
 }
 
-fn validate_replacement_cuesheet_quoted_metadata(text: &str) -> Result<(), String> {
+fn validate_replacement_cuesheet_quoted_metadata(
+    text: &str,
+    include_songwriter: bool,
+) -> Result<(), String> {
     for (line_idx, line) in text.lines().enumerate() {
         let line = if line_idx == 0 {
             line.trim_start_matches('\u{FEFF}')
@@ -550,7 +642,12 @@ fn validate_replacement_cuesheet_quoted_metadata(text: &str) -> Result<(), Strin
             line
         };
         let trimmed = line.trim_start();
-        for keyword in ["TITLE", "PERFORMER", "SONGWRITER"] {
+        let quoted_fields = if include_songwriter {
+            &["TITLE", "PERFORMER", "SONGWRITER"][..]
+        } else {
+            &["TITLE", "PERFORMER"][..]
+        };
+        for keyword in quoted_fields {
             if strip_keyword_ci(trimmed, keyword).is_some() {
                 validate_replacement_quoted_line(trimmed, keyword, line_idx + 1)?;
             }
@@ -643,6 +740,8 @@ fn explicit_cue_metadata(text: &str) -> ExplicitCueMetadata {
                 metadata.tracks[track_idx].performer = Some(value);
             } else if let Some(value) = parse_quoted_field(trimmed, "SONGWRITER") {
                 metadata.tracks[track_idx].songwriter = Some(value);
+            } else if let Some(value) = parse_plain_field(trimmed, "ISRC") {
+                metadata.tracks[track_idx].isrc = Some(value);
             }
             continue;
         }
@@ -689,6 +788,8 @@ struct CueScopeLayout {
     date: Option<usize>,
     genre: Option<usize>,
     catalog: Option<usize>,
+    isrc: Option<usize>,
+    authoritative_duplicates: Vec<usize>,
     insert_after: Option<usize>,
     indent: Option<String>,
 }
@@ -739,9 +840,80 @@ fn pair_cue_track_metadata<'a>(
     Ok(paired)
 }
 
+fn normalized_authoritative_value(value: Option<&str>) -> Option<&str> {
+    value.and_then(|value| (!value.trim().is_empty()).then_some(value))
+}
+
+fn validate_authoritative_cue_projection(
+    rewritten_text: &str,
+    desired: &ExplicitCueMetadata,
+) -> Result<(), String> {
+    let actual = explicit_cue_metadata(rewritten_text);
+    let album_matches = normalized_authoritative_value(actual.album.title.as_deref())
+        == normalized_authoritative_value(desired.album.title.as_deref())
+        && normalized_authoritative_value(actual.album.performer.as_deref())
+            == normalized_authoritative_value(desired.album.performer.as_deref())
+        && normalized_authoritative_value(actual.album.date.as_deref())
+            == normalized_authoritative_value(desired.album.date.as_deref())
+        && normalized_authoritative_value(actual.album.genre.as_deref())
+            == normalized_authoritative_value(desired.album.genre.as_deref())
+        && normalized_authoritative_value(actual.album.catalog.as_deref())
+            == normalized_authoritative_value(desired.album.catalog.as_deref());
+    if !album_matches {
+        return Err(
+            "sidecar CUE authoritative write verification failed for album metadata; sidecar left unchanged"
+                .to_string(),
+        );
+    }
+
+    if actual.tracks.len() != desired.tracks.len() {
+        return Err(format!(
+            "sidecar CUE authoritative write verification found {} tracks, expected {}; sidecar left unchanged",
+            actual.tracks.len(),
+            desired.tracks.len()
+        ));
+    }
+    let mut actual_by_number = std::collections::BTreeMap::new();
+    for track in &actual.tracks {
+        let number = track.track_number.ok_or_else(|| {
+            "sidecar CUE authoritative write verification found an unnumbered track; sidecar left unchanged"
+                .to_string()
+        })?;
+        if actual_by_number.insert(number, track).is_some() {
+            return Err(format!(
+                "sidecar CUE authoritative write verification found duplicate track {number}; sidecar left unchanged"
+            ));
+        }
+    }
+    for track in &desired.tracks {
+        let number = track.track_number.ok_or_else(|| {
+            "replacement CUESHEET audio track has no track number; sidecar left unchanged"
+                .to_string()
+        })?;
+        let actual = actual_by_number.get(&number).ok_or_else(|| {
+            format!(
+                "sidecar CUE authoritative write verification found no track {number}; sidecar left unchanged"
+            )
+        })?;
+        let matches = normalized_authoritative_value(actual.title.as_deref())
+            == normalized_authoritative_value(track.title.as_deref())
+            && normalized_authoritative_value(actual.performer.as_deref())
+                == normalized_authoritative_value(track.performer.as_deref())
+            && normalized_authoritative_value(actual.isrc.as_deref())
+                == normalized_authoritative_value(track.isrc.as_deref());
+        if !matches {
+            return Err(format!(
+                "sidecar CUE authoritative write verification failed for track {number}; sidecar left unchanged"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_cue_metadata_text(
     original_text: &str,
     desired: &ExplicitCueMetadata,
+    mode: CueMetadataRewriteMode,
 ) -> Result<String, String> {
     let lines = split_cue_lines_preserving_eol(original_text);
     let layout = cue_metadata_layout(&lines);
@@ -754,6 +926,7 @@ fn rewrite_cue_metadata_text(
     }
 
     let mut replacements = std::collections::BTreeMap::<usize, String>::new();
+    let mut deletions = std::collections::BTreeSet::<usize>::new();
     let mut album_insertions = Vec::<String>::new();
     let mut track_insertions = std::collections::BTreeMap::<usize, Vec<String>>::new();
 
@@ -762,8 +935,10 @@ fn rewrite_cue_metadata_text(
         &layout.album,
         &desired.album,
         &mut replacements,
+        &mut deletions,
         &mut album_insertions,
         true,
+        mode,
     )?;
 
     for (track_layout, desired_track) in
@@ -775,8 +950,10 @@ fn rewrite_cue_metadata_text(
             track_layout,
             desired_track,
             &mut replacements,
+            &mut deletions,
             &mut insertions,
             false,
+            mode,
         )?;
         if !insertions.is_empty() {
             let insert_after = track_layout.insert_after.ok_or_else(|| {
@@ -795,13 +972,15 @@ fn rewrite_cue_metadata_text(
                 output.push_str(default_eol);
             }
         }
-        output.push_str(
-            replacements
-                .get(&idx)
-                .map(String::as_str)
-                .unwrap_or(line.body.as_str()),
-        );
-        output.push_str(&line.eol);
+        if !deletions.contains(&idx) {
+            output.push_str(
+                replacements
+                    .get(&idx)
+                    .map(String::as_str)
+                    .unwrap_or(line.body.as_str()),
+            );
+            output.push_str(&line.eol);
+        }
         if let Some(insertions) = track_insertions.get(&idx) {
             let eol = if line.eol.is_empty() {
                 default_eol
@@ -854,9 +1033,15 @@ fn rewrite_cue_metadata_preserving_bytes(
     raw: &[u8],
     decoded: &DecodedCueForWrite,
     desired: &ExplicitCueMetadata,
+    mode: CueMetadataRewriteMode,
 ) -> Result<CueByteRewrite, String> {
     if !encoding_supports_ascii_byte_span_rewrite(decoded.encoding) {
-        return rewrite_cue_metadata_by_text_reencode(&decoded.text, desired, decoded.encoding);
+        return rewrite_cue_metadata_by_text_reencode(
+            &decoded.text,
+            desired,
+            decoded.encoding,
+            mode,
+        );
     }
 
     let raw_lines = split_cue_raw_lines_preserving_eol(raw, decoded.encoding)?;
@@ -877,6 +1062,7 @@ fn rewrite_cue_metadata_preserving_bytes(
     }
 
     let mut replacements = std::collections::BTreeMap::<usize, Vec<u8>>::new();
+    let mut deletions = std::collections::BTreeSet::<usize>::new();
     let mut album_insertions = Vec::<Vec<u8>>::new();
     let mut track_insertions = std::collections::BTreeMap::<usize, Vec<Vec<u8>>>::new();
     let mut need_utf8_fallback = false;
@@ -887,8 +1073,10 @@ fn rewrite_cue_metadata_preserving_bytes(
         &desired.album,
         decoded.encoding,
         &mut replacements,
+        &mut deletions,
         &mut album_insertions,
         true,
+        mode,
         &mut need_utf8_fallback,
     )?;
 
@@ -902,8 +1090,10 @@ fn rewrite_cue_metadata_preserving_bytes(
             desired_track,
             decoded.encoding,
             &mut replacements,
+            &mut deletions,
             &mut insertions,
             false,
+            mode,
             &mut need_utf8_fallback,
         )?;
         if !insertions.is_empty() {
@@ -915,7 +1105,7 @@ fn rewrite_cue_metadata_preserving_bytes(
     }
 
     if need_utf8_fallback {
-        let rewritten_text = rewrite_cue_metadata_text(&decoded.text, desired)?;
+        let rewritten_text = rewrite_cue_metadata_text(&decoded.text, desired, mode)?;
         if rewritten_text == decoded.text {
             return Ok(CueByteRewrite::Unchanged);
         }
@@ -932,12 +1122,14 @@ fn rewrite_cue_metadata_preserving_bytes(
             append_raw_insertions(&mut output, &album_insertions, default_eol);
         }
 
-        let body = replacements
-            .get(&idx)
-            .map(Vec::as_slice)
-            .unwrap_or(line.body.as_slice());
-        output.extend_from_slice(body);
-        output.extend_from_slice(&line.eol);
+        if !deletions.contains(&idx) {
+            let body = replacements
+                .get(&idx)
+                .map(Vec::as_slice)
+                .unwrap_or(line.body.as_slice());
+            output.extend_from_slice(body);
+            output.extend_from_slice(&line.eol);
+        }
 
         if let Some(insertions) = track_insertions.get(&idx) {
             let insertion_eol = if line.eol.is_empty() {
@@ -977,8 +1169,9 @@ fn rewrite_cue_metadata_by_text_reencode(
     original_text: &str,
     desired: &ExplicitCueMetadata,
     source_encoding: CueWriteEncoding,
+    mode: CueMetadataRewriteMode,
 ) -> Result<CueByteRewrite, String> {
-    let rewritten = rewrite_cue_metadata_text(original_text, desired)?;
+    let rewritten = rewrite_cue_metadata_text(original_text, desired, mode)?;
     if rewritten == original_text {
         return Ok(CueByteRewrite::Unchanged);
     }
@@ -1077,10 +1270,16 @@ fn queue_scope_metadata_byte_edits(
     desired: &ExplicitCueScopeMetadata,
     source_encoding: CueWriteEncoding,
     replacements: &mut std::collections::BTreeMap<usize, Vec<u8>>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<Vec<u8>>,
     album_scope: bool,
+    mode: CueMetadataRewriteMode,
     need_utf8_fallback: &mut bool,
 ) -> Result<(), String> {
+    let authoritative = mode == CueMetadataRewriteMode::AuthoritativeProjection;
+    if authoritative {
+        deletions.extend(layout.authoritative_duplicates.iter().copied());
+    }
     queue_quoted_metadata_byte_edit(
         lines,
         layout.title,
@@ -1089,7 +1288,9 @@ fn queue_scope_metadata_byte_edits(
         layout,
         source_encoding,
         replacements,
+        deletions,
         insertions,
+        authoritative,
         need_utf8_fallback,
     )?;
     queue_quoted_metadata_byte_edit(
@@ -1100,20 +1301,42 @@ fn queue_scope_metadata_byte_edits(
         layout,
         source_encoding,
         replacements,
+        deletions,
         insertions,
+        authoritative,
         need_utf8_fallback,
     )?;
-    queue_quoted_metadata_byte_edit(
-        lines,
-        layout.songwriter,
-        desired.songwriter.as_deref(),
-        "SONGWRITER",
-        layout,
-        source_encoding,
-        replacements,
-        insertions,
-        need_utf8_fallback,
-    )?;
+    if !authoritative {
+        queue_quoted_metadata_byte_edit(
+            lines,
+            layout.songwriter,
+            desired.songwriter.as_deref(),
+            "SONGWRITER",
+            layout,
+            source_encoding,
+            replacements,
+            deletions,
+            insertions,
+            false,
+            need_utf8_fallback,
+        )?;
+    }
+
+    if !album_scope && authoritative {
+        queue_plain_metadata_byte_edit(
+            lines,
+            layout.isrc,
+            desired.isrc.as_deref(),
+            "ISRC",
+            layout,
+            source_encoding,
+            replacements,
+            deletions,
+            insertions,
+            authoritative,
+            need_utf8_fallback,
+        )?;
+    }
 
     if album_scope {
         queue_rem_metadata_byte_edit(
@@ -1124,7 +1347,9 @@ fn queue_scope_metadata_byte_edits(
             layout,
             source_encoding,
             replacements,
+            deletions,
             insertions,
+            authoritative,
             need_utf8_fallback,
         )?;
         queue_rem_metadata_byte_edit(
@@ -1135,7 +1360,9 @@ fn queue_scope_metadata_byte_edits(
             layout,
             source_encoding,
             replacements,
+            deletions,
             insertions,
+            authoritative,
             need_utf8_fallback,
         )?;
         queue_plain_metadata_byte_edit(
@@ -1146,7 +1373,9 @@ fn queue_scope_metadata_byte_edits(
             layout,
             source_encoding,
             replacements,
+            deletions,
             insertions,
+            authoritative,
             need_utf8_fallback,
         )?;
     }
@@ -1162,10 +1391,21 @@ fn queue_quoted_metadata_byte_edit(
     layout: &CueScopeLayout,
     source_encoding: CueWriteEncoding,
     replacements: &mut std::collections::BTreeMap<usize, Vec<u8>>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<Vec<u8>>,
+    authoritative: bool,
     need_utf8_fallback: &mut bool,
 ) -> Result<(), String> {
-    let Some(value) = desired else { return Ok(()); };
+    let value = match cue_metadata_field_action(desired, authoritative) {
+        CueMetadataFieldAction::Preserve => return Ok(()),
+        CueMetadataFieldAction::Delete => {
+            if let Some(idx) = existing_idx {
+                deletions.insert(idx);
+            }
+            return Ok(());
+        }
+        CueMetadataFieldAction::Set(value) => value,
+    };
     validate_cue_quoted_metadata_value(keyword, value)?;
     if let Some(idx) = existing_idx {
         match replace_quoted_value_bytes(&lines[idx].body, keyword, value, source_encoding)? {
@@ -1193,10 +1433,21 @@ fn queue_rem_metadata_byte_edit(
     layout: &CueScopeLayout,
     source_encoding: CueWriteEncoding,
     replacements: &mut std::collections::BTreeMap<usize, Vec<u8>>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<Vec<u8>>,
+    authoritative: bool,
     need_utf8_fallback: &mut bool,
 ) -> Result<(), String> {
-    let Some(value) = desired else { return Ok(()); };
+    let value = match cue_metadata_field_action(desired, authoritative) {
+        CueMetadataFieldAction::Preserve => return Ok(()),
+        CueMetadataFieldAction::Delete => {
+            if let Some(idx) = existing_idx {
+                deletions.insert(idx);
+            }
+            return Ok(());
+        }
+        CueMetadataFieldAction::Set(value) => value,
+    };
     validate_cue_line_metadata_value(field, value)?;
     if value.contains('"') {
         return Err(format!(
@@ -1230,10 +1481,21 @@ fn queue_plain_metadata_byte_edit(
     layout: &CueScopeLayout,
     source_encoding: CueWriteEncoding,
     replacements: &mut std::collections::BTreeMap<usize, Vec<u8>>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<Vec<u8>>,
+    authoritative: bool,
     need_utf8_fallback: &mut bool,
 ) -> Result<(), String> {
-    let Some(value) = desired else { return Ok(()); };
+    let value = match cue_metadata_field_action(desired, authoritative) {
+        CueMetadataFieldAction::Preserve => return Ok(()),
+        CueMetadataFieldAction::Delete => {
+            if let Some(idx) = existing_idx {
+                deletions.insert(idx);
+            }
+            return Ok(());
+        }
+        CueMetadataFieldAction::Set(value) => value,
+    };
     validate_cue_plain_metadata_value(keyword, value)?;
     if let Some(idx) = existing_idx {
         match replace_plain_value_bytes(&lines[idx].body, keyword, value, source_encoding)? {
@@ -1459,9 +1721,15 @@ fn queue_scope_metadata_edits(
     layout: &CueScopeLayout,
     desired: &ExplicitCueScopeMetadata,
     replacements: &mut std::collections::BTreeMap<usize, String>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<String>,
     album_scope: bool,
+    mode: CueMetadataRewriteMode,
 ) -> Result<(), String> {
+    let authoritative = mode == CueMetadataRewriteMode::AuthoritativeProjection;
+    if authoritative {
+        deletions.extend(layout.authoritative_duplicates.iter().copied());
+    }
     queue_quoted_metadata_edit(
         lines,
         layout.title,
@@ -1469,7 +1737,9 @@ fn queue_scope_metadata_edits(
         "TITLE",
         layout,
         replacements,
+        deletions,
         insertions,
+        authoritative,
     )?;
     queue_quoted_metadata_edit(
         lines,
@@ -1478,17 +1748,37 @@ fn queue_scope_metadata_edits(
         "PERFORMER",
         layout,
         replacements,
+        deletions,
         insertions,
+        authoritative,
     )?;
-    queue_quoted_metadata_edit(
-        lines,
-        layout.songwriter,
-        desired.songwriter.as_deref(),
-        "SONGWRITER",
-        layout,
-        replacements,
-        insertions,
-    )?;
+    if !authoritative {
+        queue_quoted_metadata_edit(
+            lines,
+            layout.songwriter,
+            desired.songwriter.as_deref(),
+            "SONGWRITER",
+            layout,
+            replacements,
+            deletions,
+            insertions,
+            false,
+        )?;
+    }
+
+    if !album_scope && authoritative {
+        queue_plain_metadata_edit(
+            lines,
+            layout.isrc,
+            desired.isrc.as_deref(),
+            "ISRC",
+            layout,
+            replacements,
+            deletions,
+            insertions,
+            authoritative,
+        )?;
+    }
 
     if album_scope {
         queue_rem_metadata_edit(
@@ -1498,7 +1788,9 @@ fn queue_scope_metadata_edits(
             "DATE",
             layout,
             replacements,
+            deletions,
             insertions,
+            authoritative,
         )?;
         queue_rem_metadata_edit(
             lines,
@@ -1507,7 +1799,9 @@ fn queue_scope_metadata_edits(
             "GENRE",
             layout,
             replacements,
+            deletions,
             insertions,
+            authoritative,
         )?;
         queue_plain_metadata_edit(
             lines,
@@ -1516,7 +1810,9 @@ fn queue_scope_metadata_edits(
             "CATALOG",
             layout,
             replacements,
+            deletions,
             insertions,
+            authoritative,
         )?;
     }
 
@@ -1530,9 +1826,20 @@ fn queue_quoted_metadata_edit(
     keyword: &str,
     layout: &CueScopeLayout,
     replacements: &mut std::collections::BTreeMap<usize, String>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<String>,
+    authoritative: bool,
 ) -> Result<(), String> {
-    let Some(value) = desired else { return Ok(()); };
+    let value = match cue_metadata_field_action(desired, authoritative) {
+        CueMetadataFieldAction::Preserve => return Ok(()),
+        CueMetadataFieldAction::Delete => {
+            if let Some(idx) = existing_idx {
+                deletions.insert(idx);
+            }
+            return Ok(());
+        }
+        CueMetadataFieldAction::Set(value) => value,
+    };
     validate_cue_quoted_metadata_value(keyword, value)?;
     if let Some(idx) = existing_idx {
         let rewritten = replace_quoted_value(&lines[idx].body, keyword, value)
@@ -1553,9 +1860,20 @@ fn queue_rem_metadata_edit(
     field: &str,
     layout: &CueScopeLayout,
     replacements: &mut std::collections::BTreeMap<usize, String>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<String>,
+    authoritative: bool,
 ) -> Result<(), String> {
-    let Some(value) = desired else { return Ok(()); };
+    let value = match cue_metadata_field_action(desired, authoritative) {
+        CueMetadataFieldAction::Preserve => return Ok(()),
+        CueMetadataFieldAction::Delete => {
+            if let Some(idx) = existing_idx {
+                deletions.insert(idx);
+            }
+            return Ok(());
+        }
+        CueMetadataFieldAction::Set(value) => value,
+    };
     validate_cue_line_metadata_value(field, value)?;
     if value.contains('"') {
         return Err(format!(
@@ -1582,9 +1900,20 @@ fn queue_plain_metadata_edit(
     keyword: &str,
     layout: &CueScopeLayout,
     replacements: &mut std::collections::BTreeMap<usize, String>,
+    deletions: &mut std::collections::BTreeSet<usize>,
     insertions: &mut Vec<String>,
+    authoritative: bool,
 ) -> Result<(), String> {
-    let Some(value) = desired else { return Ok(()); };
+    let value = match cue_metadata_field_action(desired, authoritative) {
+        CueMetadataFieldAction::Preserve => return Ok(()),
+        CueMetadataFieldAction::Delete => {
+            if let Some(idx) = existing_idx {
+                deletions.insert(idx);
+            }
+            return Ok(());
+        }
+        CueMetadataFieldAction::Set(value) => value,
+    };
     validate_cue_plain_metadata_value(keyword, value)?;
     if let Some(idx) = existing_idx {
         let rewritten = replace_plain_value(&lines[idx].body, keyword, value).unwrap_or_else(|| {
@@ -1649,28 +1978,52 @@ fn cue_metadata_layout(lines: &[CueTextLine]) -> CueMetadataLayout {
     layout
 }
 
+
+fn cue_rem_field_is_present(line: &str, field: &str) -> bool {
+    strip_keyword_ci(line, "REM")
+        .map(str::trim_start)
+        .and_then(|rest| strip_keyword_ci(rest, field))
+        .is_some()
+}
+
 fn record_scope_line(layout: &mut CueScopeLayout, idx: usize, body: &str, album_scope: bool) {
     let trimmed = body.trim();
     let mut recorded = false;
     if parse_quoted_field(trimmed, "TITLE").is_some() {
-        layout.title = Some(idx);
+        if let Some(previous) = layout.title.replace(idx) {
+            layout.authoritative_duplicates.push(previous);
+        }
         recorded = true;
     } else if parse_quoted_field(trimmed, "PERFORMER").is_some() {
-        layout.performer = Some(idx);
+        if let Some(previous) = layout.performer.replace(idx) {
+            layout.authoritative_duplicates.push(previous);
+        }
         recorded = true;
     } else if parse_quoted_field(trimmed, "SONGWRITER").is_some() {
         layout.songwriter = Some(idx);
         recorded = true;
-    } else if album_scope
-        && (parse_rem_field(trimmed, "DATE").is_some() || parse_rem_field(trimmed, "YEAR").is_some())
-    {
-        layout.date = Some(idx);
+    } else if !album_scope && strip_keyword_ci(trimmed, "ISRC").is_some() {
+        if let Some(previous) = layout.isrc.replace(idx) {
+            layout.authoritative_duplicates.push(previous);
+        }
         recorded = true;
-    } else if album_scope && parse_rem_field(trimmed, "GENRE").is_some() {
-        layout.genre = Some(idx);
+    } else if album_scope
+        && (cue_rem_field_is_present(trimmed, "DATE")
+            || cue_rem_field_is_present(trimmed, "YEAR"))
+    {
+        if let Some(previous) = layout.date.replace(idx) {
+            layout.authoritative_duplicates.push(previous);
+        }
+        recorded = true;
+    } else if album_scope && cue_rem_field_is_present(trimmed, "GENRE") {
+        if let Some(previous) = layout.genre.replace(idx) {
+            layout.authoritative_duplicates.push(previous);
+        }
         recorded = true;
     } else if album_scope && strip_keyword_ci(trimmed, "CATALOG").is_some() {
-        layout.catalog = Some(idx);
+        if let Some(previous) = layout.catalog.replace(idx) {
+            layout.authoritative_duplicates.push(previous);
+        }
         recorded = true;
     }
 
@@ -2546,6 +2899,141 @@ FILE \"different-generated-name.flac\" FLAC\n\
             "UTF-8 BOM sidecar rewrite must be deterministic"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn authoritative_sidecar_writeback_sets_and_deletes_owned_fields_on_byte_span_path() {
+        let dir = unique_cue_parser_test_dir("authoritative_sidecar_byte_span");
+        let cue_path = dir.join("album.cue");
+        let original = concat!(
+            "; keep comment\r\n",
+            "REM COMMENT keep album rem\r\n",
+            "CATALOG OLD-CAT\r\n",
+            "REM DATE 1987\r\n",
+            "REM GENRE Rock\r\n",
+            "PERFORMER \"Old Album Artist\"\r\n",
+            "TITLE \"Old Album\"\r\n",
+            "FILE \"side-a.flac\" FLAC\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    TITLE \"Delete Me\"\r\n",
+            "    PERFORMER \"Delete Artist\"\r\n",
+            "    SONGWRITER \"Keep Writer\"\r\n",
+            "    ISRC OLD000000001\r\n",
+            "    FLAGS PRE\r\n",
+            "    REM COMMENT keep track rem\r\n",
+            "    INDEX 01 00:00:00\r\n",
+            "FILE \"side-b.flac\" FLAC\r\n",
+            "  TRACK 02 AUDIO\r\n",
+            "    TITLE \"Old Two\"\r\n",
+            "    INDEX 01 00:00:00\r\n",
+        );
+        std::fs::write(&cue_path, original).expect("write original sidecar");
+        let replacement = concat!(
+            "PERFORMER \"New Album Artist\"\n",
+            "FILE \"generated-a.wav\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    SONGWRITER \"Attempted Rewrite\"\n",
+            "    ISRC NEW000000001\n",
+            "    INDEX 01 00:00:00\n",
+            "FILE \"generated-b.wav\" WAVE\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"New Two\"\n",
+            "    PERFORMER \"Track Two Artist\"\n",
+            "    ISRC NEW000000002\n",
+            "    INDEX 01 00:00:00\n",
+        );
+
+        let outcome = rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
+            &cue_path,
+            replacement,
+        )
+        .expect("authoritative rewrite");
+        assert_eq!(
+            outcome,
+            CueSidecarWritebackOutcome::Rewritten {
+                encoding: "UTF-8".to_string()
+            }
+        );
+        let rewritten = std::fs::read_to_string(&cue_path).expect("read rewritten sidecar");
+        for removed in [
+            "CATALOG OLD-CAT",
+            "REM DATE 1987",
+            "REM GENRE Rock",
+            "TITLE \"Old Album\"",
+            "TITLE \"Delete Me\"",
+            "PERFORMER \"Delete Artist\"",
+            "ISRC OLD000000001",
+            "SONGWRITER \"Attempted Rewrite\"",
+        ] {
+            assert!(!rewritten.contains(removed), "stale line survived: {removed}");
+        }
+        for preserved in [
+            "; keep comment",
+            "REM COMMENT keep album rem",
+            "SONGWRITER \"Keep Writer\"",
+            "FLAGS PRE",
+            "REM COMMENT keep track rem",
+            "FILE \"side-a.flac\" FLAC",
+            "TRACK 01 AUDIO",
+            "INDEX 01 00:00:00",
+        ] {
+            assert!(rewritten.contains(preserved), "unrelated line lost: {preserved}");
+        }
+        assert!(rewritten.contains("PERFORMER \"New Album Artist\""));
+        assert!(rewritten.contains("SONGWRITER \"Keep Writer\""));
+        assert!(rewritten.contains("ISRC NEW000000001"));
+        assert!(rewritten.contains("TITLE \"New Two\""));
+        assert!(rewritten.contains("PERFORMER \"Track Two Artist\""));
+        assert!(rewritten.contains("ISRC NEW000000002"));
+        assert!(rewritten.contains("\r\n"));
+
+        let second = rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
+            &cue_path,
+            replacement,
+        )
+        .expect("idempotent authoritative rewrite");
+        assert_eq!(second, CueSidecarWritebackOutcome::Unchanged);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn authoritative_sidecar_writeback_deletes_isrc_and_fields_on_utf8_bom_reencode_path() {
+        let dir = unique_cue_parser_test_dir("authoritative_sidecar_utf8_bom");
+        let cue_path = dir.join("album.cue");
+        let body = concat!(
+            "TITLE \"Delete Album\"\n",
+            "REM DATE 2001\n",
+            "FILE \"album.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Delete Track\"\n",
+            "    ISRC OLD000000001\n",
+            "    FLAGS DCP\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        let mut original = vec![0xEF, 0xBB, 0xBF];
+        original.extend_from_slice(body.as_bytes());
+        std::fs::write(&cue_path, original).expect("write BOM sidecar");
+        let replacement = concat!(
+            "FILE \"generated.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    PERFORMER \"New Track Artist\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+
+        rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(&cue_path, replacement)
+            .expect("authoritative BOM rewrite");
+        let raw = std::fs::read(&cue_path).expect("read BOM rewrite");
+        assert!(raw.starts_with(&[0xEF, 0xBB, 0xBF]));
+        let text = std::str::from_utf8(&raw).expect("UTF-8 BOM text");
+        assert!(!text.contains("TITLE \"Delete Album\""));
+        assert!(!text.contains("REM DATE 2001"));
+        assert!(!text.contains("TITLE \"Delete Track\""));
+        assert!(!text.contains("ISRC OLD000000001"));
+        assert!(text.contains("PERFORMER \"New Track Artist\""));
+        assert!(text.contains("FLAGS DCP"));
+        assert!(text.contains("FILE \"album.flac\" FLAC"));
+        assert!(!text.contains("generated.flac"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

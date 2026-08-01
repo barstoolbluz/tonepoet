@@ -8482,7 +8482,7 @@ impl MetadataEditorState {
 
     /// Recompute dirty state for the active surface from authoritative row data.
     pub fn recompute_active_dirty(&mut self) -> bool {
-        let dirty = crate::tui::probe::metadata_editor_has_changes(self);
+        let dirty = presentation_tab_has_changes(self.active_surface());
         self.active_surface_mut().dirty = dirty;
         dirty
     }
@@ -9292,19 +9292,120 @@ fn attach_write_issue(tab: &mut PresentationTab, idx: usize, issue: MetadataIssu
     file.issues.push(issue);
 }
 
+fn native_multi_file_sidecar_authority(tab: &PresentationTab) -> bool {
+    tab.paths.len() > 1
+        && tab.cue_album_synthetic_sheet.is_some()
+        && matches!(&tab.cue_source, Some(MetadataCueSource::Sidecar(_)))
+}
+
+fn cue_sidecar_representable_entry_for_path_count(
+    path_count: usize,
+    entry: &crate::tui::probe::TagEntry,
+) -> bool {
+    let key = entry.display_key.to_ascii_uppercase();
+    if key == "CUESHEET" {
+        return true;
+    }
+    if entry.is_track_scoped(path_count) {
+        return matches!(key.as_str(), "TITLE" | "ARTIST" | "ISRC");
+    }
+    matches!(
+        key.as_str(),
+        "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
+    )
+}
+
+fn cue_sidecar_representable_entry(
+    tab: &PresentationTab,
+    entry: &crate::tui::probe::TagEntry,
+) -> bool {
+    cue_sidecar_representable_entry_for_path_count(tab.paths.len(), entry)
+}
+
+fn cue_sidecar_standard_owned_entry(
+    path_count: usize,
+    entry: &crate::tui::probe::TagEntry,
+) -> bool {
+    let key = entry.display_key.to_ascii_uppercase();
+    if entry.is_track_scoped(path_count) {
+        matches!(key.as_str(), "TITLE" | "ARTIST" | "ISRC")
+    } else {
+        matches!(
+            key.as_str(),
+            "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
+        )
+    }
+}
+
+fn mark_tag_entry_saved_empty(entry: &mut crate::tui::probe::TagEntry) {
+    for value in &mut entry.per_file_values {
+        value.clear();
+    }
+    entry.per_file_originals = entry.per_file_values.clone();
+    entry.value.clear();
+    entry.original.clear();
+    entry.is_mixed = false;
+    entry.has_multiple_stored_values = false;
+    entry.per_file_stored_value_counts.clear();
+    entry.mb_proposed_value = None;
+    entry.mb_proposed_per_file = None;
+}
+
 fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
     let path_count = tab.paths.len();
-    for entry in &mut tab.entries {
-        let is_cuesheet_shadow = tab.sidecar_cuesheet_shadow_present
-            && entry.display_key.eq_ignore_ascii_case("CUESHEET");
-        let is_sidecar_track_row = (entry.display_key.eq_ignore_ascii_case("TITLE")
-            || entry.display_key.eq_ignore_ascii_case("ARTIST")
-            || entry.display_key.eq_ignore_ascii_case("ISRC"))
-            && entry.is_track_scoped(path_count);
-        if is_cuesheet_shadow || is_sidecar_track_row {
+    if !native_multi_file_sidecar_authority(tab) {
+        for entry in &mut tab.entries {
+            let is_cuesheet_shadow = tab.sidecar_cuesheet_shadow_present
+                && entry.display_key.eq_ignore_ascii_case("CUESHEET");
+            let is_sidecar_track_row = (entry.display_key.eq_ignore_ascii_case("TITLE")
+                || entry.display_key.eq_ignore_ascii_case("ARTIST")
+                || entry.display_key.eq_ignore_ascii_case("ISRC"))
+                && entry.is_track_scoped(path_count);
+            if is_cuesheet_shadow || is_sidecar_track_row {
+                mark_tag_entry_saved(entry);
+            }
+        }
+        return;
+    }
+
+    // A native multi-FILE sidecar-authoritative save deliberately produces no
+    // image results. Consume exactly the CUE-representable edits here after the
+    // sidecar write succeeds; unsupported changes are rejected before I/O.
+    let deleted = tab
+        .deleted
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let consumed_deletions = deleted
+        .iter()
+        .copied()
+        .filter(|index| {
+            tab.entries
+                .get(*index)
+                .is_some_and(|entry| cue_sidecar_standard_owned_entry(path_count, entry))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for (index, entry) in tab.entries.iter_mut().enumerate() {
+        if !cue_sidecar_representable_entry_for_path_count(path_count, entry) {
+            continue;
+        }
+        if consumed_deletions.contains(&index) {
+            // Standard sidecar-owned rows remain present as an editable empty
+            // surface after deletion. This allows users to repopulate an
+            // initially absent or just-deleted CUE field without reopening or
+            // relying on carrier-image writability.
+            mark_tag_entry_saved_empty(entry);
+        } else if !deleted.contains(&index) {
             mark_tag_entry_saved(entry);
         }
     }
+    tab.deleted = tab
+        .deleted
+        .iter()
+        .copied()
+        .filter(|index| !consumed_deletions.contains(index))
+        .collect();
+    tab.cue_album_forced_cleanup.clear();
 }
 
 fn pending_embedded_cuesheet_delete_fully_saved(
@@ -9482,6 +9583,7 @@ fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
     }
 
     let path_count = tab.paths.len();
+    let sidecar_authority = native_multi_file_sidecar_authority(tab);
     let has_file_details = tab.technical_details.files.len() == path_count;
     let writable = |idx: usize, tab: &PresentationTab| -> bool {
         if !has_file_details {
@@ -9495,6 +9597,12 @@ fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
     };
 
     tab.entries.iter().any(|entry| {
+        let sidecar_authoritative = sidecar_authority
+            && cue_sidecar_representable_entry(tab, entry);
+        if sidecar_authoritative {
+            return entry.per_file_values != entry.per_file_originals
+                || entry.value != entry.original;
+        }
         if !entry.is_track_scoped(path_count)
             && entry.per_file_values.len() == path_count
             && entry.per_file_originals.len() == path_count
