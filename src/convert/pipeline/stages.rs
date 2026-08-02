@@ -4947,10 +4947,18 @@ fn parse_native_tag_keys(text: &str) -> BTreeSet<String> {
     keys
 }
 
-fn deterministic_metadata_tool_environment() -> Vec<EnvVar> {
+fn deterministic_metadata_read_environment() -> Vec<EnvVar> {
     vec![EnvVar {
         key: "LC_ALL".to_string(),
         value: SecretString::new("C"),
+        secret: false,
+    }]
+}
+
+fn deterministic_metadata_write_environment() -> Vec<EnvVar> {
+    vec![EnvVar {
+        key: "LC_ALL".to_string(),
+        value: SecretString::new("C.UTF-8"),
         secret: false,
     }]
 }
@@ -4978,7 +4986,7 @@ fn native_existing_tag_list_command(path: &Path, ext: &str) -> Option<ToolComman
         args,
         secret_args: vec![],
         cwd: None,
-        env: deterministic_metadata_tool_environment(),
+        env: deterministic_metadata_read_environment(),
         timeout: Duration::from_secs(30),
     })
 }
@@ -5216,7 +5224,7 @@ fn m4a_freeform_tag_command(path: &Path, pairs: &[(String, String)]) -> ToolComm
         args,
         secret_args: vec![],
         cwd: None,
-        env: deterministic_metadata_tool_environment(),
+        env: deterministic_metadata_write_environment(),
         timeout: Duration::from_secs(60),
     }
 }
@@ -5287,7 +5295,7 @@ fn metadata_tag_command(
             args,
             secret_args: vec![],
             cwd: None,
-            env: deterministic_metadata_tool_environment(),
+            env: deterministic_metadata_write_environment(),
             timeout,
         },
         tmp_path,
@@ -6278,14 +6286,14 @@ mod metadata_writer_command_tests {
         assert_eq!(args.last().map(String::as_str), Some(".track.m4a.tmp.m4a"));
     }
 
-    fn assert_closed_metadata_environment(command: &ToolCommand) {
+    fn assert_closed_metadata_environment(command: &ToolCommand, locale: &str) {
         assert_eq!(
             command.environment_policy,
             tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
         );
         assert_eq!(command.env.len(), 1);
         assert_eq!(command.env[0].key, "LC_ALL");
-        assert_eq!(command.env[0].value.expose(), "C");
+        assert_eq!(command.env[0].value.expose(), locale);
         assert!(!command.env[0].secret);
     }
 
@@ -6294,14 +6302,15 @@ mod metadata_writer_command_tests {
         let temp = tempfile::tempdir().expect("metadata test tempdir");
         let input = temp.path().join("track.wav");
         fs::write(&input, b"RIFF\0\0\0\0WAVE").expect("write RIFF marker");
-        let tags = vec![("TITLE".to_string(), "Reference".to_string())];
+        let tags = vec![("TITLE".to_string(), "Reference 25・3P-426".to_string())];
         let (ffmpeg, _) = metadata_tag_command(&input, "wav", &tags, &BTreeSet::new())
             .expect("build FFmpeg metadata command");
-        assert_closed_metadata_environment(&ffmpeg);
+        assert_closed_metadata_environment(&ffmpeg, "C.UTF-8");
+        assert!(ffmpeg.args.iter().any(|arg| arg.contains("25・3P-426")));
 
         let metaflac_discovery = native_existing_tag_list_command(Path::new("track.flac"), "flac")
             .expect("build metaflac discovery command");
-        assert_closed_metadata_environment(&metaflac_discovery);
+        assert_closed_metadata_environment(&metaflac_discovery, "C");
         let (metaflac_mutation, metaflac_temporary) = metadata_tag_command(
             Path::new("track.flac"),
             "flac",
@@ -6311,11 +6320,11 @@ mod metadata_writer_command_tests {
         .expect("build metaflac mutation command");
         assert_eq!(metaflac_mutation.binary, ToolBinary::Metaflac);
         assert!(metaflac_temporary.is_none());
-        assert_closed_metadata_environment(&metaflac_mutation);
+        assert_closed_metadata_environment(&metaflac_mutation, "C.UTF-8");
 
         let wvtag_discovery = native_existing_tag_list_command(Path::new("track.wv"), "wv")
             .expect("build wvtag discovery command");
-        assert_closed_metadata_environment(&wvtag_discovery);
+        assert_closed_metadata_environment(&wvtag_discovery, "C");
         let (wvtag_mutation, wvtag_temporary) = metadata_tag_command(
             Path::new("track.wv"),
             "wv",
@@ -6325,13 +6334,13 @@ mod metadata_writer_command_tests {
         .expect("build wvtag mutation command");
         assert_eq!(wvtag_mutation.binary, ToolBinary::Wvtag);
         assert!(wvtag_temporary.is_none());
-        assert_closed_metadata_environment(&wvtag_mutation);
+        assert_closed_metadata_environment(&wvtag_mutation, "C.UTF-8");
 
         let atomic_parsley = m4a_freeform_tag_command(
             Path::new("track.m4a"),
             &[("MY_NOTE".to_string(), "Reference".to_string())],
         );
-        assert_closed_metadata_environment(&atomic_parsley);
+        assert_closed_metadata_environment(&atomic_parsley, "C.UTF-8");
     }
 
     #[test]

@@ -32,6 +32,29 @@ pub struct ArtworkInfo {
     pub height: Option<u32>,
 }
 
+/// Cached availability of a CUESHEET tag that the embedded-only metadata
+/// resolver can actually open. `Unknown` is deliberate: persistent probe rows
+/// predate this fact, and failed/transient metadata reads must not be converted
+/// into a false negative merely to make a menu item look settled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmbeddedCueAvailability {
+    Present,
+    Absent,
+    #[default]
+    Unknown,
+}
+
+/// Cached availability of a sidecar CUE source that the Browse `Get tags from
+/// CUE` command can consume. This is distinct from embedded authority: a
+/// sidecar-only album may be `Present` here and `Absent` above.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CueImportAvailability {
+    Present,
+    Absent,
+    #[default]
+    Unknown,
+}
+
 impl Default for ArtworkInfo {
     fn default() -> Self {
         Self {
@@ -94,6 +117,12 @@ pub struct SourceMetadata {
 
     /// Embedded artwork blocks, without retaining the raw image bytes.
     pub artwork: Vec<ArtworkInfo>,
+
+    /// Whether this individual carrier exposes a usable embedded CUESHEET.
+    /// Folder-level native multi-FILE sheets are resolved separately by the
+    /// existing bounded folder-classification worker because their validity is
+    /// defined over the complete member set, not one file in isolation.
+    pub embedded_cue_availability: EmbeddedCueAvailability,
 }
 
 
@@ -353,8 +382,13 @@ fn probe_bluray_disc(path: &Path) -> Result<SourceInfo, String> {
     ))
 }
 
+fn recover_metadata_before_read(path: &Path) -> Result<(), String> {
+    recover_ape_tail_before_read(path)?;
+    flac_metadata_writer::recover_before_read(path)
+}
+
 pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
-    flac_metadata_writer::recover_before_read(path)?;
+    recover_metadata_before_read(path)?;
     if crate::disc::dvda_utils::is_dvda_source(path) {
         return probe_dvda_disc(path);
     }
@@ -636,12 +670,29 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
         return read_metadata_sacd(path);
     }
     if crate::dsf_tags::is_dsf(path) {
-        return crate::dsf_tags::read(path).map(|snapshot| source_metadata_from_dsf(&snapshot));
+        return crate::dsf_tags::read(path).map(|snapshot| {
+            let mut metadata = source_metadata_from_dsf(&snapshot);
+            metadata.embedded_cue_availability = snapshot
+                .first("CUESHEET")
+                .filter(|value| !value.trim().is_empty())
+                .map(|cue_text| {
+                    if super::keybindings::embedded_cuesheet_text_is_usable_for_single_carrier(
+                        path,
+                        cue_text,
+                    ) {
+                        EmbeddedCueAvailability::Present
+                    } else {
+                        EmbeddedCueAvailability::Absent
+                    }
+                })
+                .unwrap_or(EmbeddedCueAvailability::Absent);
+            metadata
+        });
     }
 
     use lofty::file::TaggedFileExt;
 
-    flac_metadata_writer::recover_before_read(path)?;
+    recover_metadata_before_read(path)?;
 
     match lofty::read_from_path(path) {
         Ok(tagged_file) => Ok(source_metadata_from_tags(path, tagged_file.tags(), true)),
@@ -676,7 +727,7 @@ pub fn read_embedded_picture_bytes(
 
     use lofty::file::TaggedFileExt;
 
-    flac_metadata_writer::recover_before_read(path)?;
+    recover_metadata_before_read(path)?;
 
     let tagged_file = lofty::read_from_path(path)
         .map_err(|e| format!("Failed to read artwork from '{}': {}", path.display(), e))?;
@@ -5735,8 +5786,9 @@ impl MetadataField {
 ///
 /// FLAC writes use the same padding-aware metadata writer as the full editor
 /// save path, so inline browse edits no longer create a full-file backup or
-/// perform the slow Lofty full-file FLAC rewrite. Other formats deliberately
-/// retain the conservative generic writer.
+/// perform the slow Lofty full-file FLAC rewrite. WavPack and Monkey's Audio
+/// likewise use their bounded native APEv2-tail writer; other formats retain
+/// the conservative generic writer.
 ///
 /// Year values must be valid u32; non-numeric input returns an error.
 /// Empty strings clear the field (set to None).
@@ -5747,11 +5799,11 @@ pub fn write_metadata_field(path: &Path, field: MetadataField, value: &str) -> R
 
 /// Execute an inline metadata edit under one crash-recovery authority.
 ///
-/// Native FLAC and DSF writes already own format-specific recovery journals and
-/// therefore use the ordinary writer directly. Every other format is enclosed
-/// by the database-backed full-file transaction; the inner writer is
-/// deliberately backup-free so it cannot retire or replace the transaction's
-/// rollback marker independently.
+/// Native FLAC, DSF, and bounded APEv2-tail writes own format-specific
+/// recovery journals and therefore use the ordinary writer directly. Every
+/// other format is enclosed by the database-backed full-file transaction; the
+/// inner writer is deliberately backup-free so it cannot retire or replace the
+/// transaction's rollback marker independently.
 pub fn write_metadata_field_transactional(
     path: &Path,
     field: MetadataField,
@@ -5762,9 +5814,10 @@ pub fn write_metadata_field_transactional(
 
 /// Inline metadata write with the same operation-scoped cancellation,
 /// byte-progress, and durability-warning report used by the full metadata
-/// editor. DSF and native-FLAC paths observe cancellation inside their bounded
-/// copy loops. Generic formats retain the database transaction and are checked
-/// before mutation because their third-party writer has no cancellable seam.
+/// editor. DSF, native-FLAC, and native APEv2-tail paths observe cancellation
+/// inside their bounded I/O loops. Generic formats retain the database
+/// transaction and are checked before mutation because their third-party
+/// writer has no cancellable seam.
 pub fn write_metadata_field_transactional_with_control(
     path: &Path,
     field: MetadataField,
@@ -5796,22 +5849,28 @@ pub fn write_metadata_field_transactional_with_control_at_verification(
 ) -> Result<MetadataWriteCommitReport, String> {
     let change = metadata_field_change(field, value)
         .map_err(|error| format!("write failed before mutation: {error}"))?;
-    reject_unsupported_dff_metadata_write(path, "writing")?;
-    if uses_native_flac_metadata_journal(path)
-        || crate::dsf_tags::is_dsf(path)
-        || matches!(
-            crate::metadata_persistence::metadata_persistence_route_for_path(path),
-            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
-        )
-    {
-        return write_all_tags_with_cancel_report_classified_at_verification(
-            path,
-            &[change],
-            cancel,
-            byte_progress,
-            verification,
-        )
-        .map_err(MetadataWriteFailure::into_message);
+    let route = crate::metadata_persistence::metadata_persistence_route_for_path(path);
+    match route {
+        crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily => {
+            return reject_read_only_ape_family_write(path)
+                .map(|()| MetadataWriteCommitReport::clean());
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {
+            reject_unsupported_dff_metadata_write(path, "writing")?;
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
+        | crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3
+        | crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+            return write_all_tags_with_cancel_report_classified_at_verification(
+                path,
+                &[change],
+                cancel,
+                byte_progress,
+                verification,
+            )
+            .map_err(MetadataWriteFailure::into_message);
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {}
     }
 
     check_metadata_write_cancel(cancel, "before starting inline metadata transaction")?;
@@ -5841,18 +5900,22 @@ fn write_metadata_field_with_database(
     path: &Path,
     change: (lofty::tag::ItemKey, Option<String>),
 ) -> Result<(), String> {
-    reject_unsupported_dff_metadata_write(path, "writing")?;
-    if crate::dsf_tags::is_dsf(path)
-        || matches!(
-            crate::metadata_persistence::metadata_persistence_route_for_path(path),
-            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
-        )
-    {
-        // DSF and WavPack dispatch own their complete transaction authority.
-        // Do not wrap them in the legacy database transaction: malformed APE
-        // recovery uses its native atomic journal, while healthy WavPack uses
-        // the established Lofty transaction selected by the top-level writer.
-        return write_all_tags(path, std::slice::from_ref(&change));
+    match crate::metadata_persistence::metadata_persistence_route_for_path(path) {
+        crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily => {
+            return reject_read_only_ape_family_write(path);
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::UnsupportedDff => {
+            reject_unsupported_dff_metadata_write(path, "writing")?;
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
+        | crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3
+        | crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+            // Native FLAC, DSF, and WavPack/Monkey's Audio dispatch own their
+            // complete transaction authority. Do not wrap them in the legacy
+            // database transaction.
+            return write_all_tags(path, std::slice::from_ref(&change));
+        }
+        crate::metadata_persistence::MetadataPersistenceRoute::Lofty => {}
     }
     db.atomic_metadata_write(path, || {
         write_all_tags_without_full_file_backup(path, std::slice::from_ref(&change))
@@ -6758,12 +6821,12 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
     let sort_keys: Vec<(u32, u32, String)> = paths
         .iter()
         .map(|p| {
-            // Native FLAC writes recover from .tonepoet-meta-journal before any
-            // tag/probe reader is allowed to parse the metadata block chain. If
+            // Native FLAC and APEv2 writes recover their journals before any
+            // tag/probe reader is allowed to parse mutable metadata. If
             // recovery itself refuses the target (for example, because the file
             // identity changed), do not hand a possibly torn metadata region to
             // Lofty; fall back to path-derived ordering for this entry.
-            let (tag_disc, tag_track) = match flac_metadata_writer::recover_before_read(p) {
+            let (tag_disc, tag_track) = match recover_metadata_before_read(p) {
                 Ok(()) => {
                     #[cfg(test)]
                     run_test_sort_after_recover_before_lofty_hook(p);
@@ -7370,6 +7433,7 @@ fn source_metadata_from_tags(
     // R128 ItemKeys (Vorbis comment style; not a dedicated lofty variant).
     let r128_track_key = ItemKey::Unknown("R128_TRACK_GAIN".to_string());
     let r128_album_key = ItemKey::Unknown("R128_ALBUM_GAIN".to_string());
+    let cuesheet_key = ItemKey::Unknown("CUESHEET".to_string());
 
     let mut meta = SourceMetadata::default();
     for tag in tags {
@@ -7435,6 +7499,18 @@ fn source_metadata_from_tags(
             meta.r128_album_gain = tag.get_string(&r128_album_key).and_then(r128_raw_to_db);
         }
 
+        if let Some(cue_text) = tag
+            .get_string(&cuesheet_key)
+            .filter(|value| !value.trim().is_empty())
+        {
+            if super::keybindings::embedded_cuesheet_text_is_usable_for_single_carrier(
+                path,
+                cue_text,
+            ) {
+                meta.embedded_cue_availability = EmbeddedCueAvailability::Present;
+            }
+        }
+
         for picture in tag.pictures() {
             let data = picture.data();
             let (width, height) = picture_dimensions(data);
@@ -7467,6 +7543,10 @@ fn source_metadata_from_tags(
     // pass. Dedicated browse/metadata reads keep the historical behavior.
     if include_external_preemphasis_checks {
         meta.preemphasis_metadata = preemphasis_metadata_check(path);
+    }
+
+    if meta.embedded_cue_availability != EmbeddedCueAvailability::Present {
+        meta.embedded_cue_availability = EmbeddedCueAvailability::Absent;
     }
 
     meta
@@ -7510,13 +7590,29 @@ fn native_ape_fields(
     Ok(fields)
 }
 
-fn source_metadata_from_canonical_fields(fields: &[CanonicalEditorTagField]) -> SourceMetadata {
+fn source_metadata_from_canonical_fields(
+    path: &std::path::Path,
+    fields: &[CanonicalEditorTagField],
+) -> SourceMetadata {
     let value = |key: &str| {
         fields
             .iter()
             .find(|field| field.display_key == key && !field.is_binary)
             .map(|field| field.value.clone())
     };
+    let embedded_cue_availability = value("CUESHEET")
+        .filter(|value| !value.trim().is_empty())
+        .map(|cue_text| {
+            if super::keybindings::embedded_cuesheet_text_is_usable_for_single_carrier(
+                path,
+                &cue_text,
+            ) {
+                EmbeddedCueAvailability::Present
+            } else {
+                EmbeddedCueAvailability::Absent
+            }
+        })
+        .unwrap_or(EmbeddedCueAvailability::Absent);
     SourceMetadata {
         title: value("TITLE"),
         artist: value("ARTIST"),
@@ -7533,6 +7629,7 @@ fn source_metadata_from_canonical_fields(fields: &[CanonicalEditorTagField]) -> 
         r128_track_gain: value("R128_TRACK_GAIN").as_deref().and_then(r128_raw_to_db),
         r128_album_gain: value("R128_ALBUM_GAIN").as_deref().and_then(r128_raw_to_db),
         isrc: value("ISRC"),
+        embedded_cue_availability,
         ..SourceMetadata::default()
     }
 }
@@ -7556,7 +7653,7 @@ fn read_native_ape_fallback(path: &std::path::Path) -> Result<NativeApeReadOutco
         kind: MetadataReadIssueKind::RecoverableTagWarning,
         reason: warning.message(),
     });
-    let metadata = source_metadata_from_canonical_fields(&fields);
+    let metadata = source_metadata_from_canonical_fields(path, &fields);
     Ok(NativeApeReadOutcome {
         fields,
         metadata,
@@ -7711,7 +7808,7 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
         }
         return Ok(tag_entries_from_dsf_snapshot(&outcome.snapshot));
     }
-    flac_metadata_writer::recover_before_read(path)?;
+    recover_metadata_before_read(path)?;
     let (fields, _metadata, warning) =
         read_editor_metadata_file(path).map_err(|issue| issue.reason)?;
     if let Some(warning) = warning {
@@ -7882,7 +7979,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             }
             continue;
         }
-        flac_metadata_writer::recover_before_read(path)?;
+        recover_metadata_before_read(path)?;
         let (fields, _metadata, warning) =
             read_editor_metadata_file(path).map_err(|issue| issue.reason)?;
         if let Some(warning) = warning {
@@ -8032,7 +8129,7 @@ where
                 }),
             };
         }
-        if let Err(err) = flac_metadata_writer::recover_before_read(path) {
+        if let Err(err) = recover_metadata_before_read(path) {
             return Ok(MergedTagsAndMetadata {
                 entries: Vec::new(),
                 metadata: vec![SourceMetadata::default()],
@@ -8119,7 +8216,7 @@ where
             }
             continue;
         }
-        if let Err(err) = flac_metadata_writer::recover_before_read(path) {
+        if let Err(err) = recover_metadata_before_read(path) {
             metadata_errors[file_idx] = Some(MetadataReadIssue::filesystem(path, err));
             continue;
         }
@@ -8910,15 +9007,16 @@ fn write_editor_tag_changes_with_cancel_report_at_verification(
     let use_editor_aware_lofty_writer = match route {
         crate::metadata_persistence::MetadataPersistenceRoute::Lofty => true,
         crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
-            if wavpack_requires_native_ape_writer(path)? {
-                if has_explicit_container {
-                    return Err(format!(
-                        "cannot target a secondary tag container in '{}': the file requires the native APEv2 recovery writer",
-                        path.display()
-                    ));
-                }
+            if !has_explicit_container {
                 false
+            } else if is_wavpack_path(path) && wavpack_requires_native_ape_writer(path)? {
+                return Err(format!(
+                    "cannot target a secondary tag container in '{}': the malformed APEv2 tag requires the native recovery writer",
+                    path.display()
+                ));
             } else {
+                // Preserve origin-aware edits to secondary containers. The
+                // bounded native writer owns only the primary APEv2 tail.
                 true
             }
         }
@@ -9260,44 +9358,36 @@ fn remove_all_tags_atomic(
             Ok(had_tags)
         }
         crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
-            match wavpack_requires_native_ape_writer(path) {
-                Ok(true) => {
-                    let had_tags = match crate::metadata_persistence::read_native_ape_tag(path) {
-                        Ok(tag) => {
-                            let has_ape = tag.is_some_and(|tag| !tag.items.is_empty());
-                            match has_id3v1_tag(path) {
-                                Ok(has_id3v1) => has_ape || has_id3v1,
-                                Err(error) => return result.fail(error),
-                            }
-                        }
+            if let Err(error) = recover_ape_tail_before_read(path) {
+                return result.fail(error);
+            }
+            let had_tags = match crate::metadata_persistence::read_native_ape_tag(path) {
+                Ok(tag) => {
+                    let has_ape = tag.is_some_and(|tag| !tag.items.is_empty());
+                    match has_id3v1_tag(path) {
+                        Ok(has_id3v1) => has_ape || has_id3v1,
                         Err(error) => return result.fail(error),
-                    };
-                    match clear_all_tags_native_wavpack_ape_atomic(path, cancel) {
-                        Ok(report) => {
-                            result
-                                .durability_warnings
-                                .extend(report.durability_warnings);
-                            Ok(had_tags)
-                        }
-                        Err(error) => Err(error),
                     }
                 }
-                Ok(false) => {
-                    let had_tags = match lofty::read_from_path(path) {
-                        Ok(tagged) => !tagged.tags().is_empty(),
-                        Err(error) => return result.fail(format!(
-                            "failed to read '{}': {error}",
-                            path.display()
-                        )),
-                    };
-                    clear_all_lofty_tags_at_verification(path, verification, cancel).map(
-                        |report| {
-                            result
-                                .durability_warnings
-                                .extend(report.durability_warnings);
-                            had_tags
-                        },
-                    )
+                Err(error) => return result.fail(error),
+            };
+            let mutation = if is_wavpack_path(path) {
+                match wavpack_requires_native_ape_writer(path) {
+                    Ok(true) => clear_all_tags_native_wavpack_ape_atomic(path, cancel),
+                    Ok(false) => {
+                        write_all_tags_native_ape_tail(path, &[], cancel, None, true, true)
+                    }
+                    Err(error) => return result.fail(error),
+                }
+            } else {
+                write_all_tags_native_ape_tail(path, &[], cancel, None, true, true)
+            };
+            match mutation {
+                Ok(report) => {
+                    result
+                        .durability_warnings
+                        .extend(report.durability_warnings);
+                    Ok(had_tags)
                 }
                 Err(error) => Err(error),
             }
@@ -9340,9 +9430,7 @@ fn remove_all_tags_atomic(
     if result.changed {
         let verify = match route {
             crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => Ok(()),
-            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
-                if wavpack_requires_native_ape_writer(path).unwrap_or(false) =>
-            {
+            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
                 crate::metadata_persistence::read_native_ape_tag(path).and_then(|tag| {
                     if tag.is_some_and(|tag| !tag.items.is_empty()) {
                         return Err("APEv2 items remain after remove-all-tags".to_string());
@@ -9536,6 +9624,11 @@ fn canonical_field_value(
         .filter(|value| !value.is_empty())
 }
 
+fn native_ape_numbering_fraction(value: &str) -> Option<(&str, &str)> {
+    let (number, total) = value.split_once('/')?;
+    (!number.is_empty() && !total.is_empty() && !total.contains('/')).then_some((number, total))
+}
+
 fn combine_native_ape_numbering_change(
     requested: &mut std::collections::BTreeMap<String, NativeApeRequestedChange>,
     fields: &[CanonicalEditorTagField],
@@ -9560,16 +9653,31 @@ fn combine_native_ape_numbering_change(
                 ));
             }
             (Some(number), None) => Some(number),
-            (Some(number), Some(total)) => Some(format!("{number}/{total}")),
+            (Some(number), Some(total)) => {
+                if let Some((_, embedded_total)) = native_ape_numbering_fraction(&number) {
+                    if embedded_total != total.as_str() {
+                        return Err(format!(
+                            "conflicting native WavPack/APEv2 numbering totals: {number_identity}={number:?} contains total {embedded_total:?}, but {total_identity}={total:?} was also requested"
+                        ));
+                    }
+                    Some(number)
+                } else {
+                    Some(format!("{number}/{total}"))
+                }
+            },
         },
         (Some(number), None) => match number.value {
             // Track/Disc number owns the combined physical item. Deleting the
             // number therefore deletes the whole item and its inseparable
             // total, exactly as the logical tag-delete contract requires.
             None => None,
-            Some(number) => Some(match existing_total {
-                Some(total) => format!("{number}/{total}"),
-                None => number,
+            Some(number) => Some(if native_ape_numbering_fraction(&number).is_some() {
+                number
+            } else {
+                match existing_total {
+                    Some(total) => format!("{number}/{total}"),
+                    None => number,
+                }
             }),
         },
         (None, Some(total)) => match total.value {
@@ -9578,11 +9686,10 @@ fn combine_native_ape_numbering_change(
             None => existing_number,
             Some(total) => match existing_number {
                 Some(number) => Some(format!("{number}/{total}")),
-                None => {
-                    return Err(format!(
-                        "native WavPack/APEv2 cannot persist {total_identity} without {number_identity}"
-                    ));
-                }
+                // APEv2 stores number and total in one physical Track/Disc
+                // item. Preserve the logical API's independently writable
+                // total by materializing the absent number as a real zero.
+                None => Some(format!("0/{total}")),
             },
         },
         (None, None) => unreachable!("numbering changes were checked above"),
@@ -9816,6 +9923,755 @@ fn prepare_native_ape_replacement(
         false
     };
     Ok((replace_start, footer_end, replacement, unchanged))
+}
+
+const APE_TAIL_JOURNAL_MAGIC: &[u8; 8] = b"TPAPEJ01";
+const APE_TAIL_JOURNAL_STATE_PREPARED: u8 = 0;
+const APE_TAIL_JOURNAL_STATE_COMMITTED: u8 = 1;
+const APE_TAIL_JOURNAL_STATE_OFFSET: u64 = 8;
+const APE_TAIL_JOURNAL_HEADER_LEN: u64 = 80;
+const APE_TAIL_COPY_CHUNK_BYTES: usize = 1024 * 1024;
+const APE_TAIL_IDENTITY_SAMPLE_BYTES: usize = 64 * 1024;
+const APE_TAIL_JOURNAL_SUFFIX: &str = ".tonepoet-ape-tail-journal";
+
+#[derive(Debug, Clone, Copy)]
+struct ApeTailJournalHeader {
+    state: u8,
+    replace_start: u64,
+    original_file_size: u64,
+    committed_file_size: u64,
+    original_tail_len: u64,
+    prefix_identity: [u8; 32],
+}
+
+fn is_wavpack_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wv"))
+}
+
+fn is_monkeys_audio_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ape"))
+}
+
+fn is_native_ape_tail_carrier(path: &std::path::Path) -> bool {
+    is_wavpack_path(path) || is_monkeys_audio_path(path)
+}
+
+fn ape_tail_journal_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let file_name = path.file_name().ok_or_else(|| {
+        format!(
+            "cannot derive APEv2 tail-journal name for '{}'",
+            path.display()
+        )
+    })?;
+    let mut journal_name = std::ffi::OsString::from(".");
+    journal_name.push(file_name);
+    journal_name.push(APE_TAIL_JOURNAL_SUFFIX);
+    Ok(path.with_file_name(journal_name))
+}
+
+fn validate_native_ape_carrier_magic(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open APEv2 carrier '{}': {error}", path.display()))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)
+        .map_err(|error| format!("read carrier signature from '{}': {error}", path.display()))?;
+    let valid = if is_wavpack_path(path) {
+        &magic == b"wvpk"
+    } else if is_monkeys_audio_path(path) {
+        &magic == b"MAC "
+    } else {
+        false
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing native APEv2 tail write to '{}': carrier signature does not match its .{} extension",
+            path.display(),
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("unknown")
+        ))
+    }
+}
+
+fn ape_tail_prefix_identity(
+    file: &mut std::fs::File,
+    replace_start: u64,
+) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let sample_len = replace_start.min(APE_TAIL_IDENTITY_SAMPLE_BYTES as u64) as usize;
+    let mut first = vec![0u8; sample_len];
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek APEv2 carrier identity prefix: {error}"))?;
+    file.read_exact(&mut first)
+        .map_err(|error| format!("read APEv2 carrier identity prefix: {error}"))?;
+
+    let last_offset = replace_start.saturating_sub(sample_len as u64);
+    let mut last = vec![0u8; sample_len];
+    file.seek(SeekFrom::Start(last_offset))
+        .map_err(|error| format!("seek APEv2 carrier identity suffix: {error}"))?;
+    file.read_exact(&mut last)
+        .map_err(|error| format!("read APEv2 carrier identity suffix: {error}"))?;
+
+    let mut digest = Sha256::new();
+    digest.update(b"tonepoet-ape-tail-recovery-v1\0");
+    digest.update(replace_start.to_le_bytes());
+    digest.update((sample_len as u64).to_le_bytes());
+    digest.update(&first);
+    digest.update(&last);
+    Ok(digest.finalize().into())
+}
+
+fn encode_ape_tail_journal_header(header: ApeTailJournalHeader) -> [u8; 80] {
+    let mut encoded = [0u8; 80];
+    encoded[..8].copy_from_slice(APE_TAIL_JOURNAL_MAGIC);
+    encoded[8] = header.state;
+    encoded[16..24].copy_from_slice(&header.replace_start.to_le_bytes());
+    encoded[24..32].copy_from_slice(&header.original_file_size.to_le_bytes());
+    encoded[32..40].copy_from_slice(&header.committed_file_size.to_le_bytes());
+    encoded[40..48].copy_from_slice(&header.original_tail_len.to_le_bytes());
+    encoded[48..80].copy_from_slice(&header.prefix_identity);
+    encoded
+}
+
+fn read_ape_tail_journal_header(
+    journal: &std::path::Path,
+    file: &mut std::fs::File,
+) -> Result<ApeTailJournalHeader, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek APEv2 tail journal '{}': {error}", journal.display()))?;
+    let mut encoded = [0u8; 80];
+    file.read_exact(&mut encoded)
+        .map_err(|error| format!("read APEv2 tail journal '{}': {error}", journal.display()))?;
+    if &encoded[..8] != APE_TAIL_JOURNAL_MAGIC {
+        return Err(format!(
+            "refusing APEv2 recovery from '{}': invalid journal magic",
+            journal.display()
+        ));
+    }
+    let state = encoded[8];
+    if !matches!(
+        state,
+        APE_TAIL_JOURNAL_STATE_PREPARED | APE_TAIL_JOURNAL_STATE_COMMITTED
+    ) {
+        return Err(format!(
+            "refusing APEv2 recovery from '{}': invalid journal state {state}",
+            journal.display()
+        ));
+    }
+    if encoded[9..16].iter().any(|byte| *byte != 0) {
+        return Err(format!(
+            "refusing APEv2 recovery from '{}': reserved header bytes are nonzero",
+            journal.display()
+        ));
+    }
+    let read_u64 = |range: std::ops::Range<usize>| {
+        u64::from_le_bytes(encoded[range].try_into().expect("fixed APE journal field"))
+    };
+    let replace_start = read_u64(16..24);
+    let original_file_size = read_u64(24..32);
+    let committed_file_size = read_u64(32..40);
+    let original_tail_len = read_u64(40..48);
+    let expected_tail_len = original_file_size.checked_sub(replace_start).ok_or_else(|| {
+        format!(
+            "refusing APEv2 recovery from '{}': replace offset exceeds original size",
+            journal.display()
+        )
+    })?;
+    if original_tail_len != expected_tail_len
+        || original_tail_len > MAX_NATIVE_APE_TAG_BYTES.saturating_add(128)
+    {
+        return Err(format!(
+            "refusing APEv2 recovery from '{}': invalid original tail length {original_tail_len}",
+            journal.display()
+        ));
+    }
+    let committed_tail_len = committed_file_size.checked_sub(replace_start).ok_or_else(|| {
+        format!(
+            "refusing APEv2 recovery from '{}': replace offset exceeds committed size",
+            journal.display()
+        )
+    })?;
+    if committed_tail_len > MAX_NATIVE_APE_TAG_BYTES.saturating_add(128) {
+        return Err(format!(
+            "refusing APEv2 recovery from '{}': invalid committed tail length {committed_tail_len}",
+            journal.display()
+        ));
+    }
+    let expected_journal_len = APE_TAIL_JOURNAL_HEADER_LEN
+        .checked_add(original_tail_len)
+        .ok_or_else(|| "APEv2 tail journal length overflow".to_string())?;
+    let actual_journal_len = file
+        .metadata()
+        .map_err(|error| format!("stat APEv2 tail journal '{}': {error}", journal.display()))?
+        .len();
+    if actual_journal_len != expected_journal_len {
+        return Err(format!(
+            "refusing APEv2 recovery from '{}': journal has {actual_journal_len} bytes, expected {expected_journal_len}",
+            journal.display()
+        ));
+    }
+    let mut prefix_identity = [0u8; 32];
+    prefix_identity.copy_from_slice(&encoded[48..80]);
+    Ok(ApeTailJournalHeader {
+        state,
+        replace_start,
+        original_file_size,
+        committed_file_size,
+        original_tail_len,
+        prefix_identity,
+    })
+}
+
+fn publish_ape_tail_journal(
+    journal: &std::path::Path,
+    header: ApeTailJournalHeader,
+    original_tail: &[u8],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    progress: &dyn Fn(crate::dsf_tags::DsfWriteProgress),
+) -> Result<(), String> {
+    use std::io::Write;
+
+    if original_tail.len() as u64 != header.original_tail_len {
+        return Err("internal APEv2 journal payload length mismatch".to_string());
+    }
+    let parent = journal
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".tonepoet-ape-tail-journal.tmp-")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "create APEv2 tail-journal temporary beside '{}': {error}",
+                journal.display()
+            )
+        })?;
+    temporary
+        .write_all(&encode_ape_tail_journal_header(header))
+        .map_err(|error| format!("write APEv2 tail-journal header: {error}"))?;
+    let mut copied = 0u64;
+    for chunk in original_tail.chunks(APE_TAIL_COPY_CHUNK_BYTES) {
+        check_metadata_write_cancel(cancel, "while journaling the original APEv2 tail")?;
+        temporary
+            .write_all(chunk)
+            .map_err(|error| format!("write APEv2 tail-journal payload: {error}"))?;
+        copied += chunk.len() as u64;
+        progress(crate::dsf_tags::DsfWriteProgress {
+            phase: crate::dsf_tags::DsfWriteProgressPhase::Journaling,
+            bytes_done: copied,
+            bytes_total: header.original_tail_len,
+        });
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync APEv2 tail-journal temporary: {error}"))?;
+    check_metadata_write_cancel(cancel, "before publishing the APEv2 tail journal")?;
+    std::fs::hard_link(temporary.path(), journal).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "refusing to replace unresolved APEv2 tail journal '{}'",
+                journal.display()
+            )
+        } else {
+            format!(
+                "publish APEv2 tail journal '{}' without replacement: {error}",
+                journal.display()
+            )
+        }
+    })?;
+    temporary.close().map_err(|error| {
+        format!(
+            "retire private APEv2 tail-journal temporary after publishing '{}': {error}",
+            journal.display()
+        )
+    })?;
+    crate::config::sync_parent_dir(parent).map_err(|error| {
+        format!(
+            "sync parent after publishing APEv2 tail journal '{}': {error}",
+            journal.display()
+        )
+    })
+}
+
+fn remove_ape_tail_journal_durably(journal: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(journal) {
+        Ok(()) => crate::config::sync_parent_dir(
+            journal
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .map_err(|error| {
+            format!(
+                "sync parent after removing APEv2 tail journal '{}': {error}",
+                journal.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "remove APEv2 tail journal '{}': {error}",
+            journal.display()
+        )),
+    }
+}
+
+fn verify_ape_tail_journal_target(
+    path: &std::path::Path,
+    file: &mut std::fs::File,
+    header: ApeTailJournalHeader,
+) -> Result<(), String> {
+    let actual_len = file
+        .metadata()
+        .map_err(|error| format!("stat APEv2 recovery target '{}': {error}", path.display()))?
+        .len();
+    let size_valid = if header.state == APE_TAIL_JOURNAL_STATE_COMMITTED {
+        actual_len == header.committed_file_size
+    } else {
+        let lower = header.original_file_size.min(header.committed_file_size);
+        let upper = header.original_file_size.max(header.committed_file_size);
+        actual_len >= lower && actual_len <= upper
+    };
+    if !size_valid {
+        return Err(format!(
+            "refusing APEv2 tail-journal recovery for '{}': target size {actual_len} is incompatible with journal sizes {} and {}",
+            path.display(),
+            header.original_file_size,
+            header.committed_file_size
+        ));
+    }
+    let identity = ape_tail_prefix_identity(file, header.replace_start)?;
+    if identity != header.prefix_identity {
+        return Err(format!(
+            "refusing APEv2 tail-journal recovery for '{}': bounded audio-prefix identity no longer matches",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn recover_ape_tail_journal_locked(
+    path: &std::path::Path,
+    progress: &dyn Fn(crate::dsf_tags::DsfWriteProgress),
+) -> Result<Option<String>, String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let journal = ape_tail_journal_path(path)?;
+    let mut journal_file = match std::fs::File::open(&journal) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "open APEv2 tail journal '{}': {error}",
+                journal.display()
+            ))
+        }
+    };
+    let header = read_ape_tail_journal_header(&journal, &mut journal_file)?;
+    let mut target = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("open APEv2 recovery target '{}': {error}", path.display()))?;
+    verify_ape_tail_journal_target(path, &mut target, header)?;
+
+    if header.state == APE_TAIL_JOURNAL_STATE_PREPARED {
+        journal_file
+            .seek(SeekFrom::Start(APE_TAIL_JOURNAL_HEADER_LEN))
+            .map_err(|error| format!("seek APEv2 journal payload: {error}"))?;
+        target
+            .seek(SeekFrom::Start(header.replace_start))
+            .map_err(|error| format!("seek APEv2 rollback target: {error}"))?;
+        let mut restored = 0u64;
+        let mut buffer = vec![0u8; APE_TAIL_COPY_CHUNK_BYTES];
+        while restored < header.original_tail_len {
+            let wanted = usize::try_from(
+                (header.original_tail_len - restored).min(buffer.len() as u64),
+            )
+            .expect("bounded APEv2 rollback chunk");
+            journal_file
+                .read_exact(&mut buffer[..wanted])
+                .map_err(|error| format!("read original APEv2 tail from journal: {error}"))?;
+            target
+                .write_all(&buffer[..wanted])
+                .map_err(|error| format!("restore original APEv2 tail: {error}"))?;
+            restored += wanted as u64;
+            progress(crate::dsf_tags::DsfWriteProgress {
+                phase: crate::dsf_tags::DsfWriteProgressPhase::Recovering,
+                bytes_done: restored,
+                bytes_total: header.original_tail_len,
+            });
+        }
+        target
+            .set_len(header.original_file_size)
+            .map_err(|error| format!("restore original APEv2 carrier length: {error}"))?;
+        target
+            .sync_all()
+            .map_err(|error| format!("sync restored APEv2 carrier '{}': {error}", path.display()))?;
+    }
+
+    match remove_ape_tail_journal_durably(&journal) {
+        Ok(()) => Ok(None),
+        Err(error) => Ok(Some(format!(
+            "APEv2 tail recovery for '{}' completed, but the journal could not be retired durably: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn recover_ape_tail_before_read(path: &std::path::Path) -> Result<(), String> {
+    if !is_native_ape_tail_carrier(path) {
+        return Ok(());
+    }
+    let recovery_target = if ape_tail_journal_path(path)?.exists() {
+        path.to_path_buf()
+    } else {
+        let canonical = match std::fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(_) => return Ok(()),
+        };
+        if !is_native_ape_tail_carrier(&canonical)
+            || !ape_tail_journal_path(&canonical)?.exists()
+        {
+            return Ok(());
+        }
+        canonical
+    };
+    let (_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(&recovery_target)
+        .map_err(|error| {
+            format!(
+                "acquire APEv2 recovery lock for '{}': {error}",
+                recovery_target.display()
+            )
+        })?;
+    if let Some(warning) = recover_ape_tail_journal_locked(&resolved, &|_| {})? {
+        log::warn!("{warning}");
+    }
+    Ok(())
+}
+
+fn recover_stale_ape_tail_journals_in_dir(dir: &std::path::Path) -> Vec<String> {
+    let mut messages = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            messages.push(format!(
+                "scan '{}' for APEv2 tail journals: {error}",
+                dir.display()
+            ));
+            return messages;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_native_ape_tail_carrier(&path) {
+            continue;
+        }
+        let Ok(journal) = ape_tail_journal_path(&path) else {
+            continue;
+        };
+        if !journal.exists() {
+            continue;
+        }
+        match crate::config::StoreFileLock::acquire_for_path(&path) {
+            Ok((_lock, resolved)) => match recover_ape_tail_journal_locked(&resolved, &|_| {}) {
+                Ok(Some(warning)) => messages.push(warning),
+                Ok(None) => messages.push(format!(
+                    "recovered interrupted APEv2 tail write for '{}'",
+                    resolved.display()
+                )),
+                Err(error) => messages.push(error),
+            },
+            Err(error) => messages.push(format!(
+                "acquire APEv2 recovery lock for '{}': {error}",
+                path.display()
+            )),
+        }
+    }
+    messages
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApeTailJournalCommitOutcome {
+    Durable,
+    StateUnchanged(String),
+    DurabilityUncertain(String),
+}
+
+fn mark_ape_tail_journal_committed(
+    journal: &std::path::Path,
+) -> ApeTailJournalCommitOutcome {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(journal)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return ApeTailJournalCommitOutcome::StateUnchanged(format!(
+                "open APEv2 tail journal for commit: {error}"
+            ));
+        }
+    };
+    if let Err(error) = file.seek(SeekFrom::Start(APE_TAIL_JOURNAL_STATE_OFFSET)) {
+        return ApeTailJournalCommitOutcome::StateUnchanged(format!(
+            "seek APEv2 tail-journal state: {error}"
+        ));
+    }
+    if let Err(error) = file.write_all(&[APE_TAIL_JOURNAL_STATE_COMMITTED]) {
+        return ApeTailJournalCommitOutcome::DurabilityUncertain(format!(
+            "mark APEv2 tail journal committed: {error}"
+        ));
+    }
+    match file.sync_all() {
+        Ok(()) => ApeTailJournalCommitOutcome::Durable,
+        Err(error) => ApeTailJournalCommitOutcome::DurabilityUncertain(format!(
+            "sync committed APEv2 tail journal: {error}"
+        )),
+    }
+}
+
+fn write_all_tags_native_ape_tail(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    drop_invalid_items: bool,
+    clear_all_items: bool,
+) -> Result<MetadataWriteCommitReport, String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let report_progress = |update| {
+        if let Some(progress) = byte_progress {
+            progress(path, update);
+        }
+    };
+    check_metadata_write_cancel(cancel, "before acquiring APEv2 metadata-write authority")?;
+    let (_write_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(path).map_err(|error| {
+        format!(
+            "acquire bounded APEv2 metadata-write lock for '{}': {error}",
+            path.display()
+        )
+    })?;
+    let path = resolved.as_path();
+    if let Some(warning) = recover_ape_tail_journal_locked(path, &report_progress)? {
+        log::warn!("{warning}");
+    }
+    validate_native_ape_carrier_magic(path)?;
+    crate::metadata_persistence::validate_numbering_changes_for_backend(
+        crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
+        changes,
+    )?;
+    check_metadata_write_cancel(cancel, "before checking APEv2 metadata recovery authority")?;
+    {
+        let db = crate::db::Database::open().map_err(|error| {
+            format!("write failed before mutation: metadata journal unavailable: {error}")
+        })?;
+        db.assert_metadata_write_unarmed(path)?;
+    }
+
+    let snapshot = GenericMetadataReplacementSnapshot::capture(path)?;
+    check_metadata_write_cancel(cancel, "before parsing native APEv2 metadata")?;
+    let (replace_start, footer_end, replacement, unchanged) =
+        prepare_native_ape_replacement(path, changes, drop_invalid_items, clear_all_items)?;
+    if unchanged {
+        return Ok(MetadataWriteCommitReport::clean());
+    }
+    let original_file_size = snapshot.len();
+    if footer_end > original_file_size || replace_start > footer_end {
+        return Err(format!(
+            "invalid APEv2 replacement range {replace_start}..{footer_end} for {}-byte carrier '{}'",
+            original_file_size,
+            path.display()
+        ));
+    }
+    let original_tail_len = original_file_size - replace_start;
+    if original_tail_len > MAX_NATIVE_APE_TAG_BYTES.saturating_add(128) {
+        return Err(format!(
+            "refusing bounded APEv2 tail write for '{}': {}-byte owned tail exceeds safety limit",
+            path.display(),
+            original_tail_len
+        ));
+    }
+
+    let mut source = std::fs::File::open(path)
+        .map_err(|error| format!("open APEv2 carrier '{}': {error}", path.display()))?;
+    source
+        .seek(SeekFrom::Start(replace_start))
+        .map_err(|error| format!("seek original APEv2 tail: {error}"))?;
+    let original_tail_len_usize = usize::try_from(original_tail_len)
+        .map_err(|_| "APEv2 original tail length does not fit memory".to_string())?;
+    let mut original_tail = vec![0u8; original_tail_len_usize];
+    source
+        .read_exact(&mut original_tail)
+        .map_err(|error| format!("read original APEv2 tail: {error}"))?;
+    check_metadata_write_cancel(cancel, "after reading the original APEv2 tail")?;
+    let suffix_offset = usize::try_from(footer_end - replace_start)
+        .map_err(|_| "APEv2 suffix offset does not fit memory".to_string())?;
+    let mut committed_tail = Vec::with_capacity(
+        replacement
+            .len()
+            .saturating_add(original_tail.len().saturating_sub(suffix_offset)),
+    );
+    committed_tail.extend_from_slice(&replacement);
+    committed_tail.extend_from_slice(&original_tail[suffix_offset..]);
+    let committed_file_size = replace_start
+        .checked_add(committed_tail.len() as u64)
+        .ok_or_else(|| "APEv2 committed file size overflow".to_string())?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind APEv2 carrier identity source: {error}"))?;
+    let prefix_identity = ape_tail_prefix_identity(&mut source, replace_start)?;
+    drop(source);
+
+    check_metadata_write_cancel(cancel, "before publishing APEv2 tail journal")?;
+    let journal = ape_tail_journal_path(path)?;
+    publish_ape_tail_journal(
+        &journal,
+        ApeTailJournalHeader {
+            state: APE_TAIL_JOURNAL_STATE_PREPARED,
+            replace_start,
+            original_file_size,
+            committed_file_size,
+            original_tail_len,
+            prefix_identity,
+        },
+        &original_tail,
+        cancel,
+        &report_progress,
+    )?;
+
+    snapshot.validate_unchanged(path).map_err(|error| {
+        let cleanup = remove_ape_tail_journal_durably(&journal);
+        match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; additionally failed to retire unused journal: {cleanup}"),
+        }
+    })?;
+    if let Err(error) = check_metadata_write_cancel(cancel, "before mutating APEv2 tail") {
+        let rollback = recover_ape_tail_journal_locked(path, &report_progress);
+        return Err(match rollback {
+            Ok(None) => format!("{error}; original tail restored"),
+            Ok(Some(warning)) => format!("{error}; original tail restored; {warning}"),
+            Err(rollback) => format!(
+                "{error}; rollback failed and journal '{}' was retained: {rollback}",
+                journal.display()
+            ),
+        });
+    }
+
+    let mutation = (|| -> Result<(), String> {
+        let mut target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("open APEv2 tail for update '{}': {error}", path.display()))?;
+        target
+            .seek(SeekFrom::Start(replace_start))
+            .map_err(|error| format!("seek APEv2 replacement tail: {error}"))?;
+        let mut written = 0u64;
+        for chunk in committed_tail.chunks(APE_TAIL_COPY_CHUNK_BYTES) {
+            check_metadata_write_cancel(cancel, "while writing APEv2 metadata tail")?;
+            target
+                .write_all(chunk)
+                .map_err(|error| format!("write APEv2 metadata tail: {error}"))?;
+            written += chunk.len() as u64;
+            report_progress(crate::dsf_tags::DsfWriteProgress {
+                phase: crate::dsf_tags::DsfWriteProgressPhase::WritingTail,
+                bytes_done: written,
+                bytes_total: committed_tail.len() as u64,
+            });
+        }
+        target
+            .set_len(committed_file_size)
+            .map_err(|error| format!("truncate APEv2 carrier to committed size: {error}"))?;
+        target
+            .flush()
+            .map_err(|error| format!("flush APEv2 metadata tail: {error}"))?;
+        record_metadata_replacement_rewrite(committed_tail.len() as u64);
+        record_metadata_source_copy(original_tail.len() as u64);
+        record_metadata_file_sync();
+        target
+            .sync_all()
+            .map_err(|error| format!("sync APEv2 metadata carrier '{}': {error}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = mutation {
+        let rollback = recover_ape_tail_journal_locked(path, &report_progress);
+        return Err(match rollback {
+            Ok(None) => format!("{error}; original tail restored"),
+            Ok(Some(warning)) => format!("{error}; original tail restored; {warning}"),
+            Err(rollback) => format!(
+                "{error}; rollback failed and journal '{}' was retained for startup recovery: {rollback}",
+                journal.display()
+            ),
+        });
+    }
+
+    report_progress(crate::dsf_tags::DsfWriteProgress {
+        phase: crate::dsf_tags::DsfWriteProgressPhase::Publishing,
+        bytes_done: committed_tail.len() as u64,
+        bytes_total: committed_tail.len() as u64,
+    });
+    match mark_ape_tail_journal_committed(&journal) {
+        ApeTailJournalCommitOutcome::Durable => {}
+        ApeTailJournalCommitOutcome::StateUnchanged(error) => {
+            let rollback = recover_ape_tail_journal_locked(path, &report_progress);
+            return Err(match rollback {
+                Ok(None) => format!(
+                    "could not commit APEv2 tail journal for '{}': {error}; original tail restored",
+                    path.display(),
+                ),
+                Ok(Some(warning)) => format!(
+                    "could not commit APEv2 tail journal for '{}': {error}; original tail restored; {warning}",
+                    path.display(),
+                ),
+                Err(rollback) => format!(
+                    "could not commit APEv2 tail journal for '{}': {error}; rollback failed and PREPARED journal '{}' was retained: {rollback}",
+                    path.display(),
+                    journal.display(),
+                ),
+            });
+        }
+        ApeTailJournalCommitOutcome::DurabilityUncertain(error) => {
+            return Err(format!(
+                "APEv2 metadata for '{}' reached the durable target but journal commit durability is uncertain: {error}; journal '{}' was retained so recovery can resolve the durable state",
+                path.display(),
+                journal.display(),
+            ));
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if let Some(warning) = flac_metadata_writer::post_commit_parent_sync_warning(
+        path,
+        "native APEv2 tail metadata commit",
+    ) {
+        warnings.push(warning);
+    }
+    match remove_ape_tail_journal_durably(&journal) {
+        Ok(()) => {}
+        Err(error) => warnings.push(format!(
+            "APEv2 metadata for '{}' committed, but its committed recovery journal could not be retired durably: {error}",
+            path.display()
+        )),
+    }
+    Ok(MetadataWriteCommitReport::from_warnings(warnings))
 }
 
 const INVALID_APE_REPAIR_COPY_CHUNK_BYTES: usize = 1024 * 1024;
@@ -10347,11 +11203,10 @@ fn write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
 
 fn reject_read_only_ape_family_write(path: &std::path::Path) -> Result<(), String> {
     Err(format!(
-        "metadata writes to '{}' are refused this round: tolerant native APEv2 writes are implemented only for WavPack (.wv); .ape and .mpc remain read-fallback-only",
+        "metadata writes to '{}' are unavailable: Musepack (.mpc) remains read-only",
         path.display()
     ))
 }
-
 
 fn write_all_tags_with_cancel_report_at_verification(
     path: &std::path::Path,
@@ -10468,7 +11323,8 @@ fn write_all_tags_with_cancel_report_at_verification(
             }
         }
         crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
-            if wavpack_requires_native_ape_writer(path)? {
+            recover_ape_tail_before_read(path)?;
+            if is_wavpack_path(path) && wavpack_requires_native_ape_writer(path)? {
                 return write_all_tags_native_wavpack_ape_atomic_with_policy(
                     path,
                     changes,
@@ -10476,19 +11332,14 @@ fn write_all_tags_with_cancel_report_at_verification(
                     false,
                 );
             }
-            // Healthy WavPack files retain the pre-Round-8 Lofty writer. The
-            // native serializer is a recovery path only for typed APE decode
-            // failures, keeping its mutation authority as narrow as the field
-            // defect that required it.
-            check_metadata_write_cancel(cancel, "before starting healthy WavPack metadata rewrite")?;
-            return if verification == tui_file_picker::VerificationMode::Standard {
-                write_all_tags_lofty_standard_atomic(path, changes, cancel)
-            } else {
-                let cleanup_warning = write_all_tags_lofty_with_backup(path, changes)?;
-                Ok(MetadataWriteCommitReport::from_warnings(
-                    cleanup_warning.into_iter().collect(),
-                ))
-            };
+            return write_all_tags_native_ape_tail(
+                path,
+                changes,
+                cancel,
+                byte_progress,
+                false,
+                false,
+            );
         }
         crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily => {
             reject_read_only_ape_family_write(path)?;
@@ -10532,7 +11383,7 @@ fn write_all_tags_without_full_file_backup(
         }
         crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
             return Err(format!(
-                "internal transaction error: WavPack policy-dispatch path '{}' reached the legacy full-file writer",
+                "internal transaction error: native APEv2 tail path '{}' reached the legacy full-file writer",
                 path.display()
             ));
         }
@@ -12965,7 +13816,7 @@ fn read_artwork_metadata_for_projection(path: &std::path::Path) -> Result<Source
         return read_metadata_sacd(path);
     }
 
-    flac_metadata_writer::recover_before_read(path)?;
+    recover_metadata_before_read(path)?;
     let tagged = lofty::read_from_path(path)
         .map_err(|e| format!("failed to read metadata before artwork write '{}': {}", path.display(), e))?;
     Ok(source_metadata_from_tags(path, tagged.tags(), false))
@@ -13083,29 +13934,31 @@ fn image_mime_type(
 /// metadata-region writer and its sidecar `.tonepoet-meta-journal`. Callers
 /// must not also create a DB metadata-journal entry pointing at a fake
 /// `.tonepoet-bak`; for FLAC, the sidecar journal is the sole recovery
-/// artifact. Non-FLAC formats continue to use the legacy full-file backup
-/// writer until they receive native metadata-region writers.
+/// artifact. Other formats choose their own recovery authority separately;
+/// notably, healthy WavPack/Monkey's Audio writes use the native APEv2 tail
+/// journal rather than this FLAC-specific predicate.
 pub fn uses_native_flac_metadata_journal(path: &std::path::Path) -> bool {
     flac_metadata_writer::is_probably_flac(path)
 }
 
-/// Recover native FLAC recovery journals before any direct Lofty read outside
+/// Recover native FLAC and APEv2 tail journals before any direct Lofty read outside
 /// this module. For symlinked read paths, this also checks the canonical target
 /// path because native writes are refused through symlinks but a stale journal
 /// may legitimately live beside the real target. Callers that cannot surface the
 /// error should skip the tag read rather than parse a possibly torn metadata
 /// block chain.
 pub fn recover_flac_metadata_before_read(path: &std::path::Path) -> Result<(), String> {
-    flac_metadata_writer::recover_before_read(path)
+    recover_metadata_before_read(path)
 }
 
-/// Recover stale native FLAC metadata journals in one directory. This is used
+/// Recover stale native FLAC, DSF, and APEv2 metadata journals in one directory. This is used
 /// during startup and before browse-visible probes so a process crash during an
 /// in-place metadata write is repaired before Lofty/ffmpeg attempt to parse
 /// a possibly half-written metadata block chain.
 pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec<String> {
     let mut messages = flac_metadata_writer::recover_metadata_journals_in_directory(dir);
     messages.extend(crate::dsf_tags::recover_stale_writes_in_directory(dir));
+    messages.extend(recover_stale_ape_tail_journals_in_dir(dir));
     messages
 }
 
@@ -13254,6 +14107,9 @@ mod tests {
 
     #[test]
     fn all_view_reads_edits_and_deletes_only_the_selected_id3_container() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-all-view-selected-id3-container",
+        );
         use lofty::tag::{ItemKey, TagType};
 
         let (_temp, path) = copy_numbering_fixture("multi-container.mp3", ID3V2_NUMBERING_FIXTURE);
@@ -13360,6 +14216,9 @@ mod tests {
 
     #[test]
     fn all_view_edits_unsuffixed_title_in_id3v1_only_mp3_without_creating_id3v2() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-all-view-id3v1-edit",
+        );
         use lofty::tag::{ItemKey, TagType};
 
         let (_temp, path) = copy_numbering_fixture("id3v1-only-edit.mp3", ID3V2_NUMBERING_FIXTURE);
@@ -13407,6 +14266,9 @@ mod tests {
 
     #[test]
     fn all_view_deletes_unsuffixed_title_from_id3v1_only_mp3() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-all-view-id3v1-delete",
+        );
         use lofty::tag::{ItemKey, TagType};
 
         let (_temp, path) = copy_numbering_fixture("id3v1-only-delete.mp3", ID3V2_NUMBERING_FIXTURE);
@@ -13455,6 +14317,9 @@ mod tests {
 
     #[test]
     fn all_view_new_field_on_id3v1_only_mp3_uses_normal_id3v2_primary() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-all-view-id3v1-new-field",
+        );
         use lofty::tag::{ItemKey, TagType};
 
         let (_temp, path) = copy_numbering_fixture("id3v1-only-new-field.mp3", ID3V2_NUMBERING_FIXTURE);
@@ -13507,6 +14372,9 @@ mod tests {
 
     #[test]
     fn all_view_mixed_mp3_edit_targets_each_files_existing_preferred_container() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-all-view-mixed-mp3-edit",
+        );
         use lofty::tag::{ItemKey, TagType};
 
         let (_temp_a, path_a) = copy_numbering_fixture("mixed-id3v1.mp3", ID3V2_NUMBERING_FIXTURE);
@@ -13563,6 +14431,9 @@ mod tests {
 
     #[test]
     fn all_view_preserves_primary_custom_field_edits() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-all-view-primary-custom-field",
+        );
         let (_temp, path) = copy_numbering_fixture("custom-field.wv", APE_NUMBERING_FIXTURE);
         let key = lofty::tag::ItemKey::Unknown("MOOD".to_string());
         write_all_tags_with_cancel_report_at_verification(
@@ -13917,11 +14788,21 @@ mod tests {
     }
 
     #[test]
-    fn healthy_wavpack_retains_lofty_writer_and_native_is_recovery_only() {
-        let (temp, path) = copy_numbering_fixture("healthy-lofty-route.wv", APE_NUMBERING_FIXTURE);
+    fn healthy_wavpack_write_is_bounded_to_the_ape_tail() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-healthy-wavpack-tail-write",
+        );
+        let (temp, path) = copy_numbering_fixture("healthy-tail-route.wv", APE_NUMBERING_FIXTURE);
+        let before = std::fs::read(&path).expect("read healthy WavPack fixture");
+        let replace_start = read_native_ape_tag(&path)
+            .expect("read native APEv2 tag")
+            .expect("fixture has APEv2")
+            .replace_start as usize;
         let lofty_transactions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = std::sync::Arc::clone(&lofty_transactions);
+        reset_test_metadata_write_io();
 
+        let cue_text = "TITLE \"Exact embedded sheet\"\r\nFILE \"side.wv\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
         with_lofty_fallback_hook(
             temp.path(),
             move |_| {
@@ -13930,25 +14811,277 @@ mod tests {
             || {
                 write_all_tags(
                     &path,
-                    &[(
-                        lofty::tag::ItemKey::TrackTitle,
-                        Some("Healthy Lofty route".to_string()),
-                    )],
+                    &[
+                        (
+                            lofty::tag::ItemKey::TrackTitle,
+                            Some("Bounded native tail route".to_string()),
+                        ),
+                        (
+                            lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                            Some(cue_text.to_string()),
+                        ),
+                    ],
                 )
             },
         )
-        .expect("healthy WavPack write");
+        .expect("healthy WavPack bounded-tail write");
 
         assert_eq!(
             lofty_transactions.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "healthy WavPack must use the established Lofty transaction"
+            0,
+            "healthy WavPack must not enter the full-file Lofty transaction"
         );
-        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some("Healthy Lofty route"));
+        let after = std::fs::read(&path).expect("read rewritten WavPack fixture");
+        assert_eq!(
+            &after[..replace_start],
+            &before[..replace_start],
+            "audio prefix must remain byte-identical"
+        );
+        let io = test_metadata_write_io();
+        assert!(
+            io.source_copy_bytes_read <= (before.len() - replace_start) as u64,
+            "bounded writer copied beyond the original APEv2 tail: {io:?}"
+        );
+        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some("Bounded native tail route"));
+        let tag = read_native_ape_tag(&path)
+            .expect("read rewritten WavPack APEv2 tag")
+            .expect("rewritten WavPack retains APEv2");
+        let stored_cue = tag
+            .items
+            .iter()
+            .find(|item| {
+                item.key
+                    .as_deref()
+                    .is_some_and(|key| native_ape_canonical_key(key) == "CUESHEET")
+            })
+            .expect("rewritten WavPack has CUESHEET");
+        assert_eq!(stored_cue.value, cue_text.as_bytes());
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(!ape_tail_journal_path(&path).expect("journal path").exists());
+    }
+
+    fn synthetic_monkeys_audio_with_ape_tag(path: &std::path::Path, title: &str) -> Vec<u8> {
+        let mut bytes = vec![0x5au8; 2 * 1024 * 1024];
+        bytes[..4].copy_from_slice(b"MAC ");
+        let item = encode_native_ape_text_item("Title", title).expect("encode APEv2 title");
+        bytes.extend_from_slice(
+            &serialize_native_ape_tag(&[item], true).expect("serialize APEv2 fixture tag"),
+        );
+        std::fs::write(path, &bytes).expect("write synthetic Monkey's Audio fixture");
+        bytes
     }
 
     #[test]
-    fn healthy_wavpack_lofty_deletion_observes_combined_numbering_state() {
+    fn monkeys_audio_write_is_enabled_and_bounded_to_the_ape_tail() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-monkeys-audio-tail-write",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.ape");
+        let before = synthetic_monkeys_audio_with_ape_tag(&path, "Old title");
+        let replace_start = read_native_ape_tag(&path)
+            .expect("read synthetic APEv2 tag")
+            .expect("synthetic carrier has APEv2")
+            .replace_start as usize;
+        reset_test_metadata_write_io();
+
+        let cue_text = "TITLE \"Exact ・ sheet\"\nFILE \"album.ape\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        write_all_tags(
+            &path,
+            &[
+                (
+                    lofty::tag::ItemKey::TrackTitle,
+                    Some("New title".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                    Some(cue_text.to_string()),
+                ),
+            ],
+        )
+        .expect("write Monkey's Audio APEv2 tail");
+
+        let after = std::fs::read(&path).expect("read rewritten Monkey's Audio fixture");
+        assert_eq!(&after[..replace_start], &before[..replace_start]);
+        assert_eq!(editor_value(&path, "TITLE").as_deref(), Some("New title"));
+        let tag = read_native_ape_tag(&path)
+            .expect("read rewritten Monkey's Audio APEv2 tag")
+            .expect("rewritten Monkey's Audio retains APEv2");
+        let stored_cue = tag
+            .items
+            .iter()
+            .find(|item| {
+                item.key
+                    .as_deref()
+                    .is_some_and(|key| native_ape_canonical_key(key) == "CUESHEET")
+            })
+            .expect("rewritten Monkey's Audio has CUESHEET");
+        assert_eq!(stored_cue.value, cue_text.as_bytes());
+        let io = test_metadata_write_io();
+        assert!(io.source_copy_bytes_read < 1024 * 1024, "{io:?}");
+        assert!(!crate::db::Database::backup_path_for(&path).exists());
+        assert!(!ape_tail_journal_path(&path).expect("journal path").exists());
+    }
+
+    #[test]
+    fn prepared_ape_tail_journal_restores_the_exact_original_tail() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-ape-tail-prepared-recovery",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("recovery.ape");
+        let original = synthetic_monkeys_audio_with_ape_tag(&path, "Original title");
+        let changes = [(
+            lofty::tag::ItemKey::TrackTitle,
+            Some("Replacement title with a different length".to_string()),
+        )];
+        let (replace_start, footer_end, replacement, unchanged) =
+            prepare_native_ape_replacement(&path, &changes, false, false)
+                .expect("prepare APEv2 replacement");
+        assert!(!unchanged);
+        let mut source = std::fs::File::open(&path).expect("open recovery fixture");
+        source.seek(SeekFrom::Start(replace_start)).expect("seek original tail");
+        let mut original_tail = Vec::new();
+        source.read_to_end(&mut original_tail).expect("read original tail");
+        let suffix_offset = (footer_end - replace_start) as usize;
+        let mut committed_tail = replacement;
+        committed_tail.extend_from_slice(&original_tail[suffix_offset..]);
+        source.seek(SeekFrom::Start(0)).expect("rewind identity source");
+        let identity = ape_tail_prefix_identity(&mut source, replace_start)
+            .expect("compute prefix identity");
+        let journal = ape_tail_journal_path(&path).expect("journal path");
+        publish_ape_tail_journal(
+            &journal,
+            ApeTailJournalHeader {
+                state: APE_TAIL_JOURNAL_STATE_PREPARED,
+                replace_start,
+                original_file_size: original.len() as u64,
+                committed_file_size: replace_start + committed_tail.len() as u64,
+                original_tail_len: original_tail.len() as u64,
+                prefix_identity: identity,
+            },
+            &original_tail,
+            None,
+            &|_| {},
+        )
+        .expect("publish prepared journal");
+        let mut target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open mutation target");
+        target.seek(SeekFrom::Start(replace_start)).expect("seek mutation tail");
+        target
+            .write_all(&committed_tail[..committed_tail.len() / 2])
+            .expect("write torn replacement");
+        target.sync_all().expect("sync torn replacement");
+        drop(target);
+
+        let messages = recover_stale_flac_metadata_journals_in_dir(temp.path());
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("recovered interrupted APEv2 tail write")),
+            "startup recovery must report the recovered APEv2 transaction: {messages:?}",
+        );
+        assert_eq!(std::fs::read(&path).expect("read recovered fixture"), original);
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn committed_ape_tail_journal_adopts_the_durable_new_tail() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-ape-tail-committed-recovery",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("committed.ape");
+        let original = synthetic_monkeys_audio_with_ape_tag(&path, "Original title");
+        let changes = [(
+            lofty::tag::ItemKey::TrackTitle,
+            Some("Durable replacement title".to_string()),
+        )];
+        let (replace_start, footer_end, replacement, unchanged) =
+            prepare_native_ape_replacement(&path, &changes, false, false)
+                .expect("prepare committed APEv2 replacement");
+        assert!(!unchanged);
+        let mut source = std::fs::File::open(&path).expect("open committed fixture");
+        source
+            .seek(SeekFrom::Start(replace_start))
+            .expect("seek original committed tail");
+        let mut original_tail = Vec::new();
+        source
+            .read_to_end(&mut original_tail)
+            .expect("read original committed tail");
+        let suffix_offset = usize::try_from(footer_end - replace_start)
+            .expect("bounded committed suffix offset");
+        let mut committed_tail = replacement;
+        committed_tail.extend_from_slice(&original_tail[suffix_offset..]);
+        source
+            .seek(SeekFrom::Start(0))
+            .expect("rewind committed identity source");
+        let identity = ape_tail_prefix_identity(&mut source, replace_start)
+            .expect("compute committed prefix identity");
+        let journal = ape_tail_journal_path(&path).expect("journal path");
+        publish_ape_tail_journal(
+            &journal,
+            ApeTailJournalHeader {
+                state: APE_TAIL_JOURNAL_STATE_PREPARED,
+                replace_start,
+                original_file_size: original.len() as u64,
+                committed_file_size: replace_start + committed_tail.len() as u64,
+                original_tail_len: original_tail.len() as u64,
+                prefix_identity: identity,
+            },
+            &original_tail,
+            None,
+            &|_| {},
+        )
+        .expect("publish committed recovery journal");
+        let mut target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open committed mutation target");
+        target
+            .seek(SeekFrom::Start(replace_start))
+            .expect("seek committed mutation tail");
+        target
+            .write_all(&committed_tail)
+            .expect("write committed replacement tail");
+        target
+            .set_len(replace_start + committed_tail.len() as u64)
+            .expect("set committed replacement length");
+        target.sync_all().expect("sync committed replacement");
+        drop(target);
+        assert_eq!(
+            mark_ape_tail_journal_committed(&journal),
+            ApeTailJournalCommitOutcome::Durable,
+        );
+
+        let messages = recover_stale_flac_metadata_journals_in_dir(temp.path());
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("recovered interrupted APEv2 tail write")),
+            "startup recovery must adopt the committed APEv2 transaction: {messages:?}",
+        );
+        assert!(!journal.exists());
+        assert_ne!(std::fs::read(&path).expect("read committed fixture"), original);
+        assert_eq!(
+            editor_value(&path, "TITLE").as_deref(),
+            Some("Durable replacement title"),
+        );
+    }
+
+    #[test]
+    fn healthy_wavpack_native_tail_deletion_observes_combined_numbering_state() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-wavpack-healthy-tail-delete",
+        );
         let (_temp, path) =
             copy_numbering_fixture("healthy-lofty-numbering-delete.wv", APE_NUMBERING_FIXTURE);
         write_all_tags(
@@ -13964,7 +15097,7 @@ mod tests {
                 ),
             ],
         )
-        .expect("seed healthy Lofty APE combined numbering");
+        .expect("seed healthy native APE combined numbering");
         assert_eq!(editor_numbering_value(&path, "TRACKNUMBER"), "7");
         assert_eq!(editor_numbering_value(&path, "TRACKTOTAL"), "12");
 
@@ -14039,6 +15172,147 @@ mod tests {
         .expect("matching read-only value is an idempotent no-op");
 
         assert_eq!(std::fs::read(&path).expect("re-read WavPack fixture"), before);
+    }
+
+    #[test]
+    fn musepack_reads_renamed_wavpack_and_refuses_mutation_before_transaction() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-musepack-read-only",
+        );
+        let (temp, seed) = copy_numbering_fixture("disc.wv", APE_NUMBERING_FIXTURE);
+        let path = temp.path().join("disc.mpc");
+        let cue = concat!(
+            "TITLE \"Read-only Embedded\"\n",
+            "FILE \"disc.mpc\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"First\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        write_all_tags_with_cancel_report_at_verification(
+            &seed,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(cue.to_string()),
+            )],
+            None,
+            None,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("seed embedded CUESHEET through writable WavPack route");
+        std::fs::rename(&seed, &path).expect("rename WavPack fixture to Musepack route");
+
+        assert_eq!(
+            crate::metadata_persistence::metadata_persistence_route_for_path(&path),
+            crate::metadata_persistence::MetadataPersistenceRoute::ReadOnlyApeFamily,
+        );
+        let read = read_all_tags_merged_with_metadata(std::slice::from_ref(&path))
+            .expect("read renamed WavPack bytes through Lofty content detection");
+        assert!(read.metadata_errors[0].is_none());
+        assert!(read.entries.iter().any(|entry| {
+            entry.display_key.eq_ignore_ascii_case("CUESHEET")
+                && entry.per_file_values.first().map(String::as_str) == Some(cue)
+        }));
+        // The embedded CUESHEET is readable (asserted above), but
+        // `embedded_cue_availability` reports whether the cue is *editable* on
+        // this carrier (it gates the embedded-cue edit affordance). Musepack is
+        // read-only, so a valid-but-unwritable embedded cue is correctly Absent.
+        assert_eq!(
+            read.metadata[0].embedded_cue_availability,
+            EmbeddedCueAvailability::Absent,
+        );
+
+        let before = std::fs::read(&path).expect("snapshot read-only Musepack fixture");
+        let expected_refusal = reject_read_only_ape_family_write(&path)
+            .expect_err("read-only route must refuse mutation");
+        let backup = crate::db::Database::backup_path_for(&path);
+        assert!(!backup.exists());
+
+        let fallback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_hook = std::sync::Arc::clone(&fallback_calls);
+        with_lofty_fallback_hook(
+            temp.path(),
+            move |_| {
+                calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            || {
+                for (label, changes) in [
+                    (
+                        "ordinary tag write",
+                        vec![(
+                            lofty::tag::ItemKey::TrackTitle,
+                            Some("Changed title".to_string()),
+                        )],
+                    ),
+                    (
+                        "embedded CUESHEET replacement",
+                        vec![(
+                            lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                            Some("replacement".to_string()),
+                        )],
+                    ),
+                    (
+                        "embedded CUESHEET removal",
+                        vec![(
+                            lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                            None,
+                        )],
+                    ),
+                    (
+                        "track numbering write",
+                        vec![(
+                            lofty::tag::ItemKey::Unknown("TRACKNUMBER".to_string()),
+                            Some("7/17".to_string()),
+                        )],
+                    ),
+                    (
+                        "disc numbering write",
+                        vec![(
+                            lofty::tag::ItemKey::Unknown("DISCNUMBER".to_string()),
+                            Some("1/2".to_string()),
+                        )],
+                    ),
+                ] {
+                    let error = match write_all_tags_with_cancel_report_at_verification(
+                        &path,
+                        &changes,
+                        None,
+                        None,
+                        tui_file_picker::VerificationMode::Strong,
+                    ) {
+                        Ok(_) => panic!("{label} must be refused"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error, expected_refusal, "{label} refusal");
+                    assert_eq!(
+                        std::fs::read(&path).expect("re-read refused Musepack write"),
+                        before,
+                        "{label} must leave the carrier byte-identical",
+                    );
+                    assert!(!backup.exists(), "{label} must not allocate a rollback backup");
+                }
+
+                let inline_error = write_metadata_field_transactional_with_control_at_verification(
+                    &path,
+                    MetadataField::Title,
+                    "Changed inline title",
+                    None,
+                    None,
+                    tui_file_picker::VerificationMode::Strong,
+                )
+                .expect_err("strong inline Musepack edit must be refused before transaction");
+                assert_eq!(inline_error, expected_refusal);
+                assert_eq!(
+                    std::fs::read(&path).expect("re-read refused inline Musepack write"),
+                    before,
+                );
+                assert!(!backup.exists());
+            },
+        );
+        assert_eq!(
+            fallback_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "read-only Musepack refusals must not enter the Lofty fallback writer",
+        );
     }
 
     #[test]
@@ -14692,8 +15966,12 @@ mod tests {
         // counts. A total is a single count, not a number/total fraction, so
         // fraction spellings are intentionally not exercised here: writing a
         // fraction into a total field is invalid input rather than a supported
-        // round trip. Persisting a total synthesizes a zero number when absent.
-        for total_key in ["TRACKTOTAL", "DISCTOTAL"] {
+        // round trip. Because APEv2 has no bare-total representation, persisting
+        // a total with no number stores `0/total`; the synthesized zero is a
+        // real, readable number and must remain stable across repeated writes.
+        for (number_key, total_key) in
+            [("TRACKNUMBER", "TRACKTOTAL"), ("DISCNUMBER", "DISCTOTAL")]
+        {
             for input in ["7", "01"] {
                 let (_temp, path) = copy_numbering_fixture(file_name, fixture);
                 let change = [(
@@ -14707,6 +15985,11 @@ mod tests {
                     editor_numbering_value(&path, total_key),
                     input,
                     "APE {total_key}={input:?} must preserve the total spelling"
+                );
+                assert_eq!(
+                    editor_numbering_value(&path, number_key),
+                    "0",
+                    "APE {total_key}={input:?} must materialize the absent {number_key} as zero"
                 );
                 assert_lofty_repetition_skips_transaction(
                     &path,
@@ -15130,6 +16413,9 @@ mod tests {
 
     #[test]
     fn ape_numbering_capability_matches_production_round_trip() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-ape-numbering-round-trip",
+        );
         assert_ape_numbering_backend_round_trip(
             "numbering.wv",
             APE_NUMBERING_FIXTURE,
@@ -15179,6 +16465,9 @@ mod tests {
 
     #[test]
     fn ape_punctuation_custom_fields_remain_independent_on_real_carrier() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-ape-punctuation-custom-fields",
+        );
         let (_temp, path) = copy_numbering_fixture("custom.wv", APE_NUMBERING_FIXTURE);
         let custom_changes = [
             (
@@ -15320,6 +16609,9 @@ mod tests {
 
     #[test]
     fn ape_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-ape-numbering-alias-conflicts",
+        );
         assert_typed_numbering_conflicts_fail_closed(
             "aliases.wv",
             APE_NUMBERING_FIXTURE,
@@ -15886,11 +17178,11 @@ mod tests {
                 )
             },
         )
-        .expect("healthy WavPack inline write uses Lofty");
+        .expect("healthy WavPack inline write uses bounded native tail writer");
         assert_eq!(
             lofty_transactions.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "healthy inline WavPack write must use the established Lofty transaction"
+            0,
+            "healthy inline WavPack write must bypass the full-file Lofty transaction"
         );
         assert_eq!(
             editor_value(&healthy, "TITLE").as_deref(),

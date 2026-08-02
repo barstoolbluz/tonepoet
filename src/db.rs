@@ -195,6 +195,19 @@ impl Database {
                 .map_err(|e| format!("failed to create DB directory {}: {e}", parent.display()))?;
         }
 
+        // Serialize connection creation + WAL initialization process-wide.
+        // Switching a freshly created database into WAL mode requires that no
+        // other connection is open; concurrent opens (e.g. writing metadata to
+        // several files in quick succession, each opening its own connection)
+        // would otherwise race and fail with "database is locked". This lock
+        // only gates the brief open+pragma window — once WAL is established the
+        // journal_mode pragma is a no-op, so overlapping connections thereafter
+        // are fine.
+        static DB_OPEN_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _init = DB_OPEN_INIT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let conn = Connection::open(path)
             .map_err(|e| format!("failed to open database {}: {e}", path.display()))?;
         Self::from_connection(conn, DatabasePragmaProfile::FileBacked)
@@ -215,6 +228,15 @@ impl Database {
     ) -> Result<Self, String> {
         match profile {
             DatabasePragmaProfile::FileBacked => {
+                // Wait (rather than immediately failing with "database is
+                // locked") when another connection briefly holds the lock. This
+                // must precede the WAL pragma: switching journal_mode to WAL
+                // takes a transient exclusive lock, and on a freshly created DB
+                // with rapid successive opens (e.g. multi-file metadata writes)
+                // that lock can momentarily collide. Without a busy timeout the
+                // default is zero and the very first write fails.
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|e| format!("busy_timeout pragma failed: {}", e))?;
                 // WAL mode for crash safety + concurrent reads. This is part of
                 // the production behavior and must be exercised by temp-file DB
                 // tests too.
@@ -3425,6 +3447,8 @@ impl CachedProbeRow {
                 isrc: None, // Not cached; re-read on full probe (only used by :cue).
                 tool: None, // Not cached; re-read on full probe.
                 artwork: Vec::new(), // Not cached; re-read on full probe.
+                embedded_cue_availability:
+                    crate::tui::probe::EmbeddedCueAvailability::Unknown,
             },
         })
     }
@@ -4605,6 +4629,8 @@ mod tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
         let entry = DirectorySummaryCacheEntry {
             identity,

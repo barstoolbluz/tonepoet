@@ -4401,6 +4401,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let (rendered, info) = render_classification(entry, classification);
@@ -4458,6 +4460,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let (rendered, _) = render_classification(entry, classification);
@@ -4488,6 +4492,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let (rendered, _) = render_classification(entry, classification);
@@ -4517,6 +4523,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let mut browse = BrowseState::new();
@@ -4575,6 +4583,8 @@ mod folder_classification_info_pane_tests {
             collection_many: true,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let mut browse = BrowseState::new();
@@ -4696,6 +4706,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: Some(FolderDiscMarkerKind::BluRay),
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let mut browse = BrowseState::new();
@@ -4763,6 +4775,8 @@ mod folder_classification_info_pane_tests {
                 collection_many: false,
                 io_budget_exhausted: false,
                 disc_marker: Some(marker),
+                embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+                cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             };
             let mut contents = disc_contents(nested_iso.clone());
             contents.presentations.truncate(1);
@@ -4844,6 +4858,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: Some(FolderDiscMarkerKind::BluRay),
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
         let mut contents = disc_contents(root.clone());
         contents.copy_protection.description = "  AACS  ".to_string();
@@ -4892,6 +4908,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: Some(FolderDiscMarkerKind::BluRay),
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
         let mut contents = disc_contents(root.clone());
         contents.copy_protection.description = "  none  ".to_string();
@@ -4940,6 +4958,8 @@ mod folder_classification_info_pane_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: Some(FolderDiscMarkerKind::BluRay),
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let mut browse = BrowseState::new();

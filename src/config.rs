@@ -384,6 +384,13 @@ pub fn normalized_aggregate_metadata_target_priority(
             normalized.push(target);
         }
     }
+    if normalized.as_slice() != configured {
+        log::debug!(
+            "normalized aggregate metadata target priority from {:?} to {:?}",
+            configured,
+            normalized,
+        );
+    }
     normalized
 }
 

@@ -775,6 +775,8 @@ mod tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: Some(marker),
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());

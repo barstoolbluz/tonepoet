@@ -189,7 +189,7 @@ pub(crate) use crate::convert::queue_expansion::{
 };
 #[cfg(test)]
 pub(crate) use crate::convert::queue_expansion::path_list_contains;
-use crate::tui::probe::{SourceInfo, SourceMetadata};
+use crate::tui::probe::{CueImportAvailability, EmbeddedCueAvailability, SourceInfo, SourceMetadata};
 use crate::tui::disc_browser::{DiscProbeCacheEntry, DiscProbeFollowup};
 use crate::tui::text_input::TextInputState;
 
@@ -356,6 +356,7 @@ struct FolderClassifyRequest {
     identity: ProbeCacheIdentity,
     scan_generation: u64,
     cursor_focused: bool,
+    probe_cue_availability: bool,
 }
 
 /// Coalesced Browse reducer work. Async completions set these flags while the
@@ -911,6 +912,8 @@ impl DirectorySummaryCacheEntry {
                 collection_many: fields[12] == "1",
                 io_budget_exhausted: fields[13] == "1",
                 disc_marker: directory_summary_marker_from_code(fields[14]),
+                embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+                cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             };
             entry.facts.classification_scope = Some(classification_scope);
             entry.facts.classification = Some(Arc::new(classification));
@@ -1026,6 +1029,15 @@ pub struct FolderContentClassification {
     pub collection_many: bool,
     pub io_budget_exhausted: bool,
     pub disc_marker: Option<FolderDiscMarkerKind>,
+    /// Exact embedded-only authority for this folder's bounded audio member
+    /// set. Normal hover classification leaves this `Unknown`; an explicit
+    /// context-menu request reuses the same worker and enriches the cached
+    /// result without blocking the reducer.
+    pub embedded_cue_availability: EmbeddedCueAvailability,
+    /// Sidecar CUE availability for Browse `Get tags from CUE`. Normal folder
+    /// classification leaves this `Unknown`; the explicit context-menu probe
+    /// resolves it on the same worker as embedded authority.
+    pub cue_import_availability: CueImportAvailability,
 }
 
 fn classification_summary_scope(classification: &FolderContentClassification) -> DirectorySummaryScope {
@@ -1060,6 +1072,8 @@ impl FolderContentClassification {
             collection_many: false,
             io_budget_exhausted,
             disc_marker: None,
+            embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         }
     }
 
@@ -1073,6 +1087,8 @@ impl FolderContentClassification {
             collection_many: many,
             io_budget_exhausted,
             disc_marker: None,
+            embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         }
     }
 
@@ -2299,6 +2315,7 @@ pub(crate) struct PendingTagTransfer {
     pub scope: super::app::TagTransferScope,
     pub verification: tui_file_picker::VerificationMode,
     pub require_browse_confirmation: bool,
+    pub metadata_target_priority: Vec<crate::config::AggregateMetadataTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -2615,6 +2632,12 @@ pub struct BrowseState {
     /// Folder classifications currently queued or running. Used to debounce
     /// cursor focus and avoid duplicate bounded walks for the same path.
     folder_classification_pending: std::collections::HashSet<PathBuf>,
+
+    /// Explicit menu requests that need an embedded-only authority result.
+    /// This survives an already-running ordinary folder classification; its
+    /// completion immediately schedules one enriched pass through the same
+    /// bounded worker instead of launching a competing discovery subsystem.
+    folder_cue_availability_probe_requested: std::collections::HashSet<PathBuf>,
 
     /// Folder classifications waiting for the same debounce/cursor-stale
     /// machinery as Browse audio probes. Kept tiny because only cursor-focused
@@ -3093,6 +3116,7 @@ impl BrowseState {
             directory_stats_cold_work_policy: BrowseDirectoryStatsColdWorkPolicy::default(),
             folder_classification_cache: HashMap::new(),
             folder_classification_pending: std::collections::HashSet::new(),
+            folder_cue_availability_probe_requested: std::collections::HashSet::new(),
             folder_classification_queue: VecDeque::new(),
             sacd_classify_cache: HashMap::new(),
             dvda_iso_classify_cache: HashMap::new(),
@@ -6904,6 +6928,24 @@ impl BrowseState {
         self.probe_cache.insert(path, entry);
     }
 
+    /// Test-only: insert a folder classification using the synthetic identity
+    /// used by `BrowseEntry::new(..., 0, None)` fixtures.
+    #[cfg(test)]
+    pub fn insert_folder_classification_for_test(
+        &mut self,
+        path: PathBuf,
+        classification: FolderContentClassification,
+    ) {
+        let identity = ProbeCacheIdentity {
+            modified: None,
+            size: 0,
+        };
+        self.folder_classification_cache.insert(
+            path,
+            FolderClassificationCacheEntry::new(identity, classification),
+        );
+    }
+
     pub fn remove_probe_cache_entry(&mut self, path: &Path) {
         self.probe_cache.remove(path);
         self.probe_cache_needs_metadata_enrichment.remove(path);
@@ -7958,8 +8000,71 @@ impl BrowseState {
             identity,
             scan_generation: self.scan_generation,
             cursor_focused: true,
+            probe_cue_availability: false,
         });
         self.launch_ready_folder_classifications(tx);
+    }
+
+    /// Request exact CUE availability for the currently selected folder.
+    /// The ordinary folder classifier remains extension-only and fast; this
+    /// explicit request enriches its cached result on the same bounded worker
+    /// only when the context menu needs sidecar-import and embedded-only facts.
+    pub fn request_current_folder_cue_availability(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        let Some(entry) = self.entries.get(self.selected_index).cloned() else {
+            return;
+        };
+        if !entry.is_child_dir() {
+            return;
+        }
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        if self
+            .valid_folder_classification_for_entry(&entry)
+            .is_some_and(|classification| {
+                classification.embedded_cue_availability
+                    != EmbeddedCueAvailability::Unknown
+                    && classification.cue_import_availability
+                        != CueImportAvailability::Unknown
+            })
+        {
+            self.folder_cue_availability_probe_requested.remove(&entry.path);
+            return;
+        }
+
+        self.folder_cue_availability_probe_requested
+            .insert(entry.path.clone());
+        if self.folder_classification_pending.contains(&entry.path) {
+            return;
+        }
+
+        self.folder_classification_pending.insert(entry.path.clone());
+        self.folder_classification_queue
+            .retain(|request| !same_scanned_path(&request.path, &entry.path));
+        self.folder_classification_queue.push_front(FolderClassifyRequest {
+            path: entry.path,
+            identity,
+            scan_generation: self.scan_generation,
+            cursor_focused: true,
+            probe_cue_availability: true,
+        });
+        self.launch_ready_folder_classifications(tx);
+    }
+
+    /// Continue an explicit CUE-availability request after an already-running
+    /// ordinary classification publishes its extension-only result.
+    pub fn continue_requested_folder_cue_availability_probe(
+        &mut self,
+        path: &Path,
+        tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        if !self.folder_cue_availability_probe_requested.contains(path)
+            || !self.is_current_entry_path(path)
+        {
+            return;
+        }
+        self.request_current_folder_cue_availability(tx);
     }
 
     fn discard_stale_queued_folder_classifications(&mut self) {
@@ -7996,8 +8101,22 @@ impl BrowseState {
                 self.folder_classification_pending.remove(&request.path);
                 continue;
             }
-            if self.has_valid_folder_classification_for_identity(&request.path, request.identity) {
+            let cached_satisfies_request = self
+                .folder_classification_cache
+                .get(&request.path)
+                .filter(|cached| cached.is_valid_for(request.identity))
+                .is_some_and(|cached| {
+                    !request.probe_cue_availability
+                        || (cached.classification.embedded_cue_availability
+                            != EmbeddedCueAvailability::Unknown
+                            && cached.classification.cue_import_availability
+                                != CueImportAvailability::Unknown)
+                });
+            if cached_satisfies_request {
                 self.folder_classification_pending.remove(&request.path);
+                if request.probe_cue_availability {
+                    self.folder_cue_availability_probe_requested.remove(&request.path);
+                }
                 continue;
             }
             let Some(current_identity) = std::fs::metadata(&request.path)
@@ -8016,7 +8135,19 @@ impl BrowseState {
                 }
                 continue;
             }
-            spawn_folder_classification(request.path, request.identity, tx.clone());
+            if request.probe_cue_availability {
+                // The explicit request has now been consumed. Leaving the
+                // marker armed would reschedule forever when a bounded scan
+                // legitimately returns `Unknown` (for example, budget
+                // exhaustion on an unusually large directory).
+                self.folder_cue_availability_probe_requested.remove(&request.path);
+            }
+            spawn_folder_classification(
+                request.path,
+                request.identity,
+                request.probe_cue_availability,
+                tx.clone(),
+            );
         }
     }
 
@@ -8027,6 +8158,7 @@ impl BrowseState {
     pub fn clear_folder_classification_work_queue(&mut self) {
         self.folder_classification_queue.clear();
         self.folder_classification_pending.clear();
+        self.folder_cue_availability_probe_requested.clear();
     }
 
     fn spawn_cached_probe_metadata_completion_if_needed(
@@ -8907,11 +9039,20 @@ fn spawn_cached_audio_probe_metadata_completion(
             if cancel_for_task.load(Ordering::Relaxed) {
                 return Err("cached probe metadata task cancelled".to_string());
             }
-            if info.metadata.preemphasis_metadata.is_none()
-                && !cancel_for_task.load(Ordering::Relaxed)
-            {
-                info.metadata.preemphasis_metadata =
-                    crate::tui::probe::preemphasis_metadata_check_blocking(&path_for_task);
+            if !cancel_for_task.load(Ordering::Relaxed) {
+                match crate::tui::probe::read_metadata(&path_for_task) {
+                    Ok(mut metadata) => {
+                        if metadata.hdcd_detail.is_none() {
+                            metadata.hdcd_detail = info.metadata.hdcd_detail.take();
+                        }
+                        info.metadata = metadata;
+                    }
+                    Err(_) if info.metadata.preemphasis_metadata.is_none() => {
+                        info.metadata.preemphasis_metadata =
+                            crate::tui::probe::preemphasis_metadata_check_blocking(&path_for_task);
+                    }
+                    Err(_) => {}
+                }
             }
             if cancel_for_task.load(Ordering::Relaxed) {
                 Err("cached probe metadata task cancelled".to_string())
@@ -9918,6 +10059,7 @@ fn entry_type_rank(kind: &EntryKind) -> u8 {
         EntryKind::AudioFile(AudioFormat::Dts) => 20,
         EntryKind::AudioFile(AudioFormat::Ac3) => 21,
         EntryKind::AudioFile(AudioFormat::Ape) => 22,
+        EntryKind::AudioFile(AudioFormat::Musepack) => 22,
         EntryKind::AudioFile(AudioFormat::Shorten) => 23,
         EntryKind::AudioFile(AudioFormat::Ogg) => 24,
         EntryKind::AudioFile(AudioFormat::Tta) => 25,
@@ -9951,12 +10093,43 @@ fn folder_probe_profile_label(info: &SourceInfo) -> String {
 pub fn spawn_folder_classification(
     path: PathBuf,
     identity: ProbeCacheIdentity,
+    probe_cue_availability: bool,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
         let classify_path = path.clone();
         let classification = tokio::task::spawn_blocking(move || {
-            classify_folder_content_blocking(&classify_path, identity)
+            let mut classification = classify_folder_content_blocking(&classify_path, identity);
+            if probe_cue_availability {
+                let incomplete_member_set = classification.io_budget_exhausted
+                    || (classification.audio.file_paths.is_empty()
+                        && matches!(
+                            classification.kind,
+                            FolderClassificationKind::Collection
+                                | FolderClassificationKind::Unknown
+                        ));
+                let embedded = super::keybindings::embedded_cuesheet_availability_for_paths(
+                    &classification.audio.file_paths,
+                );
+                classification.embedded_cue_availability = if incomplete_member_set
+                    && embedded == EmbeddedCueAvailability::Absent
+                {
+                    EmbeddedCueAvailability::Unknown
+                } else {
+                    embedded
+                };
+                let cue_import = super::keybindings::cue_import_availability_for_paths(
+                    &classification.audio.file_paths,
+                );
+                classification.cue_import_availability = if incomplete_member_set
+                    && cue_import == CueImportAvailability::Absent
+                {
+                    CueImportAvailability::Unknown
+                } else {
+                    cue_import
+                };
+            }
+            classification
         })
         .await
         .unwrap_or_else(|err| {
@@ -10066,6 +10239,8 @@ fn classify_folder_content_blocking(
             collection_many: false,
             io_budget_exhausted: budget.exhausted,
             disc_marker: None,
+            embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
     }
 
@@ -10079,6 +10254,8 @@ fn classify_folder_content_blocking(
             collection_many: false,
             io_budget_exhausted: budget.exhausted,
             disc_marker: Some(marker),
+            embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         };
     }
 
@@ -10262,6 +10439,8 @@ fn classify_units_if_decided(
                 collection_many: false,
                 io_budget_exhausted,
                 disc_marker: common_unit_disc_marker(units),
+                embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+                cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             })
         }
         MultiDiscDecision::Collection => Some(FolderContentClassification::collection(
@@ -10300,6 +10479,8 @@ fn finalize_folder_units(
                 units: vec![unit],
                 collection_many: false,
                 io_budget_exhausted,
+                embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+                cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             }
         }
         _ => classify_units_if_decided(
@@ -15839,6 +16020,8 @@ mod browse_perf_followup_v10_tests {
             collection_many: true,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability: EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         }));
         entry.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
         entry.facts.stats = Some(Arc::new(DirStats {

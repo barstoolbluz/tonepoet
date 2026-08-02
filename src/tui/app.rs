@@ -4620,7 +4620,7 @@ impl FormatState {
                 }
             }
             // Ape/Shorten/TTA are lossless but not encodable; same constraints as FLAC.
-            AudioFormat::Ape | AudioFormat::Shorten | AudioFormat::Tta => {
+            AudioFormat::Ape | AudioFormat::Musepack | AudioFormat::Shorten | AudioFormat::Tta => {
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
                 for opt in &mut self.sample_rate.options {

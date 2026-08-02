@@ -21,6 +21,7 @@ macro_rules! supported_audio_extension_table {
             "aifc" => AudioFormat::Aiff,
             "wv" => AudioFormat::WavPack,
             "ape" => AudioFormat::Ape,
+            "mpc" => AudioFormat::Musepack,
             "dsf" => AudioFormat::Dsf,
             "dff" => AudioFormat::Dff,
             "shn" => AudioFormat::Shorten,
@@ -228,6 +229,19 @@ mod tests {
             );
             assert!(is_audio_file_path(&path));
         }
+    }
+
+    #[test]
+    fn musepack_is_recognized_as_input_audio() {
+        assert_eq!(
+            audio_format_from_extension("MPC"),
+            Some(AudioFormat::Musepack)
+        );
+        assert_eq!(
+            classify_file(Path::new("disc.mpc")),
+            EntryKind::AudioFile(AudioFormat::Musepack)
+        );
+        assert!(is_audio_file_path(Path::new("disc.MPC")));
     }
 
     #[test]

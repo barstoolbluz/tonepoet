@@ -8597,12 +8597,13 @@ async fn execute_commands(
             ));
         }
         let (window_start, window_end) = windows[index];
+        let description = user_facing_planned_description(&planned.description);
         let label = format!(
             "{} - step {} of {} - {}",
             track_label,
             index + 1,
             commands.len(),
-            planned.description
+            description
         );
         progress
             .estimated_with_key(
@@ -8794,12 +8795,23 @@ fn command_record_for_unstarted_command(cmd: &ToolCommand) -> CommandRecord {
 }
 
 fn non_empty_planned_description(planned: &PlannedCommand) -> Option<String> {
-    let description = planned.description.trim();
+    let description = user_facing_planned_description(&planned.description);
+    let description = description.trim();
     if description.is_empty() {
         None
     } else {
         Some(description.to_string())
     }
+}
+
+fn user_facing_planned_description(description: &str) -> String {
+    // FFmpeg still requires `-strict experimental` for true 32-bit FLAC on
+    // supported builds, but that compatibility switch is not a meaningful
+    // user-facing encoder qualification. Keep the operational argument while
+    // removing the derived qualifier from both live progress and command logs.
+    description
+        .replace(" with FFmpeg experimental encoder", " with FFmpeg")
+        .replace("FFmpeg experimental encoder", "FFmpeg")
 }
 
 fn set_sox_omp_threads(cmd: &mut ToolCommand, threads: u32) {
@@ -9390,40 +9402,41 @@ fn planned_tool_error_message(
     planned: &PlannedCommand,
     err: &ToolRunnerError,
 ) -> String {
+    let description = user_facing_planned_description(&planned.description);
     match err {
         ToolRunnerError::NonZeroExit { stderr_tail, .. } => format!(
             "planned command {} failed ({}): {}",
             index + 1,
-            planned.description,
+            description,
             stderr_tail
         ),
         ToolRunnerError::Timeout { elapsed, .. } => format!(
             "planned command {} timed out after {:?} ({})",
             index + 1,
             elapsed,
-            planned.description
+            description
         ),
         ToolRunnerError::Cancelled { .. } => "cancelled".to_string(),
         ToolRunnerError::Spawn { .. } => format!(
             "planned command {} failed to start ({})",
             index + 1,
-            planned.description
+            description
         ),
         ToolRunnerError::UnsupportedPipeline => format!(
             "planned command {} requires a runner with typed pipeline support ({})",
             index + 1,
-            planned.description
+            description
         ),
         ToolRunnerError::Termination { message, .. } => format!(
             "planned command {} could not prove process termination/reaping ({}): {}",
             index + 1,
-            planned.description,
+            description,
             message
         ),
         ToolRunnerError::Io(err) => format!(
             "planned command {} failed before execution ({}): {}",
             index + 1,
-            planned.description,
+            description,
             err
         ),
     }
@@ -9483,6 +9496,20 @@ mod tests {
     use tonepoet_pipeline::{AudioFormat, InputSource, OutputSink, PipelineSettings, ToolIdentifier};
 
     use super::*;
+
+    #[test]
+    fn true_32_bit_flac_description_omits_experimental_encoder_qualifier() {
+        assert_eq!(
+            user_facing_planned_description(
+                "Encode true 32-bit FLAC with FFmpeg experimental encoder",
+            ),
+            "Encode true 32-bit FLAC with FFmpeg",
+        );
+        assert_eq!(
+            user_facing_planned_description("Encode FLAC with FFmpeg"),
+            "Encode FLAC with FFmpeg",
+        );
+    }
 
     fn valid_loudnorm_json(input_tp: &str) -> String {
         format!(

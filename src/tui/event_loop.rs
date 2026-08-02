@@ -1214,7 +1214,7 @@ fn reduce_file_picker_complete(
             direction,
             scope,
             fixed_roots,
-            ..
+            metadata_target_priority,
         } => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale tag-transfer completion");
@@ -1238,6 +1238,7 @@ fn reduce_file_picker_complete(
                 source_roots,
                 target_roots,
                 scope,
+                metadata_target_priority,
                 tx,
             );
         }
@@ -4344,6 +4345,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     app.browse.mark_probe_cache_update_pending(false);
                 }
             }
+            super::context_menu::refresh_open_browse_entry_menu(app);
         }
         AppMessage::DiscProbeComplete { path, fingerprint, result } => {
             if !app.browse.complete_disc_probe(&path) {
@@ -4458,6 +4460,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     let is_current = app.browse.is_current_entry_path(&path);
                     app.browse.insert_folder_classification_for_identity(path.clone(), identity, classification);
                     app.browse.store_directory_summary_for_identity_best_effort(&path, identity, &app.db);
+                    app.browse
+                        .continue_requested_folder_cue_availability_probe(&path, tx);
+                    super::context_menu::refresh_open_browse_entry_menu(app);
                     if is_current {
                         // Re-enter the cheap current-entry policy path after
                         // caching the classification. This lets cached summary
@@ -4959,7 +4964,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             let path_str = path.display().to_string();
             let uses_native_journal =
                 crate::tui::probe::uses_native_flac_metadata_journal(&path)
-                    || crate::dsf_tags::is_dsf(&path);
+                    || crate::dsf_tags::is_dsf(&path)
+                    || matches!(
+                        crate::metadata_persistence::metadata_persistence_route_for_path(&path),
+                        crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
+                    );
             match result {
                 Ok(report) => {
                     app.browse.remove_probe_cache_entry(&path);
@@ -15345,6 +15354,9 @@ mod async_message_drain_tests {
             collection_many: false,
             io_budget_exhausted: false,
             disc_marker: None,
+            embedded_cue_availability:
+                crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
         }
     }
 

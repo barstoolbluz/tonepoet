@@ -7599,7 +7599,12 @@ The terminal emulator must also permit OSC 52 clipboard writes. Payloads larger 
                     .map(|(w, h)| (w / 3, h / 3))
                     .unwrap_or((20, 10))
             });
-            super::keybindings::open_context_menu(app, origin.0, origin.1);
+            super::keybindings::open_context_menu_with_tx(
+                app,
+                origin.0,
+                origin.1,
+                Some(tx),
+            );
         }
         Command::Unknown(input) => {
             app.set_status(format!("Unknown command: {}", input));

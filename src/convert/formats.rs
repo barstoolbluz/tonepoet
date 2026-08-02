@@ -47,6 +47,8 @@ pub enum AudioFormat {
     Ac3,
     /// Monkey's Audio (decode-only — not encodable by ffmpeg or SoX)
     Ape,
+    /// Musepack audio (decode-only input; metadata writes remain read-only)
+    Musepack,
     /// Shorten lossless audio (decode-only — not encodable by ffmpeg or SoX)
     Shorten,
     /// Ogg container input, usually Vorbis for legacy rips. Decode-only in
@@ -75,6 +77,7 @@ impl AudioFormat {
             Self::Dts => "dts",
             Self::Ac3 => "ac3",
             Self::Ape => "ape",
+            Self::Musepack => "mpc",
             Self::Shorten => "shn",
             Self::Ogg => "ogg",
             Self::Tta => "tta",
@@ -98,6 +101,7 @@ impl AudioFormat {
             Self::Dts => "DTS",
             Self::Ac3 => "AC3",
             Self::Ape => "APE",
+            Self::Musepack => "MPC",
             Self::Shorten => "SHN",
             Self::Ogg => "OGG",
             Self::Tta => "TTA",
@@ -125,8 +129,8 @@ impl AudioFormat {
 
     /// Formats that may appear as conversion targets.
     ///
-    /// This is deliberately narrower than source/input recognition. APE,
-    /// Shorten, OGG, and TTA are accepted as input sources and CUE backing
+    /// This is deliberately narrower than source/input recognition. Musepack,
+    /// APE, Shorten, OGG, and TTA are accepted as input sources and CUE backing
     /// images, but they are not exposed as output codecs or treated as
     /// encodable targets.
     pub fn all() -> Vec<Self> {
@@ -149,6 +153,7 @@ impl AudioFormat {
             Self::Dts,
             Self::Ac3,
             Self::Ape,
+            Self::Musepack,
             Self::Shorten,
             Self::Ogg,
             Self::Tta,
@@ -191,6 +196,7 @@ impl AudioFormat {
                 | Self::Dts
                 | Self::Ac3
                 | Self::Ape
+                | Self::Musepack
                 | Self::Shorten
                 | Self::Ogg
                 | Self::Tta
@@ -318,6 +324,9 @@ impl AudioFormat {
             ],
             Self::Ape => &[
                 ContainerOption { extension: "ape", display_name: "APE", ffmpeg_flags: &[], enabled: false },
+            ],
+            Self::Musepack => &[
+                ContainerOption { extension: "mpc", display_name: "Musepack", ffmpeg_flags: &[], enabled: false },
             ],
             Self::Shorten => &[
                 ContainerOption { extension: "shn", display_name: "SHN", ffmpeg_flags: &[], enabled: false },
@@ -1101,7 +1110,11 @@ impl AudioFormat {
             },
             AudioFormat::Dts => QualitySettings::Flac { compression_level: 0 },
             AudioFormat::Ac3 => QualitySettings::Flac { compression_level: 0 },
-            AudioFormat::Ape | AudioFormat::Shorten | AudioFormat::Ogg | AudioFormat::Tta => {
+            AudioFormat::Ape
+            | AudioFormat::Musepack
+            | AudioFormat::Shorten
+            | AudioFormat::Ogg
+            | AudioFormat::Tta => {
                 QualitySettings::Flac { compression_level: 0 }
             },
             AudioFormat::Lpcm => QualitySettings::Wav {
@@ -1331,6 +1344,10 @@ mod tests {
             FileFormat::Audio(AudioFormat::Ape)
         );
         assert_eq!(
+            FormatDetector::detect(Path::new("album.mpc")).expect("Musepack is supported"),
+            FileFormat::Audio(AudioFormat::Musepack)
+        );
+        assert_eq!(
             FormatDetector::detect(Path::new("album.shn")).expect("Shorten is supported"),
             FileFormat::Audio(AudioFormat::Shorten)
         );
@@ -1371,6 +1388,10 @@ mod tests {
             AudioFormat::Ape
         );
         assert_eq!(
+            FormatDetector::detect_audio(Path::new("track.MPC")).expect("uppercase MPC is supported"),
+            AudioFormat::Musepack
+        );
+        assert_eq!(
             FormatDetector::detect_audio(Path::new("track.SHN")).expect("uppercase SHN is supported"),
             AudioFormat::Shorten
         );
@@ -1386,7 +1407,13 @@ mod tests {
 
     #[test]
     fn decode_only_source_formats_are_not_output_choices() {
-        for format in [AudioFormat::Ape, AudioFormat::Shorten, AudioFormat::Ogg, AudioFormat::Tta] {
+        for format in [
+            AudioFormat::Ape,
+            AudioFormat::Musepack,
+            AudioFormat::Shorten,
+            AudioFormat::Ogg,
+            AudioFormat::Tta,
+        ] {
             assert!(
                 AudioFormat::input_decodable().contains(&format),
                 "decode-only format must remain accepted as an input source"
@@ -1402,6 +1429,10 @@ mod tests {
             assert!(!format.is_output_encodable());
             assert!(format.enabled_output_containers().is_empty());
         }
+        assert_eq!(AudioFormat::Musepack.extension(), "mpc");
+        assert_eq!(AudioFormat::Musepack.name(), "MPC");
+        assert_eq!(AudioFormat::Musepack.default_container().display_name, "Musepack");
+        assert!(!AudioFormat::Musepack.default_container().enabled);
     }
 
     #[test]

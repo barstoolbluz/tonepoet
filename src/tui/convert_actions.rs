@@ -209,6 +209,7 @@ pub fn try_pills_to_options(
         AudioFormat::Dts
         | AudioFormat::Ac3
         | AudioFormat::Ape
+        | AudioFormat::Musepack
         | AudioFormat::Shorten
         | AudioFormat::Ogg
         | AudioFormat::Tta
@@ -565,6 +566,7 @@ fn map_audio_format(format: AudioFormat, container_ext: Option<&str>) -> pipelin
         // Decode-only source formats are never output targets; default to FLAC
         // like the pre-existing Ape arm.
         (AudioFormat::Ape, _)
+        | (AudioFormat::Musepack, _)
         | (AudioFormat::Shorten, _)
         | (AudioFormat::Ogg, _)
         | (AudioFormat::Tta, _) => pipeline_enums::AudioFormat::Flac,

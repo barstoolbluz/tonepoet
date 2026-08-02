@@ -119,7 +119,10 @@ pub(crate) fn native_ape_error_is_eligible(err: &lofty::error::LoftyError) -> bo
     matches!(
         err.kind(),
         ErrorKind::FileDecoding(decoding)
-            if decoding.format() == Some(lofty::file::FileType::Ape)
+            if matches!(
+                decoding.format(),
+                Some(lofty::file::FileType::Ape | lofty::file::FileType::Mpc)
+            )
     )
 }
 
@@ -596,9 +599,9 @@ pub(crate) fn flac_stream_offset(path: &Path) -> Result<Option<u64>, String> {
 /// Top-level persistence route used by the metadata writer.
 ///
 /// Format-owned routes centralize policy without necessarily forcing one
-/// serializer. `WavPackApeDispatch` keeps healthy files on the established
-/// Lofty path and activates the native APEv2 recovery writer only after a
-/// typed APE decoding failure. `Lofty` probes the carrier and writes its
+/// serializer. `WavPackApeDispatch` owns bounded native APEv2 tail writes for
+/// WavPack and Monkey's Audio, while retaining the full-copy native repair
+/// path for malformed WavPack tags. `Lofty` probes the carrier and writes its
 /// actual primary tag type through Lofty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataPersistenceRoute {
@@ -725,12 +728,12 @@ impl MetadataPersistenceBackend {
         match self {
             Self::NativeFlacVorbis => "native FLAC/Vorbis comments",
             Self::NativeDsfId3 => "native DSF/ID3",
-            Self::NativeWavPackApe => "native WavPack/APEv2",
+            Self::NativeWavPackApe => "native WavPack/Monkey's Audio APEv2",
             Self::LoftyVorbisComments => "Lofty Vorbis comments",
             Self::LoftyId3v2 => "Lofty ID3v2",
             Self::LoftyApe => "Lofty APE",
             Self::LoftyMp4Ilst => "Lofty MP4 ilst",
-            Self::ReadOnlyApeFamily => "read-only APE/Musepack metadata",
+            Self::ReadOnlyApeFamily => "read-only Musepack metadata",
             Self::UnsupportedDff => "unsupported DFF metadata",
             Self::UnclassifiedLofty => "unclassified Lofty tag type",
         }
@@ -743,24 +746,27 @@ fn extension_is(path: &Path, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
+fn is_read_only_ape_family_path(path: &Path) -> bool {
+    extension_is(path, "mpc")
+}
+
 fn has_flac_magic(path: &Path) -> bool {
     matches!(flac_stream_offset(path), Ok(Some(_)))
 }
 
 /// Resolve the same top-level route used by the metadata writer.
 ///
-/// Dispatch order is intentional: DSF is extension-owned native; WavPack is
-/// extension-owned policy dispatch (healthy tags use Lofty, typed malformed
-/// APE tags use the native recovery writer); APE/Musepack remain
-/// read-fallback-only; FLAC uses either its
+/// Dispatch order is intentional: DSF is extension-owned native; WavPack and
+/// Monkey's Audio use extension-owned bounded native APEv2 tail writes;
+/// Musepack remains read-fallback-only; FLAC uses either its
 /// extension or file magic; DFF is explicitly unsupported; every other path is
 /// delegated to Lofty's content probe.
 pub fn metadata_persistence_route_for_path(path: &Path) -> MetadataPersistenceRoute {
     if extension_is(path, "dsf") {
         MetadataPersistenceRoute::NativeDsfId3
-    } else if extension_is(path, "wv") {
+    } else if extension_is(path, "wv") || extension_is(path, "ape") {
         MetadataPersistenceRoute::WavPackApeDispatch
-    } else if extension_is(path, "ape") || extension_is(path, "mpc") {
+    } else if is_read_only_ape_family_path(path) {
         MetadataPersistenceRoute::ReadOnlyApeFamily
     } else if extension_is(path, "flac") || has_flac_magic(path) {
         MetadataPersistenceRoute::NativeFlacVorbis
@@ -1963,7 +1969,7 @@ mod tests {
         );
         assert_eq!(
             metadata_persistence_route_for_path(Path::new("track.ape")),
-            MetadataPersistenceRoute::ReadOnlyApeFamily
+            MetadataPersistenceRoute::WavPackApeDispatch
         );
         assert_eq!(
             metadata_persistence_route_for_path(Path::new("track.MPC")),
@@ -1976,6 +1982,31 @@ mod tests {
         assert_eq!(
             metadata_persistence_route_for_path(Path::new("track.mp3")),
             MetadataPersistenceRoute::Lofty
+        );
+    }
+
+    #[test]
+    fn musepack_route_is_extension_owned_read_only_and_probe_free() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("renamed-wavpack.MPC");
+        std::fs::write(&path, b"wvpk fixture bytes need not be native Musepack")
+            .expect("write mismatched-content Musepack fixture");
+
+        assert_eq!(
+            metadata_persistence_route_for_path(&path),
+            MetadataPersistenceRoute::ReadOnlyApeFamily,
+        );
+        assert_eq!(
+            metadata_backend_for_path(&path).expect("extension-owned read-only backend"),
+            MetadataPersistenceBackend::ReadOnlyApeFamily,
+        );
+        assert_eq!(
+            metadata_numbering_capability_for_path(&path)
+                .expect("read-only Musepack numbering capability"),
+            MetadataNumberingCapability {
+                backend: MetadataPersistenceBackend::ReadOnlyApeFamily,
+                capabilities: MetadataNumberingCapabilities::NONE,
+            },
         );
     }
 

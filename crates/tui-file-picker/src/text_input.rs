@@ -841,10 +841,22 @@ impl TextInputState {
             let mut candidate_col = cursor_col;
             for (byte, ch) in self.text.char_indices() {
                 let cell_width = crate::display_width::char_width(ch);
-                if col >= desired_start && cell_width > 0 {
-                    candidate = byte;
-                    candidate_col = col;
-                    break;
+                // If the requested left edge lands in the second cell of a
+                // wide glyph, keep that glyph as the first visible character.
+                // Skipping it makes the window jump by one column as the
+                // cursor crosses the glyph and can leave the view underfilled.
+                // At end-of-text, however, keeping that straddling glyph must
+                // not consume the cell reserved for the trailing cursor. In
+                // that one case, continue to the next positive-width glyph;
+                // any intervening combining marks are skipped with their base.
+                if cell_width > 0 && col.saturating_add(cell_width) > desired_start {
+                    let keeps_end_cursor_visible = self.cursor != self.text.len()
+                        || cursor_col.saturating_sub(col) < width;
+                    if keeps_end_cursor_visible {
+                        candidate = byte;
+                        candidate_col = col;
+                        break;
+                    }
                 }
                 col = col.saturating_add(cell_width);
             }
@@ -1984,6 +1996,19 @@ mod tests {
         assert_eq!(crate::display_width::width(&visible), 2);
         assert_eq!(visible, "e\u{301}Z");
         assert_eq!(cursor_col, 2);
+        assert!(usize::from(cursor_col) < 4);
+    }
+
+    #[test]
+    fn display_view_reserves_end_cursor_cell_when_left_edge_splits_wide_glyph() {
+        let mut input = TextInputState::new("日本e\u{301}".to_string());
+        input.cursor_end();
+
+        let (visible, cursor_col) = input.view(5);
+        assert_eq!(visible, "本e\u{301}");
+        assert_eq!(crate::display_width::width(&visible), 3);
+        assert_eq!(cursor_col, 3);
+        assert!(usize::from(cursor_col) < 5);
     }
 
     #[test]
@@ -1995,6 +2020,20 @@ mod tests {
         assert_eq!(visible, "x");
         assert_eq!(cursor_col, 1);
         assert!(!visible.starts_with('\u{301}'));
+    }
+
+    #[test]
+    fn display_view_stays_stationary_when_left_edge_crosses_wide_glyph() {
+        let mut input = TextInputState::new("a・bcdefghijk".to_string());
+
+        input.cursor = "a・bcdefgh".len();
+        let before = input.view(10);
+        input.cursor = "a・bcdefghi".len();
+        let after = input.view(10);
+
+        assert_eq!(before.0, "・bcdefghi");
+        assert_eq!(after.0, before.0);
+        assert_eq!(crate::display_width::width(&after.0), 10);
     }
 
     #[test]

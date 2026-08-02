@@ -9385,7 +9385,24 @@ fn browse_context_paths_for_current_entry(app: &AppState) -> Option<Vec<std::pat
 /// the screen position where the menu should be anchored (right-click
 /// position, or a computed position for keyboard `m`).
 pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
+    open_context_menu_with_tx(app, x, y, None);
+}
+
+pub(super) fn open_context_menu_with_tx(
+    app: &mut AppState,
+    x: u16,
+    y: u16,
+    tx: Option<&mpsc::Sender<AppMessage>>,
+) {
     use super::context_menu::*;
+
+    if app.current_screen == AppScreen::Browse {
+        if let Some(tx) = tx {
+            app.browse.probe_current_with_db(tx, Some(&app.db));
+            app.browse
+                .request_current_folder_cue_availability(tx);
+        }
+    }
 
     let entries = match app.current_screen {
         AppScreen::Browse => {
@@ -14727,6 +14744,23 @@ fn validate_embedded_cue_sheet_for_metadata(
     Ok(())
 }
 
+/// Cache-safe single-carrier predicate shared by Browse probing and the
+/// embedded-only metadata resolver. Native multi-FILE sheets intentionally do
+/// not pass this per-file predicate; they are validated over the complete
+/// member set by `embedded_cuesheet_availability_for_paths` below.
+pub(super) fn embedded_cuesheet_text_is_usable_for_single_carrier(
+    audio_path: &std::path::Path,
+    cue_text: &str,
+) -> bool {
+    if cue_text.trim().is_empty() {
+        return false;
+    }
+    let sheet = super::cue_parser::parse_cue(cue_text);
+    validate_embedded_cue_sheet_for_metadata(&sheet).is_ok()
+        && sheet.tracks.len() >= 2
+        && super::tag_interchange::embedded_cue_metadata_target_is_writable(audio_path)
+}
+
 fn embedded_cue_candidate_for_metadata(
     entries: &[super::probe::TagEntry],
     audio_path: &std::path::Path,
@@ -14968,6 +15002,28 @@ fn usable_embedded_metadata_surfaces_for_paths(
     surfaces
 }
 
+/// Resolve Browse-menu availability through the same position-independent
+/// embedded-only paths used at dispatch time. A read/validation failure stays
+/// `Unknown` rather than being misrepresented as absence; the dispatch-time
+/// resolver remains the final consistency check after the menu gate.
+pub(super) fn embedded_cuesheet_availability_for_paths(
+    paths: &[std::path::PathBuf],
+) -> super::probe::EmbeddedCueAvailability {
+    if paths.is_empty() {
+        return super::probe::EmbeddedCueAvailability::Absent;
+    }
+    match native_multi_file_embedded_surface_for_paths(paths) {
+        Ok(Some(_)) => return super::probe::EmbeddedCueAvailability::Present,
+        Err(_) => return super::probe::EmbeddedCueAvailability::Unknown,
+        Ok(None) => {}
+    }
+    if usable_embedded_metadata_surfaces_for_paths(paths).is_empty() {
+        super::probe::EmbeddedCueAvailability::Absent
+    } else {
+        super::probe::EmbeddedCueAvailability::Present
+    }
+}
+
 fn embedded_cue_matches_sidecar_structure(
     sidecar: &super::cue_parser::CueSheet,
     embedded: &super::cue_parser::CueSheet,
@@ -15071,28 +15127,6 @@ fn cue_sheet_has_native_multi_file_subdivision(
     tracks_by_file.len() >= 2 && tracks_by_file.values().any(|count| *count > 1)
 }
 
-fn first_path_has_native_multi_file_embedded_cue(paths: &[std::path::PathBuf]) -> bool {
-    if paths.len() < 2 {
-        return false;
-    }
-    let Some(path) = paths.first() else {
-        return false;
-    };
-    let Ok(merged) = super::probe::read_all_tags_merged_with_metadata(&[path.clone()]) else {
-        return false;
-    };
-    match embedded_cue_candidate_for_transfer_at(&merged.entries, path, 0) {
-        EmbeddedCueCandidate::Valid {
-            multi_file_read_only: true,
-            sheet,
-            ..
-        } => cue_sheet_has_native_multi_file_subdivision(&sheet),
-        EmbeddedCueCandidate::Absent
-        | EmbeddedCueCandidate::Invalid(_)
-        | EmbeddedCueCandidate::Valid { .. } => false,
-    }
-}
-
 fn native_multi_file_embedded_surface_for_paths(
     paths: &[std::path::PathBuf],
 ) -> Result<Option<MetadataCueSurface>, String> {
@@ -15110,6 +15144,7 @@ fn native_multi_file_embedded_surface_for_paths(
     let merged = super::probe::read_all_tags_merged_with_metadata(&paths)
         .map_err(|err| format!("failed to read native multi-FILE embedded CUESHEETs: {err}"))?;
     let mut selected: Option<(std::path::PathBuf, String, super::cue_parser::CueSheet)> = None;
+    let mut ordinary_embedded_carrier: Option<std::path::PathBuf> = None;
     for (index, path) in paths.iter().enumerate() {
         if merged
             .metadata_errors
@@ -15129,6 +15164,22 @@ fn native_multi_file_embedded_surface_for_paths(
                 multi_file_read_only: true,
                 ..
             } => {
+                if !cue_sheet_has_native_multi_file_subdivision(&sheet) {
+                    if selected.is_some() {
+                        return Err(format!(
+                            "embedded CUESHEETs in '{}' mix native multi-FILE and ordinary per-file representations",
+                            path.parent().unwrap_or(path).display()
+                        ));
+                    }
+                    ordinary_embedded_carrier.get_or_insert_with(|| path.clone());
+                    continue;
+                }
+                if let Some(ordinary_path) = &ordinary_embedded_carrier {
+                    return Err(format!(
+                        "embedded CUESHEETs in '{}' mix native multi-FILE and ordinary per-file representations",
+                        ordinary_path.parent().unwrap_or(ordinary_path).display()
+                    ));
+                }
                 if let Some((_, _, selected_sheet)) = &selected {
                     if !cue_sheets_have_equivalent_metadata(selected_sheet, &sheet) {
                         return Err(format!(
@@ -15140,7 +15191,7 @@ fn native_multi_file_embedded_surface_for_paths(
                     selected = Some((path.clone(), cue_text, sheet));
                 }
             }
-            EmbeddedCueCandidate::Absent => return Ok(None),
+            EmbeddedCueCandidate::Absent => {}
             EmbeddedCueCandidate::Invalid(reason) => {
                 return Err(format!(
                     "embedded CUESHEET in '{}' is invalid: {reason}",
@@ -15150,7 +15201,15 @@ fn native_multi_file_embedded_surface_for_paths(
             EmbeddedCueCandidate::Valid {
                 multi_file_read_only: false,
                 ..
-            } => return Ok(None),
+            } => {
+                if selected.is_some() {
+                    return Err(format!(
+                        "embedded CUESHEETs in '{}' mix native multi-FILE and ordinary per-file representations",
+                        path.parent().unwrap_or(path).display()
+                    ));
+                }
+                ordinary_embedded_carrier.get_or_insert_with(|| path.clone());
+            }
         }
     }
 
@@ -15280,13 +15339,10 @@ fn native_multi_file_embedded_source_from_entries(
     if present == 0 {
         return Ok(None);
     }
-    if present != sidecar.audio_paths.len() {
-        return Err(format!(
-            "native multi-FILE album '{}' has embedded CUESHEET metadata on only {present}/{} member images",
-            sidecar.cue_path.display(),
-            sidecar.audio_paths.len()
-        ));
-    }
+    // A native multi-FILE CUESHEET describes the complete album even when a
+    // single member image is the tag carrier. Every present copy was checked
+    // above for structural equivalence and conflicts; absent copies are not a
+    // coherence failure.
     let Some((audio_path, cue_text, sheet)) = selected else {
         return Err(
             "native multi-FILE embedded CUESHEET selection lost its validated source"
@@ -15330,7 +15386,7 @@ fn resolve_native_multi_file_metadata_cue_source(
         }
         crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly => {
             native_multi_file_embedded_source_from_entries(sidecar, entries)?.ok_or_else(|| {
-                "CUE policy requires a coherent embedded native multi-FILE CUESHEET on every member image, but none is present"
+                "CUE policy requires a coherent embedded native multi-FILE CUESHEET on at least one selected member image, but none is present"
                     .to_string()
             })
         }
@@ -18855,20 +18911,206 @@ fn write_cuesheet_edit_buffer(path: &std::path::Path, text: &str) -> Result<(), 
         .map_err(|err| format!("failed to sync edit buffer {}: {}", path.display(), err))
 }
 
+fn embedded_cuesheet_extract_source(
+    state: &super::app::MetadataEditorState,
+) -> Result<(std::path::PathBuf, String), String> {
+    let (audio_path, cue_idx) = embedded_cuesheet_command_target(state, "cuesheet-extract")?;
+    let entry = state
+        .active_surface()
+        .entries
+        .get(cue_idx)
+        .ok_or_else(|| ":cuesheet-extract: embedded CUESHEET row disappeared".to_string())?;
+    let cue_text = entry
+        .per_file_originals
+        .iter()
+        .find(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            ":cuesheet-extract: exact on-disk embedded CUESHEET text is unavailable"
+                .to_string()
+        })?;
+    Ok((audio_path, cue_text))
+}
+
+fn extracted_cuesheet_filename(audio_path: &std::path::Path, cue_text: &str) -> String {
+    let sheet = super::cue_parser::parse_cue(cue_text);
+    let base = match (
+        sheet.performer.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        sheet.title.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+    ) {
+        (Some(performer), Some(title)) => format!("{performer} - {title}"),
+        (_, Some(title)) => title.to_string(),
+        _ => audio_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("embedded-cuesheet")
+            .to_string(),
+    };
+    let sanitized = base
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized
+        .trim()
+        .trim_end_matches(|ch| matches!(ch, '.' | ' '));
+    let mut bounded = String::new();
+    for ch in sanitized.chars() {
+        if bounded.len().saturating_add(ch.len_utf8()) > 240 {
+            break;
+        }
+        bounded.push(ch);
+    }
+    let mut base = if bounded.is_empty() {
+        "embedded-cuesheet".to_string()
+    } else {
+        bounded
+    };
+    let upper = base.to_ascii_uppercase();
+    let windows_reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"));
+    if windows_reserved {
+        base.insert(0, '_');
+    }
+    format!("{base}.cue")
+}
+
+fn write_extracted_cuesheet_sidecar(
+    cue_path: &std::path::Path,
+    cue_text: &str,
+) -> Result<String, String> {
+    use std::io::Write as _;
+
+    let parent = cue_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".tonepoet-cue-extract.tmp-")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "Extract embedded CUE sheet could not create a temporary beside '{}': {error}",
+                cue_path.display(),
+            )
+        })?;
+    temporary
+        .write_all(cue_text.as_bytes())
+        .map_err(|error| {
+            format!(
+                "Extract embedded CUE sheet failed while writing temporary for '{}': {error}",
+                cue_path.display(),
+            )
+        })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        format!(
+            "Extract embedded CUE sheet failed while syncing temporary for '{}': {error}",
+            cue_path.display(),
+        )
+    })?;
+
+    let published = match temporary.persist_noclobber(cue_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let tempfile::PersistError { error, file } = error;
+            drop(file);
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "Extract embedded CUE sheet refused to overwrite existing sidecar: {}",
+                    cue_path.display(),
+                )
+            } else {
+                format!(
+                    "Extract embedded CUE sheet could not publish '{}': {error}",
+                    cue_path.display(),
+                )
+            });
+        }
+    };
+    drop(published);
+
+    let parent_warning = crate::config::sync_parent_dir(parent).err().map(|error| {
+        format!(
+            "; file contents are durable, but the parent directory could not be synced: {error}"
+        )
+    });
+    Ok(format!(
+        "Embedded CUE sheet extracted byte-for-byte: {}{}",
+        cue_path.display(),
+        parent_warning.unwrap_or_default(),
+    ))
+}
+
+pub(super) fn start_embedded_cuesheet_extract(
+    app: &mut AppState,
+    state: &super::app::MetadataEditorState,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let (audio_path, cue_text) = match embedded_cuesheet_extract_source(state) {
+        Ok(source) => source,
+        Err(reason) => {
+            app.set_status(reason);
+            return;
+        }
+    };
+    let output_dir = audio_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let cue_filename = extracted_cuesheet_filename(&audio_path, &cue_text);
+    let cue_path = output_dir.join(&cue_filename);
+    let refresh_browse = app.current_screen == AppScreen::Browse;
+    let tx = tx.clone();
+    app.set_status(format!("Extract embedded CUE sheet: writing {cue_filename}..."));
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            write_extracted_cuesheet_sidecar(&cue_path, &cue_text)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(format!(
+                "Extract embedded CUE sheet worker terminated unexpectedly: {error}"
+            ))
+        });
+        let _ = tx
+            .send(AppMessage::CueWriteComplete {
+                result,
+                refresh_browse,
+            })
+            .await;
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataCuePillAction {
     View,
     Edit,
+    Extract,
     Delete,
 }
 
-fn metadata_cuesheet_pill_action_at_offset(offset: usize) -> MetadataCuePillAction {
+fn metadata_cuesheet_pill_action_at_offset(
+    offset: usize,
+    embedded_actions: bool,
+) -> MetadataCuePillAction {
+    if !embedded_actions {
+        return MetadataCuePillAction::View;
+    }
     let view_end = super::display_width::width(" [view]");
     let edit_end = super::display_width::width(" [view] [edit]");
+    let extract_end = super::display_width::width(" [view] [edit] [extract]");
     if offset < view_end {
         MetadataCuePillAction::View
     } else if offset < edit_end {
         MetadataCuePillAction::Edit
+    } else if offset < extract_end {
+        MetadataCuePillAction::Extract
     } else {
         MetadataCuePillAction::Delete
     }
@@ -18878,11 +19120,15 @@ fn metadata_cuesheet_pill_action_for_click(
     entry: &super::probe::TagEntry,
     button_x: u16,
     click_x: u16,
+    embedded_actions: bool,
 ) -> MetadataCuePillAction {
     if !super::probe::is_synthetic_preview(entry) {
         return MetadataCuePillAction::View;
     }
-    metadata_cuesheet_pill_action_at_offset(click_x.saturating_sub(button_x) as usize)
+    metadata_cuesheet_pill_action_at_offset(
+        click_x.saturating_sub(button_x) as usize,
+        embedded_actions,
+    )
 }
 
 fn embedded_cuesheet_delete_confirmation_message(
@@ -22391,6 +22637,52 @@ pub fn open_metadata_editor_with_tx(app: &mut AppState, tx: &mpsc::Sender<AppMes
     );
 }
 
+pub(super) fn open_embedded_cuesheet_editor_for_browse_action(
+    app: &mut AppState,
+) -> bool {
+    let selection = super::command::collect_selection_for_file_ops(app);
+    let paths = if selection.len() == 1 && selection[0].is_dir() {
+        super::command::expand_audio_paths_for_metadata(&selection)
+    } else {
+        selection
+            .into_iter()
+            .filter(|path| {
+                matches!(
+                    crate::convert::classify::classify_file(path),
+                    crate::convert::classify::EntryKind::AudioFile(_)
+                )
+            })
+            .collect()
+    };
+    if paths.is_empty() {
+        app.set_status("embedded CUE sheet: select an audio carrier or album folder");
+        return false;
+    }
+
+    let mut surfaces = match native_multi_file_embedded_surface_for_paths(&paths) {
+        Ok(Some(surface)) => vec![surface],
+        Ok(None) => usable_embedded_metadata_surfaces_for_paths(&paths),
+        Err(error) => {
+            app.set_status(error);
+            return false;
+        }
+    };
+    if surfaces.is_empty() {
+        app.set_status(
+            "embedded CUE sheet: the selected metadata surface has no embedded CUESHEET tag",
+        );
+        return false;
+    }
+    surfaces.sort_by(|left, right| left.audio_path.cmp(&right.audio_path));
+    open_metadata_editor_for_cue_surfaces_with_active_and_policy(
+        app,
+        surfaces,
+        0,
+        crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly,
+    );
+    matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_))
+}
+
 fn aggregate_metadata_audio_paths(
     cue_surfaces: &[MetadataCueSurface],
     metadata_sidecar_surfaces: &[MetadataCueSurface],
@@ -22416,18 +22708,47 @@ fn metadata_cue_surface_is_native_multi_file(surface: &MetadataCueSurface) -> bo
         && surface.sheet.tracks.len() == surface.track_audio_paths.len()
 }
 
-fn directory_audio_paths_have_neighboring_cue(paths: &[std::path::PathBuf]) -> bool {
+pub(super) fn cue_import_availability_for_paths(
+    paths: &[std::path::PathBuf],
+) -> super::probe::CueImportAvailability {
+    if paths.is_empty() {
+        return super::probe::CueImportAvailability::Absent;
+    }
     let parents = paths
         .iter()
         .filter_map(|path| path.parent().map(metadata_cue_surface_key))
         .collect::<std::collections::BTreeSet<_>>();
-    parents.into_iter().any(|parent| {
-        std::fs::read_dir(parent).ok().is_some_and(|mut entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .any(|entry| super::cue_parser::is_user_visible_cue_path(&entry.path()))
-        })
-    })
+    let mut saw_unknown = false;
+    for parent in parents {
+        let entries = match std::fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(_) => {
+                saw_unknown = true;
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    saw_unknown = true;
+                    continue;
+                }
+            };
+            if super::cue_parser::is_user_visible_cue_path(&entry.path()) {
+                return super::probe::CueImportAvailability::Present;
+            }
+        }
+    }
+    if saw_unknown {
+        super::probe::CueImportAvailability::Unknown
+    } else {
+        super::probe::CueImportAvailability::Absent
+    }
+}
+
+fn directory_audio_paths_have_neighboring_cue(paths: &[std::path::PathBuf]) -> bool {
+    cue_import_availability_for_paths(paths) == super::probe::CueImportAvailability::Present
 }
 
 fn resolve_directory_metadata_target(
@@ -22442,13 +22763,14 @@ fn resolve_directory_metadata_target(
         .chain(metadata_sidecar_surfaces.iter())
         .find(|surface| metadata_cue_surface_is_native_multi_file(surface))
         .cloned();
-    // Preserve the ordinary-folder fast path: only a first carrier that already
-    // advertises a multi-FILE embedded CUE triggers the full coherent-set read.
-    // Once advertised, fail closed rather than collapsing an invalid or
-    // conflicting album to one row per carrier image.
-    let embedded_multi_file_advertised = admitted_native_multi_file_surface.is_none()
-        && first_path_has_native_multi_file_embedded_cue(aggregate_audio_paths);
-    let embedded_only_native_multi_file_surface = if embedded_multi_file_advertised {
+    // Escalate to the bounded full-member probe only for a multi-image folder
+    // with no admitted sidecar surface. A native multi-FILE CUESHEET may live
+    // on any member image; absent ordinary per-track tags remain cheap to
+    // classify outside this narrow candidate shape.
+    let embedded_only_native_multi_file_surface = if admitted_native_multi_file_surface.is_none()
+        && !sidecar_available
+        && aggregate_audio_paths.len() >= 2
+    {
         native_multi_file_embedded_surface_for_paths(aggregate_audio_paths)
             .ok()
             .flatten()
@@ -22463,8 +22785,7 @@ fn resolve_directory_metadata_target(
         match target {
             crate::config::AggregateMetadataTarget::IndividualFiles
                 if !aggregate_audio_paths.is_empty()
-                    && native_multi_file_surface.is_none()
-                    && !embedded_multi_file_advertised =>
+                    && native_multi_file_surface.is_none() =>
             {
                 return Some((target, Vec::new()));
             }
@@ -22503,9 +22824,9 @@ fn resolve_directory_metadata_target_before_sidecar(
 ) -> Option<(crate::config::AggregateMetadataTarget, Vec<MetadataCueSurface>)> {
     let neighboring_cue_present =
         directory_audio_paths_have_neighboring_cue(aggregate_audio_paths);
-    let embedded_multi_file_advertised = !neighboring_cue_present
-        && first_path_has_native_multi_file_embedded_cue(aggregate_audio_paths);
-    let embedded_only_native_multi_file_surface = if embedded_multi_file_advertised {
+    let embedded_only_native_multi_file_surface = if !neighboring_cue_present
+        && aggregate_audio_paths.len() >= 2
+    {
         native_multi_file_embedded_surface_for_paths(aggregate_audio_paths)
             .ok()
             .flatten()
@@ -22521,7 +22842,7 @@ fn resolve_directory_metadata_target_before_sidecar(
                 if neighboring_cue_present {
                     return None;
                 }
-                if !embedded_multi_file_advertised {
+                if embedded_only_native_multi_file_surface.is_none() {
                     return Some((target, Vec::new()));
                 }
             }
@@ -27312,6 +27633,7 @@ pub(super) fn start_tag_maintenance(
     app: &mut AppState,
     mut editor: Option<Box<super::app::MetadataEditorState>>,
     roots: Vec<std::path::PathBuf>,
+    from_metadata_editor: bool,
     kind: super::probe::TagMaintenanceKind,
     verification: tui_file_picker::VerificationMode,
     tx: &mpsc::Sender<AppMessage>,
@@ -27324,7 +27646,7 @@ pub(super) fn start_tag_maintenance(
         return;
     }
 
-    let from_metadata_editor = editor.is_some();
+    let editor_attached = editor.is_some();
     let (session_id, save_generation, cancel) = if let Some(state) = editor.as_mut() {
         if state.phase == super::app::MetadataEditorPhase::Saving {
             app.active_overlay = ActiveOverlay::MetadataEditor(editor.take().expect("checked"));
@@ -27438,7 +27760,7 @@ pub(super) fn start_tag_maintenance(
                 results.push(result);
             }
 
-            let refreshed_entries = if from_metadata_editor {
+            let refreshed_entries = if editor_attached {
                 Some(super::probe::read_all_tags_merged(&paths))
             } else {
                 None
@@ -28187,13 +28509,19 @@ pub(super) fn build_metadata_row_context_menu_for_column(
             label: "Edit CUE sheet".to_string(),
             action: ContextAction::MetadataCueEdit,
             shortcut: Some(":cuesheet-edit".to_string()),
-            enabled: !state.read_only,
+            enabled: !state.read_only && state.active_surface().embedded_cuesheet_present,
+        }));
+        entries.push(ContextMenuEntry::Item(ContextMenuItem {
+            label: "Extract embedded CUE sheet".to_string(),
+            action: ContextAction::MetadataCueExtract,
+            shortcut: Some(":cuesheet-extract".to_string()),
+            enabled: state.active_surface().embedded_cuesheet_present,
         }));
         entries.push(ContextMenuEntry::Item(ContextMenuItem {
             label: "Delete embedded CUE sheet".to_string(),
             action: ContextAction::MetadataCueDelete,
             shortcut: Some(":cuesheet-delete".to_string()),
-            enabled: !state.read_only,
+            enabled: !state.read_only && state.active_surface().embedded_cuesheet_present,
         }));
         entries.push(ContextMenuEntry::Separator);
     }
@@ -30500,7 +30828,14 @@ fn handle_metadata_editor_mouse_in_area(
                                 let action = app
                                     .button_map
                                     .find_button_rect(&super::button_map::TuiButton::MetadataEntryView(idx))
-                                    .map(|rect| metadata_cuesheet_pill_action_for_click(entry, rect.x, mx))
+                                    .map(|rect| {
+                                        metadata_cuesheet_pill_action_for_click(
+                                            entry,
+                                            rect.x,
+                                            mx,
+                                            state.active_surface().embedded_cuesheet_present,
+                                        )
+                                    })
                                     .unwrap_or(MetadataCuePillAction::View);
                                 state.cursor = idx;
                                 ensure_cursor_visible(&mut state);
@@ -30528,6 +30863,10 @@ fn handle_metadata_editor_mouse_in_area(
                                         let status = metadata_editor_edit_embedded_cuesheet_with_system_editor(&mut state);
                                         app.force_redraw = true;
                                         app.set_status(status);
+                                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                    }
+                                    MetadataCuePillAction::Extract => {
+                                        start_embedded_cuesheet_extract(app, &state, tx);
                                         app.active_overlay = ActiveOverlay::MetadataEditor(state);
                                     }
                                     MetadataCuePillAction::Delete => {
@@ -41464,16 +41803,18 @@ fn execute_confirm_action(
             verification,
         } => {
             let editor = if *from_metadata_editor {
-                match app.pending_metadata_editor.take() {
-                    Some(state) => Some(state),
-                    None => {
-                        app.set_status(format!(
-                            "{}: editor state unavailable; no files changed",
-                            kind.label()
-                        ));
-                        return;
-                    }
+                let editor = app.pending_metadata_editor.take();
+                if editor.is_none() {
+                    // Sidecar-CUE editor flows can pass through CueSelect,
+                    // which intentionally consumes the parked editor. The
+                    // confirmation already owns a frozen target list, so the
+                    // maintenance operation remains safe and self-contained.
+                    log::debug!(
+                        "{} confirmation continued from frozen roots without a parked metadata editor",
+                        kind.label(),
+                    );
                 }
+                editor
             } else {
                 None
             };
@@ -41481,6 +41822,7 @@ fn execute_confirm_action(
                 app,
                 editor,
                 roots.clone(),
+                *from_metadata_editor,
                 *kind,
                 *verification,
                 tx,
@@ -42202,16 +42544,37 @@ fn editor_target_for_button(app: &AppState, button: TuiButton) -> Option<EditorT
     use super::app::MetadataEditorPhase;
 
     let target = match button {
-        TuiButton::BrowseFileInlineEdit => EditorTextTarget::BrowseFileInlineEdit,
-        TuiButton::BrowseInfoMeta(_)
-            if active_inline_edit_matches_button(app, Some(&button)) =>
+        TuiButton::BrowseFileInlineEdit
+            if matches!(app.active_overlay, ActiveOverlay::None) =>
         {
             EditorTextTarget::BrowseFileInlineEdit
         }
-        TuiButton::BrowseTreeInlineEdit => EditorTextTarget::BrowseTreeInlineEdit,
-        TuiButton::BrowsePathInlineEdit => EditorTextTarget::BrowsePath,
-        TuiButton::BrowseSearchInput => EditorTextTarget::BrowseSearch,
-        TuiButton::BrowseFilterInput => EditorTextTarget::BrowseFilter,
+        TuiButton::BrowseInfoMeta(_)
+            if matches!(app.active_overlay, ActiveOverlay::None)
+                && active_inline_edit_matches_button(app, Some(&button)) =>
+        {
+            EditorTextTarget::BrowseFileInlineEdit
+        }
+        TuiButton::BrowseTreeInlineEdit
+            if matches!(app.active_overlay, ActiveOverlay::None) =>
+        {
+            EditorTextTarget::BrowseTreeInlineEdit
+        }
+        TuiButton::BrowsePathInlineEdit
+            if matches!(app.active_overlay, ActiveOverlay::None) =>
+        {
+            EditorTextTarget::BrowsePath
+        }
+        TuiButton::BrowseSearchInput
+            if matches!(app.active_overlay, ActiveOverlay::None) =>
+        {
+            EditorTextTarget::BrowseSearch
+        }
+        TuiButton::BrowseFilterInput
+            if matches!(app.active_overlay, ActiveOverlay::None) =>
+        {
+            EditorTextTarget::BrowseFilter
+        }
         TuiButton::MetadataField(kind)
             if app.convert.metadata.editing
                 == Some(ConvertMetadataField::from_button_kind(kind)) =>
@@ -42342,6 +42705,21 @@ fn editor_mouse_geometry(app: &AppState, target: EditorTextTarget) -> Option<(Tu
 fn handle_editor_text_mouse(app: &mut AppState, mouse: MouseEvent) -> bool {
     if matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }) {
         return false;
+    }
+
+    if !matches!(app.active_overlay, ActiveOverlay::None)
+        && app.browse_text_mouse_target.is_some_and(|target| {
+            matches!(
+                target,
+                EditorTextTarget::BrowseFileInlineEdit
+                    | EditorTextTarget::BrowseTreeInlineEdit
+                    | EditorTextTarget::BrowsePath
+                    | EditorTextTarget::BrowseSearch
+                    | EditorTextTarget::BrowseFilter
+            )
+        })
+    {
+        app.browse_text_mouse_target = None;
     }
 
     let hit = app.button_map.find_button_at(mouse.column, mouse.row);
@@ -42934,7 +43312,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 _ => {}
             }
 
-            open_context_menu(app, x, y);
+            open_context_menu_with_tx(app, x, y, Some(tx));
         }
         return;
     }
@@ -56941,7 +57319,31 @@ mod single_image_metadata_editor_regression_tests {
             }
         }
 
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority =
+            vec![SidecarCue, EmbeddedCue, IndividualFiles];
+        let mut app = AppState::new_for_test(config);
+        select_foxy_route(&mut app, &album, temp.path());
+        assert!(
+            open_embedded_cuesheet_editor_for_browse_action(&mut app),
+            "the explicit embedded-edit action must override sidecar authority when a valid embedded surface exists",
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("explicit embedded action must open the metadata editor");
+        };
+        assert!(state.active_surface().embedded_cuesheet_present);
+        assert!(!state.active_surface().sidecar_cuesheet_shadow_present);
+        assert_eq!(state.active_surface().file_labels.len(), 4);
+
         std::fs::remove_file(&cue_path).expect("remove sidecar for embedded-only case");
+        crate::tui::probe::write_all_tags(
+            &side_a,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                None,
+            )],
+        )
+        .expect("leave the native multi-FILE CUESHEET on the non-first image only");
         for priority in [
             vec![IndividualFiles, SidecarCue, EmbeddedCue],
             vec![SidecarCue, IndividualFiles, EmbeddedCue],
@@ -56959,7 +57361,8 @@ mod single_image_metadata_editor_regression_tests {
             assert_eq!(surface.file_labels.len(), 4);
             assert!(matches!(
                 &surface.cue_source,
-                Some(crate::tui::app::MetadataCueSource::Embedded(_))
+                Some(crate::tui::app::MetadataCueSource::Embedded(path))
+                    if path == &side_b
             ));
             assert_eq!(
                 surface
@@ -59211,7 +59614,7 @@ FILE "a.flac" WAVE
         cue
     }
 
-    fn write_read_only_embedded_ape_fixture(
+    fn write_read_only_embedded_mpc_fixture(
         path: &std::path::Path,
         album_title: &str,
     ) -> String {
@@ -59239,7 +59642,7 @@ FILE "a.flac" WAVE
             )],
         )
         .expect("seed embedded CUESHEET through writable WavPack route");
-        std::fs::rename(&seed, path).expect("rename fixture to read-only APE route");
+        std::fs::rename(&seed, path).expect("rename fixture to read-only Musepack route");
         cue
     }
 
@@ -59402,8 +59805,8 @@ FILE "a.flac" WAVE
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album dir");
-        let read_only_image = album.join("disc.ape");
-        write_read_only_embedded_ape_fixture(&read_only_image, "Read-only Embedded");
+        let read_only_image = album.join("disc.mpc");
+        write_read_only_embedded_mpc_fixture(&read_only_image, "Read-only Embedded");
         let sidecar_image = album.join("sidecar.flac");
         std::fs::write(
             &sidecar_image,
@@ -59478,8 +59881,8 @@ FILE "a.flac" WAVE
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album dir");
-        let read_only_image = album.join("disc.ape");
-        write_read_only_embedded_ape_fixture(&read_only_image, "Read-only Embedded");
+        let read_only_image = album.join("disc.mpc");
+        write_read_only_embedded_mpc_fixture(&read_only_image, "Read-only Embedded");
         let priority = [EmbeddedCue, SidecarCue, IndividualFiles];
         let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
 
@@ -59756,6 +60159,84 @@ FILE "a.flac" WAVE
 }
 
 #[cfg(test)]
+mod overlay_mouse_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn blocking_overlay_suppresses_browse_owned_text_targets() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        // The Browse path input must be active for BrowsePath to be a valid
+        // editor target; otherwise editor_text_input() yields None regardless
+        // of overlay state. Set it so the control case exercises the overlay
+        // guard rather than a missing input.
+        app.browse.path_input =
+            Some(crate::tui::text_input::TextInputState::new("/tmp".to_string()));
+        assert_eq!(
+            editor_target_for_button(&app, TuiButton::BrowsePathInlineEdit),
+            Some(EditorTextTarget::BrowsePath),
+        );
+
+        app.active_overlay = ActiveOverlay::Help {
+            screen: AppScreen::Browse,
+            scroll: 0,
+        };
+        for button in [
+            TuiButton::BrowseFileInlineEdit,
+            TuiButton::BrowseTreeInlineEdit,
+            TuiButton::BrowsePathInlineEdit,
+            TuiButton::BrowseSearchInput,
+            TuiButton::BrowseFilterInput,
+        ] {
+            assert_eq!(editor_target_for_button(&app, button), None, "{button:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod embedded_cuesheet_extract_tests {
+    use super::*;
+
+    #[test]
+    fn extraction_writes_raw_embedded_text_and_refuses_overwrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue_path = temp.path().join("Album.cue");
+        let raw = "REM exact bytes\r\nTITLE \"25・3P-426\"\r\nFILE \"side.flac\" FLAC\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
+
+        write_extracted_cuesheet_sidecar(&cue_path, raw).expect("extract raw CUESHEET");
+        assert_eq!(
+            std::fs::read(&cue_path).expect("read extracted CUE"),
+            raw.as_bytes(),
+        );
+
+        let replacement = "TITLE \"must not replace\"\n";
+        let error = write_extracted_cuesheet_sidecar(&cue_path, replacement)
+            .expect_err("existing sidecar must not be overwritten");
+        assert!(error.contains("refused to overwrite"), "{error}");
+        assert_eq!(
+            std::fs::read(&cue_path).expect("read preserved CUE"),
+            raw.as_bytes(),
+        );
+        let entries = std::fs::read_dir(temp.path())
+            .expect("read extraction directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect extraction directory");
+        assert_eq!(entries.len(), 1, "temporary publication files must be retired");
+    }
+
+    #[test]
+    fn extraction_filename_is_sanitized_without_rewriting_cue_text() {
+        let audio = std::path::Path::new("side-a.flac");
+        let cue = "PERFORMER \"Artist/Name\"\nTITLE \"Album:Title\"\nFILE \"side-a.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        assert_eq!(
+            extracted_cuesheet_filename(audio, cue),
+            "Artist_Name - Album_Title.cue",
+        );
+        let reserved = "TITLE \"CON\"\nFILE \"side-a.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        assert_eq!(extracted_cuesheet_filename(audio, reserved), "_CON.cue");
+    }
+}
+
+#[cfg(test)]
 mod metadata_cuesheet_pill_click_tests {
     use super::*;
 
@@ -59778,19 +60259,23 @@ mod metadata_cuesheet_pill_click_tests {
     }
 
     #[test]
-    fn visible_cuesheet_pill_offsets_dispatch_view_edit_delete() {
+    fn visible_cuesheet_pill_offsets_dispatch_view_edit_extract_delete() {
         let entry = cue_entry();
         let x = 40;
         assert_eq!(
-            metadata_cuesheet_pill_action_for_click(&entry, x, x),
+            metadata_cuesheet_pill_action_for_click(&entry, x, x, true),
             MetadataCuePillAction::View
         );
         assert_eq!(
-            metadata_cuesheet_pill_action_for_click(&entry, x, x + crate::tui::display_width::width(" [view] ") as u16),
+            metadata_cuesheet_pill_action_for_click(&entry, x, x + crate::tui::display_width::width(" [view] ") as u16, true),
             MetadataCuePillAction::Edit
         );
         assert_eq!(
-            metadata_cuesheet_pill_action_for_click(&entry, x, x + crate::tui::display_width::width(" [view] [edit] ") as u16),
+            metadata_cuesheet_pill_action_for_click(&entry, x, x + crate::tui::display_width::width(" [view] [edit] ") as u16, true),
+            MetadataCuePillAction::Extract
+        );
+        assert_eq!(
+            metadata_cuesheet_pill_action_for_click(&entry, x, x + crate::tui::display_width::width(" [view] [edit] [extract] ") as u16, true),
             MetadataCuePillAction::Delete
         );
     }
@@ -59800,7 +60285,16 @@ mod metadata_cuesheet_pill_click_tests {
         let mut entry = cue_entry();
         entry.display_key = "TITLE".to_string();
         assert_eq!(
-            metadata_cuesheet_pill_action_for_click(&entry, 10, 80),
+            metadata_cuesheet_pill_action_for_click(&entry, 10, 80, true),
+            MetadataCuePillAction::View
+        );
+    }
+
+    #[test]
+    fn sidecar_derived_cuesheet_pill_is_view_only() {
+        let entry = cue_entry();
+        assert_eq!(
+            metadata_cuesheet_pill_action_for_click(&entry, 10, 80, false),
             MetadataCuePillAction::View
         );
     }

@@ -963,6 +963,7 @@ pub fn planner_format_from_main(format: crate::convert::AudioFormat) -> PlannerF
         // Decode-only source formats are never output targets; default to FLAC
         // like the pre-existing Ape arm.
         crate::convert::AudioFormat::Ape
+        | crate::convert::AudioFormat::Musepack
         | crate::convert::AudioFormat::Shorten
         | crate::convert::AudioFormat::Ogg
         | crate::convert::AudioFormat::Tta => PlannerFormat::Flac,

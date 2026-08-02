@@ -41,7 +41,6 @@ pub enum SidecarCueWriteMethod {
 #[derive(Debug, Clone)]
 pub struct EmbeddedCueCarrier {
     pub(crate) image_path: std::path::PathBuf,
-    #[allow(dead_code)]
     pub(crate) cue_text: String,
     pub(crate) sheet: crate::convert::cue_parser::CueSheet,
     /// A multi-FILE embedded CUESHEET may be read as a source, but one
@@ -1486,7 +1485,7 @@ mod tests {
         assert!(embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.ogg")
         ));
-        assert!(!embedded_cue_metadata_target_is_writable(
+        assert!(embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.ape")
         ));
         assert!(!embedded_cue_metadata_target_is_writable(
@@ -1516,7 +1515,7 @@ mod tests {
             ..Default::default()
         };
         let target = TransferCarrier::EmbeddedCue {
-            image_path: std::path::PathBuf::from("image.ape"),
+            image_path: std::path::PathBuf::from("image.mpc"),
             cue_text: concat!(
                 "FILE \"image.wav\" WAVE\n",
                 "  TRACK 01 AUDIO\n",
@@ -2007,7 +2006,7 @@ mod tests {
             "    INDEX 01 03:00:00\n",
         ));
         let read_only = TransferCarrier::EmbeddedCue {
-            image_path: std::path::PathBuf::from("/album/album.ape"),
+            image_path: std::path::PathBuf::from("/album/album.mpc"),
             cue_text: String::new(),
             sheet: sheet.clone(),
             multi_file_read_only: false,
@@ -3296,12 +3295,17 @@ fn write_embedded_cue_transfer(
     verification: tui_file_picker::VerificationMode,
     cancel: &super::probe::MetadataWriteCancelFlag,
 ) -> Result<Option<super::probe::MetadataWriteCommitReport>, String> {
-    validate_embedded_cue_transfer_target(carrier)?;
     let current_cue_text = revalidate_embedded_transfer_target(
         &carrier.image_path,
         &carrier.sheet,
         cancel,
     )?;
+    if current_cue_text != carrier.cue_text {
+        log::debug!(
+            "embedded CUE text changed after transfer classification for '{}'; composing against the revalidated current text",
+            carrier.image_path.display(),
+        );
+    }
     let composed = crate::convert::cue_parser::compose_cue_metadata_replacement(
         &current_cue_text,
         replacement,
@@ -3384,6 +3388,8 @@ fn execute_tag_transfer_to_embedded_cues(
     if carriers.is_empty() {
         return Err("internal error: embedded CUE carrier set is empty".to_string());
     }
+    // Aggregate transfer is intentionally all-or-nothing at admission: no
+    // member is mutated unless every carrier is writable at dispatch time.
     for carrier in carriers {
         validate_embedded_cue_transfer_target(carrier)?;
     }

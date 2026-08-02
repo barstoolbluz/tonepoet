@@ -149,6 +149,7 @@ pub fn extract_wizard_settings(
         AudioFormat::Dts
         | AudioFormat::Ac3
         | AudioFormat::Ape
+        | AudioFormat::Musepack
         | AudioFormat::Shorten
         | AudioFormat::Ogg
         | AudioFormat::Tta
@@ -546,6 +547,7 @@ pub fn preset_to_conversion_options(
         AudioFormat::Dts
         | AudioFormat::Ac3
         | AudioFormat::Ape
+        | AudioFormat::Musepack
         | AudioFormat::Shorten
         | AudioFormat::Ogg
         | AudioFormat::Tta

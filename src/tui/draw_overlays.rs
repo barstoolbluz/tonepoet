@@ -5295,10 +5295,13 @@ fn draw_metadata_editor(
         let pill_w = super::display_width::width(&pill_text);
         // Synthetic-preview rows (CUESHEET) surface the full affordance set
         // inline.  The existing MetadataEntryView button kind owns the whole
-        // `[view] [edit] [delete]` pill span; the mouse handler dispatches to
+        // `[view] [edit] [extract] [delete]` pill span; the mouse handler dispatches to
         // the concrete action by click offset so no button-map schema change is
         // required in this partial bundle.
-        let cue_actions_text = metadata_cuesheet_affordance_text(entry);
+        let cue_actions_text = metadata_cuesheet_affordance_text(
+            entry,
+            state.active_surface().embedded_cuesheet_present,
+        );
         let view_w = if super::probe::is_synthetic_preview(entry) {
             super::display_width::width(&cue_actions_text)
         } else {
@@ -5792,7 +5795,53 @@ fn kv_line(label: &str, value: impl Into<String>) -> Line<'static> {
 }
 
 fn metadata_details_lines(state: &super::app::MetadataEditorState, theme: super::theme::Theme) -> Vec<Line<'static>> {
-    render_details_view_model(&super::metadata_view_models::build_details_view_model(state), theme)
+    let mut vm = super::metadata_view_models::build_details_view_model(state);
+    apply_metadata_sample_format_label(state, &mut vm);
+    render_details_view_model(&vm, theme)
+}
+
+fn apply_metadata_sample_format_label(
+    state: &super::app::MetadataEditorState,
+    vm: &mut super::metadata_view_models::DetailsViewModel,
+) {
+    let mut sample_format = None;
+    for file in &state.active_surface().technical_details.files {
+        let super::app::ProbeState::Ready(facts) = &file.media_facts else {
+            continue;
+        };
+        let Some(is_float) = facts.sample_format_is_float else {
+            continue;
+        };
+        let current = (facts.bit_depth, is_float);
+        if sample_format.is_some_and(|seen| seen != current) {
+            sample_format = None;
+            break;
+        }
+        sample_format = Some(current);
+    }
+    let Some((bit_depth, is_float)) = sample_format else {
+        return;
+    };
+    let Some(label) = metadata_sample_format_label(bit_depth, is_float) else {
+        return;
+    };
+    let Some(row) = vm
+        .general
+        .iter_mut()
+        .find(|row| row.key.eq_ignore_ascii_case("bit depth"))
+    else {
+        return;
+    };
+    row.value = label;
+}
+
+fn metadata_sample_format_label(bit_depth: Option<u32>, is_float: bool) -> Option<String> {
+    bit_depth.map(|bit_depth| {
+        format!(
+            "{bit_depth}-bit {}",
+            if is_float { "float" } else { "int" },
+        )
+    })
 }
 
 fn metadata_replaygain_lines(state: &super::app::MetadataEditorState, theme: super::theme::Theme) -> Vec<Line<'static>> {
@@ -8463,9 +8512,16 @@ fn draw_mb_select_tracks(f: &mut Frame, state: &MbSelectState, area: Rect, theme
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn metadata_cuesheet_affordance_text(entry: &super::probe::TagEntry) -> &'static str {
+fn metadata_cuesheet_affordance_text(
+    entry: &super::probe::TagEntry,
+    embedded_actions: bool,
+) -> &'static str {
     if super::probe::is_synthetic_preview(entry) {
-        " [view] [edit] [delete]"
+        if embedded_actions {
+            " [view] [edit] [extract] [delete]"
+        } else {
+            " [view]"
+        }
     } else {
         ""
     }
@@ -8617,12 +8673,29 @@ mod tests {
     }
 
     #[test]
+    fn metadata_sample_format_label_distinguishes_float_and_integer() {
+        assert_eq!(
+            metadata_sample_format_label(Some(32), true).as_deref(),
+            Some("32-bit float"),
+        );
+        assert_eq!(
+            metadata_sample_format_label(Some(32), false).as_deref(),
+            Some("32-bit int"),
+        );
+        assert_eq!(metadata_sample_format_label(None, true), None);
+    }
+
+    #[test]
     fn metadata_cuesheet_row_affordance_text_surfaces_all_actions() {
         let cue = tag("CUESHEET", "FILE \"a.flac\" FLAC", vec!["FILE \"a.flac\" FLAC"]);
         let title = tag("TITLE", "Track", vec!["Track"]);
 
-        assert_eq!(metadata_cuesheet_affordance_text(&cue), " [view] [edit] [delete]");
-        assert_eq!(metadata_cuesheet_affordance_text(&title), "");
+        assert_eq!(
+            metadata_cuesheet_affordance_text(&cue, true),
+            " [view] [edit] [extract] [delete]"
+        );
+        assert_eq!(metadata_cuesheet_affordance_text(&cue, false), " [view]");
+        assert_eq!(metadata_cuesheet_affordance_text(&title, true), "");
     }
 
     fn presentation_tab(

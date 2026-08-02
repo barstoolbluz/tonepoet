@@ -286,6 +286,7 @@ fn format_description(format: AudioFormat) -> String {
         AudioFormat::Dts => "DTS Coherent Acoustics - Multichannel lossy surround codec",
         AudioFormat::Ac3 => "Dolby Digital (AC-3) - Lossy surround sound codec",
         AudioFormat::Ape => "Monkey's Audio - Lossless compression (decode-only)",
+        AudioFormat::Musepack => "Musepack - Lossy compression (decode-only)",
         AudioFormat::Shorten => "Shorten - Legacy lossless compression (decode-only)",
         AudioFormat::Ogg => "Ogg Vorbis - Lossy compression (decode-only)",
         AudioFormat::Tta => "True Audio - Lossless compression (decode-only)",
