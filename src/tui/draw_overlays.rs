@@ -4889,16 +4889,21 @@ pub(crate) struct MetadataEditorLayout {
     pub footer_area: Rect,
 }
 
+// Test-only convenience wrapper for the non-maximized layout. The live draw and
+// hit-test paths call `metadata_editor_layout_for_area_with_maximized` directly
+// with the current `state.maximized`; only tests use this fixed non-maximized
+// form.
+#[cfg(test)]
+pub(crate) fn metadata_editor_layout_for_area(area: Rect) -> MetadataEditorLayout {
+    metadata_editor_layout_for_area_with_maximized(area, false)
+}
+
 /// Compute the metadata editor popup layout once for rendering and input.
 ///
 /// Keep this as the single source of truth for the editor's top-level geometry:
 /// border, content-tab strip, content body, and footer. Input handlers use the
 /// same rectangles for scroll bounds and hit testing so row math cannot drift
 /// from what the renderer actually paints.
-pub(crate) fn metadata_editor_layout_for_area(area: Rect) -> MetadataEditorLayout {
-    metadata_editor_layout_for_area_with_maximized(area, false)
-}
-
 pub(crate) fn metadata_editor_layout_for_area_with_maximized(
     area: Rect,
     maximized: bool,

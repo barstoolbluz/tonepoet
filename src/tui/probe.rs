@@ -8599,6 +8599,10 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_v
     )
 }
 
+// Test-only convenience wrapper hardcoding Strong verification. The live save
+// path calls the `_at_verification` variant directly with the configured
+// `VerificationMode`; only tests use this Strong-hardcoding form.
+#[cfg(test)]
 pub(crate) fn apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes(
     paths: &[std::path::PathBuf],
     entries_snap: &[MetadataEditorTagSnapshot],
@@ -10994,6 +10998,11 @@ fn wavpack_requires_native_ape_writer(path: &std::path::Path) -> Result<bool, St
 #[derive(Debug, Clone)]
 enum NativeApeWriteFailure {
     NotCommitted(String),
+    // Constructed only on Windows, where `ReplaceFileW` can fail after
+    // partially moving/altering the target, leaving commit state unprovable.
+    // The non-Windows atomic rename never hits this class, so the variant reads
+    // as dead code on Linux/macOS builds despite being live on Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
     CommitStateUnknown(String),
 }
 

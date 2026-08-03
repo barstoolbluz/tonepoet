@@ -16182,11 +16182,6 @@ fn collect_metadata_cue_admission_with_selections_and_mode(
     }
 }
 
-
-fn default_transfer_cue_policy() -> crate::convert::pipeline::CueSidecarPolicy {
-    super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY
-}
-
 fn authored_track_audio_paths(
     sheet: &super::cue_parser::CueSheet,
     track_audio_paths: &[std::path::PathBuf],
@@ -18799,6 +18794,10 @@ fn build_unified_cue_album_sheet_with_combined_limit(
     Ok((sheet, track_numbers, track_titles, track_artists, isrcs, warnings))
 }
 
+// Test-only convenience wrapper. The live editor-open path calls
+// `build_unified_cue_album_sheet_with_combined_limit` directly (passing
+// `!per_carrier_embedded_cuesheets`); only tests use this always-limited form.
+#[cfg(test)]
 fn build_unified_cue_album_sheet(
     surfaces: &[MetadataCueSurface],
 ) -> Result<(super::app::CueAlbumSyntheticSheet, Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<String>), String> {
@@ -24077,7 +24076,7 @@ fn metadata_editor_state_from_loaded_files(
     ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
 
     let file_labels = metadata_editor_file_labels(&paths, &entries);
-    let mut state = super::app::MetadataEditorState::for_files(
+    let state = super::app::MetadataEditorState::for_files(
         paths,
         entries,
         file_labels,
@@ -24368,51 +24367,6 @@ fn metadata_cue_surface_proves_image_content(surface: &MetadataCueSurface) -> bo
         }
     }
     false
-}
-
-fn metadata_image_carrier_keys<'a>(
-    surfaces: impl IntoIterator<Item = &'a MetadataCueSurface>,
-) -> std::collections::BTreeSet<std::path::PathBuf> {
-    surfaces
-        .into_iter()
-        .filter(|surface| metadata_cue_surface_proves_image_content(surface))
-        .flat_map(|surface| surface.audio_paths.iter())
-        .map(|path| metadata_cue_surface_key(path))
-        .collect()
-}
-
-fn metadata_audio_paths_outside_image_surfaces<'a>(
-    paths: &[std::path::PathBuf],
-    surfaces: impl IntoIterator<Item = &'a MetadataCueSurface>,
-) -> Vec<std::path::PathBuf> {
-    let covered = metadata_image_carrier_keys(surfaces);
-    let mut seen = std::collections::BTreeSet::new();
-    paths
-        .iter()
-        .filter_map(|path| {
-            let key = metadata_cue_surface_key(path);
-            (!covered.contains(&key) && seen.insert(key)).then(|| path.clone())
-        })
-        .collect()
-}
-
-fn metadata_audio_paths_outside_selected_surfaces<'a>(
-    paths: &[std::path::PathBuf],
-    surfaces: impl IntoIterator<Item = &'a MetadataCueSurface>,
-) -> Vec<std::path::PathBuf> {
-    let covered = surfaces
-        .into_iter()
-        .flat_map(|surface| surface.audio_paths.iter())
-        .map(|path| metadata_cue_surface_key(path))
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut seen = std::collections::BTreeSet::new();
-    paths
-        .iter()
-        .filter_map(|path| {
-            let key = metadata_cue_surface_key(path);
-            (!covered.contains(&key) && seen.insert(key)).then(|| path.clone())
-        })
-        .collect()
 }
 
 pub(super) fn cue_import_availability_for_paths(
@@ -24793,8 +24747,8 @@ fn open_metadata_editor_impl(
         return;
     }
     let mut cue_surfaces = admission.surfaces;
-    let mut metadata_sidecar_surfaces = admission.metadata_sidecar_surfaces;
-    let mut admitted_ordinary_paths = admission.ordinary_paths;
+    let metadata_sidecar_surfaces = admission.metadata_sidecar_surfaces;
+    let admitted_ordinary_paths = admission.ordinary_paths;
     let cue_admission_warnings = admission.warnings;
     let cue_fallback_status = (!cue_admission_warnings.is_empty())
         .then(|| format!("metadata: {}", cue_admission_warnings.join("; ")));
