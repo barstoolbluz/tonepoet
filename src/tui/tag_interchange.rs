@@ -75,6 +75,12 @@ pub enum TransferCarrier {
     /// Ordered aggregate representation selected from a directory, or from
     /// multiple explicitly selected images that all carry usable embedded CUEs.
     EmbeddedCues { carriers: Vec<EmbeddedCueCarrier> },
+    /// One folder-level logical selection containing independently resolved
+    /// metadata groups and/or genuinely uncovered ordinary files. Components
+    /// retain deterministic directory order, while each CUE component retains
+    /// its authored track order. Classification flattens nested aggregates and
+    /// never constructs an empty aggregate.
+    Aggregate { carriers: Vec<TransferCarrier> },
 }
 
 /// Availability facts consumed by ordered aggregate-target resolution.
@@ -120,6 +126,9 @@ impl TransferCarrier {
                     .map(|carrier| carrier.sheet.tracks.len())
                     .sum(),
             ),
+            Self::Aggregate { carriers } => TransferDimension::Tracks(
+                carriers.iter().map(TransferCarrier::count).sum(),
+            ),
         }
     }
 
@@ -132,6 +141,7 @@ impl TransferCarrier {
             Self::Files { .. } => "files",
             Self::SidecarCue { .. } => "sidecar CUE",
             Self::EmbeddedCue { .. } | Self::EmbeddedCues { .. } => "embedded CUE",
+            Self::Aggregate { .. } => "aggregate metadata",
         }
     }
 
@@ -153,6 +163,37 @@ impl TransferCarrier {
                     .flat_map(|carrier| carrier.sheet.tracks.iter().map(|track| track.number))
                     .collect(),
             ),
+            Self::Aggregate { carriers } => {
+                let mut numbers = Vec::new();
+                for carrier in carriers {
+                    numbers.extend(carrier.authored_track_numbers()?);
+                }
+                Some(numbers)
+            }
+        }
+    }
+
+    /// Stable within one process and complete enough to revalidate a prepared
+    /// folder target before dispatch. CUE writers still perform their stronger
+    /// content-specific snapshot checks immediately before publication.
+    pub(crate) fn classification_identity(&self) -> String {
+        format!("{self:?}")
+    }
+
+    fn write_operation_count(&self) -> usize {
+        match self {
+            Self::Files { paths } => paths.len(),
+            Self::SidecarCue {
+                track_audio_paths,
+                write_method: SidecarCueWriteMethod::PerFileAndSidecar,
+                ..
+            } => track_audio_paths.len().saturating_add(1),
+            Self::SidecarCue { .. } | Self::EmbeddedCue { .. } => 1,
+            Self::EmbeddedCues { carriers } => carriers.len(),
+            Self::Aggregate { carriers } => carriers
+                .iter()
+                .map(TransferCarrier::write_operation_count)
+                .sum(),
         }
     }
 }
@@ -2091,6 +2132,65 @@ mod tests {
         assert_eq!(std::fs::read(&cue).expect("re-read sidecar"), before);
     }
 
+    #[test]
+    fn aggregate_preview_slices_positions_without_crossing_representation_boundaries() {
+        let cue_text = concat!(
+            "TITLE \"Album\"\n",
+            "FILE \"image.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        );
+        let target = TransferCarrier::Aggregate {
+            carriers: vec![
+                TransferCarrier::SidecarCue {
+                    cue_path: std::path::PathBuf::from("/tmp/album.cue"),
+                    image_paths: vec![std::path::PathBuf::from("/tmp/image.flac")],
+                    track_audio_paths: vec![
+                        std::path::PathBuf::from("/tmp/image.flac"),
+                        std::path::PathBuf::from("/tmp/image.flac"),
+                    ],
+                    role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+                    write_method: SidecarCueWriteMethod::SidecarOnly,
+                    cue_text: cue_text.to_string(),
+                    sheet: crate::convert::cue_parser::parse_cue(cue_text),
+                },
+                TransferCarrier::Files {
+                    paths: vec![std::path::PathBuf::from("/tmp/bonus.flac")],
+                },
+            ],
+        };
+        let source = vec![entry("TITLE", &["Cue One", "Cue Two", "Bonus"])];
+        assert_eq!(target.dimension(), TransferDimension::Tracks(3));
+        assert_eq!(
+            preview_tag_transfer(
+                &source,
+                TransferDimension::Tracks(3),
+                &target,
+                super::super::app::TagTransferScope::All,
+            )
+            .expect("aggregate preview"),
+            2,
+            "the CUE and uncovered-file components each receive their own positional plan"
+        );
+        assert_eq!(
+            preview_tag_transfer_fanout(
+                &source,
+                TransferDimension::Tracks(3),
+                &target,
+                super::super::app::TagTransferScope::All,
+            )
+            .expect("aggregate fanout preview"),
+            (2, None)
+        );
+        assert!(preview_tag_transfer(
+            &source,
+            TransferDimension::Tracks(2),
+            &target,
+            super::super::app::TagTransferScope::All,
+        )
+        .unwrap_err()
+        .contains("2 source positions and 3 target positions"));
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2131,7 +2231,18 @@ impl TagTransferReport {
 
     pub fn status(&self) -> String {
         let mut status = if let Some(target_carrier) = self.target_carrier.as_deref() {
-            if target_carrier == "files" {
+            if target_carrier == "aggregate metadata" {
+                format!(
+                    "Transferred {} field application{} across {} logical position{} ({} written, {} unchanged, {} failed)",
+                    self.written_fields,
+                    if self.written_fields == 1 { "" } else { "s" },
+                    self.target_count,
+                    if self.target_count == 1 { "" } else { "s" },
+                    self.written,
+                    self.unchanged,
+                    self.failed.len(),
+                )
+            } else if target_carrier == "files" {
                 format!(
                     "Transferred {} field{} to {} file{} ({} written, {} unchanged, {} failed)",
                     self.written_fields,
@@ -2346,7 +2457,9 @@ fn plan_transfer_values_for_dimensions_with_collapse(
         }
         (TransferDimension::Files(source), TransferDimension::Files(target)) => source == target,
         (TransferDimension::Files(source), TransferDimension::Tracks(target)) => source == target,
-        (TransferDimension::Tracks(_), TransferDimension::Files(1)) => first_track_collapse,
+        (TransferDimension::Tracks(source), TransferDimension::Files(1)) => {
+            source == 1 || first_track_collapse
+        }
         (TransferDimension::Tracks(source), TransferDimension::Files(target)) => source == target,
         (TransferDimension::Tracks(source), TransferDimension::Tracks(target)) => source == target,
     };
@@ -2602,6 +2715,316 @@ fn embedded_cue_set_transfer_entries(carriers: &[EmbeddedCueCarrier]) -> Vec<Tag
         .collect()
 }
 
+
+fn transfer_value_summary(values: &[String]) -> (String, bool) {
+    let is_mixed = values.windows(2).any(|pair| pair[0] != pair[1]);
+    let value = if is_mixed {
+        "<multiple values>".to_string()
+    } else {
+        values.first().cloned().unwrap_or_default()
+    };
+    (value, is_mixed)
+}
+
+fn normalize_transfer_entry(entry: &mut TagEntry) {
+    let (value, is_mixed) = transfer_value_summary(&entry.per_file_values);
+    let (original, _) = transfer_value_summary(&entry.per_file_originals);
+    entry.value = value;
+    entry.original = original;
+    entry.is_mixed = is_mixed;
+    entry.has_multiple_stored_values = entry
+        .per_file_stored_value_counts
+        .iter()
+        .any(|count| *count > 1);
+    entry.row_scope = super::probe::RowScope::Track;
+    entry.mb_proposed_value = None;
+    entry.mb_proposed_per_file = None;
+}
+
+/// Merge independently read carrier segments into one logical positional
+/// transfer surface. A field absent from a segment contributes empty values for
+/// that segment, matching the ordinary merged-file reader's absent-tag
+/// semantics without allowing one representation to absorb another.
+fn merge_transfer_entry_segments(
+    segments: Vec<(Vec<TagEntry>, usize)>,
+) -> Result<Vec<TagEntry>, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let total = segments.iter().map(|(_, count)| *count).sum::<usize>();
+    if total == 0 {
+        return Err("tag transfer aggregate has no source positions".to_string());
+    }
+
+    let mut ordered_keys = Vec::new();
+    let mut templates = BTreeMap::<String, TagEntry>::new();
+    let mut normalized_segments = Vec::with_capacity(segments.len());
+    for (entries, count) in segments {
+        let mut seen = BTreeSet::new();
+        let mut local = BTreeMap::new();
+        for entry in entries {
+            let key = super::probe::canonical_metadata_display_key(&entry.display_key);
+            if !seen.insert(key.clone()) {
+                return Err(format!(
+                    "tag transfer source contains duplicate field {key}"
+                ));
+            }
+            if entry.per_file_values.len() != count {
+                return Err(format!(
+                    "tag transfer source field {key} has {} values for {count} positions",
+                    entry.per_file_values.len()
+                ));
+            }
+            if !entry.per_file_originals.is_empty()
+                && entry.per_file_originals.len() != count
+            {
+                return Err(format!(
+                    "tag transfer source field {key} has {} original values for {count} positions",
+                    entry.per_file_originals.len()
+                ));
+            }
+            if !templates.contains_key(&key) {
+                ordered_keys.push(key.clone());
+                templates.insert(key.clone(), entry.clone());
+            }
+            local.insert(key, entry);
+        }
+        normalized_segments.push((local, count));
+    }
+
+    let mut merged = Vec::with_capacity(ordered_keys.len());
+    for key in ordered_keys {
+        let mut entry = templates
+            .remove(&key)
+            .ok_or_else(|| "internal error: aggregate transfer template missing".to_string())?;
+        entry.per_file_values.clear();
+        entry.per_file_originals.clear();
+        entry.per_file_stored_value_counts.clear();
+        for (local, count) in &normalized_segments {
+            if let Some(segment) = local.get(&key) {
+                entry
+                    .per_file_values
+                    .extend(segment.per_file_values.iter().cloned());
+                if segment.per_file_originals.is_empty() {
+                    entry
+                        .per_file_originals
+                        .extend(segment.per_file_values.iter().cloned());
+                } else {
+                    entry
+                        .per_file_originals
+                        .extend(segment.per_file_originals.iter().cloned());
+                }
+                for index in 0..*count {
+                    entry
+                        .per_file_stored_value_counts
+                        .push(segment.stored_value_count_for_slot(index));
+                }
+            } else {
+                entry
+                    .per_file_values
+                    .extend(std::iter::repeat(String::new()).take(*count));
+                entry
+                    .per_file_originals
+                    .extend(std::iter::repeat(String::new()).take(*count));
+                entry
+                    .per_file_stored_value_counts
+                    .extend(std::iter::repeat(0).take(*count));
+            }
+        }
+        normalize_transfer_entry(&mut entry);
+        merged.push(entry);
+    }
+    Ok(merged)
+}
+
+fn slice_transfer_entries(
+    entries: &[TagEntry],
+    start: usize,
+    count: usize,
+) -> Result<Vec<TagEntry>, String> {
+    let end = start
+        .checked_add(count)
+        .ok_or_else(|| "tag transfer aggregate position overflow".to_string())?;
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.per_file_values.len() < end {
+                return Err(format!(
+                    "tag transfer source field {} has {} values but aggregate segment requires positions {} through {}",
+                    super::probe::canonical_metadata_display_key(&entry.display_key),
+                    entry.per_file_values.len(),
+                    start + 1,
+                    end
+                ));
+            }
+            let mut sliced = entry.clone();
+            sliced.per_file_values = entry.per_file_values[start..end].to_vec();
+            sliced.per_file_originals = if entry.per_file_originals.len() >= end {
+                entry.per_file_originals[start..end].to_vec()
+            } else {
+                sliced.per_file_values.clone()
+            };
+            sliced.per_file_stored_value_counts = (start..end)
+                .map(|index| entry.stored_value_count_for_slot(index))
+                .collect();
+            normalize_transfer_entry(&mut sliced);
+            Ok(sliced)
+        })
+        .collect()
+}
+
+fn aggregate_source_segment(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    target_dimension: TransferDimension,
+    start: usize,
+    count: usize,
+    aggregate_count: usize,
+) -> Result<(Vec<TagEntry>, TransferDimension), String> {
+    match source_dimension {
+        TransferDimension::Files(1) => Ok((source_entries.to_vec(), source_dimension)),
+        TransferDimension::Files(source_count) | TransferDimension::Tracks(source_count)
+            if source_count == aggregate_count =>
+        {
+            if target_dimension.count() != count {
+                return Err(format!(
+                    "tag transfer aggregate segment has {} positions but its carrier has {}",
+                    count,
+                    target_dimension.count()
+                ));
+            }
+            let segment_dimension = match source_dimension {
+                TransferDimension::Files(_) => TransferDimension::Files(count),
+                TransferDimension::Tracks(_) => TransferDimension::Tracks(count),
+            };
+            Ok((
+                slice_transfer_entries(source_entries, start, count)?,
+                segment_dimension,
+            ))
+        }
+        _ => Err(format!(
+            "tag transfer carrier dimensions do not match: {} source positions and {} target positions",
+            source_dimension.count(),
+            aggregate_count
+        )),
+    }
+}
+
+
+fn expand_image_entries_to_cue_tracks(
+    file_entries: Vec<TagEntry>,
+    image_paths: &[std::path::PathBuf],
+    track_audio_paths: &[std::path::PathBuf],
+) -> Result<Vec<TagEntry>, String> {
+    let mut image_index = std::collections::BTreeMap::new();
+    for (index, path) in image_paths.iter().enumerate() {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if image_index.insert(key, index).is_some() {
+            return Err(format!(
+                "tag transfer synthetic CUE contains duplicate image '{}'",
+                path.display()
+            ));
+        }
+    }
+    let mut track_indices = Vec::with_capacity(track_audio_paths.len());
+    for path in track_audio_paths {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        track_indices.push(*image_index.get(&key).ok_or_else(|| {
+            format!(
+                "tag transfer synthetic CUE track references unclassified image '{}'",
+                path.display()
+            )
+        })?);
+    }
+
+    let mut expanded = Vec::new();
+    for mut entry in file_entries {
+        let key = super::probe::canonical_metadata_display_key(&entry.display_key);
+        if key == "CUESHEET" || is_cue_per_track_field(&key) {
+            continue;
+        }
+        if entry.per_file_values.len() != image_paths.len() {
+            return Err(format!(
+                "tag transfer image field {key} has {} values for {} images",
+                entry.per_file_values.len(),
+                image_paths.len()
+            ));
+        }
+        let source_values = entry.per_file_values.clone();
+        let source_originals = entry.per_file_originals.clone();
+        let source_counts = (0..image_paths.len())
+            .map(|index| entry.stored_value_count_for_slot(index))
+            .collect::<Vec<_>>();
+        entry.per_file_values = track_indices
+            .iter()
+            .map(|index| source_values[*index].clone())
+            .collect();
+        entry.per_file_originals = track_indices
+            .iter()
+            .map(|index| {
+                source_originals
+                    .get(*index)
+                    .cloned()
+                    .unwrap_or_else(|| source_values[*index].clone())
+            })
+            .collect();
+        entry.per_file_stored_value_counts = track_indices
+            .iter()
+            .map(|index| source_counts[*index])
+            .collect();
+        normalize_transfer_entry(&mut entry);
+        expanded.push(entry);
+    }
+    Ok(expanded)
+}
+
+fn overlay_cue_entries_on_file_entries(
+    file_entries: Vec<TagEntry>,
+    cue_entries: Vec<TagEntry>,
+    count: usize,
+) -> Result<Vec<TagEntry>, String> {
+    let mut merged = merge_transfer_entry_segments(vec![(file_entries, count)])?;
+    let mut by_key = merged
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                super::probe::canonical_metadata_display_key(&entry.display_key),
+                index,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for cue in cue_entries {
+        let key = super::probe::canonical_metadata_display_key(&cue.display_key);
+        if cue.per_file_values.len() != count {
+            return Err(format!(
+                "tag transfer CUE field {key} has {} values for {count} tracks",
+                cue.per_file_values.len()
+            ));
+        }
+        if let Some(index) = by_key.get(&key).copied() {
+            let entry = &mut merged[index];
+            entry.item_key = cue.item_key.clone();
+            for position in 0..count {
+                let value = &cue.per_file_values[position];
+                if value.is_empty() {
+                    continue;
+                }
+                entry.per_file_values[position] = value.clone();
+                entry.per_file_originals[position] = value.clone();
+                entry.per_file_stored_value_counts[position] =
+                    cue.stored_value_count_for_slot(position).max(1);
+            }
+            normalize_transfer_entry(entry);
+        } else {
+            let mut cue = cue;
+            normalize_transfer_entry(&mut cue);
+            by_key.insert(key, merged.len());
+            merged.push(cue);
+        }
+    }
+    Ok(merged)
+}
+
 pub(crate) fn read_transfer_carrier_entries(
     carrier: &TransferCarrier,
     scope: super::app::TagTransferScope,
@@ -2609,8 +3032,57 @@ pub(crate) fn read_transfer_carrier_entries(
 ) -> Result<Vec<TagEntry>, String> {
     match carrier {
         TransferCarrier::Files { paths } => read_transfer_source_entries(paths, scope, cancel),
-        TransferCarrier::SidecarCue { sheet, .. }
-        | TransferCarrier::EmbeddedCue { sheet, .. } => {
+        TransferCarrier::SidecarCue {
+            image_paths,
+            track_audio_paths,
+            role,
+            sheet,
+            ..
+        } => {
+            let cue_entries = cue_sheet_transfer_entries(sheet)
+                .into_iter()
+                .filter(|entry| match scope {
+                    super::app::TagTransferScope::Canonical => {
+                        super::context_menu::tag_entry_matches_copy_selection(
+                            entry,
+                            super::context_menu::TagCopySelection::CanonicalOnly,
+                        )
+                    }
+                    super::app::TagTransferScope::All => true,
+                })
+                .collect::<Vec<_>>();
+            if track_audio_paths.len() != sheet.tracks.len() {
+                return Err(
+                    "tag transfer sidecar track/image ownership cardinality mismatch".to_string(),
+                );
+            }
+            match role {
+                crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar => {
+                    let file_entries =
+                        read_transfer_source_entries(track_audio_paths, scope, cancel)?;
+                    overlay_cue_entries_on_file_entries(
+                        file_entries,
+                        cue_entries,
+                        sheet.tracks.len(),
+                    )
+                }
+                crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart => {
+                    let file_entries =
+                        read_transfer_source_entries(image_paths, scope, cancel)?;
+                    let track_entries = expand_image_entries_to_cue_tracks(
+                        file_entries,
+                        image_paths,
+                        track_audio_paths,
+                    )?;
+                    overlay_cue_entries_on_file_entries(
+                        track_entries,
+                        cue_entries,
+                        sheet.tracks.len(),
+                    )
+                }
+            }
+        }
+        TransferCarrier::EmbeddedCue { sheet, .. } => {
             let entries = cue_sheet_transfer_entries(sheet);
             Ok(entries
                 .into_iter()
@@ -2639,6 +3111,19 @@ pub(crate) fn read_transfer_carrier_entries(
                     super::app::TagTransferScope::All => true,
                 })
                 .collect())
+        }
+        TransferCarrier::Aggregate { carriers } => {
+            if carriers.is_empty() {
+                return Err("internal error: aggregate transfer carrier is empty".to_string());
+            }
+            let mut segments = Vec::with_capacity(carriers.len());
+            for child in carriers {
+                segments.push((
+                    read_transfer_carrier_entries(child, scope, cancel)?,
+                    child.count(),
+                ));
+            }
+            merge_transfer_entry_segments(segments)
         }
     }
 }
@@ -3456,6 +3941,141 @@ fn execute_tag_transfer_to_embedded_cues(
     Ok(report)
 }
 
+fn validate_transfer_target_for_write(target: &TransferCarrier) -> Result<(), String> {
+    match target {
+        TransferCarrier::EmbeddedCue {
+            image_path,
+            cue_text,
+            sheet,
+            multi_file_read_only,
+        } => validate_embedded_cue_transfer_target(&EmbeddedCueCarrier {
+            image_path: image_path.clone(),
+            cue_text: cue_text.clone(),
+            sheet: sheet.clone(),
+            multi_file_read_only: *multi_file_read_only,
+        }),
+        TransferCarrier::EmbeddedCues { carriers } => {
+            if carriers.is_empty() {
+                return Err("internal error: embedded CUE carrier set is empty".to_string());
+            }
+            for carrier in carriers {
+                validate_embedded_cue_transfer_target(carrier)?;
+            }
+            Ok(())
+        }
+        TransferCarrier::Aggregate { carriers } => {
+            if carriers.is_empty() {
+                return Err("internal error: aggregate transfer carrier is empty".to_string());
+            }
+            for carrier in carriers {
+                validate_transfer_target_for_write(carrier)?;
+            }
+            Ok(())
+        }
+        TransferCarrier::Files { .. } | TransferCarrier::SidecarCue { .. } => Ok(()),
+    }
+}
+
+fn append_transfer_report(target: &mut TagTransferReport, mut child: TagTransferReport) {
+    target.written = target.written.saturating_add(child.written);
+    target.unchanged = target.unchanged.saturating_add(child.unchanged);
+    target.written_fields = target.written_fields.saturating_add(child.written_fields);
+    target.first_track_collapse |= child.first_track_collapse;
+    target.target_paths.append(&mut child.target_paths);
+    target.written_paths.append(&mut child.written_paths);
+    target.failed.append(&mut child.failed);
+    target
+        .skipped_numbering_keys
+        .append(&mut child.skipped_numbering_keys);
+    target.skipped_fields.append(&mut child.skipped_fields);
+    target
+        .cardinality_warnings
+        .append(&mut child.cardinality_warnings);
+    target
+        .durability_warnings
+        .append(&mut child.durability_warnings);
+}
+
+fn execute_tag_transfer_to_aggregate(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    source_track_numbers: Option<&[u32]>,
+    carriers: &[TransferCarrier],
+    scope: super::app::TagTransferScope,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+) -> Result<TagTransferReport, String> {
+    if carriers.is_empty() {
+        return Err("internal error: aggregate transfer carrier is empty".to_string());
+    }
+    let aggregate_count = carriers.iter().map(TransferCarrier::count).sum::<usize>();
+    validate_transfer_target_for_write(&TransferCarrier::Aggregate {
+        carriers: carriers.to_vec(),
+    })?;
+
+    let mut report = TagTransferReport {
+        source_count: source_dimension.count(),
+        target_count: aggregate_count,
+        source_carrier: Some(if source_dimension.is_tracks() {
+            "CUE tracks".to_string()
+        } else {
+            "files".to_string()
+        }),
+        target_carrier: Some("aggregate metadata".to_string()),
+        ..TagTransferReport::default()
+    };
+    let total_operations = carriers
+        .iter()
+        .map(TransferCarrier::write_operation_count)
+        .sum::<usize>();
+    let mut position_offset = 0usize;
+    let mut operation_offset = 0usize;
+    for carrier in carriers {
+        let count = carrier.count();
+        let (segment_entries, segment_dimension) = aggregate_source_segment(
+            source_entries,
+            source_dimension,
+            carrier.dimension(),
+            position_offset,
+            count,
+            aggregate_count,
+        )?;
+        let segment_track_numbers = match source_track_numbers {
+            Some(numbers) if source_dimension.count() == aggregate_count => {
+                let end = position_offset
+                    .checked_add(count)
+                    .ok_or_else(|| "tag transfer aggregate track-number overflow".to_string())?;
+                Some(numbers.get(position_offset..end).ok_or_else(|| {
+                    "tag transfer source track-number cardinality does not match its aggregate dimension"
+                        .to_string()
+                })?)
+            }
+            Some(numbers) if source_dimension.count() == 1 => Some(numbers),
+            _ => None,
+        };
+        let mapped_progress = |completed: usize, _total: usize, path: &std::path::Path| {
+            if let Some(progress) = progress {
+                progress(operation_offset + completed, total_operations, path);
+            }
+        };
+        let child = execute_tag_transfer_from_entries_to_carrier(
+            &segment_entries,
+            segment_dimension,
+            segment_track_numbers,
+            carrier,
+            scope,
+            verification,
+            cancel,
+            Some(&mapped_progress),
+        )?;
+        append_transfer_report(&mut report, child);
+        position_offset += count;
+        operation_offset += carrier.write_operation_count();
+    }
+    Ok(report)
+}
+
 fn execute_tag_transfer_to_cue(
     source_entries: &[TagEntry],
     source_dimension: TransferDimension,
@@ -3501,7 +4121,9 @@ fn execute_tag_transfer_to_cue(
     let (target_sheet, target_path) = match target {
         TransferCarrier::SidecarCue { cue_path, sheet, .. } => (sheet, cue_path.as_path()),
         TransferCarrier::EmbeddedCue { image_path, sheet, .. } => (sheet, image_path.as_path()),
-        TransferCarrier::Files { .. } | TransferCarrier::EmbeddedCues { .. } => {
+        TransferCarrier::Files { .. }
+        | TransferCarrier::EmbeddedCues { .. }
+        | TransferCarrier::Aggregate { .. } => {
             return Err("internal error: CUE writer received unsupported carrier".to_string())
         }
     };
@@ -3652,7 +4274,9 @@ fn execute_tag_transfer_to_cue(
             verification,
             cancel,
         ),
-        TransferCarrier::Files { .. } | TransferCarrier::EmbeddedCues { .. } => unreachable!(),
+        TransferCarrier::Files { .. }
+        | TransferCarrier::EmbeddedCues { .. }
+        | TransferCarrier::Aggregate { .. } => unreachable!(),
     };
 
     match write_result {
@@ -3713,6 +4337,16 @@ pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
                 progress,
             )
         }
+        TransferCarrier::Aggregate { carriers } => execute_tag_transfer_to_aggregate(
+            source_entries,
+            source_dimension,
+            source_track_numbers,
+            carriers,
+            scope,
+            verification,
+            cancel,
+            progress,
+        ),
     }
 }
 
@@ -3722,27 +4356,30 @@ pub(crate) fn preview_tag_transfer(
     target: &TransferCarrier,
     scope: super::app::TagTransferScope,
 ) -> Result<usize, String> {
-    match target {
-        TransferCarrier::EmbeddedCue {
-            image_path,
-            cue_text,
-            sheet,
-            multi_file_read_only,
-        } => validate_embedded_cue_transfer_target(&EmbeddedCueCarrier {
-            image_path: image_path.clone(),
-            cue_text: cue_text.clone(),
-            sheet: sheet.clone(),
-            multi_file_read_only: *multi_file_read_only,
-        })?,
-        TransferCarrier::EmbeddedCues { carriers } => {
-            if carriers.is_empty() {
-                return Err("internal error: embedded CUE carrier set is empty".to_string());
-            }
-            for carrier in carriers {
-                validate_embedded_cue_transfer_target(carrier)?;
-            }
+    validate_transfer_target_for_write(target)?;
+    if let TransferCarrier::Aggregate { carriers } = target {
+        let aggregate_count = target.count();
+        let mut offset = 0usize;
+        let mut field_count = 0usize;
+        for carrier in carriers {
+            let count = carrier.count();
+            let (entries, dimension) = aggregate_source_segment(
+                source_entries,
+                source_dimension,
+                carrier.dimension(),
+                offset,
+                count,
+                aggregate_count,
+            )?;
+            field_count = field_count.saturating_add(preview_tag_transfer(
+                &entries,
+                dimension,
+                carrier,
+                scope,
+            )?);
+            offset += count;
         }
-        TransferCarrier::Files { .. } | TransferCarrier::SidecarCue { .. } => {}
+        return Ok(field_count);
     }
     Ok(plan_transfer_values_for_dimensions(
         source_entries,
@@ -3760,6 +4397,29 @@ pub(crate) fn preview_tag_transfer_fanout(
     target: &TransferCarrier,
     scope: super::app::TagTransferScope,
 ) -> Result<(usize, Option<(usize, usize)>), String> {
+    if let TransferCarrier::Aggregate { carriers } = target {
+        validate_transfer_target_for_write(target)?;
+        let aggregate_count = target.count();
+        let mut offset = 0usize;
+        let mut total = 0usize;
+        for carrier in carriers {
+            let count = carrier.count();
+            let (entries, dimension) = aggregate_source_segment(
+                source_entries,
+                source_dimension,
+                carrier.dimension(),
+                offset,
+                count,
+                aggregate_count,
+            )?;
+            total = total.saturating_add(
+                preview_tag_transfer_fanout(&entries, dimension, carrier, scope)?.0,
+            );
+            offset += count;
+        }
+        return Ok((total, None));
+    }
+
     let cue_or_file_count = preview_tag_transfer(
         source_entries,
         source_dimension,

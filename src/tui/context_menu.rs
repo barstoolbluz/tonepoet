@@ -2334,37 +2334,25 @@ pub(crate) fn handle_tag_transfer_prepared(
     }
 }
 
-fn reverify_prepared_files_target(
+fn reverify_prepared_target(
     prepared: &super::browse::PreparedTagTransfer,
     metadata_target_priority: &[crate::config::AggregateMetadataTarget],
     cancel: &super::probe::MetadataWriteCancelFlag,
 ) -> Result<(), String> {
-    let super::tag_interchange::TransferCarrier::Files { paths: prepared_paths } =
-        &prepared.target
-    else {
-        return Ok(());
-    };
+    // Metadata-editor targets are already concrete editor surfaces rather than
+    // picker roots. Their writers perform representation-specific snapshot
+    // checks at commit time.
     if prepared.target_roots.is_empty() {
-        return Err(
-            "internal error: confirmed Files transfer has no retained target roots".to_string(),
-        );
+        return Ok(());
     }
     let current = super::keybindings::classify_tag_transfer_roots(
         &prepared.target_roots,
         metadata_target_priority,
         cancel,
     )?;
-    let super::tag_interchange::TransferCarrier::Files {
-        paths: current_paths,
-    } = current
-    else {
+    if current.classification_identity() != prepared.target.classification_identity() {
         return Err(
-            "target folder changed since the confirmation was prepared; retry".to_string(),
-        );
-    };
-    if current_paths != *prepared_paths {
-        return Err(
-            "target folder changed since the confirmation was prepared; retry".to_string(),
+            "target selection changed since the confirmation was prepared; retry".to_string(),
         );
     }
     Ok(())
@@ -2410,7 +2398,7 @@ pub(crate) fn launch_prepared_tag_transfer(
                     });
                 }
             };
-            reverify_prepared_files_target(&prepared, &metadata_target_priority, &cancel)?;
+            reverify_prepared_target(&prepared, &metadata_target_priority, &cancel)?;
             let mut report = super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
                 &prepared.source_entries,
                 prepared.source_dimension,
@@ -4685,7 +4673,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_files_target_is_reexpanded_and_refuses_membership_changes() {
+    fn confirmed_target_is_reclassified_and_refuses_membership_changes() {
         let temp = tempfile::tempdir().expect("transfer target tempdir");
         let first = temp.path().join("01.flac");
         let second = temp.path().join("02.flac");
@@ -4710,13 +4698,13 @@ mod tests {
         };
         let cancel = super::super::probe::MetadataWriteCancelFlag::new();
         let priority = crate::config::default_aggregate_metadata_target_priority();
-        reverify_prepared_files_target(&prepared, &priority, &cancel)
+        reverify_prepared_target(&prepared, &priority, &cancel)
             .expect("unchanged target membership re-verifies");
 
         std::fs::write(&third, b"three").expect("third target");
         assert_eq!(
-            reverify_prepared_files_target(&prepared, &priority, &cancel).unwrap_err(),
-            "target folder changed since the confirmation was prepared; retry"
+            reverify_prepared_target(&prepared, &priority, &cancel).unwrap_err(),
+            "target selection changed since the confirmation was prepared; retry"
         );
     }
 

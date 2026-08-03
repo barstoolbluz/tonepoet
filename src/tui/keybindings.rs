@@ -3766,9 +3766,12 @@ mod metadata_auto_populate_alignment_tests {
         assert!(populated);
         let title = entries.iter().find(|e| e.display_key == "TITLE").unwrap();
         assert_eq!(title.per_file_values, vec!["One".to_string(), "Two".to_string()]);
+        assert_eq!(title.per_file_originals, title.per_file_values);
+        assert_eq!(title.original, "<multiple values>");
         assert!(title.is_mixed, "distinct titles recalculate as mixed");
         let tn = entries.iter().find(|e| e.display_key == "TRACKNUMBER").unwrap();
         assert_eq!(tn.per_file_values.len(), 2);
+        assert_eq!(tn.per_file_originals, tn.per_file_values);
     }
 
     #[test]
@@ -3798,10 +3801,52 @@ mod metadata_auto_populate_alignment_tests {
 
         let title = entries.iter().find(|e| e.display_key == "TITLE").unwrap();
         assert_eq!(title.per_file_values[0], "One");
+        assert_eq!(title.per_file_originals[0], "One");
         assert_eq!(
             title.per_file_values[1], "",
             "write-blocked slots keep their placeholder"
         );
+        assert_eq!(
+            title.per_file_originals[1], "",
+            "write-blocked slots must not advance their clean baseline"
+        );
+    }
+
+    #[test]
+    fn filename_suggestions_open_clean_and_real_edits_become_dirty() {
+        let paths = vec![std::path::PathBuf::from("/tmp/01 - Only.flac")];
+        let mut entries = vec![entry(
+            "TITLE",
+            lofty::tag::ItemKey::TrackTitle,
+            vec![""],
+        )];
+
+        assert!(ensure_and_auto_populate_track_title_entries(
+            &mut entries,
+            &paths,
+            &[true],
+        ));
+        let mut state = crate::tui::app::MetadataEditorState::for_files(
+            paths,
+            entries,
+            vec!["01".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        assert!(
+            !state.any_presentation_dirty(),
+            "filename-derived display suggestions are a clean opening baseline"
+        );
+
+        let title = state
+            .active_surface_mut()
+            .entries
+            .iter_mut()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("TITLE row");
+        title.per_file_values[0] = "User edit".to_string();
+        title.value = "User edit".to_string();
+        state.active_surface_mut().dirty = true;
+        assert!(state.any_presentation_dirty());
     }
 }
 
@@ -9575,12 +9620,17 @@ fn unified_cue_album_per_track_add_key_refusal(
                 .to_string(),
         );
     }
-    if matches!(
-        canonical.as_str(),
-        "ISRC" | "MUSICBRAINZ_TRACKID" | "MUSICBRAINZ_RELEASETRACKID"
-    ) {
+    let metadata_sidecar_authority =
+        metadata_editor_native_multi_file_metadata_sidecar_authority(state);
+    if canonical == "ISRC"
+        || (!metadata_sidecar_authority
+            && matches!(
+                canonical.as_str(),
+                "MUSICBRAINZ_TRACKID" | "MUSICBRAINZ_RELEASETRACKID"
+            ))
+    {
         return Some(format!(
-            "metadata editor: cannot persist per-track {} on a multi-image CUE album",
+            "metadata editor: cannot persist per-track {} on this unified CUE album",
             canonical
         ));
     }
@@ -9898,6 +9948,82 @@ fn metadata_editor_native_multi_file_sidecar_authority(
         )
 }
 
+fn metadata_editor_native_multi_file_metadata_sidecar_authority(
+    state: &super::app::MetadataEditorState,
+) -> bool {
+    if !metadata_editor_native_multi_file_sidecar_authority(state) {
+        return false;
+    }
+    let surface = state.active_surface();
+    let Some(sheet) = surface.cue_album_synthetic_sheet.as_ref() else {
+        return false;
+    };
+    if sheet.track_sources.len() != surface.paths.len()
+        || sheet.audio_paths.len() != surface.paths.len()
+    {
+        return false;
+    }
+    let path_keys = surface
+        .paths
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    let save_path_keys = sheet
+        .audio_paths
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    if save_path_keys.len() != sheet.audio_paths.len() || save_path_keys != path_keys {
+        return false;
+    }
+    let mut covered = std::collections::BTreeSet::new();
+    sheet.track_sources.iter().all(|source| {
+        let key = metadata_cue_surface_key(&source.audio_path);
+        path_keys.contains(&key) && covered.insert(key)
+    }) && covered.len() == path_keys.len()
+}
+
+fn metadata_editor_audio_save_paths(
+    state: &super::app::MetadataEditorState,
+) -> &[std::path::PathBuf] {
+    let surface = state.active_surface();
+    if metadata_editor_native_multi_file_metadata_sidecar_authority(state) {
+        if let Some(sheet) = surface.cue_album_synthetic_sheet.as_ref() {
+            return &sheet.audio_paths;
+        }
+    }
+    &surface.paths
+}
+
+fn metadata_editor_track_slots_in_member_file_order<T: Clone>(
+    state: &super::app::MetadataEditorState,
+    slots: &[T],
+) -> Option<Vec<T>> {
+    let surface = state.active_surface();
+    let sheet = surface.cue_album_synthetic_sheet.as_ref()?;
+    if slots.len() != sheet.track_sources.len() {
+        return None;
+    }
+    let path_indices = sheet
+        .audio_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (metadata_cue_surface_key(path), index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if path_indices.len() != sheet.audio_paths.len() {
+        return None;
+    }
+    let mut reordered = vec![None; sheet.audio_paths.len()];
+    for (track_index, source) in sheet.track_sources.iter().enumerate() {
+        let file_index = path_indices.get(&metadata_cue_surface_key(&source.audio_path))?;
+        if reordered[*file_index].is_some() {
+            return None;
+        }
+        reordered[*file_index] = slots.get(track_index).cloned();
+    }
+    reordered.into_iter().collect()
+}
+
 fn metadata_editor_cue_sidecar_representable_entry(
     state: &super::app::MetadataEditorState,
     entry: &super::probe::TagEntry,
@@ -10012,6 +10138,14 @@ fn metadata_editor_native_multi_file_sidecar_preflight_error(
         }
     }
 
+    // A one-track-per-file metadata sidecar has dual authority: CUE-representable
+    // edits update the selected sidecar, while ordinary fields remain writable
+    // through the member files. The CUE-specific structural checks above still
+    // apply, but the image-sidecar restriction to CUE-representable fields does not.
+    if metadata_editor_native_multi_file_metadata_sidecar_authority(state) {
+        return None;
+    }
+
     let unsupported = surface
         .entries
         .iter()
@@ -10072,6 +10206,10 @@ fn metadata_editor_entries_snapshot_for_save(
     state: &super::app::MetadataEditorState,
 ) -> Vec<crate::tui::probe::MetadataEditorTagSnapshot> {
     let surface = state.active_surface();
+    let save_path_count = metadata_editor_audio_save_paths(state).len();
+    let native_sidecar_authority = metadata_editor_native_multi_file_sidecar_authority(state);
+    let metadata_sidecar_authority =
+        metadata_editor_native_multi_file_metadata_sidecar_authority(state);
     let suppress_sidecar_shadow_cuesheet =
         surface.sidecar_cuesheet_shadow_present && !surface.embedded_cuesheet_present;
 
@@ -10079,27 +10217,69 @@ fn metadata_editor_entries_snapshot_for_save(
         .entries
         .iter()
         .map(|entry| {
-            let row_scope = entry.effective_row_scope(surface.paths.len());
-            let originals = entry.per_file_originals.clone();
-            let values = if suppress_sidecar_shadow_cuesheet
-                && entry.display_key.eq_ignore_ascii_case("CUESHEET")
+            let source_row_scope = entry.effective_row_scope(surface.paths.len());
+            let sidecar_owned = native_sidecar_authority
+                && metadata_editor_cue_sidecar_representable_entry(state, entry);
+            let map_track_to_member = metadata_sidecar_authority
+                && source_row_scope == crate::tui::probe::RowScope::Track
+                && !sidecar_owned;
+            let mapped_originals = map_track_to_member
+                .then(|| {
+                    metadata_editor_track_slots_in_member_file_order(
+                        state,
+                        &entry.per_file_originals,
+                    )
+                })
+                .flatten();
+            let mapped_values = map_track_to_member
+                .then(|| {
+                    metadata_editor_track_slots_in_member_file_order(
+                        state,
+                        &entry.per_file_values,
+                    )
+                })
+                .flatten();
+            let mapped_stored_value_counts = map_track_to_member
+                .then(|| {
+                    let stored_value_counts = (0..entry.per_file_values.len())
+                        .map(|index| entry.stored_value_count_for_slot(index))
+                        .collect::<Vec<_>>();
+                    metadata_editor_track_slots_in_member_file_order(
+                        state,
+                        &stored_value_counts,
+                    )
+                })
+                .flatten();
+            let row_scope = if mapped_originals.is_some() && mapped_values.is_some() {
+                crate::tui::probe::RowScope::File
+            } else {
+                source_row_scope
+            };
+            let originals = mapped_originals
+                .unwrap_or_else(|| entry.per_file_originals.clone());
+            let values = if (suppress_sidecar_shadow_cuesheet
+                && entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+                || sidecar_owned
             {
-                // A sidecar shadow is the editable structural anchor for the
-                // sidecar CUE, not an embedded-tag create/update request. Keep
-                // the ordinary lofty diff blind to the regenerated shadow; the
-                // dedicated sidecar write-back plan persists it instead.
+                // A selected native multi-FILE sidecar owns CUE-representable
+                // fields. Keep the ordinary per-file writer blind to those
+                // edits; the dedicated sidecar write-back path persists them.
                 originals.clone()
             } else {
-                entry.per_file_values.clone()
+                mapped_values.unwrap_or_else(|| entry.per_file_values.clone())
             };
             crate::tui::probe::MetadataEditorTagSnapshot {
                 item_key: entry.item_key.clone(),
                 row_scope,
                 tag_type: crate::tui::probe::editor_tag_origin(&entry.display_key),
                 existed: if row_scope == crate::tui::probe::RowScope::File {
-                    (0..surface.paths.len())
-                        .map(|idx| entry.stored_value_count_for_slot(idx) > 0)
-                        .collect()
+                    if let Some(counts) = mapped_stored_value_counts {
+                        counts.into_iter().map(|count| count > 0).collect()
+                    } else {
+                        (0..save_path_count)
+                            .map(|idx| entry.stored_value_count_for_slot(idx) > 0)
+                            .collect()
+                    }
                 } else {
                     Vec::new()
                 },
@@ -10110,39 +10290,54 @@ fn metadata_editor_entries_snapshot_for_save(
         .collect()
 }
 
+fn metadata_editor_audio_paths_requiring_save(
+    state: &super::app::MetadataEditorState,
+) -> Vec<std::path::PathBuf> {
+    let surface = state.active_surface();
+    let save_paths = metadata_editor_audio_save_paths(state);
+    let snapshots = metadata_editor_entries_snapshot_for_save(state);
+    let deleted = surface
+        .deleted
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let forced_deletes = metadata_editor_forced_delete_items(state);
+
+    save_paths
+        .iter()
+        .enumerate()
+        .filter_map(|(file_index, path)| {
+            let entry_change = snapshots.iter().enumerate().any(|(entry_index, entry)| {
+                let sidecar_owned = metadata_editor_native_multi_file_sidecar_authority(state)
+                    && surface
+                        .entries
+                        .get(entry_index)
+                        .is_some_and(|source| {
+                            metadata_editor_cue_sidecar_representable_entry(state, source)
+                        });
+                entry.row_scope != crate::tui::probe::RowScope::Track
+                    && ((!sidecar_owned && deleted.contains(&entry_index))
+                        || (entry.values.len() == save_paths.len()
+                            && entry.originals.len() == save_paths.len()
+                            && entry.values[file_index] != entry.originals[file_index]))
+            });
+            let forced_delete = forced_deletes
+                .iter()
+                .any(|(target_index, _)| *target_index == file_index);
+            (entry_change || forced_delete).then(|| path.clone())
+        })
+        .collect()
+}
+
 fn metadata_editor_audio_tag_changes_required_for_sidecar_writeback(
     state: &super::app::MetadataEditorState,
 ) -> bool {
-    if metadata_editor_native_multi_file_sidecar_authority(state) {
+    if metadata_editor_native_multi_file_sidecar_authority(state)
+        && !metadata_editor_native_multi_file_metadata_sidecar_authority(state)
+    {
         return false;
     }
-    let surface = state.active_surface();
-    let path_count = surface.paths.len();
-    if path_count != 1 {
-        return true;
-    }
-    if !metadata_editor_forced_delete_items(state).is_empty() {
-        return true;
-    }
-
-    let deleted: std::collections::BTreeSet<usize> = surface.deleted.iter().copied().collect();
-    metadata_editor_entries_snapshot_for_save(state)
-        .into_iter()
-        .enumerate()
-        .any(|(entry_idx, entry)| {
-            if entry.row_scope == crate::tui::probe::RowScope::Track {
-                return false;
-            }
-            if entry.values.len() != path_count || entry.originals.len() != path_count {
-                return false;
-            }
-            deleted.contains(&entry_idx)
-                || entry
-                    .values
-                    .iter()
-                    .zip(entry.originals.iter())
-                    .any(|(value, original)| value != original)
-        })
+    !metadata_editor_audio_paths_requiring_save(state).is_empty()
 }
 
 fn metadata_save_byte_count(bytes: u64) -> String {
@@ -10215,9 +10410,9 @@ mod metadata_save_progress_tests {
 
 /// Save tags to disk. Runs Phase 4's CUESHEET regen (β album re-derive
 /// + per-track-edit overrides) before snapshotting; refuses save on a
-/// dirty per-track entry without a CUESHEET anchor. Skips per-track
-/// entries from lofty's per-file write loop (their truth is the
-/// regenerated CUESHEET tag).
+/// dirty per-track entry without a CUESHEET anchor. CUE-representable rows
+/// owned by a selected native multi-FILE sidecar persist through the dedicated
+/// sidecar writer; ordinary non-CUE fields retain member-file authority.
 pub(super) fn metadata_editor_save(
     app: &mut AppState,
     state: &mut super::app::MetadataEditorState,
@@ -10413,7 +10608,7 @@ pub(super) fn metadata_editor_save(
         .is_some_and(|plan| plan.sidecar_only);
     state.phase = super::app::MetadataEditorPhase::Saving;
     let (session_id, save_generation, cancel) = state.begin_cancellable_write();
-    let paths = state.active_surface().paths.clone();
+    let paths = metadata_editor_audio_save_paths(state).to_vec();
     state.model.metadata_save_progress = Some(if sidecar_only_save {
         "Saving CUE sidecar".to_string()
     } else {
@@ -10423,15 +10618,33 @@ pub(super) fn metadata_editor_save(
     let save_block_reasons: Vec<Option<String>> = if sidecar_only_save {
         vec![None; paths.len()]
     } else {
-        state.active_surface()
+        let write_eligibility_by_path = state
+            .active_surface()
             .technical_details
             .files
             .iter()
             .map(|file| {
-                file.file_facts
-                    .write_eligibility
-                    .block_reason()
-                    .map(str::to_string)
+                (
+                    metadata_cue_surface_key(&file.file_facts.path),
+                    file.file_facts
+                        .write_eligibility
+                        .block_reason()
+                        .map(str::to_string),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        paths
+            .iter()
+            .map(|path| {
+                write_eligibility_by_path
+                    .get(&metadata_cue_surface_key(path))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Some(format!(
+                            "metadata editor has no write-eligibility facts for '{}'",
+                            path.display()
+                        ))
+                    })
             })
             .collect()
     };
@@ -10561,7 +10774,11 @@ struct CueSidecarWritebackPlan {
     cue_path: std::path::PathBuf,
     replacement_cuesheet: String,
     require_successful_image_save: bool,
+    /// No member audio write is required for this save.
     sidecar_only: bool,
+    /// Missing editor-owned fields delete their corresponding CUE directives.
+    /// This is independent of whether member audio also needs to be written.
+    authoritative_projection: bool,
     preflight_error: Option<String>,
 }
 
@@ -10569,6 +10786,9 @@ fn cue_sidecar_writeback_plan_for_state(
     state: &super::app::MetadataEditorState,
 ) -> Option<CueSidecarWritebackPlan> {
     let surface = state.active_surface();
+    let multi_file_surface = surface.paths.len() > 1;
+    let metadata_sidecar_authority =
+        metadata_editor_native_multi_file_metadata_sidecar_authority(state);
     let (audio_path, required_audio_paths, cue_path, mut preflight_error) =
         if surface.paths.len() == 1 {
             let audio_path = surface.paths.first()?.clone();
@@ -10629,7 +10849,35 @@ fn cue_sidecar_writeback_plan_for_state(
                 .iter()
                 .map(|source| metadata_cue_surface_key(&source.audio_path))
                 .collect();
-            let preflight_error =
+            let preflight_error = if metadata_sidecar_authority {
+                match crate::convert::split_cue_album::admit_split_cue_member(&cue_path) {
+                    Ok(member)
+                        if member.role
+                            == crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar =>
+                    {
+                        let current_track_paths: Vec<std::path::PathBuf> = member
+                            .track_audio_paths
+                            .iter()
+                            .map(|path| metadata_cue_surface_key(path))
+                            .collect();
+                        (current_track_paths != editor_track_paths).then(|| {
+                            format!(
+                                "save aborted: sidecar CUE '{}' changed after the metadata editor opened; no audio file or sidecar was changed",
+                                cue_path.display()
+                            )
+                        })
+                    }
+                    Ok(_) => Some(format!(
+                        "save aborted: sidecar CUE '{}' no longer describes the open one-track-per-FILE metadata authority; no audio file or sidecar was changed",
+                        cue_path.display()
+                    )),
+                    Err(err) => Some(format!(
+                        "save aborted: sidecar CUE '{}' could not be revalidated before save: {}; no audio file or sidecar was changed",
+                        cue_path.display(),
+                        err
+                    )),
+                }
+            } else {
                 match super::cue_parser::multi_file_cue_layout_for_cue_with_policy(
                     &cue_path,
                     crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
@@ -10656,10 +10904,16 @@ fn cue_sidecar_writeback_plan_for_state(
                         cue_path.display(),
                         err
                     )),
-                };
+                }
+            };
+            let required_audio_paths = if metadata_sidecar_authority {
+                metadata_editor_audio_paths_requiring_save(state)
+            } else {
+                surface.paths.clone()
+            };
             (
                 surface.paths.first()?.clone(),
-                surface.paths.clone(),
+                required_audio_paths,
                 cue_path,
                 preflight_error,
             )
@@ -10671,7 +10925,7 @@ fn cue_sidecar_writeback_plan_for_state(
         .per_file_values;
     let replacement_cuesheet = replacement_values.first()?.clone();
     if replacement_cuesheet.trim().is_empty() {
-        if required_audio_paths.len() == 1 {
+        if !multi_file_surface {
             return None;
         }
         preflight_error.get_or_insert_with(|| {
@@ -10683,7 +10937,7 @@ fn cue_sidecar_writeback_plan_for_state(
         .iter()
         .any(|value| value != &replacement_cuesheet)
     {
-        if required_audio_paths.len() == 1 {
+        if !multi_file_surface {
             return None;
         }
         preflight_error.get_or_insert_with(|| {
@@ -10691,7 +10945,12 @@ fn cue_sidecar_writeback_plan_for_state(
                 .to_string()
         });
     }
-    let sidecar_only = metadata_editor_native_multi_file_sidecar_authority(state);
+    let sidecar_only = metadata_editor_native_multi_file_sidecar_authority(state)
+        && (!metadata_sidecar_authority || required_audio_paths.is_empty());
+    let authoritative_projection = matches!(
+        &surface.cue_source,
+        Some(super::app::MetadataCueSource::Sidecar(_))
+    );
     let require_successful_image_save =
         metadata_editor_audio_tag_changes_required_for_sidecar_writeback(state);
     Some(CueSidecarWritebackPlan {
@@ -10701,6 +10960,7 @@ fn cue_sidecar_writeback_plan_for_state(
         replacement_cuesheet,
         require_successful_image_save,
         sidecar_only,
+        authoritative_projection,
         preflight_error,
     })
 }
@@ -10715,7 +10975,8 @@ fn cue_sidecar_writeback_result_after_successful_image_save(
         cue_path,
         replacement_cuesheet,
         require_successful_image_save,
-        sidecar_only,
+        sidecar_only: _,
+        authoritative_projection,
         preflight_error,
     } = plan;
     let all_required_images_saved = required_audio_paths.iter().all(|required| {
@@ -10739,7 +11000,7 @@ fn cue_sidecar_writeback_result_after_successful_image_save(
             reason,
         )
     } else {
-        let write_result = if sidecar_only {
+        let write_result = if authoritative_projection {
             super::cue_parser::rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
                 &cue_path,
                 &replacement_cuesheet,
@@ -14291,12 +14552,19 @@ fn regenerate_unified_cue_album_cuesheet_for_save(
     state: &mut super::app::MetadataEditorState,
 ) -> Result<bool, String> {
     let n_paths = state.active_surface().paths.len();
+    let metadata_sidecar_authority =
+        metadata_editor_native_multi_file_metadata_sidecar_authority(state);
     let per_track_dirty = |surface: &super::app::PresentationTab| -> Vec<String> {
         surface
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.is_track_scoped(n_paths))
+            .filter(|(_, entry)| {
+                !metadata_sidecar_authority
+                    || unified_cue_album_per_track_key_is_persistable(&entry.display_key)
+                    || entry.display_key.eq_ignore_ascii_case("TRACKNUMBER")
+            })
             .filter(|(_, entry)| entry.per_file_values != entry.per_file_originals)
             .map(|(_, entry)| entry.display_key.clone())
             .collect()
@@ -14328,6 +14596,21 @@ fn regenerate_unified_cue_album_cuesheet_for_save(
 
     let cue_idx = cue_album_entry_index(&state.active_surface().entries, "CUESHEET")
         .ok_or_else(|| "save aborted: unified CUE album has no CUESHEET row".to_string())?;
+    if metadata_sidecar_authority {
+        let cue_representable_change = state
+            .active_surface()
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(entry_idx, entry)| {
+                metadata_editor_cue_sidecar_representable_entry(state, entry)
+                    && (entry.per_file_values != entry.per_file_originals
+                        || state.active_surface().deleted.contains(&entry_idx))
+            });
+        if !cue_representable_change {
+            return Ok(false);
+        }
+    }
     let dirty_keys = per_track_dirty(state.active_surface());
     if state.active_surface().deleted.contains(&cue_idx) && !dirty_keys.is_empty() {
         return Err(format!(
@@ -14349,7 +14632,11 @@ fn regenerate_unified_cue_album_cuesheet_for_save(
             entry.per_file_values != entry.per_file_originals
                 || state.active_surface().deleted.contains(entry_idx)
         })
-        .find(|(_, entry)| !unified_cue_album_per_track_key_is_persistable(&entry.display_key))
+        .find(|(_, entry)| {
+            !unified_cue_album_per_track_key_is_persistable(&entry.display_key)
+                && (!metadata_sidecar_authority
+                    || entry.display_key.eq_ignore_ascii_case("TRACKNUMBER"))
+        })
     {
         if state.active_surface().deleted.contains(&entry_idx) {
             return Err(format!(
@@ -14444,18 +14731,28 @@ pub fn regenerate_cuesheet_for_save(
         .iter()
         .enumerate()
         .any(|(i, _)| is_per_track(i) && dirty_at(i));
+    let changed_or_deleted_at = |idx: usize| -> bool {
+        dirty_at(idx) || state.active_surface().deleted.contains(&idx)
+    };
     let album_keys_dirty = ["ALBUM", "DATE", "GENRE", "CATALOGNUMBER"]
         .iter()
-        .filter_map(|k| entry_idx(k))
-        .any(dirty_at);
-    // ARTIST: only as album-level (dim 1). When per-track, it's
-    // already covered by per_track_dirty.
-    let artist_album_dirty = entry_idx("ARTIST")
-        .filter(|&i| !is_per_track(i))
-        .map(dirty_at)
-        .unwrap_or(false);
+        .filter_map(|key| entry_idx(key))
+        .any(changed_or_deleted_at);
+    // ALBUMARTIST is the canonical album-level CUE PERFORMER row. An
+    // album-scoped ARTIST row is accepted only as a compatibility fallback
+    // for older/synthetic states that do not contain ALBUMARTIST. Track-scoped
+    // ARTIST remains covered exclusively by per_track_dirty.
+    let album_artist_idx = entry_idx("ALBUMARTIST").filter(|&i| !is_per_track(i));
+    let album_performer_dirty = album_artist_idx
+        .map(changed_or_deleted_at)
+        .unwrap_or_else(|| {
+            entry_idx("ARTIST")
+                .filter(|&i| !is_per_track(i))
+                .map(changed_or_deleted_at)
+                .unwrap_or(false)
+        });
 
-    if !per_track_dirty && !album_keys_dirty && !artist_album_dirty {
+    if !per_track_dirty && !album_keys_dirty && !album_performer_dirty {
         return Ok(false);
     }
 
@@ -14582,7 +14879,11 @@ pub fn regenerate_cuesheet_for_save(
     if let Some(s) = derive_album("ALBUM") {
         parsed.title = s;
     }
-    if let Some(s) = derive_album("ARTIST") {
+    let album_performer = match album_artist_idx {
+        Some(_) => derive_album("ALBUMARTIST"),
+        None => derive_album("ARTIST"),
+    };
+    if let Some(s) = album_performer {
         parsed.performer = s;
     }
     if let Some(s) = derive_album("DATE") {
@@ -14602,6 +14903,44 @@ pub fn regenerate_cuesheet_for_save(
     let title_idx_pt = entry_idx("TITLE").filter(|&i| is_per_track(i));
     let artist_idx_pt = entry_idx("ARTIST").filter(|&i| is_per_track(i));
     let isrc_idx_pt = entry_idx("ISRC").filter(|&i| is_per_track(i));
+
+    // A per-track slot the user explicitly emptied (had a value on open, now
+    // blank) or a deleted per-track row is a DELETION, not "preserve the parsed
+    // value". `regenerate_cue_with_overrides` treats a `None` override as
+    // "keep the parsed track field", so without this the parsed template's
+    // inherited performer (CUE inheritance materialises the album PERFORMER into
+    // every track) would silently resurrect per-track even after the user
+    // cleared it. Null the parsed field so regen omits the directive.
+    let explicit_pt_clear = |idx: Option<usize>, i: usize| -> bool {
+        let Some(j) = idx else { return false };
+        if deleted_entries.contains(&j) {
+            return true;
+        }
+        let entry = &state.active_surface().entries[j];
+        let now_empty = entry
+            .per_file_values
+            .get(i)
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(false);
+        let had_value = entry
+            .per_file_originals
+            .get(i)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        now_empty && had_value
+    };
+    for i in 0..parsed.tracks.len() {
+        if explicit_pt_clear(title_idx_pt, i) {
+            parsed.tracks[i].title = None;
+        }
+        if explicit_pt_clear(artist_idx_pt, i) {
+            parsed.tracks[i].performer = None;
+        }
+        if explicit_pt_clear(isrc_idx_pt, i) {
+            parsed.tracks[i].isrc = None;
+        }
+    }
+
     let pt_get = |idx: Option<usize>, i: usize| -> Option<String> {
         idx.filter(|j| !deleted_entries.contains(j))
             .and_then(|j| state.active_surface().entries[j].per_file_values.get(i).cloned())
@@ -14878,8 +15217,7 @@ fn embedded_transfer_carrier_from_candidate(
             cue_text,
             sheet,
             multi_file_read_only: false,
-        } if sheet.tracks.len() >= 2
-            && super::tag_interchange::embedded_cue_metadata_target_is_writable(&audio_path) => {
+        } if sheet.tracks.len() >= 2 => {
             Some(super::tag_interchange::EmbeddedCueCarrier {
                 image_path: audio_path,
                 cue_text,
@@ -14890,24 +15228,6 @@ fn embedded_transfer_carrier_from_candidate(
         EmbeddedCueCandidate::Absent
         | EmbeddedCueCandidate::Invalid(_)
         | EmbeddedCueCandidate::Valid { .. } => None,
-    }
-}
-
-fn transfer_carrier_from_embedded_set(
-    mut carriers: Vec<super::tag_interchange::EmbeddedCueCarrier>,
-) -> Option<super::tag_interchange::TransferCarrier> {
-    if carriers.len() == 1 {
-        let carrier = carriers.pop().expect("one embedded CUE carrier");
-        Some(super::tag_interchange::TransferCarrier::EmbeddedCue {
-            image_path: carrier.image_path,
-            cue_text: carrier.cue_text,
-            sheet: carrier.sheet,
-            multi_file_read_only: carrier.multi_file_read_only,
-        })
-    } else if carriers.is_empty() {
-        None
-    } else {
-        Some(super::tag_interchange::TransferCarrier::EmbeddedCues { carriers })
     }
 }
 
@@ -15051,6 +15371,73 @@ fn normalized_cue_file_reference(value: Option<&str>) -> Option<String> {
     })
 }
 
+
+fn explicit_embedded_metadata_surface_for_path(
+    path: &std::path::Path,
+) -> Result<Option<MetadataCueSurface>, String> {
+    let merged = super::probe::read_all_tags_merged_with_metadata(&[path.to_path_buf()])
+        .map_err(|error| {
+            format!(
+                "metadata: failed to inspect explicitly selected file '{}': {error}",
+                path.display()
+            )
+        })?;
+    if let Some(issue) = merged
+        .metadata_errors
+        .first()
+        .and_then(|issue| issue.as_ref())
+        .filter(|issue| issue.blocks_metadata_use())
+    {
+        return Err(format!(
+            "metadata: failed to inspect explicitly selected file '{}': {}",
+            path.display(),
+            issue.reason
+        ));
+    }
+    match embedded_cue_candidate_for_metadata_at(&merged.entries, path, 0) {
+        EmbeddedCueCandidate::Absent => Ok(None),
+        EmbeddedCueCandidate::Invalid(reason) => Err(format!(
+            "metadata: embedded CUE in '{}' is unusable: {reason}",
+            path.display()
+        )),
+        EmbeddedCueCandidate::Valid {
+            audio_path,
+            cue_text,
+            sheet,
+            multi_file_read_only: false,
+        } if sheet.tracks.len() >= 2 => {
+            if !super::tag_interchange::embedded_cue_metadata_target_is_writable(&audio_path) {
+                return Err(format!(
+                    "metadata: embedded CUE in '{}' is readable but cannot be safely rewritten; select its sidecar CUE or individual tracks instead",
+                    path.display()
+                ));
+            }
+            Ok(Some(MetadataCueSurface {
+                cue_path: audio_path.clone(),
+                audio_path: audio_path.clone(),
+                audio_paths: vec![audio_path.clone()],
+                track_audio_paths: vec![audio_path; sheet.tracks.len()],
+                role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+                cue_text,
+                sheet,
+            }))
+        }
+        EmbeddedCueCandidate::Valid {
+            sheet,
+            multi_file_read_only: true,
+            ..
+        } if sheet.tracks.len() >= 2 => Err(format!(
+            "metadata: embedded CUE in '{}' spans multiple physical files and cannot be safely rewritten from this single-file selection; select its sidecar CUE instead",
+            path.display()
+        )),
+        EmbeddedCueCandidate::Valid { sheet, .. } => Err(format!(
+            "metadata: embedded CUE in '{}' has fewer than 2 audio tracks ({})",
+            path.display(),
+            sheet.tracks.len()
+        )),
+    }
+}
+
 fn native_multi_file_embedded_matches_sidecar_structure(
     sidecar: &MetadataCueSurface,
     embedded: &super::cue_parser::CueSheet,
@@ -15094,39 +15481,6 @@ fn cue_sheets_have_equivalent_metadata(
         })
 }
 
-fn normalized_cue_file_reference_for_structure(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let normalized = value.replace('\\', "/");
-    let path = std::path::Path::new(&normalized);
-    let stem = path.file_stem().or_else(|| path.file_name())?;
-    let mut identity = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
-    if !identity.is_empty() {
-        identity.push('/');
-    }
-    identity.push_str(&stem.to_string_lossy());
-    Some(identity.to_ascii_lowercase())
-}
-
-fn cue_sheet_has_native_multi_file_subdivision(
-    sheet: &super::cue_parser::CueSheet,
-) -> bool {
-    let mut tracks_by_file = std::collections::BTreeMap::<String, usize>::new();
-    for track in &sheet.tracks {
-        let Some(file) = normalized_cue_file_reference_for_structure(track.file.as_deref()) else {
-            return false;
-        };
-        *tracks_by_file.entry(file).or_default() += 1;
-    }
-    tracks_by_file.len() >= 2 && tracks_by_file.values().any(|count| *count > 1)
-}
-
 fn native_multi_file_embedded_surface_for_paths(
     paths: &[std::path::PathBuf],
 ) -> Result<Option<MetadataCueSurface>, String> {
@@ -15164,16 +15518,6 @@ fn native_multi_file_embedded_surface_for_paths(
                 multi_file_read_only: true,
                 ..
             } => {
-                if !cue_sheet_has_native_multi_file_subdivision(&sheet) {
-                    if selected.is_some() {
-                        return Err(format!(
-                            "embedded CUESHEETs in '{}' mix native multi-FILE and ordinary per-file representations",
-                            path.parent().unwrap_or(path).display()
-                        ));
-                    }
-                    ordinary_embedded_carrier.get_or_insert_with(|| path.clone());
-                    continue;
-                }
                 if let Some(ordinary_path) = &ordinary_embedded_carrier {
                     return Err(format!(
                         "embedded CUESHEETs in '{}' mix native multi-FILE and ordinary per-file representations",
@@ -15183,7 +15527,7 @@ fn native_multi_file_embedded_surface_for_paths(
                 if let Some((_, _, selected_sheet)) = &selected {
                     if !cue_sheets_have_equivalent_metadata(selected_sheet, &sheet) {
                         return Err(format!(
-                            "member images in '{}' carry conflicting embedded CUESHEET representations",
+                            "member files in '{}' carry conflicting embedded CUESHEET representations",
                             path.parent().unwrap_or(path).display()
                         ));
                     }
@@ -15238,6 +15582,7 @@ fn native_multi_file_embedded_surface_for_paths(
     let mut track_audio_paths = Vec::with_capacity(sheet.tracks.len());
     let mut audio_paths = Vec::new();
     let mut seen_audio = std::collections::BTreeSet::new();
+    let mut tracks_by_carrier = std::collections::BTreeMap::new();
     for track in &sheet.tracks {
         let file_name = normalized_cue_file_reference(track.file.as_deref()).ok_or_else(|| {
             format!(
@@ -15251,13 +15596,15 @@ fn native_multi_file_embedded_surface_for_paths(
                 track.number
             )
         })?;
-        if seen_audio.insert(metadata_cue_surface_key(&audio_path)) {
+        let key = metadata_cue_surface_key(&audio_path);
+        if seen_audio.insert(key.clone()) {
             audio_paths.push(audio_path.clone());
         }
+        *tracks_by_carrier.entry(key).or_insert(0usize) += 1;
         track_audio_paths.push(audio_path);
     }
 
-    if audio_paths.len() < 2 || sheet.tracks.len() <= audio_paths.len() {
+    if audio_paths.len() < 2 {
         return Ok(None);
     }
     let expected = paths
@@ -15266,17 +15613,22 @@ fn native_multi_file_embedded_surface_for_paths(
         .collect::<std::collections::BTreeSet<_>>();
     if seen_audio != expected {
         return Err(
-            "embedded native multi-FILE CUESHEET does not account for every selected image"
+            "embedded native multi-FILE CUESHEET does not account for every selected audio file"
                 .to_string(),
         );
     }
+    let role = if tracks_by_carrier.values().any(|count| *count > 1) {
+        crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart
+    } else {
+        crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar
+    };
 
     Ok(Some(MetadataCueSurface {
         cue_path: carrier_path,
         audio_path: audio_paths[0].clone(),
         audio_paths,
         track_audio_paths,
-        role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+        role,
         cue_text,
         sheet,
     }))
@@ -15286,7 +15638,22 @@ fn native_multi_file_embedded_source_from_entries(
     sidecar: &MetadataCueSurface,
     entries: &[super::probe::TagEntry],
 ) -> Result<Option<ResolvedMetadataCueSource>, String> {
-    if sidecar.audio_paths.len() < 2 || sidecar.track_audio_paths.len() <= sidecar.audio_paths.len() {
+    if sidecar.audio_paths.len() < 2
+        || sidecar.track_audio_paths.len() < sidecar.audio_paths.len()
+    {
+        return Ok(None);
+    }
+    let expected = sidecar
+        .audio_paths
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    let covered = sidecar
+        .track_audio_paths
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    if covered != expected {
         return Ok(None);
     }
     let mut selected: Option<(std::path::PathBuf, String, super::cue_parser::CueSheet)> = None;
@@ -15317,7 +15684,7 @@ fn native_multi_file_embedded_source_from_entries(
                 if let Some((_, _, selected_sheet)) = &selected {
                     if !cue_sheets_have_equivalent_metadata(selected_sheet, &sheet) {
                         return Err(format!(
-                            "member images in '{}' carry conflicting embedded CUESHEET metadata",
+                            "member files in '{}' carry conflicting embedded CUESHEET metadata",
                             sidecar.cue_path.display()
                         ));
                     }
@@ -15340,7 +15707,7 @@ fn native_multi_file_embedded_source_from_entries(
         return Ok(None);
     }
     // A native multi-FILE CUESHEET describes the complete album even when a
-    // single member image is the tag carrier. Every present copy was checked
+    // single member file is the tag carrier. Every present copy was checked
     // above for structural equivalence and conflicts; absent copies are not a
     // coherence failure.
     let Some((audio_path, cue_text, sheet)) = selected else {
@@ -15476,20 +15843,69 @@ fn apply_policy_selected_metadata_cue_source(
         entries,
         selected.sheet.tracks.len(),
     );
-    if selected
-        .sheet
-        .catalog
-        .as_deref()
-        .is_some_and(|catalog| !catalog.trim().is_empty())
-    {
-        cue_album_upsert_unique_album_entry(
-            entries,
-            "CATALOGNUMBER",
-            lofty::tag::ItemKey::CatalogNumber,
-            selected.sheet.catalog.clone(),
-            surface.audio_paths.len(),
-        );
-    }
+    let cue_or_loaded_album_value = |cue_value: Option<&str>, loaded_value: Option<String>| {
+        cue_value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or(loaded_value)
+    };
+    let album = cue_or_loaded_album_value(
+        selected.sheet.title.as_deref(),
+        cue_album_loaded_album_value(entries, "ALBUM"),
+    );
+    let album_artist = cue_or_loaded_album_value(
+        selected.sheet.performer.as_deref(),
+        cue_album_loaded_album_value(entries, "ALBUMARTIST"),
+    );
+    let date = cue_or_loaded_album_value(
+        selected.sheet.date.as_deref(),
+        cue_album_loaded_album_value(entries, "DATE"),
+    );
+    let genre = cue_or_loaded_album_value(
+        selected.sheet.genre.as_deref(),
+        cue_album_loaded_album_value(entries, "GENRE"),
+    );
+    let catalog = cue_or_loaded_album_value(
+        selected.sheet.catalog.as_deref(),
+        cue_album_loaded_album_value(entries, "CATALOGNUMBER"),
+    );
+    let n_paths = surface.audio_paths.len();
+    cue_album_upsert_unique_album_entry(
+        entries,
+        "ALBUM",
+        lofty::tag::ItemKey::AlbumTitle,
+        album,
+        n_paths,
+    );
+    cue_album_upsert_unique_album_entry(
+        entries,
+        "ALBUMARTIST",
+        lofty::tag::ItemKey::AlbumArtist,
+        album_artist,
+        n_paths,
+    );
+    cue_album_upsert_unique_album_entry(
+        entries,
+        "DATE",
+        lofty::tag::ItemKey::Year,
+        date,
+        n_paths,
+    );
+    cue_album_upsert_unique_album_entry(
+        entries,
+        "GENRE",
+        lofty::tag::ItemKey::Genre,
+        genre,
+        n_paths,
+    );
+    cue_album_upsert_optional_unique_album_entry(
+        entries,
+        "CATALOGNUMBER",
+        lofty::tag::ItemKey::CatalogNumber,
+        catalog,
+        n_paths,
+    );
     Ok((
         selected,
         embedded_cuesheet_present,
@@ -15626,37 +16042,6 @@ fn collect_metadata_cue_admission_structural(
         &crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
         MetadataCueOrdinaryPathMode::StructuralOnly,
     )
-}
-
-fn explicit_audio_member_sidecar_surface(
-    audio_path: &std::path::Path,
-    cue_selections: &crate::convert::queue_expansion::QueueCueSelectionOverrides,
-) -> Option<MetadataCueSurface> {
-    let admission = collect_metadata_cue_admission_with_selections_and_mode(
-        &[audio_path.to_path_buf()],
-        cue_selections,
-        MetadataCueOrdinaryPathMode::StructuralOnly,
-    );
-    if admission.selection_prompt.is_some() {
-        return None;
-    }
-
-    let audio_key = metadata_cue_surface_key(audio_path);
-    let mut matches = admission
-        .surfaces
-        .into_iter()
-        .chain(admission.metadata_sidecar_surfaces)
-        .filter(|surface| {
-            surface.role
-                == crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart
-                && surface.audio_paths.len() > 1
-                && surface
-                    .audio_paths
-                    .iter()
-                    .any(|path| metadata_cue_surface_key(path) == audio_key)
-        });
-    let surface = matches.next()?;
-    matches.next().is_none().then_some(surface)
 }
 
 fn collect_metadata_cue_admission_with_selections_and_mode(
@@ -15840,26 +16225,56 @@ fn transfer_carrier_from_admitted_surface(
     let track_audio_paths = authored_track_audio_paths(&surface.sheet, &surface.track_audio_paths)?;
 
     // A multi-FILE surface admitted from an aggregate directory selection is
-    // one album carrier. Explicit member-file selections bypass CUE admission
-    // before reaching this function and therefore remain file-scoped.
+    // one album carrier. Honor the configured representation here instead of
+    // silently collapsing every multi-FILE album to its sidecar.
     if surface.audio_paths.len() > 1 {
-        let write_method = match surface.role {
-            crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar => {
-                super::tag_interchange::SidecarCueWriteMethod::PerFileAndSidecar
-            }
-            crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart => {
-                super::tag_interchange::SidecarCueWriteMethod::SidecarOnly
-            }
-        };
-        return Ok(super::tag_interchange::TransferCarrier::SidecarCue {
+        let sidecar = || super::tag_interchange::TransferCarrier::SidecarCue {
             cue_path: surface.cue_path.clone(),
             image_paths: surface.audio_paths.clone(),
-            track_audio_paths,
+            track_audio_paths: track_audio_paths.clone(),
             role: surface.role,
-            write_method,
+            write_method: match surface.role {
+                crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar => {
+                    super::tag_interchange::SidecarCueWriteMethod::PerFileAndSidecar
+                }
+                crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart => {
+                    super::tag_interchange::SidecarCueWriteMethod::SidecarOnly
+                }
+            },
             cue_text: surface.cue_text.clone(),
             sheet: surface.sheet.clone(),
-        });
+        };
+        let embedded = || -> Result<Option<super::tag_interchange::TransferCarrier>, String> {
+            let Some(resolved) = native_multi_file_embedded_source(surface)? else {
+                return Ok(None);
+            };
+            let super::app::MetadataCueSource::Embedded(image_path) = resolved.identity else {
+                return Err(
+                    "internal error: native multi-FILE embedded resolver returned a sidecar"
+                        .to_string(),
+                );
+            };
+            Ok(Some(super::tag_interchange::TransferCarrier::EmbeddedCue {
+                image_path,
+                cue_text: resolved.cue_text,
+                sheet: resolved.sheet,
+                multi_file_read_only: true,
+            }))
+        };
+        return match policy {
+            crate::convert::pipeline::CueSidecarPolicy::IgnoreCue => {
+                Err("CUE policy ignores CUE sources for this selection".to_string())
+            }
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly
+            | crate::convert::pipeline::CueSidecarPolicy::PreferSidecar => Ok(sidecar()),
+            crate::convert::pipeline::CueSidecarPolicy::PreferEmbedded => {
+                Ok(embedded()?.unwrap_or_else(sidecar))
+            }
+            crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly => embedded()?.ok_or_else(|| {
+                "CUE policy requires a coherent embedded native multi-FILE CUESHEET on at least one selected member image, but none is present"
+                    .to_string()
+            }),
+        };
     }
 
     let resolved = resolve_metadata_cue_source(policy, surface, embedded)?;
@@ -15975,28 +16390,17 @@ fn transfer_admission_surfaces<'a>(
 
 struct TransferAdmissionIndex<'a> {
     surfaces: Vec<&'a MetadataCueSurface>,
-    by_parent: std::collections::BTreeMap<std::path::PathBuf, Vec<usize>>,
     by_image: std::collections::BTreeMap<std::path::PathBuf, Vec<usize>>,
 }
 
 impl<'a> TransferAdmissionIndex<'a> {
     fn new(admission: &'a MetadataCueAdmission) -> Self {
         let surfaces = transfer_admission_surfaces(admission).collect::<Vec<_>>();
-        let mut by_parent = std::collections::BTreeMap::<
-            std::path::PathBuf,
-            Vec<usize>,
-        >::new();
         let mut by_image = std::collections::BTreeMap::<
             std::path::PathBuf,
             Vec<usize>,
         >::new();
         for (index, surface) in surfaces.iter().enumerate() {
-            let parent = surface
-                .cue_path
-                .parent()
-                .map(metadata_cue_surface_key)
-                .unwrap_or_else(|| metadata_cue_surface_key(&surface.cue_path));
-            by_parent.entry(parent).or_default().push(index);
             for audio_path in &surface.audio_paths {
                 by_image
                     .entry(metadata_cue_surface_key(audio_path))
@@ -16004,15 +16408,7 @@ impl<'a> TransferAdmissionIndex<'a> {
                     .push(index);
             }
         }
-        Self {
-            surfaces,
-            by_parent,
-            by_image,
-        }
-    }
-
-    fn by_parent(&self, key: &std::path::Path) -> &[usize] {
-        self.by_parent.get(key).map(Vec::as_slice).unwrap_or(&[])
+        Self { surfaces, by_image }
     }
 
     fn by_image(&self, key: &std::path::Path) -> &[usize] {
@@ -16023,6 +16419,7 @@ impl<'a> TransferAdmissionIndex<'a> {
 fn read_transfer_embedded_candidates(
     roots: &[std::path::PathBuf],
     admission_index: &TransferAdmissionIndex<'_>,
+    explicit_audio_selection: bool,
     cancel: &super::probe::MetadataWriteCancelFlag,
 ) -> Result<
     std::collections::BTreeMap<
@@ -16044,7 +16441,7 @@ fn read_transfer_embedded_candidates(
             .by_image(&identity)
             .iter()
             .any(|index| admission_index.surfaces[*index].audio_paths.len() > 1);
-        if !belongs_to_multi_file_album {
+        if explicit_audio_selection || !belongs_to_multi_file_album {
             by_identity.entry(identity).or_insert_with(|| root.clone());
         }
     }
@@ -16108,33 +16505,8 @@ impl TransferTraversalLimits {
     }
 }
 
-fn transfer_embedded_candidate<'a>(
-    candidates: &'a std::collections::BTreeMap<
-        std::path::PathBuf,
-        Result<EmbeddedCueCandidate, String>,
-    >,
-    identity: &std::path::Path,
-    display_path: &std::path::Path,
-) -> Result<&'a EmbeddedCueCandidate, String> {
-    candidates
-        .get(identity)
-        .ok_or_else(|| {
-            format!(
-                "internal error: no cached embedded-CUE classification for '{}'",
-                display_path.display()
-            )
-        })?
-        .as_ref()
-        .map_err(|error| error.clone())
-}
-
 fn classify_single_transfer_root(
     root: &std::path::Path,
-    admission_index: &TransferAdmissionIndex<'_>,
-    embedded_candidates: &std::collections::BTreeMap<
-        std::path::PathBuf,
-        Result<EmbeddedCueCandidate, String>,
-    >,
     cancel: &super::probe::MetadataWriteCancelFlag,
     traversal_limits: TransferTraversalLimits,
     metadata_target_priority: &[crate::config::AggregateMetadataTarget],
@@ -16150,102 +16522,12 @@ fn classify_single_transfer_root(
             .to_string());
     }
     if root.is_dir() {
-        let root_key = metadata_cue_surface_key(root);
-        let surface_indices = admission_index.by_parent(&root_key);
-        if surface_indices.len() > 1 {
-            return Err(
-                "Transfer tags: multiple CUE albums in this folder; select a specific .cue or image"
-                    .to_string(),
-            );
-        }
-        if let Some(surface_index) = surface_indices.first() {
-            let surface = admission_index.surfaces[*surface_index];
-            let absent = EmbeddedCueCandidate::Absent;
-            let embedded = if surface.audio_paths.len() > 1 {
-                &absent
-            } else {
-                let image_key = metadata_cue_surface_key(&surface.audio_path);
-                transfer_embedded_candidate(
-                    embedded_candidates,
-                    &image_key,
-                    &surface.audio_path,
-                )?
-            };
-            let embedded_available = matches!(
-                embedded,
-                EmbeddedCueCandidate::Valid { sheet, .. } if sheet.tracks.len() >= 2
-            );
-            let availability = super::tag_interchange::AggregateMetadataAvailability {
-                individual_files: !surface.audio_paths.is_empty(),
-                sidecar_cue: true,
-                embedded_cue: embedded_available,
-            };
-            let target = super::tag_interchange::resolve_aggregate_metadata_target(
-                metadata_target_priority,
-                availability,
-            )
-            .ok_or_else(|| {
-                "Transfer tags: selected folder contains no applicable metadata target".to_string()
-            })?;
-            return match target {
-                crate::config::AggregateMetadataTarget::IndividualFiles => {
-                    Ok(super::tag_interchange::TransferCarrier::Files {
-                        paths: surface.audio_paths.clone(),
-                    })
-                }
-                crate::config::AggregateMetadataTarget::SidecarCue => {
-                    transfer_carrier_from_admitted_surface(
-                        surface,
-                        embedded,
-                        crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
-                    )
-                }
-                crate::config::AggregateMetadataTarget::EmbeddedCue => {
-                    transfer_carrier_from_admitted_surface(
-                        surface,
-                        embedded,
-                        crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly,
-                    )
-                }
-            };
-        }
-
-        let paths = super::command::expand_audio_paths_for_transfer_limited(
-            &[root.to_path_buf()],
-            traversal_limits.max_visited,
-            traversal_limits.max_audio_files,
-            || cancel.is_cancelled(),
-        )?;
-        if paths.is_empty() {
-            return Err("Transfer tags: selected folder contains no audio files".to_string());
-        }
-
-        let carriers = usable_embedded_transfer_carriers_for_paths(&paths, cancel)?;
-        let availability = super::tag_interchange::AggregateMetadataAvailability {
-            individual_files: true,
-            sidecar_cue: false,
-            embedded_cue: !carriers.is_empty(),
-        };
-        let target = super::tag_interchange::resolve_aggregate_metadata_target(
+        return classify_transfer_directory(
+            root,
             metadata_target_priority,
-            availability,
-        )
-        .ok_or_else(|| {
-            "Transfer tags: selected folder contains no applicable metadata target".to_string()
-        })?;
-        return match target {
-            crate::config::AggregateMetadataTarget::IndividualFiles => {
-                Ok(super::tag_interchange::TransferCarrier::Files { paths })
-            }
-            crate::config::AggregateMetadataTarget::EmbeddedCue if !carriers.is_empty() => {
-                transfer_carrier_from_embedded_set(carriers).ok_or_else(|| {
-                    "Transfer tags: selected folder contains no applicable metadata target".to_string()
-                })
-            }
-            _ => Err(
-                "Transfer tags: selected folder contains no applicable metadata target".to_string(),
-            ),
-        };
+            cancel,
+            traversal_limits,
+        );
     }
 
     match crate::convert::classify::classify_file(root) {
@@ -16312,41 +16594,846 @@ fn classify_tag_transfer_roots_with_default_priority_and_limits_for_test(
     )
 }
 
-fn classify_directory_target_before_sidecar_for_transfer(
+fn metadata_paths_outside_coverage(
+    paths: &[std::path::PathBuf],
+    covered: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    paths
+        .iter()
+        .filter_map(|path| {
+            let key = metadata_cue_surface_key(path);
+            (!covered.contains(&key) && seen.insert(key)).then(|| path.clone())
+        })
+        .collect()
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedMetadataGroupOrigin {
+    AdmittedSurface,
+    EmbeddedOnly,
+    Uncovered,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEmbeddedMetadataSurface {
+    surface: MetadataCueSurface,
+    multi_file_read_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedMetadataGroup {
+    order: usize,
+    representation: crate::config::AggregateMetadataTarget,
+    /// Every selected CUE surface belonging to this one independently resolved
+    /// album group. Album identity is deliberately separate from source kind:
+    /// two unrelated Embedded-CUE albums remain two groups, while genuine
+    /// sides/discs of one album remain one group with multiple surfaces.
+    selected_surfaces: Vec<MetadataCueSurface>,
+    covered_paths: Vec<std::path::PathBuf>,
+    /// Parallel to `selected_surfaces` when Embedded CUE is selected. Empty for
+    /// Sidecar CUE and Individual-files groups.
+    embedded_multi_file_read_only: Vec<bool>,
+    origin: ResolvedMetadataGroupOrigin,
+}
+
+fn metadata_surface_coverage_keys(
+    surface: &MetadataCueSurface,
+) -> std::collections::BTreeSet<std::path::PathBuf> {
+    surface
+        .audio_paths
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect()
+}
+
+fn metadata_paths_for_coverage(
+    paths: &[std::path::PathBuf],
+    covered: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    paths
+        .iter()
+        .filter(|path| covered.contains(&metadata_cue_surface_key(path)))
+        .cloned()
+        .collect()
+}
+
+fn metadata_sidecar_member_file_save_order(
+    surface: &MetadataCueSurface,
+    group_covered_paths: &[std::path::PathBuf],
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let cue_coverage = metadata_surface_coverage_keys(surface);
+    if cue_coverage.len() != surface.audio_paths.len() {
+        return Err(format!(
+            "metadata: sidecar '{}' contains duplicate covered audio paths",
+            surface.cue_path.display()
+        ));
+    }
+
+    let cue_track_sources = surface
+        .track_audio_paths
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    if cue_track_sources.len() != surface.track_audio_paths.len()
+        || cue_track_sources != cue_coverage
+    {
+        return Err(format!(
+            "metadata: sidecar '{}' does not provide a one-track-per-file mapping over its covered members",
+            surface.cue_path.display()
+        ));
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ordered = Vec::with_capacity(cue_coverage.len());
+    for path in group_covered_paths {
+        let key = metadata_cue_surface_key(path);
+        if !cue_coverage.contains(&key) {
+            continue;
+        }
+        if !seen.insert(key) {
+            return Err(format!(
+                "metadata: resolved group repeats a covered member of sidecar '{}'",
+                surface.cue_path.display()
+            ));
+        }
+        ordered.push(path.clone());
+    }
+
+    if ordered.len() != cue_coverage.len() || seen != cue_coverage {
+        return Err(format!(
+            "metadata: resolved group does not contain every covered member of sidecar '{}' exactly once",
+            surface.cue_path.display()
+        ));
+    }
+    Ok(ordered)
+}
+
+fn metadata_group_order(
+    paths: &[std::path::PathBuf],
+    path_order: &std::collections::BTreeMap<std::path::PathBuf, usize>,
+) -> usize {
+    paths
+        .iter()
+        .filter_map(|path| path_order.get(&metadata_cue_surface_key(path)).copied())
+        .min()
+        .unwrap_or(usize::MAX)
+}
+
+fn metadata_normalized_release_identity(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push(ch);
+            pending_space = false;
+        } else if !normalized.is_empty() {
+            pending_space = true;
+        }
+    }
+    normalized
+}
+
+/// Return a conservative `(release prefix, part token)` pair only when `value`
+/// ends in an explicit disc/side designator. A shared title prefix alone is not
+/// album identity: `Album A` and `Album B` must remain separate releases.
+fn metadata_album_part_components(value: &str) -> Option<(String, String)> {
+    let lower = value.to_ascii_lowercase();
+    for marker in ["disc", "disk", "cd", "side"] {
+        let Some(index) = lower.rfind(marker) else {
+            continue;
+        };
+        let before = &lower[..index];
+        let after = &lower[index + marker.len()..];
+        let starts_at_boundary = before
+            .chars()
+            .next_back()
+            .map_or(true, |ch| !ch.is_ascii_alphanumeric());
+        if !starts_at_boundary || after.is_empty() {
+            continue;
+        }
+        let suffix = after.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+        if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let separated_suffix = after
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_ascii_alphanumeric());
+        if !separated_suffix && suffix.len() > 1 && !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            // Avoid treating ordinary words such as "sidecar" as part labels;
+            // compact forms such as SideA, Disc2, and CD10 remain accepted.
+            continue;
+        }
+        let prefix = metadata_normalized_release_identity(before);
+        let canonical_marker = if marker == "disk" { "disc" } else { marker };
+        return Some((prefix, format!("{canonical_marker}:{suffix}")));
+    }
+    None
+}
+
+fn metadata_surface_album_part_identity(
+    surface: &MetadataCueSurface,
+) -> Option<(std::path::PathBuf, String, String)> {
+    let cue_stem = surface.cue_path.file_stem()?.to_string_lossy();
+    let path_part = metadata_album_part_components(&cue_stem);
+    let title = surface.sheet.title.as_deref().unwrap_or_default();
+    let title_part = metadata_album_part_components(title);
+    if path_part.is_none() && title_part.is_none() {
+        return None;
+    }
+
+    let release_key = title_part
+        .as_ref()
+        .map(|(prefix, _)| prefix.clone())
+        .filter(|prefix| !prefix.is_empty())
+        .or_else(|| {
+            if title_part.is_some() {
+                None
+            } else {
+                let title = metadata_normalized_release_identity(title);
+                (!title.is_empty()).then_some(title)
+            }
+        })
+        .or_else(|| {
+            path_part
+                .as_ref()
+                .map(|(prefix, _)| prefix.clone())
+                .filter(|prefix| !prefix.is_empty())
+        })
+        .or_else(|| {
+            surface
+                .cue_path
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .map(|name| metadata_normalized_release_identity(&name.to_string_lossy()))
+                .filter(|value| !value.is_empty())
+        })?;
+    let part_key = title_part
+        .as_ref()
+        .map(|(_, part)| part.clone())
+        .or_else(|| path_part.as_ref().map(|(_, part)| part.clone()))?;
+    let parent = surface
+        .cue_path
+        .parent()
+        .map(metadata_cue_surface_key)
+        .unwrap_or_default();
+    Some((parent, release_key, part_key))
+}
+
+fn metadata_surfaces_are_obvious_album_parts(surfaces: &[MetadataCueSurface]) -> bool {
+    if surfaces.len() < 2 {
+        return false;
+    }
+    let mut album_identity: Option<(std::path::PathBuf, String)> = None;
+    let mut parts = std::collections::BTreeSet::new();
+    for surface in surfaces {
+        let Some((parent, release, part)) = metadata_surface_album_part_identity(surface) else {
+            return false;
+        };
+        let identity = (parent, release);
+        if album_identity
+            .as_ref()
+            .is_some_and(|current| current != &identity)
+            || !parts.insert(part)
+        {
+            return false;
+        }
+        album_identity.get_or_insert(identity);
+    }
+    true
+}
+
+fn metadata_surface_album_groups(
+    surfaces: Vec<MetadataCueSurface>,
+    path_order: &std::collections::BTreeMap<std::path::PathBuf, usize>,
+) -> Vec<Vec<MetadataCueSurface>> {
+    let mut synthetic = Vec::new();
+    let mut metadata_sidecars = Vec::new();
+    for surface in surfaces {
+        if surface.role
+            == crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar
+        {
+            metadata_sidecars.push(surface);
+        } else {
+            synthetic.push(surface);
+        }
+    }
+
+    let mut album_groups = Vec::new();
+    for mut same_role in [synthetic, metadata_sidecars] {
+        same_role.sort_by(|left, right| {
+            metadata_group_order(&left.audio_paths, path_order)
+                .cmp(&metadata_group_order(&right.audio_paths, path_order))
+                .then_with(|| left.cue_path.cmp(&right.cue_path))
+        });
+
+        // Partition by positive release-part evidence. Surfaces without such
+        // evidence remain independent by default; the merge-biased split-CUE
+        // ladder is intentionally not an album-identity oracle here.
+        let mut part_candidates = std::collections::BTreeMap::<
+            (std::path::PathBuf, String),
+            Vec<MetadataCueSurface>,
+        >::new();
+        let mut independent = Vec::new();
+        for surface in same_role {
+            if let Some((parent, release, _)) = metadata_surface_album_part_identity(&surface) {
+                part_candidates
+                    .entry((parent, release))
+                    .or_default()
+                    .push(surface);
+            } else {
+                independent.push(vec![surface]);
+            }
+        }
+        for mut candidates in part_candidates.into_values() {
+            candidates.sort_by(|left, right| {
+                metadata_group_order(&left.audio_paths, path_order)
+                    .cmp(&metadata_group_order(&right.audio_paths, path_order))
+                    .then_with(|| left.cue_path.cmp(&right.cue_path))
+            });
+            if metadata_surfaces_are_obvious_album_parts(&candidates) {
+                album_groups.push(candidates);
+            } else {
+                album_groups.extend(candidates.into_iter().map(|surface| vec![surface]));
+            }
+        }
+        album_groups.extend(independent);
+    }
+
+    album_groups.sort_by(|left, right| {
+        let left_order = left
+            .iter()
+            .map(|surface| metadata_group_order(&surface.audio_paths, path_order))
+            .min()
+            .unwrap_or(usize::MAX);
+        let right_order = right
+            .iter()
+            .map(|surface| metadata_group_order(&surface.audio_paths, path_order))
+            .min()
+            .unwrap_or(usize::MAX);
+        left_order.cmp(&right_order).then_with(|| {
+            left.first()
+                .map(|surface| &surface.cue_path)
+                .cmp(&right.first().map(|surface| &surface.cue_path))
+        })
+    });
+    album_groups
+}
+
+/// Resolve a folder into independently authoritative metadata groups.
+///
+/// Structural sidecar admission and operation-specific embedded probing happen
+/// before this boundary. From those facts onward, Edit Metadata and Transfer
+/// Tags use the same grouping, viability, priority, coverage, and ordering
+/// rules. Materialization remains operation-specific after this function.
+fn resolve_directory_metadata_groups<F>(
+    paths: &[std::path::PathBuf],
+    admitted_surfaces: &[MetadataCueSurface],
+    standalone_embedded: Vec<ResolvedEmbeddedMetadataSurface>,
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+    mut embedded_for_admitted_surface: F,
+    operation: &str,
+) -> Result<Vec<ResolvedMetadataGroup>, String>
+where
+    F: FnMut(
+        &MetadataCueSurface,
+    ) -> Result<Option<ResolvedEmbeddedMetadataSurface>, String>,
+{
+    let path_order = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (metadata_cue_surface_key(path), index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let admitted_album_groups =
+        metadata_surface_album_groups(admitted_surfaces.to_vec(), &path_order);
+    let mut covered = std::collections::BTreeSet::new();
+    let mut groups = Vec::new();
+
+    for surfaces in admitted_album_groups {
+        let mut surface_keys = std::collections::BTreeSet::new();
+        for surface in &surfaces {
+            surface_keys.extend(metadata_surface_coverage_keys(surface));
+        }
+        if surface_keys.iter().any(|key| covered.contains(key)) {
+            return Err(format!(
+                "{operation}: overlapping CUE representations require an explicit CUE selection"
+            ));
+        }
+        let individual_paths = metadata_paths_for_coverage(paths, &surface_keys);
+        if individual_paths.is_empty() {
+            continue;
+        }
+
+        // Embedded CUE is viable for an album group only when every member has
+        // a coherent applicable embedded representation. Callers normalize
+        // absent, malformed, stale, conflicting, or inapplicable discovered
+        // data to Ok(None). Err is reserved for cancellation or a genuine
+        // operational failure and must propagate unchanged. Explicit embedded
+        // selection still uses the strict path and returns its actionable error.
+        let mut embedded_surfaces = Vec::with_capacity(surfaces.len());
+        let mut embedded_read_only = Vec::with_capacity(surfaces.len());
+        let mut embedded_available = true;
+        for surface in &surfaces {
+            match embedded_for_admitted_surface(surface) {
+                Ok(Some(embedded)) => {
+                    embedded_read_only.push(embedded.multi_file_read_only);
+                    embedded_surfaces.push(embedded.surface);
+                }
+                Ok(None) => {
+                    embedded_available = false;
+                    embedded_surfaces.clear();
+                    embedded_read_only.clear();
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let availability = super::tag_interchange::AggregateMetadataAvailability {
+            individual_files: surfaces
+                .iter()
+                .all(|surface| !metadata_cue_surface_proves_image_content(surface)),
+            // Every admitted sidecar surface is a viable Sidecar-CUE source. A
+            // same-release collection of one-track-per-file metadata sidecars
+            // remains a composite of independent field-level authorities; it
+            // is materialized per surface rather than collapsed structurally.
+            sidecar_cue: true,
+            embedded_cue: embedded_available,
+        };
+        let representation = super::tag_interchange::resolve_aggregate_metadata_target(
+            metadata_target_priority,
+            availability,
+        )
+        .ok_or_else(|| {
+            let cue = surfaces
+                .first()
+                .map(|surface| surface.cue_path.display().to_string())
+                .unwrap_or_else(|| "<unknown CUE>".to_string());
+            format!("{operation}: '{cue}' has no applicable metadata representation")
+        })?;
+        let (selected_surfaces, embedded_multi_file_read_only) = match representation {
+            crate::config::AggregateMetadataTarget::IndividualFiles => (Vec::new(), Vec::new()),
+            crate::config::AggregateMetadataTarget::SidecarCue => {
+                (surfaces.clone(), Vec::new())
+            }
+            crate::config::AggregateMetadataTarget::EmbeddedCue => {
+                if !embedded_available {
+                    return Err(format!(
+                        "{operation}: selected embedded CUE group is no longer applicable"
+                    ));
+                }
+                (embedded_surfaces, embedded_read_only)
+            }
+        };
+        let order = metadata_group_order(&individual_paths, &path_order);
+        covered.extend(surface_keys);
+        groups.push(ResolvedMetadataGroup {
+            order,
+            representation,
+            selected_surfaces,
+            covered_paths: individual_paths,
+            embedded_multi_file_read_only,
+            origin: ResolvedMetadataGroupOrigin::AdmittedSurface,
+        });
+    }
+
+    let mut standalone_by_key = standalone_embedded
+        .into_iter()
+        .filter(|embedded| {
+            let keys = metadata_surface_coverage_keys(&embedded.surface);
+            !keys.iter().all(|key| covered.contains(key))
+        })
+        .map(|embedded| {
+            (
+                metadata_cue_surface_key(&embedded.surface.cue_path),
+                embedded,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let standalone_groups = metadata_surface_album_groups(
+        standalone_by_key
+            .values()
+            .map(|embedded| embedded.surface.clone())
+            .collect(),
+        &path_order,
+    );
+    for grouped_surfaces in standalone_groups {
+        let mut embedded_group = Vec::with_capacity(grouped_surfaces.len());
+        for surface in grouped_surfaces {
+            if let Some(embedded) =
+                standalone_by_key.remove(&metadata_cue_surface_key(&surface.cue_path))
+            {
+                embedded_group.push(embedded);
+            }
+        }
+        if embedded_group.is_empty() {
+            continue;
+        }
+        let mut surface_keys = std::collections::BTreeSet::new();
+        for embedded in &embedded_group {
+            surface_keys.extend(metadata_surface_coverage_keys(&embedded.surface));
+        }
+        let overlap_count = surface_keys
+            .iter()
+            .filter(|key| covered.contains(*key))
+            .count();
+        if overlap_count == surface_keys.len() {
+            continue;
+        }
+        if overlap_count != 0 {
+            return Err(format!(
+                "{operation}: partially overlapping embedded CUE representations require an explicit selection"
+            ));
+        }
+        let individual_paths = metadata_paths_for_coverage(paths, &surface_keys);
+        if individual_paths.is_empty() {
+            continue;
+        }
+        let availability = super::tag_interchange::AggregateMetadataAvailability {
+            individual_files: embedded_group.iter().all(|embedded| {
+                !metadata_cue_surface_proves_image_content(&embedded.surface)
+            }),
+            sidecar_cue: false,
+            embedded_cue: true,
+        };
+        let representation = super::tag_interchange::resolve_aggregate_metadata_target(
+            metadata_target_priority,
+            availability,
+        )
+        .ok_or_else(|| {
+            let carrier = embedded_group
+                .first()
+                .map(|embedded| embedded.surface.audio_path.display().to_string())
+                .unwrap_or_else(|| "<unknown carrier>".to_string());
+            format!(
+                "{operation}: embedded CUE carrier '{carrier}' has no applicable metadata representation"
+            )
+        })?;
+        let (selected_surfaces, embedded_multi_file_read_only) = if representation
+            == crate::config::AggregateMetadataTarget::EmbeddedCue
+        {
+            (
+                embedded_group
+                    .iter()
+                    .map(|embedded| embedded.surface.clone())
+                    .collect(),
+                embedded_group
+                    .iter()
+                    .map(|embedded| embedded.multi_file_read_only)
+                    .collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let order = metadata_group_order(&individual_paths, &path_order);
+        covered.extend(surface_keys);
+        groups.push(ResolvedMetadataGroup {
+            order,
+            representation,
+            selected_surfaces,
+            covered_paths: individual_paths,
+            embedded_multi_file_read_only,
+            origin: ResolvedMetadataGroupOrigin::EmbeddedOnly,
+        });
+    }
+
+    let uncovered = metadata_paths_outside_coverage(paths, &covered);
+    if !uncovered.is_empty() {
+        groups.push(ResolvedMetadataGroup {
+            order: metadata_group_order(&uncovered, &path_order),
+            representation: crate::config::AggregateMetadataTarget::IndividualFiles,
+            selected_surfaces: Vec::new(),
+            covered_paths: uncovered,
+            embedded_multi_file_read_only: Vec::new(),
+            origin: ResolvedMetadataGroupOrigin::Uncovered,
+        });
+    }
+    groups.sort_by(|left, right| {
+        let rank = |group: &ResolvedMetadataGroup| {
+            if group.origin == ResolvedMetadataGroupOrigin::Uncovered {
+                2usize
+            } else if group.origin == ResolvedMetadataGroupOrigin::EmbeddedOnly
+                && (group
+                    .embedded_multi_file_read_only
+                    .iter()
+                    .any(|read_only| *read_only)
+                    || group.selected_surfaces.iter().any(|surface| {
+                        !super::tag_interchange::embedded_cue_metadata_target_is_writable(
+                            &surface.audio_path,
+                        )
+                    }))
+            {
+                // A writable admitted representation is the primary folder
+                // group; an embedded representation that is readable only as
+                // a source remains available after it. Writable peer groups
+                // otherwise retain content order.
+                1
+            } else {
+                0
+            }
+        };
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| left.order.cmp(&right.order))
+    });
+    Ok(groups)
+}
+
+fn resolved_embedded_surface_from_transfer_carrier(
+    context: &MetadataCueSurface,
+    carrier: super::tag_interchange::TransferCarrier,
+) -> Option<ResolvedEmbeddedMetadataSurface> {
+    let super::tag_interchange::TransferCarrier::EmbeddedCue {
+        image_path,
+        cue_text,
+        sheet,
+        multi_file_read_only,
+    } = carrier
+    else {
+        return None;
+    };
+    let mut surface = context.clone();
+    surface.cue_path = image_path;
+    surface.cue_text = cue_text;
+    surface.sheet = sheet;
+    Some(ResolvedEmbeddedMetadataSurface {
+        surface,
+        multi_file_read_only,
+    })
+}
+
+fn resolved_embedded_surface_from_standalone_transfer_carrier(
+    carrier: super::tag_interchange::EmbeddedCueCarrier,
+) -> ResolvedEmbeddedMetadataSurface {
+    let track_count = carrier.sheet.tracks.len();
+    let image_path = carrier.image_path;
+    ResolvedEmbeddedMetadataSurface {
+        surface: MetadataCueSurface {
+            cue_path: image_path.clone(),
+            audio_path: image_path.clone(),
+            audio_paths: vec![image_path.clone()],
+            track_audio_paths: vec![image_path; track_count],
+            role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+            cue_text: carrier.cue_text,
+            sheet: carrier.sheet,
+        },
+        multi_file_read_only: carrier.multi_file_read_only,
+    }
+}
+
+fn materialize_transfer_metadata_group(
+    group: &ResolvedMetadataGroup,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    match group.representation {
+        crate::config::AggregateMetadataTarget::IndividualFiles => {
+            Ok(super::tag_interchange::TransferCarrier::Files {
+                paths: group.covered_paths.clone(),
+            })
+        }
+        crate::config::AggregateMetadataTarget::SidecarCue => {
+            let mut carriers = Vec::with_capacity(group.selected_surfaces.len());
+            for (order, surface) in group.selected_surfaces.iter().enumerate() {
+                carriers.push((
+                    order,
+                    transfer_carrier_from_admitted_surface(
+                        surface,
+                        &EmbeddedCueCandidate::Absent,
+                        crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+                    )?,
+                ));
+            }
+            compose_transfer_carrier(carriers)
+        }
+        crate::config::AggregateMetadataTarget::EmbeddedCue => {
+            if group.selected_surfaces.is_empty() {
+                return Err(
+                    "Transfer tags: selected embedded group lost its carrier surfaces"
+                        .to_string(),
+                );
+            }
+            if group.selected_surfaces.len() == 1 {
+                let surface = &group.selected_surfaces[0];
+                return Ok(super::tag_interchange::TransferCarrier::EmbeddedCue {
+                    image_path: surface.cue_path.clone(),
+                    cue_text: surface.cue_text.clone(),
+                    sheet: surface.sheet.clone(),
+                    multi_file_read_only: group
+                        .embedded_multi_file_read_only
+                        .first()
+                        .copied()
+                        .unwrap_or(false),
+                });
+            }
+            let carriers = group
+                .selected_surfaces
+                .iter()
+                .enumerate()
+                .map(|(index, surface)| super::tag_interchange::EmbeddedCueCarrier {
+                    image_path: surface.cue_path.clone(),
+                    cue_text: surface.cue_text.clone(),
+                    sheet: surface.sheet.clone(),
+                    multi_file_read_only: group
+                        .embedded_multi_file_read_only
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false),
+                })
+                .collect();
+            Ok(super::tag_interchange::TransferCarrier::EmbeddedCues { carriers })
+        }
+    }
+}
+
+fn compose_transfer_carrier(
+    mut ordered: Vec<(usize, super::tag_interchange::TransferCarrier)>,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    ordered.sort_by_key(|(order, _)| *order);
+    let mut carriers: Vec<super::tag_interchange::TransferCarrier> = Vec::new();
+    for (_, carrier) in ordered {
+        let nested = match carrier {
+            super::tag_interchange::TransferCarrier::Aggregate { carriers } => carriers,
+            carrier => vec![carrier],
+        };
+        for carrier in nested {
+            match carrier {
+                super::tag_interchange::TransferCarrier::Files { mut paths } => {
+                    if let Some(super::tag_interchange::TransferCarrier::Files {
+                        paths: previous,
+                    }) = carriers.last_mut()
+                    {
+                        previous.append(&mut paths);
+                    } else {
+                        carriers.push(super::tag_interchange::TransferCarrier::Files { paths });
+                    }
+                }
+                carrier => carriers.push(carrier),
+            }
+        }
+    }
+    match carriers.len() {
+        0 => Err("Transfer tags: selected folder contains no applicable metadata target".to_string()),
+        1 => Ok(carriers.pop().expect("one transfer carrier")),
+        _ => Ok(super::tag_interchange::TransferCarrier::Aggregate { carriers }),
+    }
+}
+
+/// Resolve one folder-level transfer request from semantic viability facts,
+/// then materialize the selected representation plus any genuinely uncovered
+/// audio. This is the folder-policy boundary; explicit files and explicit CUE
+/// paths never call it.
+fn classify_transfer_directory(
     root: &std::path::Path,
     metadata_target_priority: &[crate::config::AggregateMetadataTarget],
     cancel: &super::probe::MetadataWriteCancelFlag,
     traversal_limits: TransferTraversalLimits,
-) -> Result<Option<super::tag_interchange::TransferCarrier>, String> {
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    if cancel.is_cancelled() {
+        return Err("Transfer tags: cancelled during carrier classification".to_string());
+    }
     let paths = super::command::expand_audio_paths_for_transfer_limited(
         &[root.to_path_buf()],
         traversal_limits.max_visited,
         traversal_limits.max_audio_files,
         || cancel.is_cancelled(),
     )?;
-    let mut embedded = None;
-    for target in crate::config::normalized_aggregate_metadata_target_priority(
-        metadata_target_priority,
-    ) {
-        match target {
-            crate::config::AggregateMetadataTarget::IndividualFiles if !paths.is_empty() => {
-                return Ok(Some(super::tag_interchange::TransferCarrier::Files {
-                    paths,
-                }));
-            }
-            crate::config::AggregateMetadataTarget::EmbeddedCue => {
-                let carriers = embedded.get_or_insert(
-                    usable_embedded_transfer_carriers_for_paths(&paths, cancel)?,
-                );
-                if !carriers.is_empty() {
-                    return Ok(transfer_carrier_from_embedded_set(carriers.clone()));
-                }
-            }
-            crate::config::AggregateMetadataTarget::SidecarCue => return Ok(None),
-            _ => {}
-        }
+    if paths.is_empty() {
+        return Err("Transfer tags: selected folder contains no audio files".to_string());
     }
-    Ok(None)
+
+    let admission = collect_transfer_metadata_cue_admission(&[root.to_path_buf()]);
+    if admission.selection_prompt.is_some() {
+        return Err(
+            "Transfer tags: multiple viable CUE files require an explicit CUE selection"
+                .to_string(),
+        );
+    }
+    let admitted_surfaces = transfer_admission_surfaces(&admission)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // Probe every discovered physical carrier once. This establishes readable
+    // source viability only. Representation-specific write support is checked
+    // later if the carrier is chosen as a target.
+    let standalone_embedded = usable_embedded_transfer_carriers_for_paths(&paths, cancel)?
+        .into_iter()
+        .map(resolved_embedded_surface_from_standalone_transfer_carrier)
+        .collect::<Vec<_>>();
+    let standalone_by_path = standalone_embedded
+        .iter()
+        .filter(|embedded| embedded.surface.audio_paths.len() == 1)
+        .map(|embedded| {
+            (
+                metadata_cue_surface_key(&embedded.surface.audio_path),
+                embedded.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let groups = resolve_directory_metadata_groups(
+        &paths,
+        &admitted_surfaces,
+        standalone_embedded,
+        metadata_target_priority,
+        |surface| {
+            if cancel.is_cancelled() {
+                return Err(
+                    "Transfer tags: cancelled during carrier classification".to_string(),
+                );
+            }
+            if surface.audio_paths.len() == 1 {
+                return Ok(standalone_by_path
+                    .get(&metadata_cue_surface_key(&surface.audio_path))
+                    .cloned());
+            }
+            Ok(transfer_carrier_from_admitted_surface(
+                surface,
+                &EmbeddedCueCandidate::Absent,
+                crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly,
+            )
+            .ok()
+            .and_then(|carrier| {
+                resolved_embedded_surface_from_transfer_carrier(surface, carrier)
+            }))
+        },
+        "Transfer tags",
+    )?;
+
+    let selected_sidecar_groups = groups
+        .iter()
+        .filter(|group| {
+            group.representation == crate::config::AggregateMetadataTarget::SidecarCue
+                && group.origin == ResolvedMetadataGroupOrigin::AdmittedSurface
+        })
+        .count();
+    if selected_sidecar_groups > 1 {
+        let files_first = matches!(
+            crate::config::normalized_aggregate_metadata_target_priority(
+                metadata_target_priority,
+            )
+            .first(),
+            Some(&crate::config::AggregateMetadataTarget::IndividualFiles)
+        );
+        if files_first {
+            return Ok(super::tag_interchange::TransferCarrier::Files { paths });
+        }
+        return Err(
+            "Transfer tags: multiple CUE albums in this folder; select a specific .cue or image"
+                .to_string(),
+        );
+    }
+
+    let ordered = groups
+        .iter()
+        .enumerate()
+        .map(|(order, group)| Ok((order, materialize_transfer_metadata_group(group)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    compose_transfer_carrier(ordered)
 }
 
 fn explicit_audio_transfer_carrier(
@@ -16377,32 +17464,66 @@ fn explicit_audio_transfer_carrier(
             .entry(metadata_cue_surface_key(root))
             .or_insert_with(|| root.clone());
     }
-    let paths = by_identity.into_values().collect::<Vec<_>>();
-    let carriers = paths
-        .iter()
-        .filter_map(|path| {
-            embedded_candidates
+    let mut paths = by_identity.into_values().collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        let rank = |path: &std::path::Path| {
+            match embedded_candidates
                 .get(&metadata_cue_surface_key(path))
                 .and_then(|candidate| candidate.as_ref().ok())
-                .cloned()
-                .and_then(embedded_transfer_carrier_from_candidate)
-        })
-        .collect::<Vec<_>>();
-    if carriers.len() == paths.len() {
-        if carriers.len() == 1 {
-            let carrier = carriers.into_iter().next().expect("one carrier");
-            return Ok(super::tag_interchange::TransferCarrier::EmbeddedCue {
-                image_path: carrier.image_path,
-                cue_text: carrier.cue_text,
-                sheet: carrier.sheet,
-                multi_file_read_only: carrier.multi_file_read_only,
-            });
-        }
-        if !carriers.is_empty() {
-            return Ok(super::tag_interchange::TransferCarrier::EmbeddedCues { carriers });
-        }
+            {
+                Some(EmbeddedCueCandidate::Valid { sheet, .. }) if sheet.tracks.len() >= 2 => 1usize,
+                _ => 0,
+            }
+        };
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| metadata_cue_surface_key(left).cmp(&metadata_cue_surface_key(right)))
+    });
+    // Multiple explicitly selected audio files are an explicit Individual-files
+    // representation, even if one or more files happen to carry embedded CUE
+    // tags. Folder policy must not reinterpret that direct selection.
+    if paths.len() != 1 {
+        return Ok(super::tag_interchange::TransferCarrier::Files { paths });
     }
-    Ok(super::tag_interchange::TransferCarrier::Files { paths })
+
+    let path = &paths[0];
+    let candidate = embedded_candidates
+        .get(&metadata_cue_surface_key(path))
+        .ok_or_else(|| {
+            format!(
+                "internal error: no cached embedded-CUE classification for '{}'",
+                path.display()
+            )
+        })?
+        .as_ref()
+        .map_err(|error| error.clone())?;
+    match candidate {
+        EmbeddedCueCandidate::Absent => {
+            Ok(super::tag_interchange::TransferCarrier::Files { paths })
+        }
+        EmbeddedCueCandidate::Invalid(reason) => Err(format!(
+            "Transfer tags: embedded CUE in '{}' is unusable: {reason}",
+            path.display()
+        )),
+        EmbeddedCueCandidate::Valid {
+            audio_path,
+            cue_text,
+            sheet,
+            multi_file_read_only,
+        } if sheet.tracks.len() >= 2 => {
+            Ok(super::tag_interchange::TransferCarrier::EmbeddedCue {
+                image_path: audio_path.clone(),
+                cue_text: cue_text.clone(),
+                sheet: sheet.clone(),
+                multi_file_read_only: *multi_file_read_only,
+            })
+        }
+        EmbeddedCueCandidate::Valid { sheet, .. } => Err(format!(
+            "Transfer tags: embedded CUE in '{}' has fewer than 2 audio tracks ({})",
+            path.display(),
+            sheet.tracks.len()
+        )),
+    }
 }
 
 fn classify_tag_transfer_roots_with_priority_and_limits(
@@ -16440,14 +17561,12 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
             )
     });
     if roots.len() == 1 && roots[0].is_dir() {
-        if let Some(carrier) = classify_directory_target_before_sidecar_for_transfer(
+        return classify_transfer_directory(
             &roots[0],
             metadata_target_priority,
             cancel,
             traversal_limits,
-        )? {
-            return Ok(carrier);
-        }
+        );
     }
 
     let aggregate_roots = roots
@@ -16463,8 +17582,12 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
         );
     }
     let admission_index = TransferAdmissionIndex::new(&admission);
-    let embedded_candidates =
-        read_transfer_embedded_candidates(roots, &admission_index, cancel)?;
+    let embedded_candidates = read_transfer_embedded_candidates(
+        roots,
+        &admission_index,
+        explicit_audio_selection,
+        cancel,
+    )?;
     if explicit_audio_selection {
         return explicit_audio_transfer_carrier(roots, &embedded_candidates, cancel);
     }
@@ -16474,8 +17597,6 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
     for root in roots {
         match classify_single_transfer_root(
             root,
-            &admission_index,
-            &embedded_candidates,
             cancel,
             traversal_limits,
             metadata_target_priority,
@@ -16811,6 +17932,24 @@ fn cue_album_upsert_unique_album_entry(
     cue_album_upsert_album_entry(entries, display_key, item_key, value, n_paths);
 }
 
+fn cue_album_upsert_optional_unique_album_entry(
+    entries: &mut Vec<super::probe::TagEntry>,
+    display_key: &str,
+    item_key: lofty::tag::ItemKey,
+    value: Option<String>,
+    n_paths: usize,
+) {
+    let canonical_key = super::probe::canonical_metadata_display_key(display_key);
+    let value = value.filter(|value| !value.trim().is_empty());
+    if value.is_none() {
+        entries.retain(|entry| {
+            super::probe::canonical_metadata_display_key(&entry.display_key) != canonical_key
+        });
+        return;
+    }
+    cue_album_upsert_unique_album_entry(entries, display_key, item_key, value, n_paths);
+}
+
 fn cue_album_upsert_album_entry(
     entries: &mut Vec<super::probe::TagEntry>,
     display_key: &str,
@@ -17049,6 +18188,84 @@ fn cue_album_loaded_album_value(
         .map(|value| value.trim())
         .find(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+#[derive(Debug, Clone, Default)]
+struct CueAlbumLoadedTrackField {
+    values: Vec<String>,
+    has_multiple_stored_values: bool,
+    stored_value_counts: Vec<usize>,
+}
+
+fn cue_album_loaded_track_field(
+    entries: &[super::probe::TagEntry],
+    display_key: &str,
+    sheet: &super::app::CueAlbumSyntheticSheet,
+) -> CueAlbumLoadedTrackField {
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case(display_key))
+    else {
+        return CueAlbumLoadedTrackField {
+            values: vec![String::new(); sheet.track_sources.len()],
+            ..CueAlbumLoadedTrackField::default()
+        };
+    };
+    let path_indices = sheet
+        .audio_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (metadata_cue_surface_key(path), index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut values = Vec::with_capacity(sheet.track_sources.len());
+    let mut stored_value_counts = Vec::with_capacity(sheet.track_sources.len());
+    for source in &sheet.track_sources {
+        let index = path_indices
+            .get(&metadata_cue_surface_key(&source.audio_path))
+            .copied();
+        values.push(
+            index
+                .and_then(|index| entry.per_file_values.get(index))
+                .cloned()
+                .unwrap_or_default(),
+        );
+        stored_value_counts.push(
+            index
+                .map(|index| entry.stored_value_count_for_slot(index))
+                .unwrap_or(0),
+        );
+    }
+    CueAlbumLoadedTrackField {
+        values,
+        has_multiple_stored_values: entry.has_multiple_stored_values,
+        stored_value_counts,
+    }
+}
+
+fn cue_album_fill_missing_track_values_from_loaded(
+    cue_values: &mut [String],
+    loaded: &CueAlbumLoadedTrackField,
+) {
+    for (value, fallback) in cue_values.iter_mut().zip(loaded.values.iter()) {
+        if value.trim().is_empty() && !fallback.trim().is_empty() {
+            *value = fallback.clone();
+        }
+    }
+}
+
+fn cue_album_restore_track_field_provenance(
+    entries: &mut [super::probe::TagEntry],
+    display_key: &str,
+    loaded: &CueAlbumLoadedTrackField,
+) {
+    let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case(display_key))
+    else {
+        return;
+    };
+    entry.has_multiple_stored_values = loaded.has_multiple_stored_values;
+    entry.per_file_stored_value_counts = loaded.stored_value_counts.clone();
 }
 
 fn cue_album_remove_replaced_keys(
@@ -17604,8 +18821,24 @@ fn build_metadata_editor_for_cue_surfaces(
 fn build_metadata_editor_for_cue_surfaces_with_policy(
     app: &mut AppState,
     surfaces: &[MetadataCueSurface],
+    active_surface: usize,
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) -> Result<(Box<super::app::MetadataEditorState>, usize), String> {
+    build_metadata_editor_for_cue_surfaces_with_policy_and_member_file_order(
+        app,
+        surfaces,
+        active_surface,
+        cue_policy,
+        None,
+    )
+}
+
+fn build_metadata_editor_for_cue_surfaces_with_policy_and_member_file_order(
+    app: &mut AppState,
+    surfaces: &[MetadataCueSurface],
     _active_surface: usize,
     cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+    member_file_save_order: Option<&[std::path::PathBuf]>,
 ) -> Result<(Box<super::app::MetadataEditorState>, usize), String> {
     if surfaces.is_empty() {
         return Err("No CUE/image pairs selected".to_string());
@@ -17620,10 +18853,21 @@ fn build_metadata_editor_for_cue_surfaces_with_policy(
                 && metadata_cue_surface_key(&surface.cue_path)
                     == metadata_cue_surface_key(&surface.audio_path)
         });
+    let metadata_sidecar_semantics = sorted.len() == 1
+        && sorted[0].audio_paths.len() > 1
+        && sorted[0].role
+            == crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar;
+    if member_file_save_order.is_some() && !metadata_sidecar_semantics {
+        return Err(
+            "metadata: member-file save ordering is only valid for one-track-per-file metadata sidecars"
+                .to_string(),
+        );
+    }
     let mut native_multi_file_merged = None;
     let mut native_multi_file_source = None;
     if sorted.len() == 1 && sorted[0].audio_paths.len() > 1 {
-        let merged = super::probe::read_all_tags_merged_with_metadata(&sorted[0].audio_paths)
+        let read_paths = member_file_save_order.unwrap_or(&sorted[0].audio_paths);
+        let merged = super::probe::read_all_tags_merged_with_metadata(read_paths)
             .map_err(|err| format!("Failed to read tags for native multi-FILE CUE album: {err}"))?;
         let selected = resolve_native_multi_file_metadata_cue_source(
             cue_policy,
@@ -17677,15 +18921,76 @@ fn build_metadata_editor_for_cue_surfaces_with_policy(
             &sorted,
             !per_carrier_embedded_cuesheets,
         )?;
-    let paths = sheet.audio_paths.clone();
+    // One-track-per-file metadata sidecars have two independent dimensions:
+    // CUE track order for presentation and ordinary member-file order for
+    // loaded file tags, change detection, and physical writes.
+    if let Some(member_file_save_order) = member_file_save_order {
+        let save_keys = member_file_save_order
+            .iter()
+            .map(|path| metadata_cue_surface_key(path))
+            .collect::<std::collections::BTreeSet<_>>();
+        let track_keys = sheet
+            .track_sources
+            .iter()
+            .map(|source| metadata_cue_surface_key(&source.audio_path))
+            .collect::<std::collections::BTreeSet<_>>();
+        if save_keys.len() != member_file_save_order.len()
+            || track_keys.len() != sheet.track_sources.len()
+            || save_keys != track_keys
+        {
+            return Err(format!(
+                "metadata: member-file save order for sidecar '{}' does not exactly match its CUE track sources",
+                sorted[0].cue_path.display()
+            ));
+        }
+        sheet.audio_paths = member_file_save_order.to_vec();
+    }
+    let save_paths = sheet.audio_paths.clone();
+    let presentation_paths = if metadata_sidecar_semantics {
+        // Preserve the CUE's structural/presentation order independently of
+        // the member-file save dimension stored in `sheet.audio_paths`.
+        let mut seen = std::collections::BTreeSet::new();
+        let paths = sheet
+            .track_sources
+            .iter()
+            .filter_map(|source| {
+                let key = metadata_cue_surface_key(&source.audio_path);
+                seen.insert(key).then(|| source.audio_path.clone())
+            })
+            .collect::<Vec<_>>();
+        if paths.len() != sheet.track_sources.len() {
+            return Err(format!(
+                "metadata: sidecar '{}' no longer has one distinct member per CUE track",
+                sorted[0].cue_path.display()
+            ));
+        }
+        paths
+    } else {
+        save_paths.clone()
+    };
     let merged = match native_multi_file_merged.take() {
         Some(merged) => merged,
-        None => super::probe::read_all_tags_merged_with_metadata(&paths)
+        None => super::probe::read_all_tags_merged_with_metadata(&save_paths)
             .map_err(|err| format!("Failed to read tags for unified CUE album: {err}"))?,
     };
     let mut entries = merged.entries;
     cue_album_normalize_entry_keys(&mut entries);
-    let n_paths = paths.len();
+    let n_paths = save_paths.len();
+    let loaded_track_titles = metadata_sidecar_semantics
+        .then(|| cue_album_loaded_track_field(&entries, "TITLE", &sheet));
+    let loaded_track_artists = metadata_sidecar_semantics
+        .then(|| cue_album_loaded_track_field(&entries, "ARTIST", &sheet));
+    let loaded_track_isrcs = metadata_sidecar_semantics
+        .then(|| cue_album_loaded_track_field(&entries, "ISRC", &sheet));
+    if let Some(loaded) = &loaded_track_titles {
+        cue_album_fill_missing_track_values_from_loaded(&mut track_titles, loaded);
+    }
+    if let Some(loaded) = &loaded_track_artists {
+        cue_album_fill_missing_track_values_from_loaded(&mut track_artists, loaded);
+    }
+    if let Some(loaded) = &loaded_track_isrcs {
+        cue_album_fill_missing_track_values_from_loaded(&mut isrcs, loaded);
+    }
 
     // Authority must be decided BEFORE the replaced-key removal so the
     // forced-cleanup signatures (H2) compare against the PROJECTED sheet —
@@ -17718,11 +19023,13 @@ fn build_metadata_editor_for_cue_surfaces_with_policy(
     // alias normalization turns Year/Album Artist into DATE/ALBUMARTIST, and
     // the replaced-key removal would otherwise make those loaded values
     // vanish from both display and revert. Sheet values keep precedence.
-    // Once native multi-FILE authority has been selected, cue-representable
-    // album fields come only from that CUE representation. Falling back to
-    // image tags here would make an unrelated sidecar edit silently import
-    // absent image metadata into the authoritative sidecar.
-    let use_loaded_album_fallbacks = native_multi_file_source.is_none();
+    // Once image-backed native multi-FILE authority has been selected,
+    // cue-representable album fields come only from that CUE representation.
+    // A one-track-per-file metadata sidecar is different: it is structurally
+    // authoritative where explicit while established file-tag fields remain
+    // the fallback for values the CUE omits.
+    let use_loaded_album_fallbacks = native_multi_file_source.is_none()
+        || metadata_sidecar_semantics;
     let loaded_album = use_loaded_album_fallbacks
         .then(|| cue_album_loaded_album_value(&entries, "ALBUM"))
         .flatten();
@@ -17810,6 +19117,15 @@ fn build_metadata_editor_for_cue_surfaces_with_policy(
         isrcs,
         native_sidecar_authority,
     );
+    if let Some(loaded) = &loaded_track_titles {
+        cue_album_restore_track_field_provenance(&mut entries, "TITLE", loaded);
+    }
+    if let Some(loaded) = &loaded_track_artists {
+        cue_album_restore_track_field_provenance(&mut entries, "ARTIST", loaded);
+    }
+    if let Some(loaded) = &loaded_track_isrcs {
+        cue_album_restore_track_field_provenance(&mut entries, "ISRC", loaded);
+    }
     if let Some(warning_entry) = cue_album_merge_warning_entry(merge_warnings) {
         entries.push(warning_entry);
     }
@@ -17840,7 +19156,7 @@ fn build_metadata_editor_for_cue_surfaces_with_policy(
     };
 
     let technical_details = metadata_technical_details_for_paths_with_analysis(
-        &paths,
+        &save_paths,
         &merged.metadata,
         &merged.metadata_errors,
         Some(&app.db),
@@ -17850,7 +19166,7 @@ fn build_metadata_editor_for_cue_surfaces_with_policy(
         .map(|idx| format!("{:02}", idx))
         .collect();
     let mut tab = super::app::PresentationTab::for_files(
-        paths,
+        presentation_paths,
         entries,
         file_labels,
         technical_details,
@@ -18083,8 +19399,7 @@ fn build_plain_metadata_presentation_tab(
         .iter()
         .map(|file| file.file_facts.write_eligibility.is_writable())
         .collect();
-    let did_auto_populate =
-        ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
+    ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
 
     let track_entry = entries
         .iter()
@@ -18136,11 +19451,318 @@ fn build_plain_metadata_presentation_tab(
         technical_details,
     );
     tab.label = "Ordinary audio files".to_string();
-    tab.dirty = did_auto_populate;
     tab.embedded_cuesheet_present = embedded_cuesheet_present;
     tab.sidecar_cuesheet_shadow_present = sidecar_cuesheet_shadow_present;
     tab.cue_source = cue_source;
     Ok(tab)
+}
+
+
+fn resolved_embedded_metadata_surface_for_admitted_surface(
+    surface: &MetadataCueSurface,
+    standalone_by_path: &std::collections::BTreeMap<
+        std::path::PathBuf,
+        ResolvedEmbeddedMetadataSurface,
+    >,
+) -> Result<Option<ResolvedEmbeddedMetadataSurface>, String> {
+    if surface.audio_paths.len() == 1 {
+        return Ok(standalone_by_path
+            .get(&metadata_cue_surface_key(&surface.audio_path))
+            .cloned());
+    }
+    let Some(source) = native_multi_file_embedded_source(surface)? else {
+        return Ok(None);
+    };
+    let super::app::MetadataCueSource::Embedded(image_path) = source.identity else {
+        return Err(
+            "internal error: native multi-FILE embedded resolver returned a sidecar"
+                .to_string(),
+        );
+    };
+    let mut embedded_surface = surface.clone();
+    embedded_surface.cue_path = image_path;
+    embedded_surface.cue_text = source.cue_text;
+    embedded_surface.sheet = source.sheet;
+    Ok(Some(ResolvedEmbeddedMetadataSurface {
+        surface: embedded_surface,
+        multi_file_read_only: true,
+    }))
+}
+
+fn resolve_edit_metadata_directory_groups(
+    paths: &[std::path::PathBuf],
+    cue_surfaces: &[MetadataCueSurface],
+    metadata_sidecar_surfaces: &[MetadataCueSurface],
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+) -> Result<Vec<ResolvedMetadataGroup>, String> {
+    let admitted_surfaces = cue_surfaces
+        .iter()
+        .chain(metadata_sidecar_surfaces.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut standalone_embedded = usable_embedded_metadata_surfaces_for_paths(paths)
+        .into_iter()
+        .map(|surface| ResolvedEmbeddedMetadataSurface {
+            surface,
+            multi_file_read_only: false,
+        })
+        .collect::<Vec<_>>();
+
+    // Preserve native multi-FILE embedded-only support when the complete
+    // folder selection is itself one coherent embedded album. Admitted
+    // sidecar groups use the per-group native resolver below instead.
+    if admitted_surfaces.is_empty() {
+        if let Ok(Some(surface)) = native_multi_file_embedded_surface_for_paths(paths) {
+            standalone_embedded.push(ResolvedEmbeddedMetadataSurface {
+                surface,
+                multi_file_read_only: true,
+            });
+        }
+    }
+    let standalone_by_path = standalone_embedded
+        .iter()
+        .filter(|embedded| embedded.surface.audio_paths.len() == 1)
+        .map(|embedded| {
+            (
+                metadata_cue_surface_key(&embedded.surface.audio_path),
+                embedded.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    resolve_directory_metadata_groups(
+        paths,
+        &admitted_surfaces,
+        standalone_embedded,
+        metadata_target_priority,
+        |surface| {
+            Ok(resolved_embedded_metadata_surface_for_admitted_surface(
+                surface,
+                &standalone_by_path,
+            )
+            .unwrap_or(None))
+        },
+        "metadata",
+    )
+}
+
+fn resolved_group_is_metadata_sidecars(group: &ResolvedMetadataGroup) -> bool {
+    !group.selected_surfaces.is_empty()
+        && group.selected_surfaces.iter().all(|surface| {
+            surface.role
+                == crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar
+        })
+}
+
+fn metadata_sidecar_presentation_tabs(
+    app: &mut AppState,
+    surfaces: &[MetadataCueSurface],
+    group_covered_paths: &[std::path::PathBuf],
+) -> Result<Vec<super::app::PresentationTab>, String> {
+    let mut tabs = Vec::with_capacity(surfaces.len());
+    for surface in surfaces {
+        // Member-file save ordering is only meaningful for a genuine multi-FILE
+        // one-track-per-file sidecar. A single-image sidecar must flow through
+        // the builder's single-image branch, which rejects a member-file order
+        // (`member-file save ordering is only valid for one-track-per-file
+        // metadata sidecars`); passing it there previously aborted the open.
+        let member_file_save_order = if surface.audio_paths.len() > 1 {
+            Some(metadata_sidecar_member_file_save_order(surface, group_covered_paths)?)
+        } else {
+            None
+        };
+        let (state, _) =
+            build_metadata_editor_for_cue_surfaces_with_policy_and_member_file_order(
+                app,
+                std::slice::from_ref(surface),
+                0,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+                member_file_save_order.as_deref(),
+            )?;
+        if state.presentation_tabs.is_empty() {
+            tabs.push(state.active_surface().clone());
+        } else if state.presentation_tabs.len() == 1 {
+            tabs.push(state.presentation_tabs[0].clone());
+        } else {
+            return Err(format!(
+                "metadata: field-level sidecar '{}' unexpectedly produced {} presentations",
+                surface.cue_path.display(),
+                state.presentation_tabs.len()
+            ));
+        }
+    }
+    Ok(tabs)
+}
+
+fn open_metadata_editor_for_resolved_groups(
+    app: &mut AppState,
+    groups: &[ResolvedMetadataGroup],
+    cue_admission_warnings: &[String],
+) -> Result<(), String> {
+    if groups.is_empty() {
+        return Err("metadata: selected folder contains no applicable metadata target".to_string());
+    }
+
+    let warning_suffix = if cue_admission_warnings.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", cue_admission_warnings.join("; "))
+    };
+
+    if groups.len() == 1 {
+        let group = &groups[0];
+        let state = match group.representation {
+            crate::config::AggregateMetadataTarget::IndividualFiles => {
+                let tab = build_plain_metadata_presentation_tab(
+                    app,
+                    group.covered_paths.clone(),
+                    &[],
+                    crate::convert::pipeline::CueSidecarPolicy::IgnoreCue,
+                )?;
+                // Preserve the established ordinary-files model. The
+                // single-surface regression applies to unified CUE albums,
+                // whose legacy builder already returns that model.
+                Box::new(super::app::MetadataEditorState::from_model(
+                    super::app::MetadataEditorModel::with_presentations(vec![tab], 0),
+                ))
+            }
+            crate::config::AggregateMetadataTarget::SidecarCue => {
+                if group.selected_surfaces.is_empty() {
+                    return Err(
+                        "metadata: selected SidecarCue group lost its source surfaces".to_string(),
+                    );
+                }
+                if resolved_group_is_metadata_sidecars(group) {
+                    // Metadata sidecars are field-level authorities. Even when
+                    // several are positively identified as parts of one
+                    // release, each must retain its own CUE source and
+                    // PerFileAndSidecar writeback plan. Combine only at the
+                    // editor-model level; never feed them to the structural
+                    // unified-CUE builder together.
+                    let tabs = metadata_sidecar_presentation_tabs(
+                        app,
+                        &group.selected_surfaces,
+                        &group.covered_paths,
+                    )?;
+                    Box::new(super::app::MetadataEditorState::from_model(
+                        super::app::MetadataEditorModel::with_presentations(tabs, 0),
+                    ))
+                } else {
+                    let (state, _) = build_metadata_editor_for_cue_surfaces_with_policy(
+                        app,
+                        &group.selected_surfaces,
+                        0,
+                        crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+                    )?;
+                    state
+                }
+            }
+            crate::config::AggregateMetadataTarget::EmbeddedCue => {
+                if group.selected_surfaces.is_empty() {
+                    return Err(
+                        "metadata: selected EmbeddedCue group lost its source surfaces".to_string(),
+                    );
+                }
+                let (state, _) = build_metadata_editor_for_cue_surfaces_with_policy(
+                    app,
+                    &group.selected_surfaces,
+                    0,
+                    crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly,
+                )?;
+                if state.presentation_tabs.is_empty() {
+                    // Preserve the existing one-tab presentation contract for
+                    // a resolved embedded carrier set. Unlike structural
+                    // sidecar albums, per-carrier embedded sheets retain their
+                    // independent regeneration model inside that tab.
+                    let tab = state.active_surface().clone();
+                    Box::new(super::app::MetadataEditorState::from_model(
+                        super::app::MetadataEditorModel::with_presentations(vec![tab], 0),
+                    ))
+                } else {
+                    state
+                }
+            }
+        };
+        let presentation_count = state.presentation_tabs.len().max(1);
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        app.set_status(format!(
+            "metadata: opened {presentation_count} independently resolved presentation{}{}",
+            if presentation_count == 1 { "" } else { "s" },
+            warning_suffix,
+        ));
+        return Ok(());
+    }
+
+    let mut tabs = Vec::new();
+    for group in groups {
+        match group.representation {
+            crate::config::AggregateMetadataTarget::IndividualFiles => {
+                tabs.push(build_plain_metadata_presentation_tab(
+                    app,
+                    group.covered_paths.clone(),
+                    &[],
+                    crate::convert::pipeline::CueSidecarPolicy::IgnoreCue,
+                )?);
+            }
+            crate::config::AggregateMetadataTarget::SidecarCue => {
+                if group.selected_surfaces.is_empty() {
+                    return Err(
+                        "metadata: selected SidecarCue group lost its source surfaces".to_string(),
+                    );
+                }
+                if resolved_group_is_metadata_sidecars(group) {
+                    tabs.extend(metadata_sidecar_presentation_tabs(
+                        app,
+                        &group.selected_surfaces,
+                        &group.covered_paths,
+                    )?);
+                } else {
+                    let (state, _) = build_metadata_editor_for_cue_surfaces_with_policy(
+                        app,
+                        &group.selected_surfaces,
+                        0,
+                        crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+                    )?;
+                    if state.presentation_tabs.is_empty() {
+                        tabs.push(state.active_surface().clone());
+                    } else {
+                        tabs.extend(state.presentation_tabs.iter().cloned());
+                    }
+                }
+            }
+            crate::config::AggregateMetadataTarget::EmbeddedCue => {
+                if group.selected_surfaces.is_empty() {
+                    return Err(
+                        "metadata: selected EmbeddedCue group lost its source surfaces".to_string(),
+                    );
+                }
+                let (state, _) = build_metadata_editor_for_cue_surfaces_with_policy(
+                    app,
+                    &group.selected_surfaces,
+                    0,
+                    crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly,
+                )?;
+                if state.presentation_tabs.is_empty() {
+                    tabs.push(state.active_surface().clone());
+                } else {
+                    tabs.extend(state.presentation_tabs.iter().cloned());
+                }
+            }
+        }
+    }
+
+    if tabs.is_empty() {
+        return Err("metadata: selected folder produced no presentation tabs".to_string());
+    }
+    let tab_count = tabs.len();
+    let model = super::app::MetadataEditorModel::with_presentations(tabs, 0);
+    app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(
+        super::app::MetadataEditorState::from_model(model),
+    ));
+    app.set_status(format!(
+        "metadata: opened {tab_count} independently resolved presentations{warning_suffix}",
+    ));
+    Ok(())
 }
 
 fn open_metadata_editor_for_cue_surfaces_and_plain_paths(
@@ -22355,13 +23977,16 @@ fn ensure_and_auto_populate_track_title_entries(
 
         if tn_aligned && entries[tn_idx].per_file_values[i].is_empty() {
             if let Some(t) = parsed_track {
-                entries[tn_idx].per_file_values[i] = t.to_string();
+                let value = t.to_string();
+                entries[tn_idx].per_file_values[i] = value.clone();
+                entries[tn_idx].per_file_originals[i] = value;
                 did_auto_populate = true;
             }
         }
         if title_aligned && entries[title_idx].per_file_values[i].is_empty() {
             if let Some(ref t) = parsed_title {
                 entries[title_idx].per_file_values[i] = t.clone();
+                entries[title_idx].per_file_originals[i] = t.clone();
                 did_auto_populate = true;
             }
         }
@@ -22380,6 +24005,20 @@ fn ensure_and_auto_populate_track_title_entries(
             "<multiple values>".to_string()
         } else {
             entries[idx].per_file_values.first().cloned().unwrap_or_default()
+        };
+
+        let originals_all_same = entries[idx]
+            .per_file_originals
+            .windows(2)
+            .all(|w| w[0] == w[1]);
+        entries[idx].original = if !originals_all_same {
+            "<multiple values>".to_string()
+        } else {
+            entries[idx]
+                .per_file_originals
+                .first()
+                .cloned()
+                .unwrap_or_default()
         };
     }
 
@@ -22435,8 +24074,7 @@ fn metadata_editor_state_from_loaded_files(
         .iter()
         .map(|file| file.file_facts.write_eligibility.is_writable())
         .collect();
-    let did_auto_populate =
-        ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
+    ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
 
     let file_labels = metadata_editor_file_labels(&paths, &entries);
     let mut state = super::app::MetadataEditorState::for_files(
@@ -22445,7 +24083,6 @@ fn metadata_editor_state_from_loaded_files(
         file_labels,
         technical_details,
     );
-    state.active_surface_mut().dirty = did_auto_populate;
     state
 }
 
@@ -22702,10 +24339,80 @@ fn aggregate_metadata_audio_paths(
     by_identity.into_values().collect()
 }
 
-fn metadata_cue_surface_is_native_multi_file(surface: &MetadataCueSurface) -> bool {
-    surface.audio_paths.len() >= 2
-        && surface.track_audio_paths.len() > surface.audio_paths.len()
-        && surface.sheet.tracks.len() == surface.track_audio_paths.len()
+fn metadata_cue_surface_proves_image_content(surface: &MetadataCueSurface) -> bool {
+    if surface.sheet.tracks.is_empty()
+        || surface.sheet.tracks.len() != surface.track_audio_paths.len()
+    {
+        return false;
+    }
+
+    let covered_carriers = surface
+        .audio_paths
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    if covered_carriers.is_empty() {
+        return false;
+    }
+
+    let mut tracks_by_carrier = std::collections::BTreeMap::new();
+    for carrier in &surface.track_audio_paths {
+        let carrier = metadata_cue_surface_key(carrier);
+        if !covered_carriers.contains(&carrier) {
+            return false;
+        }
+        let count = tracks_by_carrier.entry(carrier).or_insert(0usize);
+        *count += 1;
+        if *count > 1 {
+            return true;
+        }
+    }
+    false
+}
+
+fn metadata_image_carrier_keys<'a>(
+    surfaces: impl IntoIterator<Item = &'a MetadataCueSurface>,
+) -> std::collections::BTreeSet<std::path::PathBuf> {
+    surfaces
+        .into_iter()
+        .filter(|surface| metadata_cue_surface_proves_image_content(surface))
+        .flat_map(|surface| surface.audio_paths.iter())
+        .map(|path| metadata_cue_surface_key(path))
+        .collect()
+}
+
+fn metadata_audio_paths_outside_image_surfaces<'a>(
+    paths: &[std::path::PathBuf],
+    surfaces: impl IntoIterator<Item = &'a MetadataCueSurface>,
+) -> Vec<std::path::PathBuf> {
+    let covered = metadata_image_carrier_keys(surfaces);
+    let mut seen = std::collections::BTreeSet::new();
+    paths
+        .iter()
+        .filter_map(|path| {
+            let key = metadata_cue_surface_key(path);
+            (!covered.contains(&key) && seen.insert(key)).then(|| path.clone())
+        })
+        .collect()
+}
+
+fn metadata_audio_paths_outside_selected_surfaces<'a>(
+    paths: &[std::path::PathBuf],
+    surfaces: impl IntoIterator<Item = &'a MetadataCueSurface>,
+) -> Vec<std::path::PathBuf> {
+    let covered = surfaces
+        .into_iter()
+        .flat_map(|surface| surface.audio_paths.iter())
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    paths
+        .iter()
+        .filter_map(|path| {
+            let key = metadata_cue_surface_key(path);
+            (!covered.contains(&key) && seen.insert(key)).then(|| path.clone())
+        })
+        .collect()
 }
 
 pub(super) fn cue_import_availability_for_paths(
@@ -22747,125 +24454,70 @@ pub(super) fn cue_import_availability_for_paths(
     }
 }
 
-fn directory_audio_paths_have_neighboring_cue(paths: &[std::path::PathBuf]) -> bool {
-    cue_import_availability_for_paths(paths) == super::probe::CueImportAvailability::Present
-}
+fn native_multi_file_sidecar_surface_for_member_audio(
+    audio_path: &std::path::Path,
+) -> Result<Option<MetadataCueSurface>, String> {
+    let Some(parent) = audio_path.parent() else {
+        return Ok(None);
+    };
+    let cue_paths = crate::convert::split_cue_album::split_cue_candidate_paths(&[
+        parent.to_path_buf(),
+    ]);
+    if cue_paths.is_empty() {
+        return Ok(None);
+    }
 
-fn resolve_directory_metadata_target(
-    priority: &[crate::config::AggregateMetadataTarget],
-    cue_surfaces: &[MetadataCueSurface],
-    metadata_sidecar_surfaces: &[MetadataCueSurface],
-    aggregate_audio_paths: &[std::path::PathBuf],
-) -> Option<(crate::config::AggregateMetadataTarget, Vec<MetadataCueSurface>)> {
-    let sidecar_available = !cue_surfaces.is_empty() || !metadata_sidecar_surfaces.is_empty();
-    let admitted_native_multi_file_surface = cue_surfaces
+    let selected_key = metadata_cue_surface_key(audio_path);
+    let describes_selected_member =
+        |member: &crate::convert::split_cue_album::SplitCueAdmissionMember| {
+            member.role
+                == crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart
+                && member.referenced_audio.len() > 1
+                && member
+                    .referenced_audio
+                    .iter()
+                    .any(|path| metadata_cue_surface_key(path) == selected_key)
+        };
+
+    // This is a member-scoped entry point: establish membership before
+    // applying exact-reference preference. Folder-wide ranking can otherwise
+    // let an unrelated exact CUE suppress the selected member's fallback CUE.
+    let mut matching: Vec<_> = cue_paths
+        .into_iter()
+        .filter_map(|cue_path| {
+            crate::convert::split_cue_album::admit_split_cue_member(&cue_path).ok()
+        })
+        .filter(|member| describes_selected_member(member))
+        .collect();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+
+    // Preserve the established exact-over-fallback rule, but only among CUEs
+    // that actually describe the explicitly selected audio member.
+    if matching
         .iter()
-        .chain(metadata_sidecar_surfaces.iter())
-        .find(|surface| metadata_cue_surface_is_native_multi_file(surface))
-        .cloned();
-    // Escalate to the bounded full-member probe only for a multi-image folder
-    // with no admitted sidecar surface. A native multi-FILE CUESHEET may live
-    // on any member image; absent ordinary per-track tags remain cheap to
-    // classify outside this narrow candidate shape.
-    let embedded_only_native_multi_file_surface = if admitted_native_multi_file_surface.is_none()
-        && !sidecar_available
-        && aggregate_audio_paths.len() >= 2
+        .any(|member| member.all_file_references_exact)
     {
-        native_multi_file_embedded_surface_for_paths(aggregate_audio_paths)
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    let native_multi_file_surface = admitted_native_multi_file_surface
-        .as_ref()
-        .or(embedded_only_native_multi_file_surface.as_ref());
-    let mut embedded_surfaces = None;
-    for target in crate::config::normalized_aggregate_metadata_target_priority(priority) {
-        match target {
-            crate::config::AggregateMetadataTarget::IndividualFiles
-                if !aggregate_audio_paths.is_empty()
-                    && native_multi_file_surface.is_none() =>
-            {
-                return Some((target, Vec::new()));
-            }
-            crate::config::AggregateMetadataTarget::SidecarCue if sidecar_available => {
-                return Some((target, Vec::new()));
-            }
-            crate::config::AggregateMetadataTarget::EmbeddedCue => {
-                if let Some(surface) = embedded_only_native_multi_file_surface.as_ref() {
-                    return Some((target, vec![surface.clone()]));
-                }
-                if let Some(surface) = admitted_native_multi_file_surface.as_ref() {
-                    match native_multi_file_embedded_source(surface) {
-                        Ok(Some(_)) | Err(_) => return Some((target, vec![surface.clone()])),
-                        Ok(None) => {}
-                    }
-                }
-                let surfaces = embedded_surfaces.get_or_insert_with(|| {
-                    usable_embedded_metadata_surfaces_for_paths(aggregate_audio_paths)
-                });
-                if !surfaces.is_empty() {
-                    return Some((target, surfaces.clone()));
-                }
-            }
-            _ => {}
-        }
+        matching.retain(|member| member.all_file_references_exact);
     }
-    None
-}
-
-/// Resolve targets that outrank sidecar CUE without first forcing sidecar
-/// admission or ambiguity UX. Returning `None` means sidecar inspection is the
-/// next required step in the configured order.
-fn resolve_directory_metadata_target_before_sidecar(
-    priority: &[crate::config::AggregateMetadataTarget],
-    aggregate_audio_paths: &[std::path::PathBuf],
-) -> Option<(crate::config::AggregateMetadataTarget, Vec<MetadataCueSurface>)> {
-    let neighboring_cue_present =
-        directory_audio_paths_have_neighboring_cue(aggregate_audio_paths);
-    let embedded_only_native_multi_file_surface = if !neighboring_cue_present
-        && aggregate_audio_paths.len() >= 2
-    {
-        native_multi_file_embedded_surface_for_paths(aggregate_audio_paths)
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    let mut embedded_surfaces = None;
-    for target in crate::config::normalized_aggregate_metadata_target_priority(priority) {
-        match target {
-            crate::config::AggregateMetadataTarget::IndividualFiles
-                if !aggregate_audio_paths.is_empty() =>
-            {
-                if neighboring_cue_present {
-                    return None;
-                }
-                if embedded_only_native_multi_file_surface.is_none() {
-                    return Some((target, Vec::new()));
-                }
-            }
-            crate::config::AggregateMetadataTarget::EmbeddedCue => {
-                if let Some(surface) = &embedded_only_native_multi_file_surface {
-                    return Some((target, vec![surface.clone()]));
-                }
-                let surfaces = embedded_surfaces.get_or_insert_with(|| {
-                    usable_embedded_metadata_surfaces_for_paths(aggregate_audio_paths)
-                });
-                if !surfaces.is_empty() {
-                    return Some((target, surfaces.clone()));
-                }
-            }
-            crate::config::AggregateMetadataTarget::SidecarCue => {
-                if neighboring_cue_present {
-                    return None;
-                }
-            }
-            _ => {}
-        }
+    if matching.len() > 1 {
+        return Err(format!(
+            "metadata: multiple native multi-FILE sidecar CUEs describe '{}'; select the intended .cue file",
+            audio_path.display()
+        ));
     }
-    None
+    let member = matching
+        .pop()
+        .expect("non-empty member-scoped CUE candidate set");
+    metadata_cue_surface_from_admitted_member(member)
+        .ok_or_else(|| {
+            format!(
+                "metadata: failed to read the native multi-FILE sidecar CUE for '{}'",
+                audio_path.display()
+            )
+        })
+        .map(Some)
 }
 
 fn open_metadata_editor_impl(
@@ -22891,11 +24543,6 @@ fn open_metadata_editor_impl(
         });
     if explicit_cue_selection {
         cue_policy = crate::convert::pipeline::CueSidecarPolicy::SidecarOnly;
-    } else if explicit_audio_selection {
-        // Explicit audio picks never discover neighboring sidecars. If every
-        // selected image carries a usable embedded CUE, those exact images are
-        // opened as embedded carriers; otherwise the exact files stay file-scoped.
-        cue_policy = crate::convert::pipeline::CueSidecarPolicy::IgnoreCue;
     }
 
     if app.browse.is_in_archive() {
@@ -23027,64 +24674,80 @@ fn open_metadata_editor_impl(
         return;
     }
 
+    // A directly selected member image of one native multi-FILE sidecar
+    // album is an album-scope entry point, just like selecting its folder or
+    // CUE. This deliberately excludes one-track-per-FILE metadata sidecars and
+    // every ordinary pre-split selection.
+    let explicit_native_multi_file_sidecar_surface =
+        if explicit_audio_selection && sel.len() == 1 {
+            match native_multi_file_sidecar_surface_for_member_audio(&sel[0]) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    app.set_status(error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+    let explicit_native_multi_file_sidecar_set =
+        explicit_native_multi_file_sidecar_surface.is_some();
+    if explicit_audio_selection {
+        cue_policy = if explicit_native_multi_file_sidecar_set {
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly
+        } else {
+            // Other explicit audio picks never discover neighboring sidecars.
+            // If the exact selected image carries a usable embedded CUE it is
+            // opened as that embedded carrier; otherwise it remains file-scoped.
+            crate::convert::pipeline::CueSidecarPolicy::IgnoreCue
+        };
+    }
+
     // Multi-part single-image CUE albums must stay CUE-shaped. If we first
     // collapse the selection to image files, the ordinary multi-file metadata
     // path opens image-level rows and loses each side/disc's CUESHEET track
     // structure. Surface each cue/image pair as its own presentation tab before
     // falling back to generic audio-file expansion.
-    let directory_has_target_before_sidecar = crate::config::normalized_aggregate_metadata_target_priority(
-        &app.config.conversion.aggregate_metadata_target_priority,
-    )
-    .first()
-    .is_some_and(|target| *target != crate::config::AggregateMetadataTarget::SidecarCue);
-    let directory_audio_paths =
-        (aggregate_directory_selection && directory_has_target_before_sidecar)
-            .then(|| super::command::expand_audio_paths_for_metadata(&sel));
-    let preselected_directory_target = directory_audio_paths.as_deref().and_then(|paths| {
-        resolve_directory_metadata_target_before_sidecar(
-            &app.config.conversion.aggregate_metadata_target_priority,
-            paths,
-        )
-    });
-    let explicit_embedded_surfaces = if explicit_audio_selection {
-        usable_embedded_metadata_surfaces_for_paths(&sel)
+    // Enumerate the aggregate directory exactly once regardless of source
+    // priority. Directory-level priority is resolved later per admitted album
+    // or carrier group; a directory-wide preselection would allow one group to
+    // suppress a different group's viable representation.
+    let directory_audio_paths = aggregate_directory_selection
+        .then(|| super::command::expand_audio_paths_for_metadata(&sel));
+    let explicit_embedded_surfaces = if explicit_audio_selection
+        && sel.len() == 1
+        && !explicit_native_multi_file_sidecar_set
+    {
+        match explicit_embedded_metadata_surface_for_path(&sel[0]) {
+            Ok(Some(surface)) => vec![surface],
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                app.set_status(error);
+                return;
+            }
+        }
     } else {
         Vec::new()
     };
-    let explicit_audio_count = sel
-        .iter()
-        .map(|path| metadata_cue_surface_key(path))
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
     let explicit_embedded_set = explicit_audio_selection
-        && !explicit_embedded_surfaces.is_empty()
-        && explicit_embedded_surfaces.len() == explicit_audio_count;
+        && sel.len() == 1
+        && !explicit_embedded_surfaces.is_empty();
     if explicit_embedded_set {
         cue_policy = crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly;
     }
-    let explicit_member_sidecar_surface = if explicit_audio_selection
-        && sel.len() == 1
-        && !explicit_embedded_set
-    {
-        explicit_audio_member_sidecar_surface(&sel[0], &cue_selection_overrides)
-    } else {
-        None
-    };
-    if explicit_member_sidecar_surface.is_some() {
-        cue_policy = crate::convert::pipeline::CueSidecarPolicy::SidecarOnly;
-    }
-
-    let admission = if explicit_embedded_set {
+    // Only a proven native multi-FILE member selection is promoted to a
+    // neighboring sidecar. Every other direct audio selection remains exact.
+    let admission = if let Some(surface) = explicit_native_multi_file_sidecar_surface {
         MetadataCueAdmission {
-            surfaces: explicit_embedded_surfaces,
+            surfaces: vec![surface],
             metadata_sidecar_surfaces: Vec::new(),
             ordinary_paths: Vec::new(),
             warnings: Vec::new(),
             selection_prompt: None,
         }
-    } else if let Some(surface) = explicit_member_sidecar_surface {
+    } else if explicit_embedded_set {
         MetadataCueAdmission {
-            surfaces: vec![surface],
+            surfaces: explicit_embedded_surfaces,
             metadata_sidecar_surfaces: Vec::new(),
             ordinary_paths: Vec::new(),
             warnings: Vec::new(),
@@ -23095,24 +24758,6 @@ fn open_metadata_editor_impl(
             surfaces: Vec::new(),
             metadata_sidecar_surfaces: Vec::new(),
             ordinary_paths: sel.clone(),
-            warnings: Vec::new(),
-            selection_prompt: None,
-        }
-    } else if let (Some(paths), Some((target, embedded_surfaces))) =
-        (directory_audio_paths.as_ref(), preselected_directory_target.as_ref())
-    {
-        MetadataCueAdmission {
-            surfaces: if *target == crate::config::AggregateMetadataTarget::EmbeddedCue {
-                embedded_surfaces.clone()
-            } else {
-                Vec::new()
-            },
-            metadata_sidecar_surfaces: Vec::new(),
-            ordinary_paths: if *target == crate::config::AggregateMetadataTarget::IndividualFiles {
-                paths.clone()
-            } else {
-                Vec::new()
-            },
             warnings: Vec::new(),
             selection_prompt: None,
         }
@@ -23161,34 +24806,31 @@ fn open_metadata_editor_impl(
                 &admitted_ordinary_paths,
             )
         });
-        let resolved_target = preselected_directory_target.clone().or_else(|| {
-            resolve_directory_metadata_target(
-                &app.config.conversion.aggregate_metadata_target_priority,
-                &cue_surfaces,
-                &metadata_sidecar_surfaces,
-                &aggregate_audio_paths,
-            )
-        });
-        if let Some((target, embedded_surfaces)) = resolved_target {
-            match target {
-                crate::config::AggregateMetadataTarget::IndividualFiles => {
-                    cue_surfaces.clear();
-                    metadata_sidecar_surfaces.clear();
-                    admitted_ordinary_paths = aggregate_audio_paths;
-                    cue_policy = crate::convert::pipeline::CueSidecarPolicy::IgnoreCue;
-                }
-                crate::config::AggregateMetadataTarget::SidecarCue => {
-                    cue_policy = crate::convert::pipeline::CueSidecarPolicy::SidecarOnly;
-                }
-                crate::config::AggregateMetadataTarget::EmbeddedCue => {
-                    cue_surfaces = embedded_surfaces;
-                    metadata_sidecar_surfaces.clear();
-                    admitted_ordinary_paths.clear();
-                    cue_policy = crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly;
-                }
+        let groups = match resolve_edit_metadata_directory_groups(
+            &aggregate_audio_paths,
+            &cue_surfaces,
+            &metadata_sidecar_surfaces,
+            &app.config.conversion.aggregate_metadata_target_priority,
+        ) {
+            Ok(groups) if !groups.is_empty() => groups,
+            Ok(_) if !cue_admission_warnings.is_empty() => Vec::new(),
+            Ok(_) => {
+                app.set_status("metadata: selected folder contains no applicable metadata target");
+                return;
             }
-        } else if cue_admission_warnings.is_empty() {
-            app.set_status("metadata: selected folder contains no applicable metadata target");
+            Err(error) => {
+                app.set_status(error);
+                return;
+            }
+        };
+        if !groups.is_empty() {
+            if let Err(error) = open_metadata_editor_for_resolved_groups(
+                app,
+                &groups,
+                &cue_admission_warnings,
+            ) {
+                app.set_status(error);
+            }
             return;
         }
     }
@@ -23212,6 +24854,7 @@ fn open_metadata_editor_impl(
     }
     let embedded_carrier_set_selection = cue_policy
         == crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly
+        && admitted_ordinary_paths.is_empty()
         && !cue_surfaces.is_empty()
         && cue_surfaces.iter().all(|surface| {
             surface.audio_paths.len() == 1
@@ -23446,8 +25089,7 @@ fn open_metadata_editor_impl(
         .iter()
         .map(|file| file.file_facts.write_eligibility.is_writable())
         .collect();
-    let did_auto_populate =
-        ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
+    ensure_and_auto_populate_track_title_entries(&mut entries, &paths, &auto_populate_allowed);
 
     // Build per-file context labels from sorted paths/entries.
     // Short labels: "D1.01" or "01" or filename stem (fallback).
@@ -23521,7 +25163,6 @@ fn open_metadata_editor_impl(
     };
     {
         let surface = state.active_surface_mut();
-        surface.dirty = did_auto_populate;
         surface.embedded_cuesheet_present = embedded_cuesheet_present;
         surface.sidecar_cuesheet_shadow_present = sidecar_cuesheet_shadow_present;
         surface.cue_source = cue_source;
@@ -31696,11 +33337,12 @@ fn metadata_editor_detail_slot_file_index(
     }
     let sheet = surface.cue_album_synthetic_sheet.as_ref()?;
     let source = sheet.track_sources.get(slot_index)?;
+    let source_key = metadata_cue_surface_key(&source.audio_path);
     surface
-        .paths
+        .technical_details
+        .files
         .iter()
-        .position(|path| path == &source.audio_path)
-        .or_else(|| sheet.audio_paths.iter().position(|path| path == &source.audio_path))
+        .position(|file| metadata_cue_surface_key(&file.file_facts.path) == source_key)
 }
 
 fn metadata_editor_detail_value_edit_refusal(
@@ -53332,6 +54974,29 @@ mod single_image_metadata_editor_regression_tests {
     use crate::tui::app::{ActiveOverlay, AppState};
     use crate::config::TonepoetConfig;
 
+    // Local copy of the pre-split FLAC fixture helper (the sibling
+    // `metadata_cue_source_coverage_tests` module also defines one; test
+    // helpers are not shared across sibling test modules).
+    fn write_presplit_tagged_flac(
+        path: &std::path::Path,
+        title: &str,
+        track_number: &str,
+        artist: &str,
+    ) {
+        assert!(create_flac_fixture(path), "FLAC fixture: {}", path.display());
+        crate::tui::probe::write_all_tags(
+            path,
+            &[
+                (lofty::tag::ItemKey::TrackTitle, Some(title.to_string())),
+                (lofty::tag::ItemKey::TrackNumber, Some(track_number.to_string())),
+                (lofty::tag::ItemKey::TrackArtist, Some(artist.to_string())),
+                (lofty::tag::ItemKey::AlbumTitle, Some("File Album".to_string())),
+                (lofty::tag::ItemKey::Genre, Some("File Genre".to_string())),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("tag {}: {error}", path.display()));
+    }
+
     fn tx() -> mpsc::Sender<AppMessage> {
         let (tx, _rx) = mpsc::channel(4);
         tx
@@ -57558,6 +59223,232 @@ mod single_image_metadata_editor_regression_tests {
         }
     }
 
+    #[test]
+    fn member_audio_disambiguates_disjoint_fallback_native_multi_file_cues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path();
+        let a1 = album.join("side-a-1.wv");
+        let a2 = album.join("side-a-2.wv");
+        let b1 = album.join("side-b-1.wv");
+        let b2 = album.join("side-b-2.wv");
+        for image in [&a1, &a2, &b1, &b2] {
+            std::fs::write(image, b"audio").expect("fallback image fixture");
+        }
+        let side_a_cue = album.join("side-a.cue");
+        let side_b_cue = album.join("side-b.cue");
+        std::fs::write(
+            &side_a_cue,
+            concat!(
+                "FILE \"side-a-1.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-a-2.wav\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("side A fallback CUE");
+        std::fs::write(
+            &side_b_cue,
+            concat!(
+                "FILE \"side-b-1.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b-2.wav\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("side B fallback CUE");
+
+        let cue_paths = vec![side_a_cue.clone(), side_b_cue.clone()];
+        assert!(matches!(
+            crate::convert::split_cue_album::select_split_cue_folder_members(&cue_paths, None),
+            crate::convert::split_cue_album::SplitCueFolderSelection::NeedsChoice { .. }
+        ));
+
+        let surface = native_multi_file_sidecar_surface_for_member_audio(&b2)
+            .expect("member-scoped selection must not inherit folder ambiguity")
+            .expect("selected member must resolve its unique native multi-FILE CUE");
+        assert_eq!(
+            metadata_cue_surface_key(&surface.cue_path),
+            metadata_cue_surface_key(&side_b_cue)
+        );
+        assert_eq!(
+            surface
+                .audio_paths
+                .iter()
+                .map(|path| metadata_cue_surface_key(path))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [metadata_cue_surface_key(&b1), metadata_cue_surface_key(&b2)]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn member_audio_ignores_unrelated_exact_cue_when_selected_album_requires_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path();
+        let a1 = album.join("side-a-1.wv");
+        let a2 = album.join("side-a-2.wv");
+        let b1 = album.join("side-b-1.wv");
+        let b2 = album.join("side-b-2.wv");
+        for image in [&a1, &a2, &b1, &b2] {
+            std::fs::write(image, b"audio").expect("member image fixture");
+        }
+        let exact_cue = album.join("side-a.cue");
+        let fallback_cue = album.join("side-b.cue");
+        std::fs::write(
+            &exact_cue,
+            concat!(
+                "FILE \"side-a-1.wv\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-a-2.wv\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("unrelated exact CUE");
+        std::fs::write(
+            &fallback_cue,
+            concat!(
+                "FILE \"side-b-1.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b-2.wav\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("selected fallback CUE");
+
+        assert!(matches!(
+            crate::convert::split_cue_album::select_split_cue_folder_members(
+                &[exact_cue.clone(), fallback_cue.clone()],
+                None,
+            ),
+            crate::convert::split_cue_album::SplitCueFolderSelection::Selected {
+                members,
+                ..
+            } if members.len() == 1
+                && metadata_cue_surface_key(&members[0].cue_path)
+                    == metadata_cue_surface_key(&exact_cue)
+        ));
+
+        let surface = native_multi_file_sidecar_surface_for_member_audio(&b2)
+            .expect("member lookup must ignore unrelated folder-wide exact ranking")
+            .expect("selected fallback member must resolve its album");
+        assert_eq!(
+            metadata_cue_surface_key(&surface.cue_path),
+            metadata_cue_surface_key(&fallback_cue)
+        );
+        assert_eq!(
+            surface
+                .audio_paths
+                .iter()
+                .map(|path| metadata_cue_surface_key(path))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [metadata_cue_surface_key(&b1), metadata_cue_surface_key(&b2)]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn member_audio_prefers_exact_cue_when_exact_and_fallback_both_describe_member() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shared = temp.path().join("shared.wv");
+        let exact_other = temp.path().join("exact-other.wv");
+        let fallback_other = temp.path().join("fallback-other.wv");
+        for image in [&shared, &exact_other, &fallback_other] {
+            std::fs::write(image, b"audio").expect("ranked member image fixture");
+        }
+        let exact_cue = temp.path().join("exact.cue");
+        let fallback_cue = temp.path().join("fallback.cue");
+        std::fs::write(
+            &exact_cue,
+            concat!(
+                "FILE \"shared.wv\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"exact-other.wv\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("matching exact CUE");
+        std::fs::write(
+            &fallback_cue,
+            concat!(
+                "FILE \"shared.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"fallback-other.wav\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("matching fallback CUE");
+
+        let surface = native_multi_file_sidecar_surface_for_member_audio(&shared)
+            .expect("exact match must resolve without ambiguity")
+            .expect("matching exact CUE must produce a surface");
+        assert_eq!(
+            metadata_cue_surface_key(&surface.cue_path),
+            metadata_cue_surface_key(&exact_cue)
+        );
+    }
+
+    #[test]
+    fn member_audio_still_refuses_genuinely_overlapping_native_multi_file_cues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shared = temp.path().join("shared.wv");
+        let first_only = temp.path().join("first-only.wv");
+        let second_only = temp.path().join("second-only.wv");
+        for image in [&shared, &first_only, &second_only] {
+            std::fs::write(image, b"audio").expect("overlap image fixture");
+        }
+        for (cue_name, other_stem) in [
+            ("first.cue", "first-only"),
+            ("second.cue", "second-only"),
+        ] {
+            std::fs::write(
+                temp.path().join(cue_name),
+                format!(
+                    "FILE \"shared.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\nFILE \"{other_stem}.wav\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n"
+                ),
+            )
+            .expect("overlapping fallback CUE");
+        }
+
+        let error = native_multi_file_sidecar_surface_for_member_audio(&shared)
+            .expect_err("two matching native multi-FILE CUEs must remain ambiguous");
+        assert!(error.contains("multiple native multi-FILE sidecar CUEs"));
+        assert!(error.contains(shared.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn member_audio_does_not_promote_one_track_per_file_metadata_sidecar() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        std::fs::write(&first, b"audio").expect("first pre-split fixture");
+        std::fs::write(&second, b"audio").expect("second pre-split fixture");
+        std::fs::write(
+            temp.path().join("album.cue"),
+            concat!(
+                "FILE \"01.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "FILE \"02.flac\" FLAC\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("one-track-per-FILE metadata sidecar");
+
+        assert!(
+            native_multi_file_sidecar_surface_for_member_audio(&second)
+                .expect("ordinary pre-split member lookup")
+                .is_none(),
+            "one-track-per-FILE sidecars must remain file-scoped for explicit audio opens"
+        );
+    }
+
     #[tokio::test]
     async fn four_file_native_multi_file_album_consolidates_persists_reopens_and_queues_once() {
         if !fixture_tool_available("ffmpeg") {
@@ -57896,7 +59787,13 @@ mod single_image_metadata_editor_regression_tests {
         let mut planner_paths = queue.paths.clone();
         planner_paths.sort();
 
-        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority = vec![
+            crate::config::AggregateMetadataTarget::IndividualFiles,
+            crate::config::AggregateMetadataTarget::SidecarCue,
+            crate::config::AggregateMetadataTarget::EmbeddedCue,
+        ];
+        let mut app = AppState::new_for_test(config);
         app.browse.current_dir = temp.path().to_path_buf();
         app.browse.entries = vec![super::super::browse::BrowseEntry::new(
             album.clone(),
@@ -57919,6 +59816,316 @@ mod single_image_metadata_editor_regression_tests {
         editor_paths.sort();
         assert_eq!(editor_paths, planner_paths);
         assert_eq!(editor_paths.len(), 4);
+    }
+
+
+    #[tokio::test]
+    async fn multipart_metadata_sidecars_remain_independent_field_authorities() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("multipart-metadata-sidecars");
+        std::fs::create_dir_all(&album).expect("album directory");
+
+        let a1 = album.join("a1.flac");
+        let a2 = album.join("a2.flac");
+        let b1 = album.join("b1.flac");
+        let b2 = album.join("b2.flac");
+        for (path, title, number, artist, composer) in [
+            (&a1, "File A1", "01", "File Artist A1", "Composer A1"),
+            (&a2, "File A2", "02", "File Artist A2", "Composer A2"),
+            (&b1, "File B1", "03", "File Artist B1", "Composer B1"),
+            (&b2, "File B2", "04", "File Artist B2", "Composer B2"),
+        ] {
+            write_presplit_tagged_flac(path, title, number, artist);
+            crate::tui::probe::write_all_tags(
+                path,
+                &[(lofty::tag::ItemKey::Composer, Some(composer.to_string()))],
+            )
+            .unwrap_or_else(|error| panic!("composer tag {}: {error}", path.display()));
+        }
+
+        let side_a = album.join("side-a.cue");
+        let side_b = album.join("side-b.cue");
+        std::fs::write(
+            &side_a,
+            concat!(
+                "TITLE \"Shared Album Side A\"\n",
+                "FILE \"a1.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"Cue A1\"\n    INDEX 01 00:00:00\n",
+                "FILE \"a2.flac\" FLAC\n",
+                "  TRACK 02 AUDIO\n    TITLE \"Cue A2\"\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("side A metadata CUE");
+        std::fs::write(
+            &side_b,
+            concat!(
+                "TITLE \"Shared Album Side B\"\n",
+                "FILE \"b1.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"Cue B1\"\n    INDEX 01 00:00:00\n",
+                "FILE \"b2.flac\" FLAC\n",
+                "  TRACK 02 AUDIO\n    TITLE \"Cue B2\"\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("side B metadata CUE");
+
+        let open_with_priority = |priority| {
+            let mut config = TonepoetConfig::default();
+            config.conversion.aggregate_metadata_target_priority = priority;
+            let mut app = AppState::new_for_test(config);
+            select_foxy_route(&mut app, &album, temp.path());
+            open_metadata_editor(&mut app);
+            app
+        };
+
+        let individual = open_with_priority(vec![
+            IndividualFiles,
+            SidecarCue,
+            EmbeddedCue,
+        ]);
+        let ActiveOverlay::MetadataEditor(individual_state) = &individual.active_overlay else {
+            panic!("individual-first multi-part album must open the metadata editor");
+        };
+        assert_eq!(individual_state.presentation_tabs.len(), 1);
+        assert!(individual_state.active_surface().cue_source.is_none());
+        assert_eq!(
+            individual_state.active_surface().paths,
+            vec![a1.clone(), a2.clone(), b1.clone(), b2.clone()]
+        );
+
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        let individual_transfer = classify_tag_transfer_roots(
+            std::slice::from_ref(&album),
+            &[IndividualFiles, SidecarCue, EmbeddedCue],
+            &cancel,
+        )
+        .expect("individual-first transfer carrier");
+        assert!(matches!(
+            individual_transfer,
+            super::super::tag_interchange::TransferCarrier::Files { paths }
+                if paths == vec![a1.clone(), a2.clone(), b1.clone(), b2.clone()]
+        ));
+
+        let sidecar_transfer = classify_tag_transfer_roots(
+            std::slice::from_ref(&album),
+            &[SidecarCue, IndividualFiles, EmbeddedCue],
+            &cancel,
+        )
+        .expect("sidecar-first transfer carrier");
+        let super::super::tag_interchange::TransferCarrier::Aggregate { carriers } =
+            sidecar_transfer
+        else {
+            panic!("one release with two metadata sidecars must expose an aggregate carrier");
+        };
+        assert_eq!(carriers.len(), 2);
+        let mut transfer_cues = std::collections::BTreeSet::new();
+        for carrier in carriers {
+            let super::super::tag_interchange::TransferCarrier::SidecarCue {
+                cue_path,
+                role,
+                write_method,
+                ..
+            } = carrier
+            else {
+                panic!("every component must remain a field-level sidecar carrier");
+            };
+            assert_eq!(
+                role,
+                crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar
+            );
+            assert_eq!(
+                write_method,
+                super::super::tag_interchange::SidecarCueWriteMethod::PerFileAndSidecar
+            );
+            transfer_cues.insert(cue_path);
+        }
+        let expected_transfer_cues = [side_a.clone(), side_b.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(transfer_cues, expected_transfer_cues);
+
+        let mut app = open_with_priority(vec![
+            SidecarCue,
+            IndividualFiles,
+            EmbeddedCue,
+        ]);
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("sidecar-first multi-part album must open the metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        let side_a_index = state
+            .presentation_tabs
+            .iter()
+            .position(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &side_a
+            ))
+            .expect("side A presentation");
+        let side_b_index = state
+            .presentation_tabs
+            .iter()
+            .position(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &side_b
+            ))
+            .expect("side B presentation");
+        assert_ne!(side_a_index, side_b_index);
+        assert_eq!(state.presentation_tabs[side_a_index].paths, vec![a1.clone(), a2.clone()]);
+        assert_eq!(state.presentation_tabs[side_b_index].paths, vec![b1.clone(), b2.clone()]);
+        let side_a_titles = state.presentation_tabs[side_a_index]
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("side A TITLE values");
+        assert_eq!(
+            side_a_titles.per_file_values,
+            vec!["Cue A1".to_string(), "Cue A2".to_string()]
+        );
+        let side_b_titles = state.presentation_tabs[side_b_index]
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("side B TITLE values");
+        assert_eq!(
+            side_b_titles.per_file_values,
+            vec!["Cue B1".to_string(), "Cue B2".to_string()]
+        );
+
+        state.active_tab = side_a_index;
+        let before_side_a = std::fs::read(&side_a).expect("side A before title edit");
+        let before_side_b = std::fs::read(&side_b).expect("side B before title edit");
+        let all_audio = vec![a1.clone(), a2.clone(), b1.clone(), b2.clone()];
+        let before_audio = all_audio
+            .iter()
+            .map(|path| std::fs::read(path).expect("audio before title edit"))
+            .collect::<Vec<_>>();
+        let title_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("side A TITLE row");
+        {
+            let title = &mut state.active_surface_mut().entries[title_index];
+            title.per_file_values[0] = "Edited Cue A1".to_string();
+            cue_album_recompute_entry_display(title);
+        }
+        recalc_dirty(&mut state);
+        state.close_after_successful_save = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        let mut title_save_complete = false;
+        while !title_save_complete {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                .await
+                .expect("sidecar title save timed out")
+                .expect("sidecar title save channel closed");
+            if let AppMessage::MetadataEditorWriteComplete { results, .. } = &message {
+                title_save_complete = true;
+                assert!(results.iter().any(|result| matches!(
+                    &result.outcome,
+                    crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
+                        cue_path,
+                        unchanged: false,
+                        ..
+                    } if cue_path == &side_a
+                )));
+            }
+            crate::tui::event_loop::handle_message(&mut app, message, &tx);
+        }
+        assert_ne!(std::fs::read(&side_a).expect("side A after title edit"), before_side_a);
+        assert_eq!(std::fs::read(&side_b).expect("side B after title edit"), before_side_b);
+        for (path, before) in all_audio.iter().zip(before_audio.iter()) {
+            assert_eq!(
+                &std::fs::read(path).expect("audio after title edit"),
+                before,
+                "CUE-owned title edit rewrote {}",
+                path.display()
+            );
+        }
+
+        let mut app = open_with_priority(vec![
+            SidecarCue,
+            IndividualFiles,
+            EmbeddedCue,
+        ]);
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("reopened sidecar-first album must open the metadata editor");
+        };
+        let side_b_index = state
+            .presentation_tabs
+            .iter()
+            .position(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &side_b
+            ))
+            .expect("reopened side B presentation");
+        state.active_tab = side_b_index;
+        let before_side_a = std::fs::read(&side_a).expect("side A before composer edit");
+        let before_side_b = std::fs::read(&side_b).expect("side B before composer edit");
+        let before_audio = all_audio
+            .iter()
+            .map(|path| std::fs::read(path).expect("audio before composer edit"))
+            .collect::<Vec<_>>();
+        let composer_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
+            .expect("side B COMPOSER row");
+        {
+            let composer = &mut state.active_surface_mut().entries[composer_index];
+            composer.per_file_values[0] = "Edited Composer B1".to_string();
+            cue_album_recompute_entry_display(composer);
+        }
+        recalc_dirty(&mut state);
+        assert_eq!(metadata_editor_audio_paths_requiring_save(&state), vec![b1.clone()]);
+        state.close_after_successful_save = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        let mut composer_save_complete = false;
+        while !composer_save_complete {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                .await
+                .expect("member composer save timed out")
+                .expect("member composer save channel closed");
+            if let AppMessage::MetadataEditorWriteComplete { results, .. } = &message {
+                composer_save_complete = true;
+                assert!(results.iter().any(|result| {
+                    result.path.as_path() == b1.as_path()
+                        && matches!(
+                            &result.outcome,
+                            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                        )
+                }));
+            }
+            crate::tui::event_loop::handle_message(&mut app, message, &tx);
+        }
+        assert_eq!(std::fs::read(&side_a).expect("side A after composer edit"), before_side_a);
+        assert_eq!(std::fs::read(&side_b).expect("side B after composer edit"), before_side_b);
+        assert_ne!(std::fs::read(&b1).expect("b1 after composer edit"), before_audio[2]);
+        for (index, path) in all_audio.iter().enumerate() {
+            if path == &b1 {
+                continue;
+            }
+            assert_eq!(
+                &std::fs::read(path).expect("unaffected audio after composer edit"),
+                &before_audio[index],
+                "file-owned edit rewrote unrelated member {}",
+                path.display()
+            );
+        }
     }
 
     /// Regression pin: Edit Metadata on a single-image CUE directory must
@@ -58130,6 +60337,8 @@ mod single_image_metadata_editor_regression_tests {
             let plan = cue_sidecar_writeback_plan_for_state(state)
                 .unwrap_or_else(|| panic!("{route} route must schedule sidecar write-back"));
             assert_eq!(plan.cue_path, cue_path);
+            assert!(!plan.sidecar_only);
+            assert!(plan.authoritative_projection);
             assert!(
                 plan.require_successful_image_save,
                 "{route} route must gate sidecar metadata on the image save"
@@ -58152,6 +60361,320 @@ mod single_image_metadata_editor_regression_tests {
             assert_eq!(
                 conversion_source.catalog.as_deref(),
                 Some("25AP 1115 PROMO")
+            );
+        }
+    }
+
+    #[test]
+    fn single_image_sidecar_albumartist_edit_clear_and_delete_round_trip() {
+        let open_sidecar = |album: &std::path::Path, parent: &std::path::Path| {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            select_foxy_route(&mut app, album, parent);
+            open_metadata_editor(&mut app);
+            app
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (album, image, cue_path, original_sidecar) =
+            create_foxy_route_fixture(temp.path(), "albumartist-edit");
+        std::fs::write(
+            &cue_path,
+            original_sidecar.replace("PERFORMER \"Foxy\"", "PERFORMER \"Old Artist\""),
+        )
+        .expect("old album performer sidecar");
+
+        let mut app = open_sidecar(&album, temp.path());
+        let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+            panic!("single-image sidecar must open the metadata editor");
+        };
+        let album_artist = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUMARTIST"))
+            .expect("ALBUMARTIST row from sidecar PERFORMER");
+        assert_eq!(album_artist.value, "Old Artist");
+        edit_album_field(state, "ALBUMARTIST", "New Artist");
+        state.active_surface_mut().dirty = true;
+        assert!(
+            regenerate_cuesheet_for_save(state).expect("regenerate ALBUMARTIST edit"),
+            "an ALBUMARTIST edit must regenerate the selected sidecar CUE"
+        );
+        let plan = cue_sidecar_writeback_plan_for_state(state)
+            .expect("regenerated single-image sidecar must schedule write-back");
+        assert_eq!(plan.cue_path, cue_path);
+        let result = cue_sidecar_writeback_result_after_successful_image_save(
+            plan,
+            &[crate::tui::app::MetadataEditorWriteResult::saved(image.clone())],
+        )
+        .expect("successful image save must persist ALBUMARTIST to the sidecar");
+        assert!(matches!(
+            result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
+                unchanged: false,
+                ..
+            }
+        ));
+        let saved = crate::tui::cue_parser::parse_cue_file(&cue_path)
+            .expect("updated sidecar remains parseable");
+        assert_eq!(saved.performer.as_deref(), Some("New Artist"));
+        assert!(std::fs::read_to_string(&cue_path)
+            .expect("updated sidecar text")
+            .contains("PERFORMER \"New Artist\""));
+
+        let reopened = open_sidecar(&album, temp.path());
+        let ActiveOverlay::MetadataEditor(reopened_state) = &reopened.active_overlay else {
+            panic!("updated sidecar must reopen in the metadata editor");
+        };
+        let reopened_album_artist = reopened_state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUMARTIST"))
+            .expect("reopened ALBUMARTIST row");
+        assert_eq!(reopened_album_artist.value, "New Artist");
+
+        for (route, delete_row) in [("albumartist-clear", false), ("albumartist-delete", true)] {
+            let (album, image, cue_path, original_sidecar) =
+                create_foxy_route_fixture(temp.path(), route);
+            std::fs::write(
+                &cue_path,
+                original_sidecar.replace("PERFORMER \"Foxy\"", "PERFORMER \"Old Artist\""),
+            )
+            .expect("old album performer sidecar");
+            let mut app = open_sidecar(&album, temp.path());
+            let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+                panic!("{route} sidecar must open the metadata editor");
+            };
+            let album_artist_idx = state
+                .active_surface()
+                .entries
+                .iter()
+                .position(|entry| entry.display_key.eq_ignore_ascii_case("ALBUMARTIST"))
+                .expect("ALBUMARTIST row");
+            // The album performer is inherited into every per-track ARTIST row on
+            // open (parse_cue materializes the album PERFORMER into each track's
+            // performer). To fully remove the artist the per-track ARTIST row(s)
+            // must be cleared/deleted in the SAME save — otherwise the inherited
+            // per-track performers re-emit the old artist into the regenerated
+            // sidecar. This is the documented model (clear ALBUMARTIST alone is
+            // not sufficient when tracks carry an inherited performer).
+            let artist_idx = state
+                .active_surface()
+                .entries
+                .iter()
+                .position(|entry| entry.display_key.eq_ignore_ascii_case("ARTIST"));
+            if delete_row {
+                state.active_surface_mut().deleted.push(album_artist_idx);
+                if let Some(idx) = artist_idx {
+                    state.active_surface_mut().deleted.push(idx);
+                }
+            } else {
+                {
+                    let entry = &mut state.active_surface_mut().entries[album_artist_idx];
+                    entry.value.clear();
+                    entry.per_file_values[0].clear();
+                }
+                if let Some(idx) = artist_idx {
+                    let entry = &mut state.active_surface_mut().entries[idx];
+                    entry.value.clear();
+                    for value in &mut entry.per_file_values {
+                        value.clear();
+                    }
+                }
+            }
+            state.active_surface_mut().dirty = true;
+            assert!(
+                regenerate_cuesheet_for_save(state)
+                    .unwrap_or_else(|error| panic!("{route} regeneration failed: {error}")),
+                "{route} must regenerate the sidecar CUE"
+            );
+            let plan = cue_sidecar_writeback_plan_for_state(state)
+                .unwrap_or_else(|| panic!("{route} must schedule sidecar write-back"));
+            cue_sidecar_writeback_result_after_successful_image_save(
+                plan,
+                &[crate::tui::app::MetadataEditorWriteResult::saved(image)],
+            )
+            .unwrap_or_else(|| panic!("{route} must persist after image save"));
+            let saved = crate::tui::cue_parser::parse_cue_file(&cue_path)
+                .unwrap_or_else(|error| panic!("{route} sidecar parse failed: {error}"));
+            assert!(
+                saved.performer.is_none(),
+                "{route} must remove the album-level CUE PERFORMER"
+            );
+            assert!(
+                !std::fs::read_to_string(&cue_path)
+                    .expect("cleared sidecar text")
+                    .contains("PERFORMER \"Old Artist\""),
+                "{route} silently retained the old album performer"
+            );
+
+            let reopened = open_sidecar(&album, temp.path());
+            let ActiveOverlay::MetadataEditor(reopened_state) = &reopened.active_overlay else {
+                panic!("{route} sidecar must reopen in the metadata editor");
+            };
+            let reopened_album_artist = reopened_state
+                .active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUMARTIST"))
+                .expect("reopened empty ALBUMARTIST row");
+            assert!(
+                reopened_album_artist.value.is_empty(),
+                "{route} must not resurrect the removed sidecar performer"
+            );
+        }
+    }
+
+    #[test]
+    fn single_image_sidecar_album_field_deletions_persist_and_do_not_resurrect() {
+        struct AlbumFieldDeletionCase {
+            route: &'static str,
+            key: &'static str,
+            cue_line: &'static str,
+            old_value: &'static str,
+            parsed_value: fn(&crate::convert::cue_parser::CueSheet) -> Option<&str>,
+        }
+
+        let cases = [
+            AlbumFieldDeletionCase {
+                route: "delete-album",
+                key: "ALBUM",
+                cue_line: "",
+                old_value: "Old Sidecar Album",
+                parsed_value: |sheet| sheet.title.as_deref(),
+            },
+            AlbumFieldDeletionCase {
+                route: "delete-date",
+                key: "DATE",
+                cue_line: "REM DATE 1987\n",
+                old_value: "1987",
+                parsed_value: |sheet| sheet.date.as_deref(),
+            },
+            AlbumFieldDeletionCase {
+                route: "delete-genre",
+                key: "GENRE",
+                cue_line: "REM GENRE \"Rock\"\n",
+                old_value: "Rock",
+                parsed_value: |sheet| sheet.genre.as_deref(),
+            },
+            AlbumFieldDeletionCase {
+                route: "delete-catalog",
+                key: "CATALOGNUMBER",
+                cue_line: "",
+                old_value: "OLD-SIDECAR-CAT",
+                parsed_value: |sheet| sheet.catalog.as_deref(),
+            },
+        ];
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        for case in cases {
+            let (album, image, cue_path, original_sidecar) =
+                create_foxy_route_fixture(temp.path(), case.route);
+            if !case.cue_line.is_empty() {
+                std::fs::write(
+                    &cue_path,
+                    format!("{}{}", case.cue_line, original_sidecar),
+                )
+                .unwrap_or_else(|error| panic!("{} sidecar setup failed: {error}", case.key));
+            }
+
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            select_foxy_route(&mut app, &album, temp.path());
+            open_metadata_editor(&mut app);
+            let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+                panic!("{} sidecar must open the metadata editor", case.key);
+            };
+            let entry_idx = state
+                .active_surface()
+                .entries
+                .iter()
+                .position(|entry| entry.display_key.eq_ignore_ascii_case(case.key))
+                .unwrap_or_else(|| panic!("missing {} row", case.key));
+            assert_eq!(
+                state.active_surface().entries[entry_idx].value,
+                case.old_value,
+                "{} must initially come from the selected sidecar",
+                case.key
+            );
+            state.cursor = entry_idx;
+            assert!(
+                metadata_editor_delete_cursor(state).is_none(),
+                "{} deletion should not require a warning or confirmation",
+                case.key
+            );
+            assert!(state.active_surface().deleted.contains(&entry_idx));
+            assert!(
+                regenerate_cuesheet_for_save(state)
+                    .unwrap_or_else(|error| panic!("{} regeneration failed: {error}", case.key)),
+                "deleting {} must regenerate the selected sidecar CUE",
+                case.key
+            );
+
+            let plan = cue_sidecar_writeback_plan_for_state(state)
+                .unwrap_or_else(|| panic!("{} deletion must schedule sidecar write-back", case.key));
+            assert!(!plan.sidecar_only);
+            assert!(plan.authoritative_projection);
+            let result = cue_sidecar_writeback_result_after_successful_image_save(
+                plan,
+                &[crate::tui::app::MetadataEditorWriteResult::saved(image.clone())],
+            )
+            .unwrap_or_else(|| panic!("{} deletion must persist after image save", case.key));
+            assert!(matches!(
+                result.outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
+                    unchanged: false,
+                    ..
+                }
+            ));
+
+            let parsed = crate::tui::cue_parser::parse_cue_file(&cue_path)
+                .unwrap_or_else(|error| panic!("{} sidecar parse failed: {error}", case.key));
+            assert_eq!(
+                (case.parsed_value)(&parsed),
+                None,
+                "{} directive must be absent from the parsed sidecar",
+                case.key
+            );
+            let saved_text = std::fs::read_to_string(&cue_path)
+                .unwrap_or_else(|error| panic!("{} sidecar read failed: {error}", case.key));
+            let album_header = saved_text
+                .split_once("FILE ")
+                .map(|(header, _)| header)
+                .unwrap_or(saved_text.as_str());
+            let directive_prefix = match case.key {
+                "ALBUM" => "TITLE ",
+                "DATE" => "REM DATE ",
+                "GENRE" => "REM GENRE ",
+                "CATALOGNUMBER" => "CATALOG ",
+                _ => unreachable!("covered album-level CUE field"),
+            };
+            assert!(
+                album_header
+                    .lines()
+                    .all(|line| !line.trim_start().starts_with(directive_prefix)),
+                "{} directive survived textual sidecar regeneration: {saved_text}",
+                case.key
+            );
+
+            let mut reopened = AppState::new_for_test(TonepoetConfig::default());
+            select_foxy_route(&mut reopened, &album, temp.path());
+            open_metadata_editor(&mut reopened);
+            let ActiveOverlay::MetadataEditor(reopened_state) = &reopened.active_overlay else {
+                panic!("{} sidecar must reopen in the metadata editor", case.key);
+            };
+            let reopened_value = reopened_state
+                .active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case(case.key))
+                .map(|entry| entry.value.as_str())
+                .unwrap_or_default();
+            assert_ne!(
+                reopened_value,
+                case.old_value,
+                "{} deletion must not resurrect the removed sidecar value",
+                case.key
             );
         }
     }
@@ -58432,6 +60955,997 @@ mod metadata_cue_source_coverage_tests {
             sheet: crate::tui::cue_parser::parse_cue(&cue_text),
             cue_text,
         }
+    }
+
+    #[derive(Debug)]
+    struct PresplitMetadataSidecarFixture {
+        album: std::path::PathBuf,
+        cue_path: std::path::PathBuf,
+        file_order_paths: Vec<std::path::PathBuf>,
+        cue_order_paths: Vec<std::path::PathBuf>,
+        bonus_path: Option<std::path::PathBuf>,
+    }
+
+    fn write_presplit_tagged_flac(
+        path: &std::path::Path,
+        title: &str,
+        track_number: &str,
+        artist: &str,
+    ) {
+        assert!(create_flac_fixture(path), "FLAC fixture: {}", path.display());
+        crate::tui::probe::write_all_tags(
+            path,
+            &[
+                (
+                    lofty::tag::ItemKey::TrackTitle,
+                    Some(title.to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::TrackNumber,
+                    Some(track_number.to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::TrackArtist,
+                    Some(artist.to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::AlbumTitle,
+                    Some("File Album".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::Genre,
+                    Some("File Genre".to_string()),
+                ),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("tag {}: {error}", path.display()));
+    }
+
+    fn create_presplit_metadata_sidecar_fixture(
+        root: &std::path::Path,
+        include_bonus: bool,
+    ) -> PresplitMetadataSidecarFixture {
+        let album = root.join(if include_bonus {
+            "presplit-with-bonus"
+        } else {
+            "presplit"
+        });
+        std::fs::create_dir_all(&album).expect("pre-split album directory");
+        let first = album.join("01 - Track One.flac");
+        let second = album.join("02 - Track Two.flac");
+        let third = album.join("03 - Track Three.flac");
+        write_presplit_tagged_flac(&first, "File One", "01", "File Artist One");
+        write_presplit_tagged_flac(&second, "File Two", "02", "File Artist Two");
+        write_presplit_tagged_flac(&third, "File Three", "03", "File Artist Three");
+        for (path, composer) in [
+            (&first, "Composer One"),
+            (&second, "Composer Two"),
+            (&third, "Composer Three"),
+        ] {
+            crate::tui::probe::write_all_tags(
+                path,
+                &[(lofty::tag::ItemKey::Composer, Some(composer.to_string()))],
+            )
+            .unwrap_or_else(|error| panic!("composer tag {}: {error}", path.display()));
+        }
+
+        let cue_path = album.join("album.cue");
+        std::fs::write(
+            &cue_path,
+            concat!(
+                "TITLE \"Cue Album\"\n",
+                "FILE \"02 - Track Two.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n",
+                "    TITLE \"Cue Two\"\n",
+                "    PERFORMER \"Cue Artist Two\"\n",
+                "    INDEX 01 00:00:00\n",
+                "FILE \"01 - Track One.flac\" FLAC\n",
+                "  TRACK 02 AUDIO\n",
+                "    TITLE \"Cue One\"\n",
+                "    INDEX 01 00:00:00\n",
+                "FILE \"03 - Track Three.flac\" FLAC\n",
+                "  TRACK 03 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("pre-split sidecar CUE");
+
+        let bonus_path = include_bonus.then(|| {
+            let path = album.join("99 - Bonus.flac");
+            write_presplit_tagged_flac(&path, "Bonus File", "99", "Bonus Artist");
+            path
+        });
+        PresplitMetadataSidecarFixture {
+            album,
+            cue_path,
+            file_order_paths: vec![first.clone(), second.clone(), third.clone()],
+            cue_order_paths: vec![second, first, third],
+            bonus_path,
+        }
+    }
+
+    fn open_presplit_metadata_sidecar_fixture(
+        fixture: &PresplitMetadataSidecarFixture,
+        parent: &std::path::Path,
+        priority: Vec<crate::config::AggregateMetadataTarget>,
+    ) -> AppState {
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority = priority;
+        let mut app = AppState::new_for_test(config);
+        select_foxy_route(&mut app, &fixture.album, parent);
+        open_metadata_editor(&mut app);
+        app
+    }
+
+    fn metadata_entry<'a>(
+        state: &'a super::super::app::MetadataEditorState,
+        display_key: &str,
+    ) -> &'a super::super::probe::TagEntry {
+        state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case(display_key))
+            .unwrap_or_else(|| panic!("missing metadata row {display_key}"))
+    }
+
+    fn assert_presplit_sidecar_presentation(
+        state: &super::super::app::MetadataEditorState,
+        fixture: &PresplitMetadataSidecarFixture,
+    ) {
+        assert_eq!(state.presentation_tabs.len(), 1);
+        assert_eq!(state.active_surface().paths, fixture.cue_order_paths);
+        assert!(matches!(
+            &state.active_surface().cue_source,
+            Some(super::super::app::MetadataCueSource::Sidecar(path))
+                if path == &fixture.cue_path
+        ));
+        let sheet = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("selected sidecar synthetic sheet");
+        assert_eq!(sheet.audio_paths.as_slice(), fixture.file_order_paths.as_slice());
+        assert_eq!(
+            state
+                .active_surface()
+                .technical_details
+                .files
+                .iter()
+                .map(|file| file.file_facts.path.clone())
+                .collect::<Vec<_>>(),
+            fixture.file_order_paths,
+            "technical and write-eligibility facts must stay aligned with the save dimension"
+        );
+        assert_eq!(metadata_entry(state, "ALBUM").value, "Cue Album");
+        assert_eq!(metadata_entry(state, "GENRE").value, "File Genre");
+        assert_eq!(
+            metadata_entry(state, "TITLE").per_file_values,
+            vec![
+                "Cue Two".to_string(),
+                "Cue One".to_string(),
+                "File Three".to_string(),
+            ],
+            "explicit CUE titles win while an omitted title retains its file-tag value"
+        );
+        assert_eq!(
+            metadata_entry(state, "ARTIST").per_file_values,
+            vec![
+                "Cue Artist Two".to_string(),
+                "File Artist One".to_string(),
+                "File Artist Three".to_string(),
+            ],
+            "explicit CUE performers win while omitted performers retain file-tag values"
+        );
+        assert!(!state.any_presentation_dirty());
+    }
+
+    #[test]
+    fn presplit_metadata_sidecar_priority_materializes_the_selected_source() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+
+        let sidecar_first = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(sidecar_state) = &sidecar_first.active_overlay else {
+            panic!("sidecar-first pre-split directory must open the metadata editor");
+        };
+        assert_presplit_sidecar_presentation(sidecar_state, &fixture);
+
+        let embedded_fallback = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![EmbeddedCue, SidecarCue, IndividualFiles],
+        );
+        let ActiveOverlay::MetadataEditor(embedded_fallback_state) =
+            &embedded_fallback.active_overlay
+        else {
+            panic!("absent embedded CUE must fall through to the sidecar");
+        };
+        assert_presplit_sidecar_presentation(embedded_fallback_state, &fixture);
+
+        let individual_first = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![IndividualFiles, SidecarCue, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(individual_state) = &individual_first.active_overlay
+        else {
+            panic!("individual-first pre-split directory must open the metadata editor");
+        };
+        assert_eq!(individual_state.presentation_tabs.len(), 1);
+        assert!(individual_state.active_surface().cue_source.is_none());
+        assert!(individual_state.active_surface().cue_album_synthetic_sheet.is_none());
+        assert_eq!(individual_state.active_surface().paths, fixture.file_order_paths);
+        assert_eq!(
+            metadata_entry(individual_state, "TITLE").per_file_values,
+            vec![
+                "File One".to_string(),
+                "File Two".to_string(),
+                "File Three".to_string(),
+            ]
+        );
+        assert_eq!(metadata_entry(individual_state, "ALBUM").value, "File Album");
+        assert!(!individual_state.any_presentation_dirty());
+    }
+
+    #[test]
+    fn presplit_valid_embedded_source_still_obeys_configured_priority() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let sidecar_text = std::fs::read_to_string(&fixture.cue_path)
+            .expect("read sidecar for embedded fixture");
+        let embedded_text = sidecar_text
+            .replace("TITLE \"Cue Album\"", "TITLE \"Embedded Album\"")
+            .replace("TITLE \"Cue Two\"", "TITLE \"Embedded Two\"");
+        crate::tui::probe::write_all_tags(
+            &fixture.cue_order_paths[0],
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded_text),
+            )],
+        )
+        .expect("write coherent native multi-FILE embedded CUESHEET");
+
+        let embedded_first = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![EmbeddedCue, SidecarCue, IndividualFiles],
+        );
+        let ActiveOverlay::MetadataEditor(embedded_state) = &embedded_first.active_overlay else {
+            panic!("embedded-first pre-split directory must open the metadata editor");
+        };
+        assert_eq!(embedded_state.presentation_tabs.len(), 1);
+        assert_eq!(embedded_state.active_surface().paths, fixture.cue_order_paths);
+        assert!(matches!(
+            &embedded_state.active_surface().cue_source,
+            Some(super::super::app::MetadataCueSource::Embedded(path))
+                if path == &fixture.cue_order_paths[0]
+        ));
+        assert_eq!(metadata_entry(embedded_state, "ALBUM").value, "Embedded Album");
+        assert_eq!(
+            metadata_entry(embedded_state, "TITLE").per_file_values[0],
+            "Embedded Two"
+        );
+
+        let sidecar_first = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![SidecarCue, EmbeddedCue, IndividualFiles],
+        );
+        let ActiveOverlay::MetadataEditor(sidecar_state) = &sidecar_first.active_overlay else {
+            panic!("sidecar-first pre-split directory must open the metadata editor");
+        };
+        assert_presplit_sidecar_presentation(sidecar_state, &fixture);
+
+        let individual_first = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+        );
+        let ActiveOverlay::MetadataEditor(individual_state) = &individual_first.active_overlay
+        else {
+            panic!("individual-first pre-split directory must open the metadata editor");
+        };
+        assert!(individual_state.active_surface().cue_source.is_none());
+        assert_eq!(metadata_entry(individual_state, "ALBUM").value, "File Album");
+        assert_eq!(
+            metadata_entry(individual_state, "TITLE").per_file_values,
+            vec![
+                "File One".to_string(),
+                "File Two".to_string(),
+                "File Three".to_string(),
+            ]
+        );
+
+        std::fs::remove_file(&fixture.cue_path).expect("remove sidecar for embedded-only checks");
+        let embedded_only_first = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![EmbeddedCue, IndividualFiles, SidecarCue],
+        );
+        let ActiveOverlay::MetadataEditor(embedded_only_state) =
+            &embedded_only_first.active_overlay
+        else {
+            panic!("embedded-only pre-split directory must open the metadata editor");
+        };
+        assert!(matches!(
+            &embedded_only_state.active_surface().cue_source,
+            Some(super::super::app::MetadataCueSource::Embedded(path))
+                if path == &fixture.cue_order_paths[0]
+        ));
+        assert_eq!(metadata_entry(embedded_only_state, "ALBUM").value, "Embedded Album");
+
+        let individual_without_sidecar = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+        );
+        let ActiveOverlay::MetadataEditor(individual_without_sidecar_state) =
+            &individual_without_sidecar.active_overlay
+        else {
+            panic!("individual-first embedded-only pre-split directory must open the metadata editor");
+        };
+        assert!(individual_without_sidecar_state.active_surface().cue_source.is_none());
+        assert_eq!(
+            metadata_entry(individual_without_sidecar_state, "TITLE").per_file_values,
+            vec![
+                "File One".to_string(),
+                "File Two".to_string(),
+                "File Three".to_string(),
+            ],
+            "a one-track-per-file embedded CUE must not make Individual files nonviable"
+        );
+    }
+
+    #[test]
+    fn presplit_sidecar_first_keeps_only_the_uncovered_bonus_as_ordinary_audio() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), true);
+        let app = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("sidecar-plus-bonus directory must open the metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        let sidecar_tab = state
+            .presentation_tabs
+            .iter()
+            .find(|tab| matches!(
+                &tab.cue_source,
+                Some(super::super::app::MetadataCueSource::Sidecar(path))
+                    if path == &fixture.cue_path
+            ))
+            .expect("selected sidecar presentation");
+        assert_eq!(sidecar_tab.paths, fixture.cue_order_paths);
+        let ordinary_tab = state
+            .presentation_tabs
+            .iter()
+            .find(|tab| tab.cue_source.is_none())
+            .expect("uncovered ordinary presentation");
+        assert_eq!(ordinary_tab.paths, vec![fixture.bonus_path.clone().unwrap()]);
+        assert!(fixture.file_order_paths.iter().all(|covered| {
+            !ordinary_tab.paths.iter().any(|path| path == covered)
+        }));
+        assert!(!state.any_presentation_dirty());
+    }
+
+    fn transfer_entry_values(
+        carrier: &super::super::tag_interchange::TransferCarrier,
+        display_key: &str,
+    ) -> Vec<String> {
+        let entries = super::super::tag_interchange::read_transfer_carrier_entries(
+            carrier,
+            super::super::app::TagTransferScope::All,
+            &super::super::probe::MetadataWriteCancelFlag::new(),
+        )
+        .expect("read classified transfer carrier");
+        entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case(display_key))
+            .unwrap_or_else(|| panic!("missing transfer row {display_key}"))
+            .per_file_values
+            .clone()
+    }
+
+    #[test]
+    fn presplit_transfer_priority_materializes_cue_order_metadata_and_uncovered_bonus() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+
+        let sidecar_first = classify_tag_transfer_roots(
+            std::slice::from_ref(&fixture.album),
+            &[SidecarCue, IndividualFiles, EmbeddedCue],
+            &cancel,
+        )
+        .expect("sidecar-first transfer carrier");
+        assert!(matches!(
+            &sidecar_first,
+            super::super::tag_interchange::TransferCarrier::SidecarCue {
+                cue_path,
+                track_audio_paths,
+                ..
+            } if cue_path == &fixture.cue_path
+                && track_audio_paths == &fixture.cue_order_paths
+        ));
+        assert_eq!(
+            transfer_entry_values(&sidecar_first, "TITLE"),
+            vec![
+                "Cue Two".to_string(),
+                "Cue One".to_string(),
+                "File Three".to_string(),
+            ],
+            "CUE-explicit titles win while omitted CUE fields retain file tags"
+        );
+        assert_eq!(
+            transfer_entry_values(&sidecar_first, "ARTIST"),
+            vec![
+                "Cue Artist Two".to_string(),
+                "File Artist One".to_string(),
+                "File Artist Three".to_string(),
+            ]
+        );
+
+        let individual_first = classify_tag_transfer_roots(
+            std::slice::from_ref(&fixture.album),
+            &[IndividualFiles, SidecarCue, EmbeddedCue],
+            &cancel,
+        )
+        .expect("individual-first transfer carrier");
+        assert!(matches!(
+            &individual_first,
+            super::super::tag_interchange::TransferCarrier::Files { paths }
+                if paths == &fixture.file_order_paths
+        ));
+        assert_eq!(
+            transfer_entry_values(&individual_first, "TITLE"),
+            vec![
+                "File One".to_string(),
+                "File Two".to_string(),
+                "File Three".to_string(),
+            ]
+        );
+
+        let embedded_fallback = classify_tag_transfer_roots(
+            std::slice::from_ref(&fixture.album),
+            &[EmbeddedCue, SidecarCue, IndividualFiles],
+            &cancel,
+        )
+        .expect("absent embedded CUE falls through to sidecar");
+        assert!(matches!(
+            &embedded_fallback,
+            super::super::tag_interchange::TransferCarrier::SidecarCue { cue_path, .. }
+                if cue_path == &fixture.cue_path
+        ));
+        assert_eq!(
+            transfer_entry_values(&embedded_fallback, "TITLE"),
+            transfer_entry_values(&sidecar_first, "TITLE")
+        );
+
+        let with_bonus = create_presplit_metadata_sidecar_fixture(temp.path(), true);
+        let bonus_carrier = classify_tag_transfer_roots(
+            std::slice::from_ref(&with_bonus.album),
+            &[SidecarCue, IndividualFiles, EmbeddedCue],
+            &cancel,
+        )
+        .expect("sidecar plus uncovered bonus carrier");
+        let super::super::tag_interchange::TransferCarrier::Aggregate { carriers } = &bonus_carrier
+        else {
+            panic!("mixed folder must retain a sidecar carrier plus uncovered files");
+        };
+        assert_eq!(carriers.len(), 2);
+        assert!(matches!(
+            &carriers[0],
+            super::super::tag_interchange::TransferCarrier::SidecarCue {
+                cue_path,
+                track_audio_paths,
+                ..
+            } if cue_path == &with_bonus.cue_path
+                && track_audio_paths == &with_bonus.cue_order_paths
+        ));
+        assert!(matches!(
+            &carriers[1],
+            super::super::tag_interchange::TransferCarrier::Files { paths }
+                if paths == &vec![with_bonus.bonus_path.clone().expect("bonus path")]
+        ));
+        assert_eq!(
+            transfer_entry_values(&bonus_carrier, "TITLE"),
+            vec![
+                "Cue Two".to_string(),
+                "Cue One".to_string(),
+                "File Three".to_string(),
+                "Bonus File".to_string(),
+            ]
+        );
+
+        let individual_bonus = classify_tag_transfer_roots(
+            std::slice::from_ref(&with_bonus.album),
+            &[IndividualFiles, SidecarCue, EmbeddedCue],
+            &cancel,
+        )
+        .expect("individual-first album plus bonus carrier");
+        let mut expected_files = with_bonus.file_order_paths.clone();
+        expected_files.push(with_bonus.bonus_path.clone().expect("bonus path"));
+        assert!(matches!(
+            &individual_bonus,
+            super::super::tag_interchange::TransferCarrier::Files { paths }
+                if paths == &expected_files
+        ));
+        assert_eq!(
+            transfer_entry_values(&individual_bonus, "TITLE"),
+            vec![
+                "File One".to_string(),
+                "File Two".to_string(),
+                "File Three".to_string(),
+                "Bonus File".to_string(),
+            ],
+            "an all-files outcome must remain one ordinary carrier rather than an aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn presplit_metadata_sidecar_keeps_non_cue_track_fields_file_authoritative() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let mut app = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+        );
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("sidecar-first pre-split directory must open the metadata editor");
+        };
+        assert_presplit_sidecar_presentation(&state, &fixture);
+        assert_eq!(
+            metadata_editor_audio_save_paths(&state),
+            fixture.file_order_paths.as_slice()
+        );
+        assert_eq!(
+            metadata_editor_track_slots_in_member_file_order(
+                &state,
+                &[
+                    "Composer Two".to_string(),
+                    "Composer One".to_string(),
+                    "Composer Three".to_string(),
+                ],
+            )
+            .expect("CUE-order track values must map into member-file save order"),
+            vec![
+                "Composer One".to_string(),
+                "Composer Two".to_string(),
+                "Composer Three".to_string(),
+            ]
+        );
+
+        let composer_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
+            .expect("loaded COMPOSER row");
+        assert_eq!(
+            state.active_surface().entries[composer_index].per_file_values,
+            vec![
+                "Composer One".to_string(),
+                "Composer Two".to_string(),
+                "Composer Three".to_string(),
+            ],
+            "ordinary file-scoped values must be loaded in member-file save order"
+        );
+        {
+            let composer = &mut state.active_surface_mut().entries[composer_index];
+            composer.row_scope = crate::tui::probe::RowScope::Track;
+            composer.per_file_values = vec![
+                "Composer Two".to_string(),
+                "Composer One".to_string(),
+                "Composer Three".to_string(),
+            ];
+            composer.per_file_originals = composer.per_file_values.clone();
+            composer.per_file_stored_value_counts = vec![1, 1, 1];
+            composer.per_file_values[0] = "Edited Composer Two".to_string();
+            cue_album_recompute_entry_display(composer);
+        }
+        assert_eq!(
+            metadata_editor_detail_slot_file_index(&state, composer_index, 0),
+            Some(1),
+            "CUE track slot 01 (file 02) must resolve to file 02's save/eligibility slot"
+        );
+        recalc_dirty(&mut state);
+        assert!(state.any_presentation_dirty());
+        assert!(
+            !regenerate_cuesheet_for_save(&mut state)
+                .expect("non-CUE track metadata must not be rejected by CUE regeneration"),
+            "a file-owned COMPOSER edit must not rewrite the selected CUE"
+        );
+
+        let snapshots = metadata_editor_entries_snapshot_for_save(&state);
+        let composer = &snapshots[composer_index];
+        assert_eq!(composer.row_scope, crate::tui::probe::RowScope::File);
+        assert_eq!(
+            composer.values,
+            vec![
+                "Composer One".to_string(),
+                "Edited Composer Two".to_string(),
+                "Composer Three".to_string(),
+            ]
+        );
+        assert_eq!(
+            composer.originals,
+            vec![
+                "Composer One".to_string(),
+                "Composer Two".to_string(),
+                "Composer Three".to_string(),
+            ]
+        );
+        assert_eq!(
+            metadata_editor_audio_paths_requiring_save(&state),
+            vec![fixture.file_order_paths[1].clone()]
+        );
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("selected metadata sidecar must retain its writeback plan");
+        assert!(!plan.sidecar_only);
+        assert!(plan.require_successful_image_save);
+        assert_eq!(plan.required_audio_paths, vec![fixture.file_order_paths[1].clone()]);
+
+        let cue_before = std::fs::read(&fixture.cue_path).expect("sidecar before COMPOSER save");
+        let files_before = fixture
+            .file_order_paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("member before COMPOSER save"))
+            .collect::<Vec<_>>();
+        state.close_after_successful_save = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        let mut completion_seen = false;
+        while !completion_seen {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                .await
+                .expect("member COMPOSER save timed out")
+                .expect("member COMPOSER save channel closed");
+            if let AppMessage::MetadataEditorWriteComplete { results, .. } = &message {
+                completion_seen = true;
+                let saved_paths = results
+                    .iter()
+                    .filter(|result| matches!(
+                        &result.outcome,
+                        crate::tui::app::MetadataEditorWriteOutcome::Saved
+                            | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                    ))
+                    .map(|result| result.path.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(saved_paths, vec![fixture.file_order_paths[1].clone()]);
+            }
+            crate::tui::event_loop::handle_message(&mut app, message, &tx);
+        }
+
+        assert_eq!(
+            std::fs::read(&fixture.cue_path).expect("sidecar after COMPOSER save"),
+            cue_before,
+            "file-owned COMPOSER edit must not rewrite the selected CUE"
+        );
+        for (index, path) in fixture.file_order_paths.iter().enumerate() {
+            let after = std::fs::read(path).expect("member after COMPOSER save");
+            if index == 1 {
+                assert_ne!(after, files_before[index], "file 02 must be rewritten");
+            } else {
+                assert_eq!(
+                    after, files_before[index],
+                    "COMPOSER edit must not rewrite unrelated member {}",
+                    path.display()
+                );
+            }
+        }
+        for (index, expected) in [
+            "Composer One",
+            "Edited Composer Two",
+            "Composer Three",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let reopened = crate::tui::probe::read_all_tags(&fixture.file_order_paths[index])
+                .expect("reopen member after COMPOSER save");
+            assert_eq!(
+                reopened
+                    .iter()
+                    .find(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
+                    .map(|entry| entry.value.as_str()),
+                Some(expected),
+                "COMPOSER must persist to the correct member file"
+            );
+        }
+    }
+
+    #[test]
+    fn presplit_sidecar_save_preserves_field_authority_without_clean_churn() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let mut app = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+        );
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("sidecar-first pre-split directory must open the metadata editor");
+        };
+        assert_presplit_sidecar_presentation(&state, &fixture);
+
+        let before_cue = std::fs::read(&fixture.cue_path).expect("read sidecar before no-op save");
+        let before_files = fixture
+            .file_order_paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("read member before no-op save"))
+            .collect::<Vec<_>>();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("No changes to save")
+        );
+        assert_eq!(
+            std::fs::read(&fixture.cue_path).expect("read sidecar after no-op save"),
+            before_cue
+        );
+        for (path, before) in fixture.file_order_paths.iter().zip(before_files.iter()) {
+            assert_eq!(
+                &std::fs::read(path).expect("read member after no-op save"),
+                before,
+                "clean save must not rewrite {}",
+                path.display()
+            );
+        }
+
+        let title_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("TITLE row");
+        {
+            let title = &mut state.active_surface_mut().entries[title_index];
+            title.per_file_values[0] = "Edited Cue Two".to_string();
+            cue_album_recompute_entry_display(title);
+        }
+        recalc_dirty(&mut state);
+        assert!(state.any_presentation_dirty());
+        assert!(metadata_editor_native_multi_file_metadata_sidecar_authority(&state));
+        assert!(metadata_editor_native_multi_file_sidecar_preflight_error(&state).is_none());
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("regenerate selected sidecar"));
+
+        let snapshots = metadata_editor_entries_snapshot_for_save(&state);
+        let title_snapshot = &snapshots[title_index];
+        assert_eq!(title_snapshot.row_scope, crate::tui::probe::RowScope::Track);
+        assert_eq!(
+            title_snapshot.values, title_snapshot.originals,
+            "the ordinary member-tag writer must not consume a selected sidecar's CUE-owned title edit"
+        );
+        assert!(
+            metadata_editor_audio_paths_requiring_save(&state).is_empty(),
+            "a CUE-representable title edit belongs to the selected sidecar"
+        );
+
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("selected metadata sidecar must have a writeback plan");
+        assert!(plan.sidecar_only);
+        assert!(!plan.require_successful_image_save);
+        assert!(plan.required_audio_paths.is_empty());
+        let sidecar_result = cue_sidecar_writeback_result_after_successful_image_save(plan, &[])
+            .expect("the selected sidecar must accept its CUE-owned title edit");
+        assert!(matches!(
+            sidecar_result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved { .. }
+        ));
+
+        for (file_index, expected) in [
+            (0usize, "File One"),
+            (1usize, "File Two"),
+            (2usize, "File Three"),
+        ] {
+            let path = &fixture.file_order_paths[file_index];
+            assert_eq!(
+                std::fs::read(path).expect("read member after sidecar-only save"),
+                before_files[file_index],
+                "a CUE-owned title edit must not rewrite member tags: {}",
+                path.display()
+            );
+            let reopened = crate::tui::probe::read_all_tags(path).expect("reopen member");
+            assert_eq!(
+                reopened
+                    .iter()
+                    .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+                    .map(|entry| entry.value.as_str()),
+                Some(expected),
+                "member title must retain its independent file-tag value: {}",
+                path.display()
+            );
+        }
+        let saved_sheet = crate::tui::cue_parser::parse_cue_file(&fixture.cue_path)
+            .expect("saved sidecar remains parseable");
+        assert_eq!(saved_sheet.tracks.len(), 3);
+        assert_eq!(saved_sheet.tracks[0].title.as_deref(), Some("Edited Cue Two"));
+        assert_eq!(
+            saved_sheet
+                .tracks
+                .iter()
+                .map(|track| track.file.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("02 - Track Two.flac"),
+                Some("01 - Track One.flac"),
+                Some("03 - Track Three.flac"),
+            ],
+            "sidecar writeback must preserve CUE track-to-file order"
+        );
+    }
+
+    #[test]
+    fn per_carrier_mapping_detects_single_image_and_ignores_aggregate_count_distortion() {
+        let single_image = policy_surface();
+        assert!(metadata_cue_surface_proves_image_content(&single_image));
+
+        let mut one_track_per_file = policy_surface();
+        let second = std::path::PathBuf::from("/album/track-02.flac");
+        one_track_per_file.audio_paths = vec![
+            std::path::PathBuf::from("/album/track-01.flac"),
+            second.clone(),
+        ];
+        one_track_per_file.track_audio_paths = vec![
+            std::path::PathBuf::from("/album/track-01.flac"),
+            second,
+        ];
+        assert!(
+            !metadata_cue_surface_proves_image_content(&one_track_per_file),
+            "one logical track per carrier is not image evidence"
+        );
+
+        let mut incoherent = single_image.clone();
+        incoherent.track_audio_paths[1] =
+            std::path::PathBuf::from("/album/not-covered.flac");
+        assert!(
+            !metadata_cue_surface_proves_image_content(&incoherent),
+            "an internally inconsistent track-to-carrier mapping is not evidence"
+        );
+
+        let mut distorted_aggregate = single_image.clone();
+        distorted_aggregate
+            .audio_paths
+            .push(std::path::PathBuf::from("/album/unrelated.flac"));
+        assert_eq!(
+            distorted_aggregate.sheet.tracks.len(),
+            distorted_aggregate.audio_paths.len(),
+            "fixture defeats a tracks-greater-than-files aggregate proxy"
+        );
+        assert!(
+            metadata_cue_surface_proves_image_content(&distorted_aggregate),
+            "the actual track-to-carrier mapping remains decisive"
+        );
+    }
+
+    #[test]
+    fn individual_first_skips_a_single_image_but_preserves_uncovered_audio() {
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let surface = policy_surface();
+        let bonus = std::path::PathBuf::from("/album/bonus.flac");
+        let aggregate_paths = vec![surface.audio_path.clone(), bonus.clone()];
+
+        let groups = resolve_directory_metadata_groups(
+            &aggregate_paths,
+            std::slice::from_ref(&surface),
+            Vec::new(),
+            &[IndividualFiles, SidecarCue, EmbeddedCue],
+            |_| Ok(None),
+            "metadata test",
+        )
+        .expect("single-image sidecar is viable");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].representation, SidecarCue);
+        assert_eq!(groups[0].covered_paths, vec![surface.audio_path.clone()]);
+        assert!(matches!(
+            groups[0].selected_surfaces.first(),
+            Some(selected) if selected.cue_path == surface.cue_path
+        ));
+        assert_eq!(groups[1].representation, IndividualFiles);
+        assert_eq!(
+            groups[1].covered_paths,
+            vec![bonus],
+            "partial CUE coverage must not absorb an unrelated individual file"
+        );
+    }
+
+    #[test]
+    fn folder_group_resolution_propagates_callback_cancellation() {
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let surface = policy_surface();
+        let error = resolve_directory_metadata_groups(
+            std::slice::from_ref(&surface.audio_path),
+            std::slice::from_ref(&surface),
+            Vec::new(),
+            &[SidecarCue, IndividualFiles, EmbeddedCue],
+            |_| Err("Transfer tags: cancelled during carrier classification".to_string()),
+            "Transfer tags",
+        )
+        .expect_err("cancellation must not be reinterpreted as embedded unavailability");
+        assert_eq!(
+            error,
+            "Transfer tags: cancelled during carrier classification"
+        );
+    }
+
+    #[test]
+    fn folder_group_resolution_treats_ok_none_as_nonviable_embedded_candidate() {
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let surface = policy_surface();
+        let groups = resolve_directory_metadata_groups(
+            std::slice::from_ref(&surface.audio_path),
+            std::slice::from_ref(&surface),
+            Vec::new(),
+            &[EmbeddedCue, SidecarCue, IndividualFiles],
+            |_| Ok(None),
+            "metadata test",
+        )
+        .expect("an unavailable embedded candidate must fall through to Sidecar CUE");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].representation, SidecarCue);
+        assert_eq!(groups[0].selected_surfaces.len(), 1);
+        assert_eq!(groups[0].selected_surfaces[0].cue_path, surface.cue_path);
     }
 
     fn embedded_candidate() -> EmbeddedCueCandidate {
@@ -58916,10 +62430,16 @@ FILE "a.flac" WAVE
         std::fs::write(&cue, sidecar).expect("sidecar cue");
         crate::tui::probe::write_all_tags(
             &image,
-            &[(
-                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
-                Some(embedded.clone()),
-            )],
+            &[
+                (
+                    lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                    Some(embedded.clone()),
+                ),
+                (
+                    lofty::tag::ItemKey::Genre,
+                    Some("File Genre".to_string()),
+                ),
+            ],
         )
         .expect("embedded cuesheet");
 
@@ -58973,12 +62493,22 @@ FILE "a.flac" WAVE
             &app.config.conversion.aggregate_metadata_target_priority,
             &cancel,
         )
-        .expect("files-first directory carrier");
+        .expect("individual-first skips a nonviable single-image representation");
         assert!(matches!(
-            files_first,
-            super::super::tag_interchange::TransferCarrier::Files { paths }
-                if paths == vec![image.clone()]
+            &files_first,
+            super::super::tag_interchange::TransferCarrier::SidecarCue { cue_path, .. }
+                if cue_path == &cue
         ));
+        assert_eq!(
+            transfer_entry_values(&files_first, "ALBUM"),
+            vec!["Sidecar Album".to_string(), "Sidecar Album".to_string()],
+            "the observable source rows must come from the selected sidecar"
+        );
+        assert_eq!(
+            transfer_entry_values(&files_first, "GENRE"),
+            vec!["File Genre".to_string(), "File Genre".to_string()],
+            "fields omitted by an image-backed sidecar must retain their file-tag fallback"
+        );
 
         app.config.conversion.aggregate_metadata_target_priority =
             vec![EmbeddedCue, SidecarCue, IndividualFiles];
@@ -58989,12 +62519,17 @@ FILE "a.flac" WAVE
         )
         .expect("embedded-first directory carrier");
         assert!(matches!(
-            embedded_first,
+            &embedded_first,
             super::super::tag_interchange::TransferCarrier::EmbeddedCue {
                 image_path,
                 ..
-            } if image_path == image
+            } if image_path == &image
         ));
+        assert_eq!(
+            transfer_entry_values(&embedded_first, "ALBUM"),
+            vec!["Embedded Album".to_string(), "Embedded Album".to_string()],
+            "the observable source rows must come from the selected embedded CUE"
+        );
 
         app.config.conversion.aggregate_metadata_target_priority =
             vec![IndividualFiles, EmbeddedCue, SidecarCue];
@@ -59041,6 +62576,510 @@ FILE "a.flac" WAVE
     }
 
     #[test]
+    fn mixed_folder_resolves_each_independent_album_group_before_aggregation() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("mixed-albums");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let sidecar_image = album.join("z-sidecar.flac");
+        let embedded_image = album.join("a-embedded.flac");
+        let cue_path = album.join("z-sidecar.cue");
+        assert!(create_flac_fixture(&sidecar_image), "sidecar image fixture");
+        assert!(create_flac_fixture(&embedded_image), "embedded image fixture");
+        std::fs::write(
+            &cue_path,
+            concat!(
+                "TITLE \"Sidecar Album\"\n",
+                "FILE \"z-sidecar.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"Sidecar One\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    TITLE \"Sidecar Two\"\n    INDEX 01 00:30:00\n",
+            ),
+        )
+        .expect("sidecar fixture");
+        let embedded = concat!(
+            "TITLE \"Embedded Album\"\n",
+            "FILE \"a-embedded.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n    TITLE \"Embedded One\"\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    TITLE \"Embedded Two\"\n    INDEX 01 00:30:00\n",
+        );
+        crate::tui::probe::write_all_tags(
+            &embedded_image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded.to_string()),
+            )],
+        )
+        .expect("embedded fixture");
+
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        let carrier = classify_tag_transfer_roots(
+            std::slice::from_ref(&album),
+            &[EmbeddedCue, SidecarCue, IndividualFiles],
+            &cancel,
+        )
+        .expect("mixed folder carrier");
+        let super::super::tag_interchange::TransferCarrier::Aggregate { carriers } = &carrier
+        else {
+            panic!("independent album groups must survive as an aggregate");
+        };
+        assert_eq!(carriers.len(), 2);
+        assert!(matches!(
+            &carriers[0],
+            super::super::tag_interchange::TransferCarrier::EmbeddedCue { image_path, .. }
+                if image_path == &embedded_image
+        ));
+        assert!(matches!(
+            &carriers[1],
+            super::super::tag_interchange::TransferCarrier::SidecarCue { cue_path: selected, .. }
+                if selected == &cue_path
+        ));
+        assert_eq!(
+            transfer_entry_values(&carrier, "ALBUM"),
+            vec![
+                "Embedded Album".to_string(),
+                "Embedded Album".to_string(),
+                "Sidecar Album".to_string(),
+                "Sidecar Album".to_string(),
+            ],
+            "each group must use its own highest-priority viable source and retain directory order"
+        );
+    }
+
+
+    #[test]
+    fn metadata_editor_resolves_sidecar_and_embedded_album_groups_independently() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let folder = temp.path().join("mixed-editor-groups");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let sidecar_image = folder.join("album-a.flac");
+        let sidecar_path = folder.join("album-a.cue");
+        let embedded_image = folder.join("album-b.flac");
+        assert!(create_flac_fixture(&sidecar_image), "sidecar image");
+        assert!(create_flac_fixture(&embedded_image), "embedded image");
+        std::fs::write(
+            &sidecar_path,
+            concat!(
+                "TITLE \"Sidecar Album\"\n",
+                "FILE \"album-a.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"Sidecar One\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    TITLE \"Sidecar Two\"\n    INDEX 01 00:00:03\n",
+            ),
+        )
+        .expect("sidecar CUE");
+        let embedded_text = concat!(
+            "TITLE \"Embedded Album\"\n",
+            "FILE \"album-b.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n    TITLE \"Embedded One\"\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    TITLE \"Embedded Two\"\n    INDEX 01 00:00:03\n",
+        );
+        crate::tui::probe::write_all_tags(
+            &embedded_image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded_text.to_string()),
+            )],
+        )
+        .expect("embedded CUE");
+
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority =
+            vec![SidecarCue, EmbeddedCue, IndividualFiles];
+        let mut app = AppState::new_for_test(config);
+        select_foxy_route(&mut app, &folder, temp.path());
+        open_metadata_editor(&mut app);
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("mixed folder must open the metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        let sidecar_tab = state
+            .presentation_tabs
+            .iter()
+            .find(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Sidecar(path))
+                    if path == &sidecar_path
+            ))
+            .expect("sidecar presentation");
+        let embedded_tab = state
+            .presentation_tabs
+            .iter()
+            .find(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Embedded(path))
+                    if path == &embedded_image
+            ))
+            .expect("embedded presentation");
+        assert_eq!(sidecar_tab.paths, vec![sidecar_image]);
+        assert_eq!(embedded_tab.paths, vec![embedded_image]);
+        assert_eq!(
+            sidecar_tab
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
+                .map(|entry| entry.value.as_str()),
+            Some("Sidecar Album")
+        );
+        assert_eq!(
+            embedded_tab
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
+                .map(|entry| entry.value.as_str()),
+            Some("Embedded Album")
+        );
+    }
+
+    #[test]
+    fn metadata_editor_presplit_files_and_embedded_image_do_not_influence_each_other() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let embedded_image = fixture.album.join("50 - Embedded Album.flac");
+        assert!(create_flac_fixture(&embedded_image), "embedded image");
+        let embedded_text = concat!(
+            "TITLE \"Embedded Album\"\n",
+            "FILE \"50 - Embedded Album.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n    TITLE \"Embedded One\"\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    TITLE \"Embedded Two\"\n    INDEX 01 00:00:03\n",
+        );
+        crate::tui::probe::write_all_tags(
+            &embedded_image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded_text.to_string()),
+            )],
+        )
+        .expect("embedded CUE");
+
+        let app = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![IndividualFiles, SidecarCue, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("mixed pre-split folder must open the metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        let files_tab = state
+            .presentation_tabs
+            .iter()
+            .find(|tab| tab.cue_source.is_none())
+            .expect("individual-files presentation");
+        assert_eq!(files_tab.paths, fixture.file_order_paths);
+        let file_titles = files_tab
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("file TITLE row");
+        assert_eq!(
+            file_titles.per_file_values,
+            vec![
+                "File One".to_string(),
+                "File Two".to_string(),
+                "File Three".to_string(),
+            ]
+        );
+        let embedded_tab = state
+            .presentation_tabs
+            .iter()
+            .find(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Embedded(path))
+                    if path == &embedded_image
+            ))
+            .expect("embedded presentation");
+        assert_eq!(embedded_tab.paths, vec![embedded_image]);
+        assert!(state.presentation_tabs.iter().all(|tab| !matches!(
+            &tab.cue_source,
+            Some(crate::tui::app::MetadataCueSource::Sidecar(path))
+                if path == &fixture.cue_path
+        )));
+    }
+
+    #[test]
+    fn heterogeneous_metadata_tabs_route_saves_only_to_their_own_authority() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), true);
+        let bonus = fixture.bonus_path.clone().expect("bonus path");
+        let embedded_image = fixture.album.join("50 - Embedded Album.flac");
+        assert!(create_flac_fixture(&embedded_image), "embedded image");
+        let embedded_text = concat!(
+            "TITLE \"Embedded Album\"\n",
+            "FILE \"50 - Embedded Album.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n    TITLE \"Embedded One\"\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    TITLE \"Embedded Two\"\n    INDEX 01 00:00:03\n",
+        );
+        crate::tui::probe::write_all_tags(
+            &embedded_image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded_text.to_string()),
+            )],
+        )
+        .expect("embedded CUE");
+
+        let open = || {
+            open_presplit_metadata_sidecar_fixture(
+                &fixture,
+                temp.path(),
+                vec![SidecarCue, EmbeddedCue, IndividualFiles],
+            )
+        };
+        let all_audio = fixture
+            .file_order_paths
+            .iter()
+            .cloned()
+            .chain([embedded_image.clone(), bonus.clone()])
+            .collect::<Vec<_>>();
+
+        // Sidecar-owned TITLE edit: only the selected sidecar changes.
+        let mut app = open();
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("heterogeneous folder must open editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 3);
+        let sidecar_index = state
+            .presentation_tabs
+            .iter()
+            .position(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Sidecar(path))
+                    if path == &fixture.cue_path
+            ))
+            .expect("sidecar tab");
+        state.active_tab = sidecar_index;
+        let before_audio = all_audio
+            .iter()
+            .map(|path| std::fs::read(path).expect("read audio before sidecar save"))
+            .collect::<Vec<_>>();
+        let before_cue = std::fs::read(&fixture.cue_path).expect("read sidecar before edit");
+        let title_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("sidecar TITLE row");
+        {
+            let title = &mut state.active_surface_mut().entries[title_index];
+            title.per_file_values[0] = "Sidecar Routed Title".to_string();
+            cue_album_recompute_entry_display(title);
+        }
+        recalc_dirty(&mut state);
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("regenerate sidecar"));
+        assert!(metadata_editor_audio_paths_requiring_save(&state).is_empty());
+        let plan = cue_sidecar_writeback_plan_for_state(&state).expect("sidecar plan");
+        assert_eq!(plan.cue_path, fixture.cue_path);
+        assert!(plan.sidecar_only);
+        cue_sidecar_writeback_result_after_successful_image_save(plan, &[])
+            .expect("persist sidecar-only edit");
+        assert_ne!(
+            std::fs::read(&fixture.cue_path).expect("read edited sidecar"),
+            before_cue
+        );
+        for (path, before) in all_audio.iter().zip(before_audio.iter()) {
+            assert_eq!(
+                &std::fs::read(path).expect("read audio after sidecar save"),
+                before,
+                "sidecar edit rewrote unrelated audio {}",
+                path.display()
+            );
+        }
+
+        // Embedded-owned TITLE edit: only the embedded carrier changes.
+        let mut app = open();
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("reopen heterogeneous editor");
+        };
+        let embedded_index = state
+            .presentation_tabs
+            .iter()
+            .position(|tab| matches!(
+                &tab.cue_source,
+                Some(crate::tui::app::MetadataCueSource::Embedded(path))
+                    if path == &embedded_image
+            ))
+            .expect("embedded tab");
+        state.active_tab = embedded_index;
+        let sidecar_before = std::fs::read(&fixture.cue_path).expect("sidecar before embedded edit");
+        let unrelated_before = fixture
+            .file_order_paths
+            .iter()
+            .chain(std::iter::once(&bonus))
+            .map(|path| (path.clone(), std::fs::read(path).expect("unrelated audio")))
+            .collect::<Vec<_>>();
+        let title_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("embedded TITLE row");
+        {
+            let title = &mut state.active_surface_mut().entries[title_index];
+            title.per_file_values[0] = "Embedded Routed Title".to_string();
+            cue_album_recompute_entry_display(title);
+        }
+        recalc_dirty(&mut state);
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("regenerate embedded CUE"));
+        assert_eq!(
+            metadata_editor_audio_paths_requiring_save(&state),
+            vec![embedded_image.clone()]
+        );
+        assert!(cue_sidecar_writeback_plan_for_state(&state).is_none());
+        let snapshots = metadata_editor_entries_snapshot_for_save(&state);
+        let forced = metadata_editor_forced_delete_items(&state);
+        let results = crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes(
+            std::slice::from_ref(&embedded_image),
+            &snapshots,
+            &[],
+            &[None],
+            None,
+            None,
+            None,
+            &forced,
+        );
+        assert!(results.iter().all(|result| {
+            result.path == embedded_image
+                && matches!(
+                    &result.outcome,
+                    crate::tui::app::MetadataEditorWriteOutcome::Saved
+                        | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                )
+        }), "unexpected embedded results: {results:?}");
+        assert_eq!(
+            std::fs::read(&fixture.cue_path).expect("sidecar after embedded edit"),
+            sidecar_before
+        );
+        for (path, before) in unrelated_before {
+            assert_eq!(
+                std::fs::read(&path).expect("unrelated after embedded edit"),
+                before,
+                "embedded edit rewrote {}",
+                path.display()
+            );
+        }
+        let embedded_after = crate::tui::probe::read_all_tags_merged(
+            std::slice::from_ref(&embedded_image),
+        )
+        .expect("read embedded after save");
+        assert!(embedded_after
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            .and_then(|entry| entry.per_file_values.first())
+            .is_some_and(|cue| cue.contains("Embedded Routed Title")));
+
+        // Individual-file edit: only the uncovered bonus file changes.
+        let mut app = open();
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("reopen heterogeneous editor for ordinary save");
+        };
+        let ordinary_index = state
+            .presentation_tabs
+            .iter()
+            .position(|tab| tab.cue_source.is_none() && tab.paths == vec![bonus.clone()])
+            .expect("ordinary bonus tab");
+        state.active_tab = ordinary_index;
+        let sidecar_before = std::fs::read(&fixture.cue_path).expect("sidecar before ordinary edit");
+        let embedded_before = std::fs::read(&embedded_image).expect("embedded before ordinary edit");
+        let members_before = fixture
+            .file_order_paths
+            .iter()
+            .map(|path| (path.clone(), std::fs::read(path).expect("member before ordinary edit")))
+            .collect::<Vec<_>>();
+        let title_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("ordinary TITLE row");
+        {
+            let title = &mut state.active_surface_mut().entries[title_index];
+            title.per_file_values[0] = "Edited Bonus Only".to_string();
+            title.value = "Edited Bonus Only".to_string();
+        }
+        recalc_dirty(&mut state);
+        assert_eq!(
+            metadata_editor_audio_paths_requiring_save(&state),
+            vec![bonus.clone()]
+        );
+        assert!(cue_sidecar_writeback_plan_for_state(&state).is_none());
+        let snapshots = metadata_editor_entries_snapshot_for_save(&state);
+        let forced = metadata_editor_forced_delete_items(&state);
+        let results = crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes(
+            std::slice::from_ref(&bonus),
+            &snapshots,
+            &[],
+            &[None],
+            None,
+            None,
+            None,
+            &forced,
+        );
+        assert!(results.iter().all(|result| {
+            result.path == bonus
+                && matches!(
+                    &result.outcome,
+                    crate::tui::app::MetadataEditorWriteOutcome::Saved
+                        | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                )
+        }), "unexpected ordinary results: {results:?}");
+        assert_eq!(
+            std::fs::read(&fixture.cue_path).expect("sidecar after ordinary edit"),
+            sidecar_before
+        );
+        assert_eq!(
+            std::fs::read(&embedded_image).expect("embedded after ordinary edit"),
+            embedded_before
+        );
+        for (path, before) in members_before {
+            assert_eq!(
+                std::fs::read(&path).expect("member after ordinary edit"),
+                before,
+                "ordinary edit rewrote {}",
+                path.display()
+            );
+        }
+        let bonus_after = crate::tui::probe::read_all_tags_merged(std::slice::from_ref(&bonus))
+            .expect("read bonus after save");
+        assert_eq!(
+            bonus_after
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+                .and_then(|entry| entry.per_file_values.first())
+                .map(String::as_str),
+            Some("Edited Bonus Only")
+        );
+    }
+
+    #[test]
     fn metadata_editor_directory_entry_uses_configured_priority_and_explicit_cue_bypasses_it() {
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
@@ -59050,8 +63089,10 @@ FILE "a.flac" WAVE
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album");
         let image = album.join("album.flac");
+        let bonus = album.join("bonus.flac");
         let cue = album.join("album.cue");
         assert!(create_flac_fixture(&image), "flac fixture");
+        assert!(create_flac_fixture(&bonus), "bonus fixture");
         let sidecar = concat!(
             "TITLE \"Sidecar Album\"\n",
             "FILE \"album.flac\" WAVE\n",
@@ -59089,21 +63130,39 @@ FILE "a.flac" WAVE
             app
         }
 
-        let files_app = open_for_selection(
+        let files_then_sidecar_app = open_for_selection(
             &album,
             temp.path(),
             vec![IndividualFiles, SidecarCue, EmbeddedCue],
         );
-        let ActiveOverlay::MetadataEditor(files_state) = &files_app.active_overlay else {
+        let ActiveOverlay::MetadataEditor(files_then_sidecar_state) =
+            &files_then_sidecar_app.active_overlay
+        else {
             panic!("files-first directory selection must open metadata editor");
         };
-        assert_eq!(files_state.active_surface().paths, vec![image.clone()]);
-        assert!(files_state.active_surface().cue_source.is_none());
-        assert!(files_state
-            .active_surface()
-            .entries
-            .iter()
-            .all(|entry| !entry.display_key.eq_ignore_ascii_case("CUESHEET")));
+        assert_eq!(
+            files_then_sidecar_state.active_surface().paths,
+            vec![image.clone()]
+        );
+        assert!(matches!(
+            &files_then_sidecar_state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &cue
+        ));
+
+        let files_then_embedded_app = open_for_selection(
+            &album,
+            temp.path(),
+            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+        );
+        let ActiveOverlay::MetadataEditor(files_then_embedded_state) =
+            &files_then_embedded_app.active_overlay
+        else {
+            panic!("files-then-embedded directory selection must open metadata editor");
+        };
+        assert!(matches!(
+            &files_then_embedded_state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Embedded(path)) if path == &image
+        ));
 
         let sidecar_app = open_for_selection(
             &album,
@@ -59115,6 +63174,24 @@ FILE "a.flac" WAVE
         };
         assert!(matches!(
             &sidecar_state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &cue
+        ));
+        assert!(sidecar_state.presentation_tabs.iter().any(|tab| {
+            tab.paths == vec![bonus.clone()] && tab.label == "Ordinary audio files"
+        }));
+
+        let sidecar_then_individual_app = open_for_selection(
+            &album,
+            temp.path(),
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(sidecar_then_individual_state) =
+            &sidecar_then_individual_app.active_overlay
+        else {
+            panic!("sidecar-then-individual directory selection must open metadata editor");
+        };
+        assert!(matches!(
+            &sidecar_then_individual_state.active_surface().cue_source,
             Some(crate::tui::app::MetadataCueSource::Sidecar(path)) if path == &cue
         ));
 
@@ -59130,6 +63207,41 @@ FILE "a.flac" WAVE
             &embedded_state.active_surface().cue_source,
             Some(crate::tui::app::MetadataCueSource::Embedded(path)) if path == &image
         ));
+
+        let embedded_then_individual_app = open_for_selection(
+            &album,
+            temp.path(),
+            vec![EmbeddedCue, IndividualFiles, SidecarCue],
+        );
+        let ActiveOverlay::MetadataEditor(embedded_then_individual_state) =
+            &embedded_then_individual_app.active_overlay
+        else {
+            panic!("embedded-then-individual directory selection must open metadata editor");
+        };
+        assert!(matches!(
+            &embedded_then_individual_state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Embedded(path)) if path == &image
+        ));
+
+        std::fs::write(&cue, "this is not a valid CUE sheet\n")
+            .expect("replace sidecar with malformed fixture");
+        let malformed_sidecar_app = open_for_selection(
+            &album,
+            temp.path(),
+            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+        );
+        let ActiveOverlay::MetadataEditor(malformed_sidecar_state) =
+            &malformed_sidecar_app.active_overlay
+        else {
+            panic!("valid embedded image must survive a malformed neighboring sidecar");
+        };
+        assert!(matches!(
+            &malformed_sidecar_state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Embedded(path)) if path == &image
+        ));
+
+        // Restore the valid sidecar for explicit-selection checks below.
+        std::fs::write(&cue, sidecar).expect("restore sidecar cue");
 
         let explicit_cue_app = open_for_selection(
             &cue,
@@ -59155,6 +63267,22 @@ FILE "a.flac" WAVE
         assert_eq!(explicit_image_state.active_surface().paths, vec![image.clone()]);
         assert!(matches!(
             &explicit_image_state.active_surface().cue_source,
+            Some(crate::tui::app::MetadataCueSource::Embedded(path)) if path == &image
+        ));
+
+        std::fs::remove_file(&cue).expect("remove sidecar for embedded-only resolution");
+        let embedded_only_files_first_app = open_for_selection(
+            &album,
+            temp.path(),
+            vec![IndividualFiles, SidecarCue, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(embedded_only_files_first_state) =
+            &embedded_only_files_first_app.active_overlay
+        else {
+            panic!("embedded-only single image must open metadata editor");
+        };
+        assert!(matches!(
+            &embedded_only_files_first_state.active_surface().cue_source,
             Some(crate::tui::app::MetadataCueSource::Embedded(path)) if path == &image
         ));
 
@@ -59647,6 +63775,282 @@ FILE "a.flac" WAVE
     }
 
     #[test]
+    fn unrelated_embedded_albums_open_as_separate_tabs_and_save_independently() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let folder = temp.path().join("unrelated-embedded-albums");
+        std::fs::create_dir_all(&folder).expect("album folder");
+        let album_a = folder.join("Album A.flac");
+        let album_b = folder.join("Album B.flac");
+        write_embedded_disc_fixture(&album_a, "Album A", 1);
+        write_embedded_disc_fixture(&album_b, "Album B", 1);
+        let album_b_before = std::fs::read(&album_b).expect("Album B bytes before edit");
+
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority =
+            vec![EmbeddedCue, SidecarCue, IndividualFiles];
+        let mut app = AppState::new_for_test(config);
+        super::single_image_metadata_editor_regression_tests::select_foxy_route(
+            &mut app,
+            &folder,
+            temp.path(),
+        );
+        open_metadata_editor(&mut app);
+
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("unrelated embedded albums must open the metadata editor");
+        };
+        assert_eq!(
+            state.presentation_tabs.len(),
+            2,
+            "source-kind equality must not merge unrelated embedded albums"
+        );
+        let album_a_index = state
+            .presentation_tabs
+            .iter()
+            .position(|tab| matches!(
+                &tab.cue_source,
+                Some(super::super::app::MetadataCueSource::Embedded(path))
+                    if path == &album_a
+            ))
+            .expect("Album A embedded tab");
+        assert!(state.presentation_tabs.iter().any(|tab| matches!(
+            &tab.cue_source,
+            Some(super::super::app::MetadataCueSource::Embedded(path))
+                if path == &album_b
+        )));
+
+        state.active_tab = album_a_index;
+        let title_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.display_key.eq_ignore_ascii_case("TITLE")
+                    && entry.is_track_scoped(state.active_surface().paths.len())
+            })
+            .expect("Album A track TITLE row");
+        {
+            let title = &mut state.active_surface_mut().entries[title_index];
+            title.per_file_values[0] = "Album A Edited Track".to_string();
+            cue_album_recompute_entry_display(title);
+        }
+        recalc_dirty(&mut state);
+        assert!(regenerate_cuesheet_for_save(&mut state).expect("regenerate Album A CUE"));
+        assert_eq!(
+            metadata_editor_audio_paths_requiring_save(&state),
+            vec![album_a.clone()]
+        );
+        let snapshots = metadata_editor_entries_snapshot_for_save(&state);
+        let forced = metadata_editor_forced_delete_items(&state);
+        let results = crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes(
+            std::slice::from_ref(&album_a),
+            &snapshots,
+            &[],
+            &[None],
+            None,
+            None,
+            None,
+            &forced,
+        );
+        assert!(results.iter().all(|result| matches!(
+            &result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        )), "unexpected Album A save results: {results:?}");
+        assert_eq!(
+            std::fs::read(&album_b).expect("Album B bytes after Album A edit"),
+            album_b_before,
+            "editing one same-source tab must not rewrite the other album"
+        );
+    }
+
+    #[test]
+    fn embedded_sides_of_one_album_open_as_one_coherent_tab() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let folder = temp.path().join("embedded-two-disc-album");
+        std::fs::create_dir_all(&folder).expect("album folder");
+        let disc_one = folder.join("Album - Disc 1.flac");
+        let disc_two = folder.join("Album - Disc 2.flac");
+        write_embedded_disc_fixture(&disc_one, "Album", 1);
+        write_embedded_disc_fixture(&disc_two, "Album", 3);
+
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority =
+            vec![EmbeddedCue, SidecarCue, IndividualFiles];
+        let mut app = AppState::new_for_test(config);
+        super::single_image_metadata_editor_regression_tests::select_foxy_route(
+            &mut app,
+            &folder,
+            temp.path(),
+        );
+        open_metadata_editor(&mut app);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("two-disc embedded album must open metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 1);
+        assert_eq!(
+            state.active_surface().paths,
+            vec![disc_one, disc_two],
+            "genuine album parts must remain one coherent presentation"
+        );
+        assert!(state.active_surface().per_carrier_embedded_cuesheets);
+    }
+
+    #[test]
+    fn unrelated_sidecar_albums_both_remain_available() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let folder = temp.path().join("unrelated-sidecar-albums");
+        std::fs::create_dir_all(&folder).expect("album folder");
+        let image_a = folder.join("Album A.flac");
+        let image_b = folder.join("Album B.flac");
+        assert!(create_flac_fixture(&image_a), "Album A image");
+        assert!(create_flac_fixture(&image_b), "Album B image");
+        let cue_a = folder.join("Album A.cue");
+        let cue_b = folder.join("Album B.cue");
+        std::fs::write(
+            &cue_a,
+            concat!(
+                "TITLE \"Album A\"\n",
+                "FILE \"Album A.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"A One\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    TITLE \"A Two\"\n    INDEX 01 00:00:03\n",
+            ),
+        )
+        .expect("Album A sidecar");
+        std::fs::write(
+            &cue_b,
+            concat!(
+                "TITLE \"Album B\"\n",
+                "FILE \"Album B.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    TITLE \"B One\"\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    TITLE \"B Two\"\n    INDEX 01 00:00:03\n",
+            ),
+        )
+        .expect("Album B sidecar");
+
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority =
+            vec![SidecarCue, EmbeddedCue, IndividualFiles];
+        let mut app = AppState::new_for_test(config);
+        super::single_image_metadata_editor_regression_tests::select_foxy_route(
+            &mut app,
+            &folder,
+            temp.path(),
+        );
+        open_metadata_editor(&mut app);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("unrelated sidecar albums must open metadata editor");
+        };
+        assert_eq!(state.presentation_tabs.len(), 2);
+        for cue in [&cue_a, &cue_b] {
+            assert!(state.presentation_tabs.iter().any(|tab| matches!(
+                &tab.cue_source,
+                Some(super::super::app::MetadataCueSource::Sidecar(path))
+                    if path == cue
+            )), "missing independently resolved sidecar tab {}", cue.display());
+        }
+    }
+
+    #[test]
+    fn invalid_lower_priority_embedded_cue_does_not_block_valid_folder_source() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{
+            EmbeddedCue, IndividualFiles, SidecarCue,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let malformed_root = temp.path().join("malformed");
+        std::fs::create_dir_all(&malformed_root).expect("malformed root");
+        let malformed = create_presplit_metadata_sidecar_fixture(&malformed_root, false);
+        crate::tui::probe::write_all_tags(
+            &malformed.cue_order_paths[0],
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some("TRACK 00 AUDIO\n".to_string()),
+            )],
+        )
+        .expect("malformed embedded CUESHEET");
+        let sidecar_first = open_presplit_metadata_sidecar_fixture(
+            &malformed,
+            &malformed_root,
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(sidecar_state) = &sidecar_first.active_overlay else {
+            panic!("malformed lower-priority embedded CUE must not block sidecar");
+        };
+        assert_presplit_sidecar_presentation(sidecar_state, &malformed);
+
+        let conflicting_root = temp.path().join("conflicting");
+        std::fs::create_dir_all(&conflicting_root).expect("conflicting root");
+        let conflicting = create_presplit_metadata_sidecar_fixture(&conflicting_root, false);
+        let embedded_a = std::fs::read_to_string(&conflicting.cue_path)
+            .expect("read sidecar for embedded conflict");
+        let embedded_b = embedded_a.replace("TITLE \"Cue Album\"", "TITLE \"Other Album\"");
+        crate::tui::probe::write_all_tags(
+            &conflicting.cue_order_paths[0],
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded_a),
+            )],
+        )
+        .expect("first embedded CUESHEET");
+        crate::tui::probe::write_all_tags(
+            &conflicting.cue_order_paths[1],
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded_b),
+            )],
+        )
+        .expect("conflicting embedded CUESHEET");
+        let individual_first = open_presplit_metadata_sidecar_fixture(
+            &conflicting,
+            &conflicting_root,
+            vec![IndividualFiles, SidecarCue, EmbeddedCue],
+        );
+        let ActiveOverlay::MetadataEditor(individual_state) = &individual_first.active_overlay else {
+            panic!("conflicting lower-priority embedded CUE must not block individual files");
+        };
+        assert_eq!(individual_state.presentation_tabs.len(), 1);
+        assert!(individual_state.active_surface().cue_source.is_none());
+        assert_eq!(individual_state.active_surface().paths, conflicting.file_order_paths);
+        assert_eq!(
+            metadata_entry(individual_state, "TITLE").per_file_values,
+            vec![
+                "File One".to_string(),
+                "File Two".to_string(),
+                "File Three".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn aggregate_embedded_priority_collects_all_usable_images_in_stable_order() {
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
@@ -59658,8 +64062,8 @@ FILE "a.flac" WAVE
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album dir");
-        let second = album.join("z-disc.flac");
-        let first = album.join("a-disc.flac");
+        let second = album.join("Album - Disc 2.flac");
+        let first = album.join("Album - Disc 1.flac");
         let ordinary = album.join("bonus.flac");
         // Create in reverse lexical order to prove filesystem enumeration does
         // not select or order aggregate authority.
@@ -59682,11 +64086,21 @@ FILE "a.flac" WAVE
             &cancel,
         )
         .expect("embedded-first aggregate carrier");
+        let super::super::tag_interchange::TransferCarrier::Aggregate { carriers } = carrier
+        else {
+            panic!("embedded album plus bonus must remain an aggregate carrier");
+        };
+        assert_eq!(carriers.len(), 2);
         assert!(matches!(
-            carrier,
+            &carriers[0],
             super::super::tag_interchange::TransferCarrier::EmbeddedCues { carriers }
                 if carriers.iter().map(|carrier| carrier.image_path.clone()).collect::<Vec<_>>()
                     == vec![first.clone(), second.clone()]
+        ));
+        assert!(matches!(
+            &carriers[1],
+            super::super::tag_interchange::TransferCarrier::Files { paths }
+                if paths == &vec![ordinary.clone()]
         ));
 
         let explicit_one = classify_tag_transfer_roots(
@@ -59709,22 +64123,18 @@ FILE "a.flac" WAVE
         .expect("explicit embedded image set");
         assert!(matches!(
             explicit_both,
-            super::super::tag_interchange::TransferCarrier::EmbeddedCues { carriers }
-                if carriers.iter().map(|carrier| carrier.image_path.clone()).collect::<Vec<_>>()
-                    == vec![first.clone(), second.clone()]
+            super::super::tag_interchange::TransferCarrier::Files { paths }
+                if paths == vec![first.clone(), second.clone()]
         ));
 
-        let explicit_ordinary = classify_tag_transfer_roots(
+        let explicit_ordinary_error = classify_tag_transfer_roots(
             std::slice::from_ref(&ordinary),
             &[EmbeddedCue, SidecarCue, IndividualFiles],
             &cancel,
         )
-        .expect("explicit ordinary track");
-        assert!(matches!(
-            explicit_ordinary,
-            super::super::tag_interchange::TransferCarrier::Files { paths }
-                if paths == vec![ordinary.clone()]
-        ));
+        .expect_err("an explicitly selected malformed embedded CUE must not be silently replaced");
+        assert!(explicit_ordinary_error.contains("embedded CUE"));
+        assert!(explicit_ordinary_error.contains("unusable"));
 
         let explicit_mixed = classify_tag_transfer_roots(
             &[second.clone(), ordinary.clone()],
@@ -59798,7 +64208,7 @@ FILE "a.flac" WAVE
     }
 
     #[test]
-    fn read_only_embedded_cue_falls_through_to_sidecar_for_transfer_and_editor() {
+    fn read_only_embedded_remains_a_transfer_source_while_editor_uses_writable_sidecar() {
         use crate::config::AggregateMetadataTarget::{
             EmbeddedCue, IndividualFiles, SidecarCue,
         };
@@ -59829,12 +64239,16 @@ FILE "a.flac" WAVE
         .expect("sidecar fixture");
 
         let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
-        assert!(usable_embedded_transfer_carriers_for_paths(
-            std::slice::from_ref(&read_only_image),
-            &cancel,
-        )
-        .expect("transfer applicability probe")
-        .is_empty());
+        assert_eq!(
+            usable_embedded_transfer_carriers_for_paths(
+                std::slice::from_ref(&read_only_image),
+                &cancel,
+            )
+            .expect("transfer source applicability probe")
+            .len(),
+            1,
+            "source viability must not be conflated with target writability"
+        );
         assert!(usable_embedded_metadata_surfaces_for_paths(std::slice::from_ref(
             &read_only_image,
         ))
@@ -59845,12 +64259,45 @@ FILE "a.flac" WAVE
             &[EmbeddedCue, SidecarCue, IndividualFiles],
             &cancel,
         )
-        .expect("read-only embedded target must fall through to sidecar");
+        .expect("embedded-first folder transfer source");
+        let super::super::tag_interchange::TransferCarrier::Aggregate { carriers } = &carrier
+        else {
+            panic!("independent sidecar and embedded groups must stay aggregate");
+        };
+        assert_eq!(carriers.len(), 2);
         assert!(matches!(
-            carrier,
+            &carriers[0],
             super::super::tag_interchange::TransferCarrier::SidecarCue { cue_path, .. }
-                if cue_path == sidecar
+                if cue_path == &sidecar
         ));
+        assert!(matches!(
+            &carriers[1],
+            super::super::tag_interchange::TransferCarrier::EmbeddedCue { image_path, .. }
+                if image_path == &read_only_image
+        ));
+        assert_eq!(
+            transfer_entry_values(&carrier, "ALBUM"),
+            vec![
+                "Sidecar Album".to_string(),
+                "Sidecar Album".to_string(),
+                "Read-only Embedded".to_string(),
+                "Read-only Embedded".to_string(),
+            ]
+        );
+        let entries = super::super::tag_interchange::read_transfer_carrier_entries(
+            &carrier,
+            super::super::app::TagTransferScope::All,
+            &cancel,
+        )
+        .expect("read-only embedded carrier remains readable as a source");
+        assert!(super::super::tag_interchange::preview_tag_transfer(
+            &entries,
+            carrier.dimension(),
+            &carrier,
+            super::super::app::TagTransferScope::All,
+        )
+        .unwrap_err()
+        .contains("not supported"));
 
         let mut config = TonepoetConfig::default();
         config.conversion.aggregate_metadata_target_priority =
@@ -59863,7 +64310,7 @@ FILE "a.flac" WAVE
         );
         open_metadata_editor(&mut app);
         let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
-            panic!("sidecar fallback must open metadata editor");
+            panic!("writable sidecar fallback must open metadata editor");
         };
         assert!(matches!(
             &state.active_surface().cue_source,
@@ -59874,7 +64321,7 @@ FILE "a.flac" WAVE
     }
 
     #[test]
-    fn read_only_embedded_cue_falls_through_to_files_and_explicit_selection_stays_exact() {
+    fn read_only_embedded_explicit_selection_is_not_silently_substituted() {
         use crate::config::AggregateMetadataTarget::{
             EmbeddedCue, IndividualFiles, SidecarCue,
         };
@@ -59891,23 +64338,33 @@ FILE "a.flac" WAVE
             &priority,
             &cancel,
         )
-        .expect("read-only embedded target must fall through to files");
+        .expect("read-only embedded remains the folder source");
         assert!(matches!(
-            aggregate,
-            super::super::tag_interchange::TransferCarrier::Files { paths }
-                if paths == vec![read_only_image.clone()]
+            &aggregate,
+            super::super::tag_interchange::TransferCarrier::EmbeddedCue { image_path, .. }
+                if image_path == &read_only_image
         ));
         let explicit = classify_tag_transfer_roots(
             std::slice::from_ref(&read_only_image),
             &priority,
             &cancel,
         )
-        .expect("explicit read-only image remains file-scoped");
+        .expect("explicit embedded image remains embedded");
         assert!(matches!(
-            explicit,
-            super::super::tag_interchange::TransferCarrier::Files { paths }
-                if paths == vec![read_only_image.clone()]
+            &explicit,
+            super::super::tag_interchange::TransferCarrier::EmbeddedCue { image_path, .. }
+                if image_path == &read_only_image
         ));
+        for target in [&aggregate, &explicit] {
+            assert!(super::super::tag_interchange::preview_tag_transfer(
+                &[],
+                super::super::tag_interchange::TransferDimension::Files(1),
+                target,
+                super::super::app::TagTransferScope::All,
+            )
+            .unwrap_err()
+            .contains("not supported"));
+        }
 
         let mut config = TonepoetConfig::default();
         config.conversion.aggregate_metadata_target_priority = priority.to_vec();
@@ -59919,11 +64376,10 @@ FILE "a.flac" WAVE
         );
         open_metadata_editor(&mut directory_app);
         let ActiveOverlay::MetadataEditor(directory_state) = &directory_app.active_overlay else {
-            panic!("file fallback must open metadata editor");
+            panic!("folder-level editor must use the viable writable file representation");
         };
         assert_eq!(directory_state.active_surface().paths, vec![read_only_image.clone()]);
         assert!(directory_state.active_surface().cue_source.is_none());
-        assert!(!directory_state.active_surface().per_carrier_embedded_cuesheets);
 
         let mut explicit_app = AppState::new_for_test(config);
         super::single_image_metadata_editor_regression_tests::select_foxy_route(
@@ -59932,12 +64388,14 @@ FILE "a.flac" WAVE
             &album,
         );
         open_metadata_editor(&mut explicit_app);
-        let ActiveOverlay::MetadataEditor(explicit_state) = &explicit_app.active_overlay else {
-            panic!("explicit read-only image must open file-scoped metadata editor");
-        };
-        assert_eq!(explicit_state.active_surface().paths, vec![read_only_image]);
-        assert!(explicit_state.active_surface().cue_source.is_none());
-        assert!(!explicit_state.active_surface().per_carrier_embedded_cuesheets);
+        assert!(!matches!(
+            explicit_app.active_overlay,
+            ActiveOverlay::MetadataEditor(_)
+        ));
+        assert!(explicit_app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("cannot be safely rewritten")));
     }
 
     #[test]
@@ -59952,8 +64410,8 @@ FILE "a.flac" WAVE
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album dir");
-        let second = album.join("z-disc.flac");
-        let first = album.join("a-disc.flac");
+        let second = album.join("Original Album - Disc 2.flac");
+        let first = album.join("Original Album - Disc 1.flac");
         let ordinary = album.join("bonus.flac");
         write_embedded_disc_fixture(&second, "Original Album", 1);
         write_embedded_disc_fixture(&first, "Original Album", 1);
@@ -59977,6 +64435,14 @@ FILE "a.flac" WAVE
         assert_eq!(state.active_surface().paths, vec![first.clone(), second.clone()]);
         assert!(!state.active_surface().paths.contains(&ordinary));
         assert!(state.active_surface().per_carrier_embedded_cuesheets);
+        assert_eq!(
+            state.presentation_tabs.len(),
+            2,
+            "uncovered ordinary audio must remain available as a separate presentation"
+        );
+        assert!(state.presentation_tabs.iter().any(|tab| {
+            tab.paths == vec![ordinary.clone()] && tab.label == "Ordinary audio files"
+        }));
         let cue_entry = state
             .active_surface()
             .entries
@@ -59984,10 +64450,10 @@ FILE "a.flac" WAVE
             .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
             .expect("CUESHEET row");
         assert_eq!(cue_entry.per_file_values.len(), 2);
-        assert!(cue_entry.per_file_values[0].contains("a-disc.flac"));
-        assert!(!cue_entry.per_file_values[0].contains("z-disc.flac"));
-        assert!(cue_entry.per_file_values[1].contains("z-disc.flac"));
-        assert!(!cue_entry.per_file_values[1].contains("a-disc.flac"));
+        assert!(cue_entry.per_file_values[0].contains("Original Album - Disc 1.flac"));
+        assert!(!cue_entry.per_file_values[0].contains("Original Album - Disc 2.flac"));
+        assert!(cue_entry.per_file_values[1].contains("Original Album - Disc 2.flac"));
+        assert!(!cue_entry.per_file_values[1].contains("Original Album - Disc 1.flac"));
 
         let album_entry = state
             .active_surface_mut()
@@ -60018,10 +64484,10 @@ FILE "a.flac" WAVE
             .expect("regenerated CUESHEET row");
         assert_eq!(cue_entry.per_file_values.len(), 2);
         assert!(cue_entry.per_file_values.iter().all(|cue| cue.contains("Edited Album")));
-        assert!(cue_entry.per_file_values[0].contains("FILE \"a-disc.flac\""));
-        assert!(!cue_entry.per_file_values[0].contains("z-disc.flac"));
-        assert!(cue_entry.per_file_values[1].contains("FILE \"z-disc.flac\""));
-        assert!(!cue_entry.per_file_values[1].contains("a-disc.flac"));
+        assert!(cue_entry.per_file_values[0].contains("FILE \"Original Album - Disc 1.flac\""));
+        assert!(!cue_entry.per_file_values[0].contains("Original Album - Disc 2.flac"));
+        assert!(cue_entry.per_file_values[1].contains("FILE \"Original Album - Disc 2.flac\""));
+        assert!(!cue_entry.per_file_values[1].contains("Original Album - Disc 1.flac"));
         assert!(cue_entry.per_file_values.iter().all(|cue| {
             cue.contains("TRACK 01") && cue.contains("TRACK 02") && !cue.contains("TRACK 03")
         }));
@@ -60066,19 +64532,19 @@ FILE "a.flac" WAVE
             assert!(cue.contains("TRACK 02"));
             assert!(!cue.contains("TRACK 03"));
             if path == &second {
-                assert!(cue.contains("FILE \"z-disc.flac\""));
-                assert!(!cue.contains("a-disc.flac"));
+                assert!(cue.contains("FILE \"Original Album - Disc 2.flac\""));
+                assert!(!cue.contains("Original Album - Disc 1.flac"));
                 assert!(cue.contains("Disc Two Changed"));
             } else {
-                assert!(cue.contains("FILE \"a-disc.flac\""));
-                assert!(!cue.contains("z-disc.flac"));
+                assert!(cue.contains("FILE \"Original Album - Disc 1.flac\""));
+                assert!(!cue.contains("Original Album - Disc 2.flac"));
                 assert!(!cue.contains("Disc Two Changed"));
             }
         }
     }
 
     #[test]
-    fn explicit_embedded_image_set_opens_only_the_selected_images() {
+    fn explicit_multi_audio_selection_stays_individual_even_when_files_have_embedded_cues() {
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -60121,11 +64587,12 @@ FILE "a.flac" WAVE
         open_metadata_editor(&mut app);
 
         let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
-            panic!("explicit embedded set must open metadata editor");
+            panic!("explicit individual-file set must open metadata editor");
         };
         assert_eq!(state.active_surface().paths, vec![first, second]);
         assert!(!state.active_surface().paths.contains(&third));
-        assert!(state.active_surface().per_carrier_embedded_cuesheets);
+        assert!(state.active_surface().cue_source.is_none());
+        assert!(!state.active_surface().per_carrier_embedded_cuesheets);
     }
 
     #[test]

@@ -2391,6 +2391,13 @@ impl PreparedTagTransfer {
                     .map(|carrier| carrier.sheet.tracks.len())
                     .sum::<usize>(),
             ),
+            crate::tui::tag_interchange::TransferCarrier::Aggregate { carriers } => format!(
+                "Write {} field{} to {} metadata group{}?",
+                self.field_count,
+                if self.field_count == 1 { "" } else { "s" },
+                carriers.len(),
+                if carriers.len() == 1 { "" } else { "s" },
+            ),
         }
     }
 }
