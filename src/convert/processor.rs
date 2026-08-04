@@ -3078,7 +3078,10 @@ fn scratch_postprocess_retry_original_error(report: &PipelineReport) -> String {
     fn stage_error(stages: &[crate::convert::pipeline::StageRecord]) -> Option<String> {
         stages.iter().rev().find_map(|stage| match &stage.outcome {
             StageOutcome::Failed(error) => Some(format!("{:?}: {}", stage.stage, error)),
-            StageOutcome::Ok | StageOutcome::Skipped => None,
+            StageOutcome::Ok
+            | StageOutcome::NotRequested
+            | StageOutcome::Skipped
+            | StageOutcome::SkippedWithReason(_) => None,
         })
     }
 

@@ -454,7 +454,7 @@ fn metadata_hdcd_is_applicable_to_active_surface(state: &MetadataEditorState) ->
 
 fn metadata_preemphasis_is_applicable_to_active_surface(state: &MetadataEditorState) -> bool {
     if state.active_surface().technical_details.disc.is_some() {
-        return false;
+        return true;
     }
     metadata_details_files_for_display(state)
         .iter()
@@ -610,9 +610,44 @@ fn metadata_preemphasis_status(state: &MetadataEditorState) -> String {
     }
     let values: Vec<String> = metadata_details_files_for_display(state)
         .iter()
-        .map(preemphasis_status_for_file)
+        .map(|file| {
+            if explicit_preemphasis_tag_for_file(state, &file.file_facts.path) {
+                "Detected (PRE flag)".to_string()
+            } else {
+                preemphasis_status_for_file(file)
+            }
+        })
         .collect();
     same_or_multiple(values)
+}
+
+fn explicit_preemphasis_tag_for_file(state: &MetadataEditorState, path: &Path) -> bool {
+    let surface = state.active_surface();
+    let Some(file_index) = surface.paths.iter().position(|candidate| candidate == path) else {
+        // Details facts and editable rows are populated independently. If the
+        // identity alignment is unavailable, retain the existing analysis
+        // display rather than applying another file's positional value.
+        return false;
+    };
+
+    surface.entries.iter().any(|entry| {
+        let Some(value) = entry.per_file_values.get(file_index) else {
+            return false;
+        };
+        if entry.display_key.eq_ignore_ascii_case("PRE_EMPHASIS") {
+            return crate::convert::pipeline::is_affirmative_preemphasis_value(value);
+        }
+        entry.display_key.eq_ignore_ascii_case("CUE_FLAGS")
+            && cue_flags_contain_pre_token(value)
+    })
+}
+
+fn cue_flags_contain_pre_token(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, ',' | ';')
+        })
+        .any(|token| token.eq_ignore_ascii_case("PRE"))
 }
 
 fn preemphasis_status_for_file(file: &MetadataFileDetails) -> String {
@@ -1740,6 +1775,34 @@ mod tests {
         file
     }
 
+    fn push_file_tag(state: &mut MetadataEditorState, display_key: &str, value: &str) {
+        state
+            .active_surface_mut()
+            .entries
+            .push(super::super::probe::TagEntry {
+                row_scope: crate::tui::probe::RowScope::File,
+                display_key: display_key.to_string(),
+                item_key: lofty::tag::ItemKey::Unknown(display_key.to_string()),
+                value: value.to_string(),
+                original: value.to_string(),
+                is_binary: false,
+                is_mixed: false,
+                has_multiple_stored_values: false,
+                per_file_stored_value_counts: vec![1],
+                per_file_values: vec![value.to_string()],
+                per_file_originals: vec![value.to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            });
+    }
+
+    fn details_value<'a>(vm: &'a DetailsViewModel, key: &str) -> Option<&'a str> {
+        vm.general
+            .iter()
+            .find(|row| row.key == key)
+            .map(|row| row.value.as_str())
+    }
+
     #[test]
     fn replaygain_cell_preserves_missing_positions() {
         let values = vec!["+1.0 dB".to_string(), String::new(), "-2.0 dB".to_string()];
@@ -1749,13 +1812,109 @@ mod tests {
     }
 
     #[test]
-    fn details_view_hides_hdcd_and_preemphasis_when_source_is_lossy() {
-        let file = file_with_probe("/tmp/lossy.mp3", "mp3", "mp3", None);
-        let state = details_state_for_file(file);
+    fn details_view_hides_hdcd_and_preemphasis_for_lossy_and_dsd_file_surfaces() {
+        for file in [
+            file_with_probe("/tmp/lossy.mp3", "mp3", "mp3", None),
+            file_with_probe("/tmp/dsd.dsf", "dsf", "dsd", Some(1)),
+        ] {
+            let state = details_state_for_file(file);
+            let vm = build_details_view_model(&state);
+
+            assert!(!vm.general.iter().any(|row| row.key == "HDCD"));
+            assert!(!vm.general.iter().any(|row| row.key == "Pre-emphasis"));
+        }
+    }
+
+    #[test]
+    fn details_view_shows_preemphasis_as_na_for_disc_surface() {
+        let file = file_with_probe("/tmp/disc.iso", "dsf", "dsd", Some(1));
+        let mut state = details_state_for_file(file);
+        state.active_surface_mut().technical_details.disc =
+            Some(DiscTechnicalDetails::default());
+
         let vm = build_details_view_model(&state);
 
-        assert!(!vm.general.iter().any(|row| row.key == "HDCD"));
-        assert!(!vm.general.iter().any(|row| row.key == "Pre-emphasis"));
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("N/A"));
+    }
+
+    #[test]
+    fn details_view_surfaces_explicit_preemphasis_without_analysis() {
+        let file = file_with_probe("/tmp/preemphasis.flac", "flac", "flac", Some(16));
+        let mut state = details_state_for_file(file);
+        push_file_tag(&mut state, "pre_emphasis", "1");
+
+        let vm = build_details_view_model(&state);
+
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("Detected (PRE flag)"));
+    }
+
+    #[test]
+    fn details_view_surfaces_cue_flags_pre_token() {
+        let file = file_with_probe("/tmp/preemphasis.wav", "wav", "pcm_s16le", Some(16));
+        let mut state = details_state_for_file(file);
+        push_file_tag(&mut state, "CUE_FLAGS", "DCP, pre; 4CH");
+
+        let vm = build_details_view_model(&state);
+
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("Detected (PRE flag)"));
+        assert!(!cue_flags_contain_pre_token("PRESENT DCPRE"));
+    }
+
+    #[test]
+    fn explicit_preemphasis_tag_takes_precedence_over_negative_analysis() {
+        let mut file = file_with_probe("/tmp/preemphasis.flac", "flac", "flac", Some(16));
+        file.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected);
+        let mut state = details_state_for_file(file);
+        push_file_tag(&mut state, "PRE_EMPHASIS", "yes");
+
+        let vm = build_details_view_model(&state);
+
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("Detected (PRE flag)"));
+    }
+
+    #[test]
+    fn details_view_without_explicit_preemphasis_preserves_analysis_status() {
+        let mut file = file_with_probe("/tmp/preemphasis.flac", "flac", "flac", Some(16));
+        file.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected);
+        let state = details_state_for_file(file);
+
+        let vm = build_details_view_model(&state);
+
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("Not detected"));
+    }
+
+    #[test]
+    fn explicit_preemphasis_lookup_falls_back_when_path_alignment_is_missing() {
+        let file = file_with_probe("/tmp/preemphasis.flac", "flac", "flac", Some(16));
+        let mut state = details_state_for_file(file);
+        push_file_tag(&mut state, "PRE_EMPHASIS", "1");
+        state.active_surface_mut().paths[0] = PathBuf::from("/tmp/different.flac");
+
+        let vm = build_details_view_model(&state);
+
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("«not scanned»"));
+    }
+
+    #[test]
+    fn explicit_preemphasis_values_follow_surface_path_positions() {
+        let first_path = PathBuf::from("/tmp/01.flac");
+        let second_path = PathBuf::from("/tmp/02.flac");
+        let first = file_with_probe("/tmp/01.flac", "flac", "flac", Some(16));
+        let second = file_with_probe("/tmp/02.flac", "flac", "flac", Some(16));
+        let mut state = MetadataEditorState::for_files(
+            vec![first_path.clone(), second_path.clone()],
+            Vec::new(),
+            Vec::new(),
+            super::super::app::MetadataTechnicalDetails::from_files(vec![first, second]),
+        );
+        push_file_tag(&mut state, "PRE_EMPHASIS", "1");
+        state.active_surface_mut().entries[0].per_file_values =
+            vec!["1".to_string(), "0".to_string()];
+
+        assert!(explicit_preemphasis_tag_for_file(&state, &first_path));
+        assert!(!explicit_preemphasis_tag_for_file(&state, &second_path));
     }
 
     #[test]

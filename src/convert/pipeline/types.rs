@@ -2533,7 +2533,14 @@ pub enum PipelineStage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageOutcome {
     Ok,
+    /// The stage was not part of this request. This is distinct from a stage
+    /// that was requested but could not or did not need to run.
+    NotRequested,
+    /// Legacy/general skip state retained for serialized-record compatibility
+    /// and stages whose request semantics are not represented by StagePolicy.
     Skipped,
+    /// The stage was requested but did not run for the stated reason.
+    SkippedWithReason(String),
     Failed(String),
 }
 

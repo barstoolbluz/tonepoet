@@ -260,6 +260,22 @@ impl BroadcastReporter {
         }
     }
 
+    fn stage_not_requested_message(stage: PipelineStage) -> String {
+        match stage {
+            PipelineStage::PreActions => "Pre-conversion actions not requested".to_string(),
+            PipelineStage::Materialize => "Source extraction not requested".to_string(),
+            PipelineStage::PlanOutputs => "Output planning not requested".to_string(),
+            PipelineStage::Convert => "Audio conversion not requested".to_string(),
+            PipelineStage::Merge => "Track merge not requested".to_string(),
+            PipelineStage::Metadata => "Metadata not requested".to_string(),
+            PipelineStage::ReplayGain => "ReplayGain not requested".to_string(),
+            PipelineStage::Features => "Feature extraction not requested".to_string(),
+            PipelineStage::Publish => "Publishing not requested".to_string(),
+            PipelineStage::PostActions => "Post-conversion actions not requested".to_string(),
+            PipelineStage::DurableLog => "Conversion log not requested".to_string(),
+        }
+    }
+
     fn round_progress(progress: f32) -> f32 {
         ((progress.clamp(0.0, 100.0) * 10.0).round()) / 10.0
     }
@@ -463,12 +479,34 @@ impl PipelineReporter for BroadcastReporter {
                             true,
                         );
                     }
+                    StageOutcome::NotRequested => {
+                        let window = Self::window(record.stage);
+                        self.send_processing(
+                            record.stage,
+                            window.end,
+                            Some(Self::stage_not_requested_message(record.stage)),
+                            true,
+                        );
+                    }
                     StageOutcome::Skipped => {
                         let window = Self::window(record.stage);
                         self.send_processing(
                             record.stage,
                             window.end,
                             Some(Self::stage_skipped_message(record.stage)),
+                            true,
+                        );
+                    }
+                    StageOutcome::SkippedWithReason(reason) => {
+                        let window = Self::window(record.stage);
+                        self.send_processing(
+                            record.stage,
+                            window.end,
+                            Some(format!(
+                                "{}: {}",
+                                Self::stage_skipped_message(record.stage),
+                                reason
+                            )),
                             true,
                         );
                     }
@@ -694,6 +732,59 @@ mod broadcast_reporter_tests {
         match update.status {
             crate::convert::ConversionStatus::Processing { message, .. } => {
                 assert_eq!(message.as_deref(), Some("Feature extraction skipped"));
+            }
+            other => panic!("expected processing update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn not_requested_stage_reports_distinct_message_at_window_end() {
+        let (reporter, mut rx) = reporter_pair();
+        reporter
+            .emit(PipelineEvent::StageFinished {
+                item_id: "item-1".to_string(),
+                record: StageRecord {
+                    stage: PipelineStage::Metadata,
+                    outcome: StageOutcome::NotRequested,
+                    dsd_dst_stats: None,
+                },
+            })
+            .await;
+
+        let update = next_update(&mut rx).await;
+        assert_eq!(update.progress, 90.0);
+        match update.status {
+            crate::convert::ConversionStatus::Processing { message, .. } => {
+                assert_eq!(message.as_deref(), Some("Metadata not requested"));
+            }
+            other => panic!("expected processing update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoned_skip_reports_reason_at_window_end() {
+        let (reporter, mut rx) = reporter_pair();
+        reporter
+            .emit(PipelineEvent::StageFinished {
+                item_id: "item-1".to_string(),
+                record: StageRecord {
+                    stage: PipelineStage::ReplayGain,
+                    outcome: StageOutcome::SkippedWithReason(
+                        "DSF output is not supported by loudgain".to_string(),
+                    ),
+                    dsd_dst_stats: None,
+                },
+            })
+            .await;
+
+        let update = next_update(&mut rx).await;
+        assert_eq!(update.progress, 93.0);
+        match update.status {
+            crate::convert::ConversionStatus::Processing { message, .. } => {
+                assert_eq!(
+                    message.as_deref(),
+                    Some("ReplayGain skipped: DSF output is not supported by loudgain")
+                );
             }
             other => panic!("expected processing update, got {other:?}"),
         }

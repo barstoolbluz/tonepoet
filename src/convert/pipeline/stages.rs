@@ -3760,7 +3760,7 @@ pub async fn merge_tracks_with_tool_limits(
             artifacts,
             StageRecord {
                 stage: PipelineStage::Merge,
-                outcome: StageOutcome::Skipped,
+                outcome: StageOutcome::NotRequested,
                 dsd_dst_stats: None,
             },
         ));
@@ -4253,7 +4253,7 @@ pub async fn apply_metadata_with_tool_limits(
     if req.stages.metadata == StageRequirement::Disabled {
         return Ok(StageRecord {
             stage: PipelineStage::Metadata,
-            outcome: StageOutcome::Skipped,
+            outcome: StageOutcome::NotRequested,
             dsd_dst_stats: None,
         });
     }
@@ -8715,7 +8715,11 @@ mod replaygain_existing_tag_policy_tests {
         .await
         .expect("complete tags should skip when source facts prove signal equivalence");
 
-        assert!(matches!(record.outcome, StageOutcome::Skipped));
+        assert!(matches!(
+            record.outcome,
+            StageOutcome::SkippedWithReason(ref reason)
+                if reason.contains("complete Both ReplayGain tag set")
+        ));
         assert_eq!(runner.transcript().len(), 0);
     }
 
@@ -8746,7 +8750,11 @@ mod replaygain_existing_tag_policy_tests {
         .await
         .expect("complete track tags should skip loudgain and remove stale album tags");
 
-        assert!(matches!(record.outcome, StageOutcome::Skipped));
+        assert!(matches!(
+            record.outcome,
+            StageOutcome::SkippedWithReason(ref reason)
+                if reason.contains("complete Track ReplayGain tag set")
+        ));
         assert!(runner.transcript().is_empty());
         let tagged = lofty::read_from_path(&one).expect("read cleaned ReplayGain tags");
         let tag = tagged
@@ -8782,7 +8790,12 @@ mod replaygain_existing_tag_policy_tests {
         .await
         .expect("unsupported ReplayGain target should degrade without reading tags");
 
-        assert!(matches!(record.outcome, StageOutcome::Skipped));
+        assert_eq!(
+            record.outcome,
+            StageOutcome::SkippedWithReason(
+                "DSF output is not supported by loudgain".to_string()
+            )
+        );
         assert!(runner.transcript().is_empty());
         assert_eq!(
             replaygain_format_support(&req),
@@ -9038,7 +9051,10 @@ mod replaygain_existing_tag_policy_tests {
         .await
         .expect("empty artifacts skip stage");
 
-        assert!(matches!(record.outcome, StageOutcome::Skipped));
+        assert_eq!(
+            record.outcome,
+            StageOutcome::SkippedWithReason("no successful output audio".to_string())
+        );
         assert_eq!(runner.transcript().len(), 0);
     }
 
@@ -9278,7 +9294,9 @@ mod replaygain_existing_tag_policy_tests {
             &source,
             &req,
             &[&record],
-            Some(&StageOutcome::Skipped),
+            Some(&StageOutcome::SkippedWithReason(
+                "W64 output is not supported by loudgain".to_string(),
+            )),
             false,
             false,
             false,
@@ -9312,12 +9330,15 @@ mod replaygain_existing_tag_policy_tests {
             &source,
             &req,
             &[&record],
-            Some(&StageOutcome::Skipped),
+            Some(&StageOutcome::SkippedWithReason(
+                "output audio is signal-equivalent and every output already has the complete Both ReplayGain tag set"
+                    .to_string(),
+            )),
             false,
             false,
             false,
         );
-        assert!(trusted.contains("ReplayGain policy: trusted inherited tags:"));
+        assert!(trusted.contains("ReplayGain policy: skipped: output audio is signal-equivalent"));
         assert!(!trusted.contains("skipped: no successful output audio"));
 
         let mut no_outputs = String::new();
@@ -9326,7 +9347,9 @@ mod replaygain_existing_tag_policy_tests {
             &source,
             &req,
             &[],
-            Some(&StageOutcome::Skipped),
+            Some(&StageOutcome::SkippedWithReason(
+                "no successful output audio".to_string(),
+            )),
             false,
             false,
             false,
@@ -9340,7 +9363,7 @@ mod replaygain_existing_tag_policy_tests {
             &source,
             &req,
             &[&record],
-            Some(&StageOutcome::Skipped),
+            Some(&StageOutcome::NotRequested),
             false,
             false,
             false,
@@ -9591,8 +9614,15 @@ fn replaygain_policy_log_label(
 
     if let ReplayGainFormatSupport::Unsupported { reason } = replaygain_format_support(req) {
         return match stage_outcome {
+            Some(StageOutcome::SkippedWithReason(skip_reason)) => format!(
+                "skipped: {}; no ReplayGain tags were written",
+                escape_log_value(skip_reason)
+            ),
             Some(StageOutcome::Skipped) => {
                 format!("skipped: {reason}; no ReplayGain tags were written")
+            }
+            Some(StageOutcome::NotRequested) => {
+                "not requested despite enabled ReplayGain settings".to_string()
             }
             Some(StageOutcome::Failed(error)) => format!(
                 "failed unexpectedly for unsupported target ({reason}): {error}"
@@ -9636,6 +9666,12 @@ fn replaygain_policy_log_label(
                 format!("skipped unexpectedly despite recompute policy: {reason}")
             }
         },
+        Some(StageOutcome::SkippedWithReason(reason)) => {
+            format!("skipped: {}", escape_log_value(reason))
+        }
+        Some(StageOutcome::NotRequested) => {
+            "not requested despite enabled ReplayGain settings".to_string()
+        }
         Some(StageOutcome::Failed(reason)) => match planned_policy {
             ReplayGainInheritedTagPolicy::Trust => format!(
                 "failed before provenance decision completed: {reason}; planned to trust only complete inherited tags on signal-equivalent output"
@@ -9715,7 +9751,7 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     if req.stages.replaygain == StageRequirement::Disabled {
         return Ok(StageRecord {
             stage: PipelineStage::ReplayGain,
-            outcome: StageOutcome::Skipped,
+            outcome: StageOutcome::NotRequested,
             dsd_dst_stats: None,
         });
     }
@@ -9727,7 +9763,9 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     if paths.is_empty() {
         return Ok(StageRecord {
             stage: PipelineStage::ReplayGain,
-            outcome: StageOutcome::Skipped,
+            outcome: StageOutcome::SkippedWithReason(
+                "no successful output audio".to_string(),
+            ),
             dsd_dst_stats: None,
         });
     }
@@ -9740,7 +9778,7 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
         );
         return Ok(StageRecord {
             stage: PipelineStage::ReplayGain,
-            outcome: StageOutcome::Skipped,
+            outcome: StageOutcome::SkippedWithReason(reason),
             dsd_dst_stats: None,
         });
     }
@@ -9764,7 +9802,9 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
                         );
                         return Ok(StageRecord {
                             stage: PipelineStage::ReplayGain,
-                            outcome: StageOutcome::Skipped,
+                            outcome: StageOutcome::SkippedWithReason(format!(
+                                "output audio is signal-equivalent and every output already has the complete {mode:?} ReplayGain tag set"
+                            )),
                             dsd_dst_stats: None,
                         });
                     }
@@ -9847,7 +9887,7 @@ pub async fn run_features(
             artifacts,
             StageRecord {
                 stage: PipelineStage::Features,
-                outcome: StageOutcome::Skipped,
+                outcome: StageOutcome::NotRequested,
                 dsd_dst_stats: None,
             },
         ));
@@ -15942,7 +15982,29 @@ fn merge_stage_outcome(existing: &StageOutcome, next: &StageOutcome) -> StageOut
             StageOutcome::Failed(reason.clone())
         }
         (StageOutcome::Ok, _) | (_, StageOutcome::Ok) => StageOutcome::Ok,
+        (StageOutcome::SkippedWithReason(left), StageOutcome::SkippedWithReason(right)) => {
+            if left == right {
+                StageOutcome::SkippedWithReason(left.clone())
+            } else {
+                StageOutcome::SkippedWithReason(format!("{left}; {right}"))
+            }
+        }
+        (StageOutcome::SkippedWithReason(reason), StageOutcome::Skipped)
+        | (StageOutcome::Skipped, StageOutcome::SkippedWithReason(reason)) => {
+            StageOutcome::SkippedWithReason(format!(
+                "{reason}; reason unavailable for one or more inputs"
+            ))
+        }
+        (StageOutcome::SkippedWithReason(reason), StageOutcome::NotRequested)
+        | (StageOutcome::NotRequested, StageOutcome::SkippedWithReason(reason)) => {
+            StageOutcome::SkippedWithReason(format!(
+                "{reason}; not requested for one or more inputs"
+            ))
+        }
         (StageOutcome::Skipped, StageOutcome::Skipped) => StageOutcome::Skipped,
+        (StageOutcome::Skipped, StageOutcome::NotRequested)
+        | (StageOutcome::NotRequested, StageOutcome::Skipped) => StageOutcome::Skipped,
+        (StageOutcome::NotRequested, StageOutcome::NotRequested) => StageOutcome::NotRequested,
     }
 }
 
@@ -17953,10 +18015,18 @@ fn metadata_satisfaction_label(
                     "metadata stage applied non-native m4a tags via AtomicParsley after artwork"
                         .to_string()
                 }
+                Some(StageOutcome::NotRequested) => {
+                    "non-native m4a tags were not applied because the metadata stage was not requested"
+                        .to_string()
+                }
                 Some(StageOutcome::Skipped) => {
                     "non-native m4a tags were not applied because the metadata stage was skipped"
                         .to_string()
                 }
+                Some(StageOutcome::SkippedWithReason(reason)) => format!(
+                    "non-native m4a tags were not applied because the metadata stage was skipped: {}",
+                    escape_log_value(reason)
+                ),
                 Some(StageOutcome::Failed(reason)) => format!(
                     "non-native m4a tag application failed: {}",
                     escape_log_value(reason)
@@ -18025,7 +18095,11 @@ fn metadata_remaining_requirement_parts(
             Some(StageOutcome::Ok) => {
                 "metadata stage completed; per-track writes not recorded".to_string()
             }
+            Some(StageOutcome::NotRequested) => "metadata stage not requested".to_string(),
             Some(StageOutcome::Skipped) => "metadata stage skipped".to_string(),
+            Some(StageOutcome::SkippedWithReason(reason)) => {
+                format!("metadata stage skipped: {}", escape_log_value(reason))
+            }
             Some(StageOutcome::Failed(reason)) => {
                 format!("metadata stage failed: {}", escape_log_value(reason))
             }
@@ -18918,7 +18992,7 @@ fn planner_artwork_transfer_label(artifacts: &ArtifactSet) -> Option<ArtworkTran
 
 fn cue_artwork_metadata_stage_outcome(req: &PipelineRequest, outcome: &AlbumOutcome) -> String {
     if req.stages.metadata == StageRequirement::Disabled {
-        return "skipped (metadata stage disabled)".to_string();
+        return "not requested (metadata stage disabled)".to_string();
     }
     if !cue_artwork_supported_by_target(&req.settings.target_format) {
         return format!(
@@ -18931,7 +19005,16 @@ fn cue_artwork_metadata_stage_outcome(req: &PipelineRequest, outcome: &AlbumOutc
         Some(StageOutcome::Ok) => {
             "metadata stage completed post-encode artwork embedding".to_string()
         }
+        Some(StageOutcome::NotRequested) => {
+            "not confirmed (metadata stage not requested)".to_string()
+        }
         Some(StageOutcome::Skipped) => "not confirmed (metadata stage skipped)".to_string(),
+        Some(StageOutcome::SkippedWithReason(reason)) => {
+            format!(
+                "not confirmed (metadata stage skipped: {})",
+                escape_log_value(reason)
+            )
+        }
         Some(StageOutcome::Failed(reason)) => {
             format!("not confirmed (metadata stage failed: {reason})")
         }
@@ -19169,7 +19252,11 @@ fn pipeline_stage_label(stage: PipelineStage) -> &'static str {
 fn stage_outcome_label(outcome: &StageOutcome) -> String {
     match outcome {
         StageOutcome::Ok => "Ok".to_string(),
+        StageOutcome::NotRequested => "Not requested".to_string(),
         StageOutcome::Skipped => "Skipped".to_string(),
+        StageOutcome::SkippedWithReason(reason) => {
+            format!("Skipped ({})", escape_log_value(reason))
+        }
         StageOutcome::Failed(error) => format!("Failed ({})", escape_log_value(error)),
     }
 }
@@ -23789,7 +23876,10 @@ fn post_action_outcome_with_terminal_authority(
                 StageOutcome::Failed(message) => {
                     StageOutcome::Failed(format!("{message}; {authority_error}"))
                 }
-                StageOutcome::Ok | StageOutcome::Skipped => StageOutcome::Failed(authority_error),
+                StageOutcome::Ok
+                | StageOutcome::NotRequested
+                | StageOutcome::Skipped
+                | StageOutcome::SkippedWithReason(_) => StageOutcome::Failed(authority_error),
             }
         }
     }
@@ -25547,7 +25637,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::Merge, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::Merge, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -25561,7 +25651,9 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         ) {
             let record = stage_record(
                 PipelineStage::Metadata,
-                StageOutcome::Skipped,
+                StageOutcome::SkippedWithReason(
+                    "already satisfied by the output planner".to_string(),
+                ),
             );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
@@ -25599,7 +25691,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::Metadata, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::Metadata, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -25638,7 +25730,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::ReplayGain, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::ReplayGain, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -25713,7 +25805,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::Features, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::Features, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -26445,7 +26537,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::Merge, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::Merge, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -26457,7 +26549,12 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             source.as_ref().expect("source present"),
             &req,
         ) {
-            let record = stage_record(PipelineStage::Metadata, StageOutcome::Skipped);
+            let record = stage_record(
+                PipelineStage::Metadata,
+                StageOutcome::SkippedWithReason(
+                    "already satisfied by the output planner".to_string(),
+                ),
+            );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
         } else {
@@ -26507,7 +26604,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::Metadata, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::Metadata, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -26559,7 +26656,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::ReplayGain, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::ReplayGain, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -26656,7 +26753,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::Features, StageOutcome::Skipped);
+        let record = stage_record(PipelineStage::Features, StageOutcome::NotRequested);
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
     }
@@ -34420,7 +34517,7 @@ async fn finalize_report_with_binding(
 ///   `Blocked` with `RequiredStageFailure`. `PostActions` is explicitly
 ///   non-blocking after successful publication: its failed record remains in
 ///   a `Complete` outcome and maps to `CompletedWithActionErrors`. Disabled
-///   stages reach aggregation as `StageOutcome::Skipped` and never block.
+///   stages reach aggregation as `StageOutcome::NotRequested` and never block.
 /// - Otherwise, with no failed tracks -> `Complete`.
 /// - With failed tracks: `FailAlbumOnAnyTrackFailure` -> `Blocked`
 ///   (`TrackFailures`); `AllowPartialAlbum` -> `Partial`.
@@ -39013,7 +39110,10 @@ fn track_record_has_storage_exhaustion_for_scratch_retry(record: &TrackRecord) -
 fn stage_record_has_storage_exhaustion_for_scratch_retry(record: &StageRecord) -> bool {
     match &record.outcome {
         StageOutcome::Failed(message) => storage_exhaustion_message_looks_like(message),
-        StageOutcome::Ok | StageOutcome::Skipped => false,
+        StageOutcome::Ok
+        | StageOutcome::NotRequested
+        | StageOutcome::Skipped
+        | StageOutcome::SkippedWithReason(_) => false,
     }
 }
 
@@ -39103,7 +39203,10 @@ fn stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
 ) -> bool {
     let message = match &record.outcome {
         StageOutcome::Failed(message) => message,
-        StageOutcome::Ok | StageOutcome::Skipped => return false,
+        StageOutcome::Ok
+        | StageOutcome::NotRequested
+        | StageOutcome::Skipped
+        | StageOutcome::SkippedWithReason(_) => return false,
     };
     if !storage_exhaustion_message_looks_like(message) {
         return false;
@@ -39171,7 +39274,10 @@ fn scratch_retry_original_error_from_outcome(outcome: &AlbumOutcome) -> String {
     fn stage_error(stages: &[StageRecord]) -> Option<String> {
         stages.iter().rev().find_map(|stage| match &stage.outcome {
             StageOutcome::Failed(error) => Some(format!("{:?}: {}", stage.stage, error)),
-            StageOutcome::Ok | StageOutcome::Skipped => None,
+            StageOutcome::Ok
+            | StageOutcome::NotRequested
+            | StageOutcome::Skipped
+            | StageOutcome::SkippedWithReason(_) => None,
         })
     }
 
@@ -40175,7 +40281,7 @@ mod pipeline_test_helpers {
             },
             StageRecord {
                 stage: PipelineStage::ReplayGain,
-                outcome: StageOutcome::Skipped,
+                outcome: StageOutcome::NotRequested,
                 dsd_dst_stats: None,
             },
             StageRecord {
@@ -40889,8 +40995,123 @@ mod conversion_log_tests {
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Materialize: Ok"));
-        assert!(log.contains("ReplayGain: Skipped"));
+        assert!(log.contains("ReplayGain: Not requested"));
         assert!(log.contains("Features: Ok"));
+    }
+
+    #[test]
+    fn disabled_optional_stages_render_as_not_requested_and_do_not_block() {
+        let source = log_test_source();
+        let mut req = log_test_request();
+        req.merge = false;
+        req.stages.metadata = StageRequirement::Disabled;
+        req.stages.replaygain = StageRequirement::Disabled;
+        req.stages.features = StageRequirement::Disabled;
+        let stages = vec![
+            stage_record(PipelineStage::Merge, StageOutcome::NotRequested),
+            stage_record(PipelineStage::Metadata, StageOutcome::NotRequested),
+            stage_record(PipelineStage::ReplayGain, StageOutcome::NotRequested),
+            stage_record(PipelineStage::Features, StageOutcome::NotRequested),
+        ];
+        let outcome = aggregate_album_outcome(
+            vec![ok_record()],
+            stages,
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+        );
+
+        assert!(matches!(outcome, AlbumOutcome::Complete { .. }));
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        for setting in [
+            "Metadata: Disabled",
+            "ReplayGain: Disabled",
+            "Features: Disabled",
+        ] {
+            assert!(log.contains(setting), "missing settings line {setting:?}");
+        }
+        for stage in ["Merge", "Metadata", "ReplayGain", "Features"] {
+            assert!(
+                log.contains(&format!("{stage}: Not requested")),
+                "missing honest stage summary for {stage}"
+            );
+            assert!(
+                !log.contains(&format!("{stage}: Skipped")),
+                "disabled stage must not render as skipped: {stage}"
+            );
+        }
+        assert!(log.contains("Result: Complete"));
+    }
+
+    #[test]
+    fn requested_metadata_already_satisfied_renders_reason_and_does_not_block() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let outcome = aggregate_album_outcome(
+            vec![ok_record()],
+            vec![stage_record(
+                PipelineStage::Metadata,
+                StageOutcome::SkippedWithReason(
+                    "already satisfied by the output planner".to_string(),
+                ),
+            )],
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+        );
+
+        assert!(matches!(outcome, AlbumOutcome::Complete { .. }));
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains("Metadata: Enabled"));
+        assert!(log.contains(
+            "Metadata: Skipped (already satisfied by the output planner)"
+        ));
+        assert!(!log.contains("Metadata: Not requested"));
+        assert!(log.contains("Result: Complete"));
+    }
+
+    #[test]
+    fn requested_unsupported_replaygain_renders_reason_and_does_not_block() {
+        let source = log_test_source();
+        let mut req = log_test_request();
+        req.stages.replaygain = StageRequirement::Enabled;
+        req.settings.target_format = PlannerAudioFormat::Dsf;
+        let outcome = aggregate_album_outcome(
+            vec![ok_record()],
+            vec![stage_record(
+                PipelineStage::ReplayGain,
+                StageOutcome::SkippedWithReason(
+                    "DSF output is not supported by loudgain".to_string(),
+                ),
+            )],
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+        );
+
+        assert!(matches!(outcome, AlbumOutcome::Complete { .. }));
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains("ReplayGain: Enabled"));
+        assert!(log.contains(
+            "ReplayGain: Skipped (DSF output is not supported by loudgain)"
+        ));
+        assert!(!log.contains("ReplayGain: Not requested"));
+        assert!(log.contains("Result: Complete"));
     }
 
     #[test]
@@ -41750,6 +41971,41 @@ mod conversion_log_tests {
         assert!(log.contains(
             "Artwork: extracted JPEG from source image → planner transferred artwork into output"
         ));
+    }
+
+    #[test]
+    fn artwork_log_reports_not_requested_when_metadata_stage_is_disabled() {
+        let mut source = log_test_source();
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+            "/stage/cover.jpg".to_string(),
+        );
+        source.album_metadata.extra.insert(
+            CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+            "image/jpeg".to_string(),
+        );
+
+        let mut req = log_test_request();
+        req.stages.metadata = StageRequirement::Disabled;
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.metadata.preserve_artwork = true;
+
+        let artifacts = log_test_artifacts();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: vec![StageRecord {
+                stage: PipelineStage::Metadata,
+                outcome: StageOutcome::NotRequested,
+                dsd_dst_stats: None,
+            }],
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Metadata: Not requested"));
+        assert!(log.contains(
+            "Artwork: extracted JPEG from source image → not requested (metadata stage disabled)"
+        ));
+        assert!(!log.contains("skipped (metadata stage disabled)"));
     }
 
     #[test]
@@ -45688,13 +45944,86 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         // SingleFile FLAC→FLAC: planner transfers source tags via ffmpeg, so
         // the orchestrator metadata stage is correctly skipped (no authoritative
         // materializer metadata to apply).
-        assert!(matches!(stage_outcome(&report, PipelineStage::Metadata), Some(StageOutcome::Skipped)));
+        assert!(matches!(
+            stage_outcome(&report, PipelineStage::Metadata),
+            Some(StageOutcome::SkippedWithReason(reason))
+                if reason == "already satisfied by the output planner"
+        ));
         assert!(matches!(stage_outcome(&report, PipelineStage::ReplayGain), Some(StageOutcome::Ok)));
         assert!(matches!(stage_outcome(&report, PipelineStage::Features), Some(StageOutcome::Ok)));
         assert!(matches!(stage_outcome(&report, PipelineStage::Publish), Some(StageOutcome::Ok)));
         let transcript = runner.transcript();
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].binary, ToolBinary::Loudgain);
+        assert!(report.published.is_some());
+    }
+
+    #[tokio::test]
+    async fn optional_stages_not_requested_remain_nonblocking_and_publish() {
+        let fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
+        for stage in [
+            PipelineStage::Merge,
+            PipelineStage::Metadata,
+            PipelineStage::ReplayGain,
+            PipelineStage::Features,
+        ] {
+            assert_eq!(stage_outcome(&report, stage), Some(&StageOutcome::NotRequested));
+        }
+        assert!(runner.transcript().is_empty());
+        assert!(report.published.is_some());
+    }
+
+    #[tokio::test]
+    async fn unsupported_requested_replaygain_remains_nonblocking_and_publishes() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, true, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.target_format = PlannerAudioFormat::Dsf;
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let outputs = vec![successful_output(&fixture, 0)];
+
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album,
+            outputs,
+            &runner,
+            &reporter,
+            &cancel,
+        )
+        .await;
+
+        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
+        assert_eq!(
+            stage_outcome(&report, PipelineStage::ReplayGain),
+            Some(&StageOutcome::SkippedWithReason(
+                "DSF output is not supported by loudgain".to_string()
+            ))
+        );
+        assert!(runner.transcript().is_empty());
         assert!(report.published.is_some());
     }
 
@@ -48078,6 +48407,67 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 && assembled.contains("Overall Summary\n---------------"),
             "normal and fragment paths share the canonical formatter section structure"
         );
+    }
+
+    #[test]
+    fn fragment_assembled_log_preserves_not_requested_and_skip_reasons() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let mut req = log_test_request();
+        req.stages.metadata = StageRequirement::Enabled;
+        req.stages.replaygain = StageRequirement::Enabled;
+        req.stages.features = StageRequirement::Disabled;
+        let stages = vec![
+            stage_record(PipelineStage::Merge, StageOutcome::NotRequested),
+            stage_record(
+                PipelineStage::Metadata,
+                StageOutcome::SkippedWithReason(
+                    "already satisfied by the output planner".to_string(),
+                ),
+            ),
+            stage_record(
+                PipelineStage::ReplayGain,
+                StageOutcome::SkippedWithReason(
+                    "DSF output is not supported by loudgain".to_string(),
+                ),
+            ),
+            stage_record(PipelineStage::Features, StageOutcome::NotRequested),
+        ];
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages,
+        };
+        let artifacts = log_test_artifacts();
+        let album_dir = PathBuf::from("/out/Test Artist/Test Album");
+        req.album_batch = Some(fragment_test_album_batch(
+            &album_dir,
+            "batch-stage-outcomes",
+            1,
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let fragment = canonical_fragment_from_record(
+            &album_dir,
+            "batch-stage-outcomes",
+            &source,
+            &req,
+            &artifacts,
+            &outcome,
+            &ok_record(),
+            fragment_test_time(43),
+        );
+
+        let assembled = build_conversion_log_from_fragments(&[fragment]);
+
+        assert!(assembled.contains("Merge: Not requested"));
+        assert!(assembled.contains(
+            "Metadata: Skipped (already satisfied by the output planner)"
+        ));
+        assert!(assembled.contains(
+            "ReplayGain: Skipped (DSF output is not supported by loudgain)"
+        ));
+        assert!(assembled.contains("Features: Not requested"));
+        assert!(!assembled.contains("Metadata: Not requested"));
+        assert!(!assembled.contains("ReplayGain: Not requested"));
     }
 
     #[test]
