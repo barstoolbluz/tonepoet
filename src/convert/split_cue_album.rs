@@ -1544,6 +1544,16 @@ fn unique_split_cue_candidate(candidates: Vec<PathBuf>) -> SplitCueReferenceReso
 mod tests {
     use super::*;
 
+    // A complete FLAC container with one final STREAMINFO block describing an
+    // empty 44.1 kHz, 16-bit stereo stream. Admission does not probe content,
+    // but using a structurally valid container keeps the real-fixture test
+    // faithful without requiring an encoder or external test dependency.
+    const TINY_VALID_FLAC: &[u8] = &[
+        0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x0a, 0xc4, 0x42, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
     #[test]
     fn merged_group_provenance_requires_every_member_and_ignores_outsiders() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1833,6 +1843,84 @@ mod tests {
         assert_eq!(member.referenced_audio, vec![a.clone(), b.clone()]);
         assert_eq!(member.track_audio_paths, vec![a.clone(), a, b.clone(), b]);
         assert_eq!(member.role, SplitCueMemberRole::SyntheticAlbumPart);
+    }
+
+    #[test]
+    fn real_world_frame_overflow_admits_the_complete_multi_file_album() {
+        const SIDE_1: &str = "Kool & The Gang, Emergency, 1984 (Side 1).flac";
+        const SIDE_2: &str = "Kool & The Gang, Emergency, 1984 (Side 2).flac";
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_1 = td.path().join(SIDE_1);
+        let side_2 = td.path().join(SIDE_2);
+        std::fs::write(&side_1, TINY_VALID_FLAC).expect("side 1 FLAC stub");
+        std::fs::write(&side_2, TINY_VALID_FLAC).expect("side 2 FLAC stub");
+
+        let cue = td.path().join("Kool & The Gang, Emergency, 1984.cue");
+        std::fs::write(
+            &cue,
+            include_bytes!("../../fixtures/Kool_and_The_Gang_Emergency_1984.cue"),
+        )
+        .expect("real malformed CUE fixture");
+
+        let member = admit_split_cue_member(&cue)
+            .expect("recoverable frame overflow must not suppress the album");
+        assert_eq!(member.role, SplitCueMemberRole::SyntheticAlbumPart);
+        assert_eq!(member.sheet.tracks.len(), 7);
+        assert_eq!(member.track_audio_paths.len(), 7);
+        assert_eq!(member.referenced_audio.len(), 2);
+        assert_eq!(member.referenced_audio, vec![side_1.clone(), side_2.clone()]);
+        assert_eq!(member.sheet.tracks[2].index01_frames, Some(43955));
+        assert_eq!(
+            member.track_audio_paths,
+            vec![
+                side_1.clone(),
+                side_1.clone(),
+                side_1.clone(),
+                side_1,
+                side_2.clone(),
+                side_2.clone(),
+                side_2,
+            ]
+        );
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(&[cue], None)
+        else {
+            panic!("the shared metadata/conversion selector must retain the CUE surface");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].role, SplitCueMemberRole::SyntheticAlbumPart);
+        assert_eq!(members[0].track_audio_paths.len(), 7);
+    }
+
+    #[test]
+    fn normalized_overflow_cannot_bypass_per_file_index_monotonicity() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(td.path().join("side.flac"), TINY_VALID_FLAC).expect("FLAC stub");
+        let cue = td.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"side.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:59:74\n",
+                // 58 seconds + 149 frames also normalizes to frame 4499.
+                "  TRACK 02 AUDIO\n    INDEX 01 00:58:149\n",
+            ),
+        )
+        .expect("cue");
+
+        let rejection = admit_split_cue_member(&cue)
+            .expect_err("equal normalized offsets must remain unusable for splitting");
+        assert!(matches!(
+            rejection.reason,
+            SplitCueMemberRejectionReason::NonIncreasingIndex {
+                track_number: 2,
+                previous_track_number: 1,
+                previous_index: 4499,
+                ..
+            }
+        ));
     }
 
     #[test]

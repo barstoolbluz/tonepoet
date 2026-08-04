@@ -2684,15 +2684,28 @@ fn parse_index_line(line: &str, wanted_index: &str) -> Option<u32> {
     parse_cue_timestamp(timestamp)
 }
 
-/// Parse a CUE "MM:SS:FF" timestamp to a frame count (75 frames/second).
+/// Parse a CUE `MM:SS:FF` timestamp to a frame count (75 frames/second).
+///
+/// Real-world CUE sheets occasionally contain a decimal seconds or frames
+/// component outside its nominal range. Treat the three fields as one
+/// mixed-radix quantity and carry that overflow instead of dropping the
+/// track: `09:45:80` is exactly `09:46:05` (five frames into the next
+/// second). This preserves the represented split point without clamping or
+/// guessing. Missing, extra, non-decimal, or numerically unrepresentable
+/// timestamps remain invalid.
 pub fn parse_cue_timestamp(ts: &str) -> Option<u32> {
     let mut parts = ts.split(':');
     let mm: u32 = parts.next()?.parse().ok()?;
     let ss: u32 = parts.next()?.parse().ok()?;
     let ff: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || ss >= 60 || ff >= 75 {
+    if parts.next().is_some() {
         return None;
     }
+
+    // Computing the total directly is equivalent to carrying `ff / 75` into
+    // seconds and then `ss / 60` into minutes. Well-formed timestamps retain
+    // their exact historical value; recoverable overflow is normalized once
+    // here so every downstream consumer sees the same split point.
     mm.checked_mul(60)?
         .checked_add(ss)?
         .checked_mul(75)?
@@ -3312,13 +3325,42 @@ FILE "album.wav" WAVE
     }
 
     #[test]
-    fn timestamp_parser_validates_ranges_and_overflow() {
+    fn timestamp_parser_normalizes_component_overflow_and_rejects_invalid_input() {
         assert_eq!(parse_cue_timestamp("00:00:00"), Some(0));
         assert_eq!(parse_cue_timestamp("03:43:37"), Some(16762));
-        assert_eq!(parse_cue_timestamp("00:60:00"), None);
-        assert_eq!(parse_cue_timestamp("00:00:75"), None);
+
+        // Decimal component overflow is an unambiguous mixed-radix carry.
+        assert_eq!(parse_cue_timestamp("00:60:00"), Some(4500));
+        assert_eq!(parse_cue_timestamp("00:00:75"), Some(75));
+        assert_eq!(parse_cue_timestamp("09:45:80"), Some(43955));
+        assert_eq!(parse_cue_timestamp("00:120:150"), Some(9150));
+
+        // Syntax errors and values that cannot fit the public u32 frame
+        // representation remain invalid rather than wrapping or panicking.
         assert_eq!(parse_cue_timestamp("00:00"), None);
+        assert_eq!(parse_cue_timestamp("00:00:00:00"), None);
+        assert_eq!(parse_cue_timestamp("00:xx:00"), None);
+        assert_eq!(parse_cue_timestamp("-1:00:00"), None);
+        assert_eq!(parse_cue_timestamp("4294967295:00:00"), None);
         assert_eq!(parse_cue_timestamp("999999999999:00:00"), None);
+    }
+
+    #[test]
+    fn real_world_frame_overflow_is_retained_as_a_normalized_track_offset() {
+        let cue = include_str!("../../fixtures/Kool_and_The_Gang_Emergency_1984.cue");
+        let sheet = parse_cue(cue);
+
+        assert_eq!(sheet.tracks.len(), 7);
+        assert!(
+            sheet
+                .tracks
+                .iter()
+                .all(|track| track.index01_frames.is_some()),
+            "every track in the real malformed CUE must retain a usable INDEX 01"
+        );
+        assert_eq!(sheet.tracks[2].number, 3);
+        assert_eq!(sheet.tracks[2].title.as_deref(), Some("Misled"));
+        assert_eq!(sheet.tracks[2].index01_frames, Some(43955));
     }
 
     #[test]
