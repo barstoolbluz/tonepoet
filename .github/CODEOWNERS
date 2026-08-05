@@ -1,0 +1,5 @@
+# Review is requested automatically from the owner of any matching path.
+# Later rules win over earlier ones, so keep the most specific ones last.
+
+/Dockerfile      @rossturk
+/.dockerignore   @rossturk
