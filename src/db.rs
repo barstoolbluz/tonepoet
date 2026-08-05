@@ -1525,7 +1525,7 @@ impl Database {
 
     /// Bump this when the analysis algorithm changes to invalidate
     /// cached results computed by an older version.
-    const ANALYSIS_ALGO_VERSION: i32 = 24;
+    const ANALYSIS_ALGO_VERSION: i32 = 25;
 
     /// Look up cached analysis. Returns None if not cached, stale,
     /// or computed by an older algorithm version.
@@ -3416,41 +3416,40 @@ impl CachedProbeRow {
     /// Returns None if essential fields (format_name, sample_rate, channels) are missing.
     pub fn to_cached_info(&self, file_size: u64) -> Option<crate::tui::browse::CachedInfo> {
         use crate::tui::probe::{SourceInfo, SourceMetadata};
-        Some(crate::tui::browse::CachedInfo {
-            source: SourceInfo {
-                sample_format_is_float: None,
-                format_name: self.format_name.clone()?,
-                codec: self.codec.clone().unwrap_or_default(),
-                bit_depth: self.bit_depth,
-                sample_rate: self.sample_rate?,
-                channels: self.channels?,
-                channel_layout: self.channel_layout.clone().unwrap_or_default(),
-                duration_secs: self.duration_secs.unwrap_or(0.0),
-                file_size,
-            },
-            metadata: SourceMetadata {
-                title: self.title.clone(),
-                artist: self.artist.clone(),
-                album: self.album.clone(),
-                genre: self.genre.clone(),
-                year: self.year.clone(),
-                track_number: self.track_number,
-                catalog_number: self.catalog_number.clone(),
-                rg_track_gain: self.rg_track_gain.clone(),
-                rg_track_peak: self.rg_track_peak.clone(),
-                rg_album_gain: self.rg_album_gain.clone(),
-                rg_album_peak: self.rg_album_peak.clone(),
-                r128_track_gain: self.r128_track_gain.clone(),
-                r128_album_gain: self.r128_album_gain.clone(),
-                preemphasis_metadata: None, // Not cached; re-detected on probe.
-                hdcd_detail: None,          // Populated from analysis cache if available.
-                isrc: None, // Not cached; re-read on full probe (only used by :cue).
-                tool: None, // Not cached; re-read on full probe.
-                artwork: Vec::new(), // Not cached; re-read on full probe.
-                embedded_cue_availability:
-                    crate::tui::probe::EmbeddedCueAvailability::Unknown,
-            },
-        })
+        let source = SourceInfo {
+            sample_format_is_float: None,
+            format_name: self.format_name.clone()?,
+            codec: self.codec.clone().unwrap_or_default(),
+            bit_depth: self.bit_depth,
+            sample_rate: self.sample_rate?,
+            channels: self.channels?,
+            channel_layout: self.channel_layout.clone().unwrap_or_default(),
+            duration_secs: self.duration_secs.unwrap_or(0.0),
+            file_size,
+        };
+        let metadata = SourceMetadata {
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            genre: self.genre.clone(),
+            year: self.year.clone(),
+            track_number: self.track_number,
+            catalog_number: self.catalog_number.clone(),
+            rg_track_gain: self.rg_track_gain.clone(),
+            rg_track_peak: self.rg_track_peak.clone(),
+            rg_album_gain: self.rg_album_gain.clone(),
+            rg_album_peak: self.rg_album_peak.clone(),
+            r128_track_gain: self.r128_track_gain.clone(),
+            r128_album_gain: self.r128_album_gain.clone(),
+            preemphasis_metadata: None, // Not cached; re-detected on probe.
+            hdcd_detail: None,          // Populated from analysis cache if available.
+            isrc: None, // Not cached; re-read on full probe (only used by :cue).
+            tool: None, // Not cached; re-read on full probe.
+            artwork: Vec::new(), // Not cached; re-read on full probe.
+            embedded_cue_availability:
+                crate::tui::probe::EmbeddedCueAvailability::Unknown,
+        };
+        Some(crate::tui::browse::CachedInfo::new(source, metadata))
     }
 
     /// Build a CachedProbeRow from SourceInfo + SourceMetadata.
@@ -4794,6 +4793,58 @@ mod tests {
         assert_eq!(
             changed_identity.preemphasis,
             Some(PreemphasisConfidence::NotDetected),
+        );
+    }
+
+    #[test]
+    fn analysis_cache_version_rejects_pre_authoritative_catalog_results() {
+        use crate::tui::preemphasis::PreemphasisConfidence;
+
+        let db = Database::open_memory().unwrap();
+        let path = "/music/false-series.flac";
+        db.conn
+            .execute(
+                "INSERT INTO analysis_cache (
+                    file_path, file_mtime, file_size, algo_version,
+                    preemphasis, preemphasis_detail, analyzed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    path,
+                    1000i64,
+                    5_000_000i64,
+                    24i32,
+                    3i32,
+                    "catalog match: 35DP-999",
+                    "2026-08-05T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            db.get_cached_metadata_analysis_facts(path, 1000, 5_000_000)
+                .is_none(),
+            "version-24 catalog candidates must miss after authoritative matching replaced series inference",
+        );
+        assert!(db.get_cached_analysis(path, 1000, 5_000_000).is_none());
+
+        let current = crate::tui::app::MetadataAnalysisFacts {
+            preemphasis: Some(PreemphasisConfidence::Possible),
+            preemphasis_detail: Some(
+                "possible catalog evidence: folder exact 35DP-150".to_string(),
+            ),
+            hdcd_detected: None,
+            hdcd_detail: None,
+        };
+        db.store_metadata_analysis_facts(path, 1000, 5_000_000, &current)
+            .unwrap();
+
+        let cached = db
+            .get_cached_metadata_analysis_facts(path, 1000, 5_000_000)
+            .expect("current-version result should hit");
+        assert_eq!(cached.preemphasis, Some(PreemphasisConfidence::Possible));
+        assert_eq!(
+            cached.preemphasis_detail.as_deref(),
+            Some("possible catalog evidence: folder exact 35DP-150"),
         );
     }
 

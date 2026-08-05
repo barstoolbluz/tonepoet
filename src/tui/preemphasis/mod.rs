@@ -23,18 +23,44 @@ use std::path::PathBuf;
 // ── Public types ───────────────────────────────────────────────────
 
 /// Confidence level for pre-emphasis detection.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PreemphasisConfidence {
     /// Metadata evidence confirms pre-emphasis.
     Detected,
-    /// Spectral analysis shows strong evidence across multiple cues.
+    /// Strong non-explicit evidence, such as an exact authoritative catalog tag.
     StrongCandidate,
-    /// Some spectral evidence, but not conclusive.
+    /// Weaker evidence, such as an exact catalog ID inferred from a folder name.
     Possible,
     /// No evidence of pre-emphasis.
     NotDetected,
     /// Insufficient data to make a determination (e.g., no corpus model).
     Indeterminate,
+}
+
+/// Typed metadata advisory retained across direct detection, caching, and UI
+/// rendering. Free-form labels are not used as a transport format.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreemphasisAdvisory {
+    pub evidence: PreemphasisAdvisoryEvidence,
+    pub confidence: PreemphasisConfidence,
+    pub catalog: Option<CatalogAdvisory>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PreemphasisAdvisoryEvidence {
+    ExplicitTag,
+    CueFlag,
+    Catalog,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CatalogAdvisory {
+    pub catalog_number: String,
+    pub quality: catalog::CatalogMatchQuality,
+    pub source: catalog::CatalogMatchSource,
+    pub source_row: usize,
+    pub source_catalog_cell: String,
 }
 
 /// Result of pre-emphasis detection for a single file.
@@ -90,24 +116,102 @@ fn empty_result(path: PathBuf, confidence: PreemphasisConfidence, detail: String
 /// the metadata editor Details tab and the `:preemph` scan path that hydrates
 /// that tab.
 pub fn detect_preemphasis_metadata_catalog(path: PathBuf) -> PreemphasisResult {
-    let evidence =
-        metadata::check_pre_flag_tag_evidence(&path).or_else(|| metadata::check_cue_evidence(&path));
-
-    if evidence.is_some() {
-        let mut result = empty_result(path, PreemphasisConfidence::Detected, "PRE flag".to_string());
-        result.cue_confirmed = true;
-        return result;
+    let advisory = detect_preemphasis_advisory(&path);
+    if advisory.is_some() && source_is_known_non_red_book(&path) {
+        return empty_result(path, PreemphasisConfidence::NotDetected, String::new());
     }
+    result_from_advisory(path, advisory.as_ref())
+}
 
-    if let Some(catalog_match) = catalog::check_catalog_evidence(&path) {
-        return empty_result(
-            path,
-            PreemphasisConfidence::StrongCandidate,
-            format!("catalog match: {}", catalog_match.catalog_number),
-        );
+/// Detect only the metadata/catalog evidence. This function deliberately does
+/// not probe source format facts, making it suitable for metadata-read workers;
+/// callers must apply `preemphasis_advisory_for_source` once `SourceInfo` is
+/// available.
+pub fn detect_preemphasis_advisory(path: &std::path::Path) -> Option<PreemphasisAdvisory> {
+    if metadata::check_pre_flag_tag_evidence(path).is_some() {
+        return Some(PreemphasisAdvisory {
+            evidence: PreemphasisAdvisoryEvidence::ExplicitTag,
+            confidence: PreemphasisConfidence::Detected,
+            catalog: None,
+            detail: "PRE tag".to_string(),
+        });
     }
+    if metadata::check_cue_evidence(path).is_some() {
+        return Some(PreemphasisAdvisory {
+            evidence: PreemphasisAdvisoryEvidence::CueFlag,
+            confidence: PreemphasisConfidence::Detected,
+            catalog: None,
+            detail: "CUE FLAGS PRE".to_string(),
+        });
+    }
+    let catalog_match = catalog::check_catalog_evidence(path)?;
+    Some(PreemphasisAdvisory {
+        evidence: PreemphasisAdvisoryEvidence::Catalog,
+        confidence: catalog_match.confidence,
+        catalog: Some(CatalogAdvisory {
+            catalog_number: catalog_match.catalog_number.clone(),
+            quality: catalog_match.quality,
+            source: catalog_match.source,
+            source_row: catalog_match.source_row,
+            source_catalog_cell: catalog_match.source_catalog_cell,
+        }),
+        detail: catalog_match.detail,
+    })
+}
 
-    empty_result(path, PreemphasisConfidence::NotDetected, String::new())
+/// Suppress advisories for sources whose probed format cannot be Red Book CD
+/// audio. Unknown bit depth remains conservative, but a known non-16-bit depth
+/// or any non-44.1-kHz rate is inapplicable.
+pub fn preemphasis_advisory_for_source(
+    advisory: Option<PreemphasisAdvisory>,
+    info: &crate::tui::probe::SourceInfo,
+) -> Option<PreemphasisAdvisory> {
+    advisory.filter(|_| source_info_is_red_book_compatible(info))
+}
+
+pub fn result_from_advisory(
+    path: PathBuf,
+    advisory: Option<&PreemphasisAdvisory>,
+) -> PreemphasisResult {
+    let Some(advisory) = advisory else {
+        return empty_result(path, PreemphasisConfidence::NotDetected, String::new());
+    };
+    let detail = match advisory.evidence {
+        PreemphasisAdvisoryEvidence::ExplicitTag | PreemphasisAdvisoryEvidence::CueFlag => {
+            "PRE flag".to_string()
+        }
+        PreemphasisAdvisoryEvidence::Catalog => advisory
+            .catalog
+            .as_ref()
+            .map(|catalog| format!("catalog match: {}", catalog.catalog_number))
+            .unwrap_or_else(|| "catalog match".to_string()),
+    };
+    let mut result = empty_result(path, advisory.confidence, detail);
+    result.cue_confirmed = matches!(
+        advisory.evidence,
+        PreemphasisAdvisoryEvidence::ExplicitTag | PreemphasisAdvisoryEvidence::CueFlag
+    );
+    result
+}
+
+fn source_is_known_non_red_book(path: &std::path::Path) -> bool {
+    crate::tui::probe::probe_audio(path)
+        .ok()
+        .is_some_and(|info| !source_info_is_red_book_compatible(&info))
+}
+
+fn source_info_is_red_book_compatible(info: &crate::tui::probe::SourceInfo) -> bool {
+    let combined = format!("{} {}", info.format_name, info.codec).to_ascii_lowercase();
+    let known_non_pcm_or_lossy = [
+        "dsd", "mp3", "aac", "opus", "vorbis", "ac-3", "e-ac-3", "dts",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle));
+
+    !known_non_pcm_or_lossy
+        && info.sample_format_is_float != Some(true)
+        && info.sample_rate == 44_100
+        && info.bit_depth.map_or(true, |depth| depth == 16)
 }
 
 /// Async wrapper for metadata/catalog-only detection.
@@ -163,7 +267,7 @@ pub fn result_from_metadata_label(path: PathBuf, label: &str) -> PreemphasisResu
         let catalog = extract_catalog_from_detail(label);
         return empty_result(
             path,
-            PreemphasisConfidence::StrongCandidate,
+            PreemphasisConfidence::Possible,
             catalog
                 .map(|catalog| format!("catalog match: {catalog}"))
                 .unwrap_or_else(|| "catalog match".to_string()),
@@ -208,7 +312,7 @@ pub fn metadata_editor_safe_result(result: &PreemphasisResult) -> PreemphasisRes
         let catalog = extract_catalog_from_detail(detail);
         return empty_result(
             result.path.clone(),
-            PreemphasisConfidence::StrongCandidate,
+            result.confidence,
             catalog
                 .map(|catalog| format!("catalog match: {catalog}"))
                 .unwrap_or_else(|| "catalog match".to_string()),
@@ -254,7 +358,6 @@ fn preemphasis_detail_is_allowed_catalog(lower: &str) -> bool {
     let lower = lower.trim();
     lower == "catalog match"
         || lower == "catalog exact"
-        || lower == "catalog series"
         || lower.starts_with("catalog match:")
         || lower.starts_with("catalog (")
 }
@@ -557,8 +660,119 @@ mod tests {
     #[test]
     fn metadata_label_catalog_becomes_candidate_without_spectral() {
         let safe = result_from_metadata_label(PathBuf::from("/tmp/catalog.flac"), "catalog (35DP-4)");
-        assert_eq!(safe.confidence, PreemphasisConfidence::StrongCandidate);
+        assert_eq!(safe.confidence, PreemphasisConfidence::Possible);
         assert_eq!(safe.detail, "catalog match: 35DP-4");
+    }
+
+    #[test]
+    fn folder_catalog_detection_retains_possible_source_and_exact_quality() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp
+            .path()
+            .join("Willie Nelson - Angel Eyes - 35DP-150");
+        std::fs::create_dir(&album).expect("album directory");
+        let path = album.join("track.flac");
+        std::fs::write(&path, b"not real audio").expect("audio fixture");
+
+        let advisory = detect_preemphasis_advisory(&path).expect("folder advisory");
+        assert_eq!(advisory.evidence, PreemphasisAdvisoryEvidence::Catalog);
+        assert_eq!(advisory.confidence, PreemphasisConfidence::Possible);
+        let catalog = advisory.catalog.expect("catalog provenance");
+        assert_eq!(catalog.catalog_number, "35DP-150");
+        assert_eq!(catalog.quality, catalog::CatalogMatchQuality::Exact);
+        assert_eq!(catalog.source, catalog::CatalogMatchSource::Folder);
+    }
+
+    #[test]
+    fn metadata_editor_safe_result_rejects_legacy_catalog_series_labels() {
+        let raw = empty_result(
+            PathBuf::from("/tmp/legacy-series.flac"),
+            PreemphasisConfidence::StrongCandidate,
+            "catalog series".to_string(),
+        );
+        let safe = metadata_editor_safe_result(&raw);
+        assert_eq!(safe.confidence, PreemphasisConfidence::NotDetected);
+        assert!(safe.detail.is_empty());
+    }
+
+    #[test]
+    fn metadata_editor_safe_result_preserves_catalog_match_confidence() {
+        for confidence in [
+            PreemphasisConfidence::StrongCandidate,
+            PreemphasisConfidence::Possible,
+        ] {
+            let raw = empty_result(
+                PathBuf::from("/tmp/catalog.flac"),
+                confidence,
+                "catalog match: 35DP-4".to_string(),
+            );
+            let safe = metadata_editor_safe_result(&raw);
+            assert_eq!(safe.confidence, confidence);
+            assert_eq!(safe.detail, "catalog match: 35DP-4");
+        }
+    }
+
+    #[test]
+    fn cached_advisory_gate_keeps_only_red_book_compatible_sources() {
+        let advisory = PreemphasisAdvisory {
+            evidence: PreemphasisAdvisoryEvidence::Catalog,
+            confidence: PreemphasisConfidence::StrongCandidate,
+            catalog: None,
+            detail: "catalog".to_string(),
+        };
+        let mut info = crate::tui::probe::SourceInfo {
+            format_name: "flac".to_string(),
+            codec: "flac".to_string(),
+            bit_depth: Some(16),
+            sample_format_is_float: Some(false),
+            sample_rate: 44_100,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 0,
+        };
+        assert!(preemphasis_advisory_for_source(Some(advisory.clone()), &info).is_some());
+
+        for (depth, rate) in [(Some(24), 96_000), (Some(24), 44_100), (Some(16), 48_000)] {
+            info.bit_depth = depth;
+            info.sample_rate = rate;
+            assert!(preemphasis_advisory_for_source(Some(advisory.clone()), &info).is_none());
+        }
+    }
+
+    #[test]
+    fn red_book_gate_rejects_known_high_resolution_sources() {
+        let mut info = crate::tui::probe::SourceInfo {
+            format_name: "flac".to_string(),
+            codec: "flac".to_string(),
+            bit_depth: Some(16),
+            sample_format_is_float: Some(false),
+            sample_rate: 44_100,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 0,
+        };
+        assert!(source_info_is_red_book_compatible(&info));
+
+        info.sample_rate = 96_000;
+        assert!(!source_info_is_red_book_compatible(&info));
+
+        info.sample_rate = 44_100;
+        info.bit_depth = Some(24);
+        assert!(!source_info_is_red_book_compatible(&info));
+
+        info.bit_depth = None;
+        assert!(source_info_is_red_book_compatible(&info));
+
+        info.codec = "mp3".to_string();
+        info.format_name = "mp3".to_string();
+        assert!(!source_info_is_red_book_compatible(&info));
+
+        info.codec = "pcm_f32le".to_string();
+        info.format_name = "wav".to_string();
+        info.sample_format_is_float = Some(true);
+        assert!(!source_info_is_red_book_compatible(&info));
     }
 
     #[test]

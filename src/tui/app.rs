@@ -7058,6 +7058,24 @@ impl MetadataFileDetails {
         };
     }
 
+    pub fn set_preemphasis_advisory(
+        &mut self,
+        advisory: &crate::tui::preemphasis::PreemphasisAdvisory,
+    ) {
+        let safe = crate::tui::preemphasis::result_from_advisory(
+            self.file_facts.path.clone(),
+            Some(advisory),
+        );
+        self.analysis_facts.preemphasis = Some(safe.confidence);
+        self.analysis_facts.preemphasis_detail = if safe.detail.is_empty() {
+            None
+        } else {
+            Some(safe.detail)
+        };
+    }
+
+    /// Compatibility path for legacy string caches. Ambiguous catalog labels
+    /// are intentionally interpreted as `Possible`, never promoted to strong.
     pub fn set_preemphasis_metadata_label(&mut self, label: &str) {
         let safe = crate::tui::preemphasis::result_from_metadata_label(
             self.file_facts.path.clone(),
@@ -11170,6 +11188,9 @@ pub struct AppState {
     /// Authoritative text field under an open editor context menu.
     pub editor_context_target: Option<EditorTextTarget>,
 
+    /// Last-request-wins ownership for asynchronous host-clipboard reads.
+    pub host_clipboard_paste_generation: u64,
+
     /// Most recent terminal file-task state, retained after its live overlay is
     /// dismissed so full warnings/failures remain inspectable via `:messages`.
     pub last_file_task_progress: Option<(u64, tui_file_picker::FileTaskProgressState)>,
@@ -12072,6 +12093,7 @@ impl AppState {
             active_overlay,
             pending_editor_context_overlay: None,
             editor_context_target: None,
+            host_clipboard_paste_generation: 0,
             last_file_task_progress: None,
             file_operation_undo: FileOperationUndoJournal::default(),
             #[cfg(test)]
@@ -17770,6 +17792,35 @@ mod metadata_presentation_tab_tests {
         assert!(matches!(details.files[1].media_facts, ProbeState::NotLoaded), "failed probe becomes retryable");
         assert!(details.files[1].issues.iter().all(|issue| !matches!(issue, MetadataIssue::Probe { .. })));
         assert!(matches!(details.details_probe_state, MetadataDetailsProbeState::Unloaded));
+    }
+
+    #[test]
+    fn canonical_metadata_view_promotes_present_preemphasis_and_cue_flags_only() {
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/album/track.flac")],
+            vec![
+                tag("TITLE", "Song", vec!["Song"]),
+                tag("PRE_EMPHASIS", "1", vec!["1"]),
+                tag("CUE_FLAGS", "PRE", vec!["PRE"]),
+                tag("X-CUSTOM", "diagnostic", vec!["diagnostic"]),
+            ],
+            vec!["track.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+
+        assert_eq!(state.metadata_view, MetadataEditorView::Canonical);
+        assert_eq!(state.visible_metadata_entry_indices(), vec![0, 1, 2]);
+
+        state.set_metadata_view(MetadataEditorView::All);
+        assert_eq!(state.visible_metadata_entry_indices(), vec![0, 1, 2, 3]);
+
+        let untagged = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/album/untagged.flac")],
+            vec![tag("TITLE", "Song", vec!["Song"])],
+            vec!["untagged.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        assert_eq!(untagged.visible_metadata_entry_indices(), vec![0]);
     }
 
     #[test]

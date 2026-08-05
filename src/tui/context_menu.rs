@@ -2635,6 +2635,7 @@ pub fn execute_context_action(
                 tui_file_picker::FilePickerClipboardMode::Cut,
                 vec![path],
             ) {
+                mirror_host_clipboard_text(&clipboard.text_projection());
                 app.browse.filesystem_clipboard = Some(clipboard);
                 app.browse.filesystem_clipboard_retry_plan = None;
                 app.set_status("Cut tree folder");
@@ -2645,6 +2646,7 @@ pub fn execute_context_action(
                 tui_file_picker::FilePickerClipboardMode::Copy,
                 vec![path],
             ) {
+                mirror_host_clipboard_text(&clipboard.text_projection());
                 app.browse.filesystem_clipboard = Some(clipboard);
                 app.browse.filesystem_clipboard_retry_plan = None;
                 app.set_status("Copied tree folder");
@@ -2774,6 +2776,7 @@ pub fn execute_context_action(
             match tui_file_picker::FilesystemClipboard::new(mode, selection.paths) {
                 Some(clipboard) => {
                     let count = clipboard.paths().len();
+                    mirror_host_clipboard_text(&clipboard.text_projection());
                     app.browse.filesystem_clipboard = Some(clipboard);
                     app.browse.filesystem_clipboard_retry_plan = None;
                     app.set_status(format!(
@@ -3675,8 +3678,6 @@ pub fn execute_context_action(
     }
 }
 
-const OSC52_TEXT_CLIPBOARD_MAX_BYTES: usize = 64 * 1024;
-
 /// Publish through Tonepoet's single text-clipboard authority. The picker
 /// crate stores the in-process value and invokes the process-wide system
 /// publisher installed by the TUI at startup.
@@ -3684,74 +3685,18 @@ pub(crate) fn publish_text_clipboard(text: &str) {
     tui_file_picker::write_shared_text_clipboard(text.to_string());
 }
 
+/// Mirror structured clipboard content to the host as text without replacing
+/// the internal text-editing clipboard.
+pub(crate) fn mirror_host_clipboard_text(text: &str) {
+    tui_file_picker::mirror_host_clipboard_text(text);
+}
+
 /// Host hook installed into `tui-file-picker`. Publication remains
 /// best-effort: the authoritative in-process clipboard was already updated
 /// before this hook runs.
 pub(crate) fn publish_system_clipboard(text: &str) {
-    let _ = write_osc52_clipboard_to(&mut std::io::stdout(), text);
+    super::host_clipboard::publish_system_clipboard(text);
 }
-
-/// Best-effort OSC 52 system-clipboard publication. `Ok(false)` means the
-/// payload exceeded the conservative terminal interoperability cap and was
-/// intentionally not emitted.
-pub(crate) fn write_osc52_clipboard_to(
-    writer: &mut impl std::io::Write,
-    text: &str,
-) -> std::io::Result<bool> {
-    write_osc52_clipboard_to_with_tmux(writer, text, std::env::var_os("TMUX").is_some())
-}
-
-fn write_osc52_clipboard_to_with_tmux(
-    writer: &mut impl std::io::Write,
-    text: &str,
-    tmux_passthrough: bool,
-) -> std::io::Result<bool> {
-    if text.len() > OSC52_TEXT_CLIPBOARD_MAX_BYTES {
-        return Ok(false);
-    }
-    let encoded = base64_encode(text.as_bytes());
-    let osc = format!("\x1b]52;c;{}\x07", encoded);
-    writer.write_all(osc.as_bytes())?;
-    if tmux_passthrough {
-        writer.write_all(b"\x1bPtmux;")?;
-        for byte in osc.bytes() {
-            if byte == 0x1b {
-                writer.write_all(b"\x1b\x1b")?;
-            } else {
-                writer.write_all(&[byte])?;
-            }
-        }
-        writer.write_all(b"\x1b\\")?;
-    }
-    writer.flush()?;
-    Ok(true)
-}
-
-/// Minimal base64 encoder for OSC 52 clipboard (no crate dependency).
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(CHARS[((n >> 18) & 0x3F) as usize] as char);
-        out.push(CHARS[((n >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(CHARS[((n >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(CHARS[(n & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
 
 fn launch_gnudb_for_split_cue_grouping_decision(
     operation_id: super::message::TagsMbOperationId,
@@ -4630,31 +4575,6 @@ mod tests {
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
             Some("Copied 1 field from 2 files (text clipboard)")
         );
-    }
-
-    #[test]
-    fn osc52_tag_clipboard_write_is_exact_and_size_gated() {
-        let mut emitted = Vec::new();
-        assert!(write_osc52_clipboard_to_with_tmux(&mut emitted, "Duke", false)
-            .expect("OSC 52 write"));
-        assert_eq!(emitted, b"\x1b]52;c;RHVrZQ==\x07");
-
-        let mut tmux = Vec::new();
-        assert!(write_osc52_clipboard_to_with_tmux(&mut tmux, "Duke", true)
-            .expect("tmux OSC 52 write"));
-        assert_eq!(
-            tmux,
-            b"\x1b]52;c;RHVrZQ==\x07\x1bPtmux;\x1b\x1b]52;c;RHVrZQ==\x07\x1b\\"
-        );
-
-        let mut oversized = Vec::new();
-        assert!(!write_osc52_clipboard_to_with_tmux(
-            &mut oversized,
-            &"x".repeat(OSC52_TEXT_CLIPBOARD_MAX_BYTES + 1),
-            true,
-        )
-        .expect("oversized OSC 52 skip"));
-        assert!(oversized.is_empty(), "oversized payloads must not emit a partial escape");
     }
 
     #[test]
@@ -6052,6 +5972,61 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn browse_filesystem_copy_and_cut_preserve_internal_text_clipboard() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            file.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            5,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        let (tx, _rx) = mpsc::channel(4);
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+
+        tui_file_picker::with_scoped_shared_text_clipboard("prior metadata text", || {
+            tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+                move |text| sink.borrow_mut().push(text.to_string()),
+                || {
+                    execute_context_action(
+                        &mut app,
+                        ContextAction::CopySelection,
+                        &tx,
+                        false,
+                    );
+                    execute_context_action(
+                        &mut app,
+                        ContextAction::CutSelection,
+                        &tx,
+                        false,
+                    );
+                },
+            );
+            assert_eq!(
+                tui_file_picker::read_shared_text_clipboard(),
+                "prior metadata text",
+            );
+        });
+
+        let clipboard = app
+            .browse
+            .filesystem_clipboard
+            .as_ref()
+            .expect("structured filesystem clipboard");
+        assert_eq!(clipboard.paths(), &[file.clone()]);
+        assert_eq!(clipboard.mode(), tui_file_picker::FilePickerClipboardMode::Cut);
+        let expected = file.to_string_lossy().to_string();
+        assert_eq!(published.borrow().as_slice(), &[expected.clone(), expected]);
     }
 
     #[test]

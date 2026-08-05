@@ -3536,6 +3536,18 @@ mod bookmark_detail_retry_regression_tests {
 
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
+        AppMessage::HostClipboardReadComplete {
+            generation,
+            target,
+            result,
+        } => {
+            super::keybindings::handle_host_clipboard_read_complete(
+                app,
+                generation,
+                target,
+                result,
+            );
+        }
         AppMessage::ClearTrackProgress {
             item_id,
             track_index,

@@ -43951,6 +43951,21 @@ mod naming_template_tests {
     }
 
     #[test]
+    fn folder_template_uses_corrected_kool_and_the_gang_canonical_identity() {
+        let mut source = template_source();
+        source.album_metadata.album_artist = Some("Kool & the Gang".to_string());
+        source.album_metadata.album = Some("Emergency".to_string());
+        assert_eq!(
+            render_folder_template(
+                "%ARTIST%, %ALBUM%, 1984/Flac",
+                &source,
+                &tonepoet_pipeline::AudioFormat::Flac,
+            ),
+            PathBuf::from("Kool & The Gang, Emergency, 1984/Flac")
+        );
+    }
+
+    #[test]
     fn track_template_canonicalizes_track_artist_casing() {
         let mut source = template_source();
         source.album_metadata.album_artist = None;

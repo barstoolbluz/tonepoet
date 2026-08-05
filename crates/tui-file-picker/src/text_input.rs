@@ -40,19 +40,27 @@ pub fn write_shared_text_clipboard(text: impl Into<String>) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *clipboard = text.clone();
     }
+    mirror_host_clipboard_text(&text);
+}
 
+/// Publish a best-effort host clipboard projection without changing Tonepoet's
+/// internal text clipboard. Structured filesystem cut/copy uses this path so a
+/// later Ctrl+V/Ctrl+P in a text field still pastes the user's prior text copy.
+pub fn mirror_host_clipboard_text(text: &str) {
     let handled_scoped_hook = SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.with(|hook| {
         let hook = hook.borrow();
         if let Some(hook) = hook.as_ref() {
-            hook(&text);
+            hook(text);
             true
         } else {
             false
         }
     });
-    if !handled_scoped && !handled_scoped_hook {
+    let scoped_clipboard_active =
+        SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| scoped.borrow().is_some());
+    if !handled_scoped_hook && !scoped_clipboard_active {
         if let Some(hook) = TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.get() {
-            hook(&text);
+            hook(text);
         }
     }
 }
@@ -1081,6 +1089,11 @@ pub fn handle_text_input_key_with_boundaries(
             true
         }
 
+        // The embedding TUI owns asynchronous host-clipboard reads. Do not let
+        // Ctrl+Shift+V fall through to the internal clipboard path; callers use
+        // the unhandled result to launch the host read without ambiguity.
+        (true, false, true, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'v') => false,
+
         // Clipboard commands.
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'c') => {
             input.copy_selection()
@@ -2096,6 +2109,23 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_v_is_reserved_for_the_host_clipboard() {
+        with_scoped_shared_text_clipboard("internal", || {
+            let mut input = TextInputState::new("prefix".to_string());
+            input.cursor_end();
+
+            assert!(!handle_text_input_key(
+                &mut input,
+                &key(
+                    KeyCode::Char('v'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+            ));
+            assert_eq!(input.text, "prefix");
+        });
+    }
+
+    #[test]
     fn ctrl_a_selects_all_and_typing_replaces_selection() {
         let mut s = TextInputState::new("hello".to_string());
         handle_text_input_key(&mut s, &key(KeyCode::Char('a'), KeyModifiers::CONTROL));
@@ -2252,6 +2282,26 @@ mod tests {
         assert_eq!(
             published.borrow().as_slice(),
             &["path/to/album".to_string(), "path/to/album".to_string()]
+        );
+    }
+
+    #[test]
+    fn host_only_mirror_does_not_replace_internal_text() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let published = Rc::new(RefCell::new(Vec::<String>::new()));
+        let hook_published = Rc::clone(&published);
+        with_scoped_shared_text_clipboard("prior metadata text", || {
+            with_scoped_shared_text_clipboard_publish_hook(
+                move |text| hook_published.borrow_mut().push(text.to_string()),
+                || mirror_host_clipboard_text("/music/album/track.flac"),
+            );
+            assert_eq!(read_shared_text_clipboard(), "prior metadata text");
+        });
+        assert_eq!(
+            published.borrow().as_slice(),
+            &["/music/album/track.flac".to_string()],
         );
     }
 

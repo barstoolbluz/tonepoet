@@ -122,9 +122,46 @@ pub struct FileOperationReplayResult {
     pub failed: Vec<(usize, String)>,
 }
 
+/// Semantic destination for an asynchronous host-clipboard read.
+///
+/// Targets carry enough identity to reject late completions after focus,
+/// presentation, or picker ownership changes. Clipboard text is never applied
+/// merely because some editor happens to be open when a worker finishes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostClipboardPasteTarget {
+    BrowseInlineEdit {
+        target: crate::tui::app::BrowseInlineEditTarget,
+    },
+    OverlayTextEdit {
+        target: crate::tui::app::TextEditTarget,
+    },
+    MetadataInline {
+        session_id: u64,
+        field_index: usize,
+    },
+    MetadataDetail {
+        session_id: u64,
+        field_index: usize,
+        detail_index: usize,
+    },
+    FilePickerOverlay {
+        session_id: u64,
+    },
+    MetadataFilePicker {
+        editor_session_id: u64,
+        picker_session_id: u64,
+    },
+}
+
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
+    /// Completion of an explicit Ctrl+Shift+V host-clipboard read.
+    HostClipboardReadComplete {
+        generation: u64,
+        target: HostClipboardPasteTarget,
+        result: Result<String, String>,
+    },
     /// A conversion item or one of its concurrent tracks reported progress.
     /// When `track_index` is `Some(idx)`, the update describes one track
     /// inside a multi-track source. The TUI routes these to per-track

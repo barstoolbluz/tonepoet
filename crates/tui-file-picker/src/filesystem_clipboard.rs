@@ -43,6 +43,19 @@ impl FilesystemClipboard {
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
+
+    /// Plain-text projection mirrored to the host clipboard.
+    ///
+    /// The in-process clipboard remains authoritative for copy/move semantics;
+    /// this projection is intentionally portable and lossless enough for users
+    /// to paste the selected paths into a shell, editor, or file manager.
+    pub fn text_projection(&self) -> String {
+        self.paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// Remap a currently viewed path after a successful cut/paste operation.
@@ -129,6 +142,23 @@ mod tests {
                 &[PathBuf::from("/archive/album")],
             ),
             None
+        );
+    }
+
+    #[test]
+    fn text_projection_preserves_clipboard_order_and_uses_newline_delimiters() {
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Copy,
+            vec![
+                PathBuf::from("/music/disc 1/01.flac"),
+                PathBuf::from("/music/disc 2/02.flac"),
+            ],
+        )
+        .expect("clipboard");
+
+        assert_eq!(
+            clipboard.text_projection(),
+            "/music/disc 1/01.flac\n/music/disc 2/02.flac"
         );
     }
 }

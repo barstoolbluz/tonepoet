@@ -454,7 +454,7 @@ fn metadata_hdcd_is_applicable_to_active_surface(state: &MetadataEditorState) ->
 
 fn metadata_preemphasis_is_applicable_to_active_surface(state: &MetadataEditorState) -> bool {
     if state.active_surface().technical_details.disc.is_some() {
-        return true;
+        return false;
     }
     metadata_details_files_for_display(state)
         .iter()
@@ -482,6 +482,15 @@ fn preemphasis_applicable_for_file(file: &MetadataFileDetails) -> bool {
             || combined.contains("ac-3")
             || combined.contains("e-ac-3")
             || combined.contains("dts")
+        {
+            return false;
+        }
+        // Red Book pre-emphasis is defined only for 16-bit / 44.1 kHz CD
+        // audio. A missing bit-depth remains provisionally applicable so a
+        // partially populated probe does not hide the row, but any known
+        // contradiction makes the advisory inapplicable.
+        if facts.bit_depth.is_some_and(|depth| depth != 16)
+            || (facts.sample_rate != 0 && facts.sample_rate != 44_100)
         {
             return false;
         }
@@ -605,9 +614,6 @@ fn path_has_extension(path: &Path, extensions: &[&str]) -> bool {
 }
 
 fn metadata_preemphasis_status(state: &MetadataEditorState) -> String {
-    if state.active_surface().technical_details.disc.is_some() {
-        return "N/A".to_string();
-    }
     let values: Vec<String> = metadata_details_files_for_display(state)
         .iter()
         .map(|file| {
@@ -668,7 +674,7 @@ fn preemphasis_status_for_file(file: &MetadataFileDetails) -> String {
         | Some(PreemphasisConfidence::StrongCandidate)
         | Some(PreemphasisConfidence::Possible)
         | Some(PreemphasisConfidence::Indeterminate) => "Not detected".to_string(),
-        None => "«not scanned»".to_string(),
+        None => "«not checked»".to_string(),
     }
 }
 
@@ -1826,7 +1832,49 @@ mod tests {
     }
 
     #[test]
-    fn details_view_shows_preemphasis_as_na_for_disc_surface() {
+    fn details_view_limits_preemphasis_to_red_book_probe_facts() {
+        let red_book = details_state_for_file(file_with_probe(
+            "/tmp/red-book.flac",
+            "flac",
+            "flac",
+            Some(16),
+        ));
+        assert_eq!(
+            details_value(&build_details_view_model(&red_book), "Pre-emphasis"),
+            Some("«not checked»")
+        );
+
+        let mut high_rate = file_with_probe(
+            "/tmp/high-rate.flac",
+            "flac",
+            "flac",
+            Some(16),
+        );
+        if let ProbeState::Ready(facts) = &mut high_rate.media_facts {
+            facts.sample_rate = 96_000;
+        }
+        assert_eq!(
+            details_value(
+                &build_details_view_model(&details_state_for_file(high_rate)),
+                "Pre-emphasis",
+            ),
+            None
+        );
+
+        let high_depth = details_state_for_file(file_with_probe(
+            "/tmp/high-depth.flac",
+            "flac",
+            "flac",
+            Some(24),
+        ));
+        assert_eq!(
+            details_value(&build_details_view_model(&high_depth), "Pre-emphasis"),
+            None
+        );
+    }
+
+    #[test]
+    fn details_view_hides_preemphasis_for_disc_surface() {
         let file = file_with_probe("/tmp/disc.iso", "dsf", "dsd", Some(1));
         let mut state = details_state_for_file(file);
         state.active_surface_mut().technical_details.disc =
@@ -1834,7 +1882,7 @@ mod tests {
 
         let vm = build_details_view_model(&state);
 
-        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("N/A"));
+        assert_eq!(details_value(&vm, "Pre-emphasis"), None);
     }
 
     #[test]
@@ -1894,7 +1942,7 @@ mod tests {
 
         let vm = build_details_view_model(&state);
 
-        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("«not scanned»"));
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("«not checked»"));
     }
 
     #[test]
@@ -2336,7 +2384,7 @@ mod tests {
     }
 
     #[test]
-    fn preemphasis_status_has_not_scanned_and_mixed_values() {
+    fn preemphasis_status_has_not_checked_and_mixed_values() {
         let mut not_scanned = MetadataFileDetails::from_open_cache(
             PathBuf::from("/tmp/unscanned.flac"),
             Some(100),
@@ -2348,7 +2396,7 @@ mod tests {
             FileWriteEligibility::Writable,
             super::super::probe::SourceMetadata::default(),
         );
-        assert_eq!(preemphasis_status_for_file(&not_scanned), "«not scanned»");
+        assert_eq!(preemphasis_status_for_file(&not_scanned), "«not checked»");
 
         not_scanned.analysis_facts.preemphasis =
             Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected);

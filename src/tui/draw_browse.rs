@@ -135,7 +135,30 @@ fn name_column_width(layout: &[BrowseColumnCell]) -> usize {
         .unwrap_or(MIN_NAME_W)
 }
 
-/// Draw the full browse screen
+/// Format the cached advisory without flattening its confidence.
+fn browse_preemphasis_status_text(
+    advisory: &super::preemphasis::PreemphasisAdvisory,
+) -> String {
+    let evidence = advisory
+        .catalog
+        .as_ref()
+        .map(|catalog| format!("catalog {}", catalog.catalog_number))
+        .unwrap_or_else(|| advisory.detail.clone());
+    let verdict = match advisory.confidence {
+        super::preemphasis::PreemphasisConfidence::Detected => "detected",
+        super::preemphasis::PreemphasisConfidence::StrongCandidate => "strong candidate",
+        super::preemphasis::PreemphasisConfidence::Possible => "possible",
+        super::preemphasis::PreemphasisConfidence::NotDetected => "not detected",
+        super::preemphasis::PreemphasisConfidence::Indeterminate => "not checked",
+    };
+    if evidence.trim().is_empty() {
+        verdict.to_string()
+    } else {
+        format!("{verdict} ({evidence})")
+    }
+}
+
+/// Draw the full browse screen.
 pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     app.browse.last_render_area = Some(area);
 
@@ -3497,17 +3520,28 @@ fn entry_info_lines(
                     Span::styled(info.size_display(), theme.text_style()),
                 ]);
 
-                // Pre-emphasis — show if metadata evidence detected.
-                if let Some(ref pe) = cached.metadata.preemphasis_metadata {
+                // Pre-emphasis — preserve typed confidence from the detector.
+                if let Some(ref advisory) = cached.metadata.preemphasis_metadata {
+                    let value = browse_preemphasis_status_text(advisory);
+                    let style = match advisory.confidence {
+                        super::preemphasis::PreemphasisConfidence::Detected => {
+                            Style::default().fg(theme.destructive)
+                        }
+                        super::preemphasis::PreemphasisConfidence::StrongCandidate
+                        | super::preemphasis::PreemphasisConfidence::Possible => {
+                            Style::default().fg(theme.amber)
+                        }
+                        super::preemphasis::PreemphasisConfidence::NotDetected
+                        | super::preemphasis::PreemphasisConfidence::Indeterminate => {
+                            theme.muted()
+                        }
+                    };
                     lines.push(vec![
                         Span::styled("   pre-emph", theme.muted()),
                         Span::raw(" "),
                         Span::styled(
-                            truncate_to(
-                                &format!("detected ({})", pe),
-                                max_value_chars.saturating_sub(11),
-                            ),
-                            Style::default().fg(theme.destructive),
+                            truncate_to(&value, max_value_chars.saturating_sub(11)),
+                            style,
                         ),
                     ]);
                 }
@@ -4145,6 +4179,25 @@ mod browse_list_render_allocation_tests {
             1024,
             None,
         )
+    }
+
+    #[test]
+    fn possible_catalog_advisory_is_never_rendered_as_detected() {
+        let advisory = crate::tui::preemphasis::PreemphasisAdvisory {
+            evidence: crate::tui::preemphasis::PreemphasisAdvisoryEvidence::Catalog,
+            confidence: crate::tui::preemphasis::PreemphasisConfidence::Possible,
+            catalog: Some(crate::tui::preemphasis::CatalogAdvisory {
+                catalog_number: "35DP-150".to_string(),
+                quality: crate::tui::preemphasis::catalog::CatalogMatchQuality::Exact,
+                source: crate::tui::preemphasis::catalog::CatalogMatchSource::Folder,
+                source_row: 1,
+                source_catalog_cell: "35DP-150".to_string(),
+            }),
+            detail: "folder exact match".to_string(),
+        };
+        let rendered = browse_preemphasis_status_text(&advisory);
+        assert_eq!(rendered, "possible (catalog 35DP-150)");
+        assert!(!rendered.contains("detected"));
     }
 
     fn cached_info() -> CachedInfo {

@@ -3142,6 +3142,143 @@ fn report_scoped_text_clipboard_status(
     }
 }
 
+fn is_host_clipboard_paste_chord(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
+        && key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn begin_host_clipboard_paste(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    target: super::message::HostClipboardPasteTarget,
+) {
+    app.host_clipboard_paste_generation = app
+        .host_clipboard_paste_generation
+        .checked_add(1)
+        .unwrap_or(1);
+    let generation = app.host_clipboard_paste_generation;
+    super::host_clipboard::request_host_clipboard_paste(tx.clone(), generation, target);
+    app.set_status("Reading host clipboard…");
+}
+
+fn single_line_clipboard_text(text: &str) -> &str {
+    text.split(|ch| matches!(ch, '\r' | '\n')).next().unwrap_or("")
+}
+
+pub(crate) fn handle_host_clipboard_read_complete(
+    app: &mut AppState,
+    generation: u64,
+    target: super::message::HostClipboardPasteTarget,
+    result: Result<String, String>,
+) {
+    if generation != app.host_clipboard_paste_generation {
+        return;
+    }
+
+    let text = match result {
+        Ok(text) if !text.is_empty() => text,
+        Ok(_) => {
+            app.set_status("Host clipboard is empty");
+            return;
+        }
+        Err(error) => {
+            app.set_status(format!("Host clipboard unavailable: {error}"));
+            return;
+        }
+    };
+
+    let applied = match target {
+        super::message::HostClipboardPasteTarget::BrowseInlineEdit { target } => app
+            .browse_inline_edit
+            .as_mut()
+            .filter(|edit| edit.target == target)
+            .map(|edit| edit.input.insert_string(single_line_clipboard_text(&text)))
+            .is_some(),
+        super::message::HostClipboardPasteTarget::OverlayTextEdit { target } => {
+            match &mut app.active_overlay {
+                ActiveOverlay::TextEdit {
+                    input,
+                    target: active_target,
+                    ..
+                } if *active_target == target => {
+                    input.insert_string(single_line_clipboard_text(&text));
+                    true
+                }
+                _ => false,
+            }
+        }
+        super::message::HostClipboardPasteTarget::MetadataInline {
+            session_id,
+            field_index,
+        } => match &mut app.active_overlay {
+            ActiveOverlay::MetadataEditor(state)
+                if state.active_surface().technical_details.session_id == session_id
+                    && state.phase == MetadataEditorPhase::InlineEdit
+                    && state.cursor == field_index =>
+            {
+                state
+                    .edit_input
+                    .as_mut()
+                    .map(|input| input.insert_string(&text))
+                    .is_some()
+            }
+            _ => false,
+        },
+        super::message::HostClipboardPasteTarget::MetadataDetail {
+            session_id,
+            field_index,
+            detail_index,
+        } => match &mut app.active_overlay {
+            ActiveOverlay::MetadataEditor(state)
+                if state.active_surface().technical_details.session_id == session_id
+                    && state.phase == MetadataEditorPhase::DetailEdit
+                    && state.detail_field_idx == field_index
+                    && state.detail_cursor == detail_index =>
+            {
+                state
+                    .detail_edit
+                    .as_mut()
+                    .map(|input| input.insert_string(&text))
+                    .is_some()
+            }
+            _ => false,
+        },
+        super::message::HostClipboardPasteTarget::FilePickerOverlay { session_id } => {
+            match &mut app.active_overlay {
+                ActiveOverlay::FilePicker(session) if session.session_id == session_id => {
+                    session.picker.paste_host_clipboard_text(&text)
+                }
+                _ => false,
+            }
+        }
+        super::message::HostClipboardPasteTarget::MetadataFilePicker {
+            editor_session_id,
+            picker_session_id,
+        } => match &mut app.active_overlay {
+            ActiveOverlay::MetadataEditor(state)
+                if state.active_surface().technical_details.session_id == editor_session_id =>
+            {
+                state
+                    .file_picker
+                    .as_mut()
+                    .filter(|session| session.session_id == picker_session_id)
+                    .map(|session| session.picker.paste_host_clipboard_text(&text))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        },
+    };
+
+    if applied {
+        app.set_status("Pasted from host clipboard");
+    } else {
+        app.set_status("Host clipboard result ignored because the editor changed");
+    }
+}
+
 fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
     match (key.code, key.modifiers) {
         (KeyCode::Enter, KeyModifiers::NONE) => commit_convert_metadata_inline_edit(app),
@@ -3645,6 +3782,21 @@ fn handle_browse_inline_edit_key(
     key: KeyEvent,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    if is_host_clipboard_paste_chord(&key) {
+        if let Some(target) = app
+            .browse_inline_edit
+            .as_ref()
+            .map(|edit| edit.target.clone())
+        {
+            begin_host_clipboard_paste(
+                app,
+                tx,
+                super::message::HostClipboardPasteTarget::BrowseInlineEdit { target },
+            );
+        }
+        return;
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Enter, KeyModifiers::NONE) => {
             commit_browse_inline_edit(app, tx);
@@ -7172,6 +7324,15 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             let session_id = session.session_id;
             let purpose = session.purpose.clone();
             let action = session.picker.handle_key(key);
+            if session.picker.take_host_clipboard_paste_request() {
+                begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::FilePickerOverlay { session_id },
+                );
+                app.active_overlay = ActiveOverlay::FilePicker(session);
+                return;
+            }
             let ignored_directories = session.picker.take_last_selection_ignored_directories();
             if let Err(err) = send_file_picker_completion(
                 app,
@@ -7395,6 +7556,21 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             target,
             label,
         } => {
+            if is_host_clipboard_paste_chord(&key) {
+                begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::OverlayTextEdit {
+                        target: target.clone(),
+                    },
+                );
+                app.active_overlay = ActiveOverlay::TextEdit {
+                    input,
+                    target,
+                    label,
+                };
+                return;
+            }
             let restore_parked_metadata_editor =
                 matches!(&target, TextEditTarget::ArchivePassword(_));
             match key.code {
@@ -12693,12 +12869,24 @@ fn handle_metadata_file_picker_key(
     state: &mut Box<super::app::MetadataEditorState>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    let editor_session_id = state.active_surface().technical_details.session_id;
     let Some(session) = state.file_picker.as_mut() else {
         return;
     };
     let session_id = session.session_id;
     let purpose = session.purpose.clone();
     let action = session.picker.handle_key(key);
+    if session.picker.take_host_clipboard_paste_request() {
+        begin_host_clipboard_paste(
+            app,
+            tx,
+            super::message::HostClipboardPasteTarget::MetadataFilePicker {
+                editor_session_id,
+                picker_session_id: session_id,
+            },
+        );
+        return;
+    }
     let ignored_directories = session.picker.take_last_selection_ignored_directories();
     if let Err(err) = send_file_picker_completion(
         app,
@@ -14264,6 +14452,17 @@ fn handle_metadata_editor_key(
                 state.phase = MetadataEditorPhase::Editing;
                 return;
             }
+            if is_host_clipboard_paste_chord(&key) {
+                begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::MetadataInline {
+                        session_id: state.active_surface().technical_details.session_id,
+                        field_index: state.cursor,
+                    },
+                );
+                return;
+            }
             let value_completion_candidates = state
                 .active_surface()
                 .entries
@@ -14454,6 +14653,18 @@ fn handle_metadata_editor_key(
 
             // If an inline edit is active within the detail overlay:
             if state.detail_edit.is_some() {
+                if is_host_clipboard_paste_chord(&key) {
+                    begin_host_clipboard_paste(
+                        app,
+                        tx,
+                        super::message::HostClipboardPasteTarget::MetadataDetail {
+                            session_id: state.active_surface().technical_details.session_id,
+                            field_index: state.detail_field_idx,
+                            detail_index: state.detail_cursor,
+                        },
+                    );
+                    return;
+                }
                 match key.code {
                     KeyCode::Esc => {
                         state.detail_edit = None;
@@ -18878,7 +19089,40 @@ fn build_metadata_editor_for_cue_surfaces_with_policy_and_member_file_order(
         native_multi_file_source = Some(selected);
         native_multi_file_merged = Some(merged);
     }
-    if sorted.len() == 1 && sorted[0].audio_paths.len() == 1 {
+    // A single-image surface whose CUE proves multi-track image content is
+    // structurally authoritative and must reach the unified synthetic-sheet
+    // path below, but it still owes the flat path's sidecar-vs-embedded
+    // policy selection: resolve the authoritative source here (without the
+    // flat path's per-file entry mutations) and hand it to the same
+    // authority plumbing the native multi-FILE route uses.
+    let mut single_image_embedded_cuesheet_present = None;
+    if sorted.len() == 1
+        && sorted[0].audio_paths.len() == 1
+        && metadata_cue_surface_proves_image_content(&sorted[0])
+    {
+        let merged = super::probe::read_all_tags_merged_with_metadata(&sorted[0].audio_paths)
+            .map_err(|err| {
+                format!(
+                    "Failed to read tags for single-image CUE album {}: {}",
+                    sorted[0].audio_path.display(),
+                    err,
+                )
+            })?;
+        let embedded_cuesheet_present =
+            metadata_entries_contain_embedded_cuesheet(&merged.entries);
+        let embedded =
+            embedded_cue_candidate_for_metadata(&merged.entries, &sorted[0].audio_path);
+        let selected = resolve_metadata_cue_source(cue_policy, &sorted[0], &embedded)?;
+        sorted[0].cue_text = selected.cue_text.clone();
+        sorted[0].sheet = selected.sheet.clone();
+        single_image_embedded_cuesheet_present = Some(embedded_cuesheet_present);
+        native_multi_file_source = Some(selected);
+        native_multi_file_merged = Some(merged);
+    }
+    if sorted.len() == 1
+        && sorted[0].audio_paths.len() == 1
+        && !metadata_cue_surface_proves_image_content(&sorted[0])
+    {
         let surface = &sorted[0];
         let paths = surface.audio_paths.clone();
         let merged = super::probe::read_all_tags_merged_with_metadata(&paths).map_err(|err| {
@@ -19176,6 +19420,12 @@ fn build_metadata_editor_for_cue_surfaces_with_policy_and_member_file_order(
         .unwrap_or_else(|| "Merged CUE album".to_string());
     tab.embedded_cuesheet_present = !native_sidecar_authority;
     tab.sidecar_cuesheet_shadow_present = native_sidecar_authority;
+    if let Some(embedded_present) = single_image_embedded_cuesheet_present {
+        // Single-image surfaces report the file's ACTUAL embedded-cuesheet
+        // presence (like the flat path did) so embedded-cue actions stay
+        // live even when the sidecar is the selected authority.
+        tab.embedded_cuesheet_present = embedded_present;
+    }
     if let Some(source) = native_multi_file_source {
         tab.cue_source = Some(source.identity);
     }
@@ -21861,8 +22111,8 @@ fn metadata_technical_details_for_paths_with_analysis(
                     file.merge_analysis_facts(&facts);
                 }
             }
-            if let Some(label) = metadata_preemphasis.as_deref() {
-                file.set_preemphasis_metadata_label(label);
+            if let Some(advisory) = metadata_preemphasis.as_ref() {
+                file.set_preemphasis_advisory(advisory);
             }
             if let Some(result) = preemph_results.iter().find(|result| result.path == *path) {
                 file.set_preemphasis_result(result);
@@ -46476,6 +46726,46 @@ mod phase4_tests {
     }
 
     #[test]
+    fn host_clipboard_completion_applies_only_to_the_owned_live_editor() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let target = crate::tui::app::BrowseInlineEditTarget::Rename {
+            path: std::path::PathBuf::from("/music/old.flac"),
+        };
+        app.browse_inline_edit = Some(crate::tui::app::BrowseInlineEditState {
+            target: target.clone(),
+            input: crate::tui::text_input::TextInputState::new("old".to_string()),
+        });
+        app.host_clipboard_paste_generation = 9;
+
+        handle_host_clipboard_read_complete(
+            &mut app,
+            8,
+            super::super::message::HostClipboardPasteTarget::BrowseInlineEdit {
+                target: target.clone(),
+            },
+            Ok("stale".to_string()),
+        );
+        assert_eq!(
+            app.browse_inline_edit.as_ref().unwrap().input.text,
+            "old",
+            "a superseded read must not mutate the editor"
+        );
+
+        handle_host_clipboard_read_complete(
+            &mut app,
+            9,
+            super::super::message::HostClipboardPasteTarget::BrowseInlineEdit { target },
+            Ok("new-name
+ignored".to_string()),
+        );
+        assert_eq!(
+            app.browse_inline_edit.as_ref().unwrap().input.text,
+            "oldnew-name",
+            "single-line editors must consume only the first host-clipboard line"
+        );
+    }
+
+    #[test]
     fn metadata_ctrl_c_serializes_only_selected_rows_as_field_blocks() {
         let mut state = two_file_editor(vec![
             entry("TITLE", ItemKey::TrackTitle, &["Behind the Lines", "Duchess"], &["Behind the Lines", "Duchess"]),
@@ -60911,6 +61201,119 @@ mod metadata_cue_source_coverage_tests {
         }
     }
 
+    fn single_image_surface_fixture(
+        root: &std::path::Path,
+        track_count: usize,
+        embed_cuesheet: bool,
+    ) -> MetadataCueSurface {
+        let audio_path = root.join("album.flac");
+        let cue_path = root.join("album.cue");
+        assert!(create_flac_fixture(&audio_path), "single-image FLAC fixture");
+
+        let mut cue_text = concat!(
+            "PERFORMER \"Fixture Artist\"\n",
+            "TITLE \"Fixture Album\"\n",
+            "FILE \"album.flac\" FLAC\n",
+        )
+        .to_string();
+        for track in 1..=track_count {
+            cue_text.push_str(&format!(
+                "  TRACK {track:02} AUDIO\n    TITLE \"Cue Track {track}\"\n    INDEX 01 {:02}:00:00\n",
+                track - 1,
+            ));
+        }
+        std::fs::write(&cue_path, &cue_text).expect("write sidecar CUE");
+        if embed_cuesheet {
+            crate::tui::probe::write_all_tags(
+                &audio_path,
+                &[(
+                    lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                    Some(cue_text.clone()),
+                )],
+            )
+            .expect("write embedded CUESHEET fixture");
+        }
+
+        MetadataCueSurface {
+            cue_path,
+            audio_path: audio_path.clone(),
+            audio_paths: vec![audio_path.clone()],
+            track_audio_paths: vec![audio_path; track_count],
+            role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+            sheet: crate::tui::cue_parser::parse_cue(&cue_text),
+            cue_text,
+        }
+    }
+
+    #[test]
+    fn single_image_multitrack_sidecar_builds_clean_synthetic_album_with_or_without_embedded_cue() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+
+        for embed_cuesheet in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let surface = single_image_surface_fixture(temp.path(), 3, embed_cuesheet);
+            assert!(metadata_cue_surface_proves_image_content(&surface));
+
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            let (state, track_count) = build_metadata_editor_for_cue_surfaces_with_policy(
+                &mut app,
+                std::slice::from_ref(&surface),
+                0,
+                crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            )
+            .expect("single-image multi-track editor");
+
+            assert_eq!(track_count, 3);
+            let tab = state.active_surface();
+            let synthetic = tab
+                .cue_album_synthetic_sheet
+                .as_ref()
+                .expect("multi-track image must retain CUE structure");
+            assert_eq!(synthetic.album_title.as_deref(), Some("Fixture Album"));
+            assert_eq!(synthetic.track_sources.len(), 3);
+            let titles = tab
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+                .expect("per-track TITLE row");
+            assert_eq!(
+                titles.per_file_values,
+                vec!["Cue Track 1", "Cue Track 2", "Cue Track 3"]
+            );
+            assert!(
+                !state.any_presentation_dirty(),
+                "opening a structurally authoritative sidecar must not synthesize an edit; embedded={embed_cuesheet}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_single_track_single_image_cue_remains_flat() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let surface = single_image_surface_fixture(temp.path(), 1, false);
+        assert!(!metadata_cue_surface_proves_image_content(&surface));
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (state, track_count) = build_metadata_editor_for_cue_surfaces_with_policy(
+            &mut app,
+            std::slice::from_ref(&surface),
+            0,
+            crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+        )
+        .expect("single-track flat editor");
+
+        assert_eq!(track_count, 1);
+        assert!(state.active_surface().cue_album_synthetic_sheet.is_none());
+    }
+
     #[derive(Debug)]
     struct PresplitMetadataSidecarFixture {
         album: std::path::PathBuf,
@@ -63404,7 +63807,12 @@ FILE "a.flac" WAVE
             let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
                 panic!("explicit {expected_source} selection must open metadata editor");
             };
-            assert_eq!(state.presentation_tabs.len(), 1);
+            // One surface only, whether presented as a single presentation tab
+            // (flat shape) or as the unified single-album `file_surface`.
+            assert!(
+                state.presentation_tabs.len() <= 1,
+                "explicit {expected_source} selection must not open sibling surfaces",
+            );
             assert_eq!(state.active_surface().paths, vec![expected_path.to_path_buf()]);
             match expected_source {
                 "sidecar" => assert!(matches!(

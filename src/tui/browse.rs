@@ -200,6 +200,25 @@ pub struct CachedInfo {
     pub metadata: SourceMetadata,
 }
 
+impl CachedInfo {
+    pub fn new(source: SourceInfo, mut metadata: SourceMetadata) -> Self {
+        metadata.preemphasis_metadata =
+            crate::tui::preemphasis::preemphasis_advisory_for_source(
+                metadata.preemphasis_metadata.take(),
+                &source,
+            );
+        Self { source, metadata }
+    }
+
+    fn apply_preemphasis_source_gate(&mut self) {
+        self.metadata.preemphasis_metadata =
+            crate::tui::preemphasis::preemphasis_advisory_for_source(
+                self.metadata.preemphasis_metadata.take(),
+                &self.source,
+            );
+    }
+}
+
 /// File identity captured alongside in-memory probe-cache entries.
 ///
 /// The persistent SQLite cache is validated by `(path, mtime, size)`, and the
@@ -9064,6 +9083,7 @@ fn spawn_cached_audio_probe_metadata_completion(
             if cancel_for_task.load(Ordering::Relaxed) {
                 Err("cached probe metadata task cancelled".to_string())
             } else {
+                info.apply_preemphasis_source_gate();
                 Ok(info)
             }
         })
@@ -9107,7 +9127,7 @@ fn spawn_staged_archive_audio_probe(
                     crate::tui::probe::preemphasis_metadata_check_blocking(&path_for_task);
                 metadata
             });
-            Ok(CachedInfo { source, metadata })
+            Ok(CachedInfo::new(source, metadata))
         })
         .await
         .unwrap_or_else(|join_err| Err(format!("staged archive probe task panicked: {}", join_err)));
@@ -9163,7 +9183,7 @@ fn spawn_archive_entry_audio_probe(
                                     );
                                 metadata
                             });
-                        Ok(CachedInfo { source, metadata })
+                        Ok(CachedInfo::new(source, metadata))
                     })
                     .await
                     .unwrap_or_else(|join_err| {
@@ -9289,7 +9309,7 @@ pub fn spawn_audio_probe(
             if cancel_for_task.load(Ordering::Relaxed) {
                 Err("audio probe cancelled".to_string())
             } else {
-                Ok(CachedInfo { source, metadata })
+                Ok(CachedInfo::new(source, metadata))
             }
         })
         .await
@@ -9326,10 +9346,7 @@ pub fn spawn_cue_proxy_audio_probe(
                 .map_err(|err| format!("CUE proxy probe failed: {}; set format manually", err))?;
 
             match result.info {
-                Some(source) => Ok(CachedInfo {
-                    source,
-                    metadata: result.metadata,
-                }),
+                Some(source) => Ok(CachedInfo::new(source, result.metadata)),
                 None => Err(result.probe_notice.unwrap_or_else(|| {
                     "CUE proxy probe returned no source info; set format manually".to_string()
                 })),
@@ -12152,6 +12169,80 @@ mod tests {
                 title: Some(title.to_string()),
                 ..Default::default()
             },
+        }
+    }
+
+    fn cached_preemphasis_advisory(
+        source: crate::tui::preemphasis::catalog::CatalogMatchSource,
+        confidence: crate::tui::preemphasis::PreemphasisConfidence,
+    ) -> crate::tui::preemphasis::PreemphasisAdvisory {
+        crate::tui::preemphasis::PreemphasisAdvisory {
+            evidence: crate::tui::preemphasis::PreemphasisAdvisoryEvidence::Catalog,
+            confidence,
+            catalog: Some(crate::tui::preemphasis::CatalogAdvisory {
+                catalog_number: "35DP-150".to_string(),
+                quality: crate::tui::preemphasis::catalog::CatalogMatchQuality::Exact,
+                source,
+                source_row: 1,
+                source_catalog_cell: "35DP-150".to_string(),
+            }),
+            detail: "exact authoritative catalog match".to_string(),
+        }
+    }
+
+    fn cached_source_info(bit_depth: Option<u32>, sample_rate: u32) -> SourceInfo {
+        SourceInfo {
+            sample_format_is_float: Some(false),
+            format_name: "FLAC".to_string(),
+            codec: "flac".to_string(),
+            bit_depth,
+            sample_rate,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 1024,
+        }
+    }
+
+    #[test]
+    fn cached_info_preserves_catalog_source_and_confidence() {
+        for (source, confidence) in [
+            (
+                crate::tui::preemphasis::catalog::CatalogMatchSource::Tag,
+                crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate,
+            ),
+            (
+                crate::tui::preemphasis::catalog::CatalogMatchSource::Folder,
+                crate::tui::preemphasis::PreemphasisConfidence::Possible,
+            ),
+        ] {
+            let mut metadata = SourceMetadata::default();
+            metadata.preemphasis_metadata =
+                Some(cached_preemphasis_advisory(source, confidence));
+            let cached = CachedInfo::new(cached_source_info(Some(16), 44_100), metadata);
+            let advisory = cached
+                .metadata
+                .preemphasis_metadata
+                .expect("Red Book advisory retained");
+            assert_eq!(advisory.confidence, confidence);
+            assert_eq!(advisory.catalog.expect("catalog").source, source);
+        }
+    }
+
+    #[test]
+    fn cached_info_suppresses_advisory_for_known_non_red_book_audio() {
+        for (bit_depth, sample_rate) in [
+            (Some(24), 96_000),
+            (Some(24), 44_100),
+            (Some(16), 48_000),
+        ] {
+            let mut metadata = SourceMetadata::default();
+            metadata.preemphasis_metadata = Some(cached_preemphasis_advisory(
+                crate::tui::preemphasis::catalog::CatalogMatchSource::Tag,
+                crate::tui::preemphasis::PreemphasisConfidence::StrongCandidate,
+            ));
+            let cached = CachedInfo::new(cached_source_info(bit_depth, sample_rate), metadata);
+            assert!(cached.metadata.preemphasis_metadata.is_none());
         }
     }
 

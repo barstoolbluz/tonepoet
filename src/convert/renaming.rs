@@ -500,10 +500,11 @@ pub fn capitalize_section(section: &str) -> String {
         } else {
             original_word
         };
-        let after_ampersand = index > 0
+        let after_ampersand = (index > 0
             && section[ranges[index - 1].clone()]
                 .chars()
-                .any(|ch| ch == '&');
+                .any(|ch| ch == '&'))
+            || word_affixes(word).0.chars().any(|ch| ch == '&');
         let first_in_delimited_section = word_has_opening_prefix(word);
         let core_lower = word_core(word).to_lowercase();
         let transformed = if index == 0
@@ -568,6 +569,21 @@ fn capitalize_word(word: &str) -> String {
 fn capitalize_word_core(word: &str) -> String {
     if word.is_empty() {
         return String::new();
+    }
+
+    // Ampersands are punctuation, not token separators. Preserve them exactly
+    // while treating every following component as the start of a name/title
+    // component. This covers both spaced input ("& The") and real-world
+    // compact spellings ("&The" / "Kool&The") without inserting spaces.
+    if let Some(pos) = word.find('&') {
+        let (first, rest_with_ampersand) = word.split_at(pos);
+        if let Some(after_ampersand) = rest_with_ampersand.strip_prefix('&') {
+            return format!(
+                "{}&{}",
+                capitalize_word_core(first),
+                capitalize_word_core(after_ampersand)
+            );
+        }
     }
 
     let word_lower = word.to_lowercase();
@@ -1021,6 +1037,30 @@ mod tests {
             assert_eq!(capitalize_section(input), expected);
             assert_eq!(capitalize_title(input), expected);
         }
+        for input in [
+            "Kool & The Gang, Emergency, 1984",
+            "Kool &The Gang, Emergency, 1984",
+            "Kool&The Gang, Emergency, 1984",
+        ] {
+            assert_eq!(capitalize_section(input), input);
+            assert_eq!(capitalize_title(input), input);
+        }
+        assert_eq!(
+            capitalize_title("KOOL & THE GANG, EMERGENCY, 1984"),
+            "Kool & The Gang, Emergency, 1984"
+        );
+        assert_eq!(
+            capitalize_title("KOOL&THE GANG, EMERGENCY, 1984"),
+            "Kool&The Gang, Emergency, 1984"
+        );
+        assert_eq!(
+            capitalize_title("Jack and the Beanstalk"),
+            "Jack and the Beanstalk"
+        );
+        assert_eq!(
+            capitalize_title("Dark Side of the Moon"),
+            "Dark Side of the Moon"
+        );
         assert_eq!(
             capitalize_section("Booker T & (the MG's)"),
             "Booker T & (The MG's)"

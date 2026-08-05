@@ -642,6 +642,14 @@ fn default_picker_title_case(value: &str) -> String {
     }
 
     fn capitalize_core(core: &str) -> String {
+        if let Some(index) = core.find('&') {
+            let (left, right) = core.split_at(index);
+            return format!(
+                "{}&{}",
+                capitalize_core(left),
+                capitalize_core(&right[1..])
+            );
+        }
         if let Some(value) = special(core) {
             return value.to_string();
         }
@@ -721,7 +729,9 @@ fn default_picker_title_case(value: &str) -> String {
             copied = range.end;
             continue;
         }
-        let after_ampersand = index > 0 && value[ranges[index - 1].clone()].contains('&');
+        let after_ampersand = (index > 0
+            && value[ranges[index - 1].clone()].contains('&'))
+            || prefix.contains('&');
         let starts_section = prefix
             .chars()
             .any(|ch| matches!(ch, '(' | '[' | '{' | '"' | '\'' | '“' | '‘'));
@@ -1065,6 +1075,9 @@ pub struct FilePickerState {
     pub(crate) sort_reverse: bool,
     pub(crate) sort_changed: bool,
     pub(crate) clipboard: Option<FilesystemClipboard>,
+    /// One-shot request raised by Ctrl+Shift+V in a focused text editor.
+    /// The embedding application owns the asynchronous host clipboard read.
+    pub(crate) host_clipboard_paste_requested: bool,
     pub(crate) paste_task: Option<PickerPasteTask>,
     /// Exact source-to-destination mappings retained after an incomplete cut.
     /// This prevents retries from allocating a suffixed duplicate path.
@@ -1150,6 +1163,7 @@ impl FilePickerState {
             sort_reverse: config.sort_reverse,
             sort_changed: false,
             clipboard: None,
+            host_clipboard_paste_requested: false,
             paste_task: None,
             paste_retry_plan: None,
             pending_delete: Vec::new(),
@@ -1200,6 +1214,13 @@ impl FilePickerState {
             state.focus = FilePickerFocus::SaveName;
         }
         state
+    }
+
+    /// Consume a host-clipboard paste request raised by the focused picker
+    /// text editor. This keeps platform integration in the embedding app
+    /// without widening the picker's terminal-action enum.
+    pub fn take_host_clipboard_paste_request(&mut self) -> bool {
+        std::mem::take(&mut self.host_clipboard_paste_requested)
     }
 
     pub fn current_selection(&self) -> Option<&FilePickerEntry> {
@@ -3071,10 +3092,11 @@ impl FilePickerState {
             return Err(FilePickerError::OperationDisabled("cut"));
         }
         let paths = self.action_paths();
-        self.clipboard = Some(
+        let clipboard =
             FilesystemClipboard::new(FilePickerClipboardMode::Cut, paths)
-                .ok_or(FilePickerError::NoSelection)?,
-        );
+                .ok_or(FilePickerError::NoSelection)?;
+        crate::text_input::mirror_host_clipboard_text(&clipboard.text_projection());
+        self.clipboard = Some(clipboard);
         self.paste_retry_plan = None;
         self.clear_error();
         Ok(())
@@ -3095,10 +3117,11 @@ impl FilePickerState {
             return Err(FilePickerError::OperationDisabled("copy"));
         }
         let paths = self.action_paths();
-        self.clipboard = Some(
+        let clipboard =
             FilesystemClipboard::new(FilePickerClipboardMode::Copy, paths)
-                .ok_or(FilePickerError::NoSelection)?,
-        );
+                .ok_or(FilePickerError::NoSelection)?;
+        crate::text_input::mirror_host_clipboard_text(&clipboard.text_projection());
+        self.clipboard = Some(clipboard);
         self.paste_retry_plan = None;
         self.clear_error();
         Ok(())
@@ -7281,6 +7304,57 @@ mod tests {
         );
         assert_eq!(default_picker_title_case("TELL US WHY"), "Tell Us Why");
         assert_eq!(default_picker_title_case("(US PROMO LP)"), "(US Promo LP)");
+        assert_eq!(
+            default_picker_title_case("KOOL & THE GANG, EMERGENCY, 1984"),
+            "Kool & The Gang, Emergency, 1984"
+        );
+        assert_eq!(
+            default_picker_title_case("Kool &The Gang, Emergency, 1984"),
+            "Kool &The Gang, Emergency, 1984"
+        );
+        assert_eq!(
+            default_picker_title_case("Kool&The Gang, Emergency, 1984"),
+            "Kool&The Gang, Emergency, 1984"
+        );
+        assert_eq!(
+            default_picker_title_case("Jack and the Beanstalk"),
+            "Jack and the Beanstalk"
+        );
+    }
+
+    #[test]
+    fn filesystem_cut_and_copy_publish_the_same_ordered_host_text_projection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track 01.flac");
+        std::fs::write(&file, b"audio").expect("fixture");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        let index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == file)
+            .expect("fixture entry");
+        picker.set_file_cursor(index, 10);
+
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        let expected = file.to_string_lossy().to_string();
+        crate::text_input::with_scoped_shared_text_clipboard("prior text", || {
+            crate::text_input::with_scoped_shared_text_clipboard_publish_hook(
+                move |text| sink.borrow_mut().push(text.to_string()),
+                || {
+                    picker.try_copy_current().expect("copy");
+                    picker.try_cut_current().expect("cut");
+                },
+            );
+
+            assert_eq!(crate::text_input::read_shared_text_clipboard(), "prior text");
+            let clipboard = picker.clipboard.as_ref().expect("structured clipboard");
+            assert_eq!(clipboard.paths(), &[file.clone()]);
+        });
+        assert_eq!(published.borrow().as_slice(), &[expected.clone(), expected]);
     }
 
     #[test]

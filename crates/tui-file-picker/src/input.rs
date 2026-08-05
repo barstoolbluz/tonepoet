@@ -85,9 +85,37 @@ impl FilePickerState {
         true
     }
 
+    /// Insert text returned by the embedding application's asynchronous host
+    /// clipboard reader. Picker name/path editors are single-line, so this uses
+    /// the same first-line rule as bracketed terminal paste.
+    pub fn paste_host_clipboard_text(&mut self, text: &str) -> bool {
+        self.handle_terminal_paste(text)
+    }
+
+    fn host_clipboard_paste_is_available(&self) -> bool {
+        matches!(
+            self.focus,
+            FilePickerFocus::Address
+                | FilePickerFocus::Search
+                | FilePickerFocus::BookmarkName
+                | FilePickerFocus::CreateName
+                | FilePickerFocus::SaveName
+        ) && (self.focus != FilePickerFocus::Address || self.address_editing)
+    }
+
     /// Apply a keyboard event and return a terminal action for the host app.
     pub fn handle_key(&mut self, key: KeyEvent) -> FilePickerAction {
         if self.handle_paste_task_key(key) {
+            return FilePickerAction::None;
+        }
+        if matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && self.host_clipboard_paste_is_available()
+        {
+            self.host_clipboard_paste_requested = true;
             return FilePickerAction::None;
         }
         self.last_click = None;
@@ -1879,6 +1907,47 @@ mod tests {
         picker.focus = FilePickerFocus::Files;
         assert!(!picker.handle_terminal_paste("must not enter a navigation surface"));
         assert_eq!(picker.search.input.text, "replacement");
+    }
+
+    #[test]
+    fn ctrl_shift_v_requests_host_paste_only_for_focused_text_editors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+
+        picker.begin_address_edit();
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            FilePickerAction::None
+        );
+        assert!(picker.take_host_clipboard_paste_request());
+        assert!(!picker.take_host_clipboard_paste_request());
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(
+                KeyCode::Char('V'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            FilePickerAction::None
+        );
+        assert!(picker.take_host_clipboard_paste_request());
+        assert!(picker.paste_host_clipboard_text("/tmp/music\nignored"));
+        assert_eq!(picker.address_input.text, "/tmp/music");
+
+        picker.cancel_address_edit();
+        picker.focus = FilePickerFocus::Files;
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            FilePickerAction::None
+        );
+        assert!(!picker.take_host_clipboard_paste_request());
     }
 
     #[test]

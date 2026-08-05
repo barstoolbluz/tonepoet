@@ -103,9 +103,10 @@ pub struct SourceMetadata {
     pub r128_track_gain: Option<String>,
     pub r128_album_gain: Option<String>,
 
-    /// Pre-emphasis detected via metadata (tags, CUE files, catalog number).
-    /// None = not detected. Some(source) = evidence found (e.g. "tag", "CUE file", "catalog (35DP-4)").
-    pub preemphasis_metadata: Option<String>,
+    /// Typed pre-emphasis advisory from explicit metadata/CUE evidence or the
+    /// authoritative catalog list. Source-format applicability is applied when
+    /// this metadata is joined with `SourceInfo` in the probe cache.
+    pub preemphasis_metadata: Option<super::preemphasis::PreemphasisAdvisory>,
 
     /// HDCD detection result from analysis cache. Populated when the file
     /// has been previously analyzed. None = not yet analyzed.
@@ -831,7 +832,9 @@ fn read_metadata_sacd(path: &Path) -> Result<SourceMetadata, String> {
 /// This can perform file/tag I/O and must not run from TUI reducers or other
 /// event-loop code. Call it from a worker, `spawn_blocking`, or an already
 /// blocking metadata/probe path only.
-pub fn preemphasis_metadata_check_blocking(path: &Path) -> Option<String> {
+pub fn preemphasis_metadata_check_blocking(
+    path: &Path,
+) -> Option<super::preemphasis::PreemphasisAdvisory> {
     preemphasis_metadata_check(path)
 }
 
@@ -839,30 +842,19 @@ pub fn preemphasis_metadata_check_blocking(path: &Path) -> Option<String> {
 /// should use `preemphasis_metadata_check_blocking()` so the blocking boundary
 /// is visible at the call site.
 #[allow(dead_code)]
-pub fn preemphasis_metadata_check_pub(path: &Path) -> Option<String> {
+pub fn preemphasis_metadata_check_pub(
+    path: &Path,
+) -> Option<super::preemphasis::PreemphasisAdvisory> {
     preemphasis_metadata_check_blocking(path)
 }
 
 /// Lightweight Phase 2 pre-emphasis check using PRE flags and catalog evidence
 /// only. It never runs spectral analysis and deliberately excludes log-file
 /// heuristics.
-fn preemphasis_metadata_check(path: &Path) -> Option<String> {
-    use super::preemphasis::catalog::check_catalog_evidence;
-    use super::preemphasis::metadata::{check_cue_evidence, check_pre_flag_tag_evidence};
-
-    // Tags (fastest).
-    if let Some(ev) = check_pre_flag_tag_evidence(path) {
-        return Some(ev.label().to_string());
-    }
-    // CUE FLAGS PRE sidecars.
-    if let Some(ev) = check_cue_evidence(path) {
-        return Some(ev.label().to_string());
-    }
-    // Catalog number matching.
-    if let Some(cm) = check_catalog_evidence(path) {
-        return Some(format!("catalog ({})", cm.catalog_number));
-    }
-    None
+fn preemphasis_metadata_check(
+    path: &Path,
+) -> Option<super::preemphasis::PreemphasisAdvisory> {
+    super::preemphasis::detect_preemphasis_advisory(path)
 }
 
 
@@ -7253,6 +7245,8 @@ pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "REPLAYGAIN_ALBUM_PEAK",
     "REPLAYGAIN_REFERENCE_LOUDNESS",
     "CUESHEET",
+    "CUE_FLAGS",
+    "PRE_EMPHASIS",
     "LINEAGE",
     "DISCOGS_URL",
 ];

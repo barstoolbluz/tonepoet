@@ -41,6 +41,7 @@ pub mod event_loop;
 pub mod external_editor;
 pub mod gnudb;
 pub mod help;
+pub mod host_clipboard;
 pub mod inline_edit;
 pub mod keybindings;
 pub mod keychain;

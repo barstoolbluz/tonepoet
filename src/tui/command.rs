@@ -4379,25 +4379,23 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         || topic.eq_ignore_ascii_case("tmux")
                         || topic.eq_ignore_ascii_case("byobu") =>
                 {
-                    const CLIPBOARD_HELP: &str = "System clipboard publication over SSH
+                    const CLIPBOARD_HELP: &str = "Host and Tonepoet clipboards
 
-Tonepoet always updates its in-app text clipboard. It also publishes copy and cut text to the outer terminal with OSC 52.
+Copy and cut always update Tonepoet's in-app clipboard first. Tonepoet mirrors a text projection to the host clipboard on a background worker, preferring wl-copy on Wayland and xclip/xsel on X11. When no native helper is available, writes fall back to OSC 52 through /dev/tty.
 
-For tmux or byobu, add both settings to ~/.tmux.conf (or the byobu tmux profile):
+Ctrl+V and Ctrl+P paste Tonepoet's internal clipboard. Ctrl+Shift+V reads host text with wl-paste, xclip, or xsel and inserts it into the focused text editor. Host filesystem paths are not interpreted as file-operation instructions.
+
+For OSC 52 fallback inside tmux or byobu, add these settings to the tmux/byobu profile and permit OSC 52 writes in the outer terminal:
 
   set -g set-clipboard on
   set -g allow-passthrough on
 
-Reload the tmux configuration or restart the session. Then copy a field in Tonepoet and paste into an application outside the terminal to test the path.
-
-When TERM=screen-256color, tmux/byobu must advertise the clipboard capability (`Ms`) for the outer terminal. Check `tmux info | grep Ms`; configure a terminal override when it is absent.
-
-The terminal emulator must also permit OSC 52 clipboard writes. Payloads larger than 64 KiB remain available in Tonepoet's in-app clipboard but are not sent through OSC 52. System-clipboard reads are not available over this channel.";
+Native helper failures, missing displays, denied clipboard access, and oversized payloads never block or invalidate Tonepoet's internal clipboard. OSC 52 fallback is capped at 64 KiB; larger content remains available internally.";
                     app.active_overlay = ActiveOverlay::CuePreview(Box::new(
                         super::app::CuePreviewState::new_readonly_help(
                             "Clipboard help".to_string(),
                             CLIPBOARD_HELP.to_string(),
-                            "SSH, tmux, byobu, and OSC 52 system-copy requirements".to_string(),
+                            "Clipboard sources, tmux/byobu fallback, and paste bindings".to_string(),
                         ),
                     ));
                 }

@@ -612,10 +612,26 @@ impl ArtistCanonicalizer {
     }
 
     pub fn canonicalize(&self, artist: &str) -> String {
-        self.canonical
-            .get(&artist.to_lowercase())
-            .cloned()
-            .unwrap_or_else(|| artist.to_string())
+        if let Some(canonical) = canonical_artist_override(artist) {
+            return canonical.to_string();
+        }
+        if let Some(canonical) = self.canonical.get(&artist.to_lowercase()).cloned() {
+            return canonical_artist_override(&canonical)
+                .map(str::to_string)
+                .unwrap_or(canonical);
+        }
+        artist.to_string()
+    }
+}
+
+/// Corrections to canonical display identities whose spelling is load-bearing
+/// for output naming. Apply these both before and after the generated reference
+/// lookup so a stale reference row cannot reintroduce the incorrect casing.
+fn canonical_artist_override(artist: &str) -> Option<&'static str> {
+    if artist.eq_ignore_ascii_case("Kool & The Gang") {
+        Some("Kool & The Gang")
+    } else {
+        None
     }
 }
 
@@ -1338,6 +1354,10 @@ mod tests {
         assert_eq!(
             canonicalizer.canonicalize("bill evans trio"),
             "Bill Evans Trio"
+        );
+        assert_eq!(
+            canonicalizer.canonicalize("Kool & the Gang"),
+            "Kool & The Gang"
         );
         assert_eq!(
             canonicalizer.canonicalize("Unknown Artist Not In List"),
