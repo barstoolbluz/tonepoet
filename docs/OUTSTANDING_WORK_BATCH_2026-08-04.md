@@ -1,14 +1,17 @@
 # Outstanding work batch — 2026-08-04
 
-Authoritative worklist for the next session (a more capable model). Branch `hardening` @ `da6a83d`
-(version **0.4.6** — do NOT bump or merge to `main` without the user's explicit per-turn instruction;
-see memory `feedback_no_version_bump_without_instruction`). Gate is green (5508/0 ×2) at `da6a83d`.
+**RESOLVED 2026-08-05 @ `98b2edb`** (reasoning-model batch delivery, brief
+`docs/BRIEF_batch_2026-08-04.md`, + direct single-image integration fix): items 1, 4, 5, 6, 7,
+and #24 are **DONE**; #2 remains **PARKED**; #3 was already done at `da6a83d`. Gate green ×2
+(5524/0). Field-verified by the user across all items. Version stays **0.4.6**.
+
+Original worklist below, statuses updated.
 
 Legend: **DONE** / **PARKED** / **TODO** / **IN-DIAGNOSIS**.
 
 ---
 
-## 1. Metadata source-selection regression + false "Discard changes?" — TODO, URGENT
+## 1. Metadata source-selection regression + false "Discard changes?" — DONE (98b2edb)
 **Symptom.** A folder with **one audio file + a sidecar `.cue` + an embedded cue** opens Properties
 using the **flat/filename tags of the audio file** and **ignores the authoritative sidecar cue**.
 E.g. `~/torrents/Blondie - Plastic Letters/` shows album TITLE = "Blondie - Plastic Letters" (the
@@ -103,7 +106,7 @@ detail: `docs/RESEARCH_dsd_dither_dsp_honesty.md`, memory `dsd_pipeline_followup
 
 ---
 
-## 3. "Metadata: Skipped" log label — DONE (needs rebuild)
+## 3. "Metadata: Skipped" log label — DONE (da6a83d; rebuilt + verified)
 Fixed on `da6a83d`. `StageOutcome` gained `NotRequested` + `SkippedWithReason(String)`; the
 planner-transferred case now renders **`Metadata: Skipped (already satisfied by the output planner)`**
 (stages.rs `stage_outcome_label` + the orchestrators). The user's confusing log was from a pre-`da6a83d`
@@ -112,7 +115,7 @@ reads oddly, change to e.g. "Applied by planner".
 
 ---
 
-## 4. Pre-emphasis false catalog matches — TODO (reasoning-model)
+## 4. Pre-emphasis false catalog matches — DONE (98b2edb: authoritative-list rebuild, cache v25)
 Falsely reports some CDs as pre-emphasized via **catalog-number matching**, even though the falsely
 matched CDs don't share catalog numbers with the authoritative list. Early, non-robust implementation
 (`src/tui/preemphasis/` — catalog.rs regex + `KNOWN_PE_EXACT` + anchored `KNOWN_PE_SERIES`; mod.rs
@@ -125,7 +128,7 @@ authoritative list, eliminate false positives, and don't over-state confidence.
 
 ---
 
-## 5. Surface PRE_EMPHASIS in the CANONICAL tag grid — TODO (re-scoped)
+## 5. Surface PRE_EMPHASIS in the CANONICAL tag grid — DONE (98b2edb)
 **Correct scope:** promote `PRE_EMPHASIS` into the editable **Canonical** tag-grid view (the
 "View: Canonical | All" toggle in the metadata editor), alongside TITLE/ARTIST/etc. Today it appears
 only under "All" because it's not in `STANDARD_KEY_ORDER` (src/tui/probe.rs ~7220, a sort/promotion
@@ -136,7 +139,7 @@ pre-emphasis row for sources >16/44.1; reconsider its "N/A" wording).
 
 ---
 
-## 6. Capitalization lower-cases "The" in "Kool & The Gang" — TODO (new)
+## 6. Capitalization lower-cases "The" in "Kool & The Gang" — DONE (98b2edb: root cause was canonical_artists_reference.txt row, not capitalize_title)
 Converting `~/torrents/Kool & The Gang, Emergency, 1984/Flac` produces a finalized folder name that
 **lower-cases "The"** in "Kool & The Gang". VERIFIED: the title-case core `capitalize_title`
 (src/convert/renaming.rs:436) is active and wired as the `fixcaps` function in the naming-template
@@ -149,7 +152,7 @@ source-heuristics normalization), then adjust the small-word rule without regres
 
 ---
 
-## 7. Dual-clipboard on cut/copy — TODO (new)
+## 7. Dual-clipboard on cut/copy — DONE (98b2edb: host mirror + SHIFT+CTRL+V host paste)
 tonepoet keeps its own clipboard. Desired: whenever the user **cuts or copies** — inline editing of
 file/folder names, editing metadata fields, and the **Copy tags** action (context menu *and*
 metadata overlay) — the content goes to **both** clipboards (host system **and** tonepoet's internal).
@@ -160,7 +163,7 @@ no F-keys; keep the existing binding conventions.)
 ---
 
 ## Also queued / context
-- **task #24**: hide the Details pre-emphasis row for sources >16-bit/44.1 kHz (only Red Book CDs can be
+- **task #24 — DONE (98b2edb)**: hide the Details pre-emphasis row for sources >16-bit/44.1 kHz (only Red Book CDs can be
   pre-emphasized); reconsider the "N/A" empty-state wording. (Follow-up from the shipped #5 mis-scope.)
 - **Process discipline (memory):** never bump the version or fast-forward `main` without explicit
   per-turn instruction; commit to `hardening` only by default.
