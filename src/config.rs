@@ -64,6 +64,9 @@ pub struct FileOperationsConfig {
     pub status_verbosity: FileOperationStatusVerbosity,
     #[serde(default)]
     pub auto_close_progress: bool,
+    /// Seconds without a progress event before the copy/move overlay reports a stall.
+    #[serde(default = "default_file_operation_stall_timeout_secs")]
+    pub stall_timeout_secs: u64,
 }
 
 impl Default for FileOperationsConfig {
@@ -72,8 +75,13 @@ impl Default for FileOperationsConfig {
             verification: tui_file_picker::VerificationMode::Standard,
             status_verbosity: FileOperationStatusVerbosity::Quiet,
             auto_close_progress: false,
+            stall_timeout_secs: default_file_operation_stall_timeout_secs(),
         }
     }
+}
+
+const fn default_file_operation_stall_timeout_secs() -> u64 {
+    crate::tui::file_task_runtime::DEFAULT_FILE_TASK_STALL_TIMEOUT_SECS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2446,6 +2454,7 @@ show_conversion_actions = false
             verification: tui_file_picker::VerificationMode::Strong,
             status_verbosity: FileOperationStatusVerbosity::Verbose,
             auto_close_progress: true,
+            stall_timeout_secs: 12,
         };
 
         let rendered = toml::to_string(&config).expect("serialize config");
@@ -2453,6 +2462,7 @@ show_conversion_actions = false
         assert!(rendered.contains("verification = \"strong\""));
         assert!(rendered.contains("status_verbosity = \"verbose\""));
         assert!(rendered.contains("auto_close_progress = true"));
+        assert!(rendered.contains("stall_timeout_secs = 12"));
 
         let reparsed: TonepoetConfig = toml::from_str(&rendered).expect("reparse config");
         assert_eq!(reparsed.file_operations, config.file_operations);

@@ -59,6 +59,12 @@ enum Commands {
         #[arg(long)]
         script_fd: i32,
     },
+    /// Internal isolated worker for cancellable Browse copy/move jobs.
+    #[command(name = "__file-task-worker", hide = true)]
+    InternalFileTaskWorker {
+        #[arg(long)]
+        journal: PathBuf,
+    },
     /// Convert audio files, directories, or archives
     Convert {
         /// Input files, directories, or archives
@@ -381,6 +387,10 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if let Commands::InternalFileTaskWorker { journal } = &cli.command {
+        tonepoet::tui::keybindings::run_internal_file_task_worker(journal)?;
+        return Ok(());
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -502,7 +512,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::InternalActionScriptSupervisor { .. }
-        | Commands::InternalActionScriptLauncher { .. } => unreachable!(),
+        | Commands::InternalActionScriptLauncher { .. }
+        | Commands::InternalFileTaskWorker { .. } => unreachable!(),
         Commands::Tui { paths } => {
             run_tui(config, paths).await?;
         }

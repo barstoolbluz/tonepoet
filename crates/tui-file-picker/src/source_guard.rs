@@ -22,7 +22,7 @@ const MAX_MANIFEST_DEPTH: usize = 1_024;
 /// These counters are intentionally byte- and call-based rather than timing-
 /// based so tests can detect accidental proof amplification without depending
 /// on machine or mount performance.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileOperationIoCounters {
     pub bytes_copied: u64,
     pub source_bytes_hashed: u64,
@@ -535,14 +535,14 @@ pub fn filesystem_identity_policy_notice(path: &Path) -> Option<String> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceKind {
     File,
     Directory,
     Symlink,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
@@ -552,7 +552,7 @@ pub enum SourceIdentity {
     Unsupported,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum SourceVersion {
     #[cfg(unix)]
     Unix {
@@ -579,7 +579,7 @@ enum SourceVersion {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceSnapshot {
     kind: SourceKind,
     identity: SourceIdentity,
@@ -1423,7 +1423,7 @@ fn file_identity(_file: &File, _metadata: &fs::Metadata) -> io::Result<SourceIde
     Ok(SourceIdentity::Unsupported)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ContentDigest(pub [u8; 32]);
 
 impl ContentDigest {
@@ -2470,13 +2470,13 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceEntryProof {
     pub snapshot: SourceSnapshot,
     pub digest: Option<ContentDigest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceManifest {
     verification: VerificationMode,
     entries: std::collections::BTreeMap<PathBuf, SourceEntryProof>,
@@ -2493,7 +2493,7 @@ impl Default for SourceManifest {
 /// satisfy both this destination-ownership proof and the source manifest at
 /// the same authority before it may remove the corresponding quarantined
 /// source object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DestinationManifest {
     verification: VerificationMode,
     entries: std::collections::BTreeMap<PathBuf, SourceSnapshot>,

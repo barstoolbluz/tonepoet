@@ -2207,7 +2207,7 @@ pub struct BrowseScrollbarDrag {
 /// is the shared state model consumed by `tree.rs` and the picker renderer.
 pub type BrowseTreeNode = tui_file_picker::TreeNode;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BrowseMoveRecoveryProof {
     pub source_manifest: tui_file_picker::SourceManifest,
     pub destination_manifest: tui_file_picker::DestinationManifest,
@@ -2217,11 +2217,14 @@ pub struct BrowseMoveRecoveryProof {
 /// retained after an incomplete Browse cut/paste. Keeping this separate from
 /// the clipboard prevents a retry from allocating suffixed destinations while
 /// allowing unattempted roots to retain mappings without fabricated proofs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BrowsePasteRetryPlan {
     pub plan: tui_file_picker::PastePlan,
     pub recovery_by_source:
         std::collections::BTreeMap<PathBuf, BrowseMoveRecoveryProof>,
+    /// Local durable journal reused across reconciliation generations.
+    #[serde(default)]
+    pub recovery_journal_path: Option<PathBuf>,
 }
 
 impl BrowsePasteRetryPlan {
@@ -2229,6 +2232,7 @@ impl BrowsePasteRetryPlan {
         Self {
             plan,
             recovery_by_source: std::collections::BTreeMap::new(),
+            recovery_journal_path: None,
         }
     }
 
@@ -2237,8 +2241,7 @@ impl BrowsePasteRetryPlan {
         clipboard: &tui_file_picker::FilesystemClipboard,
         destination_dir: &Path,
     ) -> bool {
-        self.plan.mode == tui_file_picker::FilePickerClipboardMode::Cut
-            && clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
+        self.plan.mode == clipboard.mode()
             && self.plan.mappings.len() == clipboard.paths().len()
             && self
                 .plan
@@ -2273,10 +2276,11 @@ impl BrowsePasteRetryPlan {
         }
         Some(Self {
             plan: tui_file_picker::PastePlan {
-                mode: tui_file_picker::FilePickerClipboardMode::Cut,
+                mode: self.plan.mode,
                 mappings,
             },
             recovery_by_source,
+            recovery_journal_path: self.recovery_journal_path.clone(),
         })
     }
 }
@@ -3657,6 +3661,20 @@ impl BrowseState {
             // source promotion happens lazily after focus settles.
             self.scan();
             self.reapply_after_directory_scan_complete(tx);
+        }
+    }
+
+    /// Refresh the Browse listing after a filesystem job without touching the
+    /// filesystem on the TUI thread. In particular, do not synchronize or
+    /// rebuild the directory tree here: a source or destination mount may still
+    /// be wedged after the supervisor has abandoned its helper process.
+    pub(crate) fn refresh_after_file_task_nonblocking(&mut self) {
+        if self.archive.is_some() {
+            return;
+        }
+        self.invalidate_recursive_search_for_refresh();
+        if self.scan_tx.is_some() {
+            self.begin_async_scan();
         }
     }
 

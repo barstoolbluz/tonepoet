@@ -6095,7 +6095,7 @@ pub struct MetadataArtworkWriteState {
 /// These are intentionally app-local: the reusable picker crate emits semantic
 /// [`tui_file_picker::FileTaskUserAction`] values, and Tonepoet maps them to
 /// these concrete worker controls.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileTaskControl {
     Pause,
     Resume,
@@ -11652,6 +11652,7 @@ impl Default for AppDatabaseSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStartupOptions {
     pub recover_pending_archives: bool,
+    pub recover_pending_file_operations: bool,
     pub database_source: AppDatabaseSource,
 }
 
@@ -11659,6 +11660,7 @@ impl Default for AppStartupOptions {
     fn default() -> Self {
         Self {
             recover_pending_archives: true,
+            recover_pending_file_operations: true,
             database_source: AppDatabaseSource::default(),
         }
     }
@@ -11677,6 +11679,11 @@ impl AppStartupOptions {
             recover_pending_archives: true,
             ..Self::default()
         }
+    }
+
+    pub fn without_file_operation_recovery(mut self) -> Self {
+        self.recover_pending_file_operations = false;
+        self
     }
 
     /// Use an explicitly supplied SQLite file. This is intentionally available
@@ -11711,12 +11718,16 @@ impl AppStartupOptions {
 
     #[cfg(test)]
     pub fn without_archive_recovery_for_tests() -> Self {
-        Self::without_archive_recovery().with_isolated_temp_database()
+        Self::without_archive_recovery()
+            .without_file_operation_recovery()
+            .with_isolated_temp_database()
     }
 
     #[cfg(test)]
     pub fn with_archive_recovery_for_tests() -> Self {
-        Self::with_archive_recovery().with_isolated_temp_database()
+        Self::with_archive_recovery()
+            .without_file_operation_recovery()
+            .with_isolated_temp_database()
     }
 }
 
@@ -11908,7 +11919,14 @@ impl AppState {
     ) -> Self {
         Self::new_with_startup_options(
             config,
-            AppStartupOptions::without_archive_recovery().with_database_path(database_path),
+            // Tests must not scan the process-global file-operation journal
+            // directory at construction: concurrent journal tests point it at
+            // their own tempdirs and an unrelated AppState would recover a
+            // foreign plan into its Browse clipboard. Recovery-path tests call
+            // startup_file_task_recovery() explicitly.
+            AppStartupOptions::without_archive_recovery()
+                .without_file_operation_recovery()
+                .with_database_path(database_path),
         )
     }
 
@@ -11920,7 +11938,11 @@ impl AppState {
         config.conversion.persist_queue = false;
         Self::new_with_startup_options(
             config,
-            AppStartupOptions::without_archive_recovery().with_isolated_temp_database(),
+            // See new_for_test_with_db_path: never scan the process-global
+            // file-operation journal directory from a test constructor.
+            AppStartupOptions::without_archive_recovery()
+                .without_file_operation_recovery()
+                .with_isolated_temp_database(),
         )
     }
 
@@ -12044,7 +12066,30 @@ impl AppState {
         let bookmarks = crate::tui::bookmarks::BookmarksState::load_from_db(&db);
         // Import TOML presets into DB on first run.
         crate::tui::presets::import_presets_to_db(&db);
-        let browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
+        let mut browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
+        if startup_options.recover_pending_file_operations {
+            if let Some(recovery) = crate::tui::file_task_runtime::startup_file_task_recovery() {
+                let destination = recovery
+                    .destination_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "the original destination".to_string());
+                browse.filesystem_clipboard = Some(recovery.clipboard);
+                browse.filesystem_clipboard_retry_plan = Some(recovery.retry_plan);
+                let recovery_status = format!(
+                    "file-operation recovery: {} interrupted job(s); restored the newest exact plan. Navigate to {} and paste to reconcile ({} deferred temp artifact(s), {} source quarantine(s)); journal {}",
+                    recovery.total_pending_jobs,
+                    destination,
+                    recovery.temp_artifact_count,
+                    recovery.quarantine_artifact_count,
+                    recovery.journal_path.display(),
+                );
+                theme_startup_status = Some(match theme_startup_status.take() {
+                    Some(existing) => format!("{existing}; {recovery_status}"),
+                    None => recovery_status,
+                });
+            }
+        }
         let file_task_verbose_degrade_notices = matches!(
             config.file_operations.status_verbosity,
             crate::config::FileOperationStatusVerbosity::Verbose
@@ -14707,8 +14752,10 @@ mod app_startup_options_tests {
     use super::*;
 
     #[test]
-    fn production_startup_options_enable_archive_recovery_by_default() {
-        assert!(AppStartupOptions::default().recover_pending_archives);
+    fn production_startup_options_enable_recovery_by_default() {
+        let options = AppStartupOptions::default();
+        assert!(options.recover_pending_archives);
+        assert!(options.recover_pending_file_operations);
     }
 
     #[test]
@@ -14724,9 +14771,10 @@ mod app_startup_options_tests {
     }
 
     #[test]
-    fn test_constructor_options_explicitly_disable_archive_recovery() {
+    fn test_constructor_options_explicitly_disable_external_recovery() {
         let options = AppStartupOptions::without_archive_recovery_for_tests();
         assert!(!options.recover_pending_archives);
+        assert!(!options.recover_pending_file_operations);
         assert_eq!(options.database_source, AppDatabaseSource::IsolatedTempFile);
     }
 

@@ -38,6 +38,7 @@ pub mod draw_queue;
 pub mod draw_source;
 pub mod draw_status;
 pub mod event_loop;
+pub mod file_task_runtime;
 pub mod external_editor;
 pub mod gnudb;
 pub mod help;

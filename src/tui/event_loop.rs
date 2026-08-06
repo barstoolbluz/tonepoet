@@ -1643,10 +1643,13 @@ fn reduce_file_task_complete(
     let mut completed_sources = Vec::new();
     let mut completed_destinations = Vec::new();
     let mut retry_sources = Vec::new();
-    let mut unavailable_sources = 0usize;
     let mut completion_warnings = Vec::new();
     let mut incomplete_details = Vec::new();
-    let mut incomplete_navigation_mappings = Vec::new();
+    let recovery_journal_retained = worker_retry_plan
+        .as_ref()
+        .or(pending.retry_plan.as_ref())
+        .and_then(|retry| retry.recovery_journal_path.as_ref())
+        .is_some();
 
     for (index, source) in pending.clipboard.paths().iter().enumerate() {
         let expected_destination = pending
@@ -1658,19 +1661,12 @@ fn reduce_file_task_complete(
             root.source == *source
                 && expected_destination.is_some_and(|destination| root.destination == *destination)
         });
-        let completed = root.is_some_and(|root| match root.disposition {
-            tui_file_picker::FileTaskRootDisposition::Completed => {
-                if report.is_move {
-                    !path_lexists(source) && path_lexists(&root.destination)
-                } else {
-                    path_lexists(source) && path_lexists(&root.destination)
-                }
-            }
-            tui_file_picker::FileTaskRootDisposition::CompletedWithWarning => {
-                path_lexists(&root.destination)
-            }
-            _ => false,
-        });
+        // The isolated helper owns all filesystem verification and attaches
+        // operation-time proofs to completed roots. The TUI reducer must not
+        // re-stat a source or destination: either pathname may be a wedged
+        // sshfs/removable mount, and a synchronous probe here would reintroduce
+        // the very uninterruptible cancellation failure the supervisor avoids.
+        let completed = root.is_some_and(|root| root.disposition.is_completed());
         if completed {
             let root = root.expect("completed root checked above");
             completed_sources.push(source.clone());
@@ -1694,23 +1690,13 @@ fn reduce_file_task_complete(
                     detail
                 ));
             }
-            if path_lexists(source) {
-                retry_sources.push(source.clone());
-            } else {
-                unavailable_sources = unavailable_sources.saturating_add(1);
-                if report.is_move {
-                    if let Some(root) = root.filter(|root| path_lexists(&root.destination)) {
-                        incomplete_navigation_mappings.push(tui_file_picker::PasteMapping {
-                            source: source.clone(),
-                            destination: root.destination.clone(),
-                        });
-                    }
-                }
-            }
+            // Incomplete roots remain part of the exact retry plan. The
+            // durable worker journal, not a UI-thread pathname probe, decides
+            // whether a remote/removable location is currently reachable.
+            retry_sources.push(source.clone());
         }
     }
 
-    let mut current_directory_remapped = false;
     if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
         && !completed_sources.is_empty()
     {
@@ -1718,35 +1704,10 @@ fn reduce_file_task_complete(
             tui_file_picker::FilePickerClipboardMode::Cut,
             completed_sources.clone(),
         ) {
-            current_directory_remapped = app
-                .browse
+            app.browse
                 .remap_navigation_after_cut(&completed_clipboard, &completed_destinations);
         }
     }
-    if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut {
-        for mapping in &incomplete_navigation_mappings {
-            let Some(incomplete_clipboard) = tui_file_picker::FilesystemClipboard::new(
-                tui_file_picker::FilePickerClipboardMode::Cut,
-                vec![mapping.source.clone()],
-            ) else {
-                continue;
-            };
-            // History repair is independent per root. A completed root may have
-            // already moved current_dir, but that must not leave a history entry
-            // beneath a separately, partially removed source root stale.
-            app.browse.remap_navigation_history_after_cut(
-                &incomplete_clipboard,
-                std::slice::from_ref(&mapping.destination),
-            );
-            if !current_directory_remapped {
-                current_directory_remapped = app.browse.remap_current_after_cut(
-                    &incomplete_clipboard,
-                    std::slice::from_ref(&mapping.destination),
-                );
-            }
-        }
-    }
-
     let all_completed = completed_sources.len() == pending.clipboard.paths().len();
     app.browse.filesystem_clipboard = if all_completed {
         if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Copy {
@@ -1757,28 +1718,32 @@ fn reduce_file_task_complete(
     } else {
         tui_file_picker::FilesystemClipboard::new(pending.clipboard.mode(), retry_sources.clone())
     };
-    app.browse.filesystem_clipboard_retry_plan = if !all_completed
-        && pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
-    {
-        worker_retry_plan.or_else(|| {
-            pending
-                .retry_plan
-                .as_ref()
-                .and_then(|retry| retry.retain_sources(&retry_sources))
-        })
+    app.browse.filesystem_clipboard_retry_plan = if !all_completed {
+        // Whichever plan is retained, the user-facing retry token must exclude
+        // roots the worker proved complete/committed — matching the retained
+        // clipboard above. The durable journal (whose path retain_sources
+        // preserves) remains authoritative for those roots' deferred cleanup.
+        worker_retry_plan
+            .and_then(|retry| retry.retain_sources(&retry_sources))
+            .or_else(|| {
+                pending
+                    .retry_plan
+                    .as_ref()
+                    .and_then(|retry| retry.retain_sources(&retry_sources))
+            })
     } else {
         None
     };
 
-    app.browse.rebuild_tree_preserving_expansion();
-    app.browse.refresh_with_search(Some(tx));
-    app.browse.probe_current_with_db(tx, Some(&app.db));
-    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-    if let Some(last) = completed_destinations.last() {
-        if let Some(index) = app.browse.entries.iter().position(|entry| &entry.path == last) {
-            app.browse.selected_index = index;
-            app.browse.ensure_visible();
-        }
+    // Completion reduction must remain control-plane-only. Directory scans run
+    // on the existing cancellable scan worker; tree rebuilding and selection
+    // probes can synchronously touch a dead mount and therefore do not run here.
+    if all_completed {
+        app.browse.cursor_restore_target = completed_destinations
+            .last()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+        app.browse.refresh_after_file_task_nonblocking();
     }
 
     let mut status = if all_completed {
@@ -1794,12 +1759,8 @@ fn reduce_file_task_complete(
             retry_sources.len()
         )
     };
-    if unavailable_sources > 0 {
-        status.push_str(&format!(
-            ", {} source{} unavailable and not retained in the clipboard",
-            unavailable_sources,
-            if unavailable_sources == 1 { "" } else { "s" }
-        ));
+    if !all_completed && recovery_journal_retained {
+        status.push_str("; durable reconciliation state retained");
     }
     if !completion_warnings.is_empty() {
         status.push_str(&format!(
@@ -1825,7 +1786,6 @@ fn reduce_file_task_complete(
         }
     }
     let requires_attention = !all_completed
-        || unavailable_sources > 0
         || !completion_warnings.is_empty()
         || !incomplete_details.is_empty()
         || undo_record_warning.is_some();
@@ -15475,7 +15435,7 @@ mod async_message_drain_tests {
         assert!(!app.browse.has_valid_folder_classification_for_identity(&path, stale_identity));
     }
     #[test]
-    fn completed_and_partially_removed_browse_roots_repair_current_and_history_independently() {
+    fn completion_reducer_trusts_worker_report_without_probing_missing_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source_a = temp.path().join("source-a");
         let source_b = temp.path().join("source-b");
@@ -15511,11 +15471,13 @@ mod async_message_drain_tests {
         ];
         app.browse.nav_history_index = 0;
         app.browse.filesystem_clipboard = Some(clipboard.clone());
+        let mut retry_plan = crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        retry_plan.recovery_journal_path = Some(temp.path().join("recovery.jsonl"));
         app.browse.pending_clipboard_paste = Some(crate::tui::browse::PendingClipboardPaste {
             session_id,
             clipboard,
             plan,
-            retry_plan: None,
+            retry_plan: Some(retry_plan.clone()),
         });
         let report = tui_file_picker::FileTaskCompletionReport {
             is_move: true,
@@ -15543,18 +15505,32 @@ mod async_message_drain_tests {
         };
         let (tx, _rx) = mpsc::channel(8);
 
-        reduce_file_task_complete(&mut app, session_id, report, None, &tx);
+        reduce_file_task_complete(
+            &mut app,
+            session_id,
+            report,
+            Some(retry_plan),
+            &tx,
+        );
 
         assert_eq!(app.browse.current_dir, destination_a.join("current"));
         assert_eq!(
             app.browse.nav_history,
-            vec![destination_a.join("current"), destination_b.join("history")]
+            vec![destination_a.join("current"), source_b.join("history")]
         );
-        assert!(
-            app.browse.filesystem_clipboard.is_none(),
-            "neither vanished source can be advertised as retryable"
-        );
-        assert!(app.browse.filesystem_clipboard_retry_plan.is_none());
+        let retained = app
+            .browse
+            .filesystem_clipboard
+            .as_ref()
+            .expect("failed root remains retryable without a TUI-thread stat");
+        assert_eq!(retained.paths(), &[source_b.clone()]);
+        let retained_retry = app
+            .browse
+            .filesystem_clipboard_retry_plan
+            .as_ref()
+            .expect("durable exact retry plan retained");
+        assert_eq!(retained_retry.plan.mappings, vec![mapping_b]);
+        assert!(retained_retry.recovery_journal_path.is_some());
     }
 
     #[test]

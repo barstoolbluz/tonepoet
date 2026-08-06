@@ -35703,6 +35703,10 @@ fn start_file_op(
 
     let job = FileTaskJob {
         session_id,
+        job_id: uuid::Uuid::new_v4().to_string(),
+        generation: 1,
+        journal_path: None,
+        stall_timeout_secs: app.config.file_operations.stall_timeout_secs.max(1),
         sources: sources.to_vec(),
         dest: dest.trim().to_string(),
         force,
@@ -35719,8 +35723,8 @@ fn start_file_op(
 
 /// Start a Cut/Copy/Paste operation through the existing progress-aware,
 /// cancellable file-task worker. Destinations are preplanned and retained so
-/// the event loop can reconcile partial moves and construct a retryable
-/// residual clipboard from the structured completion report.
+/// the event loop can reconcile partial copy/move jobs and construct a
+/// retryable residual clipboard from the structured completion report.
 pub(super) fn start_filesystem_clipboard_paste(
     app: &mut AppState,
     clipboard: tui_file_picker::FilesystemClipboard,
@@ -35736,7 +35740,7 @@ pub(super) fn start_filesystem_clipboard_paste(
         Some(retry) if retry.matches(&clipboard, &destination_dir) => Some(retry.clone()),
         Some(_) => {
             app.set_status(
-                "Paste failed: retained move retry belongs to a different clipboard or destination; start a new Cut operation to discard it",
+                "Paste failed: retained file-operation recovery belongs to a different clipboard or destination; start a new Copy/Cut operation to discard it",
             );
             return;
         }
@@ -35753,9 +35757,7 @@ pub(super) fn start_filesystem_clipboard_paste(
         },
     };
     let retry_plan = retry_plan
-        .or_else(|| (clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut).then(|| {
-            super::browse::BrowsePasteRetryPlan::from_plan(plan.clone())
-        }));
+        .or_else(|| Some(super::browse::BrowsePasteRetryPlan::from_plan(plan.clone())));
     let sources = plan
         .mappings
         .iter()
@@ -35788,9 +35790,13 @@ pub(super) fn start_filesystem_clipboard_paste(
     });
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct FileTaskJob {
     session_id: u64,
+    job_id: String,
+    generation: u64,
+    journal_path: Option<std::path::PathBuf>,
+    stall_timeout_secs: u64,
     sources: Vec<std::path::PathBuf>,
     dest: String,
     force: bool,
@@ -35807,6 +35813,13 @@ enum FileTaskStep {
     Completed,
     Skipped,
     Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncompleteSourceCleanupOutcome {
+    RestoredRetryable(String),
+    AwaitingReconciliation(String),
+    CommittedDeferred(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35942,13 +35955,246 @@ enum FileTaskApplyAllPolicy {
     Skip,
 }
 
+#[derive(Clone)]
+enum FileTaskEventSink {
+    App(mpsc::Sender<AppMessage>),
+    Wire(std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::io::Stdout>>>),
+}
+
+impl FileTaskEventSink {
+    fn progress(&self, session_id: u64, update: tui_file_picker::FileTaskProgressUpdate) {
+        match self {
+            Self::App(tx) => {
+                let _ = tx.try_send(AppMessage::FileTaskProgress { session_id, update });
+            }
+            Self::Wire(writer) => {
+                let Ok(mut writer) = writer.lock() else {
+                    return;
+                };
+                let _ = super::file_task_runtime::write_wire_event(
+                    &mut *writer,
+                    &super::file_task_runtime::FileTaskWireEvent::Progress { update },
+                );
+            }
+        }
+    }
+
+    fn complete(
+        &self,
+        session_id: u64,
+        report: tui_file_picker::FileTaskCompletionReport,
+        retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
+    ) {
+        match self {
+            Self::App(tx) => {
+                send_file_task_message_nonblocking(
+                    tx,
+                    session_id,
+                    AppMessage::FileTaskComplete {
+                        session_id,
+                        report,
+                        retry_plan,
+                    },
+                );
+            }
+            Self::Wire(writer) => {
+                let Ok(mut writer) = writer.lock() else {
+                    return;
+                };
+                let _ = super::file_task_runtime::write_wire_event(
+                    &mut *writer,
+                    &super::file_task_runtime::FileTaskWireEvent::Complete {
+                        report,
+                        retry_plan,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn send_file_task_message_nonblocking(
+    tx: &mpsc::Sender<AppMessage>,
+    session_id: u64,
+    message: AppMessage,
+) {
+    match tx.try_send(message) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(message)) => {
+            let tx = tx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("file-task-message-delivery-{session_id}"))
+                .spawn(move || {
+                    let _ = tx.blocking_send(message);
+                });
+        }
+    }
+}
+
+const MAX_DEFERRED_ARTIFACT_SCAN_ENTRIES: usize = 100_000;
+const MAX_DEFERRED_ARTIFACT_SCAN_DEPTH: usize = 1_024;
+const FILE_TASK_ROOTS_PER_JOURNAL_CHECKPOINT: usize = 256;
+
+fn derived_private_artifact_kind(
+    path: &std::path::Path,
+    job_id: &str,
+    generations: &[u64],
+) -> Option<(super::file_task_runtime::DurableTempArtifactKind, u64)> {
+    let name = path.file_name()?.to_str()?;
+    for generation in generations {
+        let file_token = format!(".tonepoet-part-{job_id}-{generation}-");
+        if private_file_task_artifact_name_matches(name, &file_token) {
+            return Some((
+                super::file_task_runtime::DurableTempArtifactKind::File,
+                *generation,
+            ));
+        }
+        let directory_token = format!(".tonepoet-tree-{job_id}-{generation}-");
+        if private_file_task_artifact_name_matches(name, &directory_token) {
+            return Some((
+                super::file_task_runtime::DurableTempArtifactKind::Directory,
+                *generation,
+            ));
+        }
+        let symlink_token = format!(".tonepoet-link-{job_id}-{generation}-");
+        if private_file_task_artifact_name_matches(name, &symlink_token) {
+            return Some((
+                super::file_task_runtime::DurableTempArtifactKind::Symlink,
+                *generation,
+            ));
+        }
+    }
+    None
+}
+
+fn private_file_task_artifact_name_matches(name: &str, token: &str) -> bool {
+    let Some((prefix, suffix)) = name.split_once(token) else {
+        return false;
+    };
+    let Some(sequence) = suffix.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((pid, nonce)) = sequence.split_once('-') else {
+        return false;
+    };
+    prefix.starts_with('.')
+        && prefix.len() > 1
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn collect_derived_private_artifacts(
+    root: &std::path::Path,
+    recursive: bool,
+    job_id: &str,
+    generations: &[u64],
+    found: &mut std::collections::BTreeMap<
+        std::path::PathBuf,
+        (super::file_task_runtime::DurableTempArtifactKind, u64),
+    >,
+) -> Result<(), String> {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((directory, depth)) = stack.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "scan deferred temporary artifacts under {}: {error}",
+                    directory.display()
+                ))
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "read deferred temporary artifact entry under {}: {error}",
+                    directory.display()
+                )
+            })?;
+            visited = visited.saturating_add(1);
+            if visited > MAX_DEFERRED_ARTIFACT_SCAN_ENTRIES {
+                return Err(format!(
+                    "deferred temporary artifact scan under {} exceeded the {} entry safety limit",
+                    root.display(),
+                    MAX_DEFERRED_ARTIFACT_SCAN_ENTRIES
+                ));
+            }
+            let path = entry.path();
+            if let Some(identity) = derived_private_artifact_kind(&path, job_id, generations) {
+                found.insert(path, identity);
+                continue;
+            }
+            if !recursive || depth >= MAX_DEFERRED_ARTIFACT_SCAN_DEPTH {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "inspect deferred temporary artifact scan entry {}: {error}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_dir() {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_derived_private_artifact(
+    path: &std::path::Path,
+    kind: super::file_task_runtime::DurableTempArtifactKind,
+) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    };
+    let file_type_matches = match kind {
+        super::file_task_runtime::DurableTempArtifactKind::File => metadata.is_file(),
+        super::file_task_runtime::DurableTempArtifactKind::Directory => {
+            metadata.file_type().is_dir()
+        }
+        super::file_task_runtime::DurableTempArtifactKind::Symlink => {
+            metadata.file_type().is_symlink()
+        }
+    };
+    if !file_type_matches {
+        return Err(format!(
+            "refused cleanup because the private artifact changed type: {}",
+            path.display()
+        ));
+    }
+    let result = match kind {
+        super::file_task_runtime::DurableTempArtifactKind::Directory => {
+            std::fs::remove_dir_all(path)
+        }
+        super::file_task_runtime::DurableTempArtifactKind::File
+        | super::file_task_runtime::DurableTempArtifactKind::Symlink => {
+            std::fs::remove_file(path)
+        }
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove {}: {error}", path.display())),
+    }
+}
+
 struct FileTaskWorker {
     job: FileTaskJob,
-    tx: mpsc::Sender<AppMessage>,
+    sink: FileTaskEventSink,
+    journal: Option<super::file_task_runtime::FileTaskJournalHandle>,
     controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
     totals: tui_file_picker::ProgressTotals,
     started_at: std::time::Instant,
     last_report_at: std::time::Instant,
+    roots_since_journal_checkpoint: usize,
+    dirty_journal_roots: std::collections::BTreeSet<std::path::PathBuf>,
     paused: bool,
     terminal_error: Option<String>,
     next_conflict_id: u64,
@@ -35981,6 +36227,10 @@ struct FileTaskWorker {
         std::path::PathBuf,
         (std::path::PathBuf, tui_file_picker::FileTaskRootProof),
     >,
+    /// Native rename intents cleared atomically with the root checkpoint that
+    /// proves the move completed. Retaining the intent until that checkpoint
+    /// closes the crash window between namespace mutation and journal proof.
+    native_rename_intents_to_clear: std::collections::BTreeSet<std::path::PathBuf>,
     /// Whether the worker created an absent destination root or modified a
     /// pre-existing one. Delete-based copy undo is authorized only for the
     /// former; overwrite/merge roots require preimages and are excluded.
@@ -36011,6 +36261,10 @@ struct FileTaskWorker {
     /// publication/verification and before quarantine begins.
     #[cfg(test)]
     forced_control_after_verified_publication: Option<FileTaskStep>,
+    /// Once an Abort is observed after the irreversible source-cleanup commit
+    /// boundary, finish the current root honestly but stop before starting any
+    /// additional roots.
+    stop_after_committed_cleanup: bool,
     /// Deterministic test hook for source-cleanup boundary accounting. The
     /// control is delivered before the next deletion once this many entries
     /// have already been removed from quarantine.
@@ -36023,6 +36277,15 @@ impl FileTaskWorker {
         job: FileTaskJob,
         tx: mpsc::Sender<AppMessage>,
         controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
+    ) -> Self {
+        Self::new_with_sink(job, FileTaskEventSink::App(tx), controls, None)
+    }
+
+    fn new_with_sink(
+        job: FileTaskJob,
+        sink: FileTaskEventSink,
+        controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
+        journal: Option<super::file_task_runtime::FileTaskJournalHandle>,
     ) -> Self {
         let now = std::time::Instant::now();
         let root_results = job
@@ -36061,11 +36324,14 @@ impl FileTaskWorker {
         };
         Self {
             job,
-            tx,
+            sink,
+            journal,
             controls,
             totals: tui_file_picker::ProgressTotals::default(),
             started_at: now,
             last_report_at: now,
+            roots_since_journal_checkpoint: 0,
+            dirty_journal_roots: std::collections::BTreeSet::new(),
             paused: false,
             terminal_error: None,
             next_conflict_id: 0,
@@ -36080,6 +36346,7 @@ impl FileTaskWorker {
             copied_source_digests: std::collections::HashMap::new(),
             move_recovery_by_source,
             completed_proofs_by_source: std::collections::BTreeMap::new(),
+            native_rename_intents_to_clear: std::collections::BTreeSet::new(),
             undo_disposition_by_source: std::collections::BTreeMap::new(),
             io_counters: tui_file_picker::FileOperationIoCounters::default(),
             copy_error_paths: Vec::new(),
@@ -36092,6 +36359,7 @@ impl FileTaskWorker {
             force_content_verified_move_path: false,
             #[cfg(test)]
             forced_control_after_verified_publication: None,
+            stop_after_committed_cleanup: false,
             #[cfg(test)]
             forced_cleanup_control_after_deleted_entries: None,
         }
@@ -36129,6 +36397,11 @@ impl FileTaskWorker {
                 );
                 if self.totals.not_attempted > 0 {
                     status.push_str(&format!(", {} not attempted", self.totals.not_attempted));
+                }
+                if self.stop_after_committed_cleanup {
+                    status.push_str(
+                        "; move committed; source cleanup remains journaled for reconciliation",
+                    );
                 }
                 if let Some(error) = self.terminal_error.as_ref() {
                     status.push_str("; ");
@@ -36179,7 +36452,1323 @@ impl FileTaskWorker {
         self.send_completion_report();
     }
 
+    fn ensure_file_task_endpoint_identities(&mut self) -> Result<(), String> {
+        let Some(journal) = self.journal.clone() else {
+            return Ok(());
+        };
+        let record = journal.load()?;
+        if !record.endpoint_identities.is_empty() {
+            return Ok(());
+        }
+        let has_mutation_evidence = !record.roots.is_empty()
+            || !record.temp_artifacts.is_empty()
+            || !record.quarantine_artifacts.is_empty()
+            || !record.native_rename_intents.is_empty()
+            || record
+                .retry_plan
+                .as_ref()
+                .is_some_and(|retry| !retry.recovery_by_source.is_empty());
+        if !record.endpoint_identity_protocol || has_mutation_evidence {
+            return Err(
+                "file-operation journal lacks the pre-mutation endpoint identity required for safe reconciliation"
+                    .to_string(),
+            );
+        }
+        let identities = capture_file_task_endpoint_identities(&self.job, &record.mappings)?;
+        journal
+            .record_endpoint_identities(&identities)
+            .map_err(|error| format!("durably record file-operation endpoints: {error}"))
+    }
+
+    fn ensure_destination_root_ready(
+        &mut self,
+        destination_root: &std::path::Path,
+    ) -> Result<(), String> {
+        let endpoint = if let Some(journal) = &self.journal {
+            let record = journal.load()?;
+            let endpoint = destination_endpoint_identity(&record, destination_root)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "file-operation journal has no destination endpoint identity for {}",
+                        destination_root.display()
+                    )
+                })?;
+            verify_file_task_endpoint_attached(&endpoint).map_err(|error| {
+                format!(
+                    "{error}; destination work remains awaiting reconciliation"
+                )
+            })?;
+            Some(endpoint)
+        } else {
+            None
+        };
+
+        match file_task_path_presence(destination_root) {
+            FileTaskPathPresence::Present => {
+                let metadata = std::fs::metadata(destination_root).map_err(|error| {
+                    format!(
+                        "inspect destination directory {}: {error}",
+                        destination_root.display()
+                    )
+                })?;
+                if !metadata.is_dir() {
+                    return Err(format!(
+                        "destination is not a directory: {}",
+                        destination_root.display()
+                    ));
+                }
+                Ok(())
+            }
+            FileTaskPathPresence::Unavailable(error) => Err(format!(
+                "destination endpoint {} is unavailable: {error}; work remains awaiting reconciliation",
+                destination_root.display()
+            )),
+            FileTaskPathPresence::Missing => {
+                if let Some(endpoint) = endpoint.as_ref() {
+                    if endpoint.anchor_path == endpoint.operation_root {
+                        return Err(format!(
+                            "recorded destination root {} is absent; refusing to recreate it until the matching endpoint returns",
+                            destination_root.display()
+                        ));
+                    }
+                    if !destination_root.starts_with(&endpoint.anchor_path) {
+                        return Err(format!(
+                            "destination {} escaped its recorded endpoint anchor {}",
+                            destination_root.display(),
+                            endpoint.anchor_path.display()
+                        ));
+                    }
+                }
+                std::fs::create_dir_all(destination_root)
+                    .map_err(|error| format!("failed to create destination: {error}"))
+            }
+        }
+    }
+
+    fn reconcile_native_rename_intent(
+        &mut self,
+        journal: &super::file_task_runtime::FileTaskJournalHandle,
+        intent: &super::file_task_runtime::DurableNativeRenameIntent,
+    ) -> Result<bool, String> {
+        let source = intent.source.as_path();
+        let destination = intent.destination.as_path();
+        let expected_root = intent
+            .source_manifest
+            .expected_snapshot(std::path::Path::new(""))
+            .ok_or_else(|| {
+                format!(
+                    "native-rename recovery intent for {} has no root proof",
+                    source.display()
+                )
+            })?;
+
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Verifying,
+            format!("Reconciling interrupted rename of {}", display_name(source)),
+            Some(progress_item_for_paths(source, destination, 0, None)),
+            true,
+        );
+
+        let source_present = file_task_path_is_present(
+            source,
+            "interrupted native-rename reconciliation",
+        )?;
+        let destination_present = file_task_path_is_present(
+            destination,
+            "interrupted native-rename reconciliation",
+        )?;
+        let source_snapshot = if source_present {
+            Some(
+                tui_file_picker::snapshot_path(source)
+                    .map_err(|error| format!("inspect retained file-operation source: {error}"))?,
+            )
+        } else {
+            None
+        };
+        let destination_snapshot = if destination_present {
+            Some(
+                tui_file_picker::snapshot_path(destination)
+                    .map_err(|error| format!("inspect retained file-operation destination: {error}"))?,
+            )
+        } else {
+            None
+        };
+
+        let source_matches = source_snapshot.as_ref().is_some_and(|snapshot| {
+            expected_root
+                .verify_same_object_and_version_with_capabilities(
+                    snapshot,
+                    tui_file_picker::filesystem_capabilities(source),
+                )
+                .is_ok()
+        });
+        let destination_manifest = destination_snapshot.and_then(|snapshot| {
+            intent
+                .source_manifest
+                .destination_identity_after_root_rename(
+                    snapshot,
+                    tui_file_picker::filesystem_capabilities(destination),
+                )
+                .ok()
+        });
+
+        if source_matches && destination_manifest.is_some() {
+            self.set_root_result(
+                source,
+                destination,
+                tui_file_picker::FileTaskRootDisposition::Failed,
+                Some(format!(
+                    "both {} and {} still match the durable pre-rename identity; move completion is ambiguous and requires manual review",
+                    source.display(),
+                    destination.display()
+                )),
+            );
+            return Ok(true);
+        }
+
+        if let Some(destination_manifest) = destination_manifest {
+            self.completed_proofs_by_source.insert(
+                source.to_path_buf(),
+                (
+                    destination.to_path_buf(),
+                    tui_file_picker::FileTaskRootProof {
+                        source_manifest: intent.source_manifest.clone(),
+                        destination_manifest,
+                    },
+                ),
+            );
+            self.undo_disposition_by_source.insert(
+                source.to_path_buf(),
+                tui_file_picker::FileTaskUndoDisposition::CreatedDestination,
+            );
+            self.native_rename_intents_to_clear
+                .insert(source.to_path_buf());
+            let stats = match intent.source_manifest.root_kind() {
+                Some(tui_file_picker::SourceKind::Directory) => FileTaskPathStats {
+                    files: 0,
+                    folders: 1,
+                    bytes: 0,
+                },
+                Some(tui_file_picker::SourceKind::File) => FileTaskPathStats {
+                    files: 1,
+                    folders: 0,
+                    bytes: intent.source_manifest.total_file_bytes(),
+                },
+                Some(tui_file_picker::SourceKind::Symlink) | None => FileTaskPathStats {
+                    files: 1,
+                    folders: 0,
+                    bytes: 0,
+                },
+            };
+            self.mark_completed_stats(stats);
+            self.set_root_result(
+                source,
+                destination,
+                tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                Some(
+                    "interrupted native rename was proven complete from durable identity evidence"
+                        .to_string(),
+                ),
+            );
+            return Ok(true);
+        }
+
+        if source_matches {
+            journal.clear_native_rename_intent(source)?;
+            return Ok(false);
+        }
+
+        let detail = match (source_snapshot.is_some(), destination_present) {
+            (false, false) => format!(
+                "neither the original source nor the intended destination exists after an interrupted rename of {}; manual review is required",
+                source.display()
+            ),
+            (true, _) => format!(
+                "the source pathname for {} now identifies a different object and the intended destination cannot be proven; manual review is required",
+                source.display()
+            ),
+            (false, true) => format!(
+                "the intended destination {} exists but does not match the durable pre-rename identity proof; manual review is required",
+                destination.display()
+            ),
+        };
+        self.set_root_result(
+            source,
+            destination,
+            tui_file_picker::FileTaskRootDisposition::Failed,
+            Some(detail),
+        );
+        Ok(true)
+    }
+
+    fn verify_deferred_move_destination(
+        &mut self,
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        proof: &super::browse::BrowseMoveRecoveryProof,
+    ) -> Result<FileTaskStep, String> {
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Verifying,
+            format!(
+                "Revalidating published destination before deferred source cleanup: {}",
+                destination.display()
+            ),
+            Some(progress_item_for_paths(source, destination, 0, None)),
+            true,
+        );
+        self.io_counters.destination_tree_walks =
+            self.io_counters.destination_tree_walks.saturating_add(1);
+        let mut control = None;
+        let verification = proof.destination_manifest.verify_reused_copy_at_with_cancel(
+            &proof.source_manifest,
+            destination,
+            |path| {
+                if control.is_some() {
+                    return false;
+                }
+                match self.poll_controls_for_phase(
+                    Some(progress_item_for_paths(source, path, 0, None)),
+                    true,
+                    tui_file_picker::FileTaskPhase::Verifying,
+                ) {
+                    Ok(FileTaskStep::Completed) => true,
+                    Ok(step) => {
+                        control = Some(Ok(step));
+                        false
+                    }
+                    Err(error) => {
+                        control = Some(Err(error));
+                        false
+                    }
+                }
+            },
+        );
+        if let Some(control) = control {
+            return control;
+        }
+        let rehashed = verification.map_err(|error| {
+            format!(
+                "published destination {} no longer satisfies the durable move proof: {error}",
+                destination.display()
+            )
+        })?;
+        self.io_counters.destination_bytes_hashed = self
+            .io_counters
+            .destination_bytes_hashed
+            .saturating_add(rehashed);
+        Ok(FileTaskStep::Completed)
+    }
+
+    fn preflight_partial_quarantine_entry(
+        &mut self,
+        root: &std::path::Path,
+        relative: &std::path::Path,
+        manifest: &tui_file_picker::SourceManifest,
+    ) -> Result<FileTaskStep, String> {
+        let path = if relative.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(relative)
+        };
+        match self.poll_controls_for_phase(
+            Some(progress_item_for_paths(&path, &path, 0, None)),
+            true,
+            tui_file_picker::FileTaskPhase::Verifying,
+        )? {
+            FileTaskStep::Completed => {}
+            other => return Ok(other),
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FileTaskStep::Completed)
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect deferred source quarantine {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        let expected = manifest.expected_snapshot(relative).ok_or_else(|| {
+            format!(
+                "deferred source quarantine contains an unplanned entry at {}",
+                path.display()
+            )
+        })?;
+        if expected.kind() == tui_file_picker::SourceKind::Directory {
+            if !metadata.file_type().is_dir() {
+                return Err(format!(
+                    "deferred source quarantine entry changed type at {}",
+                    path.display()
+                ));
+            }
+            let current = tui_file_picker::snapshot_path(&path).map_err(|error| {
+                format!(
+                    "re-identify deferred source quarantine directory {}: {error}",
+                    path.display()
+                )
+            })?;
+            expected
+                .verify_same_identity_with_policy(
+                    &current,
+                    tui_file_picker::filesystem_identity_policy(&path),
+                )
+                .map_err(|error| {
+                    format!(
+                        "deferred source quarantine directory identity changed at {}: {error}",
+                        path.display()
+                    )
+                })?;
+            let actual_children = std::fs::read_dir(&path)
+                .map_err(|error| {
+                    format!(
+                        "read deferred source quarantine directory {}: {error}",
+                        path.display()
+                    )
+                })?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .map_err(|error| {
+                    format!(
+                        "read deferred source quarantine entry under {}: {error}",
+                        path.display()
+                    )
+                })?;
+            let expected_children = manifest.expected_direct_children(relative);
+            let unexpected = actual_children
+                .difference(&expected_children)
+                .take(8)
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if !unexpected.is_empty() {
+                return Err(format!(
+                    "deferred source quarantine has unexpected entr{} under {}: {}",
+                    if unexpected.len() == 1 { "y" } else { "ies" },
+                    path.display(),
+                    unexpected.join(", ")
+                ));
+            }
+            for child in expected_children {
+                let child_relative = if relative.as_os_str().is_empty() {
+                    std::path::PathBuf::from(child)
+                } else {
+                    relative.join(std::path::PathBuf::from(child))
+                };
+                match self.preflight_partial_quarantine_entry(root, &child_relative, manifest)? {
+                    FileTaskStep::Completed => {}
+                    other => return Ok(other),
+                }
+            }
+        } else {
+            let rehashed = manifest
+                .verify_cleanup_entry_at(relative, &path)
+                .map_err(|error| {
+                    format!(
+                        "deferred source quarantine entry changed at {}: {error}",
+                        path.display()
+                    )
+                })?;
+            self.io_counters.source_bytes_hashed = self
+                .io_counters
+                .source_bytes_hashed
+                .saturating_add(rehashed);
+        }
+        Ok(FileTaskStep::Completed)
+    }
+
+    fn delete_remaining_quarantine_entry(
+        &mut self,
+        root: &std::path::Path,
+        destination_root: &std::path::Path,
+        relative: &std::path::Path,
+        manifest: &tui_file_picker::SourceManifest,
+        destination_manifest: &tui_file_picker::DestinationManifest,
+        deleted_entries: &mut usize,
+    ) -> Result<FileTaskStep, String> {
+        let source_path = if relative.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(relative)
+        };
+        let destination_path = if relative.as_os_str().is_empty() {
+            destination_root.to_path_buf()
+        } else {
+            destination_root.join(relative)
+        };
+        let expected = manifest.expected_snapshot(relative).ok_or_else(|| {
+            format!(
+                "deferred source cleanup has no manifest entry for {}",
+                relative.display()
+            )
+        })?;
+        let metadata = match std::fs::symlink_metadata(&source_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "inspect deferred source cleanup entry {}: {error}",
+                    source_path.display()
+                ))
+            }
+        };
+
+        if metadata.is_none() {
+            return self.verify_destination_entry_before_source_cleanup(
+                &source_path,
+                &destination_path,
+                relative,
+                manifest,
+                destination_manifest,
+            );
+        }
+
+        if expected.kind() == tui_file_picker::SourceKind::Directory {
+            if !metadata.as_ref().is_some_and(|metadata| metadata.file_type().is_dir()) {
+                return Err(format!(
+                    "deferred source cleanup entry changed type at {}",
+                    source_path.display()
+                ));
+            }
+            let actual_children = std::fs::read_dir(&source_path)
+                .map_err(|error| {
+                    format!(
+                        "read deferred source cleanup directory {}: {error}",
+                        source_path.display()
+                    )
+                })?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .map_err(|error| {
+                    format!(
+                        "read deferred source cleanup entry under {}: {error}",
+                        source_path.display()
+                    )
+                })?;
+            let expected_children = manifest.expected_direct_children(relative);
+            let unexpected = actual_children
+                .difference(&expected_children)
+                .take(8)
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if !unexpected.is_empty() {
+                return Err(format!(
+                    "deferred source cleanup found unexpected entr{} under {}: {}",
+                    if unexpected.len() == 1 { "y" } else { "ies" },
+                    source_path.display(),
+                    unexpected.join(", ")
+                ));
+            }
+            for child in expected_children {
+                let child_relative = if relative.as_os_str().is_empty() {
+                    std::path::PathBuf::from(child)
+                } else {
+                    relative.join(std::path::PathBuf::from(child))
+                };
+                match self.delete_remaining_quarantine_entry(
+                    root,
+                    destination_root,
+                    &child_relative,
+                    manifest,
+                    destination_manifest,
+                    deleted_entries,
+                )? {
+                    FileTaskStep::Completed => {}
+                    other => return Ok(other),
+                }
+            }
+        }
+
+        #[cfg(test)]
+        if self
+            .forced_cleanup_control_after_deleted_entries
+            .as_ref()
+            .is_some_and(|(threshold, _)| *deleted_entries == *threshold)
+        {
+            let (_, control) = self
+                .forced_cleanup_control_after_deleted_entries
+                .take()
+                .expect("cleanup control checked above");
+            return Ok(control);
+        }
+
+        match self.poll_controls_for_phase(
+            Some(progress_item_for_paths(
+                &source_path,
+                &destination_path,
+                0,
+                None,
+            )),
+            true,
+            tui_file_picker::FileTaskPhase::CleaningUp,
+        )? {
+            FileTaskStep::Completed => {}
+            other => return Ok(other),
+        }
+
+        if expected.kind() == tui_file_picker::SourceKind::Directory {
+            let current = tui_file_picker::snapshot_path(&source_path).map_err(|error| {
+                format!(
+                    "re-identify deferred source directory before removal {}: {error}",
+                    source_path.display()
+                )
+            })?;
+            expected
+                .verify_same_identity_with_policy(
+                    &current,
+                    tui_file_picker::filesystem_identity_policy(&source_path),
+                )
+                .map_err(|error| {
+                    format!(
+                        "deferred source directory identity changed before removal at {}: {error}",
+                        source_path.display()
+                    )
+                })?;
+        } else {
+            let rehashed = manifest
+                .verify_cleanup_entry_at(relative, &source_path)
+                .map_err(|error| {
+                    format!(
+                        "deferred source entry changed before removal at {}: {error}",
+                        source_path.display()
+                    )
+                })?;
+            self.io_counters.source_bytes_hashed = self
+                .io_counters
+                .source_bytes_hashed
+                .saturating_add(rehashed);
+        }
+
+        match self.verify_destination_entry_before_source_cleanup(
+            &source_path,
+            &destination_path,
+            relative,
+            manifest,
+            destination_manifest,
+        )? {
+            FileTaskStep::Completed => {}
+            other => return Ok(other),
+        }
+
+        let first_deleted_entry = *deleted_entries == 0;
+        match expected.kind() {
+            tui_file_picker::SourceKind::Directory => std::fs::remove_dir(&source_path)
+                .map_err(|error| {
+                    format!(
+                        "remove deferred source directory {}: {error}",
+                        source_path.display()
+                    )
+                })?,
+            tui_file_picker::SourceKind::File | tui_file_picker::SourceKind::Symlink => {
+                std::fs::remove_file(&source_path).map_err(|error| {
+                    format!(
+                        "remove deferred source entry {}: {error}",
+                        source_path.display()
+                    )
+                })?
+            }
+        }
+        *deleted_entries = (*deleted_entries).saturating_add(1);
+        if first_deleted_entry {
+            if let Some(journal) = &self.journal {
+                journal
+                    .mark_quarantine_deletion_started(root)
+                    .map_err(|error| {
+                        format!(
+                            "deferred source cleanup crossed the irreversible deletion boundary, but its durable checkpoint failed: {error}"
+                        )
+                    })?;
+            }
+        }
+        Ok(FileTaskStep::Completed)
+    }
+
+    fn reconcile_partial_source_quarantine(
+        &mut self,
+        artifact: &super::file_task_runtime::DurableQuarantineArtifact,
+        proof: &super::browse::BrowseMoveRecoveryProof,
+    ) -> Result<FileTaskStep, String> {
+        match self.verify_deferred_move_destination(
+            &artifact.original_source,
+            &artifact.destination,
+            proof,
+        )? {
+            FileTaskStep::Completed => {}
+            other => return Ok(other),
+        }
+        match self.preflight_partial_quarantine_entry(
+            &artifact.path,
+            std::path::Path::new(""),
+            &proof.source_manifest,
+        )? {
+            FileTaskStep::Completed => {}
+            other => return Ok(other),
+        }
+        self.io_counters.destination_entry_verification_passes = self
+            .io_counters
+            .destination_entry_verification_passes
+            .saturating_add(1);
+        let mut deleted_entries = 0usize;
+        self.delete_remaining_quarantine_entry(
+            &artifact.path,
+            &artifact.destination,
+            std::path::Path::new(""),
+            &proof.source_manifest,
+            &proof.destination_manifest,
+            &mut deleted_entries,
+        )
+    }
+
+    fn reconcile_deferred_file_task_artifacts(&mut self) -> Result<(), String> {
+        let Some(journal) = self.journal.clone() else {
+            return Ok(());
+        };
+        let record = journal.load()?;
+        let has_deferred_work = record.generation > 1
+            || !record.roots.is_empty()
+            || !record.temp_artifacts.is_empty()
+            || !record.quarantine_artifacts.is_empty()
+            || !record.native_rename_intents.is_empty()
+            || record.abandoned_reason.is_some();
+        let journal_job_id = record.job_id.clone();
+        let mut artifact_generations = record.artifact_generations.clone();
+        if artifact_generations.is_empty() {
+            artifact_generations.push(record.generation);
+        }
+        let journal_mappings = record.mappings.clone();
+        let mut endpoint_cache = FileTaskEndpointVerificationCache::new(&record);
+
+        for artifact in record.temp_artifacts.iter().cloned() {
+            if let Err(error) = endpoint_cache.destination(&artifact.destination) {
+                self.record_error(
+                    None,
+                    Some(&artifact.destination),
+                    format!(
+                        "deferred temporary cleanup remains pending because its destination endpoint is unavailable: {error}"
+                    ),
+                );
+                continue;
+            }
+            self.snapshot(
+                tui_file_picker::FileTaskPhase::CleaningUp,
+                format!("Cleaning deferred temporary artifact {}", artifact.path.display()),
+                Some(progress_item_for_paths(
+                    &artifact.destination,
+                    &artifact.path,
+                    0,
+                    None,
+                )),
+                true,
+            );
+            if !artifact.is_safe_private_artifact(&journal_job_id) {
+                self.record_error(
+                    None,
+                    Some(&artifact.destination),
+                    format!(
+                        "refused deferred cleanup for an invalid or non-private artifact path: {}",
+                        artifact.path.display()
+                    ),
+                );
+                continue;
+            }
+            match remove_derived_private_artifact(&artifact.path, artifact.kind) {
+                Ok(()) => {
+                    let _ = journal.clear_temp_artifact(&artifact.path);
+                }
+                Err(error) => {
+                    self.record_error(
+                        None,
+                        Some(&artifact.destination),
+                        format!(
+                            "deferred temporary cleanup remains pending at {}: {error}",
+                            artifact.path.display()
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Ordinary copy performance must not depend on a durable append+fsync
+        // for every temporary file. Generation-qualified private names let a
+        // reconciliation helper derive the same cleanup set safely after a
+        // crash or forced helper termination.
+        let mut shallow_scan_roots = std::collections::BTreeSet::new();
+        let mut recursive_scan_roots = std::collections::BTreeSet::new();
+        for mapping in &journal_mappings {
+            if let Err(error) = endpoint_cache.destination(&mapping.destination) {
+                self.record_error(
+                    Some(&mapping.source),
+                    Some(&mapping.destination),
+                    format!(
+                        "derived temporary cleanup remains pending because its destination endpoint is unavailable: {error}"
+                    ),
+                );
+                continue;
+            }
+            if let Some(parent) = mapping.destination.parent() {
+                shallow_scan_roots.insert(parent.to_path_buf());
+            }
+            match std::fs::symlink_metadata(&mapping.destination) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    recursive_scan_roots.insert(mapping.destination.clone());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => self.record_error(
+                    None,
+                    Some(&mapping.destination),
+                    format!(
+                        "deferred temporary cleanup could not inspect {}: {error}",
+                        mapping.destination.display()
+                    ),
+                ),
+            }
+        }
+        let mut derived_artifacts = std::collections::BTreeMap::new();
+        for root in shallow_scan_roots {
+            if let Err(error) = collect_derived_private_artifacts(
+                &root,
+                false,
+                &journal_job_id,
+                &artifact_generations,
+                &mut derived_artifacts,
+            ) {
+                self.record_error(None, Some(&root), error);
+            }
+        }
+        for root in recursive_scan_roots {
+            if let Err(error) = collect_derived_private_artifacts(
+                &root,
+                true,
+                &journal_job_id,
+                &artifact_generations,
+                &mut derived_artifacts,
+            ) {
+                self.record_error(None, Some(&root), error);
+            }
+        }
+        for (path, (kind, owner_generation)) in derived_artifacts {
+            self.snapshot(
+                tui_file_picker::FileTaskPhase::CleaningUp,
+                format!("Cleaning deferred temporary artifact {}", path.display()),
+                Some(progress_item_for_paths(&path, &path, 0, None)),
+                true,
+            );
+            if let Err(error) = journal.record_recovered_temp_artifact(
+                &path,
+                &path,
+                kind,
+                owner_generation,
+            ) {
+                self.record_error(
+                    None,
+                    path.parent(),
+                    format!("could not durably retain deferred cleanup obligation: {error}"),
+                );
+                continue;
+            }
+            if let Err(error) = remove_derived_private_artifact(&path, kind) {
+                self.record_error(
+                    None,
+                    path.parent(),
+                    format!("deferred temporary cleanup remains pending: {error}"),
+                );
+            } else {
+                let _ = journal.clear_temp_artifact(&path);
+            }
+        }
+
+        if !self.job.is_move {
+            if has_deferred_work {
+                let active_sources = self
+                    .job
+                    .sources
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut unavailable_sources = std::collections::BTreeSet::new();
+                for mapping in journal_mappings
+                    .iter()
+                    .filter(|mapping| active_sources.contains(&mapping.source))
+                {
+                    let endpoint_result = match endpoint_cache.source(&mapping.source) {
+                        Ok(()) => endpoint_cache.destination(&mapping.destination),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = endpoint_result {
+                        unavailable_sources.insert(mapping.source.clone());
+                        self.set_root_result(
+                            &mapping.source,
+                            &mapping.destination,
+                            tui_file_picker::FileTaskRootDisposition::Failed,
+                            Some(format!(
+                                "copy remains awaiting reconciliation because this mapping's endpoint is unavailable: {error}"
+                            )),
+                        );
+                    }
+                }
+                if !unavailable_sources.is_empty() {
+                    let mut retained_sources = Vec::new();
+                    let mut retained_targets = Vec::new();
+                    for (index, source) in self.job.sources.iter().enumerate() {
+                        if unavailable_sources.contains(source) {
+                            continue;
+                        }
+                        retained_sources.push(source.clone());
+                        if let Some(target) = self
+                            .job
+                            .root_targets
+                            .as_ref()
+                            .and_then(|targets| targets.get(index))
+                        {
+                            retained_targets.push(target.clone());
+                        }
+                    }
+                    self.job.sources = retained_sources;
+                    if self.job.root_targets.is_some() {
+                        self.job.root_targets = Some(retained_targets);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let retry = self.job.clipboard_retry_plan.clone();
+        let mut terminal_sources = std::collections::BTreeSet::new();
+        let native_renames_by_source = record
+            .native_rename_intents
+            .iter()
+            .cloned()
+            .map(|intent| (intent.source.clone(), intent))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let quarantines_by_source = record
+            .quarantine_artifacts
+            .iter()
+            .cloned()
+            .map(|artifact| (artifact.original_source.clone(), artifact))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for result in self.root_results.clone() {
+            let source = result.source;
+            let destination = record
+                .mappings
+                .iter()
+                .find(|mapping| mapping.source == source)
+                .map(|mapping| mapping.destination.clone())
+                .unwrap_or_else(|| result.destination.clone());
+            if let Err(error) = endpoint_cache.source(&source) {
+                let committed = quarantines_by_source
+                    .get(&source)
+                    .is_some_and(|artifact| artifact.state.is_irreversibly_committed());
+                if committed {
+                    self.undo_disposition_by_source.insert(
+                        source.clone(),
+                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    );
+                }
+                self.set_root_result(
+                    &source,
+                    &destination,
+                    if committed {
+                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+                    } else {
+                        tui_file_picker::FileTaskRootDisposition::Failed
+                    },
+                    Some(if committed {
+                        format!(
+                            "move remains committed; source cleanup stays journaled because this source endpoint is unavailable: {error}"
+                        )
+                    } else {
+                        format!(
+                            "move state remains awaiting reconciliation because this source endpoint is unavailable: {error}"
+                        )
+                    }),
+                );
+                terminal_sources.insert(source);
+                continue;
+            }
+            if let Some(intent) = native_renames_by_source.get(&source) {
+                if let Err(error) = endpoint_cache.destination(&intent.destination) {
+                    self.set_root_result(
+                        &source,
+                        &intent.destination,
+                        tui_file_picker::FileTaskRootDisposition::Failed,
+                        Some(format!(
+                            "interrupted native rename remains awaiting reconciliation because its destination endpoint is unavailable: {error}"
+                        )),
+                    );
+                    terminal_sources.insert(source);
+                    continue;
+                }
+                match self.reconcile_native_rename_intent(&journal, intent) {
+                    Ok(true) => {
+                        terminal_sources.insert(source);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.set_root_result(
+                            &source,
+                            &intent.destination,
+                            tui_file_picker::FileTaskRootDisposition::Failed,
+                            Some(format!(
+                                "interrupted native rename remains awaiting reconciliation: {error}"
+                            )),
+                        );
+                        terminal_sources.insert(source);
+                        continue;
+                    }
+                }
+            }
+            let source_present = match file_task_path_is_present(
+                &source,
+                "deferred move reconciliation",
+            ) {
+                Ok(present) => present,
+                Err(error) => {
+                    self.set_root_result(
+                        &source,
+                        &destination,
+                        tui_file_picker::FileTaskRootDisposition::Failed,
+                        Some(error),
+                    );
+                    terminal_sources.insert(source);
+                    continue;
+                }
+            };
+            let quarantine_present = match quarantines_by_source.get(&source) {
+                Some(artifact) => match file_task_path_is_present(
+                    &artifact.path,
+                    "deferred move reconciliation",
+                ) {
+                    Ok(present) => present,
+                    Err(error) => {
+                        self.set_root_result(
+                            &source,
+                            &destination,
+                            if artifact.state.is_irreversibly_committed() {
+                                tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+                            } else {
+                                tui_file_picker::FileTaskRootDisposition::Failed
+                            },
+                            Some(error),
+                        );
+                        terminal_sources.insert(source.clone());
+                        continue;
+                    }
+                },
+                None => false,
+            };
+            if source_present {
+                if let Some(artifact) = quarantines_by_source.get(&source) {
+                    if quarantine_present {
+                        self.set_root_result(
+                            &source,
+                            &artifact.destination,
+                            tui_file_picker::FileTaskRootDisposition::Failed,
+                            Some(format!(
+                                "both the original source and deferred quarantine {} exist; manual review is required before reconciliation",
+                                artifact.path.display()
+                            )),
+                        );
+                        terminal_sources.insert(source);
+                    } else {
+                        let _ = journal.clear_quarantine_artifact(&artifact.path);
+                    }
+                }
+                continue;
+            }
+            let Some(retry) = retry.as_ref() else {
+                continue;
+            };
+            let Some(proof) = retry.recovery_by_source.get(&source).cloned() else {
+                continue;
+            };
+            let destination = retry
+                .plan
+                .mappings
+                .iter()
+                .find(|mapping| mapping.source == source)
+                .map(|mapping| mapping.destination.clone())
+                .unwrap_or(result.destination);
+
+            if let Some(artifact) = quarantines_by_source.get(&source) {
+                if quarantine_present {
+                    self.snapshot(
+                        tui_file_picker::FileTaskPhase::Verifying,
+                        format!("Reconciling deferred source quarantine {}", artifact.path.display()),
+                        Some(progress_item_for_paths(
+                            &artifact.path,
+                            &destination,
+                            0,
+                            None,
+                        )),
+                        true,
+                    );
+                    match proof.source_manifest.verify_at(&artifact.path) {
+                        Ok(()) if !artifact.state.is_irreversibly_committed() => {
+                            match try_no_clobber_rename(&artifact.path, &source) {
+                                Ok(_) => {
+                                    if let Some(container) = artifact.path.parent() {
+                                        let _ = std::fs::remove_dir(container);
+                                    }
+                                    let _ = journal.clear_quarantine_artifact(&artifact.path);
+                                    self.move_recovery_by_source.insert(source.clone(), proof);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.undo_disposition_by_source.insert(
+                                        source.clone(),
+                                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                                    );
+                                    self.set_root_result(
+                                        &source,
+                                        &destination,
+                                        tui_file_picker::FileTaskRootDisposition::Failed,
+                                        Some(format!(
+                                            "source quarantine is intact at {} and no source entry has been deleted, but restoration failed; the exact move state remains awaiting reconciliation: {error}",
+                                            artifact.path.display()
+                                        )),
+                                    );
+                                    terminal_sources.insert(source);
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(()) | Err(_) => {
+                            if let Err(error) = endpoint_cache.destination(&destination) {
+                                self.undo_disposition_by_source.insert(
+                                    source.clone(),
+                                    tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                                );
+                                self.set_root_result(
+                                    &source,
+                                    &destination,
+                                    if artifact.state.is_irreversibly_committed() {
+                                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+                                    } else {
+                                        tui_file_picker::FileTaskRootDisposition::Failed
+                                    },
+                                    Some(format!(
+                                        "source cleanup remains journaled because its destination endpoint is unavailable: {error}"
+                                    )),
+                                );
+                                terminal_sources.insert(source);
+                                continue;
+                            }
+                            match self.reconcile_partial_source_quarantine(artifact, &proof) {
+                                Ok(FileTaskStep::Completed) => {
+                                    if let Some(container) = artifact.path.parent() {
+                                        if let Err(error) = std::fs::remove_dir(container) {
+                                            if error.kind() != std::io::ErrorKind::NotFound {
+                                                self.record_active_root_notice(
+                                                    &source,
+                                                    format!(
+                                                        "deferred source cleanup completed, but empty quarantine container {} could not be removed: {error}",
+                                                        container.display()
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    let _ = journal.clear_quarantine_artifact(&artifact.path);
+                                    self.completed_proofs_by_source.insert(
+                                        source.clone(),
+                                        (
+                                            destination.clone(),
+                                            tui_file_picker::FileTaskRootProof {
+                                                source_manifest: proof.source_manifest.clone(),
+                                                destination_manifest: proof.destination_manifest.clone(),
+                                            },
+                                        ),
+                                    );
+                                    // The persistent journal owned the deferred
+                                    // cleanup interval. Without a persisted
+                                    // pre-cleanup undo disposition, do not let
+                                    // the in-memory replay journal overclaim it.
+                                    self.undo_disposition_by_source.insert(
+                                        source.clone(),
+                                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                                    );
+                                    self.set_root_result(
+                                        &source,
+                                        &destination,
+                                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                                        Some(
+                                            "reconciled committed move by verifying the destination and deleting the remaining quarantined source entries"
+                                                .to_string(),
+                                        ),
+                                    );
+                                    terminal_sources.insert(source);
+                                    continue;
+                                }
+                                Ok(step @ (FileTaskStep::Skipped | FileTaskStep::Aborted)) => {
+                                    if step == FileTaskStep::Aborted {
+                                        self.stop_after_committed_cleanup = true;
+                                    }
+                                    self.undo_disposition_by_source.insert(
+                                        source.clone(),
+                                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                                    );
+                                    self.set_root_result(
+                                        &source,
+                                        &destination,
+                                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                                        Some(format!(
+                                            "move remains committed; verified source cleanup stopped promptly and remains durably pending at {}",
+                                            artifact.path.display()
+                                        )),
+                                    );
+                                    terminal_sources.insert(source);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.undo_disposition_by_source.insert(
+                                        source.clone(),
+                                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                                    );
+                                    self.set_root_result(
+                                        &source,
+                                        &destination,
+                                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                                        Some(format!(
+                                            "move remains committed, but deferred source cleanup stopped for manual review at {}: {error}",
+                                            artifact.path.display()
+                                        )),
+                                    );
+                                    terminal_sources.insert(source);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Err(error) = endpoint_cache.destination(&destination) {
+                let committed = quarantines_by_source
+                    .get(&source)
+                    .is_some_and(|artifact| artifact.state.is_irreversibly_committed());
+                if committed {
+                    self.undo_disposition_by_source.insert(
+                        source.clone(),
+                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    );
+                }
+                self.set_root_result(
+                    &source,
+                    &destination,
+                    if committed {
+                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+                    } else {
+                        tui_file_picker::FileTaskRootDisposition::Failed
+                    },
+                    Some(format!(
+                        "move reconciliation remains pending because its destination endpoint is unavailable: {error}"
+                    )),
+                );
+                terminal_sources.insert(source);
+                continue;
+            }
+            match self.verify_deferred_move_destination(&source, &destination, &proof) {
+                Ok(FileTaskStep::Completed) => {
+                    if let Some(artifact) = quarantines_by_source.get(&source) {
+                        let _ = journal.clear_quarantine_artifact(&artifact.path);
+                    }
+                    self.completed_proofs_by_source.insert(
+                        source.clone(),
+                        (
+                            destination.clone(),
+                            tui_file_picker::FileTaskRootProof {
+                                source_manifest: proof.source_manifest.clone(),
+                                destination_manifest: proof.destination_manifest.clone(),
+                            },
+                        ),
+                    );
+                    self.undo_disposition_by_source.insert(
+                        source.clone(),
+                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    );
+                    self.set_root_result(
+                        &source,
+                        &destination,
+                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                        Some(
+                            "reconciled after helper termination: destination is verified and source cleanup had already completed"
+                                .to_string(),
+                        ),
+                    );
+                    terminal_sources.insert(source);
+                }
+                Ok(step @ (FileTaskStep::Skipped | FileTaskStep::Aborted)) => {
+                    if step == FileTaskStep::Aborted {
+                        self.stop_after_committed_cleanup = true;
+                    }
+                    self.undo_disposition_by_source.insert(
+                        source.clone(),
+                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    );
+                    self.set_root_result(
+                        &source,
+                        &destination,
+                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                        Some(
+                            "move remains committed; destination revalidation was interrupted and reconciliation remains pending"
+                                .to_string(),
+                        ),
+                    );
+                    terminal_sources.insert(source);
+                }
+                Err(error) => {
+                    self.undo_disposition_by_source.insert(
+                        source.clone(),
+                        tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    );
+                    self.set_root_result(
+                        &source,
+                        &destination,
+                        tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                        Some(format!(
+                            "move remains committed, but destination recovery proof failed; source cleanup is stopped for manual review: {error}"
+                        )),
+                    );
+                    terminal_sources.insert(source);
+                }
+            }
+
+        }
+
+        if !terminal_sources.is_empty() {
+            let mut retained_sources = Vec::new();
+            let mut retained_targets = Vec::new();
+            for (index, source) in self.job.sources.iter().enumerate() {
+                if terminal_sources.contains(source) {
+                    continue;
+                }
+                retained_sources.push(source.clone());
+                if let Some(target) = self
+                    .job
+                    .root_targets
+                    .as_ref()
+                    .and_then(|targets| targets.get(index))
+                {
+                    retained_targets.push(target.clone());
+                }
+            }
+            self.job.sources = retained_sources;
+            if self.job.root_targets.is_some() {
+                self.job.root_targets = Some(retained_targets);
+            }
+        }
+        Ok(())
+    }
+
     fn run_inner(&mut self) -> Result<FileTaskStep, String> {
+        self.ensure_file_task_endpoint_identities()?;
+        self.reconcile_deferred_file_task_artifacts()?;
+        if self.stop_after_committed_cleanup {
+            return Ok(FileTaskStep::Completed);
+        }
         let dest_dir = std::path::PathBuf::from(self.job.dest.trim());
 
         // Copy jobs build their bounded recursive plan before mutation. Move
@@ -36213,13 +37802,7 @@ impl FileTaskWorker {
             return Ok(FileTaskStep::Completed);
         }
 
-        if !dest_dir.exists() {
-            std::fs::create_dir_all(&dest_dir)
-                .map_err(|e| format!("failed to create destination: {e}"))?;
-        }
-        if !dest_dir.is_dir() {
-            return Err(format!("destination is not a directory: {}", dest_dir.display()));
-        }
+        self.ensure_destination_root_ready(&dest_dir)?;
 
         self.conflict_count = Some(count_existing_conflicts(&plan.roots));
 
@@ -36370,6 +37953,9 @@ impl FileTaskWorker {
                 }
             }
             self.active_root_source = None;
+            if self.stop_after_committed_cleanup {
+                return Ok(FileTaskStep::Completed);
+            }
         }
         Ok(FileTaskStep::Completed)
     }
@@ -36848,7 +38434,7 @@ impl FileTaskWorker {
         self.send(tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict });
         maybe_spawn_existing_directory_size_probe(
             self.job.session_id,
-            self.tx.clone(),
+            self.sink.clone(),
             request_id,
             target,
             &existing_meta,
@@ -37117,6 +38703,16 @@ impl FileTaskWorker {
         }
         let rename_proof = tui_file_picker::RenameSourceProof::capture(source)
             .map_err(|error| format!("capture native-rename source proof: {error}"))?;
+        if let Some(journal) = &self.journal {
+            journal
+                .record_native_rename_intent(source, target, &source_manifest)
+                .map_err(|error| {
+                    format!(
+                        "record native-rename recovery intent before moving {}: {error}",
+                        source.display()
+                    )
+                })?;
+        }
         self.io_counters.rename_attempts =
             self.io_counters.rename_attempts.saturating_add(1);
         match try_no_clobber_rename(source, target) {
@@ -37190,11 +38786,14 @@ impl FileTaskWorker {
                                     },
                                 ),
                             );
+                            self.native_rename_intents_to_clear
+                                .insert(source.to_path_buf());
                         }
-                        Err(error) => self.record_active_root_notice(
+                        Err(error) => self.record_committed_failure(
                             source,
+                            target,
                             format!(
-                                "move completed, but its retained pre-operation manifest could not be rebound to {}: {error}",
+                                "move committed, but its retained pre-operation manifest could not be rebound to {}: {error}; reconciliation is required",
                                 target.display()
                             ),
                         ),
@@ -37221,15 +38820,26 @@ impl FileTaskWorker {
                 Ok(FileTaskStep::Completed)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(journal) = &self.journal {
+                    let _ = journal.clear_native_rename_intent(source);
+                }
                 self.resolve_move_root_conflict_before_copy_fallback(node)
             }
             Err(error)
                 if is_cross_device_error(&error)
                     || error.kind() == std::io::ErrorKind::Unsupported =>
             {
+                if let Some(journal) = &self.journal {
+                    let _ = journal.clear_native_rename_intent(source);
+                }
                 self.move_via_prepared_copy_fallback(node)
             }
-            Err(error) => Err(format!("rename without replacing: {error}")),
+            Err(error) => {
+                if let Some(journal) = &self.journal {
+                    let _ = journal.clear_native_rename_intent(source);
+                }
+                Err(format!("rename without replacing: {error}"))
+            }
         }
     }
 
@@ -37630,24 +39240,45 @@ impl FileTaskWorker {
                 }
             }
         };
-        self.move_recovery_by_source.insert(
-            source.to_path_buf(),
-            super::browse::BrowseMoveRecoveryProof {
-                source_manifest: manifest.clone(),
-                destination_manifest: destination_manifest.clone(),
-            },
-        );
-        if let Some(parent) = resolved_target.parent() {
-            self.io_counters.directory_sync_calls =
-                self.io_counters.directory_sync_calls.saturating_add(1);
-            if let Err(error) = sync_file_task_directory(parent) {
-                self.record_active_root_notice(
-                    source,
+        let recovery_proof = super::browse::BrowseMoveRecoveryProof {
+            source_manifest: manifest.clone(),
+            destination_manifest: destination_manifest.clone(),
+        };
+        if let Some(journal) = &self.journal {
+            journal
+                .record_move_recovery_proof(source, &recovery_proof)
+                .map_err(|error| {
                     format!(
-                        "destination verified at {}, but destination-parent synchronization failed: {error}",
+                        "durably record verified destination authority before source cleanup: {error}"
+                    )
+                })?;
+            journal
+                .mark_lifecycle(
+                    super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation,
+                    format!(
+                        "destination verified at {}; source cleanup pending",
                         resolved_target.display()
                     ),
-                );
+                )
+                .map_err(|error| {
+                    format!("checkpoint source-cleanup boundary before quarantine: {error}")
+                })?;
+        }
+        self.move_recovery_by_source
+            .insert(source.to_path_buf(), recovery_proof);
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            if let Some(parent) = resolved_target.parent() {
+                self.io_counters.directory_sync_calls =
+                    self.io_counters.directory_sync_calls.saturating_add(1);
+                if let Err(error) = sync_file_task_directory(parent) {
+                    self.record_active_root_notice(
+                        source,
+                        format!(
+                            "destination verified at {}, but destination-parent synchronization failed: {error}",
+                            resolved_target.display()
+                        ),
+                    );
+                }
             }
         }
         #[cfg(test)]
@@ -37686,7 +39317,11 @@ impl FileTaskWorker {
         );
         self.io_counters.rename_attempts =
             self.io_counters.rename_attempts.saturating_add(1);
-        let (quarantine, quarantine_mode) = match quarantine_source_root(source) {
+        let quarantine_journal = self
+            .journal
+            .as_ref()
+            .map(|journal| (journal, resolved_target.as_path()));
+        let (quarantine, quarantine_mode) = match quarantine_source_root(source, quarantine_journal) {
             Ok(result) => result,
             Err(error) => {
                 self.record_committed_retention(
@@ -37788,39 +39423,65 @@ impl FileTaskWorker {
                     ),
                 );
                 self.move_recovery_by_source.remove(source);
+                if let Some(journal) = &self.journal {
+                    let _ = journal.clear_quarantine_artifact(&quarantine);
+                }
                 Ok(FileTaskStep::Completed)
             }
             Ok(FileTaskStep::Skipped) => {
-                let warning = self.describe_incomplete_source_cleanup(
+                match self.describe_incomplete_source_cleanup(
                     source,
                     &resolved_target,
                     &quarantine,
                     deleted_entries,
                     "verified source cleanup was skipped",
-                );
-                self.record_committed_retention(source, &resolved_target, warning);
+                ) {
+                    IncompleteSourceCleanupOutcome::RestoredRetryable(warning)
+                    | IncompleteSourceCleanupOutcome::AwaitingReconciliation(warning) => {
+                        self.record_committed_retention(source, &resolved_target, warning);
+                    }
+                    IncompleteSourceCleanupOutcome::CommittedDeferred(warning) => {
+                        self.record_active_root_notice(source, warning);
+                    }
+                }
                 Ok(FileTaskStep::Completed)
             }
             Ok(FileTaskStep::Aborted) => {
-                let warning = self.describe_incomplete_source_cleanup(
+                match self.describe_incomplete_source_cleanup(
                     source,
                     &resolved_target,
                     &quarantine,
                     deleted_entries,
                     "verified source cleanup was interrupted",
-                );
-                self.record_committed_retention(source, &resolved_target, warning);
-                Ok(FileTaskStep::Aborted)
+                ) {
+                    IncompleteSourceCleanupOutcome::RestoredRetryable(warning)
+                    | IncompleteSourceCleanupOutcome::AwaitingReconciliation(warning) => {
+                        self.record_committed_retention(source, &resolved_target, warning);
+                        Ok(FileTaskStep::Aborted)
+                    }
+                    IncompleteSourceCleanupOutcome::CommittedDeferred(warning) => {
+                        self.record_active_root_notice(source, warning);
+                        self.stop_after_committed_cleanup = true;
+                        Ok(FileTaskStep::Completed)
+                    }
+                }
             }
             Err(error) => {
-                let warning = self.describe_incomplete_source_cleanup(
+                match self.describe_incomplete_source_cleanup(
                     source,
                     &resolved_target,
                     &quarantine,
                     deleted_entries,
                     &format!("verified source cleanup failed: {error}"),
-                );
-                self.record_committed_retention(source, &resolved_target, warning);
+                ) {
+                    IncompleteSourceCleanupOutcome::RestoredRetryable(warning)
+                    | IncompleteSourceCleanupOutcome::AwaitingReconciliation(warning) => {
+                        self.record_committed_retention(source, &resolved_target, warning);
+                    }
+                    IncompleteSourceCleanupOutcome::CommittedDeferred(warning) => {
+                        self.record_active_root_notice(source, warning);
+                    }
+                }
                 Ok(FileTaskStep::Completed)
             }
         }
@@ -37833,39 +39494,73 @@ impl FileTaskWorker {
         quarantine: &std::path::Path,
         deleted_entries: usize,
         reason: &str,
-    ) -> String {
+    ) -> IncompleteSourceCleanupOutcome {
         if deleted_entries == 0 {
             let (restored, recovery) = try_restore_quarantined_source_accounted(
                 quarantine,
                 source,
                 &mut self.io_counters,
             );
-            if !restored {
-                self.move_recovery_by_source.remove(source);
+            if restored {
+                if let Some(journal) = &self.journal {
+                    let _ = journal.clear_quarantine_artifact(quarantine);
+                }
+                return IncompleteSourceCleanupOutcome::RestoredRetryable(format!(
+                    "destination is complete at {}, but {reason} before any source entry was deleted; {recovery}",
+                    destination.display()
+                ));
             }
-            return format!(
-                "destination is complete at {}, but {reason} before any source entry was deleted; {recovery}",
-                destination.display()
+
+            self.completed_proofs_by_source.remove(source);
+            self.undo_disposition_by_source.insert(
+                source.to_path_buf(),
+                tui_file_picker::FileTaskUndoDisposition::NotReversible,
             );
+            return IncompleteSourceCleanupOutcome::AwaitingReconciliation(format!(
+                "destination is complete at {}, but {reason} after source quarantine and before any source entry was deleted; the intact source could not be restored immediately, so the exact source/quarantine state remains awaiting reconciliation at {} ({recovery})",
+                destination.display(),
+                quarantine.display()
+            ));
         }
 
-        // Once any quarantined entry has been removed, the original root can no
-        // longer be restored as an exact retry source. Preserve the remaining
-        // quarantine for inspection, but do not advertise a retry token whose
-        // source pathname no longer exists or whose tree is incomplete.
-        self.move_recovery_by_source.remove(source);
-        format!(
-            "destination is complete at {}, but {reason} after deleting {} quarantined entr{}; undeleted remnants remain at {}",
+        // The first successful unlink is the irreversible move-commit boundary.
+        // Cancellation after this point stops cleanup promptly but cannot turn
+        // the operation back into a cancelled/retryable move. The persistent
+        // journal remains authoritative for idempotent cleanup reconciliation.
+        self.completed_proofs_by_source.remove(source);
+        self.undo_disposition_by_source.insert(
+            source.to_path_buf(),
+            tui_file_picker::FileTaskUndoDisposition::NotReversible,
+        );
+        IncompleteSourceCleanupOutcome::CommittedDeferred(format!(
+            "move committed at {}; {reason} after deleting {} quarantined entr{}; verified cleanup remains pending at {}",
             destination.display(),
             deleted_entries,
             if deleted_entries == 1 { "y" } else { "ies" },
             quarantine.display()
-        )
+        ))
     }
 
     fn verify_destination_before_source_deletion(
         &mut self,
         node: &FileTaskPlanNode,
+        relative: &std::path::Path,
+        manifest: &tui_file_picker::SourceManifest,
+        destination_manifest: &tui_file_picker::DestinationManifest,
+    ) -> Result<FileTaskStep, String> {
+        self.verify_destination_entry_before_source_cleanup(
+            &node.source,
+            &node.target,
+            relative,
+            manifest,
+            destination_manifest,
+        )
+    }
+
+    fn verify_destination_entry_before_source_cleanup(
+        &mut self,
+        source_path: &std::path::Path,
+        destination_path: &std::path::Path,
         relative: &std::path::Path,
         manifest: &tui_file_picker::SourceManifest,
         destination_manifest: &tui_file_picker::DestinationManifest,
@@ -37877,12 +39572,12 @@ impl FileTaskWorker {
         let verification = destination_manifest.verify_entry_at_with_cancel_counted(
             manifest,
             relative,
-            &node.target,
+            destination_path,
             &mut |path| {
                 if control.is_some() {
                     return false;
                 }
-                let item = progress_item_for_paths(&node.source, path, 0, None);
+                let item = progress_item_for_paths(source_path, path, 0, None);
                 match self.poll_controls_for_phase(
                     Some(item),
                     false,
@@ -37906,7 +39601,7 @@ impl FileTaskWorker {
         let destination_bytes_rehashed = verification.map_err(|error| {
             format!(
                 "verified destination changed before source deletion at {}: {error}",
-                node.target.display()
+                destination_path.display()
             )
         })?;
         self.io_counters.destination_bytes_hashed = self
@@ -38041,6 +39736,7 @@ impl FileTaskWorker {
             other => return Ok(other),
         }
 
+        let first_deleted_entry = *deleted_entries == 0;
         match node.kind {
             FileTaskPlanKind::Directory => std::fs::remove_dir(&node.source)
                 .map_err(|error| format!("remove original directory {}: {error}", node.source.display()))?,
@@ -38048,6 +39744,17 @@ impl FileTaskWorker {
                 .map_err(|error| format!("remove original {}: {error}", node.source.display()))?,
         }
         *deleted_entries = (*deleted_entries).saturating_add(1);
+        if first_deleted_entry {
+            if let Some(journal) = &self.journal {
+                journal
+                    .mark_quarantine_deletion_started(quarantine_root)
+                    .map_err(|error| {
+                        format!(
+                            "source cleanup crossed the irreversible deletion boundary, but its durable checkpoint failed: {error}"
+                        )
+                    })?;
+            }
+        }
         Ok(FileTaskStep::Completed)
     }
 
@@ -38058,6 +39765,9 @@ impl FileTaskWorker {
         let decision = self.resolve_destination_conflict(node)?;
         let (target, applied) = match decision {
             FileTaskConflictDecision::UsePath { path, applied } => (path, applied),
+            FileTaskConflictDecision::Skip if self.job.generation > 1 => {
+                return self.revalidate_copy_retry_destination(node)
+            }
             FileTaskConflictDecision::Skip => return Ok(FileTaskStep::Skipped),
             FileTaskConflictDecision::Abort => return Ok(FileTaskStep::Aborted),
         };
@@ -38066,6 +39776,110 @@ impl FileTaskWorker {
             retarget_plan_node(&mut resolved_node, &target);
         }
         self.copy_root_progress_resolved_node(&resolved_node, applied)
+    }
+
+    fn revalidate_copy_retry_destination(
+        &mut self,
+        node: &FileTaskPlanNode,
+    ) -> Result<FileTaskStep, String> {
+        self.snapshot(
+            tui_file_picker::FileTaskPhase::Verifying,
+            format!(
+                "Reconciling existing destination for {}",
+                display_name(&node.source)
+            ),
+            Some(progress_item_for_paths(
+                &node.source,
+                &node.target,
+                0,
+                None,
+            )),
+            true,
+        );
+        let mut capture_control = None;
+        self.io_counters.source_tree_walks =
+            self.io_counters.source_tree_walks.saturating_add(1);
+        let source_manifest = tui_file_picker::capture_manifest_with_mode_and_cancel(
+            &node.source,
+            self.job.verification,
+            |path| {
+                if capture_control.is_some() {
+                    return false;
+                }
+                let item = progress_item_for_paths(path, &node.target, 0, None);
+                match self.poll_controls_for_phase(
+                    Some(item),
+                    false,
+                    tui_file_picker::FileTaskPhase::Verifying,
+                ) {
+                    Ok(FileTaskStep::Completed) => true,
+                    Ok(step) => {
+                        capture_control = Some(Ok(step));
+                        false
+                    }
+                    Err(error) => {
+                        capture_control = Some(Err(error));
+                        false
+                    }
+                }
+            },
+        );
+        if let Some(control) = capture_control {
+            return control;
+        }
+        let source_manifest = source_manifest.map_err(|error| {
+            format!(
+                "capture source while reconciling {}: {error}",
+                node.source.display()
+            )
+        })?;
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            self.io_counters.source_bytes_hashed = self
+                .io_counters
+                .source_bytes_hashed
+                .saturating_add(source_manifest.total_file_bytes());
+        }
+        self.io_counters.destination_tree_walks =
+            self.io_counters.destination_tree_walks.saturating_add(1);
+        let destination_manifest = if self.job.verification
+            == tui_file_picker::VerificationMode::Strong
+        {
+            self.io_counters.destination_bytes_hashed = self
+                .io_counters
+                .destination_bytes_hashed
+                .saturating_add(source_manifest.total_file_bytes());
+            source_manifest.capture_verified_copy_at(&node.target)
+        } else {
+            source_manifest.capture_identity_copy_at(&node.target)
+        }
+        .map_err(|error| {
+            format!(
+                "existing retry destination {} does not match source {}: {error}",
+                node.target.display(),
+                node.source.display()
+            )
+        })?;
+        self.completed_proofs_by_source.insert(
+            node.source.clone(),
+            (
+                node.target.clone(),
+                tui_file_picker::FileTaskRootProof {
+                    source_manifest,
+                    destination_manifest,
+                },
+            ),
+        );
+        self.undo_disposition_by_source.insert(
+            node.source.clone(),
+            tui_file_picker::FileTaskUndoDisposition::NotReversible,
+        );
+        self.mark_completed_stats(node.stats);
+        self.record_active_root_notice(
+            &node.source,
+            "existing destination was verified as the completed output of an interrupted copy; no data was recopied"
+                .to_string(),
+        );
+        Ok(FileTaskStep::Completed)
     }
 
     fn copy_root_progress_resolved_node(
@@ -38099,22 +39913,6 @@ impl FileTaskWorker {
                     }
                 },
             );
-        }
-        if result == FileTaskStep::Completed
-            && self.job.verification == tui_file_picker::VerificationMode::Standard
-        {
-            if let Err(error) = sync_standard_file_task_root(
-                &node.target,
-                &mut self.io_counters,
-            ) {
-                self.record_active_root_notice(
-                    &node.source,
-                    format!(
-                        "copy published at {}, but root synchronization failed: {error}",
-                        node.target.display()
-                    ),
-                );
-            }
         }
         if result != FileTaskStep::Completed || self.job.is_move {
             return Ok(result);
@@ -38224,17 +40022,19 @@ impl FileTaskWorker {
                 );
             }
         }
-        if let Some(parent) = node.target.parent() {
-            self.io_counters.directory_sync_calls =
-                self.io_counters.directory_sync_calls.saturating_add(1);
-            if let Err(error) = sync_file_task_directory(parent) {
-                self.record_active_root_notice(
-                    &node.source,
-                    format!(
-                        "copy published at {}, but destination-parent synchronization failed: {error}",
-                        node.target.display()
-                    ),
-                );
+        if self.job.verification == tui_file_picker::VerificationMode::Strong {
+            if let Some(parent) = node.target.parent() {
+                self.io_counters.directory_sync_calls =
+                    self.io_counters.directory_sync_calls.saturating_add(1);
+                if let Err(error) = sync_file_task_directory(parent) {
+                    self.record_active_root_notice(
+                        &node.source,
+                        format!(
+                            "copy published at {}, but destination-parent synchronization failed: {error}",
+                            node.target.display()
+                        ),
+                    );
+                }
             }
         }
         Ok(result)
@@ -38248,7 +40048,12 @@ impl FileTaskWorker {
             .target
             .parent()
             .ok_or_else(|| format!("destination has no parent: {}", node.target.display()))?;
-        let staging_container = create_file_task_staging_directory(parent, &node.target)?;
+        let staging_container = create_file_task_staging_directory(
+            parent,
+            &node.target,
+            Some((self.job.job_id.as_str(), self.job.generation)),
+            None,
+        )?;
         let staging_payload = staging_container.join("payload");
         let mut staged_node = node.clone();
         retarget_plan_node(&mut staged_node, &staging_payload);
@@ -38284,12 +40089,12 @@ impl FileTaskWorker {
                     Ok(FileTaskStep::Completed) => {}
                     Ok(step) => {
                         self.rollback_unpublished_staging_progress(totals_before);
-                        cleanup_file_task_staging_directory(&staging_container);
+                        self.cleanup_file_task_staging_artifact(&staging_container);
                         return Ok(step);
                     }
                     Err(error) => {
                         self.rollback_unpublished_staging_progress(totals_before);
-                        cleanup_file_task_staging_directory(&staging_container);
+                        self.cleanup_file_task_staging_artifact(&staging_container);
                         return Err(error);
                     }
                 }
@@ -38302,7 +40107,7 @@ impl FileTaskWorker {
                     Ok(mode) => mode,
                     Err(error) => {
                         self.rollback_unpublished_staging_progress(totals_before);
-                        cleanup_file_task_staging_directory(&staging_container);
+                        self.cleanup_file_task_staging_artifact(&staging_container);
                         return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
                             format!(
                                 "destination appeared before directory publication: {}",
@@ -38329,17 +40134,15 @@ impl FileTaskWorker {
                 // objects; the root-level copy or move phase performs one
                 // authoritative verification at the published pathname.
 
-                if let Err(error) = std::fs::remove_dir(&staging_container) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        self.record_active_root_notice(
-                            &node.source,
-                            format!(
-                                "directory published at {}, but empty staging directory {} could not be removed: {error}",
-                                node.target.display(),
-                                staging_container.display()
-                            ),
-                        );
-                    }
+                if !self.cleanup_file_task_staging_artifact(&staging_container) {
+                    self.record_active_root_notice(
+                        &node.source,
+                        format!(
+                            "directory published at {}, but empty staging directory {} remains journaled for deferred cleanup",
+                            node.target.display(),
+                            staging_container.display()
+                        ),
+                    );
                 }
                 // Parent-directory durability is batched at the root
                 // publication boundary by the copy or move caller.
@@ -38347,7 +40150,7 @@ impl FileTaskWorker {
             }
             Ok(FileTaskStep::Completed) => {
                 self.rollback_unpublished_staging_progress(totals_before);
-                cleanup_file_task_staging_directory(&staging_container);
+                self.cleanup_file_task_staging_artifact(&staging_container);
                 let message = match completeness {
                     MoveCopyCompleteness::Complete => {
                         "staged directory copy did not reach publication".to_string()
@@ -38359,15 +40162,25 @@ impl FileTaskWorker {
             }
             Ok(step) => {
                 self.rollback_unpublished_staging_progress(totals_before);
-                cleanup_file_task_staging_directory(&staging_container);
+                self.cleanup_file_task_staging_artifact(&staging_container);
                 Ok(step)
             }
             Err(error) => {
                 self.rollback_unpublished_staging_progress(totals_before);
-                cleanup_file_task_staging_directory(&staging_container);
+                self.cleanup_file_task_staging_artifact(&staging_container);
                 Err(error)
             }
         }
+    }
+
+    fn cleanup_file_task_staging_artifact(&self, path: &std::path::Path) -> bool {
+        let removed = cleanup_file_task_staging_directory(path);
+        if removed {
+            if let Some(journal) = &self.journal {
+                let _ = journal.clear_temp_artifact(path);
+            }
+        }
+        removed
     }
 
     fn rollback_unpublished_staging_progress(
@@ -38426,6 +40239,8 @@ impl FileTaskWorker {
                     &node.source,
                     &node.target,
                     matches!(applied, FileTaskConflictApplied::Overwrite) || self.job.force,
+                    Some((self.job.job_id.as_str(), self.job.generation)),
+                    None,
                 )?;
                 tui_file_picker::verify_path_with_capabilities(
                     &node.source,
@@ -38628,7 +40443,11 @@ impl FileTaskWorker {
         let source_metadata = input
             .metadata()
             .map_err(|error| format!("read opened source metadata: {error}"))?;
-        let (temp_target, mut output) = create_temp_output_file(target)?;
+        let (temp_target, mut output) = create_temp_output_file(
+            target,
+            Some((self.job.job_id.as_str(), self.job.generation)),
+            None,
+        )?;
         let mut digest = (self.job.verification == tui_file_picker::VerificationMode::Strong)
             .then(tui_file_picker::Sha256::new);
         let mut buffer = vec![0u8; 1024 * 1024];
@@ -38738,6 +40557,11 @@ impl FileTaskWorker {
             }
         }
         drop(output);
+        // The initial durable job snapshot plus generation-qualified private
+        // temporary names are sufficient to reconcile a crash at publication.
+        // Avoid a full root-plan checkpoint before every file rename; the
+        // terminal/root-batch deltas retain completed authority without turning
+        // large selections into quadratic journal I/O.
         let publication_warnings = match finalize_temp_file(
             &temp_target,
             target,
@@ -38751,6 +40575,9 @@ impl FileTaskWorker {
                 return Err(e);
             }
         };
+        if let Some(journal) = &self.journal {
+            let _ = journal.clear_temp_artifact(&temp_target);
+        }
         for warning in publication_warnings {
             self.record_active_root_notice(
                 source,
@@ -38998,6 +40825,56 @@ impl FileTaskWorker {
             result.undo_disposition = undo_disposition;
             result.proof = proof;
         }
+        self.roots_since_journal_checkpoint =
+            self.roots_since_journal_checkpoint.saturating_add(1);
+        self.dirty_journal_roots.insert(source.to_path_buf());
+        if self.roots_since_journal_checkpoint >= FILE_TASK_ROOTS_PER_JOURNAL_CHECKPOINT {
+            self.checkpoint_journal(
+                super::file_task_runtime::DurableFileTaskLifecycle::Running,
+                format!("root {:?}: {}", disposition, source.display()),
+            );
+        }
+    }
+
+
+    fn checkpoint_journal(
+        &mut self,
+        lifecycle: super::file_task_runtime::DurableFileTaskLifecycle,
+        status: impl Into<String>,
+    ) {
+        let Some(journal) = self.journal.clone() else {
+            self.roots_since_journal_checkpoint = 0;
+            self.dirty_journal_roots.clear();
+            self.native_rename_intents_to_clear.clear();
+            return;
+        };
+        let roots = self
+            .root_results
+            .iter()
+            .filter(|root| self.dirty_journal_roots.contains(&root.source))
+            .cloned()
+            .collect::<Vec<_>>();
+        let cleared_sources = self
+            .native_rename_intents_to_clear
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        match journal.record_checkpoint_clearing_native_intents(
+            lifecycle,
+            status,
+            &roots,
+            None,
+            &cleared_sources,
+        ) {
+            Ok(()) => {
+                self.roots_since_journal_checkpoint = 0;
+                self.dirty_journal_roots.clear();
+                self.native_rename_intents_to_clear.clear();
+            }
+            Err(error) => {
+                log::warn!("file-task journal checkpoint failed: {error}");
+            }
+        }
     }
 
     fn clipboard_retry_plan_for_report(
@@ -39008,7 +40885,6 @@ impl FileTaskWorker {
             .root_results
             .iter()
             .filter(|root| !root.disposition.is_completed())
-            .filter(|root| std::fs::symlink_metadata(&root.source).is_ok())
             .map(|root| root.source.clone())
             .collect::<Vec<_>>();
         let mut retry = seed.retain_sources(&retry_sources)?;
@@ -39025,15 +40901,44 @@ impl FileTaskWorker {
 
     fn send_completion_report(mut self) {
         let retry_plan = self.clipboard_retry_plan_for_report();
+        let lifecycle = if self.root_results.iter().all(|root| root.disposition.is_completed()) {
+            super::file_task_runtime::DurableFileTaskLifecycle::Completed
+        } else {
+            super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation
+        };
+        if let Some(journal) = &self.journal {
+            let cleared_sources = self
+                .native_rename_intents_to_clear
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            // The UI retry plan intentionally excludes committed roots. A
+            // committed move can still own a quarantine cleanup obligation,
+            // so keep the journal's fuller proof-bearing plan authoritative
+            // until that obligation is cleared.
+            let durable_retry_plan = journal
+                .load()
+                .ok()
+                .filter(|record| !record.quarantine_artifacts.is_empty())
+                .and_then(|record| record.retry_plan)
+                .or_else(|| retry_plan.clone());
+            let _ = journal.record_checkpoint_clearing_native_intents(
+                lifecycle,
+                if lifecycle == super::file_task_runtime::DurableFileTaskLifecycle::Completed {
+                    "operation completed"
+                } else {
+                    "operation ended with incomplete roots"
+                },
+                &self.root_results,
+                durable_retry_plan.as_ref(),
+                &cleared_sources,
+            );
+        }
         let report = tui_file_picker::FileTaskCompletionReport {
             is_move: self.job.is_move,
             roots: std::mem::take(&mut self.root_results),
         };
-        let _ = self.tx.blocking_send(AppMessage::FileTaskComplete {
-            session_id: self.job.session_id,
-            report,
-            retry_plan,
-        });
+        self.sink.complete(self.job.session_id, report, retry_plan);
     }
 
     fn snapshot(
@@ -39060,10 +40965,7 @@ impl FileTaskWorker {
     }
 
     fn send(&self, update: tui_file_picker::FileTaskProgressUpdate) {
-        let _ = self.tx.blocking_send(AppMessage::FileTaskProgress {
-            session_id: self.job.session_id,
-            update,
-        });
+        self.sink.progress(self.job.session_id, update);
     }
 }
 
@@ -39072,7 +40974,1299 @@ fn spawn_file_task_worker(
     tx: mpsc::Sender<AppMessage>,
     controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
 ) {
-    std::thread::spawn(move || FileTaskWorker::new(job, tx, controls).run());
+    #[cfg(test)]
+    {
+        std::thread::spawn(move || FileTaskWorker::new(job, tx, controls).run());
+    }
+    #[cfg(not(test))]
+    {
+        let failure_job = job.clone();
+        let failure_tx = tx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("file-task-supervisor-{}", job.session_id))
+            .spawn(move || supervise_file_task_process(job, tx, controls))
+        {
+            let mappings = file_task_job_mappings(&failure_job);
+            emit_supervisor_start_failure(
+                &failure_tx,
+                &failure_job,
+                &mappings,
+                format!("start file-task supervisor: {error}"),
+            );
+        }
+    }
+}
+
+fn supervise_file_task_process(
+    mut job: FileTaskJob,
+    tx: mpsc::Sender<AppMessage>,
+    controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
+) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc as std_mpsc;
+
+    let mut mappings = file_task_job_mappings(&job);
+    let resume_path = job
+        .clipboard_retry_plan
+        .as_ref()
+        .and_then(|retry| retry.recovery_journal_path.clone());
+    let journal_path = if let Some(path) = resume_path.as_ref() {
+        match super::file_task_runtime::load_record(path) {
+            Ok(previous) => {
+                let mappings_are_retained = mappings.iter().all(|mapping| {
+                    previous.mappings.iter().any(|known| known == mapping)
+                });
+                if previous.is_move != job.is_move || !mappings_are_retained {
+                    emit_supervisor_start_failure(
+                        &tx,
+                        &job,
+                        &mappings,
+                        "retained file-operation journal does not match this exact retry plan"
+                            .to_string(),
+                    );
+                    return;
+                }
+                mappings = previous.mappings_for_reconciliation(&mappings);
+                job.sources = mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect();
+                job.root_targets = Some(
+                    mappings
+                        .iter()
+                        .map(|mapping| mapping.destination.clone())
+                        .collect(),
+                );
+                job.job_id = previous.job_id.clone();
+                job.generation = previous.generation.saturating_add(1);
+                job.verification = previous.verification;
+                let retained_sources = mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect::<Vec<_>>();
+                let supplied_retry_plan = job.clipboard_retry_plan.take();
+                job.clipboard_retry_plan = previous
+                    .retry_plan
+                    .as_ref()
+                    .and_then(|retry| retry.retain_sources(&retained_sources))
+                    .or(supplied_retry_plan);
+                path.clone()
+            }
+            Err(error) => {
+                emit_supervisor_start_failure(
+                    &tx,
+                    &job,
+                    &mappings,
+                    format!("open retained file-operation journal: {error}"),
+                );
+                return;
+            }
+        }
+    } else {
+        super::file_task_runtime::file_task_journal_dir()
+            .join(format!("{}.jsonl", job.job_id))
+    };
+    job.journal_path = Some(journal_path.clone());
+    if let Some(retry) = job.clipboard_retry_plan.as_mut() {
+        retry.recovery_journal_path = Some(journal_path.clone());
+    }
+    let job_value = match serde_json::to_value(&job) {
+        Ok(value) => value,
+        Err(error) => {
+            emit_supervisor_start_failure(
+                &tx,
+                &job,
+                &mappings,
+                format!("serialize file task: {error}"),
+            );
+            return;
+        }
+    };
+    let journal_result = if resume_path.is_some() {
+        super::file_task_runtime::FileTaskJournalHandle::resume(
+            journal_path,
+            job.generation,
+            job.session_id,
+            job.is_move,
+            job.verification,
+            job.stall_timeout_secs,
+            mappings.clone(),
+            job.clipboard_retry_plan.clone(),
+            job_value,
+        )
+    } else {
+        super::file_task_runtime::FileTaskJournalHandle::create(
+            job.job_id.clone(),
+            job.generation,
+            job.session_id,
+            job.is_move,
+            job.verification,
+            job.stall_timeout_secs,
+            mappings.clone(),
+            job.clipboard_retry_plan.clone(),
+            job_value,
+        )
+    };
+    let journal = match journal_result {
+        Ok(journal) => journal,
+        Err(error) => {
+            emit_supervisor_start_failure(&tx, &job, &mappings, error);
+            return;
+        }
+    };
+
+    #[cfg(test)]
+    let executable_result = std::env::var_os("TONEPOET_TEST_FILE_TASK_HELPER")
+        .map(std::path::PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_exe);
+    #[cfg(not(test))]
+    let executable_result = std::env::current_exe();
+    let executable = match executable_result {
+        Ok(executable) => executable,
+        Err(error) => {
+            let detail = format!("resolve tonepoet executable for file task: {error}");
+            let _ = journal.mark_lifecycle(
+                super::file_task_runtime::DurableFileTaskLifecycle::Failed,
+                detail.clone(),
+            );
+            emit_supervisor_start_failure(&tx, &job, &mappings, detail);
+            return;
+        }
+    };
+    let mut child = match Command::new(executable)
+        .arg("__file-task-worker")
+        .arg("--journal")
+        .arg(journal.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let detail = format!("start isolated file-task helper: {error}");
+            let _ = journal.mark_lifecycle(
+                super::file_task_runtime::DurableFileTaskLifecycle::Failed,
+                detail.clone(),
+            );
+            emit_supervisor_start_failure(&tx, &job, &mappings, detail);
+            return;
+        }
+    };
+    let _ = journal.mark_lifecycle(
+        super::file_task_runtime::DurableFileTaskLifecycle::Running,
+        "helper process started",
+    );
+
+    let (wire_tx, wire_rx) = std_mpsc::channel::<Result<super::file_task_runtime::FileTaskWireEvent, String>>();
+    if let Some(stdout) = child.stdout.take() {
+        let wire_tx = wire_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("file-task-events-{}", job.session_id))
+            .spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let event = match line {
+                        Ok(line) => serde_json::from_str(&line)
+                            .map_err(|error| format!("parse helper event: {error}")),
+                        Err(error) => Err(format!("read helper event: {error}")),
+                    };
+                    if wire_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+    drop(wire_tx);
+
+    if let Some(stderr) = child.stderr.take() {
+        let session_id = job.session_id;
+        let _ = std::thread::Builder::new()
+            .name(format!("file-task-stderr-{session_id}"))
+            .spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    log::warn!("file-task helper {session_id}: {line}");
+                }
+            });
+    }
+
+    let (control_writer_tx, control_writer_rx) = std_mpsc::channel::<super::app::FileTaskControl>();
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = std::thread::Builder::new()
+            .name(format!("file-task-controls-{}", job.session_id))
+            .spawn(move || {
+                while let Ok(control) = control_writer_rx.recv() {
+                    if super::file_task_runtime::write_wire_control(&mut stdin, &control).is_err() {
+                        break;
+                    }
+                }
+                let _ = stdin.flush();
+            });
+    }
+
+    let mut last_forward_progress_at = std::time::Instant::now();
+    let mut last_totals = tui_file_picker::ProgressTotals::default();
+    let mut last_item = None;
+    let mut last_phase = None;
+    let mut stalled_announced = false;
+    let mut paused = false;
+    let mut waiting_for_conflict = false;
+    loop {
+        while let Ok(control) = controls.try_recv() {
+            if matches!(&control, super::app::FileTaskControl::Abort) {
+                let cancelling = tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                    phase: tui_file_picker::FileTaskPhase::Cancelling,
+                    status: "Cancelling and isolating the filesystem operation...".to_string(),
+                    current_item: last_item.clone(),
+                    totals: last_totals,
+                    rate_bytes_per_sec: None,
+                };
+                let _ = tx.try_send(AppMessage::FileTaskProgress {
+                    session_id: job.session_id,
+                    update: cancelling,
+                });
+                let _ = control_writer_tx.send(super::app::FileTaskControl::Abort);
+                let reason = "cancelled by user while helper may be blocked in filesystem I/O";
+                let _ = child.kill();
+                finalize_abandoned_file_task(child, journal.clone(), reason.to_string());
+                emit_forced_abandon_completion(&tx, &job, &journal, reason);
+                return;
+            }
+            match &control {
+                super::app::FileTaskControl::Pause => {
+                    paused = true;
+                    let _ = journal.mark_lifecycle(
+                        super::file_task_runtime::DurableFileTaskLifecycle::Paused,
+                        "paused by user",
+                    );
+                }
+                super::app::FileTaskControl::Resume => {
+                    paused = false;
+                    last_forward_progress_at = std::time::Instant::now();
+                    stalled_announced = false;
+                    let _ = journal.mark_lifecycle(
+                        super::file_task_runtime::DurableFileTaskLifecycle::Running,
+                        "resumed by user",
+                    );
+                }
+                _ => {}
+            }
+            let _ = control_writer_tx.send(control);
+        }
+
+        match wire_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Ok(super::file_task_runtime::FileTaskWireEvent::Progress { update })) => {
+                let mut made_forward_progress = false;
+                match &update {
+                    tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                        phase,
+                        current_item,
+                        totals,
+                        ..
+                    } => {
+                        paused = matches!(phase, tui_file_picker::FileTaskPhase::Paused);
+                        made_forward_progress = last_phase.as_ref() != Some(phase)
+                            || last_totals != *totals
+                            || last_item.as_ref() != current_item.as_ref();
+                        last_phase = Some(phase.clone());
+                        last_item = current_item.clone();
+                        last_totals = *totals;
+                    }
+                    tui_file_picker::FileTaskProgressUpdate::ShowConflict { .. } => {
+                        waiting_for_conflict = true;
+                        last_forward_progress_at = std::time::Instant::now();
+                    }
+                    tui_file_picker::FileTaskProgressUpdate::ClearConflict => {
+                        waiting_for_conflict = false;
+                        made_forward_progress = true;
+                    }
+                    tui_file_picker::FileTaskProgressUpdate::RecordError { totals, .. } => {
+                        made_forward_progress = last_totals != *totals;
+                        last_totals = *totals;
+                    }
+                    tui_file_picker::FileTaskProgressUpdate::Finished { totals, .. }
+                    | tui_file_picker::FileTaskProgressUpdate::Failed { totals, .. }
+                    | tui_file_picker::FileTaskProgressUpdate::Aborted { totals, .. } => {
+                        made_forward_progress = last_totals != *totals;
+                        last_totals = *totals;
+                    }
+                    tui_file_picker::FileTaskProgressUpdate::SetScope { .. }
+                    | tui_file_picker::FileTaskProgressUpdate::UpdateConflictExistingStats { .. } => {}
+                }
+                if made_forward_progress {
+                    last_forward_progress_at = std::time::Instant::now();
+                    if stalled_announced {
+                        let _ = journal.mark_lifecycle(
+                            super::file_task_runtime::DurableFileTaskLifecycle::Running,
+                            "helper made forward progress after a stall",
+                        );
+                    }
+                    stalled_announced = false;
+                }
+                let _ = tx.try_send(AppMessage::FileTaskProgress {
+                    session_id: job.session_id,
+                    update,
+                });
+            }
+            Ok(Ok(super::file_task_runtime::FileTaskWireEvent::Complete {
+                report,
+                retry_plan,
+            })) => {
+                let lifecycle = if report.is_complete() {
+                    super::file_task_runtime::DurableFileTaskLifecycle::Completed
+                } else {
+                    super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation
+                };
+                let _ = journal.record_checkpoint(
+                    lifecycle,
+                    if report.is_complete() {
+                        "operation completed"
+                    } else {
+                        "operation ended with incomplete roots"
+                    },
+                    &report.roots,
+                    retry_plan.as_ref(),
+                );
+                send_file_task_message_nonblocking(
+                    &tx,
+                    job.session_id,
+                    AppMessage::FileTaskComplete {
+                        session_id: job.session_id,
+                        report,
+                        retry_plan,
+                    },
+                );
+                reap_file_task_child(child);
+                return;
+            }
+            Ok(Err(error)) => {
+                log::warn!("file-task helper protocol error for session {}: {error}", job.session_id);
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let detail = format!("file-task helper exited without a completion report ({status})");
+                        let _ = journal.mark_lifecycle(
+                            super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation,
+                            detail.clone(),
+                        );
+                        emit_abandoned_completion(&tx, &job, &journal, &detail);
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let detail = format!("inspect file-task helper status: {error}");
+                        let _ = journal.mark_abandoned(detail.clone());
+                        let _ = child.kill();
+                        reap_file_task_child(child);
+                        emit_abandoned_completion(&tx, &job, &journal, &detail);
+                        return;
+                    }
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        if !paused
+            && !waiting_for_conflict
+            && !stalled_announced
+            && last_forward_progress_at.elapsed()
+                >= std::time::Duration::from_secs(job.stall_timeout_secs.max(1))
+        {
+            stalled_announced = true;
+            let _ = journal.mark_lifecycle(
+                super::file_task_runtime::DurableFileTaskLifecycle::Stalled,
+                "no forward progress from helper",
+            );
+            let _ = tx.try_send(AppMessage::FileTaskProgress {
+                session_id: job.session_id,
+                update: tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                    phase: tui_file_picker::FileTaskPhase::Stalled,
+                    status: format!(
+                        "No progress for {} seconds. Keep waiting, or cancel to regain control immediately.",
+                        job.stall_timeout_secs.max(1)
+                    ),
+                    current_item: last_item.clone(),
+                    totals: last_totals,
+                    rate_bytes_per_sec: Some(0),
+                },
+            });
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let detail = format!("file-task helper exited without a completion report ({status})");
+                let _ = journal.mark_lifecycle(
+                    super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation,
+                    detail.clone(),
+                );
+                emit_abandoned_completion(&tx, &job, &journal, &detail);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let detail = format!("inspect file-task helper status: {error}");
+                let _ = journal.mark_abandoned(detail.clone());
+                let _ = child.kill();
+                reap_file_task_child(child);
+                emit_abandoned_completion(&tx, &job, &journal, &detail);
+                return;
+            }
+        }
+    }
+}
+
+fn reap_file_task_child(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name(format!("file-task-reaper-{}", child.id()))
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+fn finalize_abandoned_file_task(
+    mut child: std::process::Child,
+    journal: super::file_task_runtime::FileTaskJournalHandle,
+    reason: String,
+) {
+    let _ = std::thread::Builder::new()
+        .name(format!("file-task-abandon-finalizer-{}", child.id()))
+        .spawn(move || {
+            // Cancellation latency never depends on local journal fsync or on
+            // reaping a process stuck in uninterruptible filesystem sleep.
+            // The already-persisted Running record remains restart-visible if
+            // this best-effort terminal checkpoint cannot complete.
+            let _ = journal.mark_abandoned(reason);
+            let _ = child.wait();
+            best_effort_cleanup_abandoned_generation(&journal);
+        });
+}
+
+fn best_effort_cleanup_abandoned_generation(
+    journal: &super::file_task_runtime::FileTaskJournalHandle,
+) {
+    let Ok(record) = journal.load() else {
+        return;
+    };
+    let mut endpoint_cache = FileTaskEndpointVerificationCache::new(&record);
+    let current_handle = super::file_task_runtime::FileTaskJournalHandle::open(
+        journal.path().to_path_buf(),
+    )
+    .ok();
+    for artifact in record.temp_artifacts.iter().filter(|artifact| {
+        artifact.owner_job_id == journal.job_id()
+            && artifact.owner_generation == journal.generation()
+            && artifact.is_safe_private_artifact(journal.job_id())
+    }) {
+        if endpoint_cache.destination(&artifact.destination).is_err() {
+            continue;
+        }
+        if remove_derived_private_artifact(&artifact.path, artifact.kind).is_ok() {
+            if let Some(current_handle) = current_handle.as_ref() {
+                let _ = current_handle.clear_recovered_temp_artifact(&artifact.path);
+            }
+        }
+    }
+
+    let generations = [journal.generation()];
+    let mut shallow_scan_roots = std::collections::BTreeSet::new();
+    let mut recursive_scan_roots = std::collections::BTreeSet::new();
+    for mapping in &record.mappings {
+        if endpoint_cache.destination(&mapping.destination).is_err() {
+            continue;
+        }
+        if let Some(parent) = mapping.destination.parent() {
+            shallow_scan_roots.insert(parent.to_path_buf());
+        }
+        if std::fs::symlink_metadata(&mapping.destination)
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
+        {
+            recursive_scan_roots.insert(mapping.destination.clone());
+        }
+    }
+    let mut derived_artifacts = std::collections::BTreeMap::new();
+    for root in shallow_scan_roots {
+        let _ = collect_derived_private_artifacts(
+            &root,
+            false,
+            journal.job_id(),
+            &generations,
+            &mut derived_artifacts,
+        );
+    }
+    for root in recursive_scan_roots {
+        let _ = collect_derived_private_artifacts(
+            &root,
+            true,
+            journal.job_id(),
+            &generations,
+            &mut derived_artifacts,
+        );
+    }
+    for (path, (kind, _)) in derived_artifacts {
+        let _ = remove_derived_private_artifact(&path, kind);
+    }
+}
+
+fn file_task_job_mappings(job: &FileTaskJob) -> Vec<tui_file_picker::PasteMapping> {
+    job.sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let destination = job
+                .root_targets
+                .as_ref()
+                .and_then(|targets| targets.get(index))
+                .cloned()
+                .or_else(|| {
+                    source
+                        .file_name()
+                        .map(|name| std::path::Path::new(&job.dest).join(name))
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(&job.dest));
+            tui_file_picker::PasteMapping {
+                source: source.clone(),
+                destination,
+            }
+        })
+        .collect()
+}
+
+fn emit_supervisor_start_failure(
+    tx: &mpsc::Sender<AppMessage>,
+    job: &FileTaskJob,
+    mappings: &[tui_file_picker::PasteMapping],
+    error: String,
+) {
+    let roots = mappings
+        .iter()
+        .map(|mapping| tui_file_picker::FileTaskRootResult {
+            source: mapping.source.clone(),
+            destination: mapping.destination.clone(),
+            disposition: tui_file_picker::FileTaskRootDisposition::Failed,
+            message: Some(error.clone()),
+            undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+            proof: None,
+        })
+        .collect::<Vec<_>>();
+    let totals = tui_file_picker::ProgressTotals {
+        items_done: roots.len() as u64,
+        items_total: Some(roots.len() as u64),
+        errors: roots.len() as u64,
+        ..tui_file_picker::ProgressTotals::default()
+    };
+    let _ = tx.try_send(AppMessage::FileTaskProgress {
+        session_id: job.session_id,
+        update: tui_file_picker::FileTaskProgressUpdate::Failed {
+            status: error,
+            totals,
+        },
+    });
+    send_file_task_message_nonblocking(
+        tx,
+        job.session_id,
+        AppMessage::FileTaskComplete {
+            session_id: job.session_id,
+            report: tui_file_picker::FileTaskCompletionReport {
+                is_move: job.is_move,
+                roots,
+            },
+            retry_plan: job.clipboard_retry_plan.clone(),
+        },
+    );
+}
+
+struct AbandonedFileTaskSummary {
+    roots: Vec<tui_file_picker::FileTaskRootResult>,
+    retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
+    committed_deferred: usize,
+}
+
+fn summarize_abandoned_file_task(
+    job: &FileTaskJob,
+    record: Option<super::file_task_runtime::DurableFileTaskRecord>,
+    reason: &str,
+) -> AbandonedFileTaskSummary {
+    let mappings = record
+        .as_ref()
+        .map(|record| record.mappings.clone())
+        .unwrap_or_else(|| file_task_job_mappings(job));
+    let known_roots = record
+        .as_ref()
+        .map(|record| record.roots.as_slice())
+        .unwrap_or(&[]);
+    let durable_retry = record
+        .as_ref()
+        .and_then(|record| record.retry_plan.as_ref());
+    let quarantines_by_source = record
+        .as_ref()
+        .map(|record| {
+            record
+                .quarantine_artifacts
+                .iter()
+                .map(|artifact| (artifact.original_source.clone(), artifact.state))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut committed_deferred = 0usize;
+    let roots = mappings
+        .iter()
+        .map(|mapping| {
+            let quarantine_state = quarantines_by_source.get(&mapping.source).copied();
+            let has_cleanup_authority = job.is_move
+                && quarantine_state.is_some_and(|state| state.is_irreversibly_committed())
+                && durable_retry.is_some_and(|retry| {
+                    retry.recovery_by_source.contains_key(&mapping.source)
+                });
+            if has_cleanup_authority {
+                committed_deferred = committed_deferred.saturating_add(1);
+                tui_file_picker::FileTaskRootResult {
+                    source: mapping.source.clone(),
+                    destination: mapping.destination.clone(),
+                    disposition: tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
+                    message: Some(format!(
+                        "move crossed the durably confirmed source-deletion boundary before the helper stopped; verified cleanup remains journaled for reconciliation ({reason})"
+                    )),
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
+                }
+            } else if quarantine_state.is_some() {
+                tui_file_picker::FileTaskRootResult {
+                    source: mapping.source.clone(),
+                    destination: mapping.destination.clone(),
+                    disposition: tui_file_picker::FileTaskRootDisposition::Failed,
+                    message: Some(format!(
+                        "{reason}; the source-quarantine transition is unknown because no durable source-deletion checkpoint exists; the exact mapping remains awaiting reconciliation"
+                    )),
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
+                }
+            } else if let Some(root) = known_roots
+                .iter()
+                .find(|root| root.source == mapping.source)
+                .filter(|root| root.disposition.is_completed())
+            {
+                root.clone()
+            } else {
+                tui_file_picker::FileTaskRootResult {
+                    source: mapping.source.clone(),
+                    destination: mapping.destination.clone(),
+                    disposition: tui_file_picker::FileTaskRootDisposition::Failed,
+                    message: Some(format!(
+                        "{reason}; final filesystem state is unknown and is retained for reconciliation"
+                    )),
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let retry_sources = roots
+        .iter()
+        .filter(|root| !root.disposition.is_completed())
+        .map(|root| root.source.clone())
+        .collect::<Vec<_>>();
+    let retry_plan = record
+        .and_then(|record| record.retry_plan)
+        .or_else(|| job.clipboard_retry_plan.clone())
+        .or_else(|| {
+            Some(super::browse::BrowsePasteRetryPlan::from_plan(
+                tui_file_picker::PastePlan {
+                    mode: if job.is_move {
+                        tui_file_picker::FilePickerClipboardMode::Cut
+                    } else {
+                        tui_file_picker::FilePickerClipboardMode::Copy
+                    },
+                    mappings: mappings.clone(),
+                },
+            ))
+        })
+        .and_then(|retry| retry.retain_sources(&retry_sources));
+    AbandonedFileTaskSummary {
+        roots,
+        retry_plan,
+        committed_deferred,
+    }
+}
+
+fn emit_abandoned_completion(
+    tx: &mpsc::Sender<AppMessage>,
+    job: &FileTaskJob,
+    journal: &super::file_task_runtime::FileTaskJournalHandle,
+    reason: &str,
+) {
+    let summary = summarize_abandoned_file_task(job, journal.load().ok(), reason);
+    let completed = summary
+        .roots
+        .iter()
+        .filter(|root| root.disposition.is_completed())
+        .count() as u64;
+    let errors = summary.roots.len() as u64 - completed;
+    let totals = tui_file_picker::ProgressTotals {
+        items_done: summary.roots.len() as u64,
+        items_total: Some(summary.roots.len() as u64),
+        completed,
+        errors,
+        ..tui_file_picker::ProgressTotals::default()
+    };
+    let update = if errors == 0 && summary.committed_deferred > 0 {
+        tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: format!(
+                "Move committed; source cleanup remains journaled for reconciliation at {}",
+                journal.path().display()
+            ),
+            totals,
+        }
+    } else {
+        tui_file_picker::FileTaskProgressUpdate::Failed {
+            status: format!(
+                "File task stopped unexpectedly. Recovery journal retained at {}",
+                journal.path().display()
+            ),
+            totals,
+        }
+    };
+    let _ = tx.try_send(AppMessage::FileTaskProgress {
+        session_id: job.session_id,
+        update,
+    });
+    send_file_task_message_nonblocking(
+        tx,
+        job.session_id,
+        AppMessage::FileTaskComplete {
+            session_id: job.session_id,
+            report: tui_file_picker::FileTaskCompletionReport {
+                is_move: job.is_move,
+                roots: summary.roots,
+            },
+            retry_plan: summary.retry_plan,
+        },
+    );
+}
+
+fn emit_forced_abandon_completion(
+    tx: &mpsc::Sender<AppMessage>,
+    job: &FileTaskJob,
+    journal: &super::file_task_runtime::FileTaskJournalHandle,
+    reason: &str,
+) {
+    let summary = summarize_abandoned_file_task(job, journal.load().ok(), reason);
+    let completed = summary
+        .roots
+        .iter()
+        .filter(|root| root.disposition.is_completed())
+        .count() as u64;
+    let errors = summary.roots.len() as u64 - completed;
+    let totals = tui_file_picker::ProgressTotals {
+        items_done: summary.roots.len() as u64,
+        items_total: Some(summary.roots.len() as u64),
+        completed,
+        errors,
+        ..tui_file_picker::ProgressTotals::default()
+    };
+    let update = if errors == 0 && summary.committed_deferred > 0 {
+        tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: format!(
+                "Move committed; cancellation stopped source cleanup. Reconcile the retained journal at {}",
+                journal.path().display()
+            ),
+            totals,
+        }
+    } else {
+        tui_file_picker::FileTaskProgressUpdate::Aborted {
+            status: format!(
+                "Cancelled immediately. Recovery journal retained at {}",
+                journal.path().display()
+            ),
+            totals,
+        }
+    };
+    let _ = tx.try_send(AppMessage::FileTaskProgress {
+        session_id: job.session_id,
+        update,
+    });
+    send_file_task_message_nonblocking(
+        tx,
+        job.session_id,
+        AppMessage::FileTaskComplete {
+            session_id: job.session_id,
+            report: tui_file_picker::FileTaskCompletionReport {
+                is_move: job.is_move,
+                roots: summary.roots,
+            },
+            retry_plan: summary.retry_plan,
+        },
+    );
+}
+
+/// Entry point for the hidden helper-process CLI command.
+pub fn run_internal_file_task_worker(journal_path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::BufRead as _;
+
+    let journal = super::file_task_runtime::FileTaskJournalHandle::open(journal_path.to_path_buf())
+        .map_err(anyhow::Error::msg)?;
+    let record = journal.load().map_err(anyhow::Error::msg)?;
+    if journal.is_abandoned() {
+        return Ok(());
+    }
+    let job: FileTaskJob = serde_json::from_value(record.job)
+        .map_err(|error| anyhow::anyhow!("decode file-task job: {error}"))?;
+    if job.job_id != journal.job_id() || job.generation != journal.generation() {
+        return Err(anyhow::anyhow!("file-task helper journal identity mismatch"));
+    }
+
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name(format!("file-task-helper-controls-{}", job.session_id))
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                match serde_json::from_str::<super::app::FileTaskControl>(&line) {
+                    Ok(control) => {
+                        if control_tx.send(control).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => log::warn!("ignored invalid file-task control: {error}"),
+                }
+            }
+        });
+
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(
+        std::io::stdout(),
+    )));
+    let sink = FileTaskEventSink::Wire(writer);
+    let _ = journal.mark_lifecycle(
+        super::file_task_runtime::DurableFileTaskLifecycle::Running,
+        "helper executing",
+    );
+    FileTaskWorker::new_with_sink(job, sink, control_rx, Some(journal)).run();
+    Ok(())
+}
+
+
+#[cfg(all(test, unix))]
+mod file_task_supervisor_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    struct FileTaskTestEnvironment;
+
+    impl FileTaskTestEnvironment {
+        fn install(journal_dir: &std::path::Path, helper: &std::path::Path) -> Self {
+            std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", journal_dir);
+            std::env::set_var("TONEPOET_TEST_FILE_TASK_HELPER", helper);
+            Self
+        }
+    }
+
+    impl Drop for FileTaskTestEnvironment {
+        fn drop(&mut self) {
+            std::env::remove_var("TONEPOET_TEST_FILE_TASK_HELPER");
+            std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+        }
+    }
+
+    fn install_wedged_helper(root: &std::path::Path) -> std::path::PathBuf {
+        let helper = root.join("wedged-file-task-helper.sh");
+        std::fs::write(&helper, "#!/bin/sh\nexec sleep 30\n").expect("write helper");
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&helper, permissions).expect("helper permissions");
+        helper
+    }
+
+    fn install_heartbeat_only_helper(root: &std::path::Path) -> std::path::PathBuf {
+        let helper = root.join("heartbeat-only-file-task-helper.sh");
+        let heartbeat = serde_json::to_string(
+            &super::super::file_task_runtime::FileTaskWireEvent::Progress {
+                update: tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                    phase: tui_file_picker::FileTaskPhase::Running,
+                    status: "heartbeat without forward progress".to_string(),
+                    current_item: None,
+                    totals: tui_file_picker::ProgressTotals::default(),
+                    rate_bytes_per_sec: Some(0),
+                },
+            },
+        )
+        .expect("serialize heartbeat");
+        assert!(!heartbeat.contains('\''), "test wire event must be shell-quotable");
+        let script = format!(
+            "#!/bin/sh\nwhile :; do\n  printf '%s\\n' '{heartbeat}'\n  sleep 0.05\ndone\n"
+        );
+        std::fs::write(&helper, script).expect("write heartbeat helper");
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&helper, permissions).expect("helper permissions");
+        helper
+    }
+
+    fn test_job(root: &std::path::Path, stall_timeout_secs: u64) -> FileTaskJob {
+        let source = root.join("source.flac");
+        let destination = root.join("destination.flac");
+        std::fs::write(&source, b"test audio").expect("source");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        };
+        FileTaskJob {
+            session_id: 99,
+            job_id: uuid::Uuid::new_v4().to_string(),
+            generation: 1,
+            journal_path: None,
+            stall_timeout_secs,
+            sources: vec![source],
+            dest: root.to_string_lossy().into_owned(),
+            force: false,
+            is_move: false,
+            conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
+            root_targets: Some(vec![destination]),
+            clipboard_retry_plan: Some(super::super::browse::BrowsePasteRetryPlan::from_plan(plan)),
+            verbose_degrade_notices: false,
+            verification: tui_file_picker::VerificationMode::Standard,
+        }
+    }
+
+    #[test]
+    fn cancel_abandons_a_wedged_helper_without_waiting_for_it() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = temp.path().join("journal");
+        let helper = install_wedged_helper(temp.path());
+        let _environment = FileTaskTestEnvironment::install(&journal_dir, &helper);
+
+        let job = test_job(temp.path(), 30);
+        let (app_tx, mut app_rx) = mpsc::channel(32);
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            supervise_file_task_process(job, app_tx, control_rx)
+        });
+
+        let started = Instant::now();
+        control_tx
+            .send(super::super::app::FileTaskControl::Abort)
+            .expect("abort control");
+        let mut saw_cancelling = false;
+        let mut saw_completion = false;
+        while started.elapsed() < Duration::from_secs(1) {
+            match app_rx.try_recv() {
+                Ok(AppMessage::FileTaskProgress { update, .. }) => {
+                    if matches!(
+                        update,
+                        tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                            phase: tui_file_picker::FileTaskPhase::Cancelling,
+                            ..
+                        }
+                    ) {
+                        saw_cancelling = true;
+                    }
+                }
+                Ok(AppMessage::FileTaskComplete { .. }) => {
+                    saw_completion = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        supervisor.join().expect("supervisor");
+        assert!(saw_cancelling, "cancelling phase must be observable");
+        assert!(saw_completion, "cancel must terminate the UI session promptly");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "supervisor exceeded the one-second cancellation budget"
+        );
+
+        let journal_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let pending = super::super::file_task_runtime::pending_journals();
+            assert_eq!(pending.len(), 1);
+            if pending[0].1.lifecycle
+                == super::super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < journal_deadline,
+                "abandon finalizer did not durably checkpoint the cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+    }
+
+    fn abandoned_move_summary_with_quarantine_state(
+        root: &std::path::Path,
+        state: Option<super::super::file_task_runtime::DurableQuarantineState>,
+    ) -> (AbandonedFileTaskSummary, std::path::PathBuf) {
+        let mut job = test_job(root, 30);
+        job.is_move = true;
+        let source = job.sources[0].clone();
+        let destination = job.root_targets.as_ref().expect("target")[0].clone();
+        std::fs::copy(&source, &destination).expect("published destination");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Cut,
+            mappings: file_task_job_mappings(&job),
+        };
+        job.clipboard_retry_plan = Some(
+            super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone()),
+        );
+        let source_manifest = tui_file_picker::capture_manifest_with_mode(
+            &source,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("source manifest");
+        let destination_manifest = source_manifest
+            .capture_identity_copy_at(&destination)
+            .expect("destination proof");
+        let proof = super::super::browse::BrowseMoveRecoveryProof {
+            source_manifest,
+            destination_manifest,
+        };
+        let journal = super::super::file_task_runtime::FileTaskJournalHandle::create(
+            job.job_id.clone(),
+            job.generation,
+            job.session_id,
+            true,
+            job.verification,
+            job.stall_timeout_secs,
+            plan.mappings.clone(),
+            job.clipboard_retry_plan.clone(),
+            serde_json::to_value(&job).expect("serialize job"),
+        )
+        .expect("journal");
+        journal
+            .record_move_recovery_proof(&source, &proof)
+            .expect("record destination proof");
+        if let Some(state) = state {
+            let quarantine = source
+                .parent()
+                .expect("source parent")
+                .join(".quarantine/source.flac");
+            journal
+                .record_quarantine_artifact(&quarantine, &source, &destination)
+                .expect("record quarantine intent");
+            if matches!(
+                state,
+                super::super::file_task_runtime::DurableQuarantineState::RenameConfirmed
+                    | super::super::file_task_runtime::DurableQuarantineState::DeletionStarted
+            ) {
+                journal
+                    .mark_quarantine_renamed(&quarantine)
+                    .expect("record completed quarantine rename");
+            }
+            if state
+                == super::super::file_task_runtime::DurableQuarantineState::DeletionStarted
+            {
+                journal
+                    .mark_quarantine_deletion_started(&quarantine)
+                    .expect("record irreversible source deletion");
+            }
+        }
+        let summary = summarize_abandoned_file_task(
+            &job,
+            Some(journal.load().expect("load journal")),
+            "forced cancellation",
+        );
+        (summary, source)
+    }
+
+    #[test]
+    fn abandonment_before_quarantine_stays_unknown_and_retryable() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = temp.path().join("journal");
+        let helper = install_wedged_helper(temp.path());
+        let _environment = FileTaskTestEnvironment::install(&journal_dir, &helper);
+
+        let (summary, source) = abandoned_move_summary_with_quarantine_state(temp.path(), None);
+        assert_eq!(summary.committed_deferred, 0);
+        assert_eq!(
+            summary.roots[0].disposition,
+            tui_file_picker::FileTaskRootDisposition::Failed
+        );
+        let retry = summary.retry_plan.expect("mapping remains reconcilable");
+        assert_eq!(retry.plan.mappings[0].source, source);
+    }
+
+    #[test]
+    fn abandonment_during_quarantine_rename_stays_unknown_and_retryable() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = temp.path().join("journal");
+        let helper = install_wedged_helper(temp.path());
+        let _environment = FileTaskTestEnvironment::install(&journal_dir, &helper);
+
+        let (summary, source) = abandoned_move_summary_with_quarantine_state(
+            temp.path(),
+            Some(super::super::file_task_runtime::DurableQuarantineState::IntentRecorded),
+        );
+        assert_eq!(summary.committed_deferred, 0);
+        assert_eq!(
+            summary.roots[0].disposition,
+            tui_file_picker::FileTaskRootDisposition::Failed
+        );
+        assert!(summary.roots[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("transition is unknown")));
+        let retry = summary.retry_plan.expect("mapping remains reconcilable");
+        assert_eq!(retry.plan.mappings[0].source, source);
+    }
+
+    #[test]
+    fn abandonment_after_confirmed_quarantine_rename_is_not_yet_committed() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = temp.path().join("journal");
+        let helper = install_wedged_helper(temp.path());
+        let _environment = FileTaskTestEnvironment::install(&journal_dir, &helper);
+
+        let (summary, source) = abandoned_move_summary_with_quarantine_state(
+            temp.path(),
+            Some(super::super::file_task_runtime::DurableQuarantineState::RenameConfirmed),
+        );
+        assert_eq!(summary.committed_deferred, 0);
+        assert_eq!(
+            summary.roots[0].disposition,
+            tui_file_picker::FileTaskRootDisposition::Failed
+        );
+        let retry = summary.retry_plan.expect("mapping remains reconcilable");
+        assert_eq!(retry.plan.mappings[0].source, source);
+    }
+
+    #[test]
+    fn abandonment_after_durable_unlink_boundary_is_committed_deferred_cleanup() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = temp.path().join("journal");
+        let helper = install_wedged_helper(temp.path());
+        let _environment = FileTaskTestEnvironment::install(&journal_dir, &helper);
+
+        let (summary, _source) = abandoned_move_summary_with_quarantine_state(
+            temp.path(),
+            Some(super::super::file_task_runtime::DurableQuarantineState::DeletionStarted),
+        );
+        assert_eq!(summary.committed_deferred, 1);
+        assert_eq!(
+            summary.roots[0].disposition,
+            tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
+        );
+        assert_eq!(
+            summary.roots[0].undo_disposition,
+            tui_file_picker::FileTaskUndoDisposition::NotReversible
+        );
+        assert!(summary.retry_plan.is_none());
+    }
+
+    #[test]
+    fn heartbeat_without_forward_progress_still_surfaces_stalled_state() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = temp.path().join("journal");
+        let helper = install_heartbeat_only_helper(temp.path());
+        let _environment = FileTaskTestEnvironment::install(&journal_dir, &helper);
+
+        let job = test_job(temp.path(), 1);
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            supervise_file_task_process(job, app_tx, control_rx)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_stalled = false;
+        while Instant::now() < deadline {
+            match app_rx.try_recv() {
+                Ok(AppMessage::FileTaskProgress {
+                    update:
+                        tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                            phase: tui_file_picker::FileTaskPhase::Stalled,
+                            ..
+                        },
+                    ..
+                }) => {
+                    saw_stalled = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert!(
+            saw_stalled,
+            "watchdog must measure forward progress, not helper heartbeats"
+        );
+        control_tx
+            .send(super::super::app::FileTaskControl::Abort)
+            .expect("abort control");
+        supervisor.join().expect("supervisor");
+    }
+
+    #[test]
+    fn wedged_helper_surfaces_stalled_state_before_cancel() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_dir = temp.path().join("journal");
+        let helper = install_wedged_helper(temp.path());
+        let _environment = FileTaskTestEnvironment::install(&journal_dir, &helper);
+
+        let job = test_job(temp.path(), 1);
+        let (app_tx, mut app_rx) = mpsc::channel(32);
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            supervise_file_task_process(job, app_tx, control_rx)
+        });
+
+        let started = Instant::now();
+        let mut saw_stalled = false;
+        while started.elapsed() < Duration::from_secs(3) {
+            match app_rx.try_recv() {
+                Ok(AppMessage::FileTaskProgress {
+                    update:
+                        tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                            phase: tui_file_picker::FileTaskPhase::Stalled,
+                            ..
+                        },
+                    ..
+                }) => {
+                    saw_stalled = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert!(saw_stalled, "watchdog must surface a stalled helper");
+        control_tx
+            .send(super::super::app::FileTaskControl::Abort)
+            .expect("abort control");
+        supervisor.join().expect("supervisor");
+
+    }
 }
 
 fn progress_item_for_paths(
@@ -39188,6 +42382,834 @@ fn file_task_scope_for_job(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileTaskPathPresence {
+    Present,
+    Missing,
+    Unavailable(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILE_TASK_METADATA_ERROR_OVERRIDES: std::cell::RefCell<
+        std::collections::BTreeMap<std::path::PathBuf, i32>,
+    > = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    #[cfg(target_os = "linux")]
+    static FILE_TASK_ENDPOINT_IDENTITY_OVERRIDES: std::cell::RefCell<
+        std::collections::BTreeMap<
+            std::path::PathBuf,
+            super::file_task_runtime::DurableEndpointVolumeIdentity,
+        >,
+    > = std::cell::RefCell::new(std::collections::BTreeMap::new());
+}
+
+#[cfg(test)]
+struct FileTaskMetadataErrorOverride {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+impl FileTaskMetadataErrorOverride {
+    fn install(path: &std::path::Path, raw_os_error: i32) -> Self {
+        FILE_TASK_METADATA_ERROR_OVERRIDES.with(|overrides| {
+            overrides
+                .borrow_mut()
+                .insert(path.to_path_buf(), raw_os_error);
+        });
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FileTaskMetadataErrorOverride {
+    fn drop(&mut self) {
+        FILE_TASK_METADATA_ERROR_OVERRIDES.with(|overrides| {
+            overrides.borrow_mut().remove(&self.path);
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct FileTaskEndpointIdentityOverride {
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl FileTaskEndpointIdentityOverride {
+    fn install(
+        path: &std::path::Path,
+        identity: super::file_task_runtime::DurableEndpointVolumeIdentity,
+    ) -> Self {
+        FILE_TASK_ENDPOINT_IDENTITY_OVERRIDES.with(|overrides| {
+            overrides.borrow_mut().insert(path.to_path_buf(), identity);
+        });
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for FileTaskEndpointIdentityOverride {
+    fn drop(&mut self) {
+        FILE_TASK_ENDPOINT_IDENTITY_OVERRIDES.with(|overrides| {
+            overrides.borrow_mut().remove(&self.path);
+        });
+    }
+}
+
+fn file_task_metadata_override(path: &std::path::Path) -> Option<std::io::Error> {
+    #[cfg(test)]
+    if let Some(raw_os_error) = FILE_TASK_METADATA_ERROR_OVERRIDES
+        .with(|overrides| overrides.borrow().get(path).copied())
+    {
+        return Some(std::io::Error::from_raw_os_error(raw_os_error));
+    }
+    let _ = path;
+    None
+}
+
+fn file_task_symlink_metadata(path: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+    if let Some(error) = file_task_metadata_override(path) {
+        return Err(error);
+    }
+    std::fs::symlink_metadata(path)
+}
+
+fn file_task_metadata(path: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+    if let Some(error) = file_task_metadata_override(path) {
+        return Err(error);
+    }
+    std::fs::metadata(path)
+}
+
+fn file_task_path_presence(path: &std::path::Path) -> FileTaskPathPresence {
+    match file_task_symlink_metadata(path) {
+        Ok(_) => FileTaskPathPresence::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            FileTaskPathPresence::Missing
+        }
+        Err(error) => FileTaskPathPresence::Unavailable(error.to_string()),
+    }
+}
+
+fn file_task_path_is_present(
+    path: &std::path::Path,
+    purpose: &str,
+) -> Result<bool, String> {
+    match file_task_path_presence(path) {
+        FileTaskPathPresence::Present => Ok(true),
+        FileTaskPathPresence::Missing => Ok(false),
+        FileTaskPathPresence::Unavailable(error) => Err(format!(
+            "{purpose} could not access {}: {error}; endpoint remains unavailable and reconciliation is deferred",
+            path.display()
+        )),
+    }
+}
+
+fn nearest_existing_file_task_endpoint_anchor(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let mut probe = if path.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        match file_task_metadata(&probe) {
+            Ok(metadata) if metadata.is_dir() => return Ok(probe),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect file-operation endpoint anchor {}: {error}",
+                    probe.display()
+                ))
+            }
+        }
+        if !probe.pop() || probe.as_os_str().is_empty() {
+            probe = std::path::PathBuf::from(".");
+            match file_task_metadata(&probe) {
+                Ok(metadata) if metadata.is_dir() => return Ok(probe),
+                Ok(_) => {
+                    return Err("current directory is not a directory".to_string())
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "inspect current directory for file-operation endpoint: {error}"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+trait FileTaskEndpointIdentityProvider {
+    fn capture(
+        &self,
+        anchor: &std::path::Path,
+    ) -> Result<super::file_task_runtime::DurableEndpointVolumeIdentity, String>;
+}
+
+struct SystemFileTaskEndpointIdentityProvider;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct LinuxFileTaskMountInfo {
+    mount_root: std::path::PathBuf,
+    mount_point: std::path::PathBuf,
+    filesystem_type: String,
+    source: String,
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_linux_mountinfo_bytes(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            let octal = &bytes[index + 1..index + 4];
+            if octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                let decoded = u16::from(octal[0] - b'0') * 64
+                    + u16::from(octal[1] - b'0') * 8
+                    + u16::from(octal[2] - b'0');
+                if let Ok(decoded) = u8::try_from(decoded) {
+                    output.push(decoded);
+                    index += 4;
+                    continue;
+                }
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    output
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mountinfo_path(value: &str) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        unescape_linux_mountinfo_bytes(value),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mountinfo_string(value: &str) -> String {
+    String::from_utf8_lossy(&unescape_linux_mountinfo_bytes(value)).into_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_file_task_mount_info(
+    resolved_anchor: &std::path::Path,
+) -> Result<LinuxFileTaskMountInfo, String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("read /proc/self/mountinfo: {error}"))?;
+    let mut best: Option<LinuxFileTaskMountInfo> = None;
+    for line in mountinfo.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let left_fields = left.split_whitespace().collect::<Vec<_>>();
+        let right_fields = right.split_whitespace().collect::<Vec<_>>();
+        if left_fields.len() < 5 || right_fields.len() < 2 {
+            continue;
+        }
+        let mount_point = linux_mountinfo_path(left_fields[4]);
+        if !resolved_anchor.starts_with(&mount_point) {
+            continue;
+        }
+        let candidate = LinuxFileTaskMountInfo {
+            mount_root: linux_mountinfo_path(left_fields[3]),
+            mount_point,
+            filesystem_type: right_fields[0].to_string(),
+            source: linux_mountinfo_string(right_fields[1]),
+        };
+        if best.as_ref().map_or(true, |current| {
+            candidate.mount_point.as_os_str().len() > current.mount_point.as_os_str().len()
+        }) {
+            best = Some(candidate);
+        }
+    }
+    best.ok_or_else(|| {
+        format!(
+            "no active mount boundary contains endpoint anchor {}",
+            resolved_anchor.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_filesystem_uuid_for_source(source: &str) -> Option<String> {
+    if let Some(uuid) = source.strip_prefix("UUID=").filter(|uuid| !uuid.is_empty()) {
+        return Some(uuid.to_ascii_lowercase());
+    }
+    let source_path = std::path::Path::new(source);
+    if source_path.starts_with("/dev/disk/by-uuid") {
+        return source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase());
+    }
+    if !source_path.is_absolute() || !source_path.starts_with("/dev") {
+        return None;
+    }
+    let canonical_source = std::fs::canonicalize(source_path).ok()?;
+    let entries = std::fs::read_dir("/dev/disk/by-uuid").ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if std::fs::canonicalize(&path).ok().as_deref() == Some(canonical_source.as_path()) {
+            return path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_source_is_reattachment_stable(filesystem_type: &str, source: &str) -> bool {
+    match filesystem_type {
+        "sshfs" | "fuse.sshfs" => source.contains(':') && source != "sshfs",
+        "nfs" | "nfs4" | "ceph" => source.contains(":/"),
+        "cifs" | "smb3" => source.starts_with("//"),
+        "9p" | "afs" | "coda" => {
+            !source.is_empty() && source != "none" && source != filesystem_type
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stable_endpoint_identity(
+    mount: &LinuxFileTaskMountInfo,
+) -> Option<super::file_task_runtime::DurableUnixEndpointStableIdentity> {
+    if let Some(uuid) = linux_filesystem_uuid_for_source(&mount.source) {
+        return Some(
+            super::file_task_runtime::DurableUnixEndpointStableIdentity::FilesystemUuid {
+                uuid,
+                filesystem_type: mount.filesystem_type.clone(),
+                mount_root: mount.mount_root.clone(),
+            },
+        );
+    }
+    linux_mount_source_is_reattachment_stable(&mount.filesystem_type, &mount.source).then(|| {
+        super::file_task_runtime::DurableUnixEndpointStableIdentity::MountSource {
+            source: mount.source.clone(),
+            filesystem_type: mount.filesystem_type.clone(),
+            mount_root: mount.mount_root.clone(),
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct MacOsFileTaskMountInfo {
+    mount_point: std::path::PathBuf,
+    filesystem_type: String,
+    volume_uuid: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacOsAttrList {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacOsVolumeUuidReply {
+    length: u32,
+    uuid: [u8; 16],
+}
+
+#[cfg(target_os = "macos")]
+fn macos_volume_uuid(mount_point: &std::path::Path) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "macOS volume mount point contains an interior NUL byte: {}",
+            mount_point.display()
+        )
+    })?;
+    let mut attributes = MacOsAttrList {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut reply = MacOsVolumeUuidReply {
+        length: 0,
+        uuid: [0; 16],
+    };
+    let result = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&mut attributes as *mut MacOsAttrList).cast::<libc::c_void>(),
+            (&mut reply as *mut MacOsVolumeUuidReply).cast::<libc::c_void>(),
+            std::mem::size_of::<MacOsVolumeUuidReply>(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "read persistent macOS volume UUID for {}: {}",
+            mount_point.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    if (reply.length as usize) < std::mem::size_of::<MacOsVolumeUuidReply>() {
+        return Err(format!(
+            "macOS returned a truncated volume UUID attribute for {}",
+            mount_point.display()
+        ));
+    }
+    if reply.uuid.iter().all(|byte| *byte == 0) {
+        return Err(format!(
+            "macOS returned an empty volume UUID for {}",
+            mount_point.display()
+        ));
+    }
+    let bytes = reply.uuid;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_task_mount_info(
+    resolved_anchor: &std::path::Path,
+) -> Result<MacOsFileTaskMountInfo, String> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let path = std::ffi::CString::new(resolved_anchor.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "macOS endpoint anchor contains an interior NUL byte: {}",
+            resolved_anchor.display()
+        )
+    })?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "inspect macOS mount containing endpoint anchor {}: {}",
+            resolved_anchor.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let c_char_bytes = |value: &[libc::c_char]| {
+        let end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        value[..end]
+            .iter()
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>()
+    };
+    let mount_point_bytes = c_char_bytes(&stat.f_mntonname);
+    let filesystem_type =
+        String::from_utf8_lossy(&c_char_bytes(&stat.f_fstypename)).into_owned();
+    let mount_point = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        mount_point_bytes,
+    ));
+    let volume_uuid = macos_volume_uuid(&mount_point).ok();
+    Ok(MacOsFileTaskMountInfo {
+        mount_point,
+        filesystem_type,
+        volume_uuid,
+    })
+}
+
+impl FileTaskEndpointIdentityProvider for SystemFileTaskEndpointIdentityProvider {
+    fn capture(
+        &self,
+        anchor: &std::path::Path,
+    ) -> Result<super::file_task_runtime::DurableEndpointVolumeIdentity, String> {
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(identity) = FILE_TASK_ENDPOINT_IDENTITY_OVERRIDES
+            .with(|overrides| overrides.borrow().get(anchor).cloned())
+        {
+            return Ok(identity);
+        }
+        // Resolve the endpoint anchor before taking its filesystem identity so a
+        // symlinked or junction-backed mount is identified by the attached target
+        // volume, not by the local filesystem that stores the link itself.
+        let resolved_anchor = std::fs::canonicalize(anchor).map_err(|error| {
+            format!(
+                "resolve file-operation endpoint identity anchor {}: {error}",
+                anchor.display()
+            )
+        })?;
+        let snapshot = tui_file_picker::snapshot_path(&resolved_anchor).map_err(|error| {
+            format!(
+                "capture file-operation endpoint identity for {}: {error}",
+                anchor.display()
+            )
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            let transient_device = match snapshot.identity() {
+                tui_file_picker::SourceIdentity::Unix { device, .. } => *device,
+            };
+            return match linux_file_task_mount_info(&resolved_anchor) {
+                Ok(mount) => Ok(
+                    super::file_task_runtime::DurableEndpointVolumeIdentity::UnixMount {
+                        transient_device,
+                        mount_point: mount.mount_point.clone(),
+                        stable: linux_stable_endpoint_identity(&mount),
+                    },
+                ),
+                Err(_) => Ok(
+                    super::file_task_runtime::DurableEndpointVolumeIdentity::UnixDevice {
+                        device: transient_device,
+                    },
+                ),
+            };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let transient_device = match snapshot.identity() {
+                tui_file_picker::SourceIdentity::Unix { device, .. } => *device,
+            };
+            return match macos_file_task_mount_info(&resolved_anchor) {
+                Ok(mount) => Ok(
+                    super::file_task_runtime::DurableEndpointVolumeIdentity::UnixMount {
+                        transient_device,
+                        mount_point: mount.mount_point,
+                        stable: mount.volume_uuid.map(|uuid| {
+                            super::file_task_runtime::DurableUnixEndpointStableIdentity::FilesystemUuid {
+                                uuid,
+                                filesystem_type: mount.filesystem_type,
+                                mount_root: std::path::PathBuf::from("/"),
+                            }
+                        }),
+                    },
+                ),
+                Err(_) => Ok(
+                    super::file_task_runtime::DurableEndpointVolumeIdentity::UnixDevice {
+                        device: transient_device,
+                    },
+                ),
+            };
+        }
+        #[cfg(all(
+            unix,
+            not(any(target_os = "linux", target_os = "macos"))
+        ))]
+        {
+            return match snapshot.identity() {
+                tui_file_picker::SourceIdentity::Unix { device, .. } => Ok(
+                    super::file_task_runtime::DurableEndpointVolumeIdentity::UnixDevice {
+                        device: *device,
+                    },
+                ),
+            };
+        }
+        #[cfg(windows)]
+        {
+            return match snapshot.identity() {
+                tui_file_picker::SourceIdentity::Windows { volume_serial, .. } => Ok(
+                    super::file_task_runtime::DurableEndpointVolumeIdentity::WindowsVolume {
+                        volume_serial: *volume_serial,
+                    },
+                ),
+            };
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = snapshot;
+            Ok(super::file_task_runtime::DurableEndpointVolumeIdentity::Unsupported)
+        }
+    }
+}
+
+fn capture_file_task_endpoint_volume(
+    anchor: &std::path::Path,
+) -> Result<super::file_task_runtime::DurableEndpointVolumeIdentity, String> {
+    SystemFileTaskEndpointIdentityProvider.capture(anchor)
+}
+
+fn capture_file_task_endpoint_identity(
+    role: super::file_task_runtime::DurableEndpointRole,
+    operation_root: &std::path::Path,
+    anchor_start: &std::path::Path,
+) -> Result<super::file_task_runtime::DurableEndpointIdentity, String> {
+    let anchor_path = nearest_existing_file_task_endpoint_anchor(anchor_start)?;
+    let volume = capture_file_task_endpoint_volume(&anchor_path)?;
+    Ok(super::file_task_runtime::DurableEndpointIdentity {
+        role,
+        operation_root: operation_root.to_path_buf(),
+        anchor_path,
+        volume,
+    })
+}
+
+fn capture_file_task_endpoint_identities(
+    job: &FileTaskJob,
+    mappings: &[tui_file_picker::PasteMapping],
+) -> Result<Vec<super::file_task_runtime::DurableEndpointIdentity>, String> {
+    let mut identities = Vec::with_capacity(mappings.len().saturating_add(1));
+    for mapping in mappings {
+        let anchor_start = mapping
+            .source
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(mapping.source.as_path());
+        identities.push(capture_file_task_endpoint_identity(
+            super::file_task_runtime::DurableEndpointRole::Source,
+            &mapping.source,
+            anchor_start,
+        )?);
+    }
+    let destination_root = std::path::PathBuf::from(job.dest.trim());
+    identities.push(capture_file_task_endpoint_identity(
+        super::file_task_runtime::DurableEndpointRole::Destination,
+        &destination_root,
+        &destination_root,
+    )?);
+    Ok(identities)
+}
+
+fn compare_file_task_endpoint_volumes(
+    recorded: &super::file_task_runtime::DurableEndpointVolumeIdentity,
+    current: &super::file_task_runtime::DurableEndpointVolumeIdentity,
+) -> Result<(), String> {
+    use super::file_task_runtime::DurableEndpointVolumeIdentity as Volume;
+    match (recorded, current) {
+        (
+            Volume::UnixMount {
+                transient_device: recorded_device,
+                mount_point: recorded_mount,
+                stable: recorded_stable,
+            },
+            Volume::UnixMount {
+                transient_device: current_device,
+                mount_point: current_mount,
+                stable: current_stable,
+            },
+        ) => {
+            if recorded_mount != current_mount {
+                return Err(format!(
+                    "the active mount boundary changed from {} to {}",
+                    recorded_mount.display(),
+                    current_mount.display()
+                ));
+            }
+            match (recorded_stable, current_stable) {
+                (Some(recorded_stable), Some(current_stable)) if recorded_stable == current_stable => {
+                    Ok(())
+                }
+                (Some(_), Some(_)) => Err(
+                    "the stable filesystem or mount-source identity changed".to_string(),
+                ),
+                (Some(_), None) => Err(
+                    "the recorded stable endpoint identity is not currently observable".to_string(),
+                ),
+                (None, _) if recorded_device == current_device => Ok(()),
+                (None, _) => Err(format!(
+                    "the endpoint device changed from {recorded_device} to {current_device}, but no stable identity is available; attachment is ambiguous"
+                )),
+            }
+        }
+        (
+            Volume::UnixMount {
+                transient_device: recorded,
+                stable: Some(_),
+                ..
+            },
+            Volume::UnixDevice { device: current },
+        ) => Err(format!(
+            "the recorded stable endpoint identity is not currently observable (device {recorded} -> {current}); attachment is ambiguous"
+        )),
+        (
+            Volume::UnixMount {
+                transient_device: recorded,
+                stable: None,
+                ..
+            },
+            Volume::UnixDevice { device: current },
+        ) => Err(format!(
+            "the active mount boundary is not currently observable (device {recorded} -> {current}); attachment is ambiguous"
+        )),
+        (Volume::UnixDevice { device: recorded }, Volume::UnixDevice { device: current })
+            if recorded == current =>
+        {
+            Ok(())
+        }
+        (
+            Volume::UnixDevice { device: recorded },
+            Volume::UnixMount {
+                transient_device: current,
+                ..
+            },
+        ) if recorded == current => Ok(()),
+        (Volume::UnixDevice { device: recorded }, Volume::UnixDevice { device: current })
+        | (
+            Volume::UnixDevice { device: recorded },
+            Volume::UnixMount {
+                transient_device: current,
+                ..
+            },
+        ) => Err(format!(
+            "the legacy endpoint device changed from {recorded} to {current}; attachment is ambiguous without a stable identity"
+        )),
+        (
+            Volume::WindowsVolume {
+                volume_serial: recorded,
+            },
+            Volume::WindowsVolume {
+                volume_serial: current,
+            },
+        ) if recorded == current => Ok(()),
+        (Volume::WindowsVolume { .. }, Volume::WindowsVolume { .. }) => {
+            Err("the Windows volume serial changed".to_string())
+        }
+        (Volume::Unsupported, _) | (_, Volume::Unsupported) => Err(
+            "this platform cannot prove a stable endpoint identity".to_string(),
+        ),
+        _ => Err("the endpoint identity kind changed".to_string()),
+    }
+}
+
+fn verify_file_task_endpoint_attached_with<P: FileTaskEndpointIdentityProvider>(
+    provider: &P,
+    endpoint: &super::file_task_runtime::DurableEndpointIdentity,
+) -> Result<(), String> {
+    match file_task_path_presence(&endpoint.anchor_path) {
+        FileTaskPathPresence::Missing => {
+            return Err(format!(
+                "recorded {:?} endpoint is not attached at {}",
+                endpoint.role,
+                endpoint.anchor_path.display()
+            ))
+        }
+        FileTaskPathPresence::Unavailable(error) => {
+            return Err(format!(
+                "recorded {:?} endpoint at {} is unavailable: {error}",
+                endpoint.role,
+                endpoint.anchor_path.display()
+            ))
+        }
+        FileTaskPathPresence::Present => {}
+    }
+    let current = provider.capture(&endpoint.anchor_path)?;
+    compare_file_task_endpoint_volumes(&endpoint.volume, &current).map_err(|reason| {
+        format!(
+            "recorded {:?} endpoint at {} is not safely reattached: {reason}",
+            endpoint.role,
+            endpoint.anchor_path.display()
+        )
+    })
+}
+
+fn verify_file_task_endpoint_attached(
+    endpoint: &super::file_task_runtime::DurableEndpointIdentity,
+) -> Result<(), String> {
+    verify_file_task_endpoint_attached_with(&SystemFileTaskEndpointIdentityProvider, endpoint)
+}
+
+fn source_endpoint_identity<'a>(
+    record: &'a super::file_task_runtime::DurableFileTaskRecord,
+    source: &std::path::Path,
+) -> Option<&'a super::file_task_runtime::DurableEndpointIdentity> {
+    record.endpoint_identities.iter().find(|endpoint| {
+        endpoint.role == super::file_task_runtime::DurableEndpointRole::Source
+            && endpoint.operation_root == source
+    })
+}
+
+fn destination_endpoint_identity<'a>(
+    record: &'a super::file_task_runtime::DurableFileTaskRecord,
+    destination_root: &std::path::Path,
+) -> Option<&'a super::file_task_runtime::DurableEndpointIdentity> {
+    record.endpoint_identities.iter().find(|endpoint| {
+        endpoint.role == super::file_task_runtime::DurableEndpointRole::Destination
+            && (endpoint.operation_root == destination_root
+                || destination_root.starts_with(&endpoint.operation_root))
+    })
+}
+
+struct FileTaskEndpointVerificationCache<'a> {
+    record: &'a super::file_task_runtime::DurableFileTaskRecord,
+    results: std::collections::BTreeMap<(bool, std::path::PathBuf), Result<(), String>>,
+}
+
+impl<'a> FileTaskEndpointVerificationCache<'a> {
+    fn new(record: &'a super::file_task_runtime::DurableFileTaskRecord) -> Self {
+        Self {
+            record,
+            results: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn verify_endpoint(
+        &mut self,
+        endpoint: &super::file_task_runtime::DurableEndpointIdentity,
+    ) -> Result<(), String> {
+        let key = (
+            endpoint.role == super::file_task_runtime::DurableEndpointRole::Destination,
+            endpoint.operation_root.clone(),
+        );
+        self.results
+            .entry(key)
+            .or_insert_with(|| verify_file_task_endpoint_attached(endpoint))
+            .clone()
+    }
+
+    fn source(&mut self, source: &std::path::Path) -> Result<(), String> {
+        let endpoint = source_endpoint_identity(self.record, source)
+            .ok_or_else(|| {
+                format!(
+                    "file-operation journal has no source endpoint identity for {}",
+                    source.display()
+                )
+            })?
+            .clone();
+        self.verify_endpoint(&endpoint)
+    }
+
+    fn destination(&mut self, destination: &std::path::Path) -> Result<(), String> {
+        let endpoint = destination_endpoint_identity(self.record, destination)
+            .ok_or_else(|| {
+                format!(
+                    "file-operation journal has no destination endpoint identity for {}",
+                    destination.display()
+                )
+            })?
+            .clone();
+        self.verify_endpoint(&endpoint)
+    }
+}
+
 fn common_source_root(sources: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
     match sources {
         [] => None,
@@ -39204,22 +43226,6 @@ fn common_source_root(sources: &[std::path::PathBuf]) -> Option<std::path::PathB
 }
 
 static FILE_TASK_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn sync_standard_file_task_root(
-    path: &std::path::Path,
-    counters: &mut tui_file_picker::FileOperationIoCounters,
-) -> std::io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_file() {
-        counters.file_sync_calls = counters.file_sync_calls.saturating_add(1);
-        std::fs::File::open(path)?.sync_all()
-    } else if metadata.file_type().is_dir() {
-        counters.directory_sync_calls = counters.directory_sync_calls.saturating_add(1);
-        sync_file_task_directory(path)
-    } else {
-        Ok(())
-    }
-}
 
 fn sync_file_task_directory(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -39445,6 +43451,8 @@ fn create_private_file_task_directory(path: &std::path::Path) -> std::io::Result
 fn create_file_task_staging_directory(
     parent: &std::path::Path,
     target: &std::path::Path,
+    operation: Option<(&str, u64)>,
+    journal: Option<&super::file_task_runtime::FileTaskJournalHandle>,
 ) -> Result<std::path::PathBuf, String> {
     let target_name = target
         .file_name()
@@ -39453,14 +43461,27 @@ fn create_file_task_staging_directory(
     let pid = std::process::id();
     for _ in 0..128 {
         let nonce = FILE_TASK_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let operation_token = operation
+            .map(|(job_id, generation)| format!("-{job_id}-{generation}"))
+            .unwrap_or_default();
         let candidate = parent.join(format!(
-            ".{}.tonepoet-tree-{}-{}.tmp",
-            target_name, pid, nonce
+            ".{}.tonepoet-tree{}-{}-{}.tmp",
+            target_name, operation_token, pid, nonce
         ));
+        if let Some(journal) = journal {
+            journal.record_temp_directory_artifact(&candidate, target)?;
+        }
         match create_private_file_task_directory(&candidate) {
             Ok(()) => return Ok(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(journal) = journal {
+                    let _ = journal.clear_temp_artifact(&candidate);
+                }
+            }
             Err(error) => {
+                if let Some(journal) = journal {
+                    let _ = journal.clear_temp_artifact(&candidate);
+                }
                 return Err(format!(
                     "create staging directory {}: {error}",
                     candidate.display()
@@ -39474,19 +43495,24 @@ fn create_file_task_staging_directory(
     ))
 }
 
-fn cleanup_file_task_staging_directory(path: &std::path::Path) {
-    if let Err(error) = std::fs::remove_dir_all(path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
+fn cleanup_file_task_staging_directory(path: &std::path::Path) -> bool {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
             log::warn!(
                 "could not remove file-task staging directory {}: {error}",
                 path.display()
             );
+            false
         }
     }
 }
 
 fn create_temp_output_file(
     target: &std::path::Path,
+    operation: Option<(&str, u64)>,
+    journal: Option<&super::file_task_runtime::FileTaskJournalHandle>,
 ) -> Result<(std::path::PathBuf, std::fs::File), String> {
     let parent = target
         .parent()
@@ -39498,16 +43524,34 @@ fn create_temp_output_file(
     let pid = std::process::id();
     for _ in 0..128 {
         let nonce = FILE_TASK_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temp_name = format!(".{}.tonepoet-part-{}-{}.tmp", file_name, pid, nonce);
+        let operation_token = operation
+            .map(|(job_id, generation)| format!("-{job_id}-{generation}"))
+            .unwrap_or_default();
+        let temp_name = format!(
+            ".{}.tonepoet-part{}-{}-{}.tmp",
+            file_name, operation_token, pid, nonce
+        );
         let temp_path = parent.join(temp_name);
+        if let Some(journal) = journal {
+            journal.record_temp_artifact(&temp_path, target)?;
+        }
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)
         {
             Ok(file) => return Ok((temp_path, file)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("create temporary target: {e}")),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(journal) = journal {
+                    let _ = journal.clear_temp_artifact(&temp_path);
+                }
+            }
+            Err(error) => {
+                if let Some(journal) = journal {
+                    let _ = journal.clear_temp_artifact(&temp_path);
+                }
+                return Err(format!("create temporary target: {error}"));
+            }
         }
     }
     Err(format!(
@@ -39985,7 +44029,7 @@ const FILE_TASK_EXISTING_DIR_SIZE_BUDGET: std::time::Duration = std::time::Durat
 
 fn maybe_spawn_existing_directory_size_probe(
     session_id: u64,
-    tx: mpsc::Sender<AppMessage>,
+    sink: FileTaskEventSink,
     request_id: u64,
     target: &std::path::Path,
     existing_meta: &std::fs::Metadata,
@@ -40002,14 +44046,14 @@ fn maybe_spawn_existing_directory_size_probe(
             let Some(size) = measure_existing_directory_size_for_prompt(&target) else {
                 return;
             };
-            let _ = tx.blocking_send(AppMessage::FileTaskProgress {
+            sink.progress(
                 session_id,
-                update: tui_file_picker::FileTaskProgressUpdate::UpdateConflictExistingStats {
+                tui_file_picker::FileTaskProgressUpdate::UpdateConflictExistingStats {
                     request_id,
                     size,
                     modified: existing_modified,
                 },
-            });
+            );
         });
 }
 
@@ -40254,6 +44298,10 @@ static SOURCE_QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 =
 
 fn quarantine_source_root(
     source: &std::path::Path,
+    journal: Option<(
+        &super::file_task_runtime::FileTaskJournalHandle,
+        &std::path::Path,
+    )>,
 ) -> Result<(std::path::PathBuf, NoClobberRenameMode), String> {
     let parent = source.parent().unwrap_or_else(|| std::path::Path::new("."));
     let pid = std::process::id();
@@ -40273,9 +44321,45 @@ fn quarantine_source_root(
             }
         }
         let quarantine = container.join("payload");
+        if let Some((journal, destination)) = journal {
+            if let Err(error) = journal.record_quarantine_artifact(
+                &quarantine,
+                source,
+                destination,
+            ) {
+                let _ = std::fs::remove_dir(&container);
+                return Err(format!(
+                    "could not durably record source quarantine intent for {}: {error}",
+                    source.display()
+                ));
+            }
+        }
         match try_no_clobber_rename(source, &quarantine) {
-            Ok(mode) => return Ok((quarantine, mode)),
+            Ok(mode) => {
+                if let Some((journal, _)) = journal {
+                    if let Err(error) = journal.mark_quarantine_renamed(&quarantine) {
+                        let restore = try_no_clobber_rename(&quarantine, source);
+                        if restore.is_ok() {
+                            let _ = journal.clear_quarantine_artifact(&quarantine);
+                            let _ = std::fs::remove_dir(&container);
+                            return Err(format!(
+                                "source quarantine completed but its durable rename checkpoint failed; source was restored: {error}"
+                            ));
+                        }
+                        return Err(format!(
+                            "source quarantine completed but its durable rename checkpoint failed and immediate restoration also failed; reconciliation must inspect {} and {}: {error}; restore error: {}",
+                            source.display(),
+                            quarantine.display(),
+                            restore.expect_err("restore failure checked above")
+                        ));
+                    }
+                }
+                return Ok((quarantine, mode));
+            }
             Err(error) => {
+                if let Some((journal, _)) = journal {
+                    let _ = journal.clear_quarantine_artifact(&quarantine);
+                }
                 let _ = std::fs::remove_dir(&container);
                 return Err(format!(
                     "could not quarantine source {} without replacement: {error}",
@@ -40448,19 +44532,21 @@ fn copy_symlink_atomic(
     source: &std::path::Path,
     target: &std::path::Path,
     replace_existing: bool,
+    operation: Option<(&str, u64)>,
+    journal: Option<&super::file_task_runtime::FileTaskJournalHandle>,
 ) -> Result<(), String> {
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
     }
     let link_target = std::fs::read_link(source)
-        .map_err(|e| format!("read symlink {}: {}", source.display(), e))?;
+        .map_err(|e| format!("read symlink {}: {e}", source.display()))?;
 
     if !replace_existing {
         return std::os::unix::fs::symlink(&link_target, target).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 format!("destination exists: {}", target.display())
             } else {
-                format!("copy symlink: {}", e)
+                format!("copy symlink: {e}")
             }
         });
     }
@@ -40475,21 +44561,53 @@ fn copy_symlink_atomic(
     let pid = std::process::id();
     for _ in 0..128 {
         let nonce = FILE_TASK_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temp = parent.join(format!(".{}.tonepoet-link-{}-{}.tmp", name, pid, nonce));
+        let operation_token = operation
+            .map(|(job_id, generation)| format!("-{job_id}-{generation}"))
+            .unwrap_or_default();
+        let temp = parent.join(format!(
+            ".{}.tonepoet-link{}-{}-{}.tmp",
+            name, operation_token, pid, nonce
+        ));
+        if let Some(journal) = journal {
+            journal.record_temp_symlink_artifact(&temp, target)?;
+        }
         match std::os::unix::fs::symlink(&link_target, &temp) {
             Ok(()) => {
                 let result = std::fs::rename(&temp, target)
-                    .map_err(|e| format!("rename temporary symlink: {}", e));
+                    .map_err(|e| format!("rename temporary symlink: {e}"));
                 if result.is_err() {
-                    let _ = std::fs::remove_file(&temp);
+                    let removed = match std::fs::remove_file(&temp) {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(_) => false,
+                    };
+                    if removed {
+                        if let Some(journal) = journal {
+                            let _ = journal.clear_temp_artifact(&temp);
+                        }
+                    }
+                } else if let Some(journal) = journal {
+                    let _ = journal.clear_temp_artifact(&temp);
                 }
                 return result;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("copy symlink: {}", e)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(journal) = journal {
+                    let _ = journal.clear_temp_artifact(&temp);
+                }
+            }
+            Err(error) => {
+                if let Some(journal) = journal {
+                    let _ = journal.clear_temp_artifact(&temp);
+                }
+                return Err(format!("copy symlink: {error}"));
+            }
         }
     }
-    Err(format!("could not create a unique temporary symlink for {}", target.display()))
+    Err(format!(
+        "could not create a unique temporary symlink for {}",
+        target.display()
+    ))
 }
 
 #[cfg(windows)]
@@ -40497,6 +44615,8 @@ fn copy_symlink_atomic(
     source: &std::path::Path,
     target: &std::path::Path,
     replace_existing: bool,
+    _operation: Option<(&str, u64)>,
+    _journal: Option<&super::file_task_runtime::FileTaskJournalHandle>,
 ) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {}", e))?;
@@ -40516,6 +44636,8 @@ fn copy_symlink_atomic(
     source: &std::path::Path,
     target: &std::path::Path,
     _replace_existing: bool,
+    _operation: Option<(&str, u64)>,
+    _journal: Option<&super::file_task_runtime::FileTaskJournalHandle>,
 ) -> Result<(), String> {
     copy_symlink(source, target)
 }
@@ -40553,7 +44675,513 @@ fn copy_symlink(source: &std::path::Path, _target: &std::path::Path) -> Result<(
 #[cfg(test)]
 mod file_operation_safety_tests {
     use super::*;
+    use super::file_picker_browse_parity_regression_tests::{
+        attach_test_file_task_journal, resume_test_clipboard_move_worker,
+        TestFileTaskJournalEnvironment,
+    };
     use std::fs;
+
+    #[derive(Clone)]
+    struct FixedEndpointIdentityProvider {
+        current: super::super::file_task_runtime::DurableEndpointVolumeIdentity,
+    }
+
+    impl FileTaskEndpointIdentityProvider for FixedEndpointIdentityProvider {
+        fn capture(
+            &self,
+            _anchor: &std::path::Path,
+        ) -> Result<super::super::file_task_runtime::DurableEndpointVolumeIdentity, String> {
+            Ok(self.current.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_endpoint_identity_accepts_reattachment_with_changed_device_number() {
+        use super::super::file_task_runtime::{
+            DurableEndpointIdentity, DurableEndpointRole, DurableEndpointVolumeIdentity,
+            DurableUnixEndpointStableIdentity,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stable = DurableUnixEndpointStableIdentity::FilesystemUuid {
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            filesystem_type: "ext4".to_string(),
+            mount_root: std::path::PathBuf::from("/"),
+        };
+        let endpoint = DurableEndpointIdentity {
+            role: DurableEndpointRole::Source,
+            operation_root: temp.path().join("album"),
+            anchor_path: temp.path().to_path_buf(),
+            volume: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 10,
+                mount_point: std::path::PathBuf::from("/media/test"),
+                stable: Some(stable.clone()),
+            },
+        };
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 77,
+                mount_point: std::path::PathBuf::from("/media/test"),
+                stable: Some(stable),
+            },
+        };
+
+        verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect("matching stable identity must survive device renumbering");
+    }
+
+    #[test]
+    fn macos_volume_uuid_accepts_reattachment_with_changed_device_number() {
+        use super::super::file_task_runtime::{
+            DurableEndpointIdentity, DurableEndpointRole, DurableEndpointVolumeIdentity,
+            DurableUnixEndpointStableIdentity,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stable = DurableUnixEndpointStableIdentity::FilesystemUuid {
+            uuid: "12345678-90ab-cdef-1234-567890abcdef".to_string(),
+            filesystem_type: "apfs".to_string(),
+            mount_root: std::path::PathBuf::from("/"),
+        };
+        let endpoint = DurableEndpointIdentity {
+            role: DurableEndpointRole::Source,
+            operation_root: temp.path().join("album"),
+            anchor_path: temp.path().to_path_buf(),
+            volume: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 10,
+                mount_point: std::path::PathBuf::from("/Volumes/Studio Drive"),
+                stable: Some(stable.clone()),
+            },
+        };
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 77,
+                mount_point: std::path::PathBuf::from("/Volumes/Studio Drive"),
+                stable: Some(stable),
+            },
+        };
+
+        verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect("matching macOS volume UUID must survive device renumbering");
+    }
+
+    #[test]
+    fn macos_volume_uuid_rejects_different_volume_at_same_path() {
+        use super::super::file_task_runtime::{
+            DurableEndpointIdentity, DurableEndpointRole, DurableEndpointVolumeIdentity,
+            DurableUnixEndpointStableIdentity,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let endpoint = DurableEndpointIdentity {
+            role: DurableEndpointRole::Destination,
+            operation_root: temp.path().to_path_buf(),
+            anchor_path: temp.path().to_path_buf(),
+            volume: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 10,
+                mount_point: std::path::PathBuf::from("/Volumes/Studio Drive"),
+                stable: Some(DurableUnixEndpointStableIdentity::FilesystemUuid {
+                    uuid: "12345678-90ab-cdef-1234-567890abcdef".to_string(),
+                    filesystem_type: "apfs".to_string(),
+                    mount_root: std::path::PathBuf::from("/"),
+                }),
+            },
+        };
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 77,
+                mount_point: std::path::PathBuf::from("/Volumes/Studio Drive"),
+                stable: Some(DurableUnixEndpointStableIdentity::FilesystemUuid {
+                    uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                    filesystem_type: "apfs".to_string(),
+                    mount_root: std::path::PathBuf::from("/"),
+                }),
+            },
+        };
+
+        let error = verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect_err("different macOS volume UUID must be rejected");
+        assert!(error.contains("stable filesystem"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn macos_recorded_volume_uuid_missing_from_current_mount_fails_closed() {
+        use super::super::file_task_runtime::{
+            DurableEndpointIdentity, DurableEndpointRole, DurableEndpointVolumeIdentity,
+            DurableUnixEndpointStableIdentity,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let endpoint = DurableEndpointIdentity {
+            role: DurableEndpointRole::Source,
+            operation_root: temp.path().join("album"),
+            anchor_path: temp.path().to_path_buf(),
+            volume: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 10,
+                mount_point: std::path::PathBuf::from("/Volumes/Studio Drive"),
+                stable: Some(DurableUnixEndpointStableIdentity::FilesystemUuid {
+                    uuid: "12345678-90ab-cdef-1234-567890abcdef".to_string(),
+                    filesystem_type: "apfs".to_string(),
+                    mount_root: std::path::PathBuf::from("/"),
+                }),
+            },
+        };
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 77,
+                mount_point: std::path::PathBuf::from("/Volumes/Studio Drive"),
+                stable: None,
+            },
+        };
+
+        let error = verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect_err("missing current macOS volume UUID must fail closed");
+        assert!(
+            error.contains("not currently observable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_identity_rejects_different_stable_volume_at_same_path() {
+        use super::super::file_task_runtime::{
+            DurableEndpointIdentity, DurableEndpointRole, DurableEndpointVolumeIdentity,
+            DurableUnixEndpointStableIdentity,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let endpoint = DurableEndpointIdentity {
+            role: DurableEndpointRole::Destination,
+            operation_root: temp.path().to_path_buf(),
+            anchor_path: temp.path().to_path_buf(),
+            volume: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 10,
+                mount_point: std::path::PathBuf::from("/media/test"),
+                stable: Some(DurableUnixEndpointStableIdentity::FilesystemUuid {
+                    uuid: "recorded".to_string(),
+                    filesystem_type: "ext4".to_string(),
+                    mount_root: std::path::PathBuf::from("/"),
+                }),
+            },
+        };
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 10,
+                mount_point: std::path::PathBuf::from("/media/test"),
+                stable: Some(DurableUnixEndpointStableIdentity::FilesystemUuid {
+                    uuid: "replacement".to_string(),
+                    filesystem_type: "ext4".to_string(),
+                    mount_root: std::path::PathBuf::from("/"),
+                }),
+            },
+        };
+
+        let error = verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect_err("different stable volume must be rejected");
+        assert!(error.contains("stable filesystem"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sshfs_mount_source_identity_accepts_remount_and_ambiguous_device_only_identity_does_not() {
+        use super::super::file_task_runtime::{
+            DurableEndpointIdentity, DurableEndpointRole, DurableEndpointVolumeIdentity,
+            DurableUnixEndpointStableIdentity,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stable = DurableUnixEndpointStableIdentity::MountSource {
+            source: "user@example:/music".to_string(),
+            filesystem_type: "fuse.sshfs".to_string(),
+            mount_root: std::path::PathBuf::from("/"),
+        };
+        let mut endpoint = DurableEndpointIdentity {
+            role: DurableEndpointRole::Source,
+            operation_root: temp.path().join("album"),
+            anchor_path: temp.path().to_path_buf(),
+            volume: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 20,
+                mount_point: std::path::PathBuf::from("/mnt/music"),
+                stable: Some(stable.clone()),
+            },
+        };
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 21,
+                mount_point: std::path::PathBuf::from("/mnt/music"),
+                stable: Some(stable.clone()),
+            },
+        };
+        verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect("sshfs remount source identity must be accepted");
+
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixDevice { device: 20 },
+        };
+        let error = verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect_err("missing active mount identity must fail closed");
+        assert!(
+            error.contains("not currently observable") || error.contains("ambiguous"),
+            "unexpected error: {error}"
+        );
+
+        endpoint.volume = DurableEndpointVolumeIdentity::UnixMount {
+            transient_device: 20,
+            mount_point: std::path::PathBuf::from("/mnt/music"),
+            stable: None,
+        };
+        let provider = FixedEndpointIdentityProvider {
+            current: DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 21,
+                mount_point: std::path::PathBuf::from("/mnt/music"),
+                stable: None,
+            },
+        };
+        let error = verify_file_task_endpoint_attached_with(&provider, &endpoint)
+            .expect_err("changed device without stable identity must remain ambiguous");
+        assert!(error.contains("ambiguous"), "unexpected error: {error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mount_source_identity_requires_endpoint_bearing_source_data() {
+        assert!(linux_mount_source_is_reattachment_stable(
+            "fuse.sshfs",
+            "user@example:/music"
+        ));
+        assert!(linux_mount_source_is_reattachment_stable(
+            "nfs4",
+            "server:/export"
+        ));
+        assert!(linux_mount_source_is_reattachment_stable(
+            "cifs",
+            "//server/share"
+        ));
+        assert!(!linux_mount_source_is_reattachment_stable(
+            "fuse.portal",
+            "portal"
+        ));
+        assert!(!linux_mount_source_is_reattachment_stable(
+            "fuse.sshfs",
+            "sshfs"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sshfs_reattachment_with_changed_device_resumes_deferred_cleanup() {
+        use super::super::file_task_runtime::{
+            DurableEndpointVolumeIdentity, DurableUnixEndpointStableIdentity,
+        };
+
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_mount = temp.path().join("sshfs-source");
+        let destination_dir = temp.path().join("destination");
+        let source = source_mount.join("album");
+        std::fs::create_dir_all(source.join("disc")).expect("source tree");
+        std::fs::create_dir(&destination_dir).expect("destination directory");
+        std::fs::write(source.join("a.flac"), b"a").expect("source a");
+        std::fs::write(source.join("disc/b.flac"), b"b").expect("source b");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let stable = DurableUnixEndpointStableIdentity::MountSource {
+            source: "user@example:/music".to_string(),
+            filesystem_type: "fuse.sshfs".to_string(),
+            mount_root: std::path::PathBuf::from("/"),
+        };
+        let recorded_identity = FileTaskEndpointIdentityOverride::install(
+            &source_mount,
+            DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 20,
+                mount_point: std::path::PathBuf::from("/mnt/music"),
+                stable: Some(stable.clone()),
+            },
+        );
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_first_tx, first_rx) = std::sync::mpsc::channel();
+        let mut first = clipboard_move_worker_for_test(&plan, Some(seed), first_rx);
+        first.force_content_verified_move_path = true;
+        let journal = attach_test_file_task_journal(&mut first, &plan);
+        first.forced_cleanup_control_after_deleted_entries =
+            Some((1, FileTaskStep::Aborted));
+        assert_eq!(
+            first.run_inner().expect("seed deferred cleanup"),
+            FileTaskStep::Completed
+        );
+        drop(recorded_identity);
+        let quarantine = journal
+            .load()
+            .expect("pending journal")
+            .quarantine_artifacts
+            .first()
+            .expect("quarantine obligation")
+            .path
+            .clone();
+        assert!(quarantine.exists());
+
+        let _reattached_identity = FileTaskEndpointIdentityOverride::install(
+            &source_mount,
+            DurableEndpointVolumeIdentity::UnixMount {
+                transient_device: 77,
+                mount_point: std::path::PathBuf::from("/mnt/music"),
+                stable: Some(stable),
+            },
+        );
+        let (_resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let mut resumed =
+            resume_test_clipboard_move_worker(&plan, journal.path(), resume_rx);
+        assert_eq!(
+            resumed.run_inner().expect("resume after sshfs remount"),
+            FileTaskStep::Completed
+        );
+
+        assert!(!quarantine.exists());
+        assert!(
+            resumed
+                .journal
+                .as_ref()
+                .expect("resumed journal")
+                .load()
+                .expect("reconciled record")
+                .quarantine_artifacts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn derived_artifact_names_are_generation_scoped() {
+        let job_id = "9a4ea957-1953-4937-b0bb-c80bd983d7c2";
+        let owned = std::path::PathBuf::from(format!(
+            ".track.flac.tonepoet-part-{job_id}-7-42-3.tmp"
+        ));
+        assert_eq!(
+            derived_private_artifact_kind(&owned, job_id, &[7]),
+            Some((
+                super::super::file_task_runtime::DurableTempArtifactKind::File,
+                7,
+            ))
+        );
+        assert_eq!(derived_private_artifact_kind(&owned, job_id, &[6]), None);
+        assert_eq!(
+            derived_private_artifact_kind(&owned, "another-job", &[7]),
+            None
+        );
+        assert_eq!(
+            derived_private_artifact_kind(
+                std::path::Path::new("track.flac.tonepoet-part-job-7-42-3.tmp"),
+                "job",
+                &[7],
+            ),
+            None,
+            "private artifacts must retain their leading dot"
+        );
+    }
+
+    #[test]
+    fn derived_artifact_scan_is_bounded_to_owned_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("destination");
+        let nested = destination.join("album");
+        fs::create_dir_all(&nested).expect("nested destination");
+        let job_id = "55a70999-e551-4166-ae90-845289a73e23";
+        let owned = nested.join(format!(
+            ".track.flac.tonepoet-part-{job_id}-3-42-1.tmp"
+        ));
+        let foreign = nested.join(".track.flac.tonepoet-part-foreign-3-42-1.tmp");
+        fs::write(&owned, b"partial").expect("owned artifact");
+        fs::write(&foreign, b"foreign").expect("foreign artifact");
+
+        let mut found = std::collections::BTreeMap::new();
+        collect_derived_private_artifacts(
+            &destination,
+            true,
+            job_id,
+            &[3],
+            &mut found,
+        )
+        .expect("scan");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found.get(&owned),
+            Some(&(
+                super::super::file_task_runtime::DurableTempArtifactKind::File,
+                3,
+            ))
+        );
+        remove_derived_private_artifact(
+            &owned,
+            super::super::file_task_runtime::DurableTempArtifactKind::File,
+        )
+        .expect("cleanup");
+        assert!(!owned.exists());
+        assert!(foreign.exists(), "foreign artifacts must never be removed");
+    }
+
+    #[test]
+    fn resumed_copy_reuses_only_a_verified_existing_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        fs::write(&source, b"published audio").expect("source");
+        fs::write(&destination, b"published audio").expect("destination");
+        let node = FileTaskPlanNode {
+            source: source.clone(),
+            target: destination.clone(),
+            kind: FileTaskPlanKind::File,
+            stats: FileTaskPathStats {
+                files: 1,
+                folders: 0,
+                bytes: fs::metadata(&source).expect("metadata").len(),
+            },
+            children: Vec::new(),
+            tree_fully_planned: true,
+            source_snapshot: tui_file_picker::snapshot_path(&source).expect("snapshot"),
+        };
+        let job = FileTaskJob {
+            session_id: 1,
+            job_id: uuid::Uuid::new_v4().to_string(),
+            generation: 2,
+            journal_path: None,
+            stall_timeout_secs: 8,
+            sources: vec![source.clone()],
+            dest: temp.path().to_string_lossy().into_owned(),
+            force: false,
+            is_move: false,
+            conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
+            root_targets: Some(vec![destination.clone()]),
+            clipboard_retry_plan: None,
+            verbose_degrade_notices: false,
+            verification: tui_file_picker::VerificationMode::Strong,
+        };
+        let (tx, _rx) = mpsc::channel(16);
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = FileTaskWorker::new(job, tx, control_rx);
+
+        assert_eq!(
+            worker
+                .revalidate_copy_retry_destination(&node)
+                .expect("reconcile destination"),
+            FileTaskStep::Completed
+        );
+        assert!(worker.completed_proofs_by_source.contains_key(&source));
+        assert_eq!(worker.totals.completed, 1);
+
+        fs::write(&destination, b"different audio").expect("replace destination");
+        assert!(worker
+            .revalidate_copy_retry_destination(&node)
+            .expect_err("changed destination must not be reused")
+            .contains("does not match"));
+    }
 
     #[test]
     fn directory_copy_rejects_descendant_destination() {
@@ -40707,6 +45335,10 @@ mod file_operation_safety_tests {
         let worker = FileTaskWorker::new(
             FileTaskJob {
                 session_id: 1,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
                 sources: Vec::new(),
                 dest: String::new(),
                 force,
@@ -40738,6 +45370,10 @@ mod file_operation_safety_tests {
         FileTaskWorker::new(
             FileTaskJob {
                 session_id: 77,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
                 sources: plan
                     .mappings
                     .iter()
@@ -40756,6 +45392,50 @@ mod file_operation_safety_tests {
                 clipboard_retry_plan: retry_plan,
                 verbose_degrade_notices: false,
                 verification: tui_file_picker::VerificationMode::Strong,
+            },
+            tx,
+            controls,
+        )
+    }
+
+    pub(super) fn clipboard_copy_worker_for_test(
+        plan: &tui_file_picker::PastePlan,
+        controls: std::sync::mpsc::Receiver<crate::tui::app::FileTaskControl>,
+    ) -> FileTaskWorker {
+        let destination_dir = plan
+            .mappings
+            .first()
+            .and_then(|mapping| mapping.destination.parent())
+            .expect("clipboard copy destination parent")
+            .to_path_buf();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        FileTaskWorker::new(
+            FileTaskJob {
+                session_id: 78,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
+                sources: plan
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.source.clone())
+                    .collect(),
+                dest: destination_dir.to_string_lossy().into_owned(),
+                force: false,
+                is_move: false,
+                conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
+                root_targets: Some(
+                    plan.mappings
+                        .iter()
+                        .map(|mapping| mapping.destination.clone())
+                        .collect(),
+                ),
+                clipboard_retry_plan: Some(
+                    super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone()),
+                ),
+                verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Standard,
             },
             tx,
             controls,
@@ -41400,6 +46080,90 @@ mod file_operation_safety_tests {
         assert_eq!(fs::read(&target).expect("target preserved"), b"existing");
     }
 
+    #[test]
+    fn standard_single_file_copy_performs_no_data_or_publication_syncs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let target = temp.path().join("copied.flac");
+        fs::write(&source, b"audio").expect("source file");
+        let node = build_file_task_plan_node(&source, &target).expect("plan node");
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test(false, control_rx);
+        worker.job.verification = tui_file_picker::VerificationMode::Standard;
+        worker.active_root_source = Some(source.clone());
+
+        assert_eq!(
+            worker.copy_root_progress_node(&node).expect("standard copy"),
+            FileTaskStep::Completed
+        );
+
+        assert_eq!(worker.io_counters.file_sync_calls, 0);
+        assert_eq!(worker.io_counters.directory_sync_calls, 0);
+        assert_eq!(fs::read(&target).expect("published copy"), b"audio");
+        assert!(
+            temp_file_names(temp.path()).is_empty(),
+            "successful Standard copy must leave no private temporary output"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standard_directory_copy_performs_no_data_tree_or_publication_syncs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        let destination_dir = temp.path().join("destination");
+        let target = destination_dir.join("album");
+        fs::create_dir_all(source.join("disc")).expect("source tree");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        fs::write(source.join("cover.jpg"), b"cover").expect("cover");
+        fs::write(source.join("disc/track.flac"), b"audio").expect("track");
+        let node = build_file_task_plan_node(&source, &target).expect("plan node");
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut worker = FileTaskWorker::new(
+            FileTaskJob {
+                session_id: 1,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
+                sources: vec![source.clone()],
+                dest: destination_dir.display().to_string(),
+                force: false,
+                is_move: false,
+                conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
+                root_targets: Some(vec![target.clone()]),
+                clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Standard,
+            },
+            tx,
+            control_rx,
+        );
+
+        assert_eq!(
+            worker
+                .copy_root_progress_node(&node)
+                .expect("transactional Standard directory copy"),
+            FileTaskStep::Completed
+        );
+
+        assert_eq!(worker.io_counters.file_sync_calls, 0);
+        assert_eq!(worker.io_counters.directory_sync_calls, 0);
+        assert_eq!(fs::read(target.join("cover.jpg")).expect("cover copy"), b"cover");
+        assert_eq!(
+            fs::read(target.join("disc/track.flac")).expect("track copy"),
+            b"audio"
+        );
+        assert!(
+            fs::read_dir(&destination_dir)
+                .expect("destination entries")
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().contains("tonepoet-tree")),
+            "successful publication must remove the private staging container"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn clipboard_directory_copy_publishes_one_complete_root() {
@@ -41416,6 +46180,10 @@ mod file_operation_safety_tests {
         let mut worker = FileTaskWorker::new(
             FileTaskJob {
                 session_id: 1,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
                 sources: vec![source.clone()],
                 dest: destination_dir.display().to_string(),
                 force: false,
@@ -41435,6 +46203,11 @@ mod file_operation_safety_tests {
             .expect("transactional directory copy");
 
         assert_eq!(step, FileTaskStep::Completed);
+        assert_eq!(worker.io_counters.file_sync_calls, 1);
+        assert_eq!(
+            worker.io_counters.directory_sync_calls, 2,
+            "Strong mode syncs the staged directory and the published root parent"
+        );
         assert_eq!(fs::read(target.join("track.flac")).expect("published file"), b"audio");
         assert!(
             fs::read_dir(&destination_dir)
@@ -41464,6 +46237,10 @@ mod file_operation_safety_tests {
         let mut worker = FileTaskWorker::new(
             FileTaskJob {
                 session_id: 1,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
                 sources: vec![source.clone()],
                 dest: destination_dir.display().to_string(),
                 force: false,
@@ -41472,7 +46249,7 @@ mod file_operation_safety_tests {
                 root_targets: Some(vec![target.clone()]),
                 clipboard_retry_plan: None,
                 verbose_degrade_notices: false,
-                verification: tui_file_picker::VerificationMode::Strong,
+                verification: tui_file_picker::VerificationMode::Standard,
             },
             tx,
             control_rx,
@@ -41483,6 +46260,8 @@ mod file_operation_safety_tests {
             .expect("abort is a controlled outcome");
 
         assert_eq!(step, FileTaskStep::Aborted);
+        assert_eq!(worker.io_counters.file_sync_calls, 0);
+        assert_eq!(worker.io_counters.directory_sync_calls, 0);
         assert!(!target.exists(), "aborted root must not expose a partial destination");
         assert!(source.join("track.flac").exists(), "source remains retryable");
     }
@@ -41492,7 +46271,7 @@ mod file_operation_safety_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("track.flac");
         fs::write(&target, b"existing").expect("target");
-        let (temp_path, mut output) = create_temp_output_file(&target).expect("temp output");
+        let (temp_path, mut output) = create_temp_output_file(&target, None, None).expect("temp output");
         use std::io::Write;
         output.write_all(b"new").expect("write temp");
         output.sync_all().expect("sync temp");
@@ -41511,7 +46290,7 @@ mod file_operation_safety_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("track.flac");
         fs::write(&target, b"existing").expect("target");
-        let (temp_path, mut output) = create_temp_output_file(&target).expect("temp output");
+        let (temp_path, mut output) = create_temp_output_file(&target, None, None).expect("temp output");
         use std::io::Write;
         output.write_all(b"new").expect("write temp");
         output.sync_all().expect("sync temp");
@@ -41526,7 +46305,7 @@ mod file_operation_safety_tests {
     fn no_clobber_finalization_refuses_late_destination() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("track.flac");
-        let (temp_path, mut output) = create_temp_output_file(&target).expect("temp output");
+        let (temp_path, mut output) = create_temp_output_file(&target, None, None).expect("temp output");
         use std::io::Write;
         output.write_all(b"new").expect("write temp");
         output.sync_all().expect("sync temp");
@@ -66084,7 +70863,7 @@ mod metadata_editor_inline_navigation_tests {
 #[cfg(test)]
 mod file_picker_browse_parity_regression_tests {
     use super::*;
-    use super::file_operation_safety_tests::{clipboard_move_worker_for_test, worker_for_test, worker_for_test_with_policy};
+    use super::file_operation_safety_tests::{clipboard_copy_worker_for_test, clipboard_move_worker_for_test, worker_for_test, worker_for_test_with_policy};
     use crate::config::TonepoetConfig;
 
     fn browse_file_entry(path: std::path::PathBuf) -> crate::tui::browse::BrowseEntry {
@@ -67391,6 +72170,10 @@ mod file_picker_browse_parity_regression_tests {
         let mut worker = FileTaskWorker::new(
             FileTaskJob {
                 session_id: 1,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
                 sources: vec![source.clone()],
                 dest: destination_parent.display().to_string(),
                 force: false,
@@ -67443,6 +72226,10 @@ mod file_picker_browse_parity_regression_tests {
         let mut worker = FileTaskWorker::new(
             FileTaskJob {
                 session_id: 1,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
                 sources: vec![source.clone()],
                 dest: destination_parent.display().to_string(),
                 force: false,
@@ -67502,6 +72289,10 @@ mod file_picker_browse_parity_regression_tests {
         let mut worker = FileTaskWorker::new(
             FileTaskJob {
                 session_id: 1,
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
                 sources: vec![source.clone()],
                 dest: destination_dir.display().to_string(),
                 force: false,
@@ -68211,6 +73002,34 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[test]
+    fn standard_copy_fallback_move_avoids_data_and_destination_publication_syncs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let target = temp.path().join("moved.flac");
+        std::fs::write(&source, b"audio").expect("source");
+        let node = build_file_task_plan_node(&source, &target).expect("plan");
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = worker_for_test(false, control_rx);
+        worker.job.is_move = true;
+        worker.job.verification = tui_file_picker::VerificationMode::Standard;
+        worker.active_root_source = Some(source.clone());
+        worker.force_content_verified_move_path = true;
+
+        assert_eq!(
+            worker.move_path_progress_node(&node).expect("copy fallback move"),
+            FileTaskStep::Completed
+        );
+
+        assert_eq!(worker.io_counters.file_sync_calls, 0);
+        assert_eq!(
+            worker.io_counters.directory_sync_calls, 1,
+            "Standard move fallback syncs only the final source namespace removal, not copied data or destination publication"
+        );
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&target).expect("destination"), b"audio");
+    }
+
+    #[test]
     fn browse_unavoidable_directory_move_has_bounded_proof_walks() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("album");
@@ -68373,6 +73192,486 @@ mod file_picker_browse_parity_regression_tests {
         assert!(second.clipboard_retry_plan_for_report().is_none());
     }
 
+    pub(super) struct TestFileTaskJournalEnvironment {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestFileTaskJournalEnvironment {
+        pub(super) fn install(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+            std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestFileTaskJournalEnvironment {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => {
+                    std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", previous)
+                }
+                None => std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR"),
+            }
+        }
+    }
+
+    pub(super) fn attach_test_file_task_journal(
+        worker: &mut FileTaskWorker,
+        plan: &tui_file_picker::PastePlan,
+    ) -> super::super::file_task_runtime::FileTaskJournalHandle {
+        let handle = super::super::file_task_runtime::FileTaskJournalHandle::create(
+            worker.job.job_id.clone(),
+            worker.job.generation,
+            worker.job.session_id,
+            worker.job.is_move,
+            worker.job.verification,
+            worker.job.stall_timeout_secs,
+            plan.mappings.clone(),
+            worker.job.clipboard_retry_plan.clone(),
+            serde_json::to_value(&worker.job).expect("serialize test job"),
+        )
+        .expect("create test file-task journal");
+        worker.job.journal_path = Some(handle.path().to_path_buf());
+        worker.journal = Some(handle.clone());
+        handle
+    }
+
+    pub(super) fn resume_test_clipboard_move_worker(
+        plan: &tui_file_picker::PastePlan,
+        journal_path: &std::path::Path,
+        controls: std::sync::mpsc::Receiver<crate::tui::app::FileTaskControl>,
+    ) -> FileTaskWorker {
+        let record = super::super::file_task_runtime::FileTaskJournalHandle::open(
+            journal_path.to_path_buf(),
+        )
+        .expect("open prior journal")
+        .load()
+        .expect("load prior journal");
+        let generation = record.generation.saturating_add(1);
+        let mut worker = clipboard_move_worker_for_test(
+            plan,
+            record.retry_plan.clone(),
+            controls,
+        );
+        worker.job.job_id = record.job_id.clone();
+        worker.job.generation = generation;
+        worker.job.session_id = record.session_id.saturating_add(1);
+        worker.job.verification = record.verification;
+        worker.job.journal_path = Some(journal_path.to_path_buf());
+        let job_value = serde_json::to_value(&worker.job).expect("serialize resumed test job");
+        let handle = super::super::file_task_runtime::FileTaskJournalHandle::resume(
+            journal_path.to_path_buf(),
+            generation,
+            worker.job.session_id,
+            worker.job.is_move,
+            worker.job.verification,
+            worker.job.stall_timeout_secs,
+            record.mappings,
+            worker.job.clipboard_retry_plan.clone(),
+            job_value,
+        )
+        .expect("resume test file-task journal");
+        worker.journal = Some(handle);
+        worker
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_source_does_not_block_reachable_destination_cleanup_or_other_roots() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let unavailable_root = temp.path().join("removable-source");
+        let available_root = temp.path().join("local-source");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir(&unavailable_root).expect("unavailable source root");
+        std::fs::create_dir(&available_root).expect("available source root");
+        std::fs::create_dir(&destination_dir).expect("destination root");
+        let unavailable_source = unavailable_root.join("remote.flac");
+        let available_source = available_root.join("local.flac");
+        std::fs::write(&unavailable_source, b"remote audio").expect("remote source");
+        std::fs::write(&available_source, b"local audio").expect("local source");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![unavailable_source.clone(), available_source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = clipboard_copy_worker_for_test(&plan, control_rx);
+        let journal = attach_test_file_task_journal(&mut worker, &plan);
+        worker
+            .ensure_file_task_endpoint_identities()
+            .expect("capture endpoints");
+
+        let first_temp = destination_dir.join(format!(
+            ".remote.flac.tonepoet-part-{}-1-42-1.tmp",
+            worker.job.job_id
+        ));
+        let second_temp = destination_dir.join(format!(
+            ".local.flac.tonepoet-part-{}-1-42-2.tmp",
+            worker.job.job_id
+        ));
+        std::fs::write(&first_temp, b"partial remote").expect("first temp");
+        std::fs::write(&second_temp, b"partial local").expect("second temp");
+        journal
+            .record_recovered_temp_artifact(
+                &first_temp,
+                &plan.mappings[0].destination,
+                super::super::file_task_runtime::DurableTempArtifactKind::File,
+                1,
+            )
+            .expect("record first temp");
+        journal
+            .record_recovered_temp_artifact(
+                &second_temp,
+                &plan.mappings[1].destination,
+                super::super::file_task_runtime::DurableTempArtifactKind::File,
+                1,
+            )
+            .expect("record second temp");
+        let record = journal.load().expect("journal record");
+        let unavailable_anchor = source_endpoint_identity(&record, &unavailable_source)
+            .expect("unavailable source endpoint")
+            .anchor_path
+            .clone();
+        let endpoint_error = FileTaskMetadataErrorOverride::install(&unavailable_anchor, libc::EIO);
+
+        assert_eq!(
+            worker
+                .run_inner()
+                .expect("reachable obligations and roots must continue"),
+            FileTaskStep::Completed
+        );
+        drop(endpoint_error);
+
+        assert!(!first_temp.exists(), "reachable destination temp must be removed");
+        assert!(!second_temp.exists(), "independent destination temp must be removed");
+        assert_eq!(
+            std::fs::read(&unavailable_source).expect("unavailable source preserved"),
+            b"remote audio"
+        );
+        assert!(
+            !plan.mappings[0].destination.exists(),
+            "the unavailable mapping must not perform destination mutation"
+        );
+        assert_eq!(
+            worker.job.sources,
+            vec![available_source.clone()],
+            "only the unavailable mapping is deferred from this generation"
+        );
+        assert_eq!(
+            std::fs::read(&plan.mappings[1].destination)
+                .expect("available root copied while the other source is detached"),
+            b"local audio"
+        );
+        assert_eq!(
+            worker
+                .root_results
+                .iter()
+                .find(|root| root.source == unavailable_source)
+                .expect("unavailable root result")
+                .disposition,
+            tui_file_picker::FileTaskRootDisposition::Failed
+        );
+        let retry = worker
+            .clipboard_retry_plan_for_report()
+            .expect("unavailable mapping remains retryable");
+        assert_eq!(retry.plan.mappings.len(), 1);
+        assert_eq!(retry.plan.mappings[0].source, unavailable_source);
+        let post_cleanup_record = journal.load().expect("post-cleanup journal");
+        assert!(
+            post_cleanup_record.temp_artifacts.is_empty(),
+            "reachable cleanup obligations must clear even while a source endpoint is detached"
+        );
+        assert!(
+            post_cleanup_record
+                .retry_plan
+                .as_ref()
+                .is_some_and(|retry| retry
+                    .plan
+                    .mappings
+                    .iter()
+                    .any(|mapping| mapping.source == unavailable_source)),
+            "the unavailable source mapping must remain durable and retryable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_generation_cleanup_uses_only_the_destination_endpoint() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_root = temp.path().join("removable-source");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir(&source_root).expect("source root");
+        std::fs::create_dir(&destination_dir).expect("destination root");
+        let source = source_root.join("track.flac");
+        std::fs::write(&source, b"source audio").expect("source");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = clipboard_copy_worker_for_test(&plan, control_rx);
+        let journal = attach_test_file_task_journal(&mut worker, &plan);
+        worker
+            .ensure_file_task_endpoint_identities()
+            .expect("capture endpoints");
+        let private_temp = destination_dir.join(format!(
+            ".track.flac.tonepoet-part-{}-1-99-1.tmp",
+            worker.job.job_id
+        ));
+        std::fs::write(&private_temp, b"partial").expect("private temp");
+        journal
+            .record_recovered_temp_artifact(
+                &private_temp,
+                &plan.mappings[0].destination,
+                super::super::file_task_runtime::DurableTempArtifactKind::File,
+                1,
+            )
+            .expect("record temp");
+        let record = journal.load().expect("journal record");
+        let source_anchor = source_endpoint_identity(&record, &source)
+            .expect("source endpoint")
+            .anchor_path
+            .clone();
+        let endpoint_error = FileTaskMetadataErrorOverride::install(&source_anchor, libc::ENOTCONN);
+
+        best_effort_cleanup_abandoned_generation(&journal);
+        drop(endpoint_error);
+
+        assert!(!private_temp.exists(), "reachable destination temp must be removed");
+        assert_eq!(
+            std::fs::read(&source).expect("unavailable source preserved"),
+            b"source audio"
+        );
+        assert!(
+            journal
+                .load()
+                .expect("post-cleanup journal")
+                .temp_artifacts
+                .is_empty()
+        );
+    }
+
+    struct DeferredCleanupFixture {
+        plan: tui_file_picker::PastePlan,
+        journal: super::super::file_task_runtime::FileTaskJournalHandle,
+        source_mount: std::path::PathBuf,
+        source: std::path::PathBuf,
+        destination: std::path::PathBuf,
+        quarantine: std::path::PathBuf,
+    }
+
+    fn create_deferred_cleanup_fixture(root: &std::path::Path) -> DeferredCleanupFixture {
+        let source_mount = root.join("removable-source");
+        let destination_dir = root.join("destination");
+        let source = source_mount.join("album");
+        let destination = destination_dir.join("album");
+        std::fs::create_dir_all(source.join("disc")).expect("source tree");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        std::fs::write(source.join("a.flac"), b"a").expect("a");
+        std::fs::write(source.join("disc/b.flac"), b"b").expect("b");
+        std::fs::write(source.join("disc/c.flac"), b"c").expect("c");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = clipboard_move_worker_for_test(&plan, Some(seed), control_rx);
+        worker.force_content_verified_move_path = true;
+        let journal = attach_test_file_task_journal(&mut worker, &plan);
+        worker.forced_cleanup_control_after_deleted_entries =
+            Some((1, FileTaskStep::Aborted));
+        assert_eq!(
+            worker.run_inner().expect("seed deferred cleanup"),
+            FileTaskStep::Completed
+        );
+        let record = journal.load().expect("deferred cleanup record");
+        let artifact = record
+            .quarantine_artifacts
+            .first()
+            .expect("quarantine artifact");
+        assert_eq!(
+            artifact.state,
+            super::super::file_task_runtime::DurableQuarantineState::DeletionStarted
+        );
+        DeferredCleanupFixture {
+            plan,
+            journal,
+            source_mount,
+            source,
+            destination,
+            quarantine: artifact.path.clone(),
+        }
+    }
+
+    #[test]
+    fn confirmed_quarantine_rename_without_unlink_restores_source_on_reconciliation() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_mount = temp.path().join("source-endpoint");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir(&source_mount).expect("source endpoint");
+        std::fs::create_dir(&destination_dir).expect("destination endpoint");
+        let source = source_mount.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let destination = plan.mappings[0].destination.clone();
+        std::fs::copy(&source, &destination).expect("published destination");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_first_tx, first_rx) = std::sync::mpsc::channel();
+        let mut first = clipboard_move_worker_for_test(&plan, Some(seed), first_rx);
+        let journal = attach_test_file_task_journal(&mut first, &plan);
+        first
+            .ensure_file_task_endpoint_identities()
+            .expect("capture endpoints");
+        let source_manifest = tui_file_picker::capture_manifest_with_mode(
+            &source,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("source proof");
+        let destination_manifest = source_manifest
+            .capture_identity_copy_at(&destination)
+            .expect("destination proof");
+        journal
+            .record_move_recovery_proof(
+                &source,
+                &super::super::browse::BrowseMoveRecoveryProof {
+                    source_manifest,
+                    destination_manifest,
+                },
+            )
+            .expect("record move proof");
+        let quarantine_container = source_mount.join(".tonepoet-move-test");
+        let quarantine = quarantine_container.join("track.flac");
+        std::fs::create_dir(&quarantine_container).expect("quarantine container");
+        journal
+            .record_quarantine_artifact(&quarantine, &source, &destination)
+            .expect("record quarantine intent");
+        std::fs::rename(&source, &quarantine).expect("complete source quarantine rename");
+        journal
+            .mark_quarantine_renamed(&quarantine)
+            .expect("confirm quarantine rename");
+
+        let (_resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let mut resumed = resume_test_clipboard_move_worker(
+            &plan,
+            journal.path(),
+            resume_rx,
+        );
+        resumed
+            .reconcile_deferred_file_task_artifacts()
+            .expect("reconcile reversible quarantine");
+
+        assert_eq!(std::fs::read(&source).expect("restored source"), b"audio");
+        assert!(!quarantine.exists());
+        assert!(resumed
+            .journal
+            .as_ref()
+            .expect("resumed journal")
+            .load()
+            .expect("reconciled record")
+            .quarantine_artifacts
+            .is_empty());
+    }
+
+    #[test]
+    fn missing_recorded_destination_root_is_not_recreated_locally() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("removable-destination");
+        std::fs::create_dir(&source_dir).expect("source dir");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = clipboard_move_worker_for_test(&plan, Some(seed), control_rx);
+        let journal = attach_test_file_task_journal(&mut worker, &plan);
+        worker
+            .ensure_file_task_endpoint_identities()
+            .expect("capture endpoints before mutation");
+        assert!(!journal
+            .load()
+            .expect("journal")
+            .endpoint_identities
+            .is_empty());
+
+        std::fs::remove_dir(&destination_dir).expect("simulate detached destination");
+        let error = worker
+            .ensure_destination_root_ready(&destination_dir)
+            .expect_err("detached destination must remain pending");
+
+        assert!(
+            error.contains("not attached") || error.contains("refusing to recreate"),
+            "unexpected endpoint error: {error}"
+        );
+        assert!(
+            !destination_dir.exists(),
+            "reconciliation must not create a local replacement for a missing recorded destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_endpoint_anchor_tracks_the_attached_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attached_target = temp.path().join("attached-volume");
+        let endpoint_link = temp.path().join("mounted-volume");
+        std::fs::create_dir(&attached_target).expect("attached target");
+        std::os::unix::fs::symlink(&attached_target, &endpoint_link)
+            .expect("endpoint symlink");
+
+        let endpoint = capture_file_task_endpoint_identity(
+            super::super::file_task_runtime::DurableEndpointRole::Destination,
+            &endpoint_link,
+            &endpoint_link,
+        )
+        .expect("capture symlinked endpoint");
+        assert_eq!(endpoint.anchor_path, endpoint_link);
+        verify_file_task_endpoint_attached(&endpoint).expect("target is attached");
+
+        std::fs::remove_dir(&attached_target).expect("detach target");
+        let error = verify_file_task_endpoint_attached(&endpoint)
+            .expect_err("dangling endpoint symlink must be unavailable");
+        assert!(
+            error.contains("resolve file-operation endpoint identity anchor")
+                || error.contains("not attached"),
+            "unexpected endpoint error: {error}"
+        );
+    }
+
     #[test]
     fn browse_cleanup_control_before_first_delete_restores_retryable_source() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -68395,11 +73694,11 @@ mod file_picker_browse_parity_regression_tests {
         let mut worker = clipboard_move_worker_for_test(&plan, Some(seed), control_rx);
         worker.force_content_verified_move_path = true;
         worker.forced_cleanup_control_after_deleted_entries =
-            Some((0, FileTaskStep::Skipped));
+            Some((0, FileTaskStep::Aborted));
 
         assert_eq!(
             worker.run_inner().expect("controlled cleanup"),
-            FileTaskStep::Completed
+            FileTaskStep::Aborted
         );
         assert_eq!(std::fs::read(&source).expect("restored source"), b"audio");
         assert_eq!(std::fs::read(&destination).expect("destination"), b"audio");
@@ -68407,6 +73706,11 @@ mod file_picker_browse_parity_regression_tests {
             worker.root_results[0].disposition,
             tui_file_picker::FileTaskRootDisposition::Failed
         );
+        assert_eq!(
+            worker.root_results[0].undo_disposition,
+            tui_file_picker::FileTaskUndoDisposition::NotReversible
+        );
+        assert!(worker.root_results[0].proof.is_none());
         let retry = worker
             .clipboard_retry_plan_for_report()
             .expect("restored source remains retryable");
@@ -68418,8 +73722,11 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[test]
-    fn browse_partial_quarantine_cleanup_is_failed_and_not_retryable() {
+    fn abort_after_first_source_unlink_commits_move_and_retains_cleanup_obligation() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
         let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
         let source_dir = temp.path().join("source");
         let destination_dir = temp.path().join("destination");
         let source = source_dir.join("album");
@@ -68439,25 +73746,619 @@ mod file_picker_browse_parity_regression_tests {
         let (_control_tx, control_rx) = std::sync::mpsc::channel();
         let mut worker = clipboard_move_worker_for_test(&plan, Some(seed), control_rx);
         worker.force_content_verified_move_path = true;
+        let journal = attach_test_file_task_journal(&mut worker, &plan);
         worker.forced_cleanup_control_after_deleted_entries =
-            Some((1, FileTaskStep::Skipped));
+            Some((1, FileTaskStep::Aborted));
 
         assert_eq!(
             worker.run_inner().expect("partial cleanup"),
-            FileTaskStep::Completed
+            FileTaskStep::Completed,
+            "post-commit Abort must not report a cancelled move"
         );
-        assert!(!source.exists(), "partial source remains quarantined, not retryable by original path");
+        assert!(worker.stop_after_committed_cleanup);
+        assert!(!source.exists(), "committed source remains in private quarantine");
         assert_eq!(std::fs::read(destination.join("a.flac")).expect("destination a"), b"a");
         assert_eq!(std::fs::read(destination.join("b.flac")).expect("destination b"), b"b");
         assert_eq!(
             worker.root_results[0].disposition,
-            tui_file_picker::FileTaskRootDisposition::Failed
+            tui_file_picker::FileTaskRootDisposition::CompletedWithWarning
         );
+        assert_eq!(
+            worker.root_results[0].undo_disposition,
+            tui_file_picker::FileTaskUndoDisposition::NotReversible
+        );
+        assert!(worker.root_results[0].proof.is_none());
         assert!(worker.clipboard_retry_plan_for_report().is_none());
         assert!(worker.root_results[0]
             .message
             .as_deref()
             .is_some_and(|message| message.contains("after deleting 1 quarantined entry")));
+
+        let record = journal.load().expect("durable cleanup record");
+        assert_eq!(record.quarantine_artifacts.len(), 1);
+        assert!(record
+            .retry_plan
+            .as_ref()
+            .is_some_and(|retry| retry.recovery_by_source.contains_key(&source)));
+        assert!(record.needs_reconciliation());
+    }
+
+    #[test]
+    fn restart_reconciliation_resumes_partial_source_cleanup_idempotently() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        let source = source_dir.join("album");
+        let destination = destination_dir.join("album");
+        std::fs::create_dir_all(source.join("disc")).expect("source tree");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        std::fs::write(source.join("a.flac"), b"a").expect("a");
+        std::fs::write(source.join("disc/b.flac"), b"b").expect("b");
+        std::fs::write(source.join("disc/c.flac"), b"c").expect("c");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_first_control_tx, first_control_rx) = std::sync::mpsc::channel();
+        let mut first = clipboard_move_worker_for_test(&plan, Some(seed), first_control_rx);
+        first.force_content_verified_move_path = true;
+        let journal = attach_test_file_task_journal(&mut first, &plan);
+        first.forced_cleanup_control_after_deleted_entries =
+            Some((1, FileTaskStep::Aborted));
+        assert_eq!(first.run_inner().expect("first interruption"), FileTaskStep::Completed);
+        let first_record = journal.load().expect("first durable record");
+        let quarantine = first_record.quarantine_artifacts[0].path.clone();
+        assert!(quarantine.exists());
+
+        let (_second_control_tx, second_control_rx) = std::sync::mpsc::channel();
+        let mut second = resume_test_clipboard_move_worker(
+            &plan,
+            journal.path(),
+            second_control_rx,
+        );
+        second.forced_cleanup_control_after_deleted_entries =
+            Some((1, FileTaskStep::Aborted));
+        assert_eq!(
+            second.run_inner().expect("second interruption"),
+            FileTaskStep::Completed
+        );
+        assert!(second.stop_after_committed_cleanup);
+        let second_record = second
+            .journal
+            .as_ref()
+            .expect("resumed journal")
+            .load()
+            .expect("second durable record");
+        assert_eq!(second_record.quarantine_artifacts.len(), 1);
+        assert!(quarantine.exists());
+
+        let (_third_control_tx, third_control_rx) = std::sync::mpsc::channel();
+        let mut third = resume_test_clipboard_move_worker(
+            &plan,
+            journal.path(),
+            third_control_rx,
+        );
+        assert_eq!(
+            third.run_inner().expect("final reconciliation"),
+            FileTaskStep::Completed
+        );
+        assert!(!source.exists());
+        assert!(!quarantine.exists());
+        assert_eq!(
+            std::fs::read(destination.join("disc/b.flac")).expect("destination b"),
+            b"b"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("disc/c.flac")).expect("destination c"),
+            b"c"
+        );
+        let final_record = third
+            .journal
+            .as_ref()
+            .expect("final journal")
+            .load()
+            .expect("final durable record");
+        assert!(final_record.quarantine_artifacts.is_empty());
+        assert!(third.root_results[0].disposition.is_completed());
+        assert_eq!(
+            third.root_results[0].undo_disposition,
+            tui_file_picker::FileTaskUndoDisposition::NotReversible
+        );
+    }
+
+    #[test]
+    fn detached_source_endpoint_retains_cleanup_until_matching_endpoint_returns() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let fixture = create_deferred_cleanup_fixture(temp.path());
+        let detached_mount = temp.path().join("detached-removable-source");
+        std::fs::rename(&fixture.source_mount, &detached_mount)
+            .expect("simulate source-drive removal");
+
+        let (_detached_tx, detached_rx) = std::sync::mpsc::channel();
+        let mut detached = resume_test_clipboard_move_worker(
+            &fixture.plan,
+            fixture.journal.path(),
+            detached_rx,
+        );
+        assert_eq!(
+            detached
+                .run_inner()
+                .expect("detached source must defer only its own obligation"),
+            FileTaskStep::Completed
+        );
+        assert!(
+            detached.root_results[0]
+                .message
+                .as_deref()
+                .is_some_and(|message| {
+                    message.contains("not attached") || message.contains("unavailable")
+                }),
+            "detached root must explain why cleanup remains pending"
+        );
+        let pending = fixture.journal.load().expect("pending journal");
+        assert_eq!(pending.quarantine_artifacts.len(), 1);
+        assert!(
+            detached_mount.exists(),
+            "detached source data must remain untouched"
+        );
+        assert!(
+            !fixture.source_mount.exists(),
+            "the missing mount path must not be recreated locally"
+        );
+
+        std::fs::rename(&detached_mount, &fixture.source_mount)
+            .expect("simulate matching source-drive reinsertion");
+        let (_reinserted_tx, reinserted_rx) = std::sync::mpsc::channel();
+        let mut reinserted = resume_test_clipboard_move_worker(
+            &fixture.plan,
+            fixture.journal.path(),
+            reinserted_rx,
+        );
+        assert_eq!(
+            reinserted.run_inner().expect("resume after reinsertion"),
+            FileTaskStep::Completed
+        );
+        assert!(!fixture.source.exists());
+        assert!(!fixture.quarantine.exists());
+        assert_eq!(
+            std::fs::read(fixture.destination.join("disc/b.flac"))
+                .expect("published destination"),
+            b"b"
+        );
+        assert!(reinserted
+            .journal
+            .as_ref()
+            .expect("resumed journal")
+            .load()
+            .expect("reconciled journal")
+            .quarantine_artifacts
+            .is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a disposable external volume and manual unplug/reinsert"]
+    fn macos_external_drive_unplug_reinsert_resumes_deferred_cleanup() {
+        fn wait_for_endpoint_state(
+            path: &std::path::Path,
+            present: bool,
+            timeout: std::time::Duration,
+        ) {
+            let started = std::time::Instant::now();
+            loop {
+                let currently_present = std::fs::metadata(path).is_ok();
+                if currently_present == present {
+                    return;
+                }
+                assert!(
+                    started.elapsed() < timeout,
+                    "timed out waiting for {} to become {}",
+                    path.display(),
+                    if present { "available" } else { "unavailable" }
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let volume = std::env::var_os("TONEPOET_MACOS_REATTACH_TEST_VOLUME")
+            .map(std::path::PathBuf::from)
+            .expect("set TONEPOET_MACOS_REATTACH_TEST_VOLUME to a disposable mounted external volume");
+        let volume = std::fs::canonicalize(&volume).expect("resolve external volume");
+        let timeout_secs = std::env::var("TONEPOET_MACOS_REATTACH_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(300);
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let local = tempfile::tempdir().expect("local tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&local.path().join("journals"));
+        let external_root = volume.join(format!(
+            ".tonepoet-reattach-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&external_root).expect("create isolated external-drive test root");
+        let fixture = create_deferred_cleanup_fixture(&external_root);
+        let initial_record = fixture.journal.load().expect("initial journal");
+        let source_endpoint = source_endpoint_identity(&initial_record, &fixture.source)
+            .expect("source endpoint identity");
+        assert!(
+            matches!(
+                &source_endpoint.volume,
+                super::super::file_task_runtime::DurableEndpointVolumeIdentity::UnixMount {
+                    stable: Some(
+                        super::super::file_task_runtime::DurableUnixEndpointStableIdentity::FilesystemUuid { .. }
+                    ),
+                    ..
+                }
+            ),
+            "macOS external-drive test requires an observable persistent volume UUID"
+        );
+
+        eprintln!(
+            "Unplug the external volume mounted at {} now.",
+            volume.display()
+        );
+        wait_for_endpoint_state(&fixture.source_mount, false, timeout);
+        let (_detached_tx, detached_rx) = std::sync::mpsc::channel();
+        let mut detached = resume_test_clipboard_move_worker(
+            &fixture.plan,
+            fixture.journal.path(),
+            detached_rx,
+        );
+        assert_eq!(
+            detached
+                .run_inner()
+                .expect("detached macOS volume must retain cleanup obligation"),
+            FileTaskStep::Completed
+        );
+        assert_eq!(
+            fixture
+                .journal
+                .load()
+                .expect("pending journal")
+                .quarantine_artifacts
+                .len(),
+            1
+        );
+
+        eprintln!(
+            "Reinsert the same external volume at {} now.",
+            volume.display()
+        );
+        wait_for_endpoint_state(&fixture.source_mount, true, timeout);
+        let (_reattached_tx, reattached_rx) = std::sync::mpsc::channel();
+        let mut reattached = resume_test_clipboard_move_worker(
+            &fixture.plan,
+            fixture.journal.path(),
+            reattached_rx,
+        );
+        assert_eq!(
+            reattached
+                .run_inner()
+                .expect("reattached macOS volume must reconcile"),
+            FileTaskStep::Completed
+        );
+        assert!(!fixture.quarantine.exists());
+        assert!(
+            reattached
+                .journal
+                .as_ref()
+                .expect("resumed journal")
+                .load()
+                .expect("reconciled journal")
+                .quarantine_artifacts
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&external_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_io_and_disconnect_errors_leave_cleanup_awaiting_reconciliation() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let fixture = create_deferred_cleanup_fixture(temp.path());
+
+        for raw_error in [libc::EIO, libc::ENOTCONN] {
+            let (_control_tx, control_rx) = std::sync::mpsc::channel();
+            let mut resumed = resume_test_clipboard_move_worker(
+                &fixture.plan,
+                fixture.journal.path(),
+                control_rx,
+            );
+            let endpoint_error = FileTaskMetadataErrorOverride::install(
+                &fixture.source_mount,
+                raw_error,
+            );
+            assert_eq!(
+                resumed
+                    .run_inner()
+                    .expect("unavailable endpoint must defer only its own cleanup"),
+                FileTaskStep::Completed
+            );
+            drop(endpoint_error);
+            assert!(
+                resumed.root_results[0]
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| {
+                        message.contains("unavailable") || message.contains("could not access")
+                    }),
+                "unexpected endpoint result for raw error {raw_error}: {:?}",
+                resumed.root_results[0].message
+            );
+            let record = fixture.journal.load().expect("pending journal");
+            assert_eq!(record.quarantine_artifacts.len(), 1);
+            assert!(fixture.quarantine.exists());
+        }
+    }
+
+    #[test]
+    fn missing_source_on_attached_endpoint_is_reconciled_as_already_removed() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_mount = temp.path().join("source-endpoint");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir(&source_mount).expect("source endpoint");
+        std::fs::create_dir(&destination_dir).expect("destination endpoint");
+        let source = source_mount.join("track.flac");
+        std::fs::write(&source, b"audio").expect("source");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let destination = plan.mappings[0].destination.clone();
+        std::fs::copy(&source, &destination).expect("published destination");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_first_tx, first_rx) = std::sync::mpsc::channel();
+        let mut first = clipboard_move_worker_for_test(&plan, Some(seed), first_rx);
+        let journal = attach_test_file_task_journal(&mut first, &plan);
+        first
+            .ensure_file_task_endpoint_identities()
+            .expect("capture endpoints");
+        let source_manifest = tui_file_picker::capture_manifest_with_mode(
+            &source,
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("source proof");
+        let destination_manifest = source_manifest
+            .capture_identity_copy_at(&destination)
+            .expect("destination proof");
+        journal
+            .record_move_recovery_proof(
+                &source,
+                &super::super::browse::BrowseMoveRecoveryProof {
+                    source_manifest,
+                    destination_manifest,
+                },
+            )
+            .expect("record move proof");
+        let quarantine = source_mount.join(".tonepoet-move-test/track.flac");
+        journal
+            .record_quarantine_artifact(&quarantine, &source, &destination)
+            .expect("record unknown quarantine transition");
+        std::fs::remove_file(&source).expect("simulate genuinely completed cleanup");
+
+        let (_resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let mut resumed = resume_test_clipboard_move_worker(
+            &plan,
+            journal.path(),
+            resume_rx,
+        );
+        assert_eq!(
+            resumed.run_inner().expect("reconcile attached missing source"),
+            FileTaskStep::Completed
+        );
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).expect("destination"), b"audio");
+        assert!(resumed
+            .journal
+            .as_ref()
+            .expect("resumed journal")
+            .load()
+            .expect("reconciled record")
+            .quarantine_artifacts
+            .is_empty());
+        assert!(resumed.root_results[0].disposition.is_completed());
+    }
+
+    #[test]
+    fn reconciliation_rejects_unexpected_quarantine_additions_without_deleting_them() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        let source = source_dir.join("album");
+        std::fs::create_dir_all(&source).expect("source dir");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        std::fs::write(source.join("a.flac"), b"a").expect("a");
+        std::fs::write(source.join("b.flac"), b"b").expect("b");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_first_control_tx, first_control_rx) = std::sync::mpsc::channel();
+        let mut first = clipboard_move_worker_for_test(&plan, Some(seed), first_control_rx);
+        first.force_content_verified_move_path = true;
+        let journal = attach_test_file_task_journal(&mut first, &plan);
+        first.forced_cleanup_control_after_deleted_entries =
+            Some((1, FileTaskStep::Aborted));
+        assert_eq!(first.run_inner().expect("partial cleanup"), FileTaskStep::Completed);
+        let record = journal.load().expect("durable record");
+        let quarantine = record.quarantine_artifacts[0].path.clone();
+        let unexpected = quarantine.join("intruder.flac");
+        std::fs::write(&unexpected, b"external").expect("unexpected addition");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut resumed = resume_test_clipboard_move_worker(
+            &plan,
+            journal.path(),
+            control_rx,
+        );
+        assert_eq!(resumed.run_inner().expect("manual-review reconciliation"), FileTaskStep::Completed);
+        assert_eq!(std::fs::read(&unexpected).expect("unexpected entry preserved"), b"external");
+        assert!(resumed.root_results[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("unexpected entry")));
+        let remaining = resumed
+            .journal
+            .as_ref()
+            .expect("resumed journal")
+            .load()
+            .expect("remaining obligation");
+        assert_eq!(remaining.quarantine_artifacts.len(), 1);
+    }
+
+    #[test]
+    fn reconciliation_rejects_modified_quarantine_entry_without_deleting_it() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        let source = source_dir.join("album");
+        std::fs::create_dir_all(&source).expect("source dir");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        std::fs::write(source.join("a.flac"), b"a").expect("a");
+        std::fs::write(source.join("b.flac"), b"b").expect("b");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_first_control_tx, first_control_rx) = std::sync::mpsc::channel();
+        let mut first = clipboard_move_worker_for_test(&plan, Some(seed), first_control_rx);
+        first.force_content_verified_move_path = true;
+        let journal = attach_test_file_task_journal(&mut first, &plan);
+        first.forced_cleanup_control_after_deleted_entries =
+            Some((1, FileTaskStep::Aborted));
+        assert_eq!(first.run_inner().expect("partial cleanup"), FileTaskStep::Completed);
+        let record = journal.load().expect("durable record");
+        let quarantine = record.quarantine_artifacts[0].path.clone();
+        let remaining_file = std::fs::read_dir(&quarantine)
+            .expect("quarantine entries")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("one quarantined file remains");
+        std::fs::write(&remaining_file, b"external change").expect("modify quarantine entry");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut resumed = resume_test_clipboard_move_worker(
+            &plan,
+            journal.path(),
+            control_rx,
+        );
+        assert_eq!(resumed.run_inner().expect("manual-review reconciliation"), FileTaskStep::Completed);
+        assert_eq!(
+            std::fs::read(&remaining_file).expect("modified entry preserved"),
+            b"external change"
+        );
+        assert!(resumed.root_results[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("quarantine entry changed")));
+        let remaining = resumed
+            .journal
+            .as_ref()
+            .expect("resumed journal")
+            .load()
+            .expect("remaining obligation");
+        assert_eq!(remaining.quarantine_artifacts.len(), 1);
+    }
+
+    #[test]
+    fn changed_destination_stops_reconciliation_before_more_source_deletion() {
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        let source = source_dir.join("album");
+        let destination = destination_dir.join("album");
+        std::fs::create_dir_all(&source).expect("source dir");
+        std::fs::create_dir(&destination_dir).expect("destination dir");
+        std::fs::write(source.join("a.flac"), b"a").expect("a");
+        std::fs::write(source.join("b.flac"), b"b").expect("b");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::plan_filesystem_paste(&clipboard, &destination_dir)
+            .expect("plan");
+        let seed = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        let (_first_control_tx, first_control_rx) = std::sync::mpsc::channel();
+        let mut first = clipboard_move_worker_for_test(&plan, Some(seed), first_control_rx);
+        first.force_content_verified_move_path = true;
+        let journal = attach_test_file_task_journal(&mut first, &plan);
+        first.forced_cleanup_control_after_deleted_entries =
+            Some((1, FileTaskStep::Aborted));
+        assert_eq!(first.run_inner().expect("partial cleanup"), FileTaskStep::Completed);
+        let record = journal.load().expect("durable record");
+        let quarantine = record.quarantine_artifacts[0].path.clone();
+        let before = std::fs::read_dir(&quarantine)
+            .expect("quarantine entries")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        std::fs::write(destination.join("b.flac"), b"changed").expect("change destination");
+
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut resumed = resume_test_clipboard_move_worker(
+            &plan,
+            journal.path(),
+            control_rx,
+        );
+        assert_eq!(resumed.run_inner().expect("blocked reconciliation"), FileTaskStep::Completed);
+        let after = std::fs::read_dir(&quarantine)
+            .expect("quarantine remains")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after, before, "destination proof failure must precede further deletion");
+        assert!(resumed.root_results[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("destination recovery proof failed")
+                || message.contains("published destination")));
+        let remaining = resumed
+            .journal
+            .as_ref()
+            .expect("resumed journal")
+            .load()
+            .expect("remaining obligation");
+        assert_eq!(remaining.quarantine_artifacts.len(), 1);
     }
 
 }
@@ -68566,6 +74467,10 @@ mod live_mount_perf_harness {
             FileTaskWorker::new(
                 FileTaskJob {
                     session_id: 1,
+                    job_id: uuid::Uuid::new_v4().to_string(),
+                    generation: 1,
+                    journal_path: None,
+                    stall_timeout_secs: 8,
                     sources,
                     dest: dest.display().to_string(),
                     force: false,

@@ -3,7 +3,7 @@
 use crate::FilePickerClipboardMode;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FilesystemClipboard {
     mode: FilePickerClipboardMode,
     paths: Vec<PathBuf>,

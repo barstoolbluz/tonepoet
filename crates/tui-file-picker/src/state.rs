@@ -76,7 +76,7 @@ impl Default for FilePickerSortKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FilePickerClipboardMode {
     Cut,
     Copy,
@@ -138,7 +138,7 @@ pub struct SaveModeConfig {
 /// destination pickers. `Ask` preserves the interactive prompt, while
 /// `Overwrite` and `Skip` let the host apply a whole-job policy before the
 /// worker starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictPolicyPreset {
     Ask,
     Overwrite,
@@ -3874,7 +3874,7 @@ impl FilePickerState {
 }
 
 /// One source-to-destination mapping in a planned or completed paste.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PasteMapping {
     pub source: PathBuf,
     pub destination: PathBuf,
@@ -3882,7 +3882,7 @@ pub struct PasteMapping {
 
 /// Immutable preflight plan for a clipboard paste. No filesystem mutation has
 /// occurred when this value is returned.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PastePlan {
     pub mode: FilePickerClipboardMode,
     pub mappings: Vec<PasteMapping>,

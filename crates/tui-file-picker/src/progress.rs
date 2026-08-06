@@ -18,7 +18,7 @@ const CONFLICT_DIALOG_HEIGHT: u16 = 15;
 ///
 /// The picker crate uses this only for wording. Hosts remain responsible for
 /// performing the operation and enforcing task semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileTaskKind {
     Copy,
     Move,
@@ -59,11 +59,13 @@ impl FileTaskKind {
 ///
 /// Hosts may use [`FileTaskPhase::Custom`] for task-specific phases such as
 /// "Removing source..." after a cross-device move has been verified.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileTaskPhase {
     Preparing,
     Running,
+    Stalled,
     Paused,
+    Cancelling,
     Verifying,
     CleaningUp,
     Completed,
@@ -77,7 +79,9 @@ impl FileTaskPhase {
         match self {
             Self::Preparing => "Preparing...",
             Self::Running => "Running...",
+            Self::Stalled => "Stalled",
             Self::Paused => "Paused",
+            Self::Cancelling => "Cancelling...",
             Self::Verifying => "Verifying...",
             Self::CleaningUp => "Cleaning up...",
             Self::Completed => "Completed",
@@ -93,7 +97,7 @@ impl FileTaskPhase {
 }
 
 /// One item currently being processed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProgressItem {
     pub label: String,
     pub source: Option<PathBuf>,
@@ -124,7 +128,7 @@ impl ProgressItem {
 /// scan/import roots, archive sources, or any other long-running file-oriented
 /// task. The picker crate only displays these fields; it does not interpret or
 /// mutate the referenced paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileTaskScope {
     /// Stable source/root path for the job, when a path is meaningful.
     pub source_root: Option<PathBuf>,
@@ -153,7 +157,7 @@ impl FileTaskScope {
 /// The overlay stores a bounded list of recent records so terminal partial or
 /// failed states can show which files failed without coupling the crate to a
 /// host logging system.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileTaskErrorRecord {
     pub item_label: String,
     pub source: Option<PathBuf>,
@@ -178,7 +182,7 @@ impl FileTaskErrorRecord {
 /// `Files` when the total represents recursive files inside selected folders,
 /// `Entries` when directories/symlinks/files are all counted together, and
 /// `Items` for task-specific units that are not naturally files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProgressUnit {
     Items,
     Files,
@@ -205,7 +209,7 @@ impl ProgressUnit {
 }
 
 /// Aggregate counters for the whole job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProgressTotals {
     pub items_done: u64,
     pub items_total: Option<u64>,
@@ -263,7 +267,7 @@ impl ProgressTotals {
 }
 
 /// Disposition of one top-level root in a file task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileTaskRootDisposition {
     Completed,
     /// The destination is complete and authoritative, but a post-commit step
@@ -287,7 +291,7 @@ impl FileTaskRootDisposition {
 /// be removed to undo a copy. Overwrite and merge operations modified
 /// pre-existing user state and require a retained preimage, so they are never
 /// represented as artifact-deletion undo entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileTaskUndoDisposition {
     /// The operation published a new top-level destination root.
     CreatedDestination,
@@ -304,7 +308,7 @@ pub enum FileTaskUndoDisposition {
 /// `destination_manifest` identifies the exact published objects
 /// that passed verification. Keeping both in the completion report prevents a
 /// UI-thread post-hoc recapture from redefining what the operation produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileTaskRootProof {
     pub source_manifest: crate::SourceManifest,
     pub destination_manifest: crate::DestinationManifest,
@@ -324,7 +328,7 @@ impl FileTaskRootProof {
 }
 
 /// Terminal accounting for one top-level source and its resolved destination.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileTaskRootResult {
     pub source: std::path::PathBuf,
     pub destination: std::path::PathBuf,
@@ -339,7 +343,7 @@ pub struct FileTaskRootResult {
 /// Structured terminal report emitted separately from the presentation-oriented
 /// progress update. Hosts use this to reconcile cut clipboards, navigation
 /// history, and retry state after partial success, failure, skip, or abort.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileTaskCompletionReport {
     pub is_move: bool,
     pub roots: Vec<FileTaskRootResult>,
@@ -373,7 +377,7 @@ impl FileTaskCompletionReport {
 ///
 /// Applying an update is a pure state transition: no filesystem mutation,
 /// cancellation, conflict resolution, or thread control happens in the crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileTaskProgressUpdate {
     /// Replace the stable job-level source/destination summary.
     SetScope {
@@ -448,7 +452,7 @@ pub enum FileTaskUserAction {
 /// These are semantic choices only. The host must decide whether a choice is
 /// valid for a specific file operation, perform race-conscious filesystem
 /// mutation, and account the resulting disposition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictAction {
     /// Replace the existing destination. Hosts interpret this contextually:
     /// directory-to-directory conflicts merge into the destination directory,
@@ -482,7 +486,7 @@ impl ConflictAction {
 /// The crate does not overwrite, merge, rename, skip, or abort anything. Hosts
 /// must validate the request id, re-check the destination as needed, and then
 /// apply the chosen policy safely.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictResolution {
     /// Replace or merge, depending on the current conflict context. Directory
     /// into existing directory means merge; other conflicts mean replace.
@@ -493,7 +497,7 @@ pub enum ConflictResolution {
 }
 
 /// The kind of destination conflict being presented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictItemKind {
     File,
     Directory,
@@ -506,7 +510,7 @@ pub enum ConflictItemKind {
 /// Hosts own conflict detection and resolution. This state is deliberately
 /// reusable across copy, move, import, extract, archive, checksum sidecar writes,
 /// or any other file-oriented task that may pause for a user decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConflictPromptState {
     /// Host-scoped request identity. Responses echo this id so stale conflict
     /// resolutions can be ignored safely.
@@ -939,7 +943,7 @@ impl FileTaskProgressState {
             };
         }
 
-        if !self.task_controls_available {
+        if !self.task_controls_available || matches!(self.phase, FileTaskPhase::Cancelling) {
             return FileTaskUserAction::None;
         }
 
@@ -971,7 +975,9 @@ impl FileTaskProgressState {
             return FileTaskUserAction::None;
         };
         match hit.action {
-            ProgressHitAction::PauseResume if self.task_controls_available => {
+            ProgressHitAction::PauseResume
+                if self.task_controls_available
+                    && !matches!(self.phase, FileTaskPhase::Cancelling) => {
                 if matches!(self.phase, FileTaskPhase::Paused) {
                     FileTaskUserAction::Resume
                 } else {
@@ -979,11 +985,15 @@ impl FileTaskProgressState {
                 }
             }
             ProgressHitAction::PauseResume => FileTaskUserAction::None,
-            ProgressHitAction::SkipCurrent if self.task_controls_available => {
+            ProgressHitAction::SkipCurrent
+                if self.task_controls_available
+                    && !matches!(self.phase, FileTaskPhase::Cancelling) => {
                 FileTaskUserAction::SkipCurrent
             }
             ProgressHitAction::SkipCurrent => FileTaskUserAction::None,
-            ProgressHitAction::Abort if self.task_controls_available => FileTaskUserAction::Abort,
+            ProgressHitAction::Abort
+                if self.task_controls_available
+                    && !matches!(self.phase, FileTaskPhase::Cancelling) => FileTaskUserAction::Abort,
             ProgressHitAction::Abort => FileTaskUserAction::None,
             ProgressHitAction::Acknowledge => FileTaskUserAction::Acknowledge,
             ProgressHitAction::ToggleDetails => {
@@ -1480,6 +1490,9 @@ impl FileTaskProgressState {
             ));
             return buttons;
         }
+        if matches!(self.phase, FileTaskPhase::Cancelling) {
+            return Vec::new();
+        }
         if matches!(&self.kind, FileTaskKind::Archive) {
             return self
                 .task_controls_available
@@ -1693,7 +1706,8 @@ fn phase_style(theme: &FilePickerTheme, phase: &FileTaskPhase) -> Style {
     match phase {
         FileTaskPhase::Failed | FileTaskPhase::Aborted => theme.error,
         FileTaskPhase::Completed => theme.status,
-        FileTaskPhase::Paused => theme.button_focused,
+        FileTaskPhase::Paused | FileTaskPhase::Stalled => theme.button_focused,
+        FileTaskPhase::Cancelling => theme.error,
         _ => theme.text,
     }
 }
@@ -2277,6 +2291,28 @@ mod tests {
         });
         let resume = state.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert_eq!(resume, FileTaskUserAction::Resume);
+    }
+
+    #[test]
+    fn cancelling_disables_duplicate_controls() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            FilePickerTheme::default(),
+        );
+        state.apply_update(FileTaskProgressUpdate::Snapshot {
+            phase: FileTaskPhase::Cancelling,
+            status: "Cancelling".to_string(),
+            current_item: None,
+            totals: ProgressTotals::default(),
+            rate_bytes_per_sec: None,
+        });
+
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FileTaskUserAction::None
+        );
+        assert!(state.progress_buttons().is_empty());
     }
 
     #[test]
