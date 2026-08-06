@@ -1,11 +1,24 @@
+# syntax=docker/dockerfile:1
 # tonepoet — nix-free build
+#
+# Requires BuildKit (default in Docker 23+; otherwise DOCKER_BUILDKIT=1) for
+# the RUN --mount cache mounts below.
 #
 # Debian trixie is the base because it ships ffmpeg 7.1, which is what
 # ffmpeg-next 7.1 and the native MLP decoder shim link against. Bookworm
 # (ffmpeg 5) and Ubuntu 24.04 (ffmpeg 6) will NOT work.
 #
 #   docker build -t tonepoet .
-#   docker run --rm -it -v "$PWD/audio:/audio" tonepoet tui
+#   docker run --rm -it \
+#     -v "$PWD/audio:/audio" \
+#     -v tonepoet-state:/root/.config/tonepoet \
+#     tonepoet tui
+#
+# The tonepoet-state volume persists config, presets, and the copy/move
+# recovery journal (which restores interrupted file operations on the next
+# start). Without it, `--rm` discards all of that with the container.
+# Optionally add `-v tonepoet-cache:/root/.cache/tonepoet` for the
+# conversion queue and probe cache.
 #
 # ---------------------------------------------------------------------------
 # Stage 1: build
@@ -25,16 +38,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libdbus-1-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# bindgen (ffmpeg-sys-next, libbluray-sys) needs libclang.so on the path.
-RUN echo "export LIBCLANG_PATH=$(dirname $(find /usr/lib -name 'libclang.so*' | head -1))" \
-      > /etc/profile.d/libclang.sh
-ENV LIBCLANG_PATH=/usr/lib/llvm-19/lib
+# bindgen (ffmpeg-sys-next, libbluray-sys) needs libclang.so. Resolve the
+# real llvm directory at build time and expose it behind a stable symlink so
+# a trixie point-release moving past llvm-19 cannot silently break the build.
+RUN ln -s "$(dirname "$(find /usr/lib -name 'libclang.so*' | head -1)")" /opt/libclang
+ENV LIBCLANG_PATH=/opt/libclang
 
-# Rust toolchain (stable; the workspace needs >= 1.82, system Rust is too old).
+# Rust toolchain. Pinned for reproducible rebuilds — an unpinned `stable`
+# floats with upstream releases. NB: Cargo.toml's rust-version = "1.82"
+# understates the real requirement; 1.82 cannot resolve this workspace's
+# dependency tree (see CLAUDE.md). 1.93.1 matches the nix dev shell.
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.93.1
 
 WORKDIR /build
 
@@ -43,6 +60,14 @@ COPY . .
 # The nix build bakes reference-tool store paths into the binary via
 # option_env!(). Outside nix there is no store, so point them at the
 # distro prefix; track_executor falls back to PATH lookup when unset.
+#
+# Reference mode COMPARES these: the compiled {STORE_PATH}/bin/<tool>, the
+# runtime TONEPOET_REFERENCE_*_PATH, and the exec'd path must all
+# canonicalize to the same executable. /usr + /usr/bin/<tool> (runtime
+# stage below) satisfy that by construction. Unlike a nix store path,
+# /usr/bin tools can change under a running container (apt upgrade); the
+# executor re-hashes the tool and fails closed on drift, so that surfaces
+# as an honest error rather than silent divergence.
 ENV TONEPOET_REFERENCE_SOX_STORE_PATH=/usr \
     TONEPOET_REFERENCE_FFMPEG_STORE_PATH=/usr \
     TONEPOET_REFERENCE_METAFLAC_STORE_PATH=/usr \
@@ -65,12 +90,17 @@ FROM debian:trixie-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Audio tools tonepoet shells out to. Everything the nix flake provides that
-# Debian also packages. Three of the flake's tools have no trixie package, so
-# `check-tools` reports them missing — none of them block conversion:
-#   ssrc          - brick-wall resampling; sox/ffmpeg resamplers still work
-#   sox_ng        - stock sox is installed instead (no Gesemann dither, no DSD)
-#   monkeys-audio - APE decoding still works via ffmpeg
-# Debian's `7zip` provides /usr/bin/7z but no `7zz`; tonepoet accepts 7z.
+# Debian also packages. Known gaps vs the flake — none block conversion:
+#   ssrc          - no trixie package; `check-tools` reports it MISSING.
+#                   Brick-wall resampling unavailable; sox/ffmpeg still work.
+#   7zz           - `check-tools` reports it MISSING: Debian's `7zip` ships
+#                   /usr/bin/7z but no `7zz`; tonepoet falls back to 7z.
+#   sox_ng        - stock sox substituted (no Gesemann dither, no DSD path).
+#                   Not probed by name, so check-tools does NOT flag it.
+#   monkeys-audio - no trixie package; APE decoding still works via ffmpeg.
+#                   Not probed by name, so check-tools does NOT flag it.
+# `acl` supplies getfacl/setfacl, which FLAC metadata rewrites use to
+# preserve POSIX ACLs (hard error when required and absent).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       ffmpeg \
@@ -82,7 +112,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       atomicparsley \
       7zip \
       loudgain \
-      libbluray2 libudfread0 libaacs0 \
+      acl \
+      libbluray2 libudfread0 libaacs0 libbdplus0 \
       libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/*
 

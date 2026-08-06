@@ -1,8 +1,21 @@
-# Keep this minimal. The build embeds files from docs/, fixtures/, and
-# tests/fixtures/ via include_str!/include_bytes!, so excluding them breaks
-# compilation in ways that only show up as missing-file errors from rustc.
+# Keep this minimal. The build embeds files from docs/, fixtures/,
+# tests/fixtures/, and flake.lock via include_str!/include_bytes!, so
+# excluding those breaks compilation in ways that only show up as
+# missing-file errors from rustc.
+#
+# The scratch patterns below are safe: no include_*! references any
+# tarball, image, or scratch directory, and together they cut the build
+# context by hundreds of MB (working-tree bundles accumulate at the root).
 target/
 .git/
 result
 result-*
 .DS_Store
+*.tar.gz
+*.tar
+*.png
+.claude/
+.tonepoet_chunk2_backups/
+chunk2*/
+IMPLEMENTATION_REPORT_*.md
+PR1_REVIEW_COMMENT.md
