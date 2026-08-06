@@ -1,0 +1,8 @@
+# Keep this minimal. The build embeds files from docs/, fixtures/, and
+# tests/fixtures/ via include_str!/include_bytes!, so excluding them breaks
+# compilation in ways that only show up as missing-file errors from rustc.
+target/
+.git/
+result
+result-*
+.DS_Store
