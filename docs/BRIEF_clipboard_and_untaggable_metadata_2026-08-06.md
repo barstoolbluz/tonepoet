@@ -38,15 +38,18 @@ remaining suspect layers, in order of likelihood:
    passthrough depends on tmux `set-clipboard`), and reads (SHIFT+CTRL+V) have the same
    fragility. Failures are silent — `publish_system_clipboard` is fire-and-forget with no
    user-visible outcome.
-2. **Mouse selection in inline editors.** The Browse inline rename/create/metadata editors
-   (`BrowseInlineEditState`, app.rs ~10205; `EditorTextTarget::{BrowseFileInlineEdit,
-   BrowseTreeInlineEdit, BrowsePath, BrowseSearch}` mouse contract) — our trace found no
-   evidence that mouse **drag selection** is wired to the inline rename renderer
-   (draw_browse.rs ~2366), and a mouse click during inline editing may move focus/commit
-   the editor, after which Ctrl+C is a *filesystem* copy and a later Ctrl+V finds an empty
-   text clipboard — exactly reproducing symptom 1. `TextInputState` itself has full
-   mouse-selection mechanics (`begin/drag/end_mouse_selection`, text_input.rs ~952) — the
-   question is what is and isn't routed to them, per editor surface.
+2. **Per-surface coverage gaps.** Browse's own inline editors (`BrowseInlineEditState`,
+   app.rs:10223; `EditorTextTarget` contract, app.rs:10236) DO have full mouse selection
+   wired — Down begins/double-click selects all, Drag extends, Up ends
+   (keybindings.rs ~49363–49420 → `editor_text_input_mut` ~9169 →
+   `begin/drag/end_mouse_selection`, text_input.rs ~952) — we verified this during audit,
+   so do NOT rebuild it; test it. The uncovered suspects are OTHER text-editing surfaces
+   the user may mean by "inline folder/filename editing": the **tui-file-picker overlay's
+   own rename/filter/search inputs** (crates/tui-file-picker/src/{input,state,text_input}.rs
+   — a separate dispatch from Browse inline edit), tree-pane inline variants, and
+   real-terminal event delivery differences under tmux/byobu mouse reporting. Audit every
+   text-editing surface for the full copy/cut/paste + mouse-selection contract rather than
+   assuming Browse parity.
 
 ### Outcomes
 **A1 — Copy/cut lands on the host clipboard from every text-editing surface, reliably on
@@ -65,12 +68,14 @@ detected environment (WAYLAND_DISPLAY/DISPLAY/TMUX/term), which transports were 
 result of a live write+read self-test, and the last N mirror attempts with outcomes. This
 is how the user and we stop guessing.
 
-**A4 — Mouse text-selection works in every inline editor** (Browse rename, create,
-inline-metadata field, `path:` field, search input, metadata-editor fields): click to
-position, drag to select, highlight visibly rendered, selection survives until an editing
-key; a mouse action inside the active editor's bounds must never commit/cancel the editor
-or fall through to entry selection / filesystem clipboard semantics. Copy after mouse
-highlight = the highlighted text.
+**A4 — Mouse text-selection works in every text-editing surface** — Browse rename/create/
+inline-metadata field, `path:` field, search input, metadata-editor fields, AND the
+tui-file-picker overlay's own inputs (rename/filter/search): click to position, drag to
+select, highlight visibly rendered, selection survives until an editing key; a mouse
+action inside the active editor's bounds must never commit/cancel the editor or fall
+through to entry selection / filesystem clipboard semantics. Copy after mouse highlight =
+the highlighted text. (Browse's editors already have the wiring — verify/test; bring every
+other surface to parity.)
 
 **A5 — Uniform semantics everywhere**: Ctrl+C/Ctrl+X on a selection (or whole field when
 selectionless), Ctrl+V/Ctrl+P paste internal, SHIFT+CTRL+V paste host (existing chord —
@@ -149,6 +154,17 @@ tags TO dff) degrades with an explicit message, not silence.
 the existing explicit-selection policy bypass, which must keep working for taggable
 carriers).
 
+**B5 — Sidecar creation for untaggable albums that lack one.** When the user edits
+metadata on untaggable carriers with NO existing sidecar cue and saves, tonepoet
+materializes a sidecar cue (via the existing CUE-generation machinery — do not write a
+second generator) capturing the album/track structure (probed durations/order) plus the
+edited fields, and that sidecar becomes the album's metadata surface from then on (same
+path as B2). Also provide an explicit user-invoked "create cue sheet" affordance for doing
+it without editing first (surface of your choice: context menu and/or vi command).
+GUARDRAIL: never create files as a side effect of merely browsing or opening Properties —
+materialization requires an explicit save or the explicit action; it must be visible in
+the save summary; and it must respect the existing deletion/write safety conventions.
+
 ### Guardrails (Part B)
 - LODESTAR-governed: do not disturb taggable-carrier selection/priority behavior, the
   single-image guard fixed at ~19092-19130 (regression tests exist), native multi-file
@@ -161,7 +177,9 @@ carriers).
 - Tests: minimum (a) dff+multi-track sidecar cue → editable synthetic album, saves land in
   the cue, file tags untouched; (b) dff without cue → honest empty-state, not blank grid;
   (c) an SHN or DTS variant proving the fix is format-generic; (d) right-click-the-cue
-  route for (a); (e) regression: flac+cue behavior byte-identical to today.
+  route for (a); (e) regression: flac+cue behavior byte-identical to today; (f) B5:
+  edit+save on a cue-less dff album materializes a correct sidecar and reopening uses it;
+  browsing/opening alone creates nothing.
 
 ---
 
