@@ -528,6 +528,33 @@ pub fn rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
     )
 }
 
+/// Materialize a new UTF-8 sidecar CUE from a generated CUESHEET.
+///
+/// The destination-exists preflight preserves create-only behavior for the
+/// supported single-writer workflow. The actual commit reuses the repository's
+/// established same-directory atomic sidecar replacement convention instead of
+/// maintaining a second hard-link transaction path.
+pub fn create_cue_sidecar_from_cuesheet(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+) -> Result<CueSidecarWritebackOutcome, String> {
+    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, false)?;
+    let desired = explicit_cue_metadata(replacement_cuesheet);
+    if desired.tracks.is_empty() {
+        return Err("replacement CUESHEET has no audio tracks".to_string());
+    }
+    if cue_path.exists() {
+        return Err(format!(
+            "sidecar CUE '{}' appeared after the metadata editor opened; left it unchanged",
+            cue_path.display()
+        ));
+    }
+    atomic_create_new(cue_path, replacement_cuesheet.as_bytes())?;
+    Ok(CueSidecarWritebackOutcome::Rewritten {
+        encoding: "UTF-8".to_string(),
+    })
+}
+
 /// Rewrite CUE metadata only if `validate_snapshot` accepts the exact bytes
 /// read by this mutator. The validator therefore observes the same snapshot
 /// from which byte-preserving edits are composed, rather than a prior read by
@@ -2367,6 +2394,16 @@ fn atomic_replace_if_unchanged(
     ))
 }
 
+fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "sidecar CUE '{}' appeared after the metadata editor opened; left it unchanged",
+            path.display()
+        ));
+    }
+    atomic_replace_if_unchanged(path, bytes, None)
+}
+
 fn sync_parent_dir(parent: &Path) {
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
@@ -2747,6 +2784,44 @@ mod tests {
             std::fs::read_to_string(&cue_path).expect("read concurrent cue"),
             concurrent,
             "a concurrent change must not be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn create_sidecar_is_atomic_create_only_and_never_overwrites() {
+        let dir = unique_cue_parser_test_dir("sidecar_create_only");
+        let cue_path = dir.join("album.cue");
+        let replacement = concat!(
+            "PERFORMER \"Artist\"\n",
+            "TITLE \"Album\"\n",
+            "FILE \"album.dff\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"One\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+
+        let outcome = create_cue_sidecar_from_cuesheet(&cue_path, replacement)
+            .expect("create new sidecar");
+        assert_eq!(
+            outcome,
+            CueSidecarWritebackOutcome::Rewritten {
+                encoding: "UTF-8".to_string(),
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cue_path).expect("read created sidecar"),
+            replacement,
+        );
+
+        let concurrent = replacement.replace("TITLE \"Album\"", "TITLE \"Concurrent\"");
+        std::fs::write(&cue_path, &concurrent).expect("simulate later owner");
+        let error = create_cue_sidecar_from_cuesheet(&cue_path, replacement)
+            .expect_err("create-only path must refuse an existing target");
+        assert!(error.contains("appeared after the metadata editor opened"));
+        assert_eq!(
+            std::fs::read_to_string(&cue_path).expect("existing sidecar unchanged"),
+            concurrent,
         );
         let _ = std::fs::remove_dir_all(dir);
     }

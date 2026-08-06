@@ -2774,6 +2774,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "fx",
     "effects",
     "info",
+    "clipboard",
     "tools",
     "h",
     "help",
@@ -3038,6 +3039,8 @@ pub enum Command {
     Set(String, String),
     Fx(Vec<String>),
     Info,
+    /// Inspect detected host-clipboard transports and run a live round-trip test.
+    Clipboard,
     Tools,
     Help(Option<String>),
     /// Sort command for the browse screen. Args: (field?, dir?)
@@ -3289,6 +3292,7 @@ impl std::fmt::Debug for Command {
             Command::Set(key, value) => f.debug_tuple("Set").field(key).field(value).finish(),
             Command::Fx(args) => f.debug_tuple("Fx").field(args).finish(),
             Command::Info => f.write_str("Info"),
+            Command::Clipboard => f.write_str("Clipboard"),
             Command::Tools => f.write_str("Tools"),
             Command::Help(topic) => f.debug_tuple("Help").field(topic).finish(),
             Command::Sort(field, dir) => f.debug_tuple("Sort").field(field).field(dir).finish(),
@@ -3557,6 +3561,7 @@ pub fn parse_command(input: &str) -> Command {
             Command::Fx(fx_args)
         }
         "info" => Command::Info,
+        "clipboard" => Command::Clipboard,
         "tools" => Command::Tools,
         "h" | "help" => Command::Help((!args.is_empty()).then(|| args.to_string())),
         "sort" => {
@@ -4362,6 +4367,10 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 app.set_status("No source file loaded. Use :e <path>");
             }
         }
+        Command::Clipboard => {
+            app.set_status("Running clipboard diagnostics…");
+            super::host_clipboard::request_clipboard_diagnostics(tx.clone());
+        }
         Command::Tools => {
             app.current_screen = AppScreen::Config;
             app.set_status("Showing config/tools");
@@ -4384,6 +4393,8 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
 Copy and cut always update Tonepoet's in-app clipboard first. Tonepoet mirrors a text projection to the host clipboard on a background worker, preferring wl-copy on Wayland and xclip/xsel on X11. When no native helper is available, writes fall back to OSC 52 through /dev/tty.
 
 Ctrl+V and Ctrl+P paste Tonepoet's internal clipboard. Ctrl+Shift+V reads host text with wl-paste, xclip, or xsel and inserts it into the focused text editor. Host filesystem paths are not interpreted as file-operation instructions.
+
+Run :clipboard to inspect the detected display/multiplexer environment, helper discovery, a reversible live write/read check when restoration is safe, and recent transport outcomes.
 
 For OSC 52 fallback inside tmux or byobu, add these settings to the tmux/byobu profile and permit OSC 52 writes in the outer terminal:
 
@@ -14898,6 +14909,7 @@ mod completion_tests {
             parse_command("help clipboard"),
             Command::Help(Some(topic)) if topic == "clipboard"
         ));
+        assert!(matches!(parse_command("clipboard"), Command::Clipboard));
         assert!(matches!(parse_command("messages"), Command::FileTaskMessages));
         assert!(matches!(parse_command("task-messages"), Command::FileTaskMessages));
         assert!(matches!(

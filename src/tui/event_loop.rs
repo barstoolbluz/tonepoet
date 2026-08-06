@@ -47,6 +47,7 @@ pub async fn run_app(
     let _ = tui_file_picker::set_shared_clipboard_publish_hook(
         super::context_menu::publish_system_clipboard,
     );
+    super::host_clipboard::configure_message_sender(tx.clone());
     // Set the message channel on BrowseState so navigation methods can
     // spawn async scans. Must happen before the event loop starts.
     app.browse.set_tx(tx.clone());
@@ -3507,6 +3508,16 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 target,
                 result,
             );
+        }
+        AppMessage::HostClipboardDiagnosticComplete { report } => {
+            app.active_overlay = ActiveOverlay::CuePreview(Box::new(
+                super::app::CuePreviewState::new_readonly_help(
+                    "Clipboard diagnostics".to_string(),
+                    report,
+                    "Detected transports, live round-trip, and recent attempts".to_string(),
+                ),
+            ));
+            app.set_status("Clipboard diagnostics complete");
         }
         AppMessage::ClearTrackProgress {
             item_id,

@@ -382,11 +382,20 @@ impl TextInputState {
     }
 
     pub fn cut_selection(&mut self) -> bool {
-        if !self.has_selection() || !self.copy_selection() {
+        if self.text.is_empty() {
             return false;
         }
         let before = self.snapshot();
-        self.delete_selection();
+        if !self.copy_selection() {
+            return false;
+        }
+        if !self.delete_selection() {
+            // Selectionless cut follows the application-wide contract: copy
+            // and remove the complete field rather than silently doing nothing.
+            self.text.clear();
+            self.cursor = 0;
+            self.clear_selection();
+        }
         self.record_edit(before)
     }
 
@@ -1786,14 +1795,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ctrl_letter_is_ignored() {
-        // Pre-fix bug: Ctrl+X used to insert literal 'x'. Now it should be a no-op.
-        let mut s = TextInputState::new("hi".to_string());
-        s.cursor_end();
-        let consumed =
-            handle_text_input_key(&mut s, &key(KeyCode::Char('x'), KeyModifiers::CONTROL));
-        assert!(!consumed);
-        assert_eq!(s.text, "hi");
+    fn selectionless_ctrl_x_cuts_the_complete_field() {
+        with_scoped_shared_text_clipboard("prior", || {
+            let mut s = TextInputState::new("hi".to_string());
+            s.cursor_end();
+            let consumed =
+                handle_text_input_key(&mut s, &key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+            assert!(consumed);
+            assert!(s.text.is_empty());
+            assert_eq!(read_shared_text_clipboard(), "hi");
+            assert!(s.undo());
+            assert_eq!(s.text, "hi");
+        });
     }
 
     #[test]
@@ -2232,17 +2245,23 @@ mod tests {
     }
 
     #[test]
-    fn cut_without_selection_refuses_without_copying_or_mutating() {
+    fn cut_without_selection_cuts_the_whole_field_per_app_wide_contract() {
+        // Contract change (clipboard hardening round): selectionless cut
+        // follows selectionless copy — the whole field is copied and removed
+        // rather than silently refusing.
         with_scoped_shared_text_clipboard("shared", || {
             let mut input = TextInputState::new("whole field".to_string());
             input.clipboard = "local".to_string();
             input.cursor = 4;
 
-            assert!(!input.cut_selection());
+            assert!(input.cut_selection());
+            assert_eq!(input.text, "");
+            assert_eq!(input.cursor, 0);
+            assert_eq!(input.clipboard, "whole field");
+            assert_eq!(read_shared_text_clipboard(), "whole field");
+            // The removal is a recorded edit: undo restores the field.
+            assert!(input.undo());
             assert_eq!(input.text, "whole field");
-            assert_eq!(input.cursor, 4);
-            assert_eq!(input.clipboard, "local");
-            assert_eq!(read_shared_text_clipboard(), "shared");
         });
     }
 

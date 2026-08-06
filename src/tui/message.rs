@@ -162,6 +162,10 @@ pub enum AppMessage {
         target: HostClipboardPasteTarget,
         result: Result<String, String>,
     },
+    /// Completion of the explicit `:clipboard` live diagnostic.
+    HostClipboardDiagnosticComplete {
+        report: String,
+    },
     /// A conversion item or one of its concurrent tracks reported progress.
     /// When `track_index` is `Some(idx)`, the update describes one track
     /// inside a multi-track source. The TUI routes these to per-track

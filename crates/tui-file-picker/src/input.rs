@@ -1863,6 +1863,142 @@ mod tests {
     }
 
     #[test]
+    fn every_picker_text_surface_dispatches_mouse_copy_cut_and_internal_paste_uniformly() {
+        use std::sync::{Arc, Mutex};
+
+        fn active_text(picker: &FilePickerState) -> &str {
+            match picker.focus {
+                FilePickerFocus::Address => &picker.address_input.text,
+                FilePickerFocus::CreateName => &picker.create_name_input.text,
+                FilePickerFocus::SaveName => &picker.save_name_input.text,
+                FilePickerFocus::Search => &picker.search.input.text,
+                FilePickerFocus::BookmarkName => &picker.bookmarks.name_input.text,
+                other => panic!("expected text focus, got {other:?}"),
+            }
+        }
+
+        fn exercise(picker: &mut FilePickerState, action: FilePickerHitAction) {
+            let field = Rect::new(10, 4, 20, 1);
+            picker.record_hit_region(field, action);
+            let mouse = |kind, column| MouseEvent {
+                kind,
+                column,
+                row: field.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(
+                picker.handle_mouse(
+                    mouse(MouseEventKind::Down(MouseButton::Left), field.x),
+                    Rect::default(),
+                ),
+                FilePickerAction::None,
+            );
+            assert_eq!(
+                picker.handle_mouse(
+                    mouse(MouseEventKind::Drag(MouseButton::Left), field.x + 3),
+                    Rect::default(),
+                ),
+                FilePickerAction::None,
+            );
+            assert_eq!(
+                picker.handle_mouse(
+                    mouse(MouseEventKind::Up(MouseButton::Left), field.x + 3),
+                    Rect::default(),
+                ),
+                FilePickerAction::None,
+            );
+
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                )),
+                FilePickerAction::None,
+            );
+            assert_eq!(crate::text_input::read_shared_text_clipboard(), "abc");
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::CONTROL,
+                )),
+                FilePickerAction::None,
+            );
+            assert_eq!(active_text(picker), "def");
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(
+                    KeyCode::Char('p'),
+                    KeyModifiers::CONTROL,
+                )),
+                FilePickerAction::None,
+            );
+            assert_eq!(active_text(picker), "abcdef");
+        }
+
+        crate::text_input::with_scoped_shared_text_clipboard("", || {
+            let published = Arc::new(Mutex::new(Vec::<String>::new()));
+            let captured = Arc::clone(&published);
+            crate::text_input::with_scoped_shared_text_clipboard_publish_hook(
+                move |text| captured.lock().expect("publication lock").push(text.to_string()),
+                || {
+                    let temp = tempfile::tempdir().expect("tempdir");
+
+                    let mut address = FilePickerState::new(FilePickerConfig {
+                        start_dir: temp.path().to_path_buf(),
+                        ..FilePickerConfig::default()
+                    });
+                    address.begin_address_edit();
+                    address.address_input = crate::text_input::TextInputState::new("abcdef".to_string());
+                    exercise(&mut address, FilePickerHitAction::Address);
+
+                    let mut create = FilePickerState::new(FilePickerConfig {
+                        start_dir: temp.path().to_path_buf(),
+                        ..FilePickerConfig::default()
+                    });
+                    create.begin_create_name_in(
+                        FilePickerCreateKind::File,
+                        temp.path().to_path_buf(),
+                    );
+                    create.create_name_input = crate::text_input::TextInputState::new("abcdef".to_string());
+                    exercise(&mut create, FilePickerHitAction::CreateNameEditor);
+
+                    let mut save = FilePickerState::new(FilePickerConfig {
+                        start_dir: temp.path().to_path_buf(),
+                        save_mode: Some(crate::SaveModeConfig {
+                            default_name: "abcdef".to_string(),
+                            confirm_overwrite: true,
+                            hide_extension: None,
+                            style: crate::SaveModeStyle::Inline,
+                        }),
+                        ..FilePickerConfig::default()
+                    });
+                    save.focus = FilePickerFocus::SaveName;
+                    save.save_name_input = crate::text_input::TextInputState::new("abcdef".to_string());
+                    exercise(&mut save, FilePickerHitAction::SaveNameEditor);
+
+                    let mut search = FilePickerState::new(FilePickerConfig {
+                        start_dir: temp.path().to_path_buf(),
+                        ..FilePickerConfig::default()
+                    });
+                    search.focus = FilePickerFocus::Search;
+                    search.search.input = crate::text_input::TextInputState::new("abcdef".to_string());
+                    exercise(&mut search, FilePickerHitAction::SearchInput);
+
+                    let mut bookmark = FilePickerState::new(FilePickerConfig {
+                        start_dir: temp.path().to_path_buf(),
+                        ..FilePickerConfig::default()
+                    });
+                    bookmark.begin_add_bookmark(temp.path().to_path_buf());
+                    bookmark.bookmarks.name_input = crate::text_input::TextInputState::new("abcdef".to_string());
+                    exercise(&mut bookmark, FilePickerHitAction::BookmarkNameEditor);
+                },
+            );
+            let published = published.lock().expect("publication lock");
+            assert_eq!(published.len(), 10, "copy and cut must each mirror once per surface");
+            assert!(published.iter().all(|value| value == "abc"));
+        });
+    }
+
+    #[test]
     fn picker_search_and_save_name_editors_use_text_context_menu_without_action_buttons() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut picker = FilePickerState::new(FilePickerConfig {

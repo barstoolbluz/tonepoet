@@ -6618,6 +6618,7 @@ pub enum MetadataEditorWriteOutcome {
         cue_path: std::path::PathBuf,
         unchanged: bool,
         rewritten_as_utf8: bool,
+        created: bool,
     },
     SidecarCueFailed { cue_path: std::path::PathBuf, reason: String },
     /// Typed result from the invalid-APEv2 repair worker. This remains a
@@ -6660,6 +6661,7 @@ impl MetadataEditorWriteResult {
         cue_path: std::path::PathBuf,
         unchanged: bool,
         rewritten_as_utf8: bool,
+        created: bool,
     ) -> Self {
         Self {
             path: audio_path,
@@ -6667,6 +6669,7 @@ impl MetadataEditorWriteResult {
                 cue_path,
                 unchanged,
                 rewritten_as_utf8,
+                created,
             },
         }
     }
@@ -6733,6 +6736,7 @@ pub struct MetadataEditorWriteSummary {
     pub skipped: usize,
     pub ignored: usize,
     pub sidecar_cue_saved: usize,
+    pub sidecar_cue_created: usize,
     pub sidecar_cue_unchanged: usize,
     pub sidecar_cue_failed: usize,
     pub sidecar_cue_utf8_fallback: usize,
@@ -6751,23 +6755,31 @@ pub struct MetadataEditorWriteSummary {
 
 impl MetadataEditorWriteSummary {
     fn sidecar_cue_saved_status(&self) -> String {
-        let suffix = if self.sidecar_cue_saved == 1 { "" } else { "s" };
-        if self.sidecar_cue_utf8_fallback == 0 {
-            format!("{} CUE sidecar{} updated", self.sidecar_cue_saved, suffix)
-        } else if self.sidecar_cue_utf8_fallback == self.sidecar_cue_saved {
-            format!(
-                "{} CUE sidecar{} updated as UTF-8",
-                self.sidecar_cue_saved,
-                suffix
-            )
-        } else {
-            format!(
-                "{} CUE sidecar{} updated ({} rewritten as UTF-8)",
-                self.sidecar_cue_saved,
-                suffix,
-                self.sidecar_cue_utf8_fallback
-            )
+        let updated = self.sidecar_cue_saved.saturating_sub(self.sidecar_cue_created);
+        let mut parts = Vec::new();
+        if self.sidecar_cue_created > 0 {
+            parts.push(format!(
+                "{} CUE sidecar{} created",
+                self.sidecar_cue_created,
+                if self.sidecar_cue_created == 1 { "" } else { "s" }
+            ));
         }
+        if updated > 0 {
+            let suffix = if updated == 1 { "" } else { "s" };
+            if self.sidecar_cue_utf8_fallback == 0 {
+                parts.push(format!("{} CUE sidecar{} updated", updated, suffix));
+            } else if self.sidecar_cue_utf8_fallback == updated {
+                parts.push(format!("{} CUE sidecar{} updated as UTF-8", updated, suffix));
+            } else {
+                parts.push(format!(
+                    "{} CUE sidecar{} updated ({} rewritten as UTF-8)",
+                    updated,
+                    suffix,
+                    self.sidecar_cue_utf8_fallback
+                ));
+            }
+        }
+        parts.join(", ")
     }
 
     pub fn all_saved(&self) -> bool {
@@ -7550,6 +7562,10 @@ pub struct PresentationTab {
     /// upgrade, but save-time routing still follows this retained identity
     /// instead of rediscovering or guessing another source.
     pub cue_source: Option<MetadataCueSource>,
+    /// True only for a cue-less, untaggable album whose editable metadata
+    /// surface is staged in memory. Opening or browsing never creates the
+    /// sidecar; the first explicit save materializes `cue_source` atomically.
+    pub pending_sidecar_cue_creation: bool,
     /// Unified multi-surface CUE state. Used by grouped sidecar albums and by
     /// selected sets of independent embedded-CUE carriers.
     pub cue_album_synthetic_sheet: Option<CueAlbumSyntheticSheet>,
@@ -7593,6 +7609,7 @@ impl Default for PresentationTab {
             sidecar_cuesheet_shadow_present: false,
             pending_embedded_cuesheet_delete: false,
             cue_source: None,
+            pending_sidecar_cue_creation: false,
             cue_album_synthetic_sheet: None,
             per_carrier_embedded_cuesheets: false,
             cue_album_forced_cleanup: Vec::new(),
@@ -7676,6 +7693,7 @@ impl PresentationTab {
         tab.sidecar_cuesheet_shadow_present = active.sidecar_cuesheet_shadow_present;
         tab.pending_embedded_cuesheet_delete = active.pending_embedded_cuesheet_delete;
         tab.cue_source = active.cue_source.clone();
+        tab.pending_sidecar_cue_creation = active.pending_sidecar_cue_creation;
         tab.cue_album_synthetic_sheet = active.cue_album_synthetic_sheet.clone();
         tab.per_carrier_embedded_cuesheets = active.per_carrier_embedded_cuesheets;
         tab
@@ -7849,6 +7867,7 @@ impl MetadataEditorModel {
             return false;
         };
         self.metadata_view == MetadataEditorView::All
+            || entry.display_key.eq_ignore_ascii_case("NO EDITABLE METADATA")
             || crate::tui::probe::STANDARD_KEY_ORDER.iter().any(|known| {
                 *known == crate::tui::probe::canonical_metadata_display_key(&entry.display_key)
             })
@@ -9162,12 +9181,16 @@ fn apply_write_results_to_tab(
                 cue_path: _,
                 unchanged,
                 rewritten_as_utf8,
+                created,
             } => {
                 if unchanged {
                     summary.sidecar_cue_unchanged = summary.sidecar_cue_unchanged.saturating_add(1);
                 } else {
                     summary.sidecar_cue_saved = summary.sidecar_cue_saved.saturating_add(1);
-                    if rewritten_as_utf8 {
+                    if created {
+                        summary.sidecar_cue_created = summary.sidecar_cue_created.saturating_add(1);
+                    }
+                    if rewritten_as_utf8 && !created {
                         summary.sidecar_cue_utf8_fallback = summary
                             .sidecar_cue_utf8_fallback
                             .saturating_add(1);
@@ -9316,6 +9339,22 @@ fn native_multi_file_sidecar_authority(tab: &PresentationTab) -> bool {
         && matches!(&tab.cue_source, Some(MetadataCueSource::Sidecar(_)))
 }
 
+fn untaggable_sidecar_authority(tab: &PresentationTab) -> bool {
+    tab.cue_album_synthetic_sheet.is_some()
+        && matches!(&tab.cue_source, Some(MetadataCueSource::Sidecar(_)))
+        && !tab.technical_details.files.is_empty()
+        && tab.technical_details.files.iter().all(|file| {
+            matches!(
+                &file.file_facts.read_state,
+                FileReadState::Unsupported { .. }
+            )
+        })
+}
+
+fn dedicated_cue_sidecar_authority(tab: &PresentationTab) -> bool {
+    native_multi_file_sidecar_authority(tab) || untaggable_sidecar_authority(tab)
+}
+
 fn cue_sidecar_representable_entry_for_path_count(
     path_count: usize,
     entry: &crate::tui::probe::TagEntry,
@@ -9371,7 +9410,8 @@ fn mark_tag_entry_saved_empty(entry: &mut crate::tui::probe::TagEntry) {
 
 fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
     let path_count = tab.paths.len();
-    if !native_multi_file_sidecar_authority(tab) {
+    tab.pending_sidecar_cue_creation = false;
+    if !dedicated_cue_sidecar_authority(tab) {
         for entry in &mut tab.entries {
             let is_cuesheet_shadow = tab.sidecar_cuesheet_shadow_present
                 && entry.display_key.eq_ignore_ascii_case("CUESHEET");
