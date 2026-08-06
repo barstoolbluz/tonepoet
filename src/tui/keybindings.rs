@@ -10230,19 +10230,29 @@ fn metadata_editor_track_slots_in_member_file_order<T: Clone>(
 }
 
 fn metadata_editor_cue_sidecar_representable_entry(
-    state: &super::app::MetadataEditorState,
+    _state: &super::app::MetadataEditorState,
     entry: &super::probe::TagEntry,
 ) -> bool {
+    // Representability is a property of the KEY, not of the row's inferred
+    // scope: ALBUM/DATE/GENRE map to the cue header (TITLE/REM DATE/REM GENRE)
+    // and TITLE/ARTIST/ISRC map to cue tracks regardless of how
+    // `effective_row_scope` classifies the row. Scope inference compares
+    // per-file value counts against `paths.len()`, which diverges on
+    // legitimate shapes (e.g. carriers present in the folder but absent from
+    // the cue) and previously misclassified album fields as track-scoped —
+    // refusing ALBUM/DATE/GENRE saves that the cue writer fully supports.
     let key = entry.display_key.to_ascii_uppercase();
-    if key == "CUESHEET" {
-        return true;
-    }
-    if entry.is_track_scoped(state.active_surface().paths.len()) {
-        return matches!(key.as_str(), "TITLE" | "ARTIST" | "ISRC");
-    }
     matches!(
         key.as_str(),
-        "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
+        "CUESHEET"
+            | "TITLE"
+            | "ARTIST"
+            | "ISRC"
+            | "ALBUM"
+            | "ALBUMARTIST"
+            | "DATE"
+            | "GENRE"
+            | "CATALOGNUMBER"
     )
 }
 
@@ -10263,7 +10273,7 @@ fn metadata_editor_sidecar_authority_row_is_editable(
         })
 }
 
-fn metadata_editor_native_multi_file_sidecar_preflight_error(
+fn metadata_editor_dedicated_sidecar_structural_error(
     state: &super::app::MetadataEditorState,
 ) -> Option<String> {
     if !metadata_editor_dedicated_sidecar_authority(state) {
@@ -10343,17 +10353,31 @@ fn metadata_editor_native_multi_file_sidecar_preflight_error(
         }
     }
 
+    None
+}
+
+/// Changed/deleted fields a dedicated-sidecar (native multi-FILE image or
+/// untaggable-carrier) save cannot persist into the CUE representation.
+/// Empty when the surface is exempt (dual-authority metadata sidecars) or not
+/// sidecar-authoritative at all.
+fn metadata_editor_dedicated_sidecar_unsupported_fields(
+    state: &super::app::MetadataEditorState,
+) -> std::collections::BTreeSet<String> {
+    if !metadata_editor_dedicated_sidecar_authority(state) {
+        return std::collections::BTreeSet::new();
+    }
     // A one-track-per-file metadata sidecar has dual authority: CUE-representable
     // edits update the selected sidecar, while ordinary fields remain writable
-    // through the member files. The CUE-specific structural checks above still
+    // through the member files. The CUE-specific structural checks still
     // apply, but the image-sidecar restriction to CUE-representable fields does not.
     if metadata_editor_native_multi_file_metadata_sidecar_authority(state)
         && !metadata_editor_untaggable_sidecar_authority(state)
     {
-        return None;
+        return std::collections::BTreeSet::new();
     }
-
-    let unsupported = surface
+    let surface = state.active_surface();
+    let deleted = surface.deleted.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    surface
         .entries
         .iter()
         .enumerate()
@@ -10364,24 +10388,68 @@ fn metadata_editor_native_multi_file_sidecar_preflight_error(
         })
         .filter(|(_, entry)| !metadata_editor_cue_sidecar_representable_entry(state, entry))
         .map(|(_, entry)| entry.display_key.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect()
+}
+
+/// Revert every entry whose display key is in `keys` back to its original
+/// values (and clear any deletion marker on it). Used by the opt-in
+/// warn-and-save path so unrepresentable edits are visibly undone rather than
+/// silently kept-dirty or silently dropped.
+fn metadata_editor_revert_entries_by_key(
+    state: &mut super::app::MetadataEditorState,
+    keys: &std::collections::BTreeSet<String>,
+) {
+    let surface = state.active_surface_mut();
+    let mut reverted_indexes = Vec::new();
+    for (index, entry) in surface.entries.iter_mut().enumerate() {
+        if keys
+            .iter()
+            .any(|key| entry.display_key.eq_ignore_ascii_case(key))
+        {
+            entry.value = entry.original.clone();
+            entry.per_file_values = entry.per_file_originals.clone();
+            reverted_indexes.push(index);
+        }
+    }
+    surface
+        .deleted
+        .retain(|marked| !reverted_indexes.contains(marked));
+    // NOTE: rows added this session revert to empty rather than being removed —
+    // `surface.deleted` (and other bookkeeping) is index-based, so removing
+    // entries here would silently re-target deletion markers on later rows.
+}
+
+fn metadata_editor_dedicated_sidecar_unsupported_message(
+    state: &super::app::MetadataEditorState,
+    unsupported: &std::collections::BTreeSet<String>,
+) -> String {
+    // The "carrier tags are unsupported" explanation is only true for
+    // untaggable-carrier sidecars (DFF/SHN/DTS/AC3...); a taggable native
+    // multi-FILE album refuses non-CUE-representable fields for authority
+    // reasons, not carrier support.
+    let carrier_clause = if metadata_editor_untaggable_sidecar_authority(state) {
+        " because its carrier tags are unsupported"
+    } else {
+        ""
+    };
+    format!(
+        "save aborted: this sidecar-authoritative album can persist only CUE-representable metadata{}; unsupported changed field(s): {}; no audio file or sidecar was changed",
+        carrier_clause,
+        unsupported.iter().cloned().collect::<Vec<_>>().join(", ")
+    )
+}
+
+fn metadata_editor_native_multi_file_sidecar_preflight_error(
+    state: &super::app::MetadataEditorState,
+) -> Option<String> {
+    if let Some(reason) = metadata_editor_dedicated_sidecar_structural_error(state) {
+        return Some(reason);
+    }
+    let unsupported = metadata_editor_dedicated_sidecar_unsupported_fields(state);
     if unsupported.is_empty() {
         None
     } else {
-        // The "carrier tags are unsupported" explanation is only true for
-        // untaggable-carrier sidecars (DFF/SHN/DTS/AC3...); a taggable native
-        // multi-FILE album refuses non-CUE-representable fields for authority
-        // reasons, not carrier support.
-        let carrier_clause = if metadata_editor_untaggable_sidecar_authority(state) {
-            " because its carrier tags are unsupported"
-        } else {
-            ""
-        };
-        Some(format!(
-            "save aborted: this sidecar-authoritative album can persist only CUE-representable metadata{}; unsupported changed field(s): {}; no audio file or sidecar was changed",
-            carrier_clause,
-            unsupported.into_iter().collect::<Vec<_>>().join(", ")
-        ))
+        Some(metadata_editor_dedicated_sidecar_unsupported_message(state, &unsupported))
     }
 }
 
@@ -10794,9 +10862,34 @@ pub(super) fn metadata_editor_save(
         }
         return;
     }
-    if let Some(reason) = metadata_editor_native_multi_file_sidecar_preflight_error(state) {
+    if let Some(reason) = metadata_editor_dedicated_sidecar_structural_error(state) {
+        // Structural refusals (CUESHEET deletion, PERFORMER-inheritance
+        // conflicts, ...) always block: proceeding would corrupt authority.
         app.set_status(reason);
         return;
+    }
+    let sidecar_unsupported = metadata_editor_dedicated_sidecar_unsupported_fields(state);
+    let mut sidecar_warning = None;
+    if !sidecar_unsupported.is_empty() {
+        if app.config.metadata.sidecar_save_with_warnings {
+            // Opt-in ([metadata] sidecar_save_with_warnings): persist every
+            // CUE-representable field, revert the rest VISIBLY (values return
+            // to their originals in the grid), and continue the save.
+            metadata_editor_revert_entries_by_key(state, &sidecar_unsupported);
+            sidecar_warning = Some(format!(
+                "saved with warnings: not CUE-representable, reverted: {}",
+                sidecar_unsupported.iter().cloned().collect::<Vec<_>>().join(", "),
+            ));
+        } else {
+            app.set_status(metadata_editor_dedicated_sidecar_unsupported_message(
+                state,
+                &sidecar_unsupported,
+            ));
+            return;
+        }
+    }
+    if let Some(warning) = &sidecar_warning {
+        app.set_status(warning.clone());
     }
     let regenerated_cuesheet = match regenerate_cuesheet_for_save(state) {
         Ok(regenerated) => regenerated,
@@ -14661,7 +14754,7 @@ fn handle_metadata_editor_key(
                             }
                         }
                         let n = state.active_surface().paths.len();
-                        state.active_surface_mut().entries.push(super::probe::TagEntry {
+                        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
                             row_scope: crate::tui::probe::RowScope::File,
                             display_key: key_name.clone(),
                             item_key: lofty::tag::ItemKey::Unknown(key_name),
@@ -22364,7 +22457,7 @@ pub(super) fn reload_from_sidecar_cue(
         }
         entry.value = super::probe::cue_summary_string(&text);
     } else {
-        state.active_surface_mut().entries.push(super::probe::TagEntry {
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
             row_scope: crate::tui::probe::RowScope::Track,
             display_key: "CUESHEET".to_string(),
             item_key: ItemKey::Unknown("CUESHEET".to_string()),
@@ -70623,6 +70716,243 @@ mod untaggable_carrier_sidecar_regression_tests {
         assert_eq!(parsed.title.as_deref(), Some("Corrected One-Track Album"));
         assert_eq!(parsed.tracks.len(), 1);
         assert_eq!(parsed.tracks[0].title.as_deref(), Some("Only Track"));
+    }
+
+    /// A genuinely unrepresentable field (COMMENT) on an untaggable sidecar
+    /// album: strict mode (default) refuses with the honest message; warn mode
+    /// ([metadata] sidecar_save_with_warnings) proceeds, reverts the COMMENT
+    /// edit visibly, and reports the warning.
+    #[tokio::test]
+    async fn unrepresentable_field_refuses_strict_and_warn_reverts_and_saves() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("album.dff");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&audio, b"FRM8 placeholder DFF carrier").expect("dff");
+        let cue_text = concat!(
+            "TITLE \"Original Album\"\n",
+            "FILE \"album.dff\" WAVE\n",
+            "  TRACK 01 AUDIO\n    TITLE \"First\"\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    TITLE \"Second\"\n    INDEX 01 03:00:00\n",
+        )
+        .to_string();
+        std::fs::write(&cue, &cue_text).expect("cue");
+        let surface = MetadataCueSurface {
+            cue_path: cue.clone(),
+            audio_path: audio.clone(),
+            audio_paths: vec![audio.clone()],
+            track_audio_paths: vec![audio.clone(), audio.clone()],
+            role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+            sheet: crate::tui::cue_parser::parse_cue(&cue_text),
+            cue_text,
+        };
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (mut state, _tracks) = build_metadata_editor_for_cue_surfaces_with_policy(
+            &mut app,
+            std::slice::from_ref(&surface),
+            0,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("open DFF sidecar album");
+        let n_files = state.active_surface().paths.len();
+        state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
+            display_key: "COMMENT".to_string(),
+            item_key: crate::tui::probe::item_key_for_new_editor_row("COMMENT"),
+            value: "ripped 1984".to_string(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: vec![0; n_files],
+            per_file_values: vec!["ripped 1984".to_string(); n_files],
+            per_file_originals: vec![String::new(); n_files],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+        state.active_surface_mut().dirty = true;
+
+        // Strict (default): refused with the carrier-honest message.
+        let unsupported = metadata_editor_dedicated_sidecar_unsupported_fields(&state);
+        assert_eq!(
+            unsupported.iter().cloned().collect::<Vec<_>>(),
+            vec!["COMMENT".to_string()],
+        );
+        let strict = metadata_editor_native_multi_file_sidecar_preflight_error(&state)
+            .expect("strict mode must refuse COMMENT");
+        assert!(strict.contains("COMMENT"));
+        assert!(strict.contains("carrier tags are unsupported"));
+
+        // Warn mode: the save path reverts COMMENT and continues.
+        app.config.metadata.sidecar_save_with_warnings = true;
+        let (tx, _rx) = mpsc::channel(8);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        let status = app
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.clone())
+            .unwrap_or_default();
+        assert!(
+            status.contains("COMMENT") || status.contains("warning"),
+            "warn-mode save must surface the reverted field: {status:?}",
+        );
+        let comment = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("COMMENT"))
+            .expect("comment row still present");
+        assert_eq!(comment.value, "");
+        assert!(comment.per_file_values.iter().all(|value| value.is_empty()));
+    }
+
+    #[test]
+    fn revert_entries_by_key_restores_values_and_clears_deletion_markers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("album.dff");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&audio, b"FRM8 placeholder DFF carrier").expect("dff");
+        let cue_text = concat!(
+            "TITLE \"Original Album\"\n",
+            "FILE \"album.dff\" WAVE\n",
+            "  TRACK 01 AUDIO\n    TITLE \"First\"\n    INDEX 01 00:00:00\n",
+        )
+        .to_string();
+        std::fs::write(&cue, &cue_text).expect("cue");
+        let surface = MetadataCueSurface {
+            cue_path: cue.clone(),
+            audio_path: audio.clone(),
+            audio_paths: vec![audio.clone()],
+            track_audio_paths: vec![audio.clone()],
+            role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+            sheet: crate::tui::cue_parser::parse_cue(&cue_text),
+            cue_text,
+        };
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (mut state, _tracks) = build_metadata_editor_for_cue_surfaces_with_policy(
+            &mut app,
+            std::slice::from_ref(&surface),
+            0,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("open DFF sidecar album");
+        let album_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
+            .expect("album row");
+        let original = state.active_surface().entries[album_idx].value.clone();
+        metadata_editor_apply_inline_value_to_writable_slots(
+            &mut state,
+            album_idx,
+            "Changed".to_string(),
+        );
+        state.active_surface_mut().deleted.push(album_idx);
+        let keys = std::collections::BTreeSet::from(["ALBUM".to_string()]);
+        metadata_editor_revert_entries_by_key(&mut state, &keys);
+        let entry = &state.active_surface().entries[album_idx];
+        assert_eq!(entry.value, original);
+        assert_eq!(entry.per_file_values, entry.per_file_originals);
+        assert!(!state.active_surface().deleted.contains(&album_idx));
+    }
+
+    /// Reproduction of the field-reported refusal: a MULTI-FILE dff album
+    /// (one carrier per track) + sidecar cue, editing ALBUM and adding
+    /// DATE/GENRE, must NOT be refused — all three are CUE-representable.
+    #[test]
+    fn multifile_dff_sidecar_album_field_edits_are_cue_representable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let side_a = temp.path().join("01 - First.dff");
+        let side_b = temp.path().join("02 - Second.dff");
+        std::fs::write(&side_a, b"FRM8 placeholder DFF carrier").expect("dff a");
+        std::fs::write(&side_b, b"FRM8 placeholder DFF carrier").expect("dff b");
+        let cue = temp.path().join("album.cue");
+        let cue_text = concat!(
+            "PERFORMER \"Original Artist\"\n",
+            "TITLE \"Original Album\"\n",
+            "FILE \"01 - First.dff\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"First\"\n",
+            "    INDEX 01 00:00:00\n",
+            "FILE \"02 - Second.dff\" WAVE\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Second\"\n",
+            "    INDEX 01 00:00:00\n",
+        )
+        .to_string();
+        std::fs::write(&cue, &cue_text).expect("sidecar fixture");
+        let surface = MetadataCueSurface {
+            cue_path: cue.clone(),
+            audio_path: side_a.clone(),
+            audio_paths: vec![side_a.clone(), side_b.clone()],
+            track_audio_paths: vec![side_a.clone(), side_b.clone()],
+            role: crate::convert::split_cue_album::SplitCueMemberRole::SyntheticAlbumPart,
+            sheet: crate::tui::cue_parser::parse_cue(&cue_text),
+            cue_text,
+        };
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (mut state, tracks) = build_metadata_editor_for_cue_surfaces_with_policy(
+            &mut app,
+            std::slice::from_ref(&surface),
+            0,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("open multi-file DFF sidecar album");
+        assert_eq!(tracks, 2);
+        assert!(
+            metadata_editor_untaggable_sidecar_authority(&state),
+            "multi-file dff album must be recognized as untaggable sidecar authority",
+        );
+        // Edit ALBUM (existing row from the cue).
+        let album_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
+            .expect("album row from CUE");
+        metadata_editor_apply_inline_value_to_writable_slots(
+            &mut state,
+            album_idx,
+            "Thriller".to_string(),
+        );
+        // Edit or create DATE and GENRE the way the editor's add-field path does.
+        for (key, value) in [("DATE", "1984"), ("GENRE", "Pop")] {
+            if let Some(idx) = state
+                .active_surface()
+                .entries
+                .iter()
+                .position(|entry| entry.display_key.eq_ignore_ascii_case(key))
+            {
+                metadata_editor_apply_inline_value_to_writable_slots(
+                    &mut state,
+                    idx,
+                    value.to_string(),
+                );
+            } else {
+                let n_files = state.active_surface().paths.len();
+                state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
+                    row_scope: crate::tui::probe::RowScope::File,
+                    display_key: key.to_string(),
+                    item_key: crate::tui::probe::item_key_for_new_editor_row(key),
+                    value: value.to_string(),
+                    original: String::new(),
+                    is_binary: false,
+                    is_mixed: false,
+                    has_multiple_stored_values: false,
+                    per_file_stored_value_counts: vec![0; n_files],
+                    per_file_values: vec![value.to_string(); n_files],
+                    per_file_originals: vec![String::new(); n_files],
+                    mb_proposed_value: None,
+                    mb_proposed_per_file: None,
+                });
+            }
+        }
+        state.active_surface_mut().dirty = true;
+        let refusal = metadata_editor_native_multi_file_sidecar_preflight_error(&state);
+        assert!(
+            refusal.is_none(),
+            "ALBUM/DATE/GENRE are CUE-representable and must not be refused: {refusal:?}",
+        );
     }
 
     #[test]

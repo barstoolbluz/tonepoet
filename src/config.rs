@@ -33,6 +33,8 @@ pub struct TonepoetConfig {
     pub file_operations: FileOperationsConfig,
     #[serde(default)]
     pub naming: NamingConfig,
+    #[serde(default)]
+    pub metadata: MetadataConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,6 +43,18 @@ pub struct NamingConfig {
     /// interoperability. Disabled by default so canonical metadata is lossless.
     #[serde(default)]
     pub windows_portable: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataConfig {
+    /// When a sidecar-authoritative save includes changed fields the CUE
+    /// representation cannot persist, proceed with the save anyway: persist
+    /// every representable field, revert the unrepresentable ones (named in
+    /// the status line), and warn — instead of refusing the entire save.
+    /// Structural refusals (e.g. CUESHEET-row deletion, PERFORMER-inheritance
+    /// conflicts) still block regardless of this setting. Default: false.
+    #[serde(default)]
+    pub sidecar_save_with_warnings: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -492,6 +506,7 @@ impl Default for TonepoetConfig {
             browsing: BrowsingConfig::default(),
             file_operations: FileOperationsConfig::default(),
             naming: NamingConfig::default(),
+            metadata: MetadataConfig::default(),
         }
     }
 }
