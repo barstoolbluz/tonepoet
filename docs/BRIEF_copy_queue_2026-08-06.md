@@ -42,7 +42,10 @@ exact mappings, and supervisor boundaries form the additive seam for a future qu
   `total_pending_jobs`.
 
 ### Footer "details" slot — the user-designated minimize target.
-- Right side of the Browse context bar: `TuiButton::FileTaskMessages`
+- Right side of the SHARED footer context bar — `draw_footer` (draw_footer.rs:17) is
+  rendered by multiple screens (draw.rs ~77/453/480, convert_screen.rs ~127), each passing
+  `app.last_file_task_progress.is_some()`, so the slot is app-wide, not Browse-only:
+  `TuiButton::FileTaskMessages`
   (draw_footer.rs ~163-199, button_map.rs ~30), cyan bold, responsive
   (` details ` ≥18 cells → ` msgs ` → `d` at 1 cell, hitbox preserved at every width),
   clickable; today it appears only AFTER a task completes
@@ -83,7 +86,9 @@ While minimized:
   the existing narrow-width tiers and keep a clickable hitbox at 1 cell);
 - clicking the segment (or `:messages`) RESTORES the overlay to its live state;
 - job transitions while minimized keep the segment accurate (next queued job starts,
-  totals roll over) without stealing focus.
+  totals roll over) without stealing focus;
+- the segment is visible from EVERY screen that renders the shared footer (the flag is
+  already passed at each `draw_footer` call site) — switching tabs must not lose the meter.
 Post-completion, the slot returns to today's "details" behavior (retained last report).
 
 ### Q4 — Attention-demanding states never hide
