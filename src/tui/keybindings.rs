@@ -70866,6 +70866,126 @@ mod file_picker_browse_parity_regression_tests {
     use super::file_operation_safety_tests::{clipboard_copy_worker_for_test, clipboard_move_worker_for_test, worker_for_test, worker_for_test_with_policy};
     use crate::config::TonepoetConfig;
 
+    /// Empirical reproduction of the user-reported flow: highlight text in the
+    /// Browse inline RENAME editor, Ctrl+C, then paste back into the same
+    /// field — driven through the real `handle_key` dispatch, not the
+    /// text-input layer directly.
+    #[test]
+    fn inline_rename_copy_then_paste_round_trips_through_real_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("Album Name");
+        std::fs::create_dir(&target).expect("rename target");
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        let final_text = tui_file_picker::with_scoped_shared_text_clipboard("", || {
+            tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+                move |text| sink.borrow_mut().push(text.to_string()),
+                || {
+                    let mut app = AppState::new_for_test(TonepoetConfig::default());
+                    app.current_screen = AppScreen::Browse;
+                    begin_browse_inline_rename(&mut app, target.clone());
+                    let edit = app.browse_inline_edit.as_mut().expect("inline rename active");
+                    edit.input = super::super::text_input::TextInputState::new_selected(
+                        "Album Name".to_string(),
+                    );
+                    let (tx, _rx) = mpsc::channel(8);
+                    handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                        &tx,
+                    );
+                    assert_eq!(
+                        tui_file_picker::read_shared_text_clipboard(),
+                        "Album Name",
+                        "Ctrl+C in the rename editor must land on the shared text clipboard",
+                    );
+                    // Collapse the selection (End), then paste: text doubles.
+                    handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                        &tx,
+                    );
+                    handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                        &tx,
+                    );
+                    app.browse_inline_edit
+                        .as_ref()
+                        .expect("rename editor still active")
+                        .input
+                        .text
+                        .clone()
+                },
+            )
+        });
+        assert_eq!(
+            final_text, "Album NameAlbum Name",
+            "Ctrl+V in the rename editor must paste the copied text",
+        );
+        assert_eq!(
+            published.borrow().as_slice(),
+            &["Album Name".to_string()],
+            "rename-editor copy must mirror to the host clipboard hook exactly once",
+        );
+    }
+
+    /// Empirical reproduction of the second user-reported flow: context-menu
+    /// "Copy path" followed by Ctrl+V into the Browse `path:` input — again
+    /// through the production dispatch and context-action executor.
+    #[test]
+    fn copy_path_action_pastes_into_path_input_through_real_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("Thriller");
+        std::fs::create_dir(&target).expect("target dir");
+        let expected = target.display().to_string();
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        let pasted = tui_file_picker::with_scoped_shared_text_clipboard("", || {
+            tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+                move |text| sink.borrow_mut().push(text.to_string()),
+                || {
+                    let mut app = AppState::new_for_test(TonepoetConfig::default());
+                    app.current_screen = AppScreen::Browse;
+                    let (tx, _rx) = mpsc::channel(8);
+                    super::super::context_menu::execute_context_action(
+                        &mut app,
+                        super::super::context_menu::ContextAction::CopyPath(target.clone()),
+                        &tx,
+                        false,
+                    );
+                    assert_eq!(
+                        tui_file_picker::read_shared_text_clipboard(),
+                        expected,
+                        "Copy path must land on the shared text clipboard",
+                    );
+                    app.browse.path_input = Some(
+                        super::super::text_input::TextInputState::new(String::new()),
+                    );
+                    handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                        &tx,
+                    );
+                    app.browse
+                        .path_input
+                        .as_ref()
+                        .expect("path input still open")
+                        .text
+                        .clone()
+                },
+            )
+        });
+        assert_eq!(
+            pasted, expected,
+            "Ctrl+V into the path input must paste the copied path",
+        );
+        assert!(
+            published.borrow().contains(&expected),
+            "Copy path must mirror to the host clipboard hook",
+        );
+    }
+
     fn browse_file_entry(path: std::path::PathBuf) -> crate::tui::browse::BrowseEntry {
         let name = path
             .file_name()
