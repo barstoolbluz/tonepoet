@@ -8,7 +8,8 @@ Gate `cargo test --workspace --no-fail-fast` green; must stay green.
 
 ## Field history — third round on ONE user scenario. Close it for good.
 
-Scenario: `~/torrents/Michael Jackson – Thriller. 1984 Japan` — .dff carriers + sidecar
+Scenario: `~/torrents/Michael Jackson - Thriller. 1984 Japan` (plain hyphen — exact
+on-disk path) — .dff carriers + sidecar
 .cue. The user edits ALBUM/DATE/GENRE in the metadata editor and saves.
 
 1. **Round 1 (shipped):** untaggable carriers + sidecar cue became an editable
@@ -51,6 +52,7 @@ Scenario: `~/torrents/Michael Jackson – Thriller. 1984 Japan` — .dff carrier
   this is the same paths-vs-sheet shape-divergence family that caused round 2 — the fix
   landed in classification but the regeneration layer still gates on fragile shape
   equalities and fails SILENT instead of failing loud.
+
 ## GROUND TRUTH — the exact failing album (captured from the user's machine)
 
 `~/torrents/Michael Jackson - Thriller. 1984 Japan/` contains EXACTLY:
