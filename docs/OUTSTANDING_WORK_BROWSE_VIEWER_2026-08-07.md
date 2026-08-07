@@ -32,13 +32,15 @@ minimally to keep the renamed entry visible). No jump to top.
   `rebuild_tree_preserving_expansion()` + `refresh_with_search()` but **never sets
   `cursor_restore_target`** and never repositions to the renamed entry → the cursor falls to
   the top.
-- **Fix locus:** `complete_rename_plan` (1491). Before/around the refresh, set
-  `cursor_restore_target` to the renamed entry's NEW name (derivable from the rename
-  `result`, which carries the new path) and `ensure_visible()`, mirroring the CREATE path at
-  ~47883-47892. Preserve scroll. Handle multi-item renames (the plan can carry several)
-  sensibly — restore to the first/primary renamed entry. Also confirm the sequential-rename
-  (Tab/BackTab) flow (`sequential_inline_rename_target`, keybindings.rs:3699) doesn't
-  scroll-jump.
+- **Fix locus:** `complete_rename_plan` (1491). The new path is available in the report:
+  `result` is `Result<rename_plan::RenameExecutionReport, String>`, and each
+  `RenameExecutionReport.roots[i]` (`RenameExecutionRoot`, rename_plan.rs:197) carries
+  `source` and `destination: PathBuf` — so the restore name is
+  `roots[0].destination.file_name()`. Before/around the refresh, set
+  `cursor_restore_target` to that name and `ensure_visible()`, mirroring the CREATE path at
+  ~47883-47892. Preserve scroll. For a multi-item rename restore to the first/primary root.
+  Also confirm the sequential-rename (Tab/BackTab) flow (`sequential_inline_rename_target`,
+  keybindings.rs:3699) doesn't scroll-jump.
 - Likely relates to the parked [[browse_ux_hardening_track]] leftovers.
 
 ---
