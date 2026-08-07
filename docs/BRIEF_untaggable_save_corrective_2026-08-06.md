@@ -99,6 +99,18 @@ Implications you must reconcile:
 Even with this ground truth, keep the fix shape-general (C3): single-image, multi-FILE
 one-per-track, and extra-unreferenced-carrier folders all remain in scope.
 
+**Format generality — nothing here is DFF-specific.** The failing mechanisms key off
+shape/classification, not the carrier extension:
+- Define the untaggable class by the existing CLASSIFICATION (`FileReadState::Unsupported`
+  / the untaggable-sidecar authority predicate), not by an extension list — DFF, SHN, DTS,
+  AC3 today, and automatically whatever lofty cannot tag tomorrow.
+- The edit-time guard also protects GENUINE taggable multi-image albums (e.g. two FLAC
+  side-images + cue), where refusing per-track ALBUM is correct behavior. Your fix must
+  keep that protection intact for taggable multi-image shapes while unblocking
+  album-scoped edits — this distinction must come from the C3 invariant.
+- The B5 sidecar-materialization header fix (if you make one) applies to ALL untaggable
+  formats' generated cues, not just DFF.
+
 ## Outcomes
 
 **C1 — The edits persist.** On an untaggable-carrier sidecar album, saving edited
@@ -139,10 +151,13 @@ scoped to the rows they are actually about.
 the edit-time guard) AND save (`metadata_editor_save` level) — and assert on: the edit
 being ACCEPTED, the resulting cue file TEXT (contains the edited ALBUM/DATE/GENRE), the
 clean dirty-state afterwards, and the honest summary counts — for at least: (a)
-single-image dff multi-track; (b) multi-FILE dff one-per-track; (c) a folder containing an
-extra dff the cue does not reference; (d) an SHN or DTS variant. The existing tests that
-assert plan-level or guard-level outcomes were insufficient — they passed while the user's
-edit was refused and the user's save did nothing.
+single-image dff multi-track; (b) multi-FILE dff one-per-track (the ground-truth shape,
+NINE files); (c) a folder containing an extra dff the cue does not reference; (d) a
+non-DFF untaggable variant (SHN or DTS) exercising BOTH the edit path and the save path;
+(e) a taggable multi-image CONTROL case (e.g. two FLAC images + cue) proving the genuine
+per-track-ALBUM protection and all existing taggable behavior are unchanged. The existing
+tests that assert plan-level or guard-level outcomes were insufficient — they passed while
+the user's edit was refused and the user's save did nothing.
 
 ## Guardrails
 - Preserve round-2 behavior: key-based representability, structural refusals (CUESHEET
