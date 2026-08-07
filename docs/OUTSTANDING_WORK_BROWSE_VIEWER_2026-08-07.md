@@ -16,22 +16,30 @@ in a list and have to scroll all the way back.
 RENAMED entry (at its new sorted position) and the scroll offset is preserved (or adjusted
 minimally to keep the renamed entry visible). No jump to top.
 
-**Anchors / mechanism.**
+**Anchors / mechanism (audited — the rename path is ASYNC; note the real locus).**
 - The machinery already exists: `BrowseState.cursor_restore_target: Option<String>`
-  (src/tui/browse.rs:2738) restores the cursor to a NAMED entry after a refresh, and is used
-  after file-task completions (browse.rs:~4553, `refresh_after_file_task_nonblocking`
-  ~3675). The **rename path evidently does not set it to the new name** (and/or resets
-  `scroll = 0`).
-- Rename commit: `commit_browse_inline_edit` (keybindings.rs:3672) →
-  `BrowseInlineCommit::Rename` → `commit_browse_rename` (keybindings.rs ~3678 area). There
-  are many `state.scroll = 0` / cursor resets in the browse refresh paths
-  (keybindings.rs ~7989-8536) — the rename refresh likely goes through one.
-- **Fix direction:** on rename commit, set `cursor_restore_target = Some(new_name)` before
-  the folder refresh, and preserve `scroll` instead of zeroing it (or recompute from the
-  restored cursor). Verify the same for the sequential-rename (Tab/BackTab) flow
-  (`sequential_inline_rename_target`, keybindings.rs ~3699) so tabbing through renames
-  doesn't scroll-jump either.
-- Likely relates to the parked [browse_ux_hardening_track] leftovers.
+  (src/tui/browse.rs:2738) restores the cursor to a NAMED entry after a refresh. The
+  **CREATE path already does this correctly** and is the pattern to copy: after making a
+  file/folder it sets `cursor_restore_target = Some(name)`, calls `refresh_with_search`,
+  finds the entry by path, sets `selected_index`, and `ensure_visible()`
+  (keybindings.rs ~47883-47892).
+- Rename dispatch chain (async, not synchronous): `commit_browse_inline_edit`
+  (keybindings.rs:3672) → `commit_browse_rename` (keybindings.rs:**47919**) → which validates
+  and then `spawn_rename_plan(...)` — a BACKGROUND task, like the file-task workers — and
+  returns. On completion the event loop handles `AppMessage::RenamePlanComplete`
+  (event_loop.rs:5663) → `complete_rename_plan` (keybindings.rs:**1491**) →
+  `refresh_browse_after_undo_redo` (keybindings.rs:**1765**), which calls
+  `rebuild_tree_preserving_expansion()` + `refresh_with_search()` but **never sets
+  `cursor_restore_target`** and never repositions to the renamed entry → the cursor falls to
+  the top.
+- **Fix locus:** `complete_rename_plan` (1491). Before/around the refresh, set
+  `cursor_restore_target` to the renamed entry's NEW name (derivable from the rename
+  `result`, which carries the new path) and `ensure_visible()`, mirroring the CREATE path at
+  ~47883-47892. Preserve scroll. Handle multi-item renames (the plan can carry several)
+  sensibly — restore to the first/primary renamed entry. Also confirm the sequential-rename
+  (Tab/BackTab) flow (`sequential_inline_rename_target`, keybindings.rs:3699) doesn't
+  scroll-jump.
+- Likely relates to the parked [[browse_ux_hardening_track]] leftovers.
 
 ---
 
