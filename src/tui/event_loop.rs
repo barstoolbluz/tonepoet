@@ -59,6 +59,11 @@ pub async fn run_app(
     for message in startup_metadata_recovery_messages(&app.db, &app.browse.current_dir) {
         app.set_status(message);
     }
+    // Opt-in tmux/byobu OSC 52 setup ([ui] manage_tmux_clipboard). Quiet
+    // unless it changed something or failed.
+    if let Some(message) = super::tmux_clipboard::apply_if_enabled(&app.config) {
+        app.set_status(message);
+    }
     let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
 
     loop {

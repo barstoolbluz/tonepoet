@@ -4401,6 +4401,8 @@ For OSC 52 fallback inside tmux or byobu, add these settings to the tmux/byobu p
   set -g set-clipboard on
   set -g allow-passthrough on
 
+Tonepoet can apply these for you: set manage_tmux_clipboard = true under [ui] in config.toml and the next TUI start writes an idempotent, backed-up block to ~/.byobu/.tmux.conf (byobu) or ~/.tmux.conf (plain tmux). This will become a Config screen toggle once that screen is built out.
+
 Native helper failures, missing displays, denied clipboard access, and oversized payloads never block or invalidate Tonepoet's internal clipboard. OSC 52 fallback is capped at 64 KiB; larger content remains available internally.";
                     app.active_overlay = ActiveOverlay::CuePreview(Box::new(
                         super::app::CuePreviewState::new_readonly_help(

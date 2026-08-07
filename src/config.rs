@@ -349,6 +349,17 @@ pub struct UiConfig {
     /// Runtime-selectable TUI theme slug. Unknown values fall back to Tokyo Night.
     #[serde(default = "crate::tui::theme::default_theme_name")]
     pub theme: String,
+    /// Opt-in: on TUI startup inside tmux/byobu, ensure the user's tmux
+    /// config enables OSC 52 clipboard passthrough (`set-clipboard on` +
+    /// version-appropriate companions) via an idempotent, marker-delimited,
+    /// backed-up block. Byobu users get `~/.byobu/.tmux.conf` (byobu never
+    /// reads `~/.tmux.conf`); plain tmux gets `~/.tmux.conf`. Outside a
+    /// tmux-backed session this does nothing. See `tui::tmux_clipboard`.
+    /// TODO(config-screen): must be exposed as an explicit toggle in the
+    /// new/improved Config screen once it is built out; until then it is
+    /// reachable only by hand-editing config.toml.
+    #[serde(default)]
+    pub manage_tmux_clipboard: bool,
 }
 
 fn default_initial_screen() -> String {
@@ -367,6 +378,7 @@ impl Default for UiConfig {
             convert_default_action: default_convert_action(),
             compare_keep_reference: false,
             theme: crate::tui::theme::default_theme_name(),
+            manage_tmux_clipboard: false,
         }
     }
 }
