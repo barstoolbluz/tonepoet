@@ -20,9 +20,20 @@ Scenario: `~/torrents/Michael Jackson – Thriller. 1984 Japan` — .dff carrier
    the cue does not reference. Fixed by making representability key-based
    (`metadata_editor_cue_sidecar_representable_entry`, keybindings.rs ~10232). Also added
    `[metadata] sidecar_save_with_warnings`.
-3. **Round 3 (CURRENT DEFECT):** the refusal is gone, but the save now reports:
-   **"Metadata 0 saved, 1 CUE sidecar already current, unsaved changes remain."**
-   Nothing is written; the edits stay dirty. The same user, same album, third failure.
+3. **Round 3 (CURRENT DEFECTS — two symptoms, same disease):**
+   (a) The save reports **"Metadata 0 saved, 1 CUE sidecar already current, unsaved
+   changes remain."** — nothing written, edits stranded dirty.
+   (b) Editing is BLOCKED before saving even enters the picture: attempting to edit the
+   album name — or, per the user, ANY field — yields **"metadata editor: Cannot persist
+   per-track ALBUM on a multi-image CUE album."** The edit-time guard
+   `metadata_editor_unpersistable_per_track_reason` (keybindings.rs ~9910, consulted by
+   `metadata_editor_apply_inline_value_to_writable_slots` before applying any value) still
+   classifies entries via `entry.is_track_scoped(surface.paths.len())` — the exact
+   per-file-count scope inference round 2 removed from SAVE-time representability. On the
+   user's shape it misreads album-scoped fields as per-track and refuses the edit; note
+   the message also calls the album "multi-image", evidence the surface's shape state
+   diverges from the entry dimensions.
+   The same user, same album, third failure.
 
 ## Diagnosis (bounded; verify and complete it)
 
@@ -66,16 +77,28 @@ property.
 `sheet.audio_paths.len()`, `sheet.track_sources.len()`, or per-entry value counts, decide
 deliberately what the INVARIANT is for untaggable sidecar surfaces and enforce/normalize
 it at construction time (the editor builder) rather than scattering divergent guards at
-save time. Round 2's lesson generalizes: shape inference at the leaves keeps breaking;
-establish the shape once, then trust it.
+EDIT time and SAVE time. Round 2's lesson generalizes: shape inference at the leaves keeps
+breaking — it has now produced three distinct user-facing failures from three different
+leaves (representability, edit-time persistability, cue regeneration). Establish the shape
+once, then trust it everywhere.
 
-**C4 — End-to-end proof.** Tests must drive the REAL production save path
-(`metadata_editor_save` level) and assert on the resulting cue file TEXT (contains the
-edited ALBUM/DATE/GENRE), the clean dirty-state afterwards, and the honest summary counts —
-for at least: (a) single-image dff multi-track; (b) multi-FILE dff one-per-track; (c) a
-folder containing an extra dff the cue does not reference; (d) an SHN or DTS variant.
-The existing tests that assert plan-level outcomes were insufficient — they passed while
-the user's save did nothing.
+**C3a — Edits must be POSSIBLE.** The edit-time guard
+(`metadata_editor_unpersistable_per_track_reason` and any sibling gates consulted before a
+value is applied) must permit editing every CUE-representable field on every legitimate
+untaggable-sidecar shape. Whatever scope decision it needs must come from the established
+invariant (C3), not from per-file-count inference. Guards protecting genuinely structural
+rows (TRACKNUMBER positionality on multi-image albums, CUESHEET) keep their protection —
+scoped to the rows they are actually about.
+
+**C4 — End-to-end proof.** Tests must drive the REAL production paths — edit application
+(`metadata_editor_apply_inline_value_to_writable_slots` through the dispatch that consults
+the edit-time guard) AND save (`metadata_editor_save` level) — and assert on: the edit
+being ACCEPTED, the resulting cue file TEXT (contains the edited ALBUM/DATE/GENRE), the
+clean dirty-state afterwards, and the honest summary counts — for at least: (a)
+single-image dff multi-track; (b) multi-FILE dff one-per-track; (c) a folder containing an
+extra dff the cue does not reference; (d) an SHN or DTS variant. The existing tests that
+assert plan-level or guard-level outcomes were insufficient — they passed while the user's
+edit was refused and the user's save did nothing.
 
 ## Guardrails
 - Preserve round-2 behavior: key-based representability, structural refusals (CUESHEET
