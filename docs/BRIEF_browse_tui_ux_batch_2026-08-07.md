@@ -33,8 +33,9 @@ counterpart — it insists on reading/writing the carriers directly.
 **Diagnosis (consensus-verified by two independent audits).**
 - Read side: for a `TransferCarrier::SidecarCue` with role `MetadataSidecar`, the transfer
   path extracts cue entries (`cue_sheet_transfer_entries`, tag_interchange.rs:3042) but then
-  STILL reads the carriers: `read_transfer_source_entries(track_audio_paths, …)?`
-  (tag_interchange.rs:3061). That reads each `.dff` via lofty → `UnknownFormat` →
+  STILL reads the carriers (the `MetadataSidecar` arm at tag_interchange.rs:3060):
+  `read_transfer_source_entries(track_audio_paths, …)?` (call at tag_interchange.rs:3062).
+  That reads each `.dff` via lofty → `UnknownFormat` →
   `MetadataReadIssueKind::UnsupportedFormat` (probe.rs ~7912) → `blocks_metadata_use()` true
   (probe.rs:7905, true for anything but `RecoverableTagWarning`) → the whole op aborts
   (tag_interchange.rs:3154, "(N of M sources unreadable)"). The `?` makes one unreadable
