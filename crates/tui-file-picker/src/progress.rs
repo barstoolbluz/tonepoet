@@ -13,6 +13,7 @@ const DEFAULT_MAX_CONFLICT_RECORDS: usize = 8;
 const MIN_PROGRESS_DIALOG_WIDTH: u16 = 52;
 const PROGRESS_DIALOG_HEIGHT: u16 = 12;
 const CONFLICT_DIALOG_HEIGHT: u16 = 15;
+const MAX_VISIBLE_QUEUED_JOBS: usize = 4;
 
 /// Generic category label for a long-running file-oriented task.
 ///
@@ -150,6 +151,20 @@ impl FileTaskScope {
             destination_summary: None,
         }
     }
+}
+
+/// Host-owned queued task summary rendered below the active transfer.
+///
+/// The reusable crate stores no executable plan or control channel for queued
+/// jobs; it only renders immutable summaries and emits cancellation intent by
+/// queue id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueuedFileTaskSummary {
+    pub queue_id: u64,
+    pub source_summary: String,
+    pub destination_summary: String,
+    pub item_count: usize,
+    pub recovered: bool,
 }
 
 /// One retained error or warning record for a file-task progress overlay.
@@ -442,6 +457,8 @@ pub enum FileTaskUserAction {
     Resume,
     SkipCurrent,
     Abort,
+    Minimize,
+    CancelQueued(u64),
     Acknowledge,
     ToggleAutoClose(bool),
     ChooseConflictResolution(ConflictResolution),
@@ -588,6 +605,8 @@ enum ProgressHitAction {
     PauseResume,
     SkipCurrent,
     Abort,
+    Minimize,
+    CancelQueued(u64),
     Acknowledge,
     ToggleDetails,
     ToggleAutoClose,
@@ -632,6 +651,10 @@ pub struct FileTaskProgressState {
     task_controls_available: bool,
     auto_close_available: bool,
     auto_close_progress: bool,
+    minimize_available: bool,
+    queued_jobs: Vec<QueuedFileTaskSummary>,
+    queued_selection: usize,
+    queued_scroll: usize,
 }
 
 impl FileTaskProgressState {
@@ -663,12 +686,62 @@ impl FileTaskProgressState {
             task_controls_available: true,
             auto_close_available,
             auto_close_progress: false,
+            minimize_available: false,
+            queued_jobs: Vec::new(),
+            queued_selection: 0,
+            queued_scroll: 0,
         }
     }
 
     pub fn set_scope(&mut self, scope: FileTaskScope) {
         self.scope = Some(scope);
         self.updated_at = Instant::now();
+    }
+
+    pub fn set_minimize_available(&mut self, available: bool) {
+        self.minimize_available = available;
+    }
+
+    #[must_use]
+    pub const fn minimize_available(&self) -> bool {
+        self.minimize_available
+    }
+
+    pub fn set_queued_jobs(&mut self, jobs: Vec<QueuedFileTaskSummary>) {
+        self.queued_jobs = jobs;
+        self.queued_selection = self
+            .queued_selection
+            .min(self.queued_jobs.len().saturating_sub(1));
+        self.keep_queued_selection_visible();
+    }
+
+    fn keep_queued_selection_visible(&mut self) {
+        if self.queued_jobs.is_empty() {
+            self.queued_selection = 0;
+            self.queued_scroll = 0;
+            return;
+        }
+        self.queued_selection = self.queued_selection.min(self.queued_jobs.len() - 1);
+        if self.queued_selection < self.queued_scroll {
+            self.queued_scroll = self.queued_selection;
+        } else if self.queued_selection
+            >= self.queued_scroll.saturating_add(MAX_VISIBLE_QUEUED_JOBS)
+        {
+            self.queued_scroll = self
+                .queued_selection
+                .saturating_add(1)
+                .saturating_sub(MAX_VISIBLE_QUEUED_JOBS);
+        }
+        self.queued_scroll = self.queued_scroll.min(
+            self.queued_jobs
+                .len()
+                .saturating_sub(MAX_VISIBLE_QUEUED_JOBS),
+        );
+    }
+
+    #[must_use]
+    pub fn queued_jobs(&self) -> &[QueuedFileTaskSummary] {
+        &self.queued_jobs
     }
 
     /// Enable or suppress pause/skip/abort controls for the live task.
@@ -907,6 +980,33 @@ impl FileTaskProgressState {
             return self.handle_conflict_key(key);
         }
 
+        if !self.details_open && !self.queued_jobs.is_empty() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.queued_selection = (self.queued_selection + 1) % self.queued_jobs.len();
+                    self.keep_queued_selection_visible();
+                    return FileTaskUserAction::None;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.queued_selection = if self.queued_selection == 0 {
+                        self.queued_jobs.len() - 1
+                    } else {
+                        self.queued_selection - 1
+                    };
+                    self.keep_queued_selection_visible();
+                    return FileTaskUserAction::None;
+                }
+                KeyCode::Char('x') => {
+                    return self
+                        .queued_jobs
+                        .get(self.queued_selection)
+                        .map(|job| FileTaskUserAction::CancelQueued(job.queue_id))
+                        .unwrap_or(FileTaskUserAction::None);
+                }
+                _ => {}
+            }
+        }
+
         if self.is_terminal() {
             if self.details_open {
                 match key.code {
@@ -941,6 +1041,13 @@ impl FileTaskProgressState {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => FileTaskUserAction::Acknowledge,
                 _ => FileTaskUserAction::None,
             };
+        }
+
+        if matches!(key.code, KeyCode::Char('m'))
+            && self.minimize_available
+            && matches!(&self.kind, FileTaskKind::Copy | FileTaskKind::Move)
+        {
+            return FileTaskUserAction::Minimize;
         }
 
         if !self.task_controls_available || matches!(self.phase, FileTaskPhase::Cancelling) {
@@ -995,6 +1102,10 @@ impl FileTaskProgressState {
                 if self.task_controls_available
                     && !matches!(self.phase, FileTaskPhase::Cancelling) => FileTaskUserAction::Abort,
             ProgressHitAction::Abort => FileTaskUserAction::None,
+            ProgressHitAction::Minimize => FileTaskUserAction::Minimize,
+            ProgressHitAction::CancelQueued(queue_id) => {
+                FileTaskUserAction::CancelQueued(queue_id)
+            }
             ProgressHitAction::Acknowledge => FileTaskUserAction::Acknowledge,
             ProgressHitAction::ToggleDetails => {
                 self.details_open = !self.details_open;
@@ -1078,10 +1189,13 @@ impl FileTaskProgressState {
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.hit_regions.clear();
         self.last_area = Some(area);
+        let queued_rows = self.queued_jobs.len().min(MAX_VISIBLE_QUEUED_JOBS) as u16;
         let dialog_height = if self.conflict.is_some() {
             CONFLICT_DIALOG_HEIGHT
         } else if self.details_open {
             area.height.min(30).max(16)
+        } else if queued_rows > 0 {
+            PROGRESS_DIALOG_HEIGHT.saturating_add(2).saturating_add(queued_rows)
         } else {
             PROGRESS_DIALOG_HEIGHT
         };
@@ -1114,7 +1228,6 @@ impl FileTaskProgressState {
 
     fn render_progress_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
         debug_assert!(area.width >= MIN_PROGRESS_DIALOG_WIDTH);
-        debug_assert_eq!(area.height, PROGRESS_DIALOG_HEIGHT);
 
         frame.render_widget(Paragraph::new("").style(self.theme.progress_dialog), area);
         self.render_title_bar(frame, area, 0);
@@ -1126,9 +1239,114 @@ impl FileTaskProgressState {
         self.render_total_summary_row(frame, area, 6);
         self.render_total_progress_row(frame, area, 7);
         self.render_transfer_stats_row(frame, area, 8);
-        self.render_rule(frame, area, 9, '\u{251c}', '\u{2524}');
-        self.render_action_row(frame, area, 10, self.progress_buttons());
-        self.render_rule(frame, area, 11, '\u{2514}', '\u{2518}');
+
+        let mut row = 9;
+        if !self.queued_jobs.is_empty() {
+            self.render_rule(frame, area, row, '\u{251c}', '\u{2524}');
+            row = row.saturating_add(1);
+            self.render_queue_header(frame, area, row);
+            row = row.saturating_add(1);
+            let end = self
+                .queued_scroll
+                .saturating_add(MAX_VISIBLE_QUEUED_JOBS)
+                .min(self.queued_jobs.len());
+            for index in self.queued_scroll..end {
+                self.render_queued_job_row(frame, area, row, index);
+                row = row.saturating_add(1);
+            }
+        }
+        self.render_rule(frame, area, row, '\u{251c}', '\u{2524}');
+        row = row.saturating_add(1);
+        self.render_action_row(frame, area, row, self.progress_buttons(area.width));
+        row = row.saturating_add(1);
+        self.render_rule(frame, area, row, '\u{2514}', '\u{2518}');
+    }
+
+    fn render_queue_header(&self, frame: &mut Frame<'_>, area: Rect, row: u16) {
+        let visible_start = self.queued_scroll.saturating_add(1);
+        let visible_end = self
+            .queued_scroll
+            .saturating_add(MAX_VISIBLE_QUEUED_JOBS)
+            .min(self.queued_jobs.len());
+        let range = if self.queued_jobs.len() > MAX_VISIBLE_QUEUED_JOBS {
+            format!(" · showing {visible_start}-{visible_end}")
+        } else {
+            String::new()
+        };
+        self.render_bordered_text(
+            frame,
+            area,
+            row,
+            &format!("  Queued transfers: {}{}   j/k select · x cancel", self.queued_jobs.len(), range),
+            self.theme.progress_text_dim,
+        );
+    }
+
+    fn render_queued_job_row(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        row: u16,
+        index: usize,
+    ) {
+        let Some(job) = self.queued_jobs.get(index) else {
+            return;
+        };
+        // Clone the small presentation payload before mutating hit regions so
+        // this renderer never holds an immutable borrow of `self` across a
+        // mutable one.
+        let queue_id = job.queue_id;
+        let source_summary = job.source_summary.clone();
+        let destination_summary = job.destination_summary.clone();
+        let item_count = job.item_count;
+        let recovered = job.recovered;
+        let selected = index == self.queued_selection;
+        let marker = if selected { "›" } else { " " };
+        let recovery = if recovered { "recovered · " } else { "" };
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let cancel = " x ";
+        let prefix = format!("  {} {}{} item{}: ", marker, recovery, item_count, if item_count == 1 { "" } else { "s" });
+        let arrow = " → ";
+        let available = inner_width
+            .saturating_sub(crate::display_width::width(&prefix))
+            .saturating_sub(crate::display_width::width(arrow))
+            .saturating_sub(crate::display_width::width(cancel));
+        let source_width = available / 2;
+        let destination_width = available.saturating_sub(source_width);
+        let source = fit_text(&source_summary, source_width).0;
+        let destination = fit_text(&destination_summary, destination_width).0;
+        let style = if selected {
+            self.theme.progress_button_focused
+        } else {
+            self.theme.progress_text
+        };
+        let mut spans = vec![
+            Span::styled(prefix, style),
+            Span::styled(source, style),
+            Span::styled(arrow, self.theme.progress_text_dim),
+            Span::styled(destination, style),
+        ];
+        let used = spans
+            .iter()
+            .map(|span| crate::display_width::width(span.content.as_ref()))
+            .sum::<usize>();
+        let pad = inner_width
+            .saturating_sub(used)
+            .saturating_sub(crate::display_width::width(cancel));
+        spans.push(Span::raw(" ".repeat(pad)));
+        let cancel_x = area
+            .x
+            .saturating_add(1)
+            .saturating_add(used.saturating_add(pad) as u16);
+        spans.push(Span::styled(cancel, self.theme.progress_destructive));
+        let rect = Rect::new(cancel_x, area.y.saturating_add(row), 3, 1);
+        if let Some(clipped) = intersect_rect(rect, area) {
+            self.hit_regions.push(ProgressHitRegion {
+                rect: clipped,
+                action: ProgressHitAction::CancelQueued(queue_id),
+            });
+        }
+        self.render_bordered_spans(frame, area, row, spans);
     }
 
     fn render_details_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1473,7 +1691,7 @@ impl FileTaskProgressState {
         self.render_bordered_spans(frame, area, row, spans);
     }
 
-    fn progress_buttons(&self) -> Vec<(String, ProgressHitAction, Style)> {
+    fn progress_buttons(&self, area_width: u16) -> Vec<(String, ProgressHitAction, Style)> {
         if self.is_terminal() {
             let mut buttons = Vec::new();
             if self.has_details() {
@@ -1505,36 +1723,52 @@ impl FileTaskProgressState {
                 })
                 .unwrap_or_default();
         }
-        let pause_label = if matches!(self.phase, FileTaskPhase::Paused) {
-            " p Resume "
-        } else {
-            " p Pause "
+
+        let wide = area_width >= 78;
+        let pause_label = match (wide, matches!(self.phase, FileTaskPhase::Paused)) {
+            (true, true) => " p Resume ",
+            (true, false) => " p Pause ",
+            (false, true) => "p Resume",
+            (false, false) => "p Pause",
         };
         let mut buttons = Vec::new();
         if self.auto_close_available {
             buttons.push((
-                format!(
-                    "[{}] Close when done",
-                    if self.auto_close_progress { "x" } else { " " }
-                ),
+                if wide {
+                    format!(
+                        "[{}] Close when done",
+                        if self.auto_close_progress { "x" } else { " " }
+                    )
+                } else {
+                    format!("[{}] Close", if self.auto_close_progress { "x" } else { " " })
+                },
                 ProgressHitAction::ToggleAutoClose,
                 self.theme.progress_button,
             ));
         }
+        if self.minimize_available
+            && matches!(&self.kind, FileTaskKind::Copy | FileTaskKind::Move)
+        {
+            buttons.push((
+                if wide { " m Minimize ".to_string() } else { "m Min".to_string() },
+                ProgressHitAction::Minimize,
+                self.theme.progress_button,
+            ));
+        }
         if self.task_controls_available {
-            if self.auto_close_available {
-                buttons.extend([
-                    (pause_label.trim().to_string(), ProgressHitAction::PauseResume, self.theme.progress_button),
-                    ("s Skip".to_string(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
-                    ("Esc Abort".to_string(), ProgressHitAction::Abort, self.theme.progress_destructive),
-                ]);
-            } else {
-                buttons.extend([
-                    (pause_label.to_string(), ProgressHitAction::PauseResume, self.theme.progress_button),
-                    (" s Skip ".to_string(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
-                    (" Esc Abort ".to_string(), ProgressHitAction::Abort, self.theme.progress_destructive),
-                ]);
-            }
+            buttons.extend([
+                (pause_label.to_string(), ProgressHitAction::PauseResume, self.theme.progress_button),
+                (
+                    if wide { " s Skip ".to_string() } else { "s Skip".to_string() },
+                    ProgressHitAction::SkipCurrent,
+                    self.theme.progress_button,
+                ),
+                (
+                    if wide { " Esc Abort ".to_string() } else { "Esc Abort".to_string() },
+                    ProgressHitAction::Abort,
+                    self.theme.progress_destructive,
+                ),
+            ]);
         }
         buttons
     }
@@ -1568,7 +1802,7 @@ impl FileTaskProgressState {
 
     fn conflict_buttons(&self) -> Vec<(String, ProgressHitAction, Style)> {
         let Some(conflict) = self.conflict.as_ref() else {
-            return self.progress_buttons();
+            return self.progress_buttons(MIN_PROGRESS_DIALOG_WIDTH);
         };
         conflict
             .choices
@@ -1998,6 +2232,7 @@ mod tests {
             "Copying files",
             FilePickerTheme::default(),
         );
+        state.set_minimize_available(true);
         state.started_at = Instant::now() - Duration::from_secs(2);
         state.set_scope(FileTaskScope {
             source_root: Some(PathBuf::from("~/Documents/Audio")),
@@ -2086,7 +2321,7 @@ mod tests {
         );
         assert_eq!(
             buffer_row(buffer, 10, 52),
-            "│[ ] Close when done   p Pause   s Skip   Esc Abort│"
+            "│ [ ] Close   m Min   p Pause   s Skip   Esc Abort │"
         );
         assert_eq!(
             buffer_row(buffer, 11, 52),
@@ -2101,15 +2336,15 @@ mod tests {
         assert_eq!(buffer.get(4, 5).fg, Color::Cyan);
         assert_eq!(buffer.get(29, 5).fg, Color::DarkGray);
         assert_eq!(buffer.get(47, 5).fg, Color::White);
-        assert_eq!(buffer.get(1, 10).fg, Color::Black);
-        assert_eq!(buffer.get(1, 10).bg, Color::Cyan);
-        assert_eq!(buffer.get(42, 10).fg, Color::Black);
-        assert_eq!(buffer.get(42, 10).bg, Color::Red);
+        assert_eq!(buffer.get(2, 10).fg, Color::Black);
+        assert_eq!(buffer.get(2, 10).bg, Color::Cyan);
+        assert_eq!(buffer.get(41, 10).fg, Color::Black);
+        assert_eq!(buffer.get(41, 10).bg, Color::Red);
 
         let toggle = state.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 1,
+                column: 2,
                 row: 10,
                 modifiers: KeyModifiers::NONE,
             },
@@ -2118,10 +2353,21 @@ mod tests {
         assert_eq!(toggle, FileTaskUserAction::ToggleAutoClose(true));
         assert!(state.auto_close());
 
+        let minimize = state.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 14,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 52, 12),
+        );
+        assert_eq!(minimize, FileTaskUserAction::Minimize);
+
         let pause = state.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 23,
+                column: 22,
                 row: 10,
                 modifiers: KeyModifiers::NONE,
             },
@@ -2132,7 +2378,7 @@ mod tests {
         let skip = state.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 33,
+                column: 32,
                 row: 10,
                 modifiers: KeyModifiers::NONE,
             },
@@ -2143,7 +2389,7 @@ mod tests {
         let abort = state.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 42,
+                column: 41,
                 row: 10,
                 modifiers: KeyModifiers::NONE,
             },
@@ -2312,7 +2558,7 @@ mod tests {
             state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             FileTaskUserAction::None
         );
-        assert!(state.progress_buttons().is_empty());
+        assert!(state.progress_buttons(MIN_PROGRESS_DIALOG_WIDTH).is_empty());
     }
 
     #[test]
@@ -2807,6 +3053,123 @@ mod tests {
             .iter()
             .all(|root| root.proof.is_none()));
         assert!(report.roots.iter().all(|root| root.proof.is_some()));
+    }
+
+
+    #[test]
+    fn running_progress_does_not_minimize_until_host_enables_it() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            FilePickerTheme::default(),
+        );
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+            FileTaskUserAction::None,
+        );
+    }
+
+    #[test]
+    fn running_progress_emits_explicit_minimize_action() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            FilePickerTheme::default(),
+        );
+        state.set_minimize_available(true);
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+            FileTaskUserAction::Minimize,
+        );
+    }
+
+    #[test]
+    fn queued_job_selection_scrolls_and_can_cancel_hidden_rows() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Move,
+            "Moving files",
+            FilePickerTheme::default(),
+        );
+        state.set_queued_jobs(
+            (1..=6)
+                .map(|queue_id| QueuedFileTaskSummary {
+                    queue_id,
+                    source_summary: format!("source-{queue_id}"),
+                    destination_summary: format!("destination-{queue_id}"),
+                    item_count: 1,
+                    recovered: false,
+                })
+                .collect(),
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                FileTaskUserAction::None,
+            );
+        }
+        assert_eq!(state.queued_selection, 5);
+        assert_eq!(state.queued_scroll, 2);
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            FileTaskUserAction::CancelQueued(6),
+        );
+    }
+
+    #[test]
+    fn queued_job_cancel_button_emits_queue_id() {
+        let backend = TestBackend::new(80, 15);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Copy,
+            "Copying files",
+            FilePickerTheme::default(),
+        );
+        state.set_queued_jobs(vec![QueuedFileTaskSummary {
+            queue_id: 78,
+            source_summary: "queued source".to_string(),
+            destination_summary: "queued destination".to_string(),
+            item_count: 1,
+            recovered: false,
+        }]);
+        terminal
+            .draw(|frame| state.render(frame, Rect::new(0, 0, 80, 15)))
+            .expect("render");
+
+        let action = state.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 77,
+                row: 11,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 15),
+        );
+        assert_eq!(action, FileTaskUserAction::CancelQueued(78));
+    }
+
+    #[test]
+    fn terminal_progress_keeps_keyboard_queue_cancellation_available() {
+        let mut state = FileTaskProgressState::new(
+            FileTaskKind::Move,
+            "Moving files",
+            FilePickerTheme::default(),
+        );
+        state.set_queued_jobs(vec![QueuedFileTaskSummary {
+            queue_id: 77,
+            source_summary: "queued source".to_string(),
+            destination_summary: "queued destination".to_string(),
+            item_count: 2,
+            recovered: false,
+        }]);
+        state.apply_update(FileTaskProgressUpdate::Failed {
+            status: "failed".to_string(),
+            totals: ProgressTotals::default(),
+        });
+
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            FileTaskUserAction::CancelQueued(77),
+        );
     }
 
 }

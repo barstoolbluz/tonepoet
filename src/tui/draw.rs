@@ -73,6 +73,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
             super::draw_header::draw_header(f, chunks[0], theme);
             super::draw_status::draw_queue_stats_strip(f, chunks[2], app, theme);
             draw_queue_screen(f, chunks[4], app, theme);
+            let file_task_footer = app.file_task_footer_state();
             let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
             super::draw_footer::draw_footer(
                 f,
@@ -80,7 +81,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
                 app.current_screen,
                 &mut app.button_map,
                 status_msg,
-                app.last_file_task_progress.is_some(),
+                file_task_footer,
                 theme,
             );
         }
@@ -449,6 +450,7 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
     }
 
     // Footer
+    let file_task_footer = app.file_task_footer_state();
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     super::draw_footer::draw_footer(
         f,
@@ -456,7 +458,7 @@ fn draw_settings_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: su
         app.current_screen,
         &mut app.button_map,
         status_msg,
-        app.last_file_task_progress.is_some(),
+        file_task_footer,
         theme,
     );
 }
@@ -476,6 +478,7 @@ fn draw_placeholder_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut
     )]));
     f.render_widget(msg, chunks[0]);
 
+    let file_task_footer = app.file_task_footer_state();
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     super::draw_footer::draw_footer(
         f,
@@ -483,7 +486,7 @@ fn draw_placeholder_screen(f: &mut Frame, area: ratatui::layout::Rect, app: &mut
         app.current_screen,
         &mut app.button_map,
         status_msg,
-        app.last_file_task_progress.is_some(),
+        file_task_footer,
         theme,
     );
 }

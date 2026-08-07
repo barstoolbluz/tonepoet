@@ -1365,7 +1365,8 @@ fn confirmation_footer_hint_bg(
             | super::app::ConfirmAction::TagMaintenance {
                 kind: super::probe::TagMaintenanceKind::RemoveAll,
                 ..
-            } => theme.destructive,
+            }
+            | super::app::ConfirmAction::QuitWithQueuedFileTransfers { .. } => theme.destructive,
             _ => theme.green,
         },
         "d" => theme.destructive,

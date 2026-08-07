@@ -123,6 +123,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
     }
 
     draw_convert_action_bar(f, chunks[9], &mut app.button_map, theme);
+    let file_task_footer = app.file_task_footer_state();
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
         f,
@@ -130,7 +131,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
         app.current_screen,
         &mut app.button_map,
         status_msg,
-        app.last_file_task_progress.is_some(),
+        file_task_footer,
         theme,
     );
 

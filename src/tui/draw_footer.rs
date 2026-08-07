@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::AppScreen;
+use super::app::{AppScreen, FileTaskFooterState};
 use super::button_map::{ButtonRenderMap, TuiButton};
 
 /// Draw both footer rows (tabs + context bar) into a 2-line area.
@@ -20,7 +20,7 @@ pub fn draw_footer(
     current_screen: AppScreen,
     buttons: &mut ButtonRenderMap,
     status_message: Option<&str>,
-    has_file_task_messages: bool,
+    file_task: Option<FileTaskFooterState>,
     theme: super::theme::Theme,
 ) {
     if area.height < 2 {
@@ -39,7 +39,7 @@ pub fn draw_footer(
         current_screen,
         buttons,
         status_message,
-        has_file_task_messages,
+        file_task,
         theme,
     );
 }
@@ -109,11 +109,11 @@ fn draw_context_bar(
     current: AppScreen,
     buttons: &mut ButtonRenderMap,
     status_message: Option<&str>,
-    has_file_task_messages: bool,
+    file_task: Option<FileTaskFooterState>,
     theme: super::theme::Theme,
 ) {
-    let details_label = file_task_details_label(area.width, has_file_task_messages);
-    let details_width = details_label.len() as u16;
+    let details_label = file_task_details_label(area.width, file_task);
+    let details_width = details_label.chars().count() as u16;
     let content_area = Rect::new(
         area.x,
         area.y,
@@ -160,20 +160,21 @@ fn draw_context_bar(
         f.render_widget(Paragraph::new(Line::from(spans)), content_area);
     }
 
-    if let Some(details_area) = file_task_details_rect(area, has_file_task_messages) {
+    if let Some(details_area) = file_task_details_rect(area, file_task) {
         buttons.record_button(TuiButton::FileTaskMessages, details_area);
+        let attention = file_task.is_some_and(|state| state.attention);
+        let style = Style::default()
+            .fg(if attention { theme.destructive } else { theme.cyan })
+            .add_modifier(Modifier::BOLD);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                details_label,
-                Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD),
-            ))),
+            Paragraph::new(Line::from(Span::styled(details_label, style))),
             details_area,
         );
     }
 }
 
-fn file_task_details_rect(area: Rect, has_file_task_messages: bool) -> Option<Rect> {
-    let width = file_task_details_label(area.width, has_file_task_messages).len() as u16;
+fn file_task_details_rect(area: Rect, file_task: Option<FileTaskFooterState>) -> Option<Rect> {
+    let width = file_task_details_label(area.width, file_task).chars().count() as u16;
     (width > 0).then(|| {
         Rect::new(
             area.x.saturating_add(area.width.saturating_sub(width)),
@@ -184,18 +185,69 @@ fn file_task_details_rect(area: Rect, has_file_task_messages: bool) -> Option<Re
     })
 }
 
-fn file_task_details_label(width: u16, has_file_task_messages: bool) -> &'static str {
-    if !has_file_task_messages || width == 0 {
-        ""
-    } else if width >= 18 {
-        " details "
-    } else if width >= 7 {
-        " msgs "
-    } else {
-        // Preserve a one-cell mouse target even in extremely narrow layouts;
-        // keyboard access via :messages remains available as well.
-        "d"
+fn compact_progress_bar(ratio: Option<f64>) -> String {
+    let Some(ratio) = ratio.filter(|ratio| ratio.is_finite()) else {
+        return "···".to_string();
+    };
+    let filled = (ratio.clamp(0.0, 1.0) * 3.0).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(3usize.saturating_sub(filled)))
+}
+
+fn progress_percent(ratio: Option<f64>) -> String {
+    ratio
+        .filter(|ratio| ratio.is_finite())
+        .map(|ratio| format!("{:.0}%", ratio.clamp(0.0, 1.0) * 100.0))
+        .unwrap_or_else(|| "--%".to_string())
+}
+
+fn file_task_details_label(width: u16, file_task: Option<FileTaskFooterState>) -> String {
+    let Some(state) = file_task else {
+        return String::new();
+    };
+    if width == 0 {
+        return String::new();
     }
+    if !state.live {
+        return if width >= 18 {
+            " details ".to_string()
+        } else if width >= 7 {
+            " msgs ".to_string()
+        } else {
+            "d".to_string()
+        };
+    }
+
+    let percent = progress_percent(state.ratio);
+    let queue_count = if state.queued > 999 {
+        "999+".to_string()
+    } else {
+        state.queued.to_string()
+    };
+    let queue_suffix = (state.queued > 0)
+        .then(|| format!(" +{queue_count}"))
+        .unwrap_or_default();
+    let compact_queue = (state.queued > 0)
+        .then(|| format!("+{queue_count}"))
+        .unwrap_or_default();
+    let candidates = [
+        format!(
+            " [{}] {}{} ",
+            compact_progress_bar(state.ratio),
+            percent,
+            queue_suffix
+        ),
+        format!(" {}{} ", percent, compact_queue),
+        percent.clone(),
+        if state.attention {
+            "!".to_string()
+        } else {
+            "t".to_string()
+        },
+    ];
+    candidates
+        .into_iter()
+        .find(|label| label.chars().count() <= width as usize)
+        .unwrap_or_default()
 }
 
 /// A single keybinding hint shown in the context bar.
@@ -309,26 +361,54 @@ fn truncate_groups_to_width(groups: &[Vec<Hint>], available: usize) -> Vec<Vec<H
 #[cfg(test)]
 mod tests {
     use super::{file_task_details_label, file_task_details_rect};
+    use crate::tui::app::FileTaskFooterState;
     use ratatui::layout::Rect;
 
+    fn retained() -> Option<FileTaskFooterState> {
+        Some(FileTaskFooterState {
+            live: false,
+            ratio: Some(1.0),
+            queued: 0,
+            attention: false,
+        })
+    }
+
+    fn live(queued: usize, attention: bool) -> Option<FileTaskFooterState> {
+        Some(FileTaskFooterState {
+            live: true,
+            ratio: Some(0.61),
+            queued,
+            attention,
+        })
+    }
+
     #[test]
-    fn file_task_details_keeps_a_mouse_target_at_every_nonzero_width() {
-        assert_eq!(file_task_details_label(0, true), "");
+    fn retained_details_keeps_a_mouse_target_at_every_nonzero_width() {
+        assert_eq!(file_task_details_label(0, retained()), "");
         for width in 1..7 {
-            assert_eq!(file_task_details_label(width, true), "d");
+            assert_eq!(file_task_details_label(width, retained()), "d");
         }
-        assert_eq!(file_task_details_label(7, true), " msgs ");
-        assert_eq!(file_task_details_label(17, true), " msgs ");
-        assert_eq!(file_task_details_label(18, true), " details ");
-        assert_eq!(file_task_details_label(80, false), "");
+        assert_eq!(file_task_details_label(7, retained()), " msgs ");
+        assert_eq!(file_task_details_label(17, retained()), " msgs ");
+        assert_eq!(file_task_details_label(18, retained()), " details ");
+        assert_eq!(file_task_details_label(80, None), "");
 
         assert_eq!(
-            file_task_details_rect(Rect::new(9, 4, 1, 1), true),
+            file_task_details_rect(Rect::new(9, 4, 1, 1), retained()),
             Some(Rect::new(9, 4, 1, 1)),
         );
-        assert_eq!(
-            file_task_details_rect(Rect::new(9, 4, 0, 1), true),
-            None,
-        );
+        assert_eq!(file_task_details_rect(Rect::new(9, 4, 0, 1), retained()), None);
+    }
+
+    #[test]
+    fn live_transfer_label_degrades_without_losing_restore_hitbox() {
+        assert_eq!(file_task_details_label(30, live(2, false)), " [██░] 61% +2 ");
+        assert_eq!(file_task_details_label(10, live(2, false)), " 61%+2 ");
+        assert_eq!(file_task_details_label(3, live(0, false)), "61%");
+        assert_eq!(file_task_details_label(1, live(0, false)), "t");
+        assert_eq!(file_task_details_label(1, live(0, true)), "!");
+        let huge = file_task_details_label(8, live(usize::MAX, false));
+        assert!(huge.chars().count() <= 8);
+        assert_eq!(huge, "61%");
     }
 }

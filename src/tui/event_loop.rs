@@ -68,7 +68,10 @@ pub async fn run_app(
         // folder classification/probe/stat work in the middle of scrolling.
         let input_waiting_at_frame_start = event::poll(Duration::from_millis(0))?;
 
-        // 1. Refresh items from the manager
+        // 1. Refresh items from the manager. Startup journal recoveries and
+        // any queue left waiting behind a transient modal claim the serial
+        // execution slot as soon as presentation state permits.
+        super::keybindings::maybe_start_next_file_transfer(app, &tx);
         app.refresh_items();
         app.clamp_selection();
         app.clear_expired_status();
@@ -134,6 +137,9 @@ pub async fn run_app(
         // 3. Check quit
         if app.should_quit {
             if defer_quit_for_browse_archive_metadata(app, &tx) {
+                continue;
+            }
+            if defer_quit_for_queued_file_transfers(app) {
                 continue;
             }
             if app.pending_browse_archive_rename.is_some() {
@@ -370,6 +376,85 @@ fn flush_browse_deferred_work(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
     // `terminal.clear()`; ratatui's normal diff render is sufficient for these
     // ordinary state changes.
     warm_backlog_remaining || app.browse.has_browse_deferred_work()
+}
+
+fn defer_quit_for_queued_file_transfers(app: &mut AppState) -> bool {
+    let queued_count = app.file_transfers.queued.len();
+    if queued_count == 0 || app.quit_with_queued_file_transfers_confirmed {
+        return false;
+    }
+
+    let journal_backed_count = app
+        .file_transfers
+        .queued
+        .iter()
+        .filter(|queued| queued.is_journal_backed())
+        .count();
+    let unjournaled_count = queued_count.saturating_sub(journal_backed_count);
+
+    app.should_quit = false;
+    if matches!(
+        &app.active_overlay,
+        ActiveOverlay::Confirmation {
+            action: super::app::ConfirmAction::QuitWithQueuedFileTransfers { .. },
+            ..
+        }
+    ) {
+        return true;
+    }
+    let displaced = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    if !matches!(displaced, ActiveOverlay::None) {
+        app.queued_quit_preempted_overlay = Some(Box::new(displaced));
+    }
+    let mut consequences = Vec::new();
+    if unjournaled_count > 0 {
+        let transfer_grammar = if unjournaled_count == 1 {
+            "transfer has"
+        } else {
+            "transfers have"
+        };
+        consequences.push(format!(
+            "{unjournaled_count} unstarted {transfer_grammar} no journal and will be lost.",
+        ));
+    }
+    if journal_backed_count > 0 {
+        consequences.push(format!(
+            "{journal_backed_count} journal-backed recovery transfer{} will leave the current in-memory queue but remain pending for the next startup.",
+            if journal_backed_count == 1 { "" } else { "s" },
+        ));
+    }
+    let confirm_verb = match (unjournaled_count > 0, journal_backed_count > 0) {
+        (true, true) => {
+            "Y discards the unjournaled work, defers the journal-backed recovery work, and quits."
+        }
+        (true, false) => "Y discards the queued transfers and quits.",
+        (false, true) => {
+            "Y clears the in-memory recovery queue and quits; the journals remain pending for startup recovery."
+        }
+        (false, false) => unreachable!("non-empty queue must have a classified entry"),
+    };
+    app.active_overlay = ActiveOverlay::Confirmation {
+        message: format!(
+            "Quit with {queued_count} queued file transfer{}?
+
+The running transfer, if any, has journal protection. {}
+
+{confirm_verb} N/Esc keeps the queue and returns to the app.",
+            if queued_count == 1 { "" } else { "s" },
+            consequences.join(" "),
+        ),
+        action: super::app::ConfirmAction::QuitWithQueuedFileTransfers {
+            unjournaled_count,
+            journal_backed_count,
+        },
+    };
+    app.set_status(match (unjournaled_count > 0, journal_backed_count > 0) {
+        (true, true) => "Quit requires confirmation: unjournaled queued transfers will be lost; journal-backed recoveries remain pending",
+        (true, false) => "Quit requires confirmation because unjournaled queued file transfers are not persisted",
+        (false, true) => "Quit requires confirmation; journal-backed recoveries will be deferred to the next startup",
+        (false, false) => unreachable!("non-empty queue must have a classified entry"),
+    });
+    true
 }
 
 fn defer_quit_for_browse_archive_metadata(
@@ -1387,55 +1472,135 @@ fn reduce_file_task_progress(
         .as_ref()
         .map(|(retained_session_id, _)| *retained_session_id);
     let update_is_stale = authoritative_session_id.is_some_and(|id| id > session_id);
+    let demands_attention = matches!(
+        &update,
+        tui_file_picker::FileTaskProgressUpdate::ShowConflict { .. }
+            | tui_file_picker::FileTaskProgressUpdate::Failed { .. }
+            | tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                phase: tui_file_picker::FileTaskPhase::Stalled,
+                ..
+            }
+    );
     let mut status_to_set: Option<String> = None;
     let mut refresh_after_terminal = false;
     let mut live_progress_snapshot = None;
-    match &mut app.active_overlay {
-        ActiveOverlay::FileTaskProgress(session)
-            if session.session_id == session_id && session.is_live_task() =>
+    let mut handled_background_session = false;
+    if app
+        .queued_quit_preempted_overlay
+        .as_deref()
+        .is_some_and(|overlay| {
+            matches!(
+                overlay,
+                ActiveOverlay::FileTaskProgress(session)
+                    if session.session_id == session_id && session.is_live_task()
+            )
+        })
+    {
+        if let Some(ActiveOverlay::FileTaskProgress(session)) = app
+            .queued_quit_preempted_overlay
+            .as_deref_mut()
         {
             session.progress.apply_update(update.clone());
             live_progress_snapshot = Some(session.progress.clone());
-            status_to_set = status;
+            status_to_set = status.clone();
             refresh_after_terminal = terminal;
+            handled_background_session = true;
         }
-        ActiveOverlay::FileTaskProgress(session)
-            if session.session_id == session_id && session.is_retained_viewer() =>
-        {
-            // Keep an open read-only viewer current for the same underlying
-            // task, but never use its clone as ordering or retention authority.
+        if demands_attention {
+            if let Some(parked) = app.queued_quit_preempted_overlay.take() {
+                match *parked {
+                    ActiveOverlay::FileTaskProgress(session) => {
+                        let displaced = std::mem::replace(
+                            &mut app.active_overlay,
+                            ActiveOverlay::FileTaskProgress(session),
+                        );
+                        if !matches!(displaced, ActiveOverlay::None) {
+                            app.file_task_preempted_overlay = Some(Box::new(displaced));
+                        }
+                    }
+                    other => {
+                        app.queued_quit_preempted_overlay = Some(Box::new(other));
+                    }
+                }
+            }
+        }
+    }
+
+    if !handled_background_session
+        && app
+            .minimized_file_task_progress
+            .as_ref()
+            .is_some_and(|session| session.session_id == session_id && session.is_live_task())
+    {
+        if let Some(session) = app.minimized_file_task_progress.as_mut() {
             session.progress.apply_update(update.clone());
-            if !update_is_stale {
+            live_progress_snapshot = Some(session.progress.clone());
+            status_to_set = status.clone();
+            refresh_after_terminal = terminal;
+            handled_background_session = true;
+        }
+        if demands_attention {
+            if let Some(session) = app.minimized_file_task_progress.take() {
+                app.file_transfers.keep_minimized_across_jobs = false;
+                let displaced = std::mem::replace(
+                    &mut app.active_overlay,
+                    ActiveOverlay::FileTaskProgress(session),
+                );
+                if !matches!(displaced, ActiveOverlay::None) {
+                    app.file_task_preempted_overlay = Some(Box::new(displaced));
+                }
+            }
+        }
+    }
+
+    if !handled_background_session {
+        match &mut app.active_overlay {
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == session_id && session.is_live_task() =>
+            {
+                session.progress.apply_update(update.clone());
+                live_progress_snapshot = Some(session.progress.clone());
                 status_to_set = status;
                 refresh_after_terminal = terminal;
             }
-        }
-        ActiveOverlay::FileTaskProgress(session) if session.is_live_task() => {
-            if session.session_id > session_id {
-                status_to_set = Some(format!(
-                    "file task: ignored stale progress for session {session_id}"
-                ));
-            } else {
-                // The presentation layer still owns an older live overlay, but
-                // the newer task's session-owned retained state must progress.
-                status_to_set = status;
-                refresh_after_terminal = terminal;
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == session_id && session.is_retained_viewer() =>
+            {
+                // Keep an open read-only viewer current for the same underlying
+                // task, but never use its clone as ordering or retention authority.
+                session.progress.apply_update(update.clone());
+                if !update_is_stale {
+                    status_to_set = status;
+                    refresh_after_terminal = terminal;
+                }
             }
-        }
-        ActiveOverlay::FileTaskProgress(_) => {
-            // A retained-results viewer is presentation-only and never
-            // participates in session ordering. Authoritative retained state
-            // below decides whether this update is current or stale.
-            if !update_is_stale {
-                status_to_set = status;
-                refresh_after_terminal = terminal;
+            ActiveOverlay::FileTaskProgress(session) if session.is_live_task() => {
+                if session.session_id > session_id {
+                    status_to_set = Some(format!(
+                        "file task: ignored stale progress for session {session_id}"
+                    ));
+                } else {
+                    // The presentation layer still owns an older live overlay, but
+                    // the newer task's session-owned retained state must progress.
+                    status_to_set = status;
+                    refresh_after_terminal = terminal;
+                }
             }
+            ActiveOverlay::FileTaskProgress(_) => {
+                // A retained-results viewer is presentation-only and never
+                // participates in session ordering. Authoritative retained state
+                // below decides whether this update is current or stale.
+                if !update_is_stale {
+                    status_to_set = status;
+                    refresh_after_terminal = terminal;
+                }
+            }
+            _ if terminal && !update_is_stale => {
+                status_to_set = status;
+                refresh_after_terminal = true;
+            }
+            _ => {}
         }
-        _ if terminal && !update_is_stale => {
-            status_to_set = status;
-            refresh_after_terminal = true;
-        }
-        _ => {}
     }
 
     if let Some(progress) = live_progress_snapshot {
@@ -1475,19 +1640,14 @@ fn reduce_file_task_progress(
     }
     let defer_clipboard_refresh = terminal
         && app
-            .browse
-            .pending_clipboard_paste
-            .as_ref()
-            .is_some_and(|pending| pending.session_id == session_id);
+            .file_transfers
+            .pending_by_session
+            .contains_key(&session_id);
     if refresh_after_terminal && !defer_clipboard_refresh {
         app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
         super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
     }
-}
-
-fn path_lexists(path: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn terminal_update_from_completion_report(
@@ -1565,6 +1725,34 @@ fn reduce_file_task_complete(
             }
         }
     }
+    let mut parked_auto_close = false;
+    if let Some(ActiveOverlay::FileTaskProgress(session)) = app
+        .queued_quit_preempted_overlay
+        .as_deref_mut()
+    {
+        if session.session_id == session_id && session.is_live_task() {
+            if !session.progress.is_terminal() {
+                session.progress.apply_update(terminal_update.clone());
+            }
+            session.progress.append_completion_report(&report);
+            parked_auto_close = report_finished_cleanly
+                && session.progress.auto_close_available()
+                && session.progress.auto_close();
+            active_progress_snapshot = Some(session.progress.clone());
+        }
+    }
+    if parked_auto_close {
+        app.queued_quit_preempted_overlay = None;
+    }
+    if let Some(session) = app.minimized_file_task_progress.as_mut() {
+        if session.session_id == session_id && session.is_live_task() {
+            if !session.progress.is_terminal() {
+                session.progress.apply_update(terminal_update.clone());
+            }
+            session.progress.append_completion_report(&report);
+            active_progress_snapshot = Some(session.progress.clone());
+        }
+    }
     if let Some(progress) = active_progress_snapshot {
         app.last_file_task_progress = Some((session_id, progress));
     } else {
@@ -1622,24 +1810,21 @@ fn reduce_file_task_complete(
         app.active_overlay = ActiveOverlay::None;
     }
 
-    let matches_pending = app
-        .browse
-        .pending_clipboard_paste
-        .as_ref()
-        .is_some_and(|pending| pending.session_id == session_id);
-    if !matches_pending {
+    let Some(pending) = app.file_transfers.pending_by_session.remove(&session_id) else {
+        let requires_attention = !report_finished_cleanly || undo_record_warning.is_some();
         if let Some(warning) = undo_record_warning {
             app.set_status(format!(
                 "file task completed, but undo was not retained: {warning}"
             ));
         }
+        // Direct Copy/Move jobs own the active scheduler slot without a
+        // clipboard reconciliation record. A duplicate or late completion for
+        // an older session must not clear, block, or de-minimize a newer job.
+        if app.file_transfers.active_session_id == Some(session_id) {
+            finalize_file_transfer_scheduler(app, session_id, requires_attention, tx);
+        }
         return;
-    }
-    let pending = app
-        .browse
-        .pending_clipboard_paste
-        .take()
-        .expect("matching pending clipboard paste checked above");
+    };
 
     let mut completed_sources = Vec::new();
     let mut completed_destinations = Vec::new();
@@ -1710,31 +1895,47 @@ fn reduce_file_task_complete(
         }
     }
     let all_completed = completed_sources.len() == pending.clipboard.paths().len();
-    app.browse.filesystem_clipboard = if all_completed {
-        if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Copy {
-            Some(pending.clipboard.clone())
+    let clipboard_still_owned_by_job = pending
+        .clipboard_owner_generation
+        .is_some_and(|generation| {
+            generation == app.browse.filesystem_clipboard_generation
+                && app
+                    .browse
+                    .filesystem_clipboard
+                    .as_ref()
+                    .is_some_and(|clipboard| clipboard == &pending.clipboard)
+        });
+    if clipboard_still_owned_by_job {
+        app.browse.filesystem_clipboard = if all_completed {
+            if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Copy {
+                Some(pending.clipboard.clone())
+            } else {
+                None
+            }
+        } else {
+            tui_file_picker::FilesystemClipboard::new(
+                pending.clipboard.mode(),
+                retry_sources.clone(),
+            )
+        };
+        app.browse.filesystem_clipboard_retry_plan = if !all_completed {
+            // Whichever plan is retained, the user-facing retry token must exclude
+            // roots the worker proved complete/committed — matching the retained
+            // clipboard above. The durable journal (whose path retain_sources
+            // preserves) remains authoritative for those roots' deferred cleanup.
+            worker_retry_plan
+                .as_ref()
+                .and_then(|retry| retry.retain_sources(&retry_sources))
+                .or_else(|| {
+                    pending
+                        .retry_plan
+                        .as_ref()
+                        .and_then(|retry| retry.retain_sources(&retry_sources))
+                })
         } else {
             None
-        }
-    } else {
-        tui_file_picker::FilesystemClipboard::new(pending.clipboard.mode(), retry_sources.clone())
-    };
-    app.browse.filesystem_clipboard_retry_plan = if !all_completed {
-        // Whichever plan is retained, the user-facing retry token must exclude
-        // roots the worker proved complete/committed — matching the retained
-        // clipboard above. The durable journal (whose path retain_sources
-        // preserves) remains authoritative for those roots' deferred cleanup.
-        worker_retry_plan
-            .and_then(|retry| retry.retain_sources(&retry_sources))
-            .or_else(|| {
-                pending
-                    .retry_plan
-                    .as_ref()
-                    .and_then(|retry| retry.retain_sources(&retry_sources))
-            })
-    } else {
-        None
-    };
+        };
+    }
 
     // Completion reduction must remain control-plane-only. Directory scans run
     // on the existing cancellable scan worker; tree rebuilding and selection
@@ -1793,10 +1994,109 @@ fn reduce_file_task_complete(
     if let Some(warning) = undo_record_warning {
         status.push_str(&format!("; undo was not retained: {warning}"));
     }
+    if !clipboard_still_owned_by_job {
+        status.push_str("; current clipboard was changed after enqueue and was left untouched");
+    }
     if requires_attention {
         app.set_status(status);
     } else {
         app.set_routine_file_operation_status(status);
+    }
+    finalize_file_transfer_scheduler(app, session_id, requires_attention, tx);
+}
+
+pub(super) fn finalize_file_transfer_scheduler(
+    app: &mut AppState,
+    session_id: u64,
+    requires_attention: bool,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if app.file_transfers.active_session_id == Some(session_id) {
+        app.file_transfers.active_session_id = None;
+    }
+
+    let minimized = app
+        .minimized_file_task_progress
+        .as_ref()
+        .is_some_and(|session| session.session_id == session_id);
+    if requires_attention {
+        app.file_transfers.blocked_for_attention = true;
+        app.file_transfers.keep_minimized_across_jobs = false;
+        let mut restored_parked_progress = false;
+        if let Some(parked) = app.queued_quit_preempted_overlay.take() {
+            match *parked {
+                ActiveOverlay::FileTaskProgress(session)
+                    if session.session_id == session_id && session.is_live_task() =>
+                {
+                    let displaced = std::mem::replace(
+                        &mut app.active_overlay,
+                        ActiveOverlay::FileTaskProgress(session),
+                    );
+                    if !matches!(displaced, ActiveOverlay::None) {
+                        app.file_task_preempted_overlay = Some(Box::new(displaced));
+                    }
+                    restored_parked_progress = true;
+                }
+                other => {
+                    app.queued_quit_preempted_overlay = Some(Box::new(other));
+                }
+            }
+        }
+        if restored_parked_progress {
+            // Attention preempted the quit confirmation; it is parked in
+            // `file_task_preempted_overlay` and can return after resolution.
+        } else if minimized {
+            if let Some(session) = app.minimized_file_task_progress.take() {
+                let displaced = std::mem::replace(
+                    &mut app.active_overlay,
+                    ActiveOverlay::FileTaskProgress(session),
+                );
+                if !matches!(displaced, ActiveOverlay::None) {
+                    app.file_task_preempted_overlay = Some(Box::new(displaced));
+                }
+            }
+        } else if !matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session) if session.session_id == session_id
+        ) {
+            if let Some((retained_id, progress)) = app.last_file_task_progress.clone() {
+                if retained_id == session_id {
+                    app.active_overlay = ActiveOverlay::FileTaskProgress(
+                        super::app::FileTaskProgressSession::retained_viewer(
+                            retained_id,
+                            progress,
+                        ),
+                    );
+                }
+            }
+        }
+        app.sync_file_transfer_queue_surfaces();
+        return;
+    }
+
+    if minimized {
+        app.minimized_file_task_progress = None;
+    }
+    let has_queued = !app.file_transfers.queued.is_empty();
+    let should_release_visible_progress = has_queued || app.file_task_preempted_overlay.is_some();
+    if should_release_visible_progress
+        && matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session) if session.session_id == session_id
+        )
+    {
+        app.active_overlay = ActiveOverlay::None;
+    }
+    if matches!(app.active_overlay, ActiveOverlay::None) {
+        if let Some(preempted) = app.file_task_preempted_overlay.take() {
+            app.active_overlay = *preempted;
+        }
+    }
+    if has_queued {
+        super::keybindings::maybe_start_next_file_transfer(app, tx);
+    } else {
+        app.file_transfers.keep_minimized_across_jobs = false;
+        app.sync_file_transfer_queue_surfaces();
     }
 }
 
@@ -2621,6 +2921,87 @@ fn build_recovery_listing_from_staging(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveRepackageProgressSurface {
+    Active,
+    Preempted,
+}
+
+fn is_matching_archive_repackage_session(
+    session: &super::app::FileTaskProgressSession,
+    expected_session_id: u64,
+) -> bool {
+    session.session_id == expected_session_id
+        && session.is_live_task()
+        && matches!(&session.progress.kind, tui_file_picker::FileTaskKind::Archive)
+}
+
+fn archive_repackage_progress_surface(
+    app: &AppState,
+    expected_session_id: u64,
+) -> Option<ArchiveRepackageProgressSurface> {
+    if matches!(
+        &app.active_overlay,
+        super::app::ActiveOverlay::FileTaskProgress(session)
+            if is_matching_archive_repackage_session(session, expected_session_id)
+    ) {
+        return Some(ArchiveRepackageProgressSurface::Active);
+    }
+    if matches!(
+        app.file_task_preempted_overlay.as_deref(),
+        Some(super::app::ActiveOverlay::FileTaskProgress(session))
+            if is_matching_archive_repackage_session(session, expected_session_id)
+    ) {
+        return Some(ArchiveRepackageProgressSurface::Preempted);
+    }
+    None
+}
+
+fn archive_repackage_progress_session(
+    app: &AppState,
+    expected_session_id: u64,
+) -> Option<&super::app::FileTaskProgressSession> {
+    if let super::app::ActiveOverlay::FileTaskProgress(session) = &app.active_overlay {
+        if is_matching_archive_repackage_session(session, expected_session_id) {
+            return Some(session);
+        }
+    }
+    match app.file_task_preempted_overlay.as_deref() {
+        Some(super::app::ActiveOverlay::FileTaskProgress(session))
+            if is_matching_archive_repackage_session(session, expected_session_id) => Some(session),
+        _ => None,
+    }
+}
+
+fn archive_repackage_progress_session_mut(
+    app: &mut AppState,
+    expected_session_id: u64,
+) -> Option<&mut super::app::FileTaskProgressSession> {
+    if let super::app::ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+        if is_matching_archive_repackage_session(session, expected_session_id) {
+            return Some(session);
+        }
+    }
+    match app.file_task_preempted_overlay.as_deref_mut() {
+        Some(super::app::ActiveOverlay::FileTaskProgress(session))
+            if is_matching_archive_repackage_session(session, expected_session_id) => Some(session),
+        _ => None,
+    }
+}
+
+fn replace_archive_repackage_progress_surface(
+    app: &mut AppState,
+    surface: ArchiveRepackageProgressSurface,
+    replacement: super::app::ActiveOverlay,
+) {
+    match surface {
+        ArchiveRepackageProgressSurface::Active => app.active_overlay = replacement,
+        ArchiveRepackageProgressSurface::Preempted => {
+            app.file_task_preempted_overlay = Some(Box::new(replacement));
+        }
+    }
+}
+
 fn handle_archive_repackage_progress(
     app: &mut AppState,
     archive_path: std::path::PathBuf,
@@ -2641,22 +3022,13 @@ fn handle_archive_repackage_progress(
     }
 
     let status = snapshot.status.clone();
-    let expected_session_id = Some(progress_session_id);
-    let owns_progress_surface = if let super::app::ActiveOverlay::FileTaskProgress(session) =
-        &mut app.active_overlay
-    {
-        if Some(session.session_id) == expected_session_id {
-            session
-                .progress
-                .apply_update(archive_repackage_file_task_update(snapshot));
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if owns_progress_surface {
+    let progress_surface = archive_repackage_progress_surface(app, progress_session_id);
+    if let Some(session) = archive_repackage_progress_session_mut(app, progress_session_id) {
+        session
+            .progress
+            .apply_update(archive_repackage_file_task_update(snapshot));
+    }
+    if progress_surface == Some(ArchiveRepackageProgressSurface::Active) {
         app.set_status(status);
     }
 }
@@ -2723,12 +3095,11 @@ fn archive_repackage_file_task_update(
 
 fn current_archive_repackage_totals(
     app: &AppState,
-    expected_session_id: Option<u64>,
+    expected_session_id: u64,
 ) -> tui_file_picker::ProgressTotals {
-    match &app.active_overlay {
-        super::app::ActiveOverlay::FileTaskProgress(session)
-            if Some(session.session_id) == expected_session_id => session.progress.totals,
-        _ => tui_file_picker::ProgressTotals {
+    archive_repackage_progress_session(app, expected_session_id)
+        .map(|session| session.progress.totals)
+        .unwrap_or_else(|| tui_file_picker::ProgressTotals {
             items_done: 0,
             items_total: Some(1),
             item_unit: tui_file_picker::ProgressUnit::Files,
@@ -2744,19 +3115,16 @@ fn current_archive_repackage_totals(
             renamed: 0,
             merged: 0,
             not_attempted: 0,
-        },
-    }
+        })
 }
 
 fn apply_archive_repackage_terminal_update(
     app: &mut AppState,
-    expected_session_id: Option<u64>,
+    expected_session_id: u64,
     update: tui_file_picker::FileTaskProgressUpdate,
 ) {
-    if let super::app::ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
-        if Some(session.session_id) == expected_session_id {
-            session.progress.apply_update(update);
-        }
+    if let Some(session) = archive_repackage_progress_session_mut(app, expected_session_id) {
+        session.progress.apply_update(update);
     }
 }
 
@@ -2839,18 +3207,13 @@ fn handle_archive_repackage_result(
         return;
     };
     let editor_owns_staging = context.editor_owns_staging;
-    let expected_progress_session_id = Some(progress_session_id);
+    let progress_surface = archive_repackage_progress_surface(app, progress_session_id);
     app.browse_archive_repackage_progress_session_id = None;
-    let owns_prompt_slot = matches!(
-        &app.active_overlay,
-        super::app::ActiveOverlay::FileTaskProgress(session)
-            if Some(session.session_id) == expected_progress_session_id
-    );
+    let owns_prompt_slot = progress_surface.is_some();
     let quit_after_repackage = app.quit_after_browse_archive_repackage;
     app.quit_after_browse_archive_repackage = false;
 
-    let mut terminal_totals =
-        current_archive_repackage_totals(app, expected_progress_session_id);
+    let mut terminal_totals = current_archive_repackage_totals(app, progress_session_id);
 
     match result {
         Ok(report) => {
@@ -2861,7 +3224,7 @@ fn handle_archive_repackage_result(
             }
             apply_archive_repackage_terminal_update(
                 app,
-                expected_progress_session_id,
+                progress_session_id,
                 tui_file_picker::FileTaskProgressUpdate::Finished {
                     status: "Archive repackaged".to_string(),
                     totals: terminal_totals,
@@ -2929,7 +3292,7 @@ fn handle_archive_repackage_result(
                 .saturating_sub(terminal_totals.items_done);
             apply_archive_repackage_terminal_update(
                 app,
-                expected_progress_session_id,
+                progress_session_id,
                 tui_file_picker::FileTaskProgressUpdate::Aborted {
                     status: "Archive repackage cancelled; staged edits preserved".to_string(),
                     totals: terminal_totals,
@@ -2941,8 +3304,11 @@ fn handle_archive_repackage_result(
             app.should_quit = false;
             if editor_owns_staging {
                 preserve_editor_owned_archive_repackage_context(app, &context);
-                if owns_prompt_slot {
-                    app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                if let Some(surface) = progress_surface {
+                    replace_archive_repackage_progress_surface(
+                        app,
+                        surface,
+                        super::app::ActiveOverlay::Confirmation {
                         message: format!(
                             "Archive save was cancelled for {}.\n\nYour staged metadata edits are still preserved in this session and in the recovery database. Y retries the save. D discards the staged edits. N/Esc keeps them for later retry.",
                             archive_path.display()
@@ -2951,7 +3317,8 @@ fn handle_archive_repackage_result(
                             context,
                             error: "archive save cancelled".to_string(),
                         },
-                    };
+                        },
+                    );
                 }
             }
             if owns_prompt_slot || !editor_owns_staging {
@@ -2970,26 +3337,30 @@ fn handle_archive_repackage_result(
             terminal_totals.errors = 1;
             apply_archive_repackage_terminal_update(
                 app,
-                expected_progress_session_id,
+                progress_session_id,
                 tui_file_picker::FileTaskProgressUpdate::Failed {
                     status: format!("Archive save failed: {err}"),
                     totals: terminal_totals,
                 },
             );
             preserve_editor_owned_archive_repackage_context(app, &context);
-            if owns_prompt_slot {
+            if let Some(surface) = progress_surface {
                 let message = format!(
                     "Archive save failed for {}.\n\nY retries the save. D discards your staged edits. N/Esc keeps the staged edits for later retry. Mouse Cancel opens an explicit discard confirmation.\n\n{}",
                     archive_path.display(),
                     err
                 );
-                app.active_overlay = super::app::ActiveOverlay::Confirmation {
-                    message,
-                    action: super::app::ConfirmAction::ArchiveRepackageFailure {
-                        context,
-                        error: err.clone(),
+                replace_archive_repackage_progress_surface(
+                    app,
+                    surface,
+                    super::app::ActiveOverlay::Confirmation {
+                        message,
+                        action: super::app::ConfirmAction::ArchiveRepackageFailure {
+                            context,
+                            error: err.clone(),
+                        },
                     },
-                };
+                );
             }
             if quit_after_repackage {
                 app.should_quit = false;
@@ -7014,7 +7385,7 @@ mod browse_bracketed_paste_tests {
         handle_paste(&mut app, "terminal clipboard payload is intentionally ignored", &test_tx());
 
         assert!(
-            app.browse.pending_clipboard_paste.is_some(),
+            !app.file_transfers.pending_by_session.is_empty(),
             "intercepted Ctrl+V must become file paste when no editor owns focus"
         );
     }
@@ -7041,7 +7412,7 @@ mod browse_bracketed_paste_tests {
 
         handle_paste(&mut app, "ignored terminal payload", &test_tx());
 
-        assert!(app.browse.pending_clipboard_paste.is_some());
+        assert!(!app.file_transfers.pending_by_session.is_empty());
     }
 
     #[tokio::test]
@@ -7248,7 +7619,7 @@ mod browse_bracketed_paste_tests {
 
         handle_paste(&mut app, "terminal text", &test_tx());
 
-        assert!(app.browse.pending_clipboard_paste.is_none());
+        assert!(app.file_transfers.pending_by_session.is_empty());
         assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
             message.contains("return to Browse")
         }));
@@ -9984,6 +10355,211 @@ mod sentinel_clamp_status_tests {
             "clamp status is missing: {status}"
         );
     }
+
+    #[test]
+    fn quit_with_unstarted_transfers_requires_explicit_loss_confirmation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![std::path::PathBuf::from("/source/album")],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: std::path::PathBuf::from("/source/album"),
+                destination: std::path::PathBuf::from("/destination/album"),
+            }],
+        };
+        app.file_transfers.queued.push_back(crate::tui::app::QueuedFileTransfer {
+            queue_id: 41,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: std::path::PathBuf::from("/destination"),
+            enqueue_plan: plan.clone(),
+            retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
+            recovered: false,
+        });
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let live_session = crate::tui::app::FileTaskProgressSession::new(progress, control_tx);
+        let live_session_id = live_session.session_id;
+        app.active_overlay = ActiveOverlay::FileTaskProgress(live_session);
+        app.should_quit = true;
+
+        assert!(defer_quit_for_queued_file_transfers(&mut app));
+        assert!(!app.should_quit);
+        let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
+            panic!("queued transfers must open a blocking quit confirmation");
+        };
+        assert!(message.contains("has no journal and will be lost"));
+        assert!(matches!(
+            action,
+            super::super::app::ConfirmAction::QuitWithQueuedFileTransfers {
+                unjournaled_count: 1,
+                journal_backed_count: 0,
+            }
+        ));
+        assert!(matches!(
+            app.queued_quit_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session)) if session.session_id == live_session_id
+        ));
+        assert_eq!(app.file_transfers.queued.len(), 1);
+
+        let (tx, _rx) = mpsc::channel(8);
+        reduce_file_task_progress(
+            &mut app,
+            live_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                phase: tui_file_picker::FileTaskPhase::Running,
+                status: "still running under quit confirmation".to_string(),
+                current_item: None,
+                totals: tui_file_picker::ProgressTotals::default(),
+                rate_bytes_per_sec: None,
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.queued_quit_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.progress.status == "still running under quit confirmation"
+        ));
+        assert!(matches!(app.active_overlay, ActiveOverlay::Confirmation { .. }));
+
+        let conflict = tui_file_picker::ConflictPromptState::new(
+            29,
+            "Queued quit attention",
+            "Resolve before quitting",
+            tui_file_picker::ConflictItemKind::File,
+        );
+        reduce_file_task_progress(
+            &mut app,
+            live_session_id,
+            tui_file_picker::FileTaskProgressUpdate::ShowConflict {
+                conflict: conflict.clone(),
+            },
+            &tx,
+        );
+        assert!(app.queued_quit_preempted_overlay.is_none());
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == live_session_id
+                    && session.progress.conflict.as_ref() == Some(&conflict)
+        ));
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::Confirmation { .. })
+        ));
+    }
+
+    #[test]
+    fn quit_prompt_distinguishes_lost_and_journal_backed_queue_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path = temp.path().join("recovery.jsonl");
+        std::fs::write(&journal_path, b"pending recovery\n").expect("journal fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+
+        for (queue_id, source, recovery_journal_path) in [
+            (51, "/source/new", None),
+            (52, "/source/recovery", Some(journal_path.clone())),
+        ] {
+            let clipboard = tui_file_picker::FilesystemClipboard::new(
+                tui_file_picker::FilePickerClipboardMode::Copy,
+                vec![std::path::PathBuf::from(source)],
+            )
+            .expect("clipboard");
+            let plan = tui_file_picker::PastePlan {
+                mode: tui_file_picker::FilePickerClipboardMode::Copy,
+                mappings: vec![tui_file_picker::PasteMapping {
+                    source: std::path::PathBuf::from(source),
+                    destination: std::path::PathBuf::from(format!(
+                        "/destination/{queue_id}"
+                    )),
+                }],
+            };
+            let mut retry = crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+            retry.recovery_journal_path = recovery_journal_path;
+            app.file_transfers.queued.push_back(crate::tui::app::QueuedFileTransfer {
+                queue_id,
+                clipboard,
+                clipboard_owner_generation: None,
+                destination_dir: std::path::PathBuf::from("/destination"),
+                enqueue_plan: plan,
+                retry_plan: Some(retry),
+                recovered: queue_id == 52,
+            });
+        }
+
+        assert!(defer_quit_for_queued_file_transfers(&mut app));
+        let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
+            panic!("mixed queue must open a quit confirmation");
+        };
+        assert!(message.contains("1 unstarted transfer has no journal and will be lost"));
+        assert!(message.contains(
+            "1 journal-backed recovery transfer will leave the current in-memory queue but remain pending for the next startup"
+        ));
+        assert!(matches!(
+            action,
+            super::super::app::ConfirmAction::QuitWithQueuedFileTransfers {
+                unjournaled_count: 1,
+                journal_backed_count: 1,
+            }
+        ));
+        assert!(journal_path.exists());
+    }
+
+    #[test]
+    fn quit_prompt_for_only_journal_backed_recoveries_does_not_claim_durable_loss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path = temp.path().join("recovery.jsonl");
+        std::fs::write(&journal_path, b"pending recovery\n").expect("journal fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![std::path::PathBuf::from("/source/recovery")],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Cut,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: std::path::PathBuf::from("/source/recovery"),
+                destination: std::path::PathBuf::from("/destination/recovery"),
+            }],
+        };
+        let mut retry = crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        retry.recovery_journal_path = Some(journal_path.clone());
+        app.file_transfers.queued.push_back(crate::tui::app::QueuedFileTransfer {
+            queue_id: 61,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: std::path::PathBuf::from("/destination"),
+            enqueue_plan: plan,
+            retry_plan: Some(retry),
+            recovered: true,
+        });
+
+        assert!(defer_quit_for_queued_file_transfers(&mut app));
+        let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
+            panic!("journal-backed queue must open a quit confirmation");
+        };
+        assert!(!message.contains("no journal"));
+        assert!(!message.contains("will be lost"));
+        assert!(message.contains("remain pending for the next startup"));
+        assert!(matches!(
+            action,
+            super::super::app::ConfirmAction::QuitWithQueuedFileTransfers {
+                unjournaled_count: 0,
+                journal_backed_count: 1,
+            }
+        ));
+        assert!(journal_path.exists());
+    }
+
 }
 
 #[cfg(test)]
@@ -10815,6 +11391,253 @@ mod browse_archive_quit_lifecycle_tests {
         assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
             message.contains("current editor or overlay was not replaced")
         }));
+    }
+
+    fn install_minimized_transfer_then_archive(
+        app: &mut AppState,
+    ) -> (u64, u64) {
+        let transfer_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (transfer_tx, _transfer_rx) = std::sync::mpsc::channel();
+        let transfer_session = super::super::app::FileTaskProgressSession::new(
+            transfer_progress,
+            transfer_tx,
+        );
+        let transfer_session_id = transfer_session.session_id;
+        app.file_transfers.active_session_id = Some(transfer_session_id);
+        app.file_transfers.keep_minimized_across_jobs = true;
+        app.install_file_task_progress_with_visibility(transfer_session, true);
+
+        let archive_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Archive,
+            "Repackaging archive",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (archive_tx, _archive_rx) = std::sync::mpsc::channel();
+        let archive_session = super::super::app::FileTaskProgressSession::new(
+            archive_progress,
+            archive_tx,
+        );
+        let archive_session_id = archive_session.session_id;
+        app.install_file_task_progress(archive_session);
+        (transfer_session_id, archive_session_id)
+    }
+
+    fn enqueue_test_transfer(app: &mut AppState, queue_id: u64) {
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![std::path::PathBuf::from("/source/next")],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: std::path::PathBuf::from("/source/next"),
+                destination: std::path::PathBuf::from("/destination/next"),
+            }],
+        };
+        app.file_transfers.queued.push_back(crate::tui::app::QueuedFileTransfer {
+            queue_id,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: std::path::PathBuf::from("/destination"),
+            enqueue_plan: plan.clone(),
+            retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
+            recovered: false,
+        });
+        app.sync_file_transfer_queue_surfaces();
+    }
+
+    #[test]
+    fn parked_archive_success_updates_and_returns_before_fifo_continues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.tar");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (transfer_session_id, archive_session_id) =
+            install_minimized_transfer_then_archive(&mut app);
+        app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
+            archive.clone(),
+            staging.clone(),
+        ));
+        app.browse_archive_repackage_progress_session_id = Some(archive_session_id);
+        enqueue_test_transfer(&mut app, 81);
+        app.test_file_task_dispatches = Some(Vec::new());
+        let tx = tx();
+
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Failed {
+                status: "transfer failed".to_string(),
+                totals: tui_file_picker::ProgressTotals {
+                    errors: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        finalize_file_transfer_scheduler(&mut app, transfer_session_id, true, &tx);
+        assert!(app.file_transfers.blocked_for_attention);
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.session_id == archive_session_id
+        ));
+
+        handle_archive_repackage_progress(
+            &mut app,
+            archive.clone(),
+            staging.clone(),
+            archive_session_id,
+            ArchiveRepackageProgressSnapshot {
+                stage: ArchiveRepackageStage::Compressing,
+                status: "compressing while parked".to_string(),
+                current_item: None,
+                bytes_done: 40,
+                bytes_total: Some(100),
+                items_done: 0,
+                items_total: Some(1),
+                rate_bytes_per_sec: Some(10),
+            },
+        );
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.session_id == archive_session_id
+                    && session.progress.status == "compressing while parked"
+                    && session.progress.totals.bytes_done == 40
+        ));
+
+        handle_archive_repackage_result(
+            &mut app,
+            archive,
+            staging,
+            archive_session_id,
+            Ok(ArchiveRepackageReport::default()),
+            &tx,
+        );
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.session_id == archive_session_id
+                    && session.progress.is_terminal()
+                    && session.progress.status == "Archive repackaged"
+        ));
+
+        super::super::keybindings::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+        assert!(!app.file_transfers.blocked_for_attention);
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == archive_session_id
+                    && session.progress.is_terminal()
+        ));
+        assert_eq!(app.file_transfers.queued.len(), 1);
+
+        super::super::keybindings::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(app.file_transfers.queued.len(), 1);
+
+        super::super::keybindings::maybe_start_next_file_transfer(&mut app, &tx);
+
+        assert_eq!(app.file_transfers.queued.len(), 0);
+        assert_eq!(
+            app.test_file_task_dispatches
+                .as_ref()
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parked_archive_failure_returns_retry_confirmation_after_transfer_attention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.tar");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (transfer_session_id, archive_session_id) =
+            install_minimized_transfer_then_archive(&mut app);
+        app.browse_archive_repackage = Some(ArchiveMetadataEditContext::browse(
+            archive.clone(),
+            staging.clone(),
+        ));
+        app.browse_archive_repackage_progress_session_id = Some(archive_session_id);
+        let tx = tx();
+
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Failed {
+                status: "transfer failed".to_string(),
+                totals: tui_file_picker::ProgressTotals {
+                    errors: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        finalize_file_transfer_scheduler(&mut app, transfer_session_id, true, &tx);
+
+        handle_archive_repackage_result(
+            &mut app,
+            archive.clone(),
+            staging.clone(),
+            archive_session_id,
+            Err("synthetic archive failure".to_string()),
+            &tx,
+        );
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::Confirmation {
+                action: ConfirmAction::ArchiveRepackageFailure { context, error },
+                ..
+            }) if context.archive_path == archive
+                && context.staging_dir == staging
+                && error == "synthetic archive failure"
+        ));
+
+        super::super::keybindings::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation {
+                action: ConfirmAction::ArchiveRepackageFailure { context, error },
+                ..
+            } if context.archive_path == archive
+                && context.staging_dir == staging
+                && error == "synthetic archive failure"
+        ));
+        assert!(!app.file_transfers.blocked_for_attention);
     }
 
     #[tokio::test]
@@ -15484,12 +16307,19 @@ mod async_message_drain_tests {
         app.browse.filesystem_clipboard = Some(clipboard.clone());
         let mut retry_plan = crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
         retry_plan.recovery_journal_path = Some(temp.path().join("recovery.jsonl"));
-        app.browse.pending_clipboard_paste = Some(crate::tui::browse::PendingClipboardPaste {
+        app.file_transfers.pending_by_session.insert(
             session_id,
-            clipboard,
-            plan,
-            retry_plan: Some(retry_plan.clone()),
-        });
+            crate::tui::browse::PendingClipboardPaste {
+                session_id,
+                clipboard,
+                clipboard_owner_generation: Some(
+                    app.browse.filesystem_clipboard_generation,
+                ),
+                plan,
+                retry_plan: Some(retry_plan.clone()),
+            },
+        );
+        app.file_transfers.active_session_id = Some(session_id);
         let report = tui_file_picker::FileTaskCompletionReport {
             is_move: true,
             roots: vec![
@@ -15542,6 +16372,140 @@ mod async_message_drain_tests {
             .expect("durable exact retry plan retained");
         assert_eq!(retained_retry.plan.mappings, vec![mapping_b]);
         assert!(retained_retry.recovery_journal_path.is_some());
+    }
+
+    #[test]
+    fn successive_job_completions_reconcile_clipboard_and_undo_per_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(8);
+
+        for (session_id, name) in [(1201_u64, "first"), (1202_u64, "second")] {
+            let source = temp.path().join(format!("{name}-source.flac"));
+            let destination = temp.path().join(format!("{name}-copy.flac"));
+            std::fs::write(&source, format!("{name} bytes")).expect("source");
+            let source_manifest =
+                tui_file_picker::capture_manifest(&source).expect("source proof");
+            std::fs::copy(&source, &destination).expect("copy fixture");
+            let destination_manifest = source_manifest
+                .capture_verified_copy_at(&destination)
+                .expect("destination proof");
+            let clipboard = tui_file_picker::FilesystemClipboard::new(
+                tui_file_picker::FilePickerClipboardMode::Copy,
+                vec![source.clone()],
+            )
+            .expect("clipboard");
+            app.browse
+                .replace_filesystem_clipboard_from_user(clipboard.clone());
+            let owner_generation = app.browse.filesystem_clipboard_generation;
+            let plan = tui_file_picker::PastePlan {
+                mode: tui_file_picker::FilePickerClipboardMode::Copy,
+                mappings: vec![tui_file_picker::PasteMapping {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                }],
+            };
+            app.file_transfers.pending_by_session.insert(
+                session_id,
+                crate::tui::browse::PendingClipboardPaste {
+                    session_id,
+                    clipboard: clipboard.clone(),
+                    clipboard_owner_generation: Some(owner_generation),
+                    plan,
+                    retry_plan: None,
+                },
+            );
+            app.file_transfers.active_session_id = Some(session_id);
+            let report = tui_file_picker::FileTaskCompletionReport {
+                is_move: false,
+                roots: vec![tui_file_picker::FileTaskRootResult {
+                    source,
+                    destination,
+                    disposition: tui_file_picker::FileTaskRootDisposition::Completed,
+                    message: None,
+                    undo_disposition:
+                        tui_file_picker::FileTaskUndoDisposition::CreatedDestination,
+                    proof: Some(tui_file_picker::FileTaskRootProof {
+                        source_manifest,
+                        destination_manifest,
+                    }),
+                }],
+            };
+
+            reduce_file_task_complete(&mut app, session_id, report, None, &tx);
+
+            assert_eq!(app.browse.filesystem_clipboard.as_ref(), Some(&clipboard));
+            assert!(!app
+                .file_transfers
+                .pending_by_session
+                .contains_key(&session_id));
+            assert_eq!(app.file_transfers.active_session_id, None);
+        }
+
+        assert_eq!(app.file_operation_undo.depths(), (2, 0));
+    }
+
+    #[test]
+    fn older_completion_cannot_repair_an_identical_newer_clipboard_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("destination.flac");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Cut,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+            }],
+        };
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse
+            .replace_filesystem_clipboard_from_user(clipboard.clone());
+        let older_generation = app.browse.filesystem_clipboard_generation;
+        // The user deliberately copies the identical paths again. Value
+        // equality cannot establish ownership; the revision must change.
+        app.browse
+            .replace_filesystem_clipboard_from_user(clipboard.clone());
+        let newer_generation = app.browse.filesystem_clipboard_generation;
+        assert_ne!(older_generation, newer_generation);
+
+        let session_id = 992;
+        app.file_transfers.pending_by_session.insert(
+            session_id,
+            crate::tui::browse::PendingClipboardPaste {
+                session_id,
+                clipboard: clipboard.clone(),
+                clipboard_owner_generation: Some(older_generation),
+                plan,
+                retry_plan: None,
+            },
+        );
+        app.file_transfers.active_session_id = Some(session_id);
+        let report = tui_file_picker::FileTaskCompletionReport {
+            is_move: true,
+            roots: vec![tui_file_picker::FileTaskRootResult {
+                source,
+                destination,
+                disposition: tui_file_picker::FileTaskRootDisposition::Failed,
+                message: Some("simulated failure".to_string()),
+                undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                proof: None,
+            }],
+        };
+        let (tx, _rx) = mpsc::channel(8);
+
+        reduce_file_task_complete(&mut app, session_id, report, None, &tx);
+
+        assert_eq!(app.browse.filesystem_clipboard_generation, newer_generation);
+        assert_eq!(app.browse.filesystem_clipboard.as_ref(), Some(&clipboard));
+        assert!(
+            app.browse.filesystem_clipboard_retry_plan.is_none(),
+            "the older job must not install its retry token over the newer user action"
+        );
     }
 
     #[test]
@@ -15599,4 +16563,387 @@ mod async_message_drain_tests {
         assert_eq!(error, "tag-block file read cancelled");
     }
 
+}
+
+#[cfg(test)]
+mod minimized_file_transfer_attention_tests {
+    use super::*;
+    use crate::tui::app::{
+        ActiveOverlay, AppState, ConfirmAction, FileTaskProgressSession,
+    };
+
+    #[test]
+    fn minimized_footer_state_tracks_live_progress_and_fifo_depth() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let mut progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+            phase: tui_file_picker::FileTaskPhase::Running,
+            status: "copying".to_string(),
+            current_item: None,
+            totals: tui_file_picker::ProgressTotals {
+                bytes_done: 61,
+                bytes_total: Some(100),
+                ..tui_file_picker::ProgressTotals::default()
+            },
+            rate_bytes_per_sec: None,
+        });
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.minimized_file_task_progress = Some(session);
+        app.file_transfers.active_session_id = Some(session_id);
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![std::path::PathBuf::from("/source/queued")],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: std::path::PathBuf::from("/source/queued"),
+                destination: std::path::PathBuf::from("/destination/queued"),
+            }],
+        };
+        app.file_transfers.queued.push_back(crate::tui::app::QueuedFileTransfer {
+            queue_id: 91,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: std::path::PathBuf::from("/destination"),
+            enqueue_plan: plan.clone(),
+            retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
+            recovered: false,
+        });
+        app.sync_file_transfer_queue_surfaces();
+
+        let footer = app.file_task_footer_state().expect("live footer");
+        assert!(footer.live);
+        assert_eq!(footer.ratio, Some(0.61));
+        assert_eq!(footer.queued, 1);
+
+        app.file_transfers.queued.clear();
+        app.sync_file_transfer_queue_surfaces();
+        let footer = app.file_task_footer_state().expect("live footer after transition");
+        assert_eq!(footer.ratio, Some(0.61));
+        assert_eq!(footer.queued, 0);
+    }
+
+    #[test]
+    fn minimized_fifo_install_preserves_unrelated_modal() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: "keep this modal".to_string(),
+            action: ConfirmAction::ClearQueue,
+        };
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+
+        app.install_file_task_progress_with_visibility(session, true);
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation { message, .. } if message == "keep this modal"
+        ));
+        assert!(app
+            .minimized_file_task_progress
+            .as_ref()
+            .is_some_and(|session| session.session_id == session_id));
+    }
+
+    #[test]
+    fn visible_archive_install_preserves_scheduler_owned_minimized_transfer() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let mut transfer_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        transfer_progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+            phase: tui_file_picker::FileTaskPhase::Running,
+            status: "copying before archive save".to_string(),
+            current_item: None,
+            totals: tui_file_picker::ProgressTotals {
+                bytes_done: 25,
+                bytes_total: Some(100),
+                ..tui_file_picker::ProgressTotals::default()
+            },
+            rate_bytes_per_sec: None,
+        });
+        let (transfer_tx, _transfer_rx) = std::sync::mpsc::channel();
+        let transfer_session = FileTaskProgressSession::new(transfer_progress, transfer_tx);
+        let transfer_session_id = transfer_session.session_id;
+        app.file_transfers.active_session_id = Some(transfer_session_id);
+        app.install_file_task_progress_with_visibility(transfer_session, true);
+
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![std::path::PathBuf::from("/source/queued")],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: std::path::PathBuf::from("/source/queued"),
+                destination: std::path::PathBuf::from("/destination/queued"),
+            }],
+        };
+        app.file_transfers.queued.push_back(crate::tui::app::QueuedFileTransfer {
+            queue_id: 92,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: std::path::PathBuf::from("/destination"),
+            enqueue_plan: plan.clone(),
+            retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
+            recovered: false,
+        });
+        app.sync_file_transfer_queue_surfaces();
+
+        let archive_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Archive,
+            "Repackaging archive",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (archive_tx, _archive_rx) = std::sync::mpsc::channel();
+        let archive_session = FileTaskProgressSession::new(archive_progress, archive_tx);
+        let archive_session_id = archive_session.session_id;
+        assert!(archive_session_id > transfer_session_id);
+
+        app.install_file_task_progress(archive_session);
+
+        assert!(app
+            .minimized_file_task_progress
+            .as_ref()
+            .is_some_and(|session| session.session_id == transfer_session_id));
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == archive_session_id
+                    && matches!(&session.progress.kind, tui_file_picker::FileTaskKind::Archive)
+        ));
+        let footer = app.file_task_footer_state().expect("minimized transfer footer");
+        assert_eq!(footer.ratio, Some(0.25));
+        assert_eq!(footer.queued, 1);
+
+        let (tx, _rx) = mpsc::channel(8);
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                phase: tui_file_picker::FileTaskPhase::Running,
+                status: "copying after archive save started".to_string(),
+                current_item: None,
+                totals: tui_file_picker::ProgressTotals {
+                    bytes_done: 70,
+                    bytes_total: Some(100),
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+                rate_bytes_per_sec: None,
+            },
+            &tx,
+        );
+
+        assert!(app.minimized_file_task_progress.as_ref().is_some_and(|session| {
+            session.session_id == transfer_session_id
+                && session.progress.status == "copying after archive save started"
+                && session.progress.totals.bytes_done == 70
+        }));
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session) if session.session_id == archive_session_id
+        ));
+        assert_eq!(
+            app.file_task_footer_state().and_then(|footer| footer.ratio),
+            Some(0.70)
+        );
+    }
+
+    #[test]
+    fn transfer_attention_preempts_archive_and_parks_its_exact_session() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let transfer_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Move,
+            "Moving files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (transfer_tx, _transfer_rx) = std::sync::mpsc::channel();
+        let transfer_session = FileTaskProgressSession::new(transfer_progress, transfer_tx);
+        let transfer_session_id = transfer_session.session_id;
+        app.file_transfers.active_session_id = Some(transfer_session_id);
+        app.file_transfers.keep_minimized_across_jobs = true;
+        app.install_file_task_progress_with_visibility(transfer_session, true);
+
+        let archive_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Archive,
+            "Repackaging archive",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (archive_tx, _archive_rx) = std::sync::mpsc::channel();
+        let archive_session = FileTaskProgressSession::new(archive_progress, archive_tx);
+        let archive_session_id = archive_session.session_id;
+        app.install_file_task_progress(archive_session);
+        let conflict = tui_file_picker::ConflictPromptState::new(
+            93,
+            "Destination changed",
+            "Choose how to continue",
+            tui_file_picker::ConflictItemKind::File,
+        );
+        let (tx, _rx) = mpsc::channel(8);
+
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::ShowConflict {
+                conflict: conflict.clone(),
+            },
+            &tx,
+        );
+
+        assert!(app.minimized_file_task_progress.is_none());
+        assert!(!app.file_transfers.keep_minimized_across_jobs);
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == transfer_session_id
+                    && session.progress.conflict.as_ref() == Some(&conflict)
+        ));
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.session_id == archive_session_id
+                    && matches!(&session.progress.kind, tui_file_picker::FileTaskKind::Archive)
+        ));
+    }
+
+    #[test]
+    fn conflict_while_minimized_restores_progress_without_dropping_displaced_overlay() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.minimized_file_task_progress = Some(session);
+        app.file_transfers.active_session_id = Some(session_id);
+        app.file_transfers.keep_minimized_across_jobs = true;
+        app.active_overlay = ActiveOverlay::Confirmation {
+            message: "preserve this modal".to_string(),
+            action: ConfirmAction::ClearQueue,
+        };
+        let conflict = tui_file_picker::ConflictPromptState::new(
+            17,
+            "Destination changed",
+            "Choose how to continue",
+            tui_file_picker::ConflictItemKind::File,
+        );
+        let (tx, _rx) = mpsc::channel(8);
+
+        reduce_file_task_progress(
+            &mut app,
+            session_id,
+            tui_file_picker::FileTaskProgressUpdate::ShowConflict {
+                conflict: conflict.clone(),
+            },
+            &tx,
+        );
+
+        assert!(app.minimized_file_task_progress.is_none());
+        assert!(!app.file_transfers.keep_minimized_across_jobs);
+        let ActiveOverlay::FileTaskProgress(restored) = &app.active_overlay else {
+            panic!("attention-demanding state must restore the live progress overlay");
+        };
+        assert_eq!(restored.session_id, session_id);
+        assert_eq!(restored.progress.conflict.as_ref(), Some(&conflict));
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::Confirmation { message, .. }) if message == "preserve this modal"
+        ));
+    }
+
+    #[test]
+    fn clean_single_job_completion_preserves_visible_terminal_overlay() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.active_overlay = ActiveOverlay::FileTaskProgress(session);
+        app.file_transfers.active_session_id = Some(session_id);
+        let (tx, _rx) = mpsc::channel(8);
+
+        finalize_file_transfer_scheduler(&mut app, session_id, false, &tx);
+
+        assert_eq!(app.file_transfers.active_session_id, None);
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session) if session.session_id == session_id
+        ));
+        assert!(app.file_transfers.queued.is_empty());
+    }
+
+    #[test]
+    fn clean_completion_restores_preempted_modal_before_advancing_fifo() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.active_overlay = ActiveOverlay::FileTaskProgress(session);
+        app.file_transfers.active_session_id = Some(session_id);
+        app.file_task_preempted_overlay = Some(Box::new(ActiveOverlay::Confirmation {
+            message: "return to this modal".to_string(),
+            action: ConfirmAction::ClearQueue,
+        }));
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![std::path::PathBuf::from("/source/next")],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: std::path::PathBuf::from("/source/next"),
+                destination: std::path::PathBuf::from("/destination/next"),
+            }],
+        };
+        app.file_transfers.queued.push_back(crate::tui::app::QueuedFileTransfer {
+            queue_id: 52,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: std::path::PathBuf::from("/destination"),
+            enqueue_plan: plan.clone(),
+            retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
+            recovered: false,
+        });
+        let (tx, _rx) = mpsc::channel(8);
+
+        finalize_file_transfer_scheduler(&mut app, session_id, false, &tx);
+
+        assert_eq!(app.file_transfers.active_session_id, None);
+        assert_eq!(app.file_transfers.queued.len(), 1);
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::Confirmation { message, .. } if message == "return to this modal"
+        ));
+        assert!(app.file_task_preempted_overlay.is_none());
+    }
 }

@@ -4437,12 +4437,35 @@ Native helper failures, missing displays, denied clipboard access, and oversized
             execute_filter(app, arg.as_deref(), tx);
         }
         Command::FileTaskMessages => {
+            if let Some(mut session) = app.minimized_file_task_progress.take() {
+                session.set_theme(super::keybindings::file_picker_theme_from_theme(&app.theme));
+                session
+                    .progress
+                    .set_queued_jobs(app.file_transfers.queued_summaries());
+                app.file_transfers.keep_minimized_across_jobs = false;
+                let displaced = std::mem::replace(
+                    &mut app.active_overlay,
+                    ActiveOverlay::FileTaskProgress(session),
+                );
+                if !matches!(displaced, ActiveOverlay::None) {
+                    app.file_task_preempted_overlay = Some(Box::new(displaced));
+                }
+                app.set_status("Restored live file-transfer progress");
+                return;
+            }
+            if matches!(
+                &app.active_overlay,
+                ActiveOverlay::FileTaskProgress(session) if session.is_live_task()
+            ) {
+                app.set_status("Live file-transfer progress is already open");
+                return;
+            }
             let Some((session_id, mut progress)) = app.last_file_task_progress.clone() else {
-                app.set_status("No completed file-task details are available");
+                app.set_status("No file-task details are available");
                 return;
             };
             if !progress.is_terminal() {
-                app.set_status("The most recent file task is still running; its live progress overlay owns the details");
+                app.set_status("The most recent file task is still running");
                 return;
             }
             progress.set_theme(super::keybindings::file_picker_theme_from_theme(&app.theme));

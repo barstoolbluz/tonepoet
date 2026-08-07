@@ -3517,7 +3517,11 @@ impl FilePickerState {
                 // The standalone picker has no persisted host setting. The
                 // progress state has already applied the local toggle.
             }
-            crate::FileTaskUserAction::ChooseConflictResolution(_) => {}
+            crate::FileTaskUserAction::Minimize
+            | crate::FileTaskUserAction::CancelQueued(_)
+            | crate::FileTaskUserAction::ChooseConflictResolution(_) => {
+                // These actions require a host-owned modal/queue lifecycle.
+            }
         }
         if clear_task {
             self.paste_task = None;
@@ -4055,6 +4059,44 @@ pub fn plan_filesystem_paste(
         if fs::symlink_metadata(source).is_err() {
             return Err(FilePickerError::ClipboardSourceMissing(source.clone()));
         }
+        let name = source
+            .file_name()
+            .ok_or_else(|| FilePickerError::ClipboardPathHasNoFileName(source.clone()))?;
+        let destination = unique_path_reserving(&destination_dir.join(name), &reserved);
+        reserved.insert(destination.clone());
+        mappings.push(PasteMapping {
+            source: source.clone(),
+            destination,
+        });
+    }
+    Ok(PastePlan {
+        mode: clipboard.mode(),
+        mappings,
+    })
+}
+
+/// Re-plan a queued clipboard paste at dispatch time against current
+/// destination occupancy while allowing vanished sources to reach the worker's
+/// per-root accounting path.
+///
+/// A queue can wait behind an earlier move long enough for one source to
+/// disappear. Treating that as a whole-plan preflight error would wedge the
+/// serial scheduler and hide which roots failed. Destination validity remains a
+/// hard precondition; individual source failures are intentionally classified by
+/// the cancellable helper process.
+pub fn plan_filesystem_paste_for_dispatch(
+    clipboard: &FilesystemClipboard,
+    destination_dir: &Path,
+) -> Result<PastePlan, FilePickerError> {
+    if clipboard.is_empty() {
+        return Err(FilePickerError::ClipboardEmpty);
+    }
+    if !destination_dir.is_dir() {
+        return Err(FilePickerError::NotADirectory(destination_dir.to_path_buf()));
+    }
+    let mut mappings = Vec::with_capacity(clipboard.paths().len());
+    let mut reserved = HashSet::new();
+    for source in clipboard.paths() {
         let name = source
             .file_name()
             .ok_or_else(|| FilePickerError::ClipboardPathHasNoFileName(source.clone()))?;
@@ -9764,4 +9806,50 @@ mod exact_replay_authority_tests {
         assert!(!destination.exists(), "unauthorized object must not be moved");
         assert_eq!(fs::read(&source).expect("source retained"), b"altered content!");
     }
+
+    #[test]
+    fn queued_dispatch_replans_after_prior_job_creates_collision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let source = source_dir.join("track.flac");
+        fs::write(&source, b"queued source").expect("source");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Copy,
+            vec![source],
+        )
+        .expect("clipboard");
+
+        let enqueue_plan = plan_filesystem_paste(&clipboard, &destination_dir).expect("enqueue plan");
+        let originally_reserved = enqueue_plan.mappings[0].destination.clone();
+        fs::write(&originally_reserved, b"prior job output").expect("collision");
+
+        let dispatch_plan = plan_filesystem_paste_for_dispatch(&clipboard, &destination_dir)
+            .expect("dispatch plan");
+        assert_ne!(dispatch_plan.mappings[0].destination, originally_reserved);
+        assert!(
+            !dispatch_plan.mappings[0].destination.exists(),
+            "dispatch must reserve a currently free no-clobber target",
+        );
+    }
+
+    #[test]
+    fn queued_dispatch_keeps_vanished_sources_for_per_root_worker_accounting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&destination_dir).expect("destination dir");
+        let missing = temp.path().join("vanished.flac");
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![missing.clone()],
+        )
+        .expect("clipboard");
+
+        let dispatch_plan = plan_filesystem_paste_for_dispatch(&clipboard, &destination_dir)
+            .expect("missing roots are classified by the worker");
+        assert_eq!(dispatch_plan.mappings[0].source, missing);
+    }
+
 }

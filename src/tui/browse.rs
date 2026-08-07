@@ -2292,6 +2292,9 @@ impl BrowsePasteRetryPlan {
 pub(crate) struct PendingClipboardPaste {
     pub session_id: u64,
     pub clipboard: tui_file_picker::FilesystemClipboard,
+    /// User clipboard revision that this job may reconcile. `None` is used for
+    /// older startup recoveries that must never overwrite the visible clipboard.
+    pub clipboard_owner_generation: Option<u64>,
     pub plan: tui_file_picker::PastePlan,
     pub retry_plan: Option<BrowsePasteRetryPlan>,
 }
@@ -2457,6 +2460,11 @@ pub struct BrowseState {
     /// Shared in-memory filesystem clipboard used by Cut/Copy/Paste.
     pub filesystem_clipboard: Option<tui_file_picker::FilesystemClipboard>,
 
+    /// Monotonic ownership revision for explicit user Copy/Cut actions. A
+    /// transfer may repair the visible clipboard only while this exact revision
+    /// still owns it, even if a later Copy/Cut selected identical paths.
+    pub(crate) filesystem_clipboard_generation: u64,
+
     /// Session-scoped metadata clipboard. Entries remain complete `TagEntry`
     /// clones so future paste semantics retain row scope, mixed/cardinality
     /// evidence, and positional alignment with `source_paths`.
@@ -2492,10 +2500,6 @@ pub struct BrowseState {
     /// Exact mappings/proofs retained only for an incomplete cut. A new Cut or
     /// Copy command clears this token.
     pub(crate) filesystem_clipboard_retry_plan: Option<BrowsePasteRetryPlan>,
-
-    /// Background paste reconciliation context. Only the matching session may
-    /// consume it; stale worker completions are ignored.
-    pub(crate) pending_clipboard_paste: Option<PendingClipboardPaste>,
 
     /// Anchor for one-shot extend selection: the most recent toggled or
     /// clicked selectable row. Path-based so it survives refresh/sort/filter.
@@ -3094,6 +3098,7 @@ impl BrowseState {
             visible_height: 0,
             multi_selected: Vec::new(),
             filesystem_clipboard: None,
+            filesystem_clipboard_generation: 0,
             tag_clipboard: None,
             tag_clipboard_copy_generation: 0,
             tag_clipboard_copy_active_generation: None,
@@ -3105,7 +3110,6 @@ impl BrowseState {
             tag_transfer_pending: None,
             tag_transfer_refresh_pending: false,
             filesystem_clipboard_retry_plan: None,
-            pending_clipboard_paste: None,
             multi_select_anchor: None,
             selection_mode: SelectionMode::Normal,
             drag_state: BrowseDragState::default(),
@@ -5334,6 +5338,16 @@ impl BrowseState {
         }
         self.discard_multi_select_anchor_if_unselected();
         self.selection_mode = SelectionMode::Normal;
+    }
+
+    pub(crate) fn replace_filesystem_clipboard_from_user(
+        &mut self,
+        clipboard: tui_file_picker::FilesystemClipboard,
+    ) {
+        let next = self.filesystem_clipboard_generation.wrapping_add(1);
+        self.filesystem_clipboard_generation = if next == 0 { 1 } else { next };
+        self.filesystem_clipboard = Some(clipboard);
+        self.filesystem_clipboard_retry_plan = None;
     }
 
     pub fn clear_multi_selection(&mut self) {

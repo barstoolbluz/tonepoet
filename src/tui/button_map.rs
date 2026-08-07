@@ -26,7 +26,7 @@ pub enum ScrollbarSurface {
 pub enum TuiButton {
     // Tab bar (footer)
     Tab(u8), // 1-5
-    /// Reopen the most recent completed file-task details.
+    /// Restore live minimized transfer progress or reopen retained task details.
     FileTaskMessages,
 
     // Convert screen panes (click to focus)

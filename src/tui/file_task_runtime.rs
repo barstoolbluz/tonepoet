@@ -1194,57 +1194,106 @@ pub struct StartupFileTaskRecovery {
     pub quarantine_artifact_count: usize,
 }
 
-/// Load the newest interrupted job without touching source/destination mounts.
-/// The local journal is safe to inspect during startup even when a remote mount
-/// is still unavailable. Actual verification and cleanup run inside the same
-/// cancellable helper process used for ordinary execution.
-pub fn startup_file_task_recovery() -> Option<StartupFileTaskRecovery> {
+#[derive(Debug, Clone, Default)]
+pub struct StartupFileTaskRecoveryInventory {
+    pub total_pending_jobs: usize,
+    pub recoveries: Vec<StartupFileTaskRecovery>,
+    /// Valid, reconciliation-required journals that could not be represented as
+    /// an executable recovery snapshot. They remain on disk and are surfaced to
+    /// the user rather than being silently omitted.
+    pub unreconstructable_journals: Vec<PathBuf>,
+}
+
+/// Inspect every interrupted job without touching source/destination mounts.
+///
+/// Journals remain the authority. This function only reconstructs immutable
+/// clipboard/plan snapshots; actual verification and cleanup still run inside
+/// the cancellable helper process when each recovery is dispatched.
+pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventory {
     let pending = pending_journals();
     let total_pending_jobs = pending.len();
-    let (journal_path, record) = pending.into_iter().next_back()?;
-    let pending_mappings = record.pending_mappings();
-    let requested_mappings = if pending_mappings.is_empty() {
-        record.mappings.clone()
-    } else {
-        pending_mappings
-    };
-    let mappings = record.mappings_for_reconciliation(&requested_mappings);
-    if mappings.is_empty() {
-        return None;
-    }
-    let mode = if record.is_move {
-        tui_file_picker::FilePickerClipboardMode::Cut
-    } else {
-        tui_file_picker::FilePickerClipboardMode::Copy
-    };
-    let sources = mappings
-        .iter()
-        .map(|mapping| mapping.source.clone())
-        .collect::<Vec<_>>();
-    let clipboard = tui_file_picker::FilesystemClipboard::new(mode, sources.clone())?;
-    let plan = tui_file_picker::PastePlan {
-        mode,
-        mappings: mappings.clone(),
-    };
-    let mut retry_plan = record
-        .retry_plan
-        .as_ref()
-        .and_then(|retry| retry.retain_sources(&sources))
-        .unwrap_or_else(|| BrowsePasteRetryPlan::from_plan(plan));
-    retry_plan.recovery_journal_path = Some(journal_path.clone());
-    let destination_dir = mappings
-        .first()
-        .and_then(|mapping| mapping.destination.parent())
-        .map(Path::to_path_buf);
-    Some(StartupFileTaskRecovery {
-        journal_path,
+    let mut inventory = StartupFileTaskRecoveryInventory {
         total_pending_jobs,
-        clipboard,
-        retry_plan,
-        destination_dir,
-        temp_artifact_count: record.temp_artifacts.len(),
-        quarantine_artifact_count: record.quarantine_artifacts.len(),
-    })
+        ..StartupFileTaskRecoveryInventory::default()
+    };
+
+    for (journal_path, record) in pending {
+        let pending_mappings = record.pending_mappings();
+        let requested_mappings = if pending_mappings.is_empty() {
+            record.mappings.clone()
+        } else {
+            pending_mappings
+        };
+        let mappings = record.mappings_for_reconciliation(&requested_mappings);
+        if mappings.is_empty() {
+            log::warn!(
+                "pending file-operation journal {} has no reconstructable mappings; leaving it on disk for inspection",
+                journal_path.display()
+            );
+            inventory.unreconstructable_journals.push(journal_path);
+            continue;
+        }
+        let mode = if record.is_move {
+            tui_file_picker::FilePickerClipboardMode::Cut
+        } else {
+            tui_file_picker::FilePickerClipboardMode::Copy
+        };
+        let sources = mappings
+            .iter()
+            .map(|mapping| mapping.source.clone())
+            .collect::<Vec<_>>();
+        let Some(clipboard) = tui_file_picker::FilesystemClipboard::new(mode, sources.clone()) else {
+            log::warn!(
+                "pending file-operation journal {} produced an empty clipboard snapshot; leaving it on disk for inspection",
+                journal_path.display()
+            );
+            inventory.unreconstructable_journals.push(journal_path);
+            continue;
+        };
+        let plan = tui_file_picker::PastePlan {
+            mode,
+            mappings: mappings.clone(),
+        };
+        let mut retry_plan = record
+            .retry_plan
+            .as_ref()
+            .and_then(|retry| retry.retain_sources(&sources))
+            .unwrap_or_else(|| BrowsePasteRetryPlan::from_plan(plan));
+        retry_plan.recovery_journal_path = Some(journal_path.clone());
+        let destination_dir = mappings
+            .first()
+            .and_then(|mapping| mapping.destination.parent())
+            .map(Path::to_path_buf);
+        if destination_dir.is_none() {
+            log::warn!(
+                "pending file-operation journal {} has no recoverable destination directory; leaving it on disk for inspection",
+                journal_path.display()
+            );
+            inventory.unreconstructable_journals.push(journal_path);
+            continue;
+        }
+        inventory.recoveries.push(StartupFileTaskRecovery {
+            journal_path,
+            total_pending_jobs,
+            clipboard,
+            retry_plan,
+            destination_dir,
+            temp_artifact_count: record.temp_artifacts.len(),
+            quarantine_artifact_count: record.quarantine_artifacts.len(),
+        });
+    }
+
+    inventory
+}
+
+/// Load every recoverable interrupted job in oldest-to-newest journal order.
+pub fn startup_file_task_recoveries() -> Vec<StartupFileTaskRecovery> {
+    startup_file_task_recovery_inventory().recoveries
+}
+
+/// Compatibility helper for callers that explicitly want the newest recovery.
+pub fn startup_file_task_recovery() -> Option<StartupFileTaskRecovery> {
+    startup_file_task_recoveries().pop()
 }
 
 #[cfg(test)]
@@ -2227,4 +2276,55 @@ mod tests {
         assert_eq!(recovery.retry_plan.plan.mappings.as_slice(), &[mapping]);
         assert_eq!(recovery.temp_artifact_count, 1);
     }
+
+    #[test]
+    fn startup_recovery_inventory_surfaces_every_pending_journal() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _environment = JournalDirGuard::install(temp.path());
+
+        let first_mapping = tui_file_picker::PasteMapping {
+            source: PathBuf::from("first-source"),
+            destination: PathBuf::from("first-destination"),
+        };
+        let second_mapping = tui_file_picker::PasteMapping {
+            source: PathBuf::from("second-source"),
+            destination: PathBuf::from("second-destination"),
+        };
+        let mut expected_paths = Vec::new();
+        for (session_id, mapping) in [(31, first_mapping), (32, second_mapping)] {
+            let plan = tui_file_picker::PastePlan {
+                mode: tui_file_picker::FilePickerClipboardMode::Copy,
+                mappings: vec![mapping],
+            };
+            let handle = FileTaskJournalHandle::create(
+                uuid::Uuid::new_v4().to_string(),
+                1,
+                session_id,
+                false,
+                tui_file_picker::VerificationMode::Standard,
+                8,
+                plan.mappings.clone(),
+                Some(BrowsePasteRetryPlan::from_plan(plan)),
+                serde_json::json!({"test": true}),
+            )
+            .expect("create journal");
+            handle.mark_abandoned("restart test").expect("abandon");
+            expected_paths.push(handle.path().to_path_buf());
+        }
+
+        let inventory = startup_file_task_recovery_inventory();
+        assert_eq!(inventory.total_pending_jobs, 2);
+        assert_eq!(inventory.recoveries.len(), 2);
+        assert!(inventory.unreconstructable_journals.is_empty());
+        let recovered_paths = inventory
+            .recoveries
+            .iter()
+            .map(|recovery| recovery.journal_path.as_path())
+            .collect::<Vec<_>>();
+        for expected in &expected_paths {
+            assert!(recovered_paths.contains(&expected.as_path()));
+        }
+    }
+
 }

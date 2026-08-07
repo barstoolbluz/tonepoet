@@ -1,5 +1,6 @@
 //! Application state for the standalone TUI
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -6170,6 +6171,85 @@ impl FileTaskProgressSession {
     }
 }
 
+/// Immutable enqueue-time snapshot for one Browse clipboard transfer.
+///
+/// The enqueue plan is presentation/evidence only. Dispatch recomputes a fresh
+/// no-clobber plan against current filesystem state unless this is an exact
+/// durable reconciliation retry, whose mapping must remain authoritative.
+#[derive(Debug, Clone)]
+pub struct QueuedFileTransfer {
+    pub queue_id: u64,
+    pub clipboard: tui_file_picker::FilesystemClipboard,
+    /// Visible clipboard revision this queued job is allowed to reconcile.
+    /// Older startup recoveries use `None` so they cannot overwrite the newest
+    /// recovery surfaced to the user.
+    pub clipboard_owner_generation: Option<u64>,
+    pub destination_dir: PathBuf,
+    pub enqueue_plan: tui_file_picker::PastePlan,
+    pub retry_plan: Option<crate::tui::browse::BrowsePasteRetryPlan>,
+    pub recovered: bool,
+}
+
+impl QueuedFileTransfer {
+    #[must_use]
+    pub fn is_journal_backed(&self) -> bool {
+        self.retry_plan
+            .as_ref()
+            .and_then(|retry| retry.recovery_journal_path.as_ref())
+            .is_some()
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> tui_file_picker::QueuedFileTaskSummary {
+        let source_summary = match self.clipboard.paths() {
+            [only] => only
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| only.display().to_string()),
+            paths => format!("{} selected items", paths.len()),
+        };
+        tui_file_picker::QueuedFileTaskSummary {
+            queue_id: self.queue_id,
+            source_summary,
+            destination_summary: self.destination_dir.display().to_string(),
+            item_count: self.clipboard.paths().len(),
+            recovered: self.recovered,
+        }
+    }
+}
+
+/// App-side serial scheduler and per-job reconciliation registry for Browse
+/// copy/move transfers. The worker layer remains one-helper-per-job; this state
+/// only decides which queued snapshot owns the single active slot.
+#[derive(Debug, Default)]
+pub struct FileTransferQueueState {
+    pub active_session_id: Option<u64>,
+    pub queued: VecDeque<QueuedFileTransfer>,
+    pub pending_by_session: BTreeMap<u64, crate::tui::browse::PendingClipboardPaste>,
+    pub keep_minimized_across_jobs: bool,
+    pub blocked_for_attention: bool,
+}
+
+impl FileTransferQueueState {
+    #[must_use]
+    pub fn queued_summaries(&self) -> Vec<tui_file_picker::QueuedFileTaskSummary> {
+        self.queued.iter().map(QueuedFileTransfer::summary).collect()
+    }
+
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.active_session_id.is_some() || !self.queued.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FileTaskFooterState {
+    pub live: bool,
+    pub ratio: Option<f64>,
+    pub queued: usize,
+    pub attention: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagTransferDirection {
     To,
@@ -6535,6 +6615,9 @@ static FILE_PICKER_SESSION_COUNTER: std::sync::atomic::AtomicU64 =
 static FILE_TASK_SESSION_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
+static FILE_TRANSFER_QUEUE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 /// Allocate a process-unique file-picker session id.
 ///
 /// Every picker completion carries this id back to the event loop. The reducer
@@ -6552,6 +6635,18 @@ pub fn next_file_picker_session_id() -> u64 {
 /// Allocate a process-unique file-task progress session id.
 pub fn next_file_task_session_id() -> u64 {
     FILE_TASK_SESSION_COUNTER.fetch_add(
+        1,
+        std::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// Allocate a process-unique queued-transfer id.
+///
+/// Queue ids are intentionally distinct from live progress session ids. A queued
+/// item receives its session id only when it starts, preserving the monotonic
+/// launch ordering used by retained-progress stale-update guards.
+pub fn next_file_transfer_queue_id() -> u64 {
+    FILE_TRANSFER_QUEUE_COUNTER.fetch_add(
         1,
         std::sync::atomic::Ordering::Relaxed,
     )
@@ -10766,6 +10861,12 @@ pub enum ConfirmAction {
     ClearAll,
     StopAll,
     ClearQueue,
+    /// Quit after explicitly discarding ordinary unstarted transfers while
+    /// leaving journal-backed recovery work pending for startup discovery.
+    QuitWithQueuedFileTransfers {
+        unjournaled_count: usize,
+        journal_backed_count: usize,
+    },
     /// Confirm an expensive bulk operation before replaying it once.
     ///
     /// The resolved path payload and bounded count are captured when the
@@ -11235,6 +11336,29 @@ pub struct AppState {
     /// dismissed so full warnings/failures remain inspectable via `:messages`.
     pub last_file_task_progress: Option<(u64, tui_file_picker::FileTaskProgressState)>,
 
+    /// Live progress session parked outside the modal overlay while minimized.
+    /// It retains the control sender, so cancellation/conflict guarantees are
+    /// identical whether the surface is visible or in the shared footer.
+    pub minimized_file_task_progress: Option<FileTaskProgressSession>,
+
+    /// Modal surface displaced only when a minimized transfer demands urgent
+    /// attention. It is restored after the transfer is minimized again or its
+    /// terminal report is acknowledged, so attention preemption never destroys
+    /// in-progress UI state.
+    pub file_task_preempted_overlay: Option<Box<ActiveOverlay>>,
+
+    /// Serial Browse transfer scheduler plus per-session reconciliation state.
+    pub file_transfers: FileTransferQueueState,
+
+    /// Overlay displaced by the explicit queued-transfer loss confirmation.
+    /// Cancelling quit restores it byte-for-byte, including a live transfer's
+    /// control sender and any conflict state.
+    pub queued_quit_preempted_overlay: Option<Box<ActiveOverlay>>,
+
+    /// One-shot admission after the user explicitly accepts losing queued,
+    /// not-yet-journaled work during quit.
+    pub quit_with_queued_file_transfers_confirmed: bool,
+
     /// Bounded, in-session undo/redo journal for completed copy, move, and
     /// rename operations. Delete operations are intentionally never recorded.
     pub file_operation_undo: FileOperationUndoJournal,
@@ -11243,6 +11367,13 @@ pub struct AppState {
     /// semantic View flow without launching an external pager.
     #[cfg(test)]
     pub test_view_file_dispatches: Option<Vec<std::path::PathBuf>>,
+
+    /// Test-only dispatch seam for the serial file-transfer scheduler. When
+    /// installed, task launch records the immutable dispatch plan instead of
+    /// spawning filesystem work.
+    #[cfg(test)]
+    pub test_file_task_dispatches:
+        Option<Vec<(u64, Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)>>,
 
     /// Show routine capability-degradation notices for file operations. Quiet
     /// is the safe default; failures and data-affecting warnings are unaffected.
@@ -12107,22 +12238,71 @@ impl AppState {
         // Import TOML presets into DB on first run.
         crate::tui::presets::import_presets_to_db(&db);
         let mut browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
+        let mut file_transfers = FileTransferQueueState::default();
         if startup_options.recover_pending_file_operations {
-            if let Some(recovery) = crate::tui::file_task_runtime::startup_file_task_recovery() {
-                let destination = recovery
-                    .destination_dir
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "the original destination".to_string());
-                browse.filesystem_clipboard = Some(recovery.clipboard);
-                browse.filesystem_clipboard_retry_plan = Some(recovery.retry_plan);
+            let crate::tui::file_task_runtime::StartupFileTaskRecoveryInventory {
+                total_pending_jobs,
+                recoveries,
+                unreconstructable_journals,
+            } = crate::tui::file_task_runtime::startup_file_task_recovery_inventory();
+            if let Some(newest) = recoveries.last().cloned() {
+                // Preserve the historical user-facing clipboard/retry surface
+                // for the newest job while also admitting every reconstructable
+                // journal to the serial reconciliation queue below.
+                browse.filesystem_clipboard = Some(newest.clipboard.clone());
+                browse.filesystem_clipboard_retry_plan = Some(newest.retry_plan.clone());
+                browse.filesystem_clipboard_generation = 1;
+                let total_temp = recoveries
+                    .iter()
+                    .map(|recovery| recovery.temp_artifact_count)
+                    .sum::<usize>();
+                let total_quarantine = recoveries
+                    .iter()
+                    .map(|recovery| recovery.quarantine_artifact_count)
+                    .sum::<usize>();
+                let queued_recoveries = recoveries.len();
+                for (index, recovery) in recoveries.into_iter().rev().enumerate() {
+                    let Some(destination_dir) = recovery.destination_dir else {
+                        // The inventory already classifies this case as
+                        // unreconstructable. Keep startup panic-free if a future
+                        // producer violates that contract.
+                        continue;
+                    };
+                    file_transfers.queued.push_back(QueuedFileTransfer {
+                        queue_id: next_file_transfer_queue_id(),
+                        clipboard: recovery.clipboard,
+                        clipboard_owner_generation: (index == 0)
+                            .then_some(browse.filesystem_clipboard_generation),
+                        destination_dir,
+                        enqueue_plan: recovery.retry_plan.plan.clone(),
+                        retry_plan: Some(recovery.retry_plan),
+                        recovered: true,
+                    });
+                }
+                let unreconstructable = unreconstructable_journals.len();
+                let inspection_suffix = if unreconstructable == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; {unreconstructable} journal(s) remain on disk and require manual inspection"
+                    )
+                };
                 let recovery_status = format!(
-                    "file-operation recovery: {} interrupted job(s); restored the newest exact plan. Navigate to {} and paste to reconcile ({} deferred temp artifact(s), {} source quarantine(s)); journal {}",
-                    recovery.total_pending_jobs,
-                    destination,
-                    recovery.temp_artifact_count,
-                    recovery.quarantine_artifact_count,
-                    recovery.journal_path.display(),
+                    "file-operation recovery: {} interrupted job(s); queued {} exact journal reconciliation job(s), newest first ({} deferred temp artifact(s), {} source quarantine(s)); journals remain authoritative{}",
+                    total_pending_jobs,
+                    queued_recoveries,
+                    total_temp,
+                    total_quarantine,
+                    inspection_suffix,
+                );
+                theme_startup_status = Some(match theme_startup_status.take() {
+                    Some(existing) => format!("{existing}; {recovery_status}"),
+                    None => recovery_status,
+                });
+            } else if total_pending_jobs > 0 {
+                let recovery_status = format!(
+                    "file-operation recovery: {} interrupted journal(s) remain on disk but none could be reconstructed automatically; manual inspection is required",
+                    total_pending_jobs
                 );
                 theme_startup_status = Some(match theme_startup_status.take() {
                     Some(existing) => format!("{existing}; {recovery_status}"),
@@ -12180,9 +12360,16 @@ impl AppState {
             editor_context_target: None,
             host_clipboard_paste_generation: 0,
             last_file_task_progress: None,
+            minimized_file_task_progress: None,
+            file_task_preempted_overlay: None,
+            file_transfers,
+            queued_quit_preempted_overlay: None,
+            quit_with_queued_file_transfers_confirmed: false,
             file_operation_undo: FileOperationUndoJournal::default(),
             #[cfg(test)]
             test_view_file_dispatches: None,
+            #[cfg(test)]
+            test_file_task_dispatches: None,
             file_task_verbose_degrade_notices,
             bulk_guard_bypass: None,
             bulk_guard_frozen_paths: None,
@@ -12592,6 +12779,15 @@ impl AppState {
         if let Some((_, progress)) = self.last_file_task_progress.as_mut() {
             progress.set_theme(picker_theme.clone());
         }
+        if let Some(session) = self.minimized_file_task_progress.as_mut() {
+            session.set_theme(picker_theme.clone());
+        }
+        if let Some(ActiveOverlay::FileTaskProgress(session)) = self
+            .queued_quit_preempted_overlay
+            .as_deref_mut()
+        {
+            session.set_theme(picker_theme.clone());
+        }
 
         if let Some(state) = self.pending_metadata_editor.as_mut() {
             if let Some(file_picker) = state.file_picker.as_mut() {
@@ -12606,9 +12802,108 @@ impl AppState {
     /// `last_file_task_progress` therefore tracks the newest task from launch,
     /// not only after a terminal overlay happens to remain open.
     pub fn install_file_task_progress(&mut self, session: FileTaskProgressSession) {
+        self.install_file_task_progress_with_visibility(session, false);
+    }
+
+    pub fn install_file_task_progress_with_visibility(
+        &mut self,
+        mut session: FileTaskProgressSession,
+        minimized: bool,
+    ) {
         debug_assert!(session.is_live_task());
+        session
+            .progress
+            .set_queued_jobs(self.file_transfers.queued_summaries());
         self.last_file_task_progress = Some((session.session_id, session.progress.clone()));
-        self.active_overlay = ActiveOverlay::FileTaskProgress(session);
+        if minimized {
+            // Starting the next FIFO job while the transfer surface is
+            // minimized must not steal focus or destroy an unrelated modal.
+            // The completed transfer's visible overlay is released by the
+            // scheduler before dispatch, so preserving `active_overlay` here
+            // is both sufficient and lossless.
+            self.minimized_file_task_progress = Some(session);
+        } else {
+            // A visible archive repackage may run while the serial transfer
+            // scheduler owns a minimized copy/move. Installing that unrelated
+            // progress surface must not discard the scheduler's only live
+            // session/control sender. Clear the minimized slot only when this
+            // exact scheduler session is being made visible.
+            let replaces_minimized_scheduler_session = self
+                .minimized_file_task_progress
+                .as_ref()
+                .is_some_and(|minimized| {
+                    minimized.session_id == session.session_id
+                        || self.file_transfers.active_session_id == Some(session.session_id)
+                });
+            if replaces_minimized_scheduler_session {
+                self.minimized_file_task_progress = None;
+            }
+            self.active_overlay = ActiveOverlay::FileTaskProgress(session);
+        }
+    }
+
+    pub fn sync_file_transfer_queue_surfaces(&mut self) {
+        let summaries = self.file_transfers.queued_summaries();
+        if let ActiveOverlay::FileTaskProgress(session) = &mut self.active_overlay {
+            if session.is_live_task() {
+                session.progress.set_queued_jobs(summaries.clone());
+            }
+        }
+        if let Some(session) = self.minimized_file_task_progress.as_mut() {
+            session.progress.set_queued_jobs(summaries.clone());
+        }
+        if let Some(ActiveOverlay::FileTaskProgress(session)) = self
+            .queued_quit_preempted_overlay
+            .as_deref_mut()
+        {
+            if session.is_live_task() {
+                session.progress.set_queued_jobs(summaries.clone());
+            }
+        }
+        if let Some((session_id, progress)) = self.last_file_task_progress.as_mut() {
+            if self.file_transfers.active_session_id == Some(*session_id) {
+                progress.set_queued_jobs(summaries);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn file_task_footer_state(&self) -> Option<FileTaskFooterState> {
+        let live_progress = self
+            .minimized_file_task_progress
+            .as_ref()
+            .map(|session| &session.progress)
+            .or_else(|| match &self.active_overlay {
+                ActiveOverlay::FileTaskProgress(session) if session.is_live_task() => {
+                    Some(&session.progress)
+                }
+                _ => None,
+            })
+            .or_else(|| match self.queued_quit_preempted_overlay.as_deref() {
+                Some(ActiveOverlay::FileTaskProgress(session)) if session.is_live_task() => {
+                    Some(&session.progress)
+                }
+                _ => None,
+            });
+        if let Some(progress) = live_progress {
+            return Some(FileTaskFooterState {
+                live: true,
+                ratio: progress.totals.ratio(),
+                queued: self.file_transfers.queued.len(),
+                attention: progress.conflict.is_some()
+                    || matches!(
+                        progress.phase,
+                        tui_file_picker::FileTaskPhase::Stalled
+                            | tui_file_picker::FileTaskPhase::Failed
+                    ),
+            });
+        }
+        self.last_file_task_progress.as_ref().map(|(_, progress)| FileTaskFooterState {
+            live: false,
+            ratio: progress.totals.ratio(),
+            queued: self.file_transfers.queued.len(),
+            attention: matches!(progress.phase, tui_file_picker::FileTaskPhase::Failed),
+        })
     }
 
     pub fn cycle_ui_theme(&mut self, forward: bool) {

@@ -66,7 +66,7 @@ pub use progress::{
     ConflictAction, ConflictItemKind, ConflictPromptState, ConflictResolution, FileTaskKind, FileTaskPhase,
     FileTaskCompletionReport, FileTaskErrorRecord, FileTaskProgressState, FileTaskProgressUpdate,
     FileTaskRootDisposition, FileTaskRootProof, FileTaskRootResult, FileTaskScope,
-    FileTaskUndoDisposition, FileTaskUserAction, ProgressItem,
+    FileTaskUndoDisposition, FileTaskUserAction, ProgressItem, QueuedFileTaskSummary,
     ProgressTotals, ProgressUnit,
 };
 pub use state::{
@@ -74,7 +74,7 @@ pub use state::{
     FilePickerClipboard, FilePickerClipboardMode, FilePickerConfig, FilePickerCreateKind,
     FilePickerEntry, FilePickerError, FilePickerFocus, FilePickerHitAction,
     FilePickerMenuAction, FilePickerSelectionMode, FilePickerSortKey, FilePickerState,
-    duplicate_files_in_place, execute_exact_paste_plan,
+    duplicate_files_in_place, execute_exact_paste_plan, plan_filesystem_paste_for_dispatch,
     execute_exact_paste_plan_with_proofs,
     execute_exact_paste_plan_with_proofs_and_expected_sources,
     paste_filesystem_clipboard,
