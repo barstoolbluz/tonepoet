@@ -9450,43 +9450,12 @@ fn dedicated_cue_sidecar_authority(tab: &PresentationTab) -> bool {
     native_multi_file_sidecar_authority(tab) || untaggable_sidecar_authority(tab)
 }
 
-fn cue_sidecar_representable_entry_for_path_count(
-    path_count: usize,
-    entry: &crate::tui::probe::TagEntry,
-) -> bool {
-    let key = entry.display_key.to_ascii_uppercase();
-    if key == "CUESHEET" {
-        return true;
-    }
-    if entry.is_track_scoped(path_count) {
-        return matches!(key.as_str(), "TITLE" | "ARTIST" | "ISRC");
-    }
-    matches!(
-        key.as_str(),
-        "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
-    )
+fn cue_sidecar_representable_entry(entry: &crate::tui::probe::TagEntry) -> bool {
+    crate::tui::probe::cue_sidecar_representable_key(&entry.display_key)
 }
 
-fn cue_sidecar_representable_entry(
-    tab: &PresentationTab,
-    entry: &crate::tui::probe::TagEntry,
-) -> bool {
-    cue_sidecar_representable_entry_for_path_count(tab.paths.len(), entry)
-}
-
-fn cue_sidecar_standard_owned_entry(
-    path_count: usize,
-    entry: &crate::tui::probe::TagEntry,
-) -> bool {
-    let key = entry.display_key.to_ascii_uppercase();
-    if entry.is_track_scoped(path_count) {
-        matches!(key.as_str(), "TITLE" | "ARTIST" | "ISRC")
-    } else {
-        matches!(
-            key.as_str(),
-            "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
-        )
-    }
+fn cue_sidecar_standard_owned_entry(entry: &crate::tui::probe::TagEntry) -> bool {
+    crate::tui::probe::cue_sidecar_standard_owned_key(&entry.display_key)
 }
 
 fn mark_tag_entry_saved_empty(entry: &mut crate::tui::probe::TagEntry) {
@@ -9535,11 +9504,11 @@ fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
         .filter(|index| {
             tab.entries
                 .get(*index)
-                .is_some_and(|entry| cue_sidecar_standard_owned_entry(path_count, entry))
+                .is_some_and(|entry| cue_sidecar_standard_owned_entry(entry))
         })
         .collect::<std::collections::BTreeSet<_>>();
     for (index, entry) in tab.entries.iter_mut().enumerate() {
-        if !cue_sidecar_representable_entry_for_path_count(path_count, entry) {
+        if !cue_sidecar_representable_entry(entry) {
             continue;
         }
         if consumed_deletions.contains(&index) {
@@ -9751,7 +9720,7 @@ fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
 
     tab.entries.iter().any(|entry| {
         let sidecar_authoritative = sidecar_authority
-            && cue_sidecar_representable_entry(tab, entry);
+            && cue_sidecar_representable_entry(entry);
         if sidecar_authoritative {
             return entry.per_file_values != entry.per_file_originals
                 || entry.value != entry.original;

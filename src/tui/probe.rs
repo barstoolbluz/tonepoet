@@ -5997,6 +5997,35 @@ pub struct TagEntry {
     pub mb_proposed_per_file: Option<Vec<String>>,
 }
 
+/// Whether a metadata row has a lossless representation in a CUE sidecar.
+///
+/// This classification is deliberately key-based. Row scope selects the
+/// serializer dimension; it must never decide representability. Keep this as
+/// the single source of truth for edit guards, save preflight, and completion
+/// accounting so those stages cannot drift.
+pub(crate) fn cue_sidecar_representable_key(display_key: &str) -> bool {
+    [
+        "CUESHEET",
+        "TITLE",
+        "ARTIST",
+        "ISRC",
+        "ALBUM",
+        "ALBUMARTIST",
+        "DATE",
+        "GENRE",
+        "CATALOGNUMBER",
+    ]
+    .iter()
+    .any(|key| display_key.eq_ignore_ascii_case(key))
+}
+
+/// Whether a metadata row is owned by the standard generated CUE projection.
+/// CUESHEET itself is the projection container, not one of its source fields.
+pub(crate) fn cue_sidecar_standard_owned_key(display_key: &str) -> bool {
+    !display_key.eq_ignore_ascii_case("CUESHEET")
+        && cue_sidecar_representable_key(display_key)
+}
+
 impl TagEntry {
     /// Resolve row scope with a compatibility fallback for older construction
     /// sites and persisted/test fixtures. New synthesized rows must set
@@ -22970,5 +22999,32 @@ mod tag_copy_metadata_cancellation_tests {
         )
         .expect_err("cancelled tag read must stop before I/O");
         assert!(err.contains("superseded"));
+    }
+}
+
+#[cfg(test)]
+mod cue_sidecar_contract_tests {
+    use super::*;
+
+    #[test]
+    fn cue_sidecar_representability_is_key_based_and_shared() {
+        for key in [
+            "CUESHEET",
+            "TITLE",
+            "ARTIST",
+            "ISRC",
+            "ALBUM",
+            "ALBUMARTIST",
+            "DATE",
+            "GENRE",
+            "CATALOGNUMBER",
+        ] {
+            assert!(cue_sidecar_representable_key(key), "{key}");
+        }
+        assert!(cue_sidecar_representable_key("album"));
+        assert!(!cue_sidecar_representable_key("PERFORMER"));
+        assert!(!cue_sidecar_representable_key("COMMENT"));
+        assert!(!cue_sidecar_standard_owned_key("CUESHEET"));
+        assert!(cue_sidecar_standard_owned_key("ALBUM"));
     }
 }
