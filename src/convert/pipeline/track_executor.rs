@@ -10217,6 +10217,7 @@ mod tests {
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },

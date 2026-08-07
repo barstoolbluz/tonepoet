@@ -181,6 +181,7 @@ fn w64_planner_request(root: &Path, sample_rate_hz: u32, depth: PcmBitDepth) -> 
         item_id: "reference-w64-matrix".to_string(),
         container: root.join("source.dsf"),
         source: SourceOptions {
+            sidecar_cue_track_metadata: None,
             archive_password: None,
             sacd_area: Some(SacdArea::Stereo),
             dvda_group_selection: DvdaGroupSelection::Default,

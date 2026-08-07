@@ -6934,6 +6934,7 @@ fn install_convert_source_with_async_probe(app: &mut AppState, path: std::path::
 
     app.convert.set_source_mode(mode);
     app.convert.source.cue_artifact_audio.clear();
+    app.convert.source.cue_artifact_metadata.clear();
     app.convert.apply_source_defaults();
     let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
     app.current_screen = AppScreen::Convert;
@@ -35847,6 +35848,10 @@ mod batch_removal_archive_atomicity_tests {
     struct BatchSnapshot {
         mode: String,
         cue_artifact_audio: HashSet<PathBuf>,
+        cue_artifact_metadata: std::collections::BTreeMap<
+            PathBuf,
+            crate::convert::pipeline::SidecarCueTrackMetadataSource,
+        >,
         synthetic_cue_artifacts: HashSet<PathBuf>,
         generation: u64,
         batch_probe_pending: Option<PathBuf>,
@@ -35895,6 +35900,27 @@ mod batch_removal_archive_atomicity_tests {
             .map(|path| path.with_extension("synthetic.cue"))
             .collect::<HashSet<_>>();
         app.convert.source.cue_artifact_audio = cue_artifact_audio;
+        app.convert.source.cue_artifact_metadata = app
+            .convert
+            .source
+            .cue_artifact_audio
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                (
+                    path.clone(),
+                    crate::convert::pipeline::SidecarCueTrackMetadataSource {
+                        cue_path: path.with_extension("cue"),
+                        track_index: index,
+                        cue_track_number: index as u32 + 1,
+                        cue_file_reference: path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_string),
+                    },
+                )
+            })
+            .collect();
         app.convert.source.synthetic_cue_artifacts = synthetic_cue_artifacts;
     }
 
@@ -35902,6 +35928,7 @@ mod batch_removal_archive_atomicity_tests {
         BatchSnapshot {
             mode: format!("{:?}", app.convert.source.mode),
             cue_artifact_audio: app.convert.source.cue_artifact_audio.clone(),
+            cue_artifact_metadata: app.convert.source.cue_artifact_metadata.clone(),
             synthetic_cue_artifacts: app.convert.source.synthetic_cue_artifacts.clone(),
             generation: app.probe_generation,
             batch_probe_pending: app.convert.source.batch_probe_pending.clone(),
@@ -35919,6 +35946,10 @@ mod batch_removal_archive_atomicity_tests {
         assert_eq!(
             app.convert.source.cue_artifact_audio,
             before.cue_artifact_audio
+        );
+        assert_eq!(
+            app.convert.source.cue_artifact_metadata,
+            before.cue_artifact_metadata
         );
         assert_eq!(
             app.convert.source.synthetic_cue_artifacts,

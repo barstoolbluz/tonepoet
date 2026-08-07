@@ -753,9 +753,26 @@ fn dispatch_track_metadata_for_output_planning(
         // A failed tag read yields no planning evidence (None -> the batch
         // stays provisional); the materializer owns the authoritative
         // fail-closed read.
-        SourceKind::SingleFile => read_track_metadata_with_warnings(&req.container)
-            .ok()
-            .map(|(metadata, _warnings, _recovered_by_fallback)| metadata),
+        SourceKind::SingleFile => {
+            if let Some(source) = req.source.sidecar_cue_track_metadata.as_ref() {
+                let (cue_metadata, _album) =
+                    crate::convert::pipeline::materializer_cue::metadata_for_transferred_sidecar_cue_track(source)
+                        .ok()?;
+                let base = crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings_and_viability(&req.container)
+                    .ok()
+                    .filter(|(_metadata, _warnings, _recovered, viable)| *viable)
+                    .map(|(metadata, _warnings, _recovered, _viable)| metadata)
+                    .unwrap_or_default();
+                Some(crate::convert::pipeline::materializer_single::merge_sidecar_cue_track_metadata(
+                    base,
+                    cue_metadata,
+                ))
+            } else {
+                read_track_metadata_with_warnings(&req.container)
+                    .ok()
+                    .map(|(metadata, _warnings, _recovered_by_fallback)| metadata)
+            }
+        }
         SourceKind::CueImage => {
             let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(
                 &req.container,
@@ -3677,6 +3694,7 @@ mod tests {
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },

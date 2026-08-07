@@ -274,6 +274,7 @@ fn base_request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> 
         item_id: "depth-matrix".to_string(),
         container,
         source: SourceOptions {
+            sidecar_cue_track_metadata: None,
             archive_password: None,
             sacd_area: None,
             dvda_group: None,

@@ -113,6 +113,18 @@ fn u32_le_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+/// Return true only when Lofty has positively classified the carrier/tag
+/// representation as unsupported. Callers use this typed fact for metadata
+/// source viability; I/O, permission, corruption, and other read failures do
+/// not make an otherwise taggable carrier structurally untaggable.
+pub(crate) fn lofty_error_is_unsupported_metadata_format(
+    err: &lofty::error::LoftyError,
+) -> bool {
+    use lofty::error::ErrorKind;
+
+    matches!(err.kind(), ErrorKind::UnknownFormat | ErrorKind::UnsupportedTag)
+}
+
 pub(crate) fn native_ape_error_is_eligible(err: &lofty::error::LoftyError) -> bool {
     use lofty::error::ErrorKind;
 

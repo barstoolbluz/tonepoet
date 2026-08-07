@@ -668,6 +668,11 @@ pub struct SourceOptions {
     /// One-based Blu-ray display angle. `None` means angle 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bluray_angle: Option<u8>,
+    /// Exact queue-transferred sidecar CUE metadata source for an already-split
+    /// single-file carrier. Presence means source selection chose SidecarCue;
+    /// structural CUE routing remains disabled for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_cue_track_metadata: Option<SidecarCueTrackMetadataSource>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -837,6 +842,24 @@ fn default_realized_dvda_downmix_policy() -> DvdaDownmixPolicy {
     DvdaDownmixPolicy::realized_default()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarCueTrackMetadataSource {
+    /// Exact sidecar CUE admitted by queue expansion. This is not a sibling
+    /// discovery hint: conversion must read this path or fail closed.
+    pub cue_path: PathBuf,
+    /// Zero-based position in the admitted CUE sheet. The position is retained
+    /// from queue classification so one-track-per-file mapping is never
+    /// reconstructed from filenames at materialization time.
+    pub track_index: usize,
+    /// Authored CUE track number captured with the admitted mapping. Used as a
+    /// change detector if the sidecar is edited after queue admission.
+    pub cue_track_number: u32,
+    /// FILE token captured from the admitted track. Materialization compares
+    /// this snapshot to the current CUE before applying metadata; it never
+    /// resolves the token again to choose a carrier.
+    pub cue_file_reference: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CueSidecarPolicy {
     PreferEmbedded,
@@ -984,6 +1007,11 @@ pub struct RedactedSourceOptions {
     pub bluray_audio_stream: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bluray_angle: Option<u8>,
+    /// Exact queue-transferred sidecar CUE metadata source for an already-split
+    /// single-file carrier. Presence means source selection chose SidecarCue;
+    /// structural CUE routing remains disabled for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_cue_track_metadata: Option<SidecarCueTrackMetadataSource>,
     pub cue_sidecar: CueSidecarPolicy,
     pub track_selection: TrackSelection,
 }
@@ -1013,6 +1041,7 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
                 bluray_audio_pid: req.source.bluray_audio_pid,
                 bluray_audio_stream: req.source.bluray_audio_stream,
                 bluray_angle: req.source.bluray_angle,
+                sidecar_cue_track_metadata: req.source.sidecar_cue_track_metadata.clone(),
                 cue_sidecar: req.source.cue_sidecar,
                 track_selection: req.source.track_selection.clone(),
             },

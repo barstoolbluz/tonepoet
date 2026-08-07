@@ -624,6 +624,7 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
             queue: QueueExpansionResult {
                 paths: selection,
                 cue_artifact_audio: std::collections::HashSet::new(),
+                cue_artifact_metadata: std::collections::BTreeMap::new(),
                 synthetic_cue_artifacts: std::collections::HashSet::new(),
                 expansion_errors: Vec::new(),
                 cue_selection_prompt: None,
@@ -7880,6 +7881,7 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
     let QueueExpansionResult {
         paths,
         cue_artifact_audio,
+        cue_artifact_metadata,
         synthetic_cue_artifacts,
         expansion_errors,
         ..
@@ -7923,18 +7925,22 @@ fn queue_browse_convert_paths_for_processing(app: &mut AppState, queue: QueueExp
         } else {
             None
         };
-        let cue_sidecar_override = crate::convert::queue_expansion::cue_sidecar_override_for_commit_path(
-            &path,
-            &cue_artifact_audio,
-        );
+        let cue_decision =
+            crate::convert::queue_expansion::cue_artifact_commit_decision_for_path(
+                &path,
+                &cue_artifact_audio,
+                &cue_artifact_metadata,
+                &app.config.conversion.aggregate_metadata_target_priority,
+                crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            );
         let archive_reference = archive_password
             .as_deref()
             .map(super::keychain::reference_for_password);
-        match app.manager.add_file_ready_for_processing_with_cue_sidecar_override(
+        match app.manager.add_file_ready_for_processing_with_cue_metadata_decision(
             path.clone(),
             options.clone(),
             archive_password.clone(),
-            cue_sidecar_override,
+            cue_decision,
         ) {
             Ok(item_id) => {
                 // Synthetic album-CUE artifacts are transactionally registered
@@ -8028,6 +8034,7 @@ pub(crate) fn install_browse_convert_source_paths(
     let QueueExpansionResult {
         paths,
         cue_artifact_audio,
+        cue_artifact_metadata,
         synthetic_cue_artifacts,
         expansion_errors,
         ..
@@ -8136,6 +8143,10 @@ pub(crate) fn install_browse_convert_source_paths(
     app.convert.source.cue_artifact_audio.retain(|path| {
         crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
     });
+    app.convert.source.cue_artifact_metadata = cue_artifact_metadata;
+    app.convert.source.cue_artifact_metadata.retain(|path, _| {
+        crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
+    });
     app.convert.source.synthetic_cue_artifacts = synthetic_cue_artifacts;
     let retained_synthetic_cue_artifacts = app.convert.source.synthetic_cue_artifacts.clone();
     app.convert.source.synthetic_cue_artifacts.retain(|path| {
@@ -8223,6 +8234,7 @@ fn finish_browse_queue_review_after_expansion(
     let QueueExpansionResult {
         paths,
         mut cue_artifact_audio,
+        mut cue_artifact_metadata,
         synthetic_cue_artifacts,
         expansion_errors,
         ..
@@ -8245,6 +8257,9 @@ fn finish_browse_queue_review_after_expansion(
     }
 
     cue_artifact_audio.retain(|path| {
+        crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
+    });
+    cue_artifact_metadata.retain(|path, _| {
         crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
     });
 
@@ -8279,6 +8294,7 @@ fn finish_browse_queue_review_after_expansion(
         QueueExpansionResult {
             paths,
             cue_artifact_audio,
+            cue_artifact_metadata,
             synthetic_cue_artifacts,
             expansion_errors,
             cue_selection_prompt: None,
@@ -8450,6 +8466,7 @@ fn apply_queue_item_cue_sidecar_override_to_source_options(
     if let Some(cue_sidecar_override) = item.cue_sidecar_override {
         source.cue_sidecar = cue_sidecar_override;
     }
+    source.sidecar_cue_track_metadata = item.sidecar_cue_track_metadata.clone();
 }
 
 /// Build the post-publish companion-copy policy from the already-projected
@@ -8714,6 +8731,7 @@ fn execute_commit_with_source_options_transform(
         dvda_group_selection: DvdaGroupSelection::Default,
         dvda_assume_decrypted: false,
         dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+        sidecar_cue_track_metadata: None,
         cue_sidecar: CueSidecarPolicy::PreferSidecar,
         track_selection: TrackSelection::All,
         dvdv_vts: None,
@@ -8796,11 +8814,16 @@ fn execute_commit_with_source_options_transform(
     // state. The TUI must not reconstruct ownership with a post-commit path
     // scan.
     let cue_artifact_audio = app.convert.source.cue_artifact_audio.clone();
+    let cue_artifact_metadata = app.convert.source.cue_artifact_metadata.clone();
     let source_synthetic_cue_artifacts = app.convert.source.synthetic_cue_artifacts.clone();
     let windows_portable_naming = app.config.naming.windows_portable;
-    let transaction = app.manager.commit_batch_with_cue_artifacts(
+    let cue_source_policy = commit_source.cue_sidecar;
+    let transaction = app.manager.commit_batch_with_cue_metadata_artifacts(
         &batch,
         &cue_artifact_audio,
+        &cue_artifact_metadata,
+        &app.config.conversion.aggregate_metadata_target_priority,
+        cue_source_policy,
         &source_synthetic_cue_artifacts,
         &options,
         |item| {
@@ -8821,7 +8844,7 @@ fn execute_commit_with_source_options_transform(
             apply_queue_item_cue_sidecar_override_to_source_options(item, &mut item_source);
 
             if let Some(existing_req) = item.pipeline_request.as_mut() {
-                // `commit_batch_with_cue_artifacts()` may already have attached
+                // `commit_batch_with_cue_metadata_artifacts()` may already have attached
                 // a full PipelineRequest from an earlier admission path. Replace
                 // the source and request metadata inside the admission
                 // transaction so transform/state projection cannot be skipped.
@@ -8991,6 +9014,7 @@ fn execute_commit_with_source_options_transform(
     app.convert.source.cleanup_synthetic_cue_artifacts();
     app.convert.set_source_mode(SourceMode::Empty);
     app.convert.source.cue_artifact_audio.clear();
+    app.convert.source.cue_artifact_metadata.clear();
     app.convert.metadata = MetadataState::default();
     let _ = app.db.clear_batch_state();
     app.save_queue();
@@ -14762,6 +14786,7 @@ mod completion_tests {
             bluray_audio_pid: None,
             bluray_audio_stream: None,
             bluray_angle: None,
+            sidecar_cue_track_metadata: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
         }
@@ -18082,7 +18107,7 @@ mod execute_queue_state_consistency_tests {
         let body = &source[start..end];
 
         assert!(
-            body.contains("let transaction = app.manager.commit_batch_with_cue_artifacts("),
+            body.contains("let transaction = app.manager.commit_batch_with_cue_metadata_artifacts("),
             "Convert commit must use the manager transaction result"
         );
         assert!(
@@ -18158,7 +18183,7 @@ mod execute_queue_state_consistency_tests {
         );
         let destructure = finish_body
             .find(
-                "let QueueExpansionResult {\n        paths,\n        mut cue_artifact_audio,\n        synthetic_cue_artifacts,\n        expansion_errors,\n        ..\n    } = queue;",
+                "let QueueExpansionResult {\n        paths,\n        mut cue_artifact_audio,\n        mut cue_artifact_metadata,\n        synthetic_cue_artifacts,\n        expansion_errors,\n        ..\n    } = queue;",
             )
             .expect("CUE metadata should come from the expansion result");
         let retain = finish_body
@@ -18400,6 +18425,7 @@ FILE "{stem}.flac" WAVE
                 queue: QueueExpansionResult {
                     paths: vec![track],
                     cue_artifact_audio: std::collections::HashSet::new(),
+                    cue_artifact_metadata: std::collections::BTreeMap::new(),
                     synthetic_cue_artifacts: std::collections::HashSet::new(),
                     expansion_errors: Vec::new(),
                     cue_selection_prompt: None,
@@ -18706,6 +18732,7 @@ mod cue_sidecar_override_source_transform_tests {
             dvda_group_selection: crate::convert::pipeline::DvdaGroupSelection::Default,
             dvda_assume_decrypted: false,
             dvda_downmix_policy: crate::convert::pipeline::DvdaDownmixPolicy::Auto,
+            sidecar_cue_track_metadata: None,
             cue_sidecar: crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
             track_selection: crate::convert::pipeline::TrackSelection::All,
             dvdv_vts: None,
@@ -20022,7 +20049,7 @@ mod convert_commit_synthetic_artifact_lifecycle_tests {
         let commit_body = &source[commit_start..commit_end];
 
         assert!(
-            commit_body.contains("commit_batch_with_cue_artifacts"),
+            commit_body.contains("commit_batch_with_cue_metadata_artifacts"),
             "commit must receive an authoritative queue/artifact transaction"
         );
         assert!(

@@ -5433,6 +5433,7 @@ impl BrowseState {
                     return QueueExpansionResult {
                         paths: vec![entry.path.clone()],
                         cue_artifact_audio: HashSet::new(),
+                        cue_artifact_metadata: std::collections::BTreeMap::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
                         cue_selection_prompt: None,
@@ -5442,6 +5443,7 @@ impl BrowseState {
                     return QueueExpansionResult {
                         paths: vec![entry.path.clone()],
                         cue_artifact_audio: HashSet::new(),
+                        cue_artifact_metadata: std::collections::BTreeMap::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
                         cue_selection_prompt: None,
@@ -5457,6 +5459,7 @@ impl BrowseState {
                     return QueueExpansionResult {
                         paths: vec![entry.path.clone()],
                         cue_artifact_audio: HashSet::new(),
+                        cue_artifact_metadata: std::collections::BTreeMap::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
                         cue_selection_prompt: None,

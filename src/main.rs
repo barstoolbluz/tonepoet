@@ -1443,7 +1443,15 @@ async fn run_convert(
     // Browse); symlinked layouts need explicit file arguments.
     {
         let mut q = queue.write().await;
-        let planned = plan_cli_convert_queue(&paths);
+        let planned = plan_cli_convert_queue_for_conversion(
+            &paths,
+            &config.conversion.aggregate_metadata_target_priority,
+            if no_cue {
+                tonepoet::convert::pipeline::CueSidecarPolicy::IgnoreCue
+            } else {
+                tonepoet::convert::pipeline::CueSidecarPolicy::PreferSidecar
+            },
+        );
         if !planned.errors.is_empty() {
             for err in &planned.errors {
                 eprintln!("Error: {err}");
@@ -1460,7 +1468,7 @@ async fn run_convert(
         let needs_archive_password = planned
             .items
             .iter()
-            .any(|(path, _, _)| tonepoet::is_encrypted_archive_ext(path));
+            .any(|(path, _, _, _)| tonepoet::is_encrypted_archive_ext(path));
         let resolved_archive_password = match resolve_cli_archive_password(
             needs_archive_password,
             &archive_password,
@@ -1485,12 +1493,13 @@ async fn run_convert(
                 return Err(anyhow::anyhow!(error));
             }
         };
-        for (path, format, cue_sidecar_override) in planned.items {
+        for (path, format, cue_sidecar_override, sidecar_cue_track_metadata) in planned.items {
             add_item_to_queue(
                 &mut q,
                 path,
                 format,
                 cue_sidecar_override,
+                sidecar_cue_track_metadata,
                 &options,
                 &resolved_archive_password,
             );
@@ -1506,6 +1515,11 @@ async fn run_convert(
                 req.container = item.input_path.clone();
                 req.item_id = item.id.clone();
                 req.job_id = format!("job-{}", item.id);
+                if let Some(cue_sidecar_override) = item.cue_sidecar_override {
+                    req.source.cue_sidecar = cue_sidecar_override;
+                }
+                req.source.sidecar_cue_track_metadata =
+                    item.sidecar_cue_track_metadata.clone();
                 // Carry the item's archive password if set.
                 if let Some(ref pw) = item.archive_password {
                     req.source.archive_password =
@@ -1661,6 +1675,7 @@ struct PlannedCliQueue {
         PathBuf,
         FileFormat,
         Option<tonepoet::convert::pipeline::CueSidecarPolicy>,
+        Option<tonepoet::convert::pipeline::SidecarCueTrackMetadataSource>,
     )>,
     warnings: Vec<String>,
     errors: Vec<String>,
@@ -1682,6 +1697,19 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
     )
 }
 
+fn plan_cli_convert_queue_for_conversion(
+    paths: &[PathBuf],
+    metadata_target_priority: &[tonepoet::config::AggregateMetadataTarget],
+    cue_source_policy: tonepoet::convert::pipeline::CueSidecarPolicy,
+) -> PlannedCliQueue {
+    plan_cli_convert_queue_with_grouping_decisions_and_metadata_priority(
+        paths,
+        &tonepoet::convert::queue_expansion::QueueSplitCueAlbumGroupingDecisions::new(),
+        metadata_target_priority,
+        cue_source_policy,
+    )
+}
+
 /// CLI planner seam for callers that already possess operation/session-scoped
 /// authoritative split-CUE grouping evidence. The ordinary one-shot CLI has no
 /// prior grouping session and therefore passes an empty map rather than
@@ -1689,6 +1717,20 @@ fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
 fn plan_cli_convert_queue_with_grouping_decisions(
     paths: &[PathBuf],
     grouping_decisions: &tonepoet::convert::queue_expansion::QueueSplitCueAlbumGroupingDecisions,
+) -> PlannedCliQueue {
+    plan_cli_convert_queue_with_grouping_decisions_and_metadata_priority(
+        paths,
+        grouping_decisions,
+        &[],
+        tonepoet::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+    )
+}
+
+fn plan_cli_convert_queue_with_grouping_decisions_and_metadata_priority(
+    paths: &[PathBuf],
+    grouping_decisions: &tonepoet::convert::queue_expansion::QueueSplitCueAlbumGroupingDecisions,
+    metadata_target_priority: &[tonepoet::config::AggregateMetadataTarget],
+    cue_source_policy: tonepoet::convert::pipeline::CueSidecarPolicy,
 ) -> PlannedCliQueue {
     let mut warnings = Vec::new();
     let mut expansion_inputs = Vec::new();
@@ -1730,12 +1772,20 @@ fn plan_cli_convert_queue_with_grouping_decisions(
     let mut items = Vec::new();
     for path in &expansion.paths {
         if let Ok(format) = FormatDetector::detect(path) {
-            let cue_sidecar_override =
-                tonepoet::convert::queue_expansion::cue_sidecar_override_for_commit_path(
+            let cue_decision =
+                tonepoet::convert::queue_expansion::cue_artifact_commit_decision_for_path(
                     path,
                     &expansion.cue_artifact_audio,
+                    &expansion.cue_artifact_metadata,
+                    metadata_target_priority,
+                    cue_source_policy,
                 );
-            items.push((path.clone(), format, cue_sidecar_override));
+            items.push((
+                path.clone(),
+                format,
+                cue_decision.cue_sidecar_override,
+                cue_decision.sidecar_cue_track_metadata,
+            ));
         }
     }
 
@@ -1788,11 +1838,13 @@ fn add_item_to_queue(
     path: PathBuf,
     format: FileFormat,
     cue_sidecar_override: Option<tonepoet::convert::pipeline::CueSidecarPolicy>,
+    sidecar_cue_track_metadata: Option<tonepoet::convert::pipeline::SidecarCueTrackMetadataSource>,
     options: &ConversionOptions,
     resolved_archive_password: &Option<String>,
 ) {
     let mut item = ConversionItem::new(path.clone(), format, options.clone());
     item.cue_sidecar_override = cue_sidecar_override;
+    item.sidecar_cue_track_metadata = sidecar_cue_track_metadata;
     if tonepoet::is_encrypted_archive_ext(&path) {
         item.set_archive_password(resolved_archive_password.clone(), None);
     }
@@ -1910,6 +1962,7 @@ fn build_pipeline_request_template(
             bluray_audio_pid: None,
             bluray_audio_stream: None,
             bluray_angle: None,
+            sidecar_cue_track_metadata: None,
             cue_sidecar: cue_policy,
             track_selection,
         },
@@ -3825,7 +3878,7 @@ mod cli_convert_queue_planning_tests {
         planned
             .items
             .iter()
-            .map(|(path, _, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|(path, _, _, _)| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect()
     }
 
@@ -4042,13 +4095,14 @@ FILE "side_b.flac" WAVE
 
         let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
         assert_eq!(planned.items.len(), 1);
-        let (path, _, override_policy) = &planned.items[0];
+        let (path, _, override_policy, sidecar_metadata) = &planned.items[0];
         assert!(path.ends_with("01 - One.flac"));
         assert_eq!(
             *override_policy,
             Some(tonepoet::convert::pipeline::CueSidecarPolicy::EmbeddedOnly),
             "sibling audio of an unresolvable CUE must skip sidecar CUE detection"
         );
+        assert!(sidecar_metadata.is_none(), "invalid CUEs must never transfer metadata");
     }
 
     /// Unsupported explicit file arguments warn; missing paths warn; neither
@@ -4209,12 +4263,13 @@ FILE "side_b.flac" WAVE
         let manager = ConversionManager::new(ConversionConfig::default());
         {
             let mut q = manager.queue.try_write().expect("queue write");
-            for (path, format, cue_sidecar_override) in planned.items.clone() {
+            for (path, format, cue_sidecar_override, sidecar_cue_track_metadata) in planned.items.clone() {
                 add_item_to_queue(
                     &mut q,
                     path,
                     format,
                     cue_sidecar_override,
+                    sidecar_cue_track_metadata,
                     &ConversionOptions::default(),
                     &None,
                 );

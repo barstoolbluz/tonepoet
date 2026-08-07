@@ -7909,7 +7909,7 @@ impl MetadataReadIssue {
     fn from_lofty_read_error(path: &std::path::Path, err: lofty::error::LoftyError) -> Self {
         use lofty::error::ErrorKind;
         let kind = match err.kind() {
-            ErrorKind::UnknownFormat | ErrorKind::UnsupportedTag => {
+            _ if crate::metadata_persistence::lofty_error_is_unsupported_metadata_format(&err) => {
                 MetadataReadIssueKind::UnsupportedFormat
             }
             ErrorKind::Io(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {

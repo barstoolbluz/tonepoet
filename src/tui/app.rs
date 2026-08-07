@@ -3014,6 +3014,13 @@ pub struct SourceState {
     /// resulting `ConversionItem`, so downstream detection skips sidecar CUE
     /// discovery while still honoring embedded CUESHEET tags.
     pub cue_artifact_audio: std::collections::HashSet<PathBuf>,
+    /// Exact admitted metadata-artifact CUE track mappings retained across the
+    /// Convert review screen. Keys are the queued carriers; values are copied
+    /// from queue expansion without re-association.
+    pub cue_artifact_metadata: std::collections::BTreeMap<
+        PathBuf,
+        crate::convert::pipeline::SidecarCueTrackMetadataSource,
+    >,
     /// Synthetic CUE queue inputs staged for a merged split-CUE album while the
     /// Convert screen is in review. Commit transfers these artifacts to the
     /// conversion manager; replacing or clearing the source removes them.
@@ -3066,6 +3073,7 @@ impl Clone for SourceState {
             batch_probe_pending: self.batch_probe_pending.clone(),
             batch_probe_debounce: self.batch_probe_debounce.clone(),
             cue_artifact_audio: self.cue_artifact_audio.clone(),
+            cue_artifact_metadata: self.cue_artifact_metadata.clone(),
             synthetic_cue_artifacts: std::collections::HashSet::new(),
         }
     }
@@ -3085,6 +3093,7 @@ impl Default for SourceState {
             batch_probe_pending: None,
             batch_probe_debounce: None,
             cue_artifact_audio: std::collections::HashSet::new(),
+            cue_artifact_metadata: std::collections::BTreeMap::new(),
             synthetic_cue_artifacts: std::collections::HashSet::new(),
         }
     }
@@ -5408,6 +5417,12 @@ impl ConvertState {
         self.source.mode.cleanup_archive_preview_staging();
         let retained_paths = mode.all_paths();
         self.source.cue_artifact_audio.retain(|path| {
+            crate::convert::queue_expansion::path_list_contains_queue_identity(
+                &retained_paths,
+                path,
+            )
+        });
+        self.source.cue_artifact_metadata.retain(|path, _| {
             crate::convert::queue_expansion::path_list_contains_queue_identity(
                 &retained_paths,
                 path,

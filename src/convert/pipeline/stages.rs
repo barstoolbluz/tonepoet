@@ -4029,6 +4029,7 @@ fn planner_metadata_already_satisfied(
                     let authoritative_tags_required = source_level_required
                         .authoritative_tags_applied
                         || dvd_audio_artifact_has_authoritative_metadata(track, source)
+                        || sidecar_cue_artifact_has_authoritative_metadata(track, source, req)
                         || m4a_artifact_has_freeform_metadata(track, source);
                     let required = track.metadata_required.merge(PlannedMetadataSatisfaction {
                         authoritative_tags_applied: authoritative_tags_required,
@@ -4044,6 +4045,30 @@ fn planner_metadata_already_satisfied(
         }
         AudioArtifacts::Merged(_) => false,
     }
+}
+
+fn sidecar_cue_artifact_has_authoritative_metadata(
+    artifact: &TrackArtifact,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> bool {
+    // Queue expansion transfers this exact CUE-track provenance only when the
+    // selected metadata authority is the admitted sidecar while the carrier
+    // remains on the SingleFile route. Those tags are materializer-authored;
+    // ffmpeg cannot have copied them from the carrier during encode.
+    if !matches!(source.kind, SourceKind::SingleFile)
+        || req.source.sidecar_cue_track_metadata.is_none()
+    {
+        return false;
+    }
+
+    source
+        .tracks
+        .iter()
+        .find(|track| track.id == artifact.track_id)
+        .is_some_and(|track| {
+            !authoritative_metadata_tags(&track.metadata, &source.album_metadata).is_empty()
+        })
 }
 
 fn dvd_audio_artifact_has_authoritative_metadata(
@@ -7401,6 +7426,7 @@ FILE "album.flac" WAVE
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -8223,6 +8249,682 @@ FILE "album.flac" WAVE
             ],
         );
         source
+    }
+
+    fn write_minimal_dff_dsd(path: &Path) {
+        let file = std::fs::File::create(path).expect("create DFF/DSD fixture");
+        let mut writer = sacd_rs::dff_writer::DffWriter::new(file, 2, 2_822_400)
+            .expect("create DFF/DSD writer");
+        writer
+            .write_frame(&vec![0x69; 4_096])
+            .expect("write DFF/DSD payload");
+        writer.finish().expect("finish DFF/DSD fixture");
+    }
+
+    fn create_nine_dff_thriller_sidecar_album(
+        dir: &Path,
+    ) -> (Vec<(PathBuf, &'static str, &'static str)>, PathBuf) {
+        let tracks = [
+            ("01 - Wanna Be Startin' Somethin'.dff", "Wanna Be Startin' Somethin'", "JPES08400001"),
+            ("02 - Baby Be Mine.dff", "Baby Be Mine", "JPES08400002"),
+            ("03 - The Girl Is Mine.dff", "The Girl Is Mine", "JPES08400003"),
+            ("04 - Thriller.dff", "Thriller", "JPES08400004"),
+            ("05 - Beat It.dff", "Beat It", "JPES08400005"),
+            ("06 - Billie Jean.dff", "Billie Jean", "JPES08400006"),
+            ("07 - Human Nature.dff", "Human Nature", "JPES08400007"),
+            ("08 - P.Y.T. (Pretty Young Thing).dff", "P.Y.T. (Pretty Young Thing)", "JPES08400008"),
+            ("09 - The Lady in My Life.dff", "The Lady in My Life", "JPES08400009"),
+        ];
+        let mut cue_text = String::from(
+            "REM DATE 1984\nREM GENRE \"Pop\"\nCATALOG 4988005123999\nPERFORMER \"Michael Jackson\"\nTITLE \"Thriller\"\n",
+        );
+        let mut carriers = Vec::with_capacity(tracks.len());
+        for (index, (file, title, isrc)) in tracks.into_iter().enumerate() {
+            let path = dir.join(file);
+            write_minimal_dff_dsd(&path);
+            cue_text.push_str(&format!(
+                "FILE \"{file}\" WAVE\n  TRACK {:02} AUDIO\n    TITLE \"{title}\"\n    PERFORMER \"Michael Jackson\"\n    ISRC {isrc}\n    INDEX 01 00:00:00\n",
+                index + 1,
+            ));
+            carriers.push((path, title, isrc));
+        }
+        let cue = dir.join("Michael Jackson - Thriller.cue");
+        std::fs::write(&cue, cue_text).expect("write nine-track DFF CUE");
+        (carriers, cue)
+    }
+
+    #[tokio::test]
+    async fn nine_dff_metadata_sidecar_album_drives_real_conversion_naming_and_flac_tags() {
+        let strict = cue_matrix_strict_mode();
+        let case = matrix_cases()
+            .into_iter()
+            .find(|case| case.format == tonepoet_pipeline::AudioFormat::Flac)
+            .expect("FLAC matrix case");
+        let unavailable = case_unavailability_reasons(&case);
+        if !unavailable.is_empty() {
+            let message = format!(
+                "real nine-DFF sidecar-CUE conversion requires {}",
+                unavailable.join(", ")
+            );
+            if strict {
+                panic!("{message}; strict tool mode forbids skipping this invariant");
+            }
+            eprintln!("skipping {message}");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (carriers, cue) = create_nine_dff_thriller_sidecar_album(temp.path());
+        let expansion = crate::convert::queue_expansion::expand_paths_to_audio_with_metadata(
+            &[temp.path().to_path_buf()],
+        );
+        assert!(
+            expansion.expansion_errors.is_empty(),
+            "nine-DFF queue expansion must be clean: {:?}",
+            expansion.expansion_errors
+        );
+        assert_eq!(expansion.paths.len(), carriers.len());
+        assert_eq!(expansion.cue_artifact_metadata.len(), carriers.len());
+        assert!(!expansion.paths.iter().any(|path| path == &cue));
+
+        for (index, (carrier, expected_title, expected_isrc)) in carriers.iter().enumerate() {
+            let cue_decision =
+                crate::convert::queue_expansion::cue_artifact_commit_decision_for_path(
+                    carrier,
+                    &expansion.cue_artifact_audio,
+                    &expansion.cue_artifact_metadata,
+                    &[],
+                    CueSidecarPolicy::PreferSidecar,
+                );
+            assert_eq!(
+                cue_decision.cue_sidecar_override,
+                Some(CueSidecarPolicy::IgnoreCue),
+                "DFF track {} should remain on the SingleFile route",
+                index + 1,
+            );
+            let transferred = cue_decision
+                .sidecar_cue_track_metadata
+                .expect("valid DFF metadata artifact must transfer exact CUE track provenance");
+            assert_eq!(transferred.track_index, index);
+            assert_eq!(transferred.cue_track_number, (index + 1) as u32);
+
+            let case_root = temp.path().join(format!("dff-track-{:02}", index + 1));
+            std::fs::create_dir_all(case_root.join("out")).expect("DFF output root");
+            std::fs::create_dir_all(case_root.join("logs")).expect("DFF log root");
+            let mut req = request_for_case(&case_root, carrier, &case);
+            req.job_id = format!("nine-dff-sidecar-{:02}", index + 1);
+            req.item_id = req.job_id.clone();
+            req.settings.metadata.preserve_artwork = false;
+            req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+            req.source.sidecar_cue_track_metadata = Some(transferred);
+            req.naming.template = "%ARTIST% - %TRACKNN% - %TITLE%".to_string();
+            req.naming.folder_template = Some("%ARTIST%/%ALBUM% (%YEAR%)".to_string());
+            req.naming.per_album_subdir = true;
+
+            let staging = StagingDir::new(case_root.join("staging"), req.job_id.clone());
+            let runner = RealToolRunner::new(HashMap::new());
+            let cancel = CancellationToken::new();
+            let source = SingleFileMaterializer
+                .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("DFF track {} materialization failed: {err}", index + 1));
+
+            assert_eq!(source.kind, SourceKind::SingleFile);
+            assert_eq!(source.tracks.len(), 1);
+            let metadata = &source.tracks[0].metadata;
+            assert_eq!(metadata.artist.as_deref(), Some("Michael Jackson"));
+            assert_eq!(metadata.title.as_deref(), Some(*expected_title));
+            assert_eq!(metadata.isrc.as_deref(), Some(*expected_isrc));
+            assert_eq!(metadata.track_number, Some((index + 1) as u32));
+            assert_eq!(source.album_metadata.album.as_deref(), Some("Thriller"));
+            assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Michael Jackson"));
+            assert_eq!(source.album_metadata.date.as_deref(), Some("1984"));
+            assert_eq!(source.album_metadata.genre.as_deref(), Some("Pop"));
+            assert_eq!(source.album_metadata.total_tracks, carriers.len() as u32);
+            assert_eq!(
+                source.album_metadata.extra.get("catalognumber").map(String::as_str),
+                Some("4988005123999")
+            );
+            assert!(
+                source.tracks[0]
+                    .warnings
+                    .iter()
+                    .all(|warning| !warning.contains("converted without metadata")),
+                "DFF track {} must not log the old no-metadata claim",
+                index + 1,
+            );
+
+            let plan = plan_outputs(&source, &req)
+                .unwrap_or_else(|err| panic!("DFF track {} output planning failed: {err}", index + 1));
+            assert_eq!(
+                plan.album_dir,
+                req.output_root.join("Michael Jackson").join("Thriller (1984)")
+            );
+            let expected_filename = format!(
+                "Michael Jackson - {:02} - {}.flac",
+                index + 1,
+                expected_title,
+            );
+            assert_eq!(
+                plan.entries[0]
+                    .final_path
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some(expected_filename.as_str()),
+            );
+
+            let converted = convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+            assert!(
+                matches!(converted.record.outcome, StageOutcome::Ok),
+                "DFF track {} conversion failed: {:?}",
+                index + 1,
+                converted.tracks,
+            );
+            let AudioArtifacts::Tracks(track_artifacts) = &converted.artifacts.audio else {
+                panic!("DFF track {} should produce one track artifact", index + 1);
+            };
+            assert_eq!(track_artifacts.len(), 1);
+            let output_path = track_artifacts[0].staged_path.clone();
+            apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                .await
+                .unwrap_or_else(|err| panic!("DFF track {} metadata stage failed: {err}", index + 1));
+
+            let tags = format_tag_map(&ffprobe_json(&output_path));
+            assert_tag_value(&tags, "TITLE", *expected_title, case.name);
+            assert_tag_value(&tags, "ARTIST", "Michael Jackson", case.name);
+            assert_tag_value(&tags, "ALBUM", "Thriller", case.name);
+            assert_any_tag_value(
+                &tags,
+                &["ALBUMARTIST", "ALBUM_ARTIST"],
+                "Michael Jackson",
+                case.name,
+            );
+            assert_any_tag_value(&tags, &["DATE", "YEAR"], "1984", case.name);
+            assert_tag_value(&tags, "GENRE", "Pop", case.name);
+            let expected_track_number = (index + 1).to_string();
+            assert_any_tag_value(
+                &tags,
+                &["TRACKNUMBER", "TRACK"],
+                &expected_track_number,
+                case.name,
+            );
+            assert_tag_value(&tags, "ISRC", *expected_isrc, case.name);
+            assert_tag_value(&tags, "CATALOGNUMBER", "4988005123999", case.name);
+        }
+    }
+
+    fn create_untaggable_dts_carrier(dir: &Path) -> PathBuf {
+        let carrier = dir.join("01 - Wanna Be Startin' Somethin'.dts");
+        run_checked(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                format!("sine=frequency=440:sample_rate=48000:duration={EXPECTED_DURATION_SECONDS}"),
+                "-c:a".to_string(),
+                "dca".to_string(),
+                "-strict".to_string(),
+                "-2".to_string(),
+                "-b:a".to_string(),
+                "768k".to_string(),
+                carrier.display().to_string(),
+            ],
+        );
+        carrier
+    }
+
+    // A single untaggable DFF carrier + one-track sidecar CUE. DFF (unlike DTS)
+    // is a recognized single-audio conversion source (`is_single_audio_extension`),
+    // so this fixture can drive the FULL `run_pipeline_item` path — which does
+    // source-container detection before materialization — not just the direct
+    // materializer. It is also the user's real-world format (DSD).
+    fn create_untaggable_dff_and_sidecar_cue(dir: &Path) -> (PathBuf, PathBuf) {
+        let carrier = dir.join("01 - Wanna Be Startin' Somethin'.dff");
+        write_minimal_dff_dsd(&carrier);
+        let cue = dir.join("Thriller.cue");
+        std::fs::write(
+            &cue,
+            r#"REM DATE 1984
+REM GENRE "Pop"
+CATALOG 4988005123999
+PERFORMER "Michael Jackson"
+TITLE "Thriller"
+FILE "01 - Wanna Be Startin' Somethin'.dff" WAVE
+  TRACK 01 AUDIO
+    TITLE "Wanna Be Startin' Somethin'"
+    PERFORMER "Michael Jackson"
+    ISRC JPES08400001
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("write DFF metadata sidecar CUE");
+        (carrier, cue)
+    }
+
+    fn create_untaggable_dts_and_sidecar_cue(dir: &Path) -> (PathBuf, PathBuf) {
+        let carrier = create_untaggable_dts_carrier(dir);
+        let cue = dir.join("Thriller.cue");
+        std::fs::write(
+            &cue,
+            r#"REM DATE 1984
+REM GENRE "Pop"
+CATALOG 4988005123999
+PERFORMER "Michael Jackson"
+TITLE "Thriller"
+FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
+  TRACK 01 AUDIO
+    TITLE "Wanna Be Startin' Somethin'"
+    PERFORMER "Michael Jackson"
+    ISRC JPES08400001
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("write DTS metadata sidecar CUE");
+        (carrier, cue)
+    }
+
+    fn create_headerless_untaggable_dts_and_sidecar_cue(dir: &Path) -> (PathBuf, PathBuf) {
+        let carrier = create_untaggable_dts_carrier(dir);
+        let cue = dir.join("headerless.cue");
+        std::fs::write(
+            &cue,
+            r#"FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
+  TRACK 01 AUDIO
+    TITLE "Wanna Be Startin' Somethin'"
+    PERFORMER "Michael Jackson"
+    ISRC JPES08400001
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("write headerless DTS metadata sidecar CUE");
+        (carrier, cue)
+    }
+
+    #[tokio::test]
+    async fn untaggable_dts_sidecar_cue_drives_real_flac_naming_and_tags_idempotently() {
+        let strict = cue_matrix_strict_mode();
+        let case = matrix_cases()
+            .into_iter()
+            .find(|case| case.format == tonepoet_pipeline::AudioFormat::Flac)
+            .expect("FLAC matrix case");
+        let mut unavailable = case_unavailability_reasons(&case);
+        if executable_on_path("ffmpeg") && !ffmpeg_encoder_available("dca") {
+            unavailable.push("missing ffmpeg encoder dca (DTS)".to_string());
+        }
+        if !unavailable.is_empty() {
+            let message = format!(
+                "real untaggable sidecar-CUE conversion requires {}",
+                unavailable.join(", ")
+            );
+            if strict {
+                panic!("{message}; strict tool mode forbids skipping this invariant");
+            }
+            eprintln!("skipping {message}");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (carrier, cue) = create_untaggable_dts_and_sidecar_cue(temp.path());
+        assert!(
+            !crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(&carrier),
+            "DTS fixture must exercise a structurally untaggable IndividualFiles representation"
+        );
+
+        let case_root = temp.path().join("untaggable-dts-sidecar-cue");
+        std::fs::create_dir_all(case_root.join("out")).expect("output root");
+        std::fs::create_dir_all(case_root.join("logs")).expect("log root");
+        let mut req = request_for_case(&case_root, &carrier, &case);
+        req.job_id = "untaggable-dts-sidecar-cue".to_string();
+        req.item_id = req.job_id.clone();
+        req.settings.metadata.preserve_artwork = false;
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        req.source.sidecar_cue_track_metadata = Some(SidecarCueTrackMetadataSource {
+            cue_path: cue,
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01 - Wanna Be Startin' Somethin'.dts".to_string()),
+        });
+        req.naming.template = "%ARTIST% - %TRACKNN% - %TITLE%".to_string();
+        req.naming.folder_template = Some("%ARTIST%/%ALBUM% (%YEAR%)".to_string());
+        req.naming.per_album_subdir = true;
+
+        let staging = StagingDir::new(case_root.join("staging"), req.job_id.clone());
+        let runner = RealToolRunner::new(HashMap::new());
+        let cancel = CancellationToken::new();
+        let source = SingleFileMaterializer
+            .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+            .await
+            .expect("untaggable SingleFile + transferred CUE materialization");
+
+        assert_eq!(source.kind, SourceKind::SingleFile);
+        assert_eq!(source.tracks.len(), 1);
+        let metadata = &source.tracks[0].metadata;
+        assert_eq!(metadata.artist.as_deref(), Some("Michael Jackson"));
+        assert_eq!(metadata.title.as_deref(), Some("Wanna Be Startin' Somethin'"));
+        assert_eq!(metadata.isrc.as_deref(), Some("JPES08400001"));
+        assert_eq!(source.album_metadata.album.as_deref(), Some("Thriller"));
+        assert_eq!(source.album_metadata.album_artist.as_deref(), Some("Michael Jackson"));
+        assert_eq!(source.album_metadata.date.as_deref(), Some("1984"));
+        assert_eq!(source.album_metadata.genre.as_deref(), Some("Pop"));
+        assert_eq!(
+            source.album_metadata.extra.get("catalognumber").map(String::as_str),
+            Some("4988005123999")
+        );
+        assert!(
+            source.tracks[0]
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("converted without metadata")),
+            "selected sidecar metadata must not retain the old no-metadata warning"
+        );
+
+        let plan = plan_outputs(&source, &req).expect("sidecar metadata output plan");
+        assert_eq!(
+            plan.album_dir,
+            req.output_root.join("Michael Jackson").join("Thriller (1984)")
+        );
+        assert_eq!(
+            plan.entries[0]
+                .final_path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("Michael Jackson - 01 - Wanna Be Startin' Somethin'.flac")
+        );
+
+        let converted = convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+        assert!(
+            matches!(converted.record.outcome, StageOutcome::Ok),
+            "untaggable sidecar-CUE conversion failed: {:?}",
+            converted.tracks
+        );
+        let AudioArtifacts::Tracks(track_artifacts) = &converted.artifacts.audio else {
+            panic!("untaggable sidecar-CUE case should produce per-track artifacts");
+        };
+        assert_eq!(track_artifacts.len(), 1);
+        let output_path = track_artifacts[0].staged_path.clone();
+
+        apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+            .await
+            .expect("first sidecar-CUE metadata pass");
+        let first_probe = ffprobe_json(&output_path);
+        apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+            .await
+            .expect("second sidecar-CUE metadata pass");
+        let second_probe = ffprobe_json(&output_path);
+        assert_eq!(
+            format_tag_map(&first_probe),
+            format_tag_map(&second_probe),
+            "repeated sidecar-CUE metadata application must be semantically idempotent"
+        );
+
+        let tags = format_tag_map(&second_probe);
+        assert_tag_value(&tags, "TITLE", "Wanna Be Startin' Somethin'", case.name);
+        assert_tag_value(&tags, "ARTIST", "Michael Jackson", case.name);
+        assert_tag_value(&tags, "ALBUM", "Thriller", case.name);
+        assert_any_tag_value(
+            &tags,
+            &["ALBUMARTIST", "ALBUM_ARTIST"],
+            "Michael Jackson",
+            case.name,
+        );
+        assert_any_tag_value(&tags, &["DATE", "YEAR"], "1984", case.name);
+        assert_tag_value(&tags, "GENRE", "Pop", case.name);
+        assert_any_tag_value(&tags, &["TRACKNUMBER", "TRACK"], "1", case.name);
+        assert_tag_value(&tags, "ISRC", "JPES08400001", case.name);
+        assert_tag_value(&tags, "CATALOGNUMBER", "4988005123999", case.name);
+        let exported = run_output(
+            "metaflac",
+            &["--export-tags-to=-".to_string(), output_path.display().to_string()],
+        );
+        let counts = key_value_line_counts(&exported);
+        assert_managed_key_counts_once(
+            case.name,
+            &counts,
+            &[
+                "TITLE",
+                "ARTIST",
+                "ALBUM",
+                "GENRE",
+                "DATE",
+                "TRACKNUMBER",
+                "ISRC",
+                "CATALOGNUMBER",
+            ],
+        );
+        assert_eq!(counts.get("ISRC").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("CATALOGNUMBER").copied().unwrap_or(0), 1);
+        assert_eq!(
+            counts.get("PRE_EMPHASIS").copied().unwrap_or(0),
+            0,
+            "a sidecar CUE without FLAGS PRE must not invent PRE_EMPHASIS",
+        );
+        assert_eq!(
+            counts.get("MY_NOTE").copied().unwrap_or(0),
+            0,
+            "the DTS fixture does not supply the custom MY_NOTE tag",
+        );
+    }
+
+    #[tokio::test]
+    async fn untaggable_dts_sidecar_cue_full_pipeline_embeds_authoritative_tags() {
+        let strict = cue_matrix_strict_mode();
+        let case = matrix_cases()
+            .into_iter()
+            .find(|case| case.format == tonepoet_pipeline::AudioFormat::Flac)
+            .expect("FLAC matrix case");
+        let unavailable = case_unavailability_reasons(&case);
+        if !unavailable.is_empty() {
+            let message = format!(
+                "real orchestrated untaggable sidecar-CUE conversion requires {}",
+                unavailable.join(", ")
+            );
+            if strict {
+                panic!("{message}; strict tool mode forbids skipping this invariant");
+            }
+            eprintln!("skipping {message}");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        // DFF: untaggable AND a recognized conversion source, so the FULL
+        // orchestrated pipeline (source detection -> materialize -> ... ) runs.
+        // (DTS is untaggable but is NOT in `is_single_audio_extension`, so
+        // `run_pipeline_item` rejects it as an unrecognized source container.)
+        let (carrier, cue) = create_untaggable_dff_and_sidecar_cue(temp.path());
+        assert!(
+            !crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(&carrier),
+            "full-pipeline DFF fixture must exercise an untaggable carrier",
+        );
+        let case_root = temp.path().join("untaggable-dts-sidecar-cue-full-pipeline");
+        std::fs::create_dir_all(case_root.join("out")).expect("output root");
+        std::fs::create_dir_all(case_root.join("logs")).expect("log root");
+
+        let mut req = request_for_case(&case_root, &carrier, &case);
+        req.job_id = "untaggable-dts-sidecar-cue-full-pipeline".to_string();
+        req.item_id = req.job_id.clone();
+        req.settings.metadata.preserve_artwork = false;
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        req.source.sidecar_cue_track_metadata = Some(SidecarCueTrackMetadataSource {
+            cue_path: cue,
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01 - Wanna Be Startin' Somethin'.dff".to_string()),
+        });
+        req.naming.template = "%ARTIST% - %TRACKNN% - %TITLE%".to_string();
+        req.naming.folder_template = Some("%ARTIST%/%ALBUM% (%YEAR%)".to_string());
+        req.naming.per_album_subdir = true;
+
+        let runner = RealToolRunner::new(HashMap::new());
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let report = run_pipeline_item(req, &runner, &reporter, &cancel).await;
+
+        assert!(
+            matches!(&report.outcome, AlbumOutcome::Complete { .. }),
+            "full pipeline should complete: {:?}",
+            &report.outcome,
+        );
+        let metadata_outcome = match &report.outcome {
+            AlbumOutcome::Complete { stages, .. }
+            | AlbumOutcome::Partial { stages, .. }
+            | AlbumOutcome::Blocked { stages, .. } => stages
+                .iter()
+                .find(|record| record.stage == PipelineStage::Metadata)
+                .map(|record| &record.outcome),
+        };
+        assert!(
+            matches!(metadata_outcome, Some(StageOutcome::Ok)),
+            "transferred sidecar-CUE metadata must run the orchestrator metadata stage; got {metadata_outcome:?}",
+        );
+
+        let published = report.published.as_ref().expect("published album");
+        let output_path = published
+            .entries
+            .iter()
+            .find(|entry| matches!(&entry.role, PublishRole::Audio))
+            .map(|entry| entry.final_path.clone())
+            .expect("published FLAC audio");
+        assert_eq!(
+            output_path.file_name().and_then(|name| name.to_str()),
+            Some("Michael Jackson - 01 - Wanna Be Startin' Somethin'.flac"),
+        );
+
+        let tags = format_tag_map(&ffprobe_json(&output_path));
+        assert_tag_value(&tags, "TITLE", "Wanna Be Startin' Somethin'", case.name);
+        assert_tag_value(&tags, "ARTIST", "Michael Jackson", case.name);
+        assert_tag_value(&tags, "ALBUM", "Thriller", case.name);
+        assert_any_tag_value(
+            &tags,
+            &["ALBUMARTIST", "ALBUM_ARTIST"],
+            "Michael Jackson",
+            case.name,
+        );
+        assert_any_tag_value(&tags, &["DATE", "YEAR"], "1984", case.name);
+        assert_tag_value(&tags, "GENRE", "Pop", case.name);
+        assert_any_tag_value(&tags, &["TRACKNUMBER", "TRACK"], "1", case.name);
+        assert_tag_value(&tags, "ISRC", "JPES08400001", case.name);
+        assert_tag_value(&tags, "CATALOGNUMBER", "4988005123999", case.name);
+
+        // NOTE: a standalone single-item `run_pipeline_item` (album_batch: None)
+        // does not emit the batch-coordinated VISIBLE conversion.log that a real
+        // folder-album-batch publishes, so we do not read a log file here. The
+        // substantive "the metadata stage RAN and was not planner-skipped" claim
+        // is already proven authoritatively by the `metadata_outcome ==
+        // StageOutcome::Ok` assertion above (the log text merely restates it), and
+        // the embedded-tag assertions above prove the cue metadata actually
+        // reached the output FLAC — the whole point of this corrective.
+    }
+
+    #[tokio::test]
+    async fn headerless_untaggable_sidecar_cue_keeps_album_empty_through_real_flac_output() {
+        let strict = cue_matrix_strict_mode();
+        let case = matrix_cases()
+            .into_iter()
+            .find(|case| case.format == tonepoet_pipeline::AudioFormat::Flac)
+            .expect("FLAC matrix case");
+        let mut unavailable = case_unavailability_reasons(&case);
+        if executable_on_path("ffmpeg") && !ffmpeg_encoder_available("dca") {
+            unavailable.push("missing ffmpeg encoder dca (DTS)".to_string());
+        }
+        if !unavailable.is_empty() {
+            let message = format!(
+                "real headerless untaggable sidecar-CUE conversion requires {}",
+                unavailable.join(", ")
+            );
+            if strict {
+                panic!("{message}; strict tool mode forbids skipping this invariant");
+            }
+            eprintln!("skipping {message}");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (carrier, cue) = create_headerless_untaggable_dts_and_sidecar_cue(temp.path());
+        assert!(
+            !crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(&carrier),
+            "DTS fixture must exercise a structurally untaggable IndividualFiles representation"
+        );
+
+        let case_root = temp.path().join("headerless-untaggable-dts-sidecar-cue");
+        std::fs::create_dir_all(case_root.join("out")).expect("output root");
+        std::fs::create_dir_all(case_root.join("logs")).expect("log root");
+        let mut req = request_for_case(&case_root, &carrier, &case);
+        req.job_id = "headerless-untaggable-dts-sidecar-cue".to_string();
+        req.item_id = req.job_id.clone();
+        req.settings.metadata.preserve_artwork = false;
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        req.source.sidecar_cue_track_metadata = Some(SidecarCueTrackMetadataSource {
+            cue_path: cue,
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01 - Wanna Be Startin' Somethin'.dts".to_string()),
+        });
+        req.naming.template = "%ARTIST% - %TRACKNN% - %TITLE%".to_string();
+        req.naming.folder_template = None;
+
+        let staging = StagingDir::new(case_root.join("staging"), req.job_id.clone());
+        let runner = RealToolRunner::new(HashMap::new());
+        let cancel = CancellationToken::new();
+        let source = SingleFileMaterializer
+            .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+            .await
+            .expect("headerless SingleFile + transferred CUE materialization");
+
+        let metadata = &source.tracks[0].metadata;
+        assert_eq!(metadata.artist.as_deref(), Some("Michael Jackson"));
+        assert_eq!(metadata.title.as_deref(), Some("Wanna Be Startin' Somethin'"));
+        assert_eq!(metadata.isrc.as_deref(), Some("JPES08400001"));
+        assert!(metadata.extra.get("album").is_none());
+        assert!(source.album_metadata.album.is_none());
+        assert!(source.album_metadata.album_artist.is_none());
+        assert!(source.album_metadata.date.is_none());
+        assert!(source.album_metadata.genre.is_none());
+        assert!(source.album_metadata.extra.get("catalognumber").is_none());
+
+        let plan = plan_outputs(&source, &req).expect("headerless sidecar metadata output plan");
+        assert_eq!(plan.album_dir, req.output_root);
+        assert_eq!(
+            plan.entries[0]
+                .final_path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("Michael Jackson - 01 - Wanna Be Startin' Somethin'.flac")
+        );
+
+        let converted = convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+        assert!(
+            matches!(converted.record.outcome, StageOutcome::Ok),
+            "headerless sidecar-CUE conversion failed: {:?}",
+            converted.tracks
+        );
+        let AudioArtifacts::Tracks(track_artifacts) = &converted.artifacts.audio else {
+            panic!("headerless sidecar-CUE case should produce one track artifact");
+        };
+        assert_eq!(track_artifacts.len(), 1);
+        let output_path = track_artifacts[0].staged_path.clone();
+        apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+            .await
+            .expect("headerless sidecar-CUE metadata pass");
+
+        let tags = format_tag_map(&ffprobe_json(&output_path));
+        assert_tag_value(&tags, "TITLE", "Wanna Be Startin' Somethin'", case.name);
+        assert_tag_value(&tags, "ARTIST", "Michael Jackson", case.name);
+        assert_any_tag_value(&tags, &["TRACKNUMBER", "TRACK"], "1", case.name);
+        assert_tag_value(&tags, "ISRC", "JPES08400001", case.name);
+        assert!(!tags.contains_key("ALBUM"), "headerless CUE must not invent ALBUM: {tags:?}");
+        assert!(
+            !tags.contains_key("ALBUMARTIST") && !tags.contains_key("ALBUM_ARTIST"),
+            "headerless CUE must not invent ALBUMARTIST: {tags:?}"
+        );
+        assert!(!tags.contains_key("DATE") && !tags.contains_key("YEAR"));
+        assert!(!tags.contains_key("GENRE"));
+        assert!(!tags.contains_key("CATALOGNUMBER"));
     }
 
     #[tokio::test]
@@ -16777,6 +17479,17 @@ fn append_track_log(
         metadata_stage_result,
     ) {
         push_kv_line(log, "  Metadata", metadata);
+    }
+    if let Some(metadata_source) = req.source.sidecar_cue_track_metadata.as_ref() {
+        push_kv_line(
+            log,
+            "  Metadata source",
+            format!(
+                "Sidecar CUE: {} (track {})",
+                path_log_value(&metadata_source.cue_path),
+                metadata_source.cue_track_number,
+            ),
+        );
     }
 
     push_kv_line(
@@ -30514,6 +31227,7 @@ mod companion_copy_hardening_tests {
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -40160,6 +40874,7 @@ mod pipeline_test_helpers {
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -40914,6 +41629,29 @@ mod conversion_log_tests {
         assert!(log.contains(
             "Warning: Tag read: FAILED (unsupported tag layout) - converted without metadata"
         ));
+    }
+
+    #[test]
+    fn build_conversion_log_attributes_transferred_metadata_to_exact_sidecar_cue_track() {
+        let source = log_test_source();
+        let mut req = log_test_request();
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        req.source.sidecar_cue_track_metadata = Some(SidecarCueTrackMetadataSource {
+            cue_path: PathBuf::from("/music/Thriller/album.cue"),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01.dff".to_string()),
+        });
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let artifacts = log_test_artifacts();
+
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Metadata source: Sidecar CUE: /music/Thriller/album.cue (track 1)"));
+        assert!(!log.contains("converted without metadata"));
     }
 
     #[test]
@@ -42198,6 +42936,7 @@ mod naming_template_tests {
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -44790,6 +45529,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -45254,6 +45994,57 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             ),
             "DVD-Audio sidecar/materializer tags must force the orchestrator metadata stage \
              even when source-tag transfer has no planner obligation"
+        );
+    }
+
+    #[test]
+    fn transferred_sidecar_cue_authoritative_metadata_prevents_single_file_planner_skip() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = false;
+        fixture.album.req.settings.metadata.preserve_artwork = false;
+        fixture.album.req.settings.metadata.store_source_audio_md5 = false;
+        fixture.album.req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        let cue_path = fixture._temp.path().join("album.cue");
+        fixture.album.req.source.sidecar_cue_track_metadata = Some(
+            SidecarCueTrackMetadataSource {
+                cue_path,
+                track_index: 0,
+                cue_track_number: 1,
+                cue_file_reference: Some("input.dff".to_string()),
+            },
+        );
+
+        let scheduled = successful_output(&fixture, 0);
+        let artifact = scheduled.artifact.expect("successful artifact");
+        assert_eq!(artifact.metadata_required, PlannedMetadataSatisfaction::none());
+        assert_eq!(artifact.metadata_satisfaction, PlannedMetadataSatisfaction::none());
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "materializer-authored metadata selected from an admitted sidecar CUE must force the orchestrator metadata stage",
+        );
+
+        fixture.album.req.source.sidecar_cue_track_metadata = None;
+        assert!(
+            planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "the same taggable SingleFile source remains skippable without sidecar-CUE provenance",
         );
     }
 

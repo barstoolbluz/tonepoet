@@ -114,6 +114,7 @@ pub async fn run_app(
             if archive_preview_owned_or_pending {
                 app.convert.set_source_mode(super::app::SourceMode::Empty);
                 app.convert.source.cue_artifact_audio.clear();
+                app.convert.source.cue_artifact_metadata.clear();
                 app.convert.metadata = super::app::MetadataState::default();
             }
         }

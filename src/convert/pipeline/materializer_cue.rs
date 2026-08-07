@@ -676,7 +676,7 @@ fn sidecar_cue_subdivides_image(
     Ok(sidecar_cue_track_count_for_image(cue_path, image)? >= 2)
 }
 
-fn embedded_cuesheet_is_present(path: &Path) -> bool {
+pub(crate) fn embedded_cuesheet_is_present(path: &Path) -> bool {
     matches!(read_embedded_cuesheet(path), Ok(Some(_)))
 }
 
@@ -3084,6 +3084,28 @@ fn cue_track_metadata(
     }
 }
 
+/// Canonical CUE-sheet-to-track-metadata mapping for conversion planning and
+/// already-split sidecar transfer. Keeping this wrapper beside the CueImage
+/// materializer prevents queue/planning code from maintaining a second field
+/// mapping. `pre_emphasis` comes from the raw-CUE annotation pass when that
+/// text is available.
+pub(crate) fn cue_sheet_track_metadata_for_conversion(
+    sheet: &CueSheet,
+    track_index: usize,
+    pre_emphasis: bool,
+) -> Option<TrackMetadata> {
+    let cue_track = sheet.tracks.get(track_index)?;
+    let numbering = cue_track_number_plan(sheet).get(track_index).copied()?;
+    Some(cue_track_metadata(
+        cue_track,
+        sheet,
+        &ImageAlbumMetadata::default(),
+        false,
+        pre_emphasis,
+        numbering,
+    ))
+}
+
 fn cue_album_metadata(
     sheet: &CueSheet,
     image: &ImageAlbumMetadata,
@@ -3115,6 +3137,54 @@ fn cue_album_metadata(
         disc_number: image.disc_number,
         extra,
     }
+}
+
+/// Read metadata for one already-split carrier from the exact sidecar-CUE
+/// mapping transferred by queue expansion. This deliberately reuses the same
+/// CUE -> `TrackMetadata` / `AlbumMetadata` mapping as the CueImage
+/// materializer. It does not resolve the FILE token to choose a carrier again;
+/// queue admission already made that association. Instead, the captured track
+/// number and FILE token are change detectors so a materially edited sidecar
+/// fails closed rather than silently applying metadata to the wrong file.
+pub(crate) fn metadata_for_transferred_sidecar_cue_track(
+    source: &SidecarCueTrackMetadataSource,
+) -> Result<(TrackMetadata, AlbumMetadata), MaterializeError> {
+    let raw_cue = read_cue_text(&source.cue_path)?;
+    let sheet = parse_cue(&raw_cue);
+    let cue_track = sheet.tracks.get(source.track_index).ok_or_else(|| {
+        MaterializeError::Parse(format!(
+            "sidecar CUE '{}' changed after queue admission: track position {} no longer exists",
+            source.cue_path.display(),
+            source.track_index + 1,
+        ))
+    })?;
+    if cue_track.number != source.cue_track_number
+        || cue_track.file.as_ref() != source.cue_file_reference.as_ref()
+    {
+        return Err(MaterializeError::Parse(format!(
+            "sidecar CUE '{}' changed after queue admission at track position {} (expected TRACK {} FILE {:?}, found TRACK {} FILE {:?})",
+            source.cue_path.display(),
+            source.track_index + 1,
+            source.cue_track_number,
+            source.cue_file_reference,
+            cue_track.number,
+            cue_track.file,
+        )));
+    }
+
+    let annotations = CueAnnotations::parse(&raw_cue);
+    let mut track_metadata = cue_sheet_track_metadata_for_conversion(
+        &sheet,
+        source.track_index,
+        annotations.track_pre_emphasis(cue_track.number),
+    )
+    .ok_or_else(|| MaterializeError::Parse("CUE metadata mapping lost admitted track".to_string()))?;
+    annotations.add_track_extras(cue_track.number, &mut track_metadata.extra);
+
+    let image_metadata = ImageAlbumMetadata::default();
+    let mut album_metadata = cue_album_metadata(&sheet, &image_metadata, sheet.tracks.len() as u32);
+    annotations.add_album_extras(&mut album_metadata.extra);
+    Ok((track_metadata, album_metadata))
 }
 
 fn selected_track_indices(
@@ -3648,6 +3718,7 @@ FILE "album.flac" WAVE
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
@@ -5959,6 +6030,119 @@ FILE "lofty-image.flac" WAVE
         assert!(cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("CUESHEET")));
         assert!(cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("MUSICBRAINZ_TRACKID")));
         assert!(cue_image_tag_is_structural_or_track_scoped(&normalize_tag_key("MUSICBRAINZ_RELEASETRACKID")));
+    }
+
+    #[test]
+    fn transferred_sidecar_cue_reuses_canonical_track_and_album_mapping() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = temp.path().join("Thriller.cue");
+        std::fs::write(
+            &cue_path,
+            r#"REM DATE 1984
+REM GENRE "Pop"
+CATALOG 4988005123999
+PERFORMER "Michael Jackson"
+TITLE "Thriller"
+FILE "01 - Wanna Be Startin' Somethin'.dff" WAVE
+  TRACK 01 AUDIO
+    TITLE "Wanna Be Startin' Somethin'"
+    PERFORMER "Michael Jackson"
+    ISRC JPES08400001
+    FLAGS PRE
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("cue fixture");
+        let source = SidecarCueTrackMetadataSource {
+            cue_path: cue_path.clone(),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01 - Wanna Be Startin' Somethin'.dff".to_string()),
+        };
+
+        let (track, album) =
+            metadata_for_transferred_sidecar_cue_track(&source).expect("transferred metadata");
+
+        assert_eq!(track.title.as_deref(), Some("Wanna Be Startin' Somethin'"));
+        assert_eq!(track.artist.as_deref(), Some("Michael Jackson"));
+        assert_eq!(track.performer.as_deref(), Some("Michael Jackson"));
+        assert_eq!(track.album_artist.as_deref(), Some("Michael Jackson"));
+        assert_eq!(track.date.as_deref(), Some("1984"));
+        assert_eq!(track.genre.as_deref(), Some("Pop"));
+        assert_eq!(track.track_number, Some(1));
+        assert_eq!(track.isrc.as_deref(), Some("JPES08400001"));
+        assert!(track.pre_emphasis, "transferred FLAGS PRE must promote to pre_emphasis");
+        assert_eq!(track.extra.get("album").map(String::as_str), Some("Thriller"));
+        assert_eq!(track.extra.get("catalog").map(String::as_str), Some("4988005123999"));
+
+        assert_eq!(album.album.as_deref(), Some("Thriller"));
+        assert_eq!(album.album_artist.as_deref(), Some("Michael Jackson"));
+        assert_eq!(album.date.as_deref(), Some("1984"));
+        assert_eq!(album.genre.as_deref(), Some("Pop"));
+        assert_eq!(album.total_tracks, 1);
+        assert_eq!(album.extra.get("catalog").map(String::as_str), Some("4988005123999"));
+        assert_eq!(album.extra.get("catalognumber").map(String::as_str), Some("4988005123999"));
+    }
+
+    #[test]
+    fn transferred_headerless_cue_keeps_album_empty_without_invention() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = temp.path().join("headerless.cue");
+        std::fs::write(
+            &cue_path,
+            r#"FILE "track.dts" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track From Cue"
+    PERFORMER "Cue Artist"
+    ISRC USAAA2600001
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("headerless cue fixture");
+        let source = SidecarCueTrackMetadataSource {
+            cue_path,
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("track.dts".to_string()),
+        };
+
+        let (track, album) =
+            metadata_for_transferred_sidecar_cue_track(&source).expect("transferred metadata");
+        assert_eq!(track.title.as_deref(), Some("Track From Cue"));
+        assert_eq!(track.artist.as_deref(), Some("Cue Artist"));
+        assert_eq!(track.isrc.as_deref(), Some("USAAA2600001"));
+        assert!(!track.extra.contains_key("album"));
+        assert!(album.album.is_none());
+        assert!(album.album_artist.is_none());
+        assert!(album.date.is_none());
+        assert!(album.genre.is_none());
+    }
+
+    #[test]
+    fn transferred_sidecar_cue_fails_closed_if_admitted_mapping_changes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = temp.path().join("album.cue");
+        std::fs::write(
+            &cue_path,
+            "FILE \"track.dff\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n",
+        )
+        .expect("initial cue");
+        let source = SidecarCueTrackMetadataSource {
+            cue_path: cue_path.clone(),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("track.dff".to_string()),
+        };
+        metadata_for_transferred_sidecar_cue_track(&source).expect("initial mapping valid");
+
+        std::fs::write(
+            &cue_path,
+            "FILE \"different.dff\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n",
+        )
+        .expect("changed cue");
+        let err = metadata_for_transferred_sidecar_cue_track(&source)
+            .expect_err("changed FILE mapping must fail closed");
+        assert!(err.to_string().contains("changed after queue admission"));
     }
 
     // ── Category G: probe failure ──

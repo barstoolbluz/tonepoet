@@ -11,7 +11,7 @@ use once_cell::sync::OnceCell;
 
 use crate::convert::classify::{classify_file, is_audio_file_path, is_cue_sheet_path, EntryKind};
 use crate::convert::source_admission::is_direct_queue_source_path;
-use crate::convert::pipeline::CueSidecarPolicy;
+use crate::convert::pipeline::{CueSidecarPolicy, SidecarCueTrackMetadataSource};
 use crate::convert::split_cue_album::{
     common_cue_album_title, decide_with_toc_evidence, grouping_key_from_paths,
     resolve_split_cue_file_reference, select_split_cue_folder_members,
@@ -73,6 +73,12 @@ pub struct QueueExpansionResult {
     /// skip sidecar CUE discovery for these paths while still honoring
     /// embedded CUESHEET tags.
     pub cue_artifact_audio: HashSet<PathBuf>,
+    /// Exact sidecar-CUE track mappings for valid metadata artifacts. Keys are
+    /// queued audio paths; values retain the admitted CUE path and track
+    /// position so conversion transfers metadata without re-associating a
+    /// sibling CUE by filename. Invalid/nonviable CUE artifacts deliberately
+    /// have no entry here and retain suppression-only behavior.
+    pub cue_artifact_metadata: BTreeMap<PathBuf, SidecarCueTrackMetadataSource>,
     /// Synthetic CUE files created for merged split-CUE albums. These are
     /// transient queue inputs and must be owned by the Convert source state
     /// until commit, then by the conversion manager until the corresponding
@@ -624,6 +630,13 @@ impl QueueExpansionPlan {
         let mut result = Vec::new();
         let mut result_keys = HashSet::new();
         let mut cue_artifact_audio_keys = HashSet::new();
+        let mut cue_artifact_metadata_by_key =
+            BTreeMap::<PathBuf, SidecarCueTrackMetadataSource>::new();
+        // Once a carrier is observed with two different admitted metadata-CUE
+        // mappings, keep the transfer disabled for the rest of this expansion.
+        // A later duplicate candidate must not be able to re-enable a mapping
+        // after the conflict has already been detected.
+        let mut conflicted_cue_artifact_metadata_keys = HashSet::new();
 
         for cue_path in nonviable_cue_paths {
             mark_sibling_audio_as_cue_artifacts(
@@ -679,6 +692,55 @@ impl QueueExpansionPlan {
                     if cue.explicit {
                         push_unique_path_with_keys(&mut result, &mut result_keys, cue.path);
                     } else {
+                        if let Some(member) = cue.admitted_member.as_ref() {
+                            debug_assert_eq!(
+                                member.role,
+                                crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar
+                            );
+                            if member.track_audio_paths.len() != member.sheet.tracks.len() {
+                                expansion_errors.push(format!(
+                                    "admitted metadata CUE '{}' returned {} carrier mappings for {} tracks; sidecar metadata transfer disabled for this CUE",
+                                    member.cue_path.display(),
+                                    member.track_audio_paths.len(),
+                                    member.sheet.tracks.len(),
+                                ));
+                            } else {
+                                for (track_index, (audio_path, track)) in member
+                                    .track_audio_paths
+                                    .iter()
+                                    .zip(member.sheet.tracks.iter())
+                                    .enumerate()
+                                {
+                                    let key = queue_path_key(audio_path);
+                                    let source = SidecarCueTrackMetadataSource {
+                                        cue_path: member.cue_path.clone(),
+                                        track_index,
+                                        cue_track_number: track.number,
+                                        cue_file_reference: track.file.clone(),
+                                    };
+                                    if conflicted_cue_artifact_metadata_keys.contains(&key) {
+                                        continue;
+                                    }
+                                    if let Some(existing) = cue_artifact_metadata_by_key.get(&key) {
+                                        if existing != &source {
+                                            expansion_errors.push(format!(
+                                                "conflicting admitted metadata CUE mappings for '{}': '{}' track {} vs '{}' track {}; sidecar metadata transfer disabled for this carrier",
+                                                audio_path.display(),
+                                                existing.cue_path.display(),
+                                                existing.cue_track_number,
+                                                source.cue_path.display(),
+                                                source.cue_track_number,
+                                            ));
+                                            cue_artifact_metadata_by_key.remove(&key);
+                                            conflicted_cue_artifact_metadata_keys.insert(key);
+                                            continue;
+                                        }
+                                    } else {
+                                        cue_artifact_metadata_by_key.insert(key, source);
+                                    }
+                                }
+                            }
+                        }
                         for path in referenced_audio {
                             cue_artifact_audio_keys.insert(queue_path_key(&path));
                         }
@@ -704,6 +766,7 @@ impl QueueExpansionPlan {
         }
 
         let mut cue_artifact_audio = HashSet::new();
+        let mut cue_artifact_metadata = BTreeMap::new();
         for path in queueable_non_cue {
             // Suppression applies to explicitly selected audio too when the
             // same expansion also contains an explicit split-source CUE that
@@ -720,6 +783,9 @@ impl QueueExpansionPlan {
             }
             if is_audio_file_path(&path) && cue_artifact_audio_keys.contains(&path_key) {
                 cue_artifact_audio.insert(path.clone());
+                if let Some(source) = cue_artifact_metadata_by_key.get(&path_key) {
+                    cue_artifact_metadata.insert(path.clone(), source.clone());
+                }
             }
             push_unique_path_with_keys(&mut result, &mut result_keys, path);
         }
@@ -737,6 +803,7 @@ impl QueueExpansionPlan {
         QueueExpansionResult {
             paths: result,
             cue_artifact_audio,
+            cue_artifact_metadata,
             synthetic_cue_artifacts,
             expansion_errors,
             cue_selection_prompt: None,
@@ -2311,9 +2378,118 @@ fn same_path_for_queue(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// Map queue-expansion CUE-artifact metadata onto the sidecar policy for one
-/// queued path. Shared by CLI and TUI queue construction so both front ends
-/// apply identical CUE semantics.
+/// Queue-time metadata-source decision for an audio carrier whose sibling CUE
+/// was classified as a metadata artifact. Structural CUE routing and metadata
+/// authority are intentionally separate: a transferred sidecar track keeps the
+/// request on the SingleFile path (`IgnoreCue`) while supplying metadata from
+/// the exact admitted CUE mapping.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CueArtifactCommitDecision {
+    pub cue_sidecar_override: Option<CueSidecarPolicy>,
+    pub sidecar_cue_track_metadata: Option<SidecarCueTrackMetadataSource>,
+}
+
+/// Resolve metadata authority in normalized configured order, filtering out
+/// representations that are structurally nonviable for this carrier. The
+/// request's CUE policy constrains which CUE representations are eligible; the
+/// aggregate metadata priority orders the remaining viable candidates. The CUE
+/// mapping is queue-admission evidence, not a filename association performed
+/// here.
+pub fn cue_artifact_commit_decision_for_path(
+    path: &Path,
+    cue_artifact_audio: &HashSet<PathBuf>,
+    cue_artifact_metadata: &BTreeMap<PathBuf, SidecarCueTrackMetadataSource>,
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+    cue_source_policy: CueSidecarPolicy,
+) -> CueArtifactCommitDecision {
+    if !cue_artifact_audio.contains(path)
+        && !cue_artifact_audio
+            .iter()
+            .any(|candidate| same_queue_identity(candidate, path))
+    {
+        return CueArtifactCommitDecision::default();
+    }
+
+    if cue_source_policy == CueSidecarPolicy::IgnoreCue {
+        return CueArtifactCommitDecision {
+            cue_sidecar_override: Some(CueSidecarPolicy::IgnoreCue),
+            sidecar_cue_track_metadata: None,
+        };
+    }
+
+    let metadata_source = cue_artifact_metadata.get(path).cloned().or_else(|| {
+        cue_artifact_metadata
+            .iter()
+            .find(|(candidate, _)| same_queue_identity(candidate, path))
+            .map(|(_, source)| source.clone())
+    });
+
+    // Invalid/nonviable CUE artifacts intentionally have suppression evidence
+    // but no transferred mapping. Preserve the historical fail-closed routing:
+    // skip sibling sidecars while still allowing a valid embedded CUESHEET.
+    let Some(sidecar_source) = metadata_source else {
+        return CueArtifactCommitDecision {
+            cue_sidecar_override: Some(CueSidecarPolicy::EmbeddedOnly),
+            sidecar_cue_track_metadata: None,
+        };
+    };
+
+    for target in crate::config::normalized_aggregate_metadata_target_priority(
+        metadata_target_priority,
+    ) {
+        match target {
+            crate::config::AggregateMetadataTarget::SidecarCue
+                if matches!(
+                    cue_source_policy,
+                    CueSidecarPolicy::PreferEmbedded
+                        | CueSidecarPolicy::PreferSidecar
+                        | CueSidecarPolicy::SidecarOnly
+                ) =>
+            {
+                return CueArtifactCommitDecision {
+                    cue_sidecar_override: Some(CueSidecarPolicy::IgnoreCue),
+                    sidecar_cue_track_metadata: Some(sidecar_source),
+                };
+            }
+            crate::config::AggregateMetadataTarget::EmbeddedCue
+                if matches!(
+                    cue_source_policy,
+                    CueSidecarPolicy::PreferEmbedded
+                        | CueSidecarPolicy::PreferSidecar
+                        | CueSidecarPolicy::EmbeddedOnly
+                ) && crate::convert::pipeline::materializer_cue::embedded_cuesheet_is_present(path) =>
+            {
+                return CueArtifactCommitDecision {
+                    cue_sidecar_override: Some(CueSidecarPolicy::EmbeddedOnly),
+                    sidecar_cue_track_metadata: None,
+                };
+            }
+            crate::config::AggregateMetadataTarget::IndividualFiles
+                if crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(path) =>
+            {
+                return CueArtifactCommitDecision {
+                    cue_sidecar_override: Some(CueSidecarPolicy::IgnoreCue),
+                    sidecar_cue_track_metadata: None,
+                };
+            }
+            crate::config::AggregateMetadataTarget::IndividualFiles
+            | crate::config::AggregateMetadataTarget::SidecarCue
+            | crate::config::AggregateMetadataTarget::EmbeddedCue => {}
+        }
+    }
+
+    // A restrictive CUE policy can intentionally leave no usable CUE source,
+    // and IndividualFiles may also be structurally unavailable. Preserve the
+    // historical fail-closed embedded-only routing in that no-candidate case.
+    CueArtifactCommitDecision {
+        cue_sidecar_override: Some(CueSidecarPolicy::EmbeddedOnly),
+        sidecar_cue_track_metadata: None,
+    }
+}
+
+/// Legacy suppression-only helper retained for callers/tests that do not carry
+/// exact metadata mappings. New conversion admission should use
+/// `cue_artifact_commit_decision_for_path`.
 pub fn cue_sidecar_override_for_commit_path(
     path: &Path,
     cue_artifact_audio: &HashSet<PathBuf>,
@@ -4506,6 +4682,222 @@ mod limited_queue_expansion_tests {
         assert_eq!(expanded.paths.len(), 1);
         assert!(path_list_contains(&expanded.paths, &track));
         assert!(expanded.cue_artifact_audio.contains(&track));
+        let source = expanded
+            .cue_artifact_metadata
+            .get(&track)
+            .expect("valid one-to-one CUE must transfer its exact admitted track mapping");
+        assert_eq!(source.cue_path, cue);
+        assert_eq!(source.track_index, 0);
+        assert_eq!(source.cue_track_number, 1);
+        assert_eq!(source.cue_file_reference.as_deref(), Some("album.flac"));
+    }
+
+    #[test]
+    fn nine_file_untaggable_album_transfers_each_admitted_cue_track_without_reassociation() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let tracks = [
+            ("01 - Wanna Be Startin' Somethin'.dff", "Wanna Be Startin' Somethin'", "JPES08400001"),
+            ("02 - Baby Be Mine.dff", "Baby Be Mine", "JPES08400002"),
+            ("03 - The Girl Is Mine.dff", "The Girl Is Mine", "JPES08400003"),
+            ("04 - Thriller.dff", "Thriller", "JPES08400004"),
+            ("05 - Beat It.dff", "Beat It", "JPES08400005"),
+            ("06 - Billie Jean.dff", "Billie Jean", "JPES08400006"),
+            ("07 - Human Nature.dff", "Human Nature", "JPES08400007"),
+            ("08 - P.Y.T. (Pretty Young Thing).dff", "P.Y.T. (Pretty Young Thing)", "JPES08400008"),
+            ("09 - The Lady in My Life.dff", "The Lady in My Life", "JPES08400009"),
+        ];
+        let mut cue_text = String::from(
+            "REM DATE 1984\nREM GENRE \"Pop\"\nCATALOG 4988005123999\nPERFORMER \"Michael Jackson\"\nTITLE \"Thriller\"\n",
+        );
+        for (index, (file, title, isrc)) in tracks.iter().enumerate() {
+            std::fs::write(td.path().join(file), b"extension-only DFF fixture")
+                .expect("DFF fixture");
+            cue_text.push_str(&format!(
+                "FILE \"{file}\" WAVE\n  TRACK {:02} AUDIO\n    TITLE \"{title}\"\n    PERFORMER \"Michael Jackson\"\n    ISRC {isrc}\n    INDEX 01 00:00:00\n",
+                index + 1,
+            ));
+        }
+        let cue = td.path().join("Michael Jackson - Thriller.cue");
+        std::fs::write(&cue, cue_text).expect("nine-track CUE fixture");
+
+        let expansion = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        assert!(expansion.expansion_errors.is_empty(), "{:?}", expansion.expansion_errors);
+        assert_eq!(expansion.paths.len(), tracks.len());
+        assert_eq!(expansion.cue_artifact_audio.len(), tracks.len());
+        assert_eq!(expansion.cue_artifact_metadata.len(), tracks.len());
+
+        for (index, (file, title, isrc)) in tracks.iter().enumerate() {
+            let carrier = td.path().join(file);
+            assert!(path_list_contains(&expansion.paths, &carrier));
+            let source = expansion
+                .cue_artifact_metadata
+                .get(&carrier)
+                .expect("each carrier must retain its admitted CUE track mapping");
+            assert_eq!(source.cue_path, cue);
+            assert_eq!(source.track_index, index);
+            assert_eq!(source.cue_track_number, (index + 1) as u32);
+            assert_eq!(source.cue_file_reference.as_deref(), Some(*file));
+
+            let (track_metadata, album_metadata) =
+                crate::convert::pipeline::materializer_cue::metadata_for_transferred_sidecar_cue_track(source)
+                    .expect("canonical conversion CUE mapping");
+            assert_eq!(track_metadata.artist.as_deref(), Some("Michael Jackson"));
+            assert_eq!(track_metadata.title.as_deref(), Some(*title));
+            assert_eq!(track_metadata.isrc.as_deref(), Some(*isrc));
+            assert_eq!(album_metadata.album.as_deref(), Some("Thriller"));
+            assert_eq!(
+                album_metadata.extra.get("catalognumber").map(String::as_str),
+                Some("4988005123999")
+            );
+        }
+    }
+
+    fn write_minimal_pcm_wav(path: &Path) {
+        let mut bytes = Vec::with_capacity(48);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&44_100u32.to_le_bytes());
+        bytes.extend_from_slice(&88_200u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        std::fs::write(path, bytes).expect("minimal WAV fixture");
+    }
+
+    fn transferred_source(cue: &Path, file_reference: &str) -> SidecarCueTrackMetadataSource {
+        SidecarCueTrackMetadataSource {
+            cue_path: cue.to_path_buf(),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some(file_reference.to_string()),
+        }
+    }
+
+    #[test]
+    fn cue_artifact_commit_decision_honors_priority_and_source_viability() {
+        use crate::config::AggregateMetadataTarget::{IndividualFiles, SidecarCue};
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let cue = td.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            "FILE \"track.dff\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("cue fixture");
+
+        // An unsupported carrier has no IndividualFiles representation, so an
+        // IndividualFiles-first preference must fall through to SidecarCue.
+        let untaggable = td.path().join("track.dff");
+        std::fs::write(&untaggable, b"not-a-taggable-container").expect("DFF fixture");
+        let artifact_audio = [untaggable.clone()].into_iter().collect::<HashSet<_>>();
+        let artifact_metadata = [(
+            untaggable.clone(),
+            transferred_source(&cue, "track.dff"),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let decision = cue_artifact_commit_decision_for_path(
+            &untaggable,
+            &artifact_audio,
+            &artifact_metadata,
+            &[IndividualFiles, SidecarCue],
+            CueSidecarPolicy::PreferSidecar,
+        );
+        assert_eq!(decision.cue_sidecar_override, Some(CueSidecarPolicy::IgnoreCue));
+        assert_eq!(decision.sidecar_cue_track_metadata, artifact_metadata.get(&untaggable).cloned());
+
+        // A structurally taggable carrier remains an IndividualFiles candidate;
+        // with that target first, conversion must not silently override it.
+        let taggable = td.path().join("track.wav");
+        write_minimal_pcm_wav(&taggable);
+        let artifact_audio = [taggable.clone()].into_iter().collect::<HashSet<_>>();
+        let artifact_metadata = [(
+            taggable.clone(),
+            transferred_source(&cue, "track.wav"),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let decision = cue_artifact_commit_decision_for_path(
+            &taggable,
+            &artifact_audio,
+            &artifact_metadata,
+            &[IndividualFiles, SidecarCue],
+            CueSidecarPolicy::PreferSidecar,
+        );
+        assert_eq!(decision.cue_sidecar_override, Some(CueSidecarPolicy::IgnoreCue));
+        assert!(decision.sidecar_cue_track_metadata.is_none());
+
+        // Reversing the configured preference makes the admitted sidecar CUE
+        // authoritative even though IndividualFiles remains structurally viable.
+        let decision = cue_artifact_commit_decision_for_path(
+            &taggable,
+            &artifact_audio,
+            &artifact_metadata,
+            &[SidecarCue, IndividualFiles],
+            CueSidecarPolicy::PreferSidecar,
+        );
+        assert_eq!(decision.cue_sidecar_override, Some(CueSidecarPolicy::IgnoreCue));
+        assert_eq!(
+            decision.sidecar_cue_track_metadata,
+            artifact_metadata.get(&taggable).cloned()
+        );
+    }
+
+    #[test]
+    fn cue_artifact_commit_decision_respects_cue_disable_and_invalid_mapping() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let carrier = td.path().join("track.dff");
+        std::fs::write(&carrier, b"carrier").expect("carrier fixture");
+        let artifact_audio = [carrier.clone()].into_iter().collect::<HashSet<_>>();
+        let cue = td.path().join("album.cue");
+        let artifact_metadata = [(
+            carrier.clone(),
+            transferred_source(&cue, "track.dff"),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let disabled = cue_artifact_commit_decision_for_path(
+            &carrier,
+            &artifact_audio,
+            &artifact_metadata,
+            &[],
+            CueSidecarPolicy::IgnoreCue,
+        );
+        assert_eq!(disabled.cue_sidecar_override, Some(CueSidecarPolicy::IgnoreCue));
+        assert!(disabled.sidecar_cue_track_metadata.is_none());
+
+        let embedded_only = cue_artifact_commit_decision_for_path(
+            &carrier,
+            &artifact_audio,
+            &artifact_metadata,
+            &[],
+            CueSidecarPolicy::EmbeddedOnly,
+        );
+        assert_eq!(
+            embedded_only.cue_sidecar_override,
+            Some(CueSidecarPolicy::EmbeddedOnly)
+        );
+        assert!(
+            embedded_only.sidecar_cue_track_metadata.is_none(),
+            "an explicit EmbeddedOnly request must not be bypassed by aggregate SidecarCue priority"
+        );
+
+        let invalid = cue_artifact_commit_decision_for_path(
+            &carrier,
+            &artifact_audio,
+            &BTreeMap::new(),
+            &[],
+            CueSidecarPolicy::PreferSidecar,
+        );
+        assert_eq!(invalid.cue_sidecar_override, Some(CueSidecarPolicy::EmbeddedOnly));
+        assert!(invalid.sidecar_cue_track_metadata.is_none());
     }
 
     #[test]
@@ -4950,10 +5342,12 @@ mod ogg_tta_cue_queue_tests {
             let explicit = expand_paths_to_audio_with_metadata(&[cue.clone()]);
             assert_eq!(explicit.paths, vec![cue.clone()], "explicit .cue conversion must queue the CUE for {ext}");
             assert!(explicit.cue_artifact_audio.is_empty(), "explicit split-source CUE must not be tagged as metadata artifact for {ext}");
+            assert!(explicit.cue_artifact_metadata.is_empty(), "explicit split-source CUE must not transfer metadata-artifact mappings for {ext}");
 
             let folder = expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
             assert_eq!(folder.paths, vec![cue.clone()], "folder conversion must stage the CUE, not the image, for {ext}");
             assert!(folder.cue_artifact_audio.is_empty(), "split-source CUE must not request EmbeddedOnly sidecar policy for {ext}");
+            assert!(folder.cue_artifact_metadata.is_empty(), "split-source CUE must not transfer metadata-artifact mappings for {ext}");
 
             let metadata = expand_paths_to_all_audio(&[td.path().to_path_buf()]);
             assert_eq!(metadata, vec![image.clone()], "metadata surfaces must still see the backing image for {ext}");

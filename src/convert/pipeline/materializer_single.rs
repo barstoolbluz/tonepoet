@@ -60,8 +60,70 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 }
             }
         }
-        let (metadata, mut metadata_warnings, metadata_recovered_by_fallback) =
-            read_track_metadata_with_warnings(&req.container)?;
+        let transferred_cue_metadata = req
+            .source
+            .sidecar_cue_track_metadata
+            .as_ref()
+            .map(super::materializer_cue::metadata_for_transferred_sidecar_cue_track)
+            .transpose()?;
+
+        let (
+            metadata,
+            mut metadata_warnings,
+            metadata_recovered_by_fallback,
+            cue_album_metadata,
+            sidecar_album_fallback,
+        ) = if let Some((cue_track_metadata, cue_album_metadata)) = transferred_cue_metadata {
+                // Preserve useful non-CUE fields from a taggable carrier, but do
+                // not probe a structurally untaggable carrier merely to produce
+                // the old "converted without metadata" warning. The admitted
+                // sidecar is the selected source in this branch.
+                let (individual_metadata, warnings, individual_recovered, individual_viable) =
+                    read_track_metadata_with_warnings_and_viability(&req.container)?;
+                let (individual_metadata, warnings, album_fallback) = if individual_viable {
+                    let album_fallback = derive_sidecar_album_fallback_metadata(
+                        &individual_metadata,
+                        individual_recovered,
+                    );
+                    (
+                        individual_metadata,
+                        contextualize_warnings_for_sidecar_cue(warnings),
+                        album_fallback,
+                    )
+                } else {
+                    // Unsupported carrier formats have no IndividualFiles
+                    // representation. The CUE is authoritative and a failed
+                    // tag-read warning would misdescribe the conversion.
+                    (TrackMetadata::default(), Vec::new(), AlbumMetadata::default())
+                };
+                let metadata = merge_sidecar_cue_track_metadata(
+                    individual_metadata,
+                    cue_track_metadata,
+                );
+                report_sidecar_cue_metadata_source(
+                    reporter,
+                    &req.item_id,
+                    &req.container,
+                    req.source
+                        .sidecar_cue_track_metadata
+                        .as_ref()
+                        .expect("transferred sidecar source present"),
+                    0.45,
+                )
+                .await;
+                (
+                    metadata,
+                    warnings,
+                    false,
+                    Some(cue_album_metadata),
+                    Some(album_fallback),
+                )
+            } else {
+                let (metadata, warnings, recovered) =
+                    read_track_metadata_with_warnings(&req.container)?;
+                (metadata, warnings, recovered, None, None)
+            };
+
         if req
             .album_batch
             .as_ref()
@@ -104,10 +166,12 @@ impl super::stages::Materializer for SingleFileMaterializer {
         };
 
         let tracks = apply_track_selection(vec![track], &req.source.track_selection)?;
-        let album_metadata = derive_single_file_album_metadata(
-            &tracks,
-            metadata_recovered_by_fallback,
-        );
+        let mut album_metadata = sidecar_album_fallback.unwrap_or_else(|| {
+            derive_single_file_album_metadata(&tracks, metadata_recovered_by_fallback)
+        });
+        if let Some(cue_album_metadata) = cue_album_metadata {
+            merge_sidecar_cue_album_metadata(&mut album_metadata, cue_album_metadata);
+        }
         Ok(PreparedSource {
             container: req.container.clone(),
             kind: SourceKind::SingleFile,
@@ -124,40 +188,175 @@ impl super::stages::Materializer for SingleFileMaterializer {
 }
 
 
+pub(crate) fn merge_sidecar_cue_track_metadata(
+    mut base: TrackMetadata,
+    cue: TrackMetadata,
+) -> TrackMetadata {
+    macro_rules! cue_override {
+        ($field:ident) => {
+            if cue.$field.is_some() {
+                base.$field = cue.$field;
+            }
+        };
+    }
+
+    cue_override!(title);
+    cue_override!(artist);
+    cue_override!(album_artist);
+    cue_override!(performer);
+    cue_override!(genre);
+    cue_override!(date);
+    cue_override!(track_number);
+    cue_override!(isrc);
+    base.pre_emphasis |= cue.pre_emphasis;
+    for (key, value) in cue.extra {
+        base.extra.insert(key, value);
+    }
+    base
+}
+
+fn merge_sidecar_cue_album_metadata(base: &mut AlbumMetadata, cue: AlbumMetadata) {
+    if cue.album.is_some() {
+        base.album = cue.album;
+    }
+    if cue.album_artist.is_some() {
+        base.album_artist = cue.album_artist;
+    }
+    if cue.genre.is_some() {
+        base.genre = cue.genre;
+    }
+    if cue.date.is_some() {
+        base.date = cue.date;
+    }
+    if cue.total_tracks > 0 {
+        base.total_tracks = cue.total_tracks;
+    }
+    if cue.total_discs.is_some() {
+        base.total_discs = cue.total_discs;
+    }
+    if cue.disc_number.is_some() {
+        base.disc_number = cue.disc_number;
+    }
+    for (key, value) in cue.extra {
+        base.extra.insert(key, value);
+    }
+}
+
+fn contextualize_warnings_for_sidecar_cue(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .map(|warning| {
+            warning.replace(
+                " - converted without metadata",
+                " - sidecar CUE metadata is being used",
+            )
+        })
+        .collect()
+}
+
+pub(crate) async fn report_sidecar_cue_metadata_source(
+    reporter: Option<&dyn PipelineReporter>,
+    item_id: &str,
+    path: &Path,
+    source: &SidecarCueTrackMetadataSource,
+    phase_progress: f32,
+) {
+    let message = format!(
+        "Metadata source for '{}': sidecar CUE '{}' track {}",
+        path.display(),
+        source.cue_path.display(),
+        source.cue_track_number,
+    );
+    log::info!("{message}");
+    if let Some(reporter) = reporter {
+        reporter
+            .emit(PipelineEvent::Progress {
+                item_id: item_id.to_string(),
+                stage: PipelineStage::Materialize,
+                phase_progress: phase_progress.clamp(0.0, 1.0),
+                message: Some(message),
+            })
+            .await;
+    }
+}
+
+/// Album-level fallback fields for a one-track-per-file metadata sidecar come
+/// only from the carrier's pre-CUE tags. In particular, a track ARTIST must
+/// not be promoted to ALBUMARTIST when the CUE header omits PERFORMER; the
+/// editor follows the same field-level fallback rule.
+fn derive_sidecar_album_fallback_metadata(
+    metadata: &TrackMetadata,
+    metadata_recovered_by_fallback: bool,
+) -> AlbumMetadata {
+    let mut album_metadata = AlbumMetadata {
+        album: metadata.extra.get("album").cloned(),
+        album_artist: metadata.album_artist.clone(),
+        genre: metadata.genre.clone(),
+        date: metadata.date.clone(),
+        total_tracks: 1,
+        total_discs: metadata
+            .extra
+            .get("disctotal")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .or_else(|| metadata.disc_number.map(|_| 1)),
+        disc_number: metadata.disc_number,
+        extra: metadata.extra.clone(),
+    };
+    apply_recovered_album_totals_from_metadata(
+        &mut album_metadata,
+        metadata,
+        metadata_recovered_by_fallback,
+    );
+    album_metadata
+}
+
 fn derive_single_file_album_metadata(
     tracks: &[PreparedTrack],
     metadata_recovered_by_fallback: bool,
 ) -> AlbumMetadata {
     let mut album_metadata = derive_album_metadata(tracks);
-    if metadata_recovered_by_fallback {
-        // Recovered numeric totals live in the immutable fallback snapshot under
-        // the NUL-prefixed canonical namespace, not the ordinary `extra` map, so
-        // the planning-side album counts must be sourced from there. Later label,
-        // batch-identity, or path enrichment cannot invalidate these source-proven
-        // values. `album`, `genre`, `date`, `album_artist`, and `disc_number` are
-        // already carried by the ordinary/typed fields the fallback reader
-        // populates, so only the totals need snapshot sourcing here.
-        let snapshot_total = |canonical_keys: &[&str]| {
-            tracks.first().and_then(|track| {
-                canonical_keys.iter().find_map(|key| {
-                    fallback_source_tag_value(&track.metadata.extra, key)
-                        .and_then(|value| value.trim().parse::<u32>().ok())
-                        .filter(|value| *value > 0)
-                })
-            })
-        };
-        if let Some(source_total) = snapshot_total(&["TRACKTOTAL", "TOTALTRACKS"]) {
-            album_metadata.total_tracks = source_total;
-        }
-        if let Some(source_disc_total) = snapshot_total(&["DISCTOTAL", "TOTALDISCS"]) {
-            album_metadata.total_discs = Some(source_disc_total);
-        }
-        album_metadata.extra.insert(
-            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
-            "native-apev2".to_string(),
+    if let Some(track) = tracks.first() {
+        apply_recovered_album_totals_from_metadata(
+            &mut album_metadata,
+            &track.metadata,
+            metadata_recovered_by_fallback,
         );
     }
     album_metadata
+}
+
+fn apply_recovered_album_totals_from_metadata(
+    album_metadata: &mut AlbumMetadata,
+    metadata: &TrackMetadata,
+    metadata_recovered_by_fallback: bool,
+) {
+    if !metadata_recovered_by_fallback {
+        return;
+    }
+
+    // Recovered numeric totals live in the immutable fallback snapshot under
+    // the NUL-prefixed canonical namespace, not the ordinary `extra` map, so
+    // planning-side album counts must be sourced from there. Later label,
+    // batch-identity, or path enrichment cannot invalidate these source-proven
+    // values.
+    let snapshot_total = |canonical_keys: &[&str]| {
+        canonical_keys.iter().find_map(|key| {
+            fallback_source_tag_value(&metadata.extra, key)
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|value| *value > 0)
+        })
+    };
+    if let Some(source_total) = snapshot_total(&["TRACKTOTAL", "TOTALTRACKS"]) {
+        album_metadata.total_tracks = source_total;
+    }
+    if let Some(source_disc_total) = snapshot_total(&["DISCTOTAL", "TOTALDISCS"]) {
+        album_metadata.total_discs = Some(source_disc_total);
+    }
+    album_metadata.extra.insert(
+        FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+        "native-apev2".to_string(),
+    );
 }
 
 fn completion_order_metadata_warning(
@@ -328,9 +527,37 @@ pub(crate) async fn report_metadata_warnings(
     }
 }
 
+/// Whether an individual carrier is structurally capable of participating as
+/// the IndividualFiles metadata representation. This mirrors the editor's
+/// typed unsupported-format boundary: an empty tag or a transient/corrupt read
+/// still leaves IndividualFiles viable, while a format Lofty cannot represent
+/// does not. DSF remains viable through Tonepoet's native ID3 path.
+pub(crate) fn individual_file_metadata_source_is_viable(path: &Path) -> bool {
+    if crate::dsf_tags::is_dsf(path) {
+        return true;
+    }
+
+    match lofty::read_from_path(path) {
+        Ok(_) => true,
+        Err(error) if crate::metadata_persistence::native_ape_error_is_eligible(&error) => true,
+        Err(error) => !crate::metadata_persistence::lofty_error_is_unsupported_metadata_format(&error),
+    }
+}
+
 pub(crate) fn read_track_metadata_with_warnings(
     path: &Path,
 ) -> Result<(TrackMetadata, Vec<String>, bool), MaterializeError> {
+    let (metadata, warnings, recovered, _viable) =
+        read_track_metadata_with_warnings_and_viability(path)?;
+    Ok((metadata, warnings, recovered))
+}
+
+/// Read IndividualFiles metadata once and report whether that representation
+/// is structurally viable. Sidecar-CUE materialization uses this combined form
+/// to avoid a second Lofty parse solely for viability probing.
+pub(crate) fn read_track_metadata_with_warnings_and_viability(
+    path: &Path,
+) -> Result<(TrackMetadata, Vec<String>, bool, bool), MaterializeError> {
     if crate::dsf_tags::is_dsf(path) {
         let outcome = crate::dsf_tags::read_with_warnings(path)
             .map_err(MaterializeError::Parse)?;
@@ -338,6 +565,7 @@ pub(crate) fn read_track_metadata_with_warnings(
             crate::dsf_tags::to_track_metadata(&outcome.snapshot),
             outcome.warnings,
             false,
+            true,
         ));
     }
     use lofty::prelude::*;
@@ -352,9 +580,10 @@ pub(crate) fn read_track_metadata_with_warnings(
                         path.display()
                     )],
                     false,
+                    true,
                 ));
             };
-            Ok((track_metadata_from_lofty_tag(tag), Vec::new(), false))
+            Ok((track_metadata_from_lofty_tag(tag), Vec::new(), false, true))
         }
         Err(lofty_error)
             if crate::metadata_persistence::native_ape_error_is_eligible(&lofty_error) =>
@@ -368,7 +597,7 @@ pub(crate) fn read_track_metadata_with_warnings(
                             path.display()
                         )
                     });
-                    Ok((metadata, vec![warning], true))
+                    Ok((metadata, vec![warning], true, true))
                 }
                 Err(native_error) => Ok((
                     TrackMetadata::default(),
@@ -376,16 +605,21 @@ pub(crate) fn read_track_metadata_with_warnings(
                         "Tag read: FAILED ({lofty_error}; native APEv2 fallback refused: {native_error}) - converted without metadata"
                     )],
                     false,
+                    true,
                 )),
             }
         }
-        Err(error) => Ok((
-            TrackMetadata::default(),
-            vec![format!(
-                "Tag read: FAILED ({error}) - converted without metadata"
-            )],
-            false,
-        )),
+        Err(error) => {
+            let viable = !crate::metadata_persistence::lofty_error_is_unsupported_metadata_format(&error);
+            Ok((
+                TrackMetadata::default(),
+                vec![format!(
+                    "Tag read: FAILED ({error}) - converted without metadata"
+                )],
+                false,
+                viable,
+            ))
+        }
     }
 }
 
@@ -556,6 +790,71 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn sidecar_cue_merge_overrides_cue_fields_but_preserves_non_cue_enrichment() {
+        let mut base = TrackMetadata::default();
+        base.title = Some("Embedded Title".to_string());
+        base.artist = Some("Embedded Artist".to_string());
+        base.composer = Some("Quincy Jones".to_string());
+        base.comment = Some("source note".to_string());
+        base.extra.insert("custom".to_string(), "keep".to_string());
+
+        let mut cue = TrackMetadata::default();
+        cue.title = Some("Cue Title".to_string());
+        cue.artist = Some("Cue Artist".to_string());
+        cue.album_artist = Some("Cue Album Artist".to_string());
+        cue.track_number = Some(7);
+        cue.isrc = Some("USAAA2600007".to_string());
+        cue.extra.insert("album".to_string(), "Cue Album".to_string());
+
+        let merged = merge_sidecar_cue_track_metadata(base, cue);
+        assert_eq!(merged.title.as_deref(), Some("Cue Title"));
+        assert_eq!(merged.artist.as_deref(), Some("Cue Artist"));
+        assert_eq!(merged.album_artist.as_deref(), Some("Cue Album Artist"));
+        assert_eq!(merged.track_number, Some(7));
+        assert_eq!(merged.isrc.as_deref(), Some("USAAA2600007"));
+        assert_eq!(merged.composer.as_deref(), Some("Quincy Jones"));
+        assert_eq!(merged.comment.as_deref(), Some("source note"));
+        assert_eq!(merged.extra.get("custom").map(String::as_str), Some("keep"));
+        assert_eq!(merged.extra.get("album").map(String::as_str), Some("Cue Album"));
+    }
+
+    #[test]
+    fn sidecar_album_fallback_does_not_promote_track_artist_to_album_artist() {
+        let mut metadata = TrackMetadata::default();
+        metadata.artist = Some("Track Performer".to_string());
+
+        let album = derive_sidecar_album_fallback_metadata(&metadata, false);
+        assert!(album.album_artist.is_none());
+        assert!(album.album.is_none());
+    }
+
+    #[test]
+    fn sidecar_cue_album_merge_never_invents_missing_header_fields() {
+        let mut base = AlbumMetadata::default();
+        let cue = AlbumMetadata {
+            total_tracks: 9,
+            ..AlbumMetadata::default()
+        };
+
+        merge_sidecar_cue_album_metadata(&mut base, cue);
+        assert!(base.album.is_none());
+        assert!(base.album_artist.is_none());
+        assert!(base.date.is_none());
+        assert!(base.genre.is_none());
+        assert_eq!(base.total_tracks, 9);
+    }
+
+    #[test]
+    fn sidecar_cue_warning_context_never_claims_metadata_was_absent() {
+        let warnings = contextualize_warnings_for_sidecar_cue(vec![
+            "Tag read: FAILED (unsupported layout) - converted without metadata".to_string(),
+        ]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("sidecar CUE metadata is being used"));
+        assert!(!warnings[0].contains("converted without metadata"));
+    }
 
     #[tokio::test]
     async fn dsf_metadata_warning_is_visible_through_pipeline_progress() {

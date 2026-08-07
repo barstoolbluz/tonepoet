@@ -1,7 +1,9 @@
 //! Conversion queue management
 
 use super::formats::{AudioFormat, ConversionOptions, FileFormat};
-use super::pipeline::{ArchiveTrackMetadataOverride, CueSidecarPolicy, PipelineRequest};
+use super::pipeline::{
+    ArchiveTrackMetadataOverride, CueSidecarPolicy, PipelineRequest, SidecarCueTrackMetadataSource,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -210,6 +212,11 @@ pub struct ConversionItem {
     /// again as a split-source sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cue_sidecar_override: Option<CueSidecarPolicy>,
+    /// Exact sidecar-CUE track mapping selected for conversion metadata. This
+    /// accompanies `cue_sidecar_override = IgnoreCue`: the CUE is metadata, not
+    /// a structural split source, so materialization must not rediscover it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_cue_track_metadata: Option<SidecarCueTrackMetadataSource>,
     /// Pre-extracted archive preview staging directory transferred from the
     /// Convert source at commit time. The archive materializer reuses this when
     /// it still exists and falls back to extraction when it does not.
@@ -256,6 +263,7 @@ impl Default for ConversionItem {
             archive_password_needs_migration: false,
             pipeline_settings: None,
             cue_sidecar_override: None,
+            sidecar_cue_track_metadata: None,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
             pipeline_request: None,
@@ -294,6 +302,7 @@ impl ConversionItem {
             archive_password_needs_migration: false,
             pipeline_settings,
             cue_sidecar_override: None,
+            sidecar_cue_track_metadata: None,
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
             pipeline_request: None,
@@ -345,6 +354,7 @@ impl ConversionItem {
         item.options.pipeline_settings = None;
         item.pre_extracted_staging = request.pre_extracted_staging.clone();
         item.archive_metadata_overrides = request.archive_metadata_overrides.clone();
+        item.sidecar_cue_track_metadata = request.source.sidecar_cue_track_metadata.clone();
         item.pipeline_request = Some(request);
         item
     }
@@ -1575,6 +1585,39 @@ mod cue_sidecar_override_queue_tests {
 
         let decoded: ConversionItem = serde_json::from_value(value).expect("deserialize legacy item");
         assert_eq!(decoded.cue_sidecar_override, None);
+    }
+
+    #[test]
+    fn legacy_queue_item_without_transferred_sidecar_metadata_deserializes_as_none() {
+        let mut item = ConversionItem::default();
+        item.id = "serde-legacy-no-cue-metadata".to_string();
+        item.input_path = PathBuf::from("/tmp/album/01.dff");
+
+        let mut value = serde_json::to_value(&item).expect("serialize baseline item");
+        value
+            .as_object_mut()
+            .expect("item serializes as object")
+            .remove("sidecar_cue_track_metadata");
+
+        let decoded: ConversionItem = serde_json::from_value(value).expect("deserialize legacy item");
+        assert!(decoded.sidecar_cue_track_metadata.is_none());
+    }
+
+    #[test]
+    fn transferred_sidecar_metadata_round_trips_with_queue_item() {
+        let mut item = ConversionItem::default();
+        item.id = "serde-cue-metadata".to_string();
+        item.input_path = PathBuf::from("/tmp/album/01.dff");
+        item.sidecar_cue_track_metadata = Some(SidecarCueTrackMetadataSource {
+            cue_path: PathBuf::from("/tmp/album/album.cue"),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01.dff".to_string()),
+        });
+
+        let value = serde_json::to_value(&item).expect("serialize item");
+        let decoded: ConversionItem = serde_json::from_value(value).expect("deserialize item");
+        assert_eq!(decoded.sidecar_cue_track_metadata, item.sidecar_cue_track_metadata);
     }
 
 

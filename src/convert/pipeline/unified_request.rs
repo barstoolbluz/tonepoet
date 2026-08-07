@@ -18,8 +18,8 @@ use crate::convert::formats::{AacProfile, Mp3BitrateMode, QualitySettings, WavPa
 use crate::convert::pipeline::{
     CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
     MetadataTextOverride, NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy,
-    RequestMetadataOverrides, SecretString, SourceOptions, StagePolicy, StageRequirement,
-    TrackSelection,
+    RequestMetadataOverrides, SecretString, SidecarCueTrackMetadataSource, SourceOptions, StagePolicy,
+    StageRequirement, TrackSelection,
 };
 use crate::convert::{ConversionError, ConversionItem, ConversionResult};
 
@@ -35,6 +35,8 @@ pub fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<Pipelin
         if let Some(cue_sidecar_override) = item.cue_sidecar_override {
             request.source.cue_sidecar = cue_sidecar_override;
         }
+        request.source.sidecar_cue_track_metadata =
+            item.sidecar_cue_track_metadata.clone();
         merge_request_metadata_overrides_for_item(&mut request, item);
         return Ok(request);
     }
@@ -117,6 +119,7 @@ pub fn build_pipeline_request_from_settings(
             dvda_group_selection: DvdaGroupSelection::Default,
             dvda_assume_decrypted: false,
             dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+            sidecar_cue_track_metadata: item.sidecar_cue_track_metadata.clone(),
             cue_sidecar: cue_policy,
             track_selection: TrackSelection::All,
             dvdv_vts: None,
@@ -788,6 +791,26 @@ mod cue_sidecar_override_request_tests {
         let request = build_pipeline_request(&item).expect("build request with override");
 
         assert_eq!(request.source.cue_sidecar, CueSidecarPolicy::EmbeddedOnly);
+    }
+
+    #[test]
+    fn conversion_item_transferred_sidecar_metadata_is_copied_to_pipeline_request_source() {
+        let mut item = item_with_settings("/tmp/album/01.dff");
+        item.cue_sidecar_override = Some(CueSidecarPolicy::IgnoreCue);
+        item.sidecar_cue_track_metadata = Some(SidecarCueTrackMetadataSource {
+            cue_path: PathBuf::from("/tmp/album/album.cue"),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01.dff".to_string()),
+        });
+
+        let request = build_pipeline_request(&item).expect("build request with CUE metadata source");
+
+        assert_eq!(
+            request.source.sidecar_cue_track_metadata,
+            item.sidecar_cue_track_metadata
+        );
+        assert_eq!(request.source.cue_sidecar, CueSidecarPolicy::IgnoreCue);
     }
 
     #[test]

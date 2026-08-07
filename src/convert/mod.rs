@@ -7,7 +7,7 @@
 //! - 7z archive extraction and processing
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -673,6 +673,39 @@ impl ConversionManager {
         cue_artifact_audio: &HashSet<PathBuf>,
         source_synthetic_cue_artifacts: &HashSet<PathBuf>,
         options: &ConversionOptions,
+        configure_admitted_item: F,
+    ) -> CommitBatchCueArtifactTransaction
+    where
+        F: FnMut(&mut ConversionItem),
+    {
+        self.commit_batch_with_cue_metadata_artifacts(
+            batch,
+            cue_artifact_audio,
+            &BTreeMap::new(),
+            &[],
+            crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+            source_synthetic_cue_artifacts,
+            options,
+            configure_admitted_item,
+        )
+    }
+
+    /// Transactional Convert-screen admission with exact metadata-artifact CUE
+    /// mappings and the user's aggregate metadata-source priority. This is the
+    /// production handoff for folder expansion; the suppression-only wrapper
+    /// above remains for compatibility with callers that lack transfer evidence.
+    pub fn commit_batch_with_cue_metadata_artifacts<F>(
+        &self,
+        batch: &[PathBuf],
+        cue_artifact_audio: &HashSet<PathBuf>,
+        cue_artifact_metadata: &BTreeMap<
+            PathBuf,
+            crate::convert::pipeline::SidecarCueTrackMetadataSource,
+        >,
+        metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+        cue_source_policy: crate::convert::pipeline::CueSidecarPolicy,
+        source_synthetic_cue_artifacts: &HashSet<PathBuf>,
+        options: &ConversionOptions,
         mut configure_admitted_item: F,
     ) -> CommitBatchCueArtifactTransaction
     where
@@ -774,16 +807,21 @@ impl ConversionManager {
                     )
                 });
 
-            let cue_sidecar_override = cue_artifact_audio
-                .iter()
-                .any(|path| same_path_for_queue(path, &file))
-                .then_some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly);
+            let cue_decision =
+                crate::convert::queue_expansion::cue_artifact_commit_decision_for_path(
+                    &file,
+                    cue_artifact_audio,
+                    cue_artifact_metadata,
+                    metadata_target_priority,
+                    cue_source_policy,
+                );
             let mut item = ConversionItem::new_with_cue_sidecar_override(
                 file.clone(),
                 format,
                 options.clone(),
-                cue_sidecar_override,
+                cue_decision.cue_sidecar_override,
             );
+            item.sidecar_cue_track_metadata = cue_decision.sidecar_cue_track_metadata;
             // Finish all executable request configuration before the item is
             // marked queued or published to the shared queue. This keeps a
             // processing worker from ever observing a runnable item that lacks
@@ -1181,6 +1219,27 @@ impl ConversionManager {
         archive_password: Option<String>,
         cue_sidecar_override: Option<crate::convert::pipeline::CueSidecarPolicy>,
     ) -> ConversionResult<String> {
+        self.add_file_ready_for_processing_with_cue_metadata_decision(
+            file,
+            options,
+            archive_password,
+            crate::convert::queue_expansion::CueArtifactCommitDecision {
+                cue_sidecar_override,
+                sidecar_cue_track_metadata: None,
+            },
+        )
+    }
+
+    /// Ready-queue admission with the complete metadata-artifact CUE decision.
+    /// The policy and exact sidecar-track mapping are attached atomically before
+    /// the item becomes runnable.
+    pub fn add_file_ready_for_processing_with_cue_metadata_decision(
+        &mut self,
+        file: std::path::PathBuf,
+        options: ConversionOptions,
+        archive_password: Option<String>,
+        cue_decision: crate::convert::queue_expansion::CueArtifactCommitDecision,
+    ) -> ConversionResult<String> {
         let format = FormatDetector::detect(&file)?;
 
         // Create item and mark as Queued (ready for processing). A runnable
@@ -1192,8 +1251,9 @@ impl ConversionManager {
             file.clone(),
             format,
             options,
-            cue_sidecar_override,
+            cue_decision.cue_sidecar_override,
         );
+        item.sidecar_cue_track_metadata = cue_decision.sidecar_cue_track_metadata;
         item.set_archive_password(archive_password, None);
         item.status = ConversionStatus::Queued;
         if !conversion_item_has_full_pipeline_handoff(&item) {
@@ -3031,6 +3091,7 @@ mod bluray_queue_admission_tests {
                 bluray_audio_pid: None,
                 bluray_audio_stream: None,
                 bluray_angle: None,
+                sidecar_cue_track_metadata: None,
                 cue_sidecar: CueSidecarPolicy::PreferSidecar,
                 track_selection: TrackSelection::All,
             },
