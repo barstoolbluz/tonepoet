@@ -84,12 +84,30 @@ already-detected metadata-artifact cue. Your choice; state it and why. The cue m
 tracks by the same FILE/track correspondence the classifier already established (do not
 re-guess the mapping).
 
-**Q4 — Authority is lodestar-correct.** For untaggable carriers the cue is authoritative
-(the carrier holds nothing). For TAGGABLE carriers that happen to have a one-to-one cue, do
-NOT silently override the file's own tags — follow the existing source-selection
-preference (fill only what the file lacks, or honor the configured cue policy). If unsure
-where the taggable line sits, keep taggable behavior byte-identical to today and scope the
-change to untaggable carriers; say so.
+**Q4 — Authority is lodestar-correct AND config-honoring.** For untaggable carriers the cue
+is authoritative (the carrier holds nothing). For TAGGABLE carriers that happen to have a
+one-to-one cue, do NOT silently override the file's own tags — follow the existing
+source-selection preference. If unsure where the taggable line sits, keep taggable behavior
+byte-identical to today and scope the change to untaggable carriers; say so.
+
+Critically: the conversion pipeline must **honor the user's existing metadata-source
+authority preference** the way the editor already does. That preference —
+`conversion.aggregate_metadata_target_priority` (`AggregateMetadataTarget`, default
+`[SidecarCue, EmbeddedCue, IndividualFiles]`, config.rs:389/470) — literally lives in the
+`[conversion]` config section, yet (verified by two independent audits) **zero code under
+`src/convert/` reads it today**; it is consulted only in the TUI editor
+(context_menu/tag_interchange/keybindings/app/browse). This is the "config = preference"
+lodestar invariant being satisfied in the editor but not in conversion. Conversion must
+consult the same preference so `SidecarCue`-priority means the sidecar cue's metadata is
+used (authoritatively for untaggable carriers, per-lodestar-preference for taggable ones).
+NOTE: the current `EmbeddedOnly` override (mod.rs ~777, and the CLI at main.rs ~4049) is a
+hardcoded STRUCTURAL rule derived from the one-to-one `MetadataArtifact` cue classification
+(split_cue_album.rs ~1423 → `MetadataSidecar` role) — NOT from any config value. The exact
+mechanism it triggers: `EmbeddedOnly` → `is_cue_image_candidate` returns
+`embedded_cuesheet_is_present` (materializer_cue.rs ~577); a carrier with no embedded
+CUESHEET (every `.dff`) returns false → routes to the SingleFile materializer → lofty
+fails → empty metadata. Replace this preference-blind hardcoding with preference-aware
+routing that lets the sidecar cue supply metadata.
 
 **Q5 — Honest logging.** The conversion log must stop implying "converted without metadata"
 when the cue in fact supplied it; it should record that per-track metadata came from the
