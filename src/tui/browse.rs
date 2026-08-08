@@ -47,6 +47,15 @@ const BROWSE_DIR_STATS_QUEUE_MAX: usize = 8;
 /// become readable or probeable without a content change.
 const TRANSIENT_PROBE_FAILURE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// Directory listing streaming starts with a tiny first-paint batch, then
+/// rapidly grows to amortize message/copy overhead on very large folders.
+const DIR_SCAN_FIRST_BATCH: usize = 32;
+const DIR_SCAN_MAX_BATCH: usize = 16_384;
+const DIR_SCAN_BATCH_LATENCY: Duration = Duration::from_millis(100);
+const DIR_SCAN_RUNAWAY_TIMEOUT: Duration = Duration::from_secs(300);
+const DIR_SCAN_CANCEL_CHECK_INTERVAL: usize = 50;
+const TREE_SCAN_CANCEL_CHECK_INTERVAL: usize = 64;
+
 /// Skim fuzzy matching is intentionally permissive: any ordered subsequence can
 /// produce a score. Browse search treats very low scores as false positives so
 /// long filenames cannot match short queries solely because the query characters
@@ -2737,8 +2746,12 @@ pub struct BrowseState {
     pub archive: Option<ArchiveBrowseState>,
 
     /// Handle to the in-flight async directory scan. `Some` while a background
-    /// scan is running. Used for cancellation and loading indicator.
+    /// scan is running. Used for cancellation and loading/progress indication.
     pub scan_pending: Option<ScanHandle>,
+
+    /// Number of filesystem entries discovered by the active streaming scan.
+    /// This is reset at scan start and terminal completion.
+    pub scan_discovered_count: usize,
 
     /// Monotonic token for async directory scans. Every async scan gets a
     /// unique generation; reducers must accept only the currently pending
@@ -2766,6 +2779,11 @@ pub struct BrowseState {
     /// Explore pane directory tree. Expanded/collapsed state is session-local.
     pub tree_nodes: Vec<BrowseTreeNode>,
     pub tree_cursor: usize,
+    /// Single cancellable Browse-tree child enumeration. Browse deliberately
+    /// probes only the directory the user expands; newly discovered children
+    /// are optimistic until expanded themselves.
+    pub tree_scan_pending: Option<TreeScanHandle>,
+    pub tree_scan_generation: u64,
     /// Last tree-row click, keyed by path, for shared 500ms double-click semantics.
     pub tree_last_click: Option<(PathBuf, Instant)>,
     pub tree_scroll: usize,
@@ -2815,6 +2833,14 @@ pub struct ScanHandle {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Handle to one cancellable Browse-tree directory enumeration.
+#[derive(Debug, Clone)]
+pub struct TreeScanHandle {
+    generation: u64,
+    path: PathBuf,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 impl ScanHandle {
     pub fn new(generation: u64) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2832,6 +2858,28 @@ impl ScanHandle {
     }
 
     pub fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl TreeScanHandle {
+    fn new(
+        generation: u64,
+        path: PathBuf,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                generation,
+                path,
+                cancel: flag.clone(),
+            },
+            flag,
+        )
+    }
+
+    fn cancel(&self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3094,6 +3142,13 @@ impl BrowseState {
         let start_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/"));
+        Self::new_with_config_at(config, start_dir)
+    }
+
+    fn new_with_config_at(
+        config: &crate::config::BrowsingConfig,
+        start_dir: PathBuf,
+    ) -> Self {
         let config = config.normalized();
         let sort_by = SortBy::from_label(&config.default_sort).unwrap_or(SortBy::Name);
         let sort_dir = SortDir::from_label(&config.default_sort_dir).unwrap_or(SortDir::Asc);
@@ -3185,14 +3240,17 @@ impl BrowseState {
             error: None,
             archive: None,
             scan_pending: None,
+            scan_discovered_count: 0,
             scan_generation: 0,
             cursor_restore_target: None,
             cursor_restore_scroll_offset: None,
             type_ahead_buffer: String::new(),
             type_ahead_last_keystroke: None,
             navigation_pane: BrowseNavigationPane::Files,
-            tree_nodes: initial_browse_tree_nodes(&start_dir, config.show_hidden),
+            tree_nodes: initial_browse_tree_shell(&start_dir),
             tree_cursor: 0,
+            tree_scan_pending: None,
+            tree_scan_generation: 0,
             tree_last_click: None,
             tree_scroll: 0,
             tree_visible_height: 0,
@@ -3212,14 +3270,26 @@ impl BrowseState {
             pending_inline_rename_after_scan: None,
             scan_tx: None,
         };
-        state.sync_tree_to_current_dir();
-        state.refresh(); // Initial scan is synchronous (no tx yet).
+        // Construction is intentionally filesystem-enumeration-free. The event
+        // loop installs `scan_tx` and explicitly starts the initial async scan
+        // after AppState construction, allowing the first frame to appear even
+        // when HOME itself (or one of its children) is enormous.
+        state.sync_tree_shell_to_current_dir();
         state
     }
 
-    /// Set the message channel sender (called once from the event loop).
+    /// Set the message channel sender (called once from the event loop). This is
+    /// deliberately a pure setter: tests and secondary callers can install a
+    /// channel without causing surprise work.
     pub fn set_tx(&mut self, tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
         self.scan_tx = Some(tx);
+    }
+
+    /// Start the first Browse listing once the runtime channel exists.
+    pub fn start_initial_async_scan(&mut self) {
+        if self.archive.is_none() && self.scan_tx.is_some() && self.scan_pending.is_none() {
+            self.begin_async_scan();
+        }
     }
 
     /// Whether async scanning is enabled (tx has been set).
@@ -3306,7 +3376,6 @@ impl BrowseState {
         self.current_dir = path;
         self.selected_index = 0;
         self.reset_nav_state();
-        self.sync_tree_to_current_dir();
         self.refresh();
     }
 
@@ -3387,7 +3456,7 @@ impl BrowseState {
         if previous_hidden != self.show_hidden {
             self.rebuild_tree_preserving_expansion();
         } else {
-            self.sync_tree_to_current_dir();
+            self.sync_tree_shell_to_current_dir();
         }
         self.reapply_after_browse_preference_change(tx);
     }
@@ -3602,6 +3671,16 @@ impl BrowseState {
             return;
         }
         if self.tree_nodes[index].expanded {
+            let path = self.tree_nodes[index].path.clone();
+            if self
+                .tree_scan_pending
+                .as_ref()
+                .is_some_and(|pending| pending.path == path)
+            {
+                if let Some(pending) = self.tree_scan_pending.take() {
+                    pending.cancel();
+                }
+            }
             let depth = self.tree_nodes[index].depth;
             self.tree_nodes[index].expanded = false;
             let remove_start = index + 1;
@@ -3617,31 +3696,144 @@ impl BrowseState {
             self.ensure_tree_visible();
             return;
         }
-        let children = tui_file_picker::child_directories(&self.tree_nodes[index].path, self.tree_nodes[index].depth + 1, self.show_hidden);
-        self.tree_nodes[index].expanded = true;
-        for (offset, child) in children.into_iter().enumerate() {
-            self.tree_nodes.insert(index + 1 + offset, child);
+
+        if !self.tree_nodes[index].has_children {
+            return;
         }
+
+        let path = self.tree_nodes[index].path.clone();
+        let child_depth = self.tree_nodes[index].depth + 1;
+        self.tree_nodes[index].expanded = true;
+
+        // The current directory tree is backed by the listing's already
+        // discovered directories. Never issue a second read_dir for it: while
+        // streaming, reconcile the partial snapshot; after completion, the
+        // authoritative `all_dirs` snapshot is sufficient to re-expand it.
+        if path == self.current_dir {
+            let dirs = self.all_dirs.clone();
+            let authoritative = self.scan_pending.is_none();
+            self.reconcile_current_tree_from_dirs(&dirs, authoritative);
+            return;
+        }
+
+        let Some(tx) = self.scan_tx.clone() else {
+            // Synchronous fallback exists only for unit-test/non-runtime
+            // callers. Interactive Browse always has a sender installed.
+            let children = tui_file_picker::child_directories(
+                &path,
+                child_depth,
+                self.show_hidden,
+            );
+            self.install_tree_children(&path, child_depth, children);
+            return;
+        };
+
+        if let Some(pending) = self.tree_scan_pending.take() {
+            pending.cancel();
+            if let Some(old_index) = self
+                .tree_nodes
+                .iter()
+                .position(|node| node.path == pending.path)
+            {
+                // A superseded optimistic expansion must not remain visually
+                // wedged open with no materialized children.
+                self.tree_nodes[old_index].expanded = false;
+            }
+        }
+        self.tree_scan_generation = self.tree_scan_generation.wrapping_add(1);
+        let generation = self.tree_scan_generation;
+        let (handle, cancel) = TreeScanHandle::new(generation, path.clone());
+        self.tree_scan_pending = Some(handle);
+        spawn_browse_tree_scan(
+            path,
+            child_depth,
+            self.show_hidden,
+            generation,
+            cancel,
+            tx,
+        );
     }
 
-    pub fn sync_tree_to_current_dir(&mut self) {
-        let root_misses_current = self
-            .tree_nodes
-            .first()
-            .map(|node| !self.current_dir.starts_with(&node.path))
-            .unwrap_or(true);
-        if root_misses_current {
-            self.tree_nodes = initial_browse_tree_nodes(&self.current_dir, self.show_hidden);
+    /// Keep the Browse tree pointed at `current_dir` using lexical path state
+    /// only. This function is safe on the reducer thread: it performs no
+    /// metadata calls, canonicalization, or directory enumeration.
+    pub fn sync_tree_shell_to_current_dir(&mut self) {
+        if let Some(pending) = self.tree_scan_pending.take() {
+            pending.cancel();
         }
-        browse_tree_expand_ancestors(&mut self.tree_nodes, &self.current_dir, self.show_hidden);
+
+        let current_index = self
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == self.current_dir);
+        if current_index.is_none() {
+            self.tree_nodes = initial_browse_tree_shell(&self.current_dir);
+        }
+
         if let Some(index) = self
             .tree_nodes
             .iter()
-            .position(|node| same_path(&node.path, &self.current_dir))
+            .position(|node| node.path == self.current_dir)
         {
+            // While the current listing is in flight we do not yet know
+            // whether the directory has child directories. Optimistically
+            // retain the disclosure affordance; terminal reconciliation clears
+            // it for a true leaf.
+            self.tree_nodes[index].has_children = true;
+            self.tree_nodes[index].expanded = true;
             self.tree_cursor = index;
             self.ensure_tree_visible();
         }
+    }
+
+    fn install_tree_children(
+        &mut self,
+        path: &Path,
+        child_depth: usize,
+        children: Vec<BrowseTreeNode>,
+    ) {
+        let Some(index) = self.tree_nodes.iter().position(|node| node.path == path) else {
+            return;
+        };
+        if self.tree_nodes[index].depth + 1 != child_depth || !self.tree_nodes[index].expanded {
+            return;
+        }
+        let depth = self.tree_nodes[index].depth;
+        let remove_start = index + 1;
+        let remove_end = self.tree_nodes[remove_start..]
+            .iter()
+            .position(|node| node.depth <= depth)
+            .map(|offset| remove_start + offset)
+            .unwrap_or(self.tree_nodes.len());
+        self.tree_nodes.drain(remove_start..remove_end);
+
+        if children.is_empty() {
+            self.tree_nodes[index].has_children = false;
+            self.tree_nodes[index].expanded = false;
+        } else {
+            self.tree_nodes[index].has_children = true;
+            self.tree_nodes
+                .splice(remove_start..remove_start, children);
+        }
+        self.ensure_tree_visible();
+    }
+
+    pub fn apply_tree_scan_complete(
+        &mut self,
+        generation: u64,
+        path: &Path,
+        child_depth: usize,
+        children: Vec<BrowseTreeNode>,
+    ) -> bool {
+        let current = self.tree_scan_pending.as_ref().is_some_and(|pending| {
+            pending.generation == generation && pending.path == path
+        });
+        if !current {
+            return false;
+        }
+        self.tree_scan_pending = None;
+        self.install_tree_children(path, child_depth, children);
+        true
     }
 
     fn ensure_tree_visible(&mut self) {
@@ -3673,16 +3865,19 @@ impl BrowseState {
             self.refresh_archive_view_with_search(tx);
             return;
         }
-        self.sync_tree_to_current_dir();
+        self.sync_tree_shell_to_current_dir();
         self.invalidate_recursive_search_for_refresh();
         if self.scan_tx.is_some() {
             self.begin_async_scan();
         } else {
-            // Synchronous fallback (initial scan before tx is set). Keep this
-            // path as cheap as the async scan: do not open every ISO or disc
+            // Synchronous fallback exists only for non-runtime/test callers.
+            // Interactive Browse installs a sender before its first scan. Keep
+            // this path as cheap as the async scan: do not open every ISO or disc
             // marker in the directory merely to populate a listing. Native disc
             // source promotion happens lazily after focus settles.
             self.scan();
+            let dirs = self.all_dirs.clone();
+            self.reconcile_current_tree_from_dirs(&dirs, true);
             self.reapply_after_directory_scan_complete(tx);
         }
     }
@@ -3701,22 +3896,38 @@ impl BrowseState {
         }
     }
 
-    /// Start an async directory scan. Cancels any in-flight scan first.
-    /// Clears entries immediately (renderer shows "Loading...").
+    /// Start an async directory scan. Cancels any in-flight scan first. The
+    /// worker streams bounded batches; terminal completion remains authoritative.
     fn begin_async_scan(&mut self) {
+        self.sync_tree_shell_to_current_dir();
+
         // Cancel previous scan if still running.
         if let Some(handle) = self.scan_pending.take() {
             handle.cancel();
         }
         self.clear_pending_inline_rename_after_scan();
 
-        // Clear display state.
-        self.parent_entry = None;
+        // Clear display state. Parent identity is lexical and therefore safe to
+        // construct immediately without touching the filesystem.
+        self.parent_entry = self.current_dir.parent().map(|parent| {
+            BrowseEntry::new(
+                parent.to_path_buf(),
+                "..".to_string(),
+                EntryKind::ParentDir,
+                0,
+                None,
+            )
+        });
         self.all_dirs.clear();
         self.all_files.clear();
         self.probe_cache_scan_identity_index.clear();
+        if let Some(parent) = &self.parent_entry {
+            self.probe_cache_scan_identity_index
+                .insert(parent.path.clone(), ProbeCacheIdentity::from_entry(parent));
+        }
         self.entries.clear();
         self.error = None;
+        self.scan_discovered_count = 0;
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.probe_debounce = None;
@@ -3735,8 +3946,7 @@ impl BrowseState {
         let (handle, cancel_flag) = ScanHandle::new(generation);
         self.scan_pending = Some(handle);
 
-        let classification_cache = self.classification_cache_snapshot();
-        spawn_dir_scan(self.current_dir.clone(), generation, cancel_flag, classification_cache, tx);
+        spawn_dir_scan(self.current_dir.clone(), generation, cancel_flag, tx);
     }
 
     /// Whether we're currently browsing inside an archive.
@@ -3765,10 +3975,236 @@ impl BrowseState {
         dirs: Vec<BrowseEntry>,
         files: Vec<BrowseEntry>,
     ) {
+        self.reconcile_current_tree_from_dirs(&dirs, true);
         self.parent_entry = parent_entry;
         self.all_dirs = dirs;
         self.all_files = files;
         self.rebuild_probe_cache_scan_identity_index();
+    }
+
+    /// Merge one accepted streaming scan batch into the raw Browse model.
+    /// This does no filesystem work and does not launch completion-only probes.
+    pub(super) fn publish_scanned_batch(
+        &mut self,
+        dirs: Vec<BrowseEntry>,
+        files: Vec<BrowseEntry>,
+        discovered: usize,
+    ) {
+        self.reconcile_current_tree_from_dirs(&dirs, false);
+        for entry in dirs.iter().chain(files.iter()) {
+            self.probe_cache_scan_identity_index
+                .insert(entry.path.clone(), ProbeCacheIdentity::from_entry(entry));
+        }
+        self.all_dirs.extend(dirs);
+        self.all_files.extend(files);
+        self.scan_discovered_count = self.scan_discovered_count.max(discovered);
+    }
+
+    pub fn apply_dir_scan_batch_if_current(
+        &mut self,
+        generation: u64,
+        path: &Path,
+        dirs: Vec<BrowseEntry>,
+        files: Vec<BrowseEntry>,
+        discovered: usize,
+    ) -> bool {
+        if !self.is_current_dir_scan(generation, path) {
+            return false;
+        }
+        self.append_stream_batch_to_view(&dirs, &files);
+        self.publish_scanned_batch(dirs, files, discovered);
+        true
+    }
+
+    /// Publish only the newly discovered rows into the in-flight view. We do
+    /// not globally re-sort the accumulated listing on every batch: on a slow
+    /// 300k-entry directory that would turn streaming into repeated O(n log n)
+    /// reducer work. Rows use discovery order while the scan is active; the
+    /// terminal `DirScanComplete` rebuild remains authoritative and applies the
+    /// configured dirs-first sorting/filter/search semantics exactly once.
+    fn append_stream_batch_to_view(&mut self, dirs: &[BrowseEntry], files: &[BrowseEntry]) {
+        if self.search.active {
+            // Active search owns `entries`; terminal completion restarts it
+            // against the authoritative full snapshot.
+            return;
+        }
+        let filter_lower_owned = if self.filter_text.is_empty() {
+            None
+        } else {
+            Some(self.filter_text.to_lowercase())
+        };
+        let filter_lower = filter_lower_owned.as_deref();
+        self.entries.extend(
+            dirs.iter()
+                .chain(files.iter())
+                .filter(|entry| {
+                    entry_passes_view(
+                        entry,
+                        self.show_hidden,
+                        &self.format_filter,
+                        filter_lower,
+                    )
+                })
+                .cloned(),
+        );
+        if self.selected_index >= self.entries.len() {
+            self.selected_index = self.entries.len().saturating_sub(1);
+        }
+    }
+
+    /// Reconcile direct tree children for the current directory from listing
+    /// results already discovered by the directory scan. `authoritative=false`
+    /// incrementally adds a batch; terminal publication removes children that
+    /// are absent from the final snapshot. Existing expanded child subtrees are
+    /// preserved by path.
+    fn reconcile_current_tree_from_dirs(&mut self, dirs: &[BrowseEntry], authoritative: bool) {
+        let Some(parent_index) = self
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == self.current_dir)
+        else {
+            self.sync_tree_shell_to_current_dir();
+            let Some(parent_index) = self
+                .tree_nodes
+                .iter()
+                .position(|node| node.path == self.current_dir)
+            else {
+                return;
+            };
+            return self.reconcile_current_tree_from_dirs_at(parent_index, dirs, authoritative);
+        };
+        self.reconcile_current_tree_from_dirs_at(parent_index, dirs, authoritative);
+    }
+
+    fn reconcile_current_tree_from_dirs_at(
+        &mut self,
+        parent_index: usize,
+        dirs: &[BrowseEntry],
+        authoritative: bool,
+    ) {
+        let parent_was_expanded = self.tree_nodes[parent_index].expanded;
+        if !parent_was_expanded {
+            if authoritative {
+                self.tree_nodes[parent_index].has_children = !dirs.is_empty();
+            } else if !dirs.is_empty() {
+                self.tree_nodes[parent_index].has_children = true;
+            }
+            return;
+        }
+
+        let parent_depth = self.tree_nodes[parent_index].depth;
+        let child_depth = parent_depth + 1;
+        let start = parent_index + 1;
+        let end = self.tree_nodes[start..]
+            .iter()
+            .position(|node| node.depth <= parent_depth)
+            .map(|offset| start + offset)
+            .unwrap_or(self.tree_nodes.len());
+
+        if !authoritative {
+            // Streaming hydration is append-only. Rebuilding/sorting the full
+            // direct-child set on every batch would create the same repeated
+            // large-list reducer cost we explicitly avoid for the file pane.
+            let mut existing = self.tree_nodes[start..end]
+                .iter()
+                .filter(|node| node.depth == child_depth)
+                .map(|node| node.path.clone())
+                .collect::<HashSet<_>>();
+            let mut additions = Vec::new();
+            for entry in dirs {
+                if !self.show_hidden && browse_entry_name_is_hidden(&entry.name) {
+                    continue;
+                }
+                if existing.insert(entry.path.clone()) {
+                    additions.push(BrowseTreeNode {
+                        path: entry.path.clone(),
+                        name: entry.name.clone(),
+                        depth: child_depth,
+                        expanded: false,
+                        has_children: true,
+                    });
+                }
+            }
+            if !additions.is_empty() {
+                self.tree_nodes.splice(end..end, additions);
+                self.tree_nodes[parent_index].has_children = true;
+            }
+            self.tree_nodes[parent_index].expanded = true;
+            return;
+        }
+
+        let cursor_path = self.tree_nodes.get(self.tree_cursor).map(|node| node.path.clone());
+        let old_nodes: Vec<BrowseTreeNode> = self.tree_nodes.drain(start..end).collect();
+
+        let mut groups: HashMap<PathBuf, Vec<BrowseTreeNode>> = HashMap::new();
+        let mut index = 0usize;
+        while index < old_nodes.len() {
+            if old_nodes[index].depth != child_depth {
+                index += 1;
+                continue;
+            }
+            let group_start = index;
+            index += 1;
+            while index < old_nodes.len() && old_nodes[index].depth > child_depth {
+                index += 1;
+            }
+            let group = old_nodes[group_start..index].to_vec();
+            if let Some(root) = group.first() {
+                groups.insert(root.path.clone(), group);
+            }
+        }
+
+        let mut desired: HashMap<PathBuf, String> = HashMap::new();
+        for entry in dirs {
+            if !self.show_hidden && browse_entry_name_is_hidden(&entry.name) {
+                continue;
+            }
+            desired.insert(entry.path.clone(), entry.name.clone());
+        }
+
+        let mut desired: Vec<(PathBuf, String)> = desired.into_iter().collect();
+        desired.sort_by(|(path_a, name_a), (path_b, name_b)| {
+            name_a
+                .to_ascii_lowercase()
+                .cmp(&name_b.to_ascii_lowercase())
+                .then_with(|| name_a.cmp(name_b))
+                .then_with(|| path_a.cmp(path_b))
+        });
+
+        let mut replacement = Vec::new();
+        for (path, name) in desired {
+            if let Some(mut group) = groups.remove(&path) {
+                if let Some(root) = group.first_mut() {
+                    root.name = name;
+                }
+                replacement.extend(group);
+            } else {
+                replacement.push(BrowseTreeNode {
+                    path,
+                    name,
+                    depth: child_depth,
+                    expanded: false,
+                    // Browse uses optimistic disclosure. Expanding a true leaf
+                    // asynchronously resolves this to false and collapses it.
+                    has_children: true,
+                });
+            }
+        }
+
+        let has_children = !replacement.is_empty();
+        self.tree_nodes
+            .splice(start..start, replacement);
+        self.tree_nodes[parent_index].has_children = has_children;
+        self.tree_nodes[parent_index].expanded = has_children;
+
+        if let Some(cursor_path) = cursor_path {
+            if let Some(index) = self.tree_nodes.iter().position(|node| node.path == cursor_path) {
+                self.tree_cursor = index;
+            } else {
+                self.tree_cursor = parent_index;
+            }
+        }
+        self.ensure_tree_visible();
     }
 
     /// Enter an archive: set archive state and populate entries from listing.
@@ -4556,7 +4992,6 @@ impl BrowseState {
                 self.current_dir = path;
                 self.selected_index = 0;
                 self.reset_nav_state();
-                self.sync_tree_to_current_dir();
                 self.refresh();
                 return true;
             }
@@ -4583,7 +5018,6 @@ impl BrowseState {
             self.push_nav_history(parent.clone());
             self.current_dir = parent;
             self.reset_nav_state();
-            self.sync_tree_to_current_dir();
             self.refresh();
             return true;
         }
@@ -4740,7 +5174,6 @@ impl BrowseState {
             self.current_dir = path;
             self.selected_index = 0;
             self.reset_nav_state();
-            self.sync_tree_to_current_dir();
             self.refresh();
         }
     }
@@ -4816,7 +5249,6 @@ impl BrowseState {
             self.current_dir = final_path;
             self.selected_index = 0;
             self.reset_nav_state();
-            self.sync_tree_to_current_dir();
             self.refresh();
             Ok(())
         }
@@ -5657,30 +6089,37 @@ impl BrowseState {
     }
 
     pub(crate) fn rebuild_tree_preserving_expansion(&mut self) {
-        let expanded_paths = self
-            .tree_nodes
-            .iter()
-            .filter(|node| node.expanded)
-            .map(|node| node.path.clone())
-            .collect::<Vec<_>>();
         let cursor_path = self.tree_nodes.get(self.tree_cursor).map(|node| node.path.clone());
-        let root = self
-            .tree_nodes
-            .first()
-            .map(|node| node.path.clone())
-            .filter(|root| self.current_dir.starts_with(root))
-            .unwrap_or_else(|| self.current_dir.clone());
 
-        self.tree_nodes = initial_browse_tree_nodes(&root, self.show_hidden);
-        for path in expanded_paths {
-            browse_tree_expand_path(&mut self.tree_nodes, &path, self.show_hidden);
+        // Visibility changes must not trigger filesystem discovery on the TUI
+        // thread. Retain already-materialized branches, remove newly-hidden
+        // subtrees, and authoritatively rebuild only the current directory from
+        // the raw listing that is already in memory.
+        if !self.show_hidden {
+            let mut index = 0usize;
+            while index < self.tree_nodes.len() {
+                if self.tree_nodes[index].depth > 0 && self.tree_nodes[index].name.starts_with('.') {
+                    let depth = self.tree_nodes[index].depth;
+                    let end = self.tree_nodes[index + 1..]
+                        .iter()
+                        .position(|node| node.depth <= depth)
+                        .map(|offset| index + 1 + offset)
+                        .unwrap_or(self.tree_nodes.len());
+                    self.tree_nodes.drain(index..end);
+                } else {
+                    index += 1;
+                }
+            }
         }
-        self.sync_tree_to_current_dir();
+
+        self.sync_tree_shell_to_current_dir();
+        let dirs = self.all_dirs.clone();
+        self.reconcile_current_tree_from_dirs(&dirs, true);
         if let Some(cursor_path) = cursor_path {
             if let Some(index) = self
                 .tree_nodes
                 .iter()
-                .position(|node| same_path(&node.path, &cursor_path))
+                .position(|node| node.path == cursor_path)
             {
                 self.tree_cursor = index;
                 self.ensure_tree_visible();
@@ -6803,7 +7242,7 @@ impl BrowseState {
         self.scan_pending
             .as_ref()
             .is_some_and(|handle| handle.generation() == generation)
-            && same_path(&self.current_dir, scan_path)
+            && self.current_dir == scan_path
     }
 
     /// Mark a matching scan generation as terminal. Returns true only when the
@@ -6813,6 +7252,7 @@ impl BrowseState {
             return false;
         }
         self.scan_pending = None;
+        self.scan_discovered_count = 0;
         true
     }
 
@@ -9488,25 +9928,134 @@ pub fn spawn_dir_stats(
     });
 }
 
+/// Enumerate one Browse-tree directory off the reducer thread. This reads the
+/// requested directory exactly once and never probes every child to determine
+/// disclosure-arrow accuracy. Ordinary dirents use `file_type()` directly;
+/// only symlink entries follow metadata so directory symlinks remain navigable.
+fn scan_browse_tree_children_blocking(
+    path: &Path,
+    child_depth: usize,
+    show_hidden: bool,
+    cancel: &AtomicBool,
+) -> Result<Vec<BrowseTreeNode>, String> {
+    let read = fs::read_dir(path).map_err(|err| format!("Cannot read directory: {err}"))?;
+    let mut children = Vec::new();
+    for (index, entry) in read.flatten().enumerate() {
+        if index % TREE_SCAN_CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        let is_dir = if file_type.is_dir() {
+            true
+        } else if file_type.is_symlink() {
+            fs::metadata(entry.path())
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !is_dir {
+            continue;
+        }
+
+        children.push(BrowseTreeNode {
+            path: entry.path(),
+            name,
+            depth: child_depth,
+            expanded: false,
+            has_children: true,
+        });
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+    children.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(children)
+}
+
+fn spawn_browse_tree_scan(
+    path: PathBuf,
+    child_depth: usize,
+    show_hidden: bool,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let worker_path = path.clone();
+        let worker_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            scan_browse_tree_children_blocking(
+                &worker_path,
+                child_depth,
+                show_hidden,
+                &worker_cancel,
+            )
+        })
+        .await;
+
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let (children, error) = match result {
+            Ok(Ok(children)) => (children, None),
+            Ok(Err(error)) => (Vec::new(), Some(error)),
+            Err(join_error) => (
+                Vec::new(),
+                Some(format!("tree scan task panicked: {join_error}")),
+            ),
+        };
+        let _ = tx
+            .send(crate::tui::message::AppMessage::BrowseTreeChildrenComplete {
+                generation,
+                path,
+                child_depth,
+                children,
+                error,
+            })
+            .await;
+    });
+}
+
 /// Spawn a background directory scan. The blocking I/O (readdir + lstat per
-/// entry) runs on `spawn_blocking`. Respects the cancel flag — checks every
-/// 50 entries and aborts early if set. Sends `DirScanComplete` when done.
-/// Wrapped in a 30-second timeout.
+/// entry) runs on `spawn_blocking`. Accepted entries are published in bounded,
+/// adaptive batches so the first rows appear quickly without forcing the
+/// reducer to re-sort a huge accumulated list for hundreds of tiny messages.
+/// The timeout is a runaway backstop; partial streamed rows remain useful if it
+/// ever fires.
 fn spawn_dir_scan(
     path: PathBuf,
     generation: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    classification_cache: BrowseClassificationCacheSnapshot,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
     tokio::spawn(async move {
         let scan_path = path.clone();
         let cancel_flag = cancel.clone();
+        let batch_tx = tx.clone();
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            DIR_SCAN_RUNAWAY_TIMEOUT,
             tokio::task::spawn_blocking(move || {
-                scan_directory_blocking(&scan_path, &cancel_flag, &classification_cache)
+                scan_directory_blocking(
+                    &scan_path,
+                    &cancel_flag,
+                    Some((generation, &batch_tx)),
+                )
             }),
         )
         .await;
@@ -9528,7 +10077,10 @@ fn spawn_dir_scan(
                     Vec::new(),
                     Vec::new(),
                     BrowseClassificationCacheUpdates::default(),
-                    Some("scan timed out (30s)".into()),
+                    Some(format!(
+                        "scan timed out after {}s",
+                        DIR_SCAN_RUNAWAY_TIMEOUT.as_secs()
+                    )),
                 )
             }
         };
@@ -9802,7 +10354,10 @@ fn classify_scanned_directory_entry_blocking(
 fn scan_directory_blocking(
     dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,
-    _classification_cache: &BrowseClassificationCacheSnapshot,
+    batch_sink: Option<(
+        u64,
+        &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    )>,
 ) -> Result<(
     Option<BrowseEntry>,
     Vec<BrowseEntry>,
@@ -9826,10 +10381,39 @@ fn scan_directory_blocking(
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     let classification_updates = BrowseClassificationCacheUpdates::default();
+    let mut batch_dirs = Vec::new();
+    let mut batch_files = Vec::new();
+    let mut batch_target = DIR_SCAN_FIRST_BATCH;
+    let mut last_batch = Instant::now();
+    let mut discovered = 0usize;
+
+    let flush_batch = |batch_dirs: &mut Vec<BrowseEntry>,
+                       batch_files: &mut Vec<BrowseEntry>,
+                       discovered: usize|
+     -> Result<(), String> {
+        let Some((generation, tx)) = batch_sink else {
+            batch_dirs.clear();
+            batch_files.clear();
+            return Ok(());
+        };
+        if batch_dirs.is_empty() && batch_files.is_empty() {
+            return Ok(());
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+        tx.blocking_send(crate::tui::message::AppMessage::DirScanBatch {
+            generation,
+            path: dir.to_path_buf(),
+            dirs: std::mem::take(batch_dirs),
+            files: std::mem::take(batch_files),
+            discovered,
+        })
+        .map_err(|_| "directory scan receiver closed".to_string())
+    };
 
     for (i, entry) in read.flatten().enumerate() {
-        // Check cancellation every 50 entries.
-        if i % 50 == 0 && cancel.load(Ordering::Relaxed) {
+        if i % DIR_SCAN_CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
 
@@ -9876,19 +10460,40 @@ fn scan_directory_blocking(
         // Keep directory scans cheap and predictable: do not open ISO images
         // or disc-directory structures for every row. Supported native disc
         // sources are promoted lazily from the settled-focus debounce path.
-
-        if matches!(
+        let is_directory = matches!(
             kind,
             EntryKind::Directory
                 | EntryKind::DvdAudioDir
                 | EntryKind::DvdVideoDir
                 | EntryKind::BlurayDir
-        ) {
+        );
+        if is_directory {
+            if batch_sink.is_some() {
+                batch_dirs.push(browse_entry.clone());
+            }
             dirs.push(browse_entry);
         } else {
+            if batch_sink.is_some() {
+                batch_files.push(browse_entry.clone());
+            }
             files.push(browse_entry);
         }
+        discovered += 1;
+
+        let batch_len = batch_dirs.len() + batch_files.len();
+        if batch_sink.is_some()
+            && (batch_len >= batch_target || last_batch.elapsed() >= DIR_SCAN_BATCH_LATENCY)
+        {
+            flush_batch(&mut batch_dirs, &mut batch_files, discovered)?;
+            batch_target = (batch_target.saturating_mul(4)).min(DIR_SCAN_MAX_BATCH);
+            last_batch = Instant::now();
+        }
     }
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+    flush_batch(&mut batch_dirs, &mut batch_files, discovered)?;
 
     Ok((parent_entry, dirs, files, classification_updates))
 }
@@ -11945,27 +12550,79 @@ pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn initial_browse_tree_nodes(current_dir: &Path, show_hidden: bool) -> Vec<BrowseTreeNode> {
-    tui_file_picker::initial_tree_nodes_with_hidden(current_dir, show_hidden)
-}
+fn initial_browse_tree_shell(current_dir: &Path) -> Vec<BrowseTreeNode> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from));
+    let filesystem_root = current_dir
+        .ancestors()
+        .last()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                PathBuf::from("C:\\")
+            } else {
+                PathBuf::from("/")
+            }
+        });
 
-fn browse_tree_expand_ancestors(nodes: &mut Vec<BrowseTreeNode>, target: &Path, show_hidden: bool) {
-    if nodes.is_empty() {
-        *nodes = initial_browse_tree_nodes(target, show_hidden);
+    let mut nodes = Vec::new();
+    if let Some(home) = home.clone() {
+        nodes.push(BrowseTreeNode {
+            name: home
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "Home".to_string()),
+            path: home.clone(),
+            depth: 0,
+            expanded: current_dir.starts_with(&home),
+            // Browse disclosure is intentionally optimistic. Accuracy is
+            // resolved only when this directory is listed/expanded off-thread.
+            has_children: true,
+        });
     }
-    tui_file_picker::expand_tree_to_path(nodes, target, show_hidden);
-}
 
-fn browse_tree_expand_path(nodes: &mut Vec<BrowseTreeNode>, target: &Path, show_hidden: bool) {
-    browse_tree_expand_ancestors(nodes, target, show_hidden);
-    let Some(index) = nodes.iter().position(|node| same_path(&node.path, target)) else {
-        return;
+    if !nodes.iter().any(|node| node.path == filesystem_root) {
+        nodes.push(BrowseTreeNode {
+            name: "Filesystem".to_string(),
+            path: filesystem_root.clone(),
+            depth: 0,
+            expanded: home
+                .as_ref()
+                .map(|home| !current_dir.starts_with(home))
+                .unwrap_or(true),
+            has_children: true,
+        });
+    }
+
+    let anchor = home
+        .filter(|home| current_dir.starts_with(home))
+        .unwrap_or(filesystem_root);
+    let Some(anchor_index) = nodes.iter().position(|node| node.path == anchor) else {
+        return nodes;
     };
-    if nodes[index].expanded || !nodes[index].has_children {
-        return;
+    nodes[anchor_index].expanded = true;
+
+    if let Ok(relative) = current_dir.strip_prefix(&anchor) {
+        let mut path = anchor;
+        let mut chain = Vec::new();
+        for (depth_offset, component) in relative.components().enumerate() {
+            path.push(component.as_os_str());
+            chain.push(BrowseTreeNode {
+                name: component.as_os_str().to_string_lossy().into_owned(),
+                path: path.clone(),
+                depth: depth_offset + 1,
+                expanded: true,
+                has_children: true,
+            });
+        }
+        let insert_at = anchor_index + 1;
+        nodes.splice(insert_at..insert_at, chain);
     }
-    nodes[index].expanded = true;
-    tui_file_picker::refresh_tree_children(nodes, target, show_hidden);
+
+    nodes
 }
 
 fn dvda_directory_classification_fingerprint(entry: &BrowseEntry) -> ClassificationFingerprint {
@@ -12290,6 +12947,388 @@ mod tests {
         alias_dir
             .join("..")
             .join(real_path.file_name().expect("fixture file name"))
+    }
+
+    fn test_directory_entry(path: PathBuf, name: &str) -> BrowseEntry {
+        BrowseEntry::new(path, name.to_string(), EntryKind::Directory, 0, None)
+    }
+
+    fn test_file_entry(path: PathBuf, name: &str) -> BrowseEntry {
+        BrowseEntry::new(path, name.to_string(), EntryKind::OtherFile, 0, None)
+    }
+
+    #[test]
+    fn constructor_does_not_observe_start_directory_contents() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let huge_child = td.path().join("huge-child");
+        std::fs::create_dir(&huge_child).expect("huge child");
+        // This makes the old eager has-children path materially expensive while
+        // keeping the assertion deterministic: construction must not discover
+        // even the direct child, irrespective of how much it contains.
+        for index in 0..512usize {
+            std::fs::write(huge_child.join(format!("row-{index:04}.dat")), b"x")
+                .expect("fixture file");
+        }
+
+        let state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            td.path().to_path_buf(),
+        );
+
+        assert!(state.scan_pending.is_none());
+        assert_eq!(state.scan_discovered_count, 0);
+        assert!(state.all_dirs.is_empty());
+        assert!(state.all_files.is_empty());
+        assert!(state.entries.is_empty());
+        assert!(
+            !state.tree_nodes.iter().any(|node| node.path == huge_child),
+            "constructor must build only a lexical shell, not enumerate children"
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_starts_async_listing_without_materializing_child_tree() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let destination = td.path().join("destination");
+        let huge_child = destination.join("huge-child");
+        std::fs::create_dir_all(&huge_child).expect("fixture dirs");
+        for index in 0..128usize {
+            std::fs::write(huge_child.join(format!("row-{index:04}.dat")), b"x")
+                .expect("fixture file");
+        }
+
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            td.path().to_path_buf(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        state.set_tx(tx);
+
+        state.navigate_to(destination.clone());
+
+        assert_eq!(state.current_dir, destination);
+        assert!(state.scan_pending.is_some(), "navigation must launch async listing");
+        assert!(
+            !state.tree_nodes.iter().any(|node| node.path == huge_child),
+            "navigation reducer must not synchronously enumerate tree children"
+        );
+    }
+
+    #[test]
+    fn navigation_cancels_tree_work_and_stale_completion_cannot_mutate_tree() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let old_path = td.path().join("old");
+        let new_path = td.path().join("new");
+        std::fs::create_dir_all(&old_path).expect("old");
+        std::fs::create_dir_all(&new_path).expect("new");
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            old_path.clone(),
+        );
+        let (handle, cancel) = TreeScanHandle::new(41, old_path.clone());
+        state.tree_scan_pending = Some(handle);
+
+        state.current_dir = new_path.clone();
+        state.sync_tree_shell_to_current_dir();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(state.tree_scan_pending.is_none());
+        let stale_child = BrowseTreeNode {
+            path: old_path.join("stale-child"),
+            name: "stale-child".to_string(),
+            depth: 1,
+            expanded: false,
+            has_children: true,
+        };
+        assert!(!state.apply_tree_scan_complete(41, &old_path, 1, vec![stale_child.clone()]));
+        assert!(!state.tree_nodes.iter().any(|node| node.path == stale_child.path));
+    }
+
+    #[test]
+    fn optimistic_tree_leaf_resolves_empty_without_wedging() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root.clone(),
+        );
+        let index = state
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == root)
+            .expect("current tree node");
+        state.tree_nodes[index].expanded = true;
+        state.tree_nodes[index].has_children = true;
+        let child_depth = state.tree_nodes[index].depth + 1;
+        let (handle, _cancel) = TreeScanHandle::new(7, root.clone());
+        state.tree_scan_pending = Some(handle);
+
+        assert!(state.apply_tree_scan_complete(7, &root, child_depth, Vec::new()));
+        let node = state
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == root)
+            .expect("root retained");
+        assert!(!node.has_children);
+        assert!(!node.expanded);
+    }
+
+    #[test]
+    fn async_tree_completion_keeps_real_child_expandable() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        let child = root.join("child");
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root.clone(),
+        );
+        let index = state
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == root)
+            .expect("current tree node");
+        state.tree_nodes[index].expanded = true;
+        let child_depth = state.tree_nodes[index].depth + 1;
+        let (handle, _cancel) = TreeScanHandle::new(8, root.clone());
+        state.tree_scan_pending = Some(handle);
+        let child_node = BrowseTreeNode {
+            path: child.clone(),
+            name: "child".to_string(),
+            depth: child_depth,
+            expanded: false,
+            has_children: true,
+        };
+
+        assert!(state.apply_tree_scan_complete(8, &root, child_depth, vec![child_node]));
+        assert!(state
+            .tree_nodes
+            .iter()
+            .any(|node| node.path == child && node.has_children));
+        assert!(state
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == root)
+            .is_some_and(|node| node.expanded && node.has_children));
+    }
+
+    #[test]
+    fn browse_tree_worker_honors_hidden_policy() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(td.path().join("visible")).expect("visible");
+        std::fs::create_dir(td.path().join(".hidden")).expect("hidden");
+        std::fs::write(td.path().join("ordinary-file"), b"x").expect("file");
+        let cancel = AtomicBool::new(false);
+
+        let visible_only = scan_browse_tree_children_blocking(td.path(), 1, false, &cancel)
+            .expect("scan visible");
+        assert_eq!(
+            visible_only.iter().map(|node| node.name.as_str()).collect::<Vec<_>>(),
+            vec!["visible"]
+        );
+
+        let including_hidden = scan_browse_tree_children_blocking(td.path(), 1, true, &cancel)
+            .expect("scan hidden");
+        assert_eq!(including_hidden.len(), 2);
+        assert!(including_hidden.iter().any(|node| node.name == ".hidden"));
+        assert!(including_hidden.iter().any(|node| node.name == "visible"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browse_tree_worker_preserves_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let target = td.path().join("target");
+        let link = td.path().join("linked-dir");
+        std::fs::create_dir(&target).expect("target");
+        symlink(&target, &link).expect("symlink");
+        let cancel = AtomicBool::new(false);
+
+        let children = scan_browse_tree_children_blocking(td.path(), 1, false, &cancel)
+            .expect("scan");
+        assert!(children.iter().any(|node| node.path == link));
+    }
+
+    #[test]
+    fn current_tree_reexpands_from_listing_without_second_tree_job() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        let child_path = root.join("child");
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root.clone(),
+        );
+        state.all_dirs = vec![test_directory_entry(child_path.clone(), "child")];
+        let root_index = state
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == root)
+            .expect("root");
+        state.tree_nodes[root_index].expanded = false;
+        state.tree_nodes[root_index].has_children = true;
+
+        state.toggle_tree_node(root_index);
+
+        assert!(state.tree_scan_pending.is_none());
+        assert!(state.tree_nodes.iter().any(|node| node.path == child_path));
+    }
+
+    #[test]
+    fn streaming_batch_updates_visible_rows_and_rejects_stale_generation() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root.clone(),
+        );
+        let (handle, _cancel) = ScanHandle::new(17);
+        state.scan_pending = Some(handle);
+        let child = test_directory_entry(root.join("child"), "child");
+        let file = test_file_entry(root.join("note.txt"), "note.txt");
+
+        assert!(state.apply_dir_scan_batch_if_current(
+            17,
+            &root,
+            vec![child.clone()],
+            vec![file.clone()],
+            2,
+        ));
+        assert_eq!(state.scan_discovered_count, 2);
+        assert_eq!(state.entries.len(), 2);
+        assert!(state.entries.iter().any(|entry| entry.path == child.path));
+        assert!(state.entries.iter().any(|entry| entry.path == file.path));
+
+        let before = state
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert!(!state.apply_dir_scan_batch_if_current(
+            16,
+            &root,
+            Vec::new(),
+            vec![test_file_entry(root.join("stale.txt"), "stale.txt")],
+            3,
+        ));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(state.scan_discovered_count, 2);
+
+        assert!(state.finish_dir_scan_if_current(17, &root));
+        assert!(state.scan_pending.is_none());
+        assert_eq!(state.scan_discovered_count, 0);
+    }
+
+    #[test]
+    fn terminal_stream_publication_matches_authoritative_sorted_filtered_view() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        let dirs = vec![
+            test_directory_entry(root.join("z-keep-dir"), "z-keep-dir"),
+            test_directory_entry(root.join("a-drop-dir"), "a-drop-dir"),
+        ];
+        let files = vec![
+            test_file_entry(root.join("z-keep.txt"), "z-keep.txt"),
+            test_file_entry(root.join("a-keep.txt"), "a-keep.txt"),
+            test_file_entry(root.join("drop.txt"), "drop.txt"),
+        ];
+
+        let mut streamed = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root.clone(),
+        );
+        streamed.filter_text = "keep".to_string();
+        let (handle, _cancel) = ScanHandle::new(23);
+        streamed.scan_pending = Some(handle);
+        assert!(streamed.apply_dir_scan_batch_if_current(
+            23,
+            &root,
+            vec![dirs[0].clone()],
+            vec![files[0].clone()],
+            2,
+        ));
+        assert!(streamed.apply_dir_scan_batch_if_current(
+            23,
+            &root,
+            vec![dirs[1].clone()],
+            vec![files[1].clone(), files[2].clone()],
+            5,
+        ));
+        assert!(streamed.finish_dir_scan_if_current(23, &root));
+        streamed.publish_scanned_entries(None, dirs.clone(), files.clone());
+        streamed.reapply_after_directory_scan_complete(None);
+
+        let mut expected = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root,
+        );
+        expected.filter_text = "keep".to_string();
+        expected.publish_scanned_entries(None, dirs, files);
+        expected.apply_view();
+
+        let streamed_paths = streamed
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        let expected_paths = expected
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(streamed_paths, expected_paths);
+    }
+
+    #[tokio::test]
+    async fn scan_worker_emits_multiple_batches_before_terminal_snapshot() {
+        let td = tempfile::tempdir().expect("tempdir");
+        for index in 0..100usize {
+            std::fs::write(td.path().join(format!("row-{index:03}.txt")), b"x")
+                .expect("fixture file");
+        }
+        let path = td.path().to_path_buf();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let worker_tx = tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let cancel = AtomicBool::new(false);
+            scan_directory_blocking(&path, &cancel, Some((91, &worker_tx)))
+        })
+        .await
+        .expect("join")
+        .expect("scan");
+        drop(tx);
+
+        let mut batches = 0usize;
+        let mut published = 0usize;
+        let mut last_discovered = 0usize;
+        while let Ok(message) = rx.try_recv() {
+            if let crate::tui::message::AppMessage::DirScanBatch {
+                generation,
+                dirs,
+                files,
+                discovered,
+                ..
+            } = message
+            {
+                assert_eq!(generation, 91);
+                batches += 1;
+                published += dirs.len() + files.len();
+                assert!(discovered >= last_discovered);
+                last_discovered = discovered;
+            }
+        }
+
+        assert!(batches >= 2, "100 entries must cross the fast first-paint batch");
+        assert_eq!(published, 100);
+        assert_eq!(last_discovered, 100);
+        assert_eq!(result.1.len() + result.2.len(), 100);
     }
 
     fn test_cached_info(file_size: u64, title: &str) -> CachedInfo {
@@ -14469,22 +15508,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_worker_does_not_apply_cached_iso_classification_before_publication() {
+    fn scan_worker_leaves_iso_classification_lazy_before_publication() {
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("disc.iso");
         std::fs::write(&path, b"not really an iso").unwrap();
-        let meta = std::fs::metadata(&path).expect("metadata");
-        let fingerprint = ClassificationFingerprint {
-            len: meta.len(),
-            modified: meta.modified().ok(),
-            markers: Vec::new(),
-        };
-        let mut snapshot = BrowseClassificationCacheSnapshot::default();
-        snapshot.sacd_iso.insert(path.clone(), (fingerprint, true));
         let cancel = std::sync::atomic::AtomicBool::new(false);
 
         let (_parent, _dirs, files, updates) =
-            scan_directory_blocking(td.path(), &cancel, &snapshot).expect("scan");
+            scan_directory_blocking(td.path(), &cancel, None).expect("scan");
 
         let entry = files.iter().find(|entry| entry.path == path).expect("iso entry");
         assert!(matches!(entry.kind, EntryKind::Archive));
@@ -14496,11 +15527,10 @@ mod tests {
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("data.iso");
         std::fs::write(&path, b"not really an iso").unwrap();
-        let snapshot = BrowseClassificationCacheSnapshot::default();
         let cancel = std::sync::atomic::AtomicBool::new(false);
 
         let (_parent, _dirs, files, updates) =
-            scan_directory_blocking(td.path(), &cancel, &snapshot).expect("scan");
+            scan_directory_blocking(td.path(), &cancel, None).expect("scan");
 
         let entry = files.iter().find(|entry| entry.path == path).expect("iso entry");
         assert!(matches!(entry.kind, EntryKind::Archive));
@@ -14992,9 +16022,8 @@ mod tests {
         make_valid_bluray_layout(&root, "BDMV", "index.bdmv");
 
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let snapshot = BrowseClassificationCacheSnapshot::default();
         let (_parent, dirs, _files, updates) =
-            scan_directory_blocking(td.path(), &cancel, &snapshot).expect("scan directory");
+            scan_directory_blocking(td.path(), &cancel, None).expect("scan directory");
         let entry = dirs
             .iter()
             .find(|entry| entry.path == root)

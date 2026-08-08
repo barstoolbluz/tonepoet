@@ -509,6 +509,15 @@ pub enum AppMessage {
         input: String,
         result: Result<std::path::PathBuf, String>,
     },
+    /// Incremental results from the active async directory scan. Batches are
+    /// generation/path scoped exactly like the terminal completion.
+    DirScanBatch {
+        generation: u64,
+        path: std::path::PathBuf,
+        dirs: Vec<crate::tui::browse::BrowseEntry>,
+        files: Vec<crate::tui::browse::BrowseEntry>,
+        discovered: usize,
+    },
     /// Result of an async directory scan (readdir + lstat per entry).
     DirScanComplete {
         generation: u64,
@@ -517,6 +526,14 @@ pub enum AppMessage {
         dirs: Vec<crate::tui::browse::BrowseEntry>,
         files: Vec<crate::tui::browse::BrowseEntry>,
         classification_updates: crate::tui::browse::BrowseClassificationCacheUpdates,
+        error: Option<String>,
+    },
+    /// Result of one async Browse-tree directory-only enumeration.
+    BrowseTreeChildrenComplete {
+        generation: u64,
+        path: std::path::PathBuf,
+        child_depth: usize,
+        children: Vec<crate::tui::browse::BrowseTreeNode>,
         error: Option<String>,
     },
     /// Result of an async metadata tag write.

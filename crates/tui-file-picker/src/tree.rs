@@ -154,7 +154,14 @@ pub fn child_directories(dir: &Path, depth: usize, show_hidden: bool) -> Vec<Tre
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) || path.is_dir() {
+        let is_dir = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => true,
+            // Preserve directory-symlink behavior without stat'ing every
+            // ordinary non-directory entry.
+            Ok(kind) if kind.is_symlink() => path.is_dir(),
+            _ => false,
+        };
+        if is_dir {
             children.push(TreeNode {
                 has_children: has_child_directories(&path, show_hidden),
                 expanded: false,
@@ -267,7 +274,15 @@ fn has_child_directories_uncached(dir: &Path, show_hidden: bool) -> bool {
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) || entry.path().is_dir() {
+        let is_dir = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => true,
+            // `DirEntry::file_type` is authoritative for ordinary entries.
+            // Follow metadata only for symlinks so a directory symlink keeps
+            // the existing picker semantics without a per-file stat storm.
+            Ok(kind) if kind.is_symlink() => entry.path().is_dir(),
+            _ => false,
+        };
+        if is_dir {
             return true;
         }
     }

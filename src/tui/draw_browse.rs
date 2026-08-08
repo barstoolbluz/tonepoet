@@ -2164,6 +2164,20 @@ fn truncate_left(s: &str, max: usize) -> String {
     super::display_width::truncate_left(s, max)
 }
 
+fn browse_scan_progress_text(browse: &BrowseState) -> Option<String> {
+    browse.scan_pending.as_ref()?;
+    let folder = browse
+        .current_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| browse.current_dir.display().to_string());
+    Some(format!(
+        "Reading {}… ({})",
+        folder, browse.scan_discovered_count
+    ))
+}
+
 /// Draw the directory listing (left pane) with a sortable column header row.
 /// Reserves an extra row for the live filter input when one is active.
 fn draw_browse_list(
@@ -2211,10 +2225,26 @@ fn draw_browse_list(
         Span::styled("┐", theme.border(border_color)),
     ]);
 
-    let bot_line = Line::from(Span::styled(
-        format!("└{}┘", "─".repeat(w.saturating_sub(2))),
-        theme.border(border_color),
-    ));
+    let bot_line = if let Some(progress) = browse_scan_progress_text(browse) {
+        let available = w.saturating_sub(2);
+        let decorated = format!(" {} ", progress);
+        let label = super::display_width::truncate_right(&decorated, available);
+        let label_w = super::display_width::width(&label);
+        Line::from(vec![
+            Span::styled("└", theme.border(border_color)),
+            Span::styled(label, theme.muted()),
+            Span::styled(
+                "─".repeat(available.saturating_sub(label_w)),
+                theme.border(border_color),
+            ),
+            Span::styled("┘", theme.border(border_color)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            format!("└{}┘", "─".repeat(w.saturating_sub(2))),
+            theme.border(border_color),
+        ))
+    };
 
     // Content rows = total - top border - header - bottom border
     // (-1 if filter row, -2 if search panel).
@@ -2333,11 +2363,9 @@ fn draw_browse_list(
                 theme,
             ));
         } else {
-            let msg = if browse.scan_pending.is_some() {
-                "   Loading..."
-            } else {
-                "   (empty)"
-            };
+            let msg = browse_scan_progress_text(browse)
+                .map(|progress| format!("   {progress}"))
+                .unwrap_or_else(|| "   (empty)".to_string());
             lines.push(bordered_line(
                 border_color,
                 w,
@@ -5154,6 +5182,35 @@ fn size_str(bytes: u64) -> String {
 #[cfg(test)]
 mod path_field_render_tests {
     use super::*;
+
+    #[test]
+    fn browse_scan_progress_renders_for_empty_and_populated_streams() {
+        let mut browse = BrowseState::new();
+        browse.current_dir = std::path::PathBuf::from("/music/album");
+        let (handle, _cancel) = crate::tui::browse::ScanHandle::new(1);
+        browse.scan_pending = Some(handle);
+
+        assert_eq!(
+            browse_scan_progress_text(&browse).as_deref(),
+            Some("Reading album… (0)")
+        );
+
+        browse.entries.push(crate::tui::browse::BrowseEntry::new(
+            browse.current_dir.join("track.flac"),
+            "track.flac".to_string(),
+            crate::tui::browse::EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            0,
+            None,
+        ));
+        browse.scan_discovered_count = 42;
+        assert_eq!(
+            browse_scan_progress_text(&browse).as_deref(),
+            Some("Reading album… (42)")
+        );
+
+        browse.scan_pending = None;
+        assert!(browse_scan_progress_text(&browse).is_none());
+    }
 
     #[test]
     fn browse_path_go_label_is_lowercase_without_changing_hit_width() {

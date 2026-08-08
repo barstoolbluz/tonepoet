@@ -51,6 +51,7 @@ pub async fn run_app(
     // Set the message channel on BrowseState so navigation methods can
     // spawn async scans. Must happen before the event loop starts.
     app.browse.set_tx(tx.clone());
+    app.browse.start_initial_async_scan();
     app.tui_tx = Some(tx.clone());
     // Recover both explicit metadata-write models at startup. Database-owned
     // PREPARED entries must run first because their authoritative backup can
@@ -294,7 +295,9 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
         | AppMessage::DiscProbeComplete { .. }
         | AppMessage::DirStatsComplete { .. }
         | AppMessage::FolderClassifyComplete { .. }
+        | AppMessage::DirScanBatch { .. }
         | AppMessage::DirScanComplete { .. }
+        | AppMessage::BrowseTreeChildrenComplete { .. }
         | AppMessage::PathValidationComplete { .. }
         | AppMessage::SearchComplete { .. }
         | AppMessage::ArchiveListingComplete { .. }
@@ -5222,6 +5225,44 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         },
+        AppMessage::DirScanBatch {
+            generation,
+            path,
+            dirs,
+            files,
+            discovered,
+        } => {
+            if !app.browse.apply_dir_scan_batch_if_current(
+                generation,
+                &path,
+                dirs,
+                files,
+                discovered,
+            ) {
+                log::debug!(
+                    "discarded stale directory scan batch for generation {} path {}",
+                    generation,
+                    path.display()
+                );
+                return;
+            }
+        },
+        AppMessage::BrowseTreeChildrenComplete {
+            generation,
+            path,
+            child_depth,
+            children,
+            error,
+        } => {
+            if app
+                .browse
+                .apply_tree_scan_complete(generation, &path, child_depth, children)
+            {
+                if let Some(error) = error {
+                    log::debug!("Browse tree expansion {}: {}", path.display(), error);
+                }
+            }
+        },
         AppMessage::DirScanComplete {
             generation,
             path,
@@ -5243,20 +5284,33 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
 
             if let Some(err) = error {
+                let partial_count = app.browse.scan_discovered_count;
                 app.browse.finish_dir_scan_if_current(generation, &path);
                 app.browse
                     .clear_pending_inline_rename_after_scan_generation(generation);
-                app.browse.error = Some(err);
+                if partial_count > 0 {
+                    // Streaming may already have produced a useful partial
+                    // listing. Keep it visible and surface the terminal failure
+                    // through status instead of replacing the pane with an
+                    // error-only row.
+                    app.set_status(&format!(
+                        "Reading {} stopped after {} entries: {}",
+                        path.display(),
+                        partial_count,
+                        err
+                    ));
+                } else {
+                    app.browse.error = Some(err);
+                }
                 return;
             }
 
-            // Success — clear the scan handle.
+            // Success — clear the scan handle/progress indicator.
             app.browse.finish_dir_scan_if_current(generation, &path);
 
-            // The blocking scan worker performs cold disc-source classification
-            // before publication and returns identity-bound cache updates. This
-            // preserves the old stable one-batch display semantics without
-            // doing ISO/DVD-A/DVD-Video/Blu-ray filesystem I/O in the reducer.
+            // Directory scanning intentionally avoids cold disc-source probes.
+            // Any identity-bound cache updates remain terminal-only plumbing so
+            // settled-focus classification behavior is unchanged.
             app.browse.apply_classification_cache_updates(classification_updates);
             app.browse.publish_scanned_entries(parent_entry, dirs, files);
 
