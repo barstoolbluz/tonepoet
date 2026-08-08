@@ -131,7 +131,11 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
 /// to `less` if no editor is found.
 pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
     let editor_str = detect_editor_for_view()?;
-    let (program, args) = split_command(&editor_str);
+    run_read_only_command(path, &editor_str)
+}
+
+fn run_read_only_command(path: &Path, editor_str: &str) -> Result<bool, String> {
+    let (program, args) = split_command(editor_str);
 
     // Determine read-only flag based on the program basename.
     let editor_base = std::path::Path::new(program)
@@ -164,6 +168,55 @@ pub fn open_in_viewer(path: &Path) -> Result<bool, String> {
 
     terminal_restore.restore_now();
     Ok(status.success())
+}
+
+fn preferred_log_viewer_command(preference: crate::config::LogViewer) -> Option<&'static str> {
+    (preference == crate::config::LogViewer::Bat).then_some("bat")
+}
+
+fn open_log_viewer_with(
+    path: &Path,
+    preference: crate::config::LogViewer,
+    mut launch_read_only: impl FnMut(&Path, &str) -> Result<bool, String>,
+    mut fallback: impl FnMut(&Path) -> Result<bool, String>,
+) -> Result<bool, String> {
+    if let Some(command) = preferred_log_viewer_command(preference) {
+        match launch_read_only(path, command) {
+            Ok(status) => return Ok(status),
+            Err(error) => {
+                log::debug!("bat log viewer unavailable at launch; falling back: {error}");
+            }
+        }
+    }
+    fallback(path)
+}
+
+/// Open a `.log` file through the configured strictly read-only policy.
+/// `bat` is preferred by default; if its direct launch fails, the pre-existing
+/// read-only viewer path remains the fallback rather than turning file
+/// activation into an error.
+fn open_log_viewer(
+    path: &Path,
+    preference: crate::config::LogViewer,
+) -> Result<bool, String> {
+    open_log_viewer_with(path, preference, run_read_only_command, open_in_viewer)
+}
+
+/// Open any read-only text target, applying the `.log` policy without changing
+/// the behavior of other viewable text formats.
+pub fn open_viewer_for_path(
+    path: &Path,
+    log_viewer: crate::config::LogViewer,
+) -> Result<bool, String> {
+    let is_log = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("log"));
+    if is_log {
+        open_log_viewer(path, log_viewer)
+    } else {
+        open_in_viewer(path)
+    }
 }
 
 /// Split a command string into program and arguments.
@@ -235,6 +288,8 @@ fn which(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn editor_spawn_error_path_is_guarded_by_terminal_restore_drop() {
         let source = include_str!("external_editor.rs");
@@ -250,15 +305,54 @@ mod tests {
         assert!(editor_fn.contains("terminal_restore.restore_now();"));
 
         let viewer_fn = source
-            .split("pub fn open_in_viewer")
+            .split("fn run_read_only_command")
             .nth(1)
-            .expect("open_in_viewer function")
-            .split("/// Split a command string")
+            .expect("read-only command runner")
+            .split("fn preferred_log_viewer_command")
             .next()
-            .expect("open_in_viewer body");
+            .expect("read-only command runner body");
         assert!(viewer_fn.contains("TuiRestoreGuard::suspend()"));
         assert!(viewer_fn.contains(".map_err(|e| format!(\"failed to run {}: {}\", editor_str, e))?"));
         assert!(viewer_fn.contains("terminal_restore.restore_now();"));
+    }
+
+    #[test]
+    fn log_viewer_default_prefers_bat_and_editor_policy_bypasses_it() {
+        assert_eq!(
+            preferred_log_viewer_command(crate::config::LogViewer::default()),
+            Some("bat")
+        );
+        assert_eq!(
+            preferred_log_viewer_command(crate::config::LogViewer::Editor),
+            None,
+            "the editor opt-out must bypass bat"
+        );
+    }
+
+    #[test]
+    fn missing_bat_launch_falls_back_to_existing_read_only_viewer_path() {
+        let path = std::path::Path::new("session.log");
+        let mut launch_calls = 0usize;
+        let mut fallback_calls = 0usize;
+        let result = open_log_viewer_with(
+            path,
+            crate::config::LogViewer::Bat,
+            |actual, command| {
+                launch_calls += 1;
+                assert_eq!(actual, path);
+                assert_eq!(command, "bat");
+                Err("executable not found".to_string())
+            },
+            |actual| {
+                fallback_calls += 1;
+                assert_eq!(actual, path);
+                Ok(true)
+            },
+        )
+        .expect("missing bat must use the normal viewer fallback");
+        assert!(result);
+        assert_eq!(launch_calls, 1);
+        assert_eq!(fallback_calls, 1);
     }
 
     #[test]

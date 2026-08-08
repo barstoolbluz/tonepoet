@@ -7564,7 +7564,10 @@ Native helper failures, missing displays, denied clipboard access, and oversized
             } else {
                 path
             };
-            match super::external_editor::open_in_viewer(&target) {
+            match super::external_editor::open_viewer_for_path(
+                &target,
+                app.config.ui.log_viewer,
+            ) {
                 Ok(_) => {
                     app.force_redraw = true;
                 }

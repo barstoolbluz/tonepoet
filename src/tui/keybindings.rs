@@ -1502,12 +1502,29 @@ pub(crate) fn complete_rename_plan(
         }
         Ok(report) => {
             let succeeded_count = report.succeeded_count;
+            let pre_refresh_scroll = app.browse.scroll_offset;
+            let primary_restore = report.roots.first().and_then(|root| {
+                let parent = root.destination.parent()?;
+                if !crate::tui::browse::same_path(parent, &app.browse.current_dir) {
+                    return None;
+                }
+                root.destination
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            });
             for root in &report.roots {
                 app.browse
                     .remap_navigation_after_rename(&root.source, &root.destination);
             }
+            if let Some(target) = primary_restore {
+                app.browse
+                    .arm_cursor_restore(target, Some(pre_refresh_scroll));
+            }
             let warning = record_rename_report_for_undo(app, base_dir, report);
             refresh_browse_after_undo_redo(app, tx);
+            if app.browse.pending_scan_generation().is_none() {
+                app.browse.restore_cursor_after_refresh();
+            }
             if let Some((directory, target_path)) = app.pending_inline_rename_resume.take() {
                 if crate::tui::browse::same_path(&directory, &app.browse.current_dir) {
                     if let Some(scan_generation) = app.browse.pending_scan_generation() {
@@ -6295,8 +6312,31 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                         );
                     }
                     _ => {
-                        // Toggle selection — converting is via context menu or :queue.
-                        app.browse.toggle_selection();
+                        let open_action = (!app.browse.is_in_archive())
+                            .then(|| super::browse::browse_enter_file_action(&entry.path))
+                            .flatten();
+                        match open_action {
+                            Some(super::browse::BrowseEnterFileAction::Edit) => {
+                                let path = entry.path.clone();
+                                super::command::execute_command(
+                                    app,
+                                    super::command::Command::EditFile(path),
+                                    tx,
+                                );
+                            }
+                            Some(super::browse::BrowseEnterFileAction::View) => {
+                                let path = entry.path.clone();
+                                super::command::execute_command(
+                                    app,
+                                    super::command::Command::ViewFile(path),
+                                    tx,
+                                );
+                            }
+                            None => {
+                                // Toggle selection — converting is via context menu or :queue.
+                                app.browse.toggle_selection();
+                            }
+                        }
                     }
                 }
             }
@@ -15712,12 +15752,27 @@ fn embedded_transfer_carrier_from_candidate(
     }
 }
 
-fn usable_embedded_transfer_carriers_for_paths(
+#[derive(Debug, Default)]
+struct TransferPathCapabilitySnapshot {
+    embedded_carriers: Vec<super::tag_interchange::EmbeddedCueCarrier>,
+    unsupported_paths: std::collections::BTreeSet<std::path::PathBuf>,
+    embedded_candidates: std::collections::BTreeMap<
+        std::path::PathBuf,
+        Result<EmbeddedCueCandidate, String>,
+    >,
+}
+
+/// Probe each unique transfer carrier once and retain the two facts that must
+/// stay coupled for unsupported formats: embedded-CUE readability and typed
+/// `UnsupportedFormat` evidence. The latter is the same lofty/probe
+/// classification used by the metadata editor; no extension allow/deny list
+/// participates in this decision.
+fn inspect_transfer_path_capabilities(
     paths: &[std::path::PathBuf],
     cancel: &super::probe::MetadataWriteCancelFlag,
-) -> Result<Vec<super::tag_interchange::EmbeddedCueCarrier>, String> {
+) -> Result<TransferPathCapabilitySnapshot, String> {
     if paths.is_empty() {
-        return Ok(Vec::new());
+        return Ok(TransferPathCapabilitySnapshot::default());
     }
     let mut by_identity = std::collections::BTreeMap::new();
     for path in paths {
@@ -15731,23 +15786,46 @@ fn usable_embedded_transfer_carriers_for_paths(
         || cancel.is_cancelled(),
         "tag transfer cancelled while checking embedded CUESHEET carriers",
     )?;
-    let mut carriers = Vec::new();
+    let mut snapshot = TransferPathCapabilitySnapshot::default();
     for (index, path) in paths.iter().enumerate() {
-        if merged
+        let issue = merged
             .metadata_errors
             .get(index)
-            .and_then(|issue| issue.as_ref())
-            .is_some_and(|issue| issue.blocks_metadata_use())
-        {
+            .and_then(|issue| issue.as_ref());
+        if issue.is_some_and(|issue| {
+            issue.kind == super::probe::MetadataReadIssueKind::UnsupportedFormat
+        }) {
+            snapshot
+                .unsupported_paths
+                .insert(metadata_cue_surface_key(path));
+        }
+        if let Some(issue) = issue.filter(|issue| issue.blocks_metadata_use()) {
+            snapshot.embedded_candidates.insert(
+                metadata_cue_surface_key(path),
+                Err(format!(
+                    "Transfer tags: failed to read '{}': {}",
+                    path.display(),
+                    issue.reason
+                )),
+            );
             continue;
         }
-        if let Some(carrier) = embedded_transfer_carrier_from_candidate(
-            embedded_cue_candidate_for_transfer_at(&merged.entries, path, index),
-        ) {
-            carriers.push(carrier);
+        let candidate = embedded_cue_candidate_for_transfer_at(&merged.entries, path, index);
+        if let Some(carrier) = embedded_transfer_carrier_from_candidate(candidate.clone()) {
+            snapshot.embedded_carriers.push(carrier);
         }
+        snapshot
+            .embedded_candidates
+            .insert(metadata_cue_surface_key(path), Ok(candidate));
     }
-    Ok(carriers)
+    Ok(snapshot)
+}
+
+fn usable_embedded_transfer_carriers_for_paths(
+    paths: &[std::path::PathBuf],
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<Vec<super::tag_interchange::EmbeddedCueCarrier>, String> {
+    Ok(inspect_transfer_path_capabilities(paths, cancel)?.embedded_carriers)
 }
 
 #[derive(Debug, Default)]
@@ -16816,6 +16894,7 @@ fn transfer_carrier_from_admitted_surface(
 
 fn transfer_carrier_from_explicit_cue(
     cue_path: &std::path::Path,
+    cancel: &super::probe::MetadataWriteCancelFlag,
 ) -> Result<super::tag_interchange::TransferCarrier, String> {
     let member = crate::convert::split_cue_album::admit_split_cue_member(cue_path).map_err(
         |error| format!("Transfer tags: CUE admission failed for '{}': {error}", cue_path.display()),
@@ -16840,6 +16919,13 @@ fn transfer_carrier_from_explicit_cue(
                 member.cue_path.display()
             )
         })?;
+    let capabilities = inspect_transfer_path_capabilities(&member.referenced_audio, cancel)?;
+    let unsupported_carrier_authority = !member.referenced_audio.is_empty()
+        && member.referenced_audio.iter().all(|path| {
+            capabilities
+                .unsupported_paths
+                .contains(&metadata_cue_surface_key(path))
+        });
     Ok(super::tag_interchange::TransferCarrier::SidecarCue {
         cue_path: member.cue_path,
         image_paths: member.referenced_audio,
@@ -16847,7 +16933,11 @@ fn transfer_carrier_from_explicit_cue(
         role: member.role,
         // An explicit .cue pick always names the sidecar as the sole write
         // authority; it intentionally bypasses sidecar/embedded resolution.
-        write_method: super::tag_interchange::SidecarCueWriteMethod::SidecarOnly,
+        write_method: if unsupported_carrier_authority {
+            super::tag_interchange::SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly
+        } else {
+            super::tag_interchange::SidecarCueWriteMethod::SidecarOnly
+        },
         cue_text,
         sheet: member.sheet,
     })
@@ -17013,7 +17103,7 @@ fn classify_single_transfer_root(
         return Err("Transfer tags: cancelled during carrier classification".to_string());
     }
     if super::cue_parser::is_user_visible_cue_path(root) {
-        return transfer_carrier_from_explicit_cue(root);
+        return transfer_carrier_from_explicit_cue(root, cancel);
     }
     if transfer_path_is_disc_source(root) {
         return Err("Transfer tags: disc-image sources and targets are not supported this round"
@@ -17734,6 +17824,7 @@ fn resolved_embedded_surface_from_standalone_transfer_carrier(
 
 fn materialize_transfer_metadata_group(
     group: &ResolvedMetadataGroup,
+    unsupported_paths: &std::collections::BTreeSet<std::path::PathBuf>,
 ) -> Result<super::tag_interchange::TransferCarrier, String> {
     match group.representation {
         crate::config::AggregateMetadataTarget::IndividualFiles => {
@@ -17742,15 +17833,34 @@ fn materialize_transfer_metadata_group(
             })
         }
         crate::config::AggregateMetadataTarget::SidecarCue => {
+            let sidecar_is_untaggable_authority = !group.covered_paths.is_empty()
+                && group.covered_paths.iter().all(|path| {
+                    unsupported_paths.contains(&metadata_cue_surface_key(path))
+                });
             let mut carriers = Vec::with_capacity(group.selected_surfaces.len());
             for (order, surface) in group.selected_surfaces.iter().enumerate() {
+                let mut carrier = transfer_carrier_from_admitted_surface(
+                    surface,
+                    &EmbeddedCueCandidate::Absent,
+                    crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+                )?;
+                if sidecar_is_untaggable_authority {
+                    let super::tag_interchange::TransferCarrier::SidecarCue {
+                        write_method,
+                        ..
+                    } = &mut carrier
+                    else {
+                        return Err(
+                            "internal error: sidecar metadata group materialized as a non-sidecar carrier"
+                                .to_string(),
+                        );
+                    };
+                    *write_method = super::tag_interchange::SidecarCueWriteMethod::
+                        UnsupportedCarriersSidecarOnly;
+                }
                 carriers.push((
                     order,
-                    transfer_carrier_from_admitted_surface(
-                        surface,
-                        &EmbeddedCueCandidate::Absent,
-                        crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
-                    )?,
+                    carrier,
                 ));
             }
             compose_transfer_carrier(carriers)
@@ -17865,7 +17975,9 @@ fn classify_transfer_directory(
     // Probe every discovered physical carrier once. This establishes readable
     // source viability only. Representation-specific write support is checked
     // later if the carrier is chosen as a target.
-    let standalone_embedded = usable_embedded_transfer_carriers_for_paths(&paths, cancel)?
+    let transfer_capabilities = inspect_transfer_path_capabilities(&paths, cancel)?;
+    let standalone_embedded = transfer_capabilities
+        .embedded_carriers
         .into_iter()
         .map(resolved_embedded_surface_from_standalone_transfer_carrier)
         .collect::<Vec<_>>();
@@ -17880,13 +17992,12 @@ fn classify_transfer_directory(
         })
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let no_unusable_individual_paths = std::collections::BTreeSet::new();
     let groups = resolve_directory_metadata_groups(
         &paths,
         &admitted_surfaces,
         standalone_embedded,
         metadata_target_priority,
-        &no_unusable_individual_paths,
+        &transfer_capabilities.unsupported_paths,
         |surface| {
             if cancel.is_cancelled() {
                 return Err(
@@ -17938,7 +18049,15 @@ fn classify_transfer_directory(
     let ordered = groups
         .iter()
         .enumerate()
-        .map(|(order, group)| Ok((order, materialize_transfer_metadata_group(group)?)))
+        .map(|(order, group)| {
+            Ok((
+                order,
+                materialize_transfer_metadata_group(
+                    group,
+                    &transfer_capabilities.unsupported_paths,
+                )?,
+            ))
+        })
         .collect::<Result<Vec<_>, String>>()?;
     compose_transfer_carrier(ordered)
 }
@@ -18033,6 +18152,105 @@ fn explicit_audio_transfer_carrier(
     }
 }
 
+/// Preserve explicit-file semantics for normal/taggable selections, but when
+/// every selected carrier is metadata-unsupported allow one unambiguous valid
+/// sidecar that covers all selected files to become their metadata authority.
+/// The carrier retains the complete CUE track/image ownership map while its
+/// `image_paths` are narrowed to the explicit selection, so transfer read/write
+/// can project onto only those authored tracks without widening the operation.
+fn unsupported_explicit_audio_sidecar_carrier(
+    roots: &[std::path::PathBuf],
+    admission: &MetadataCueAdmission,
+) -> Result<Option<super::tag_interchange::TransferCarrier>, String> {
+    let selected = roots
+        .iter()
+        .map(|path| metadata_cue_surface_key(path))
+        .collect::<std::collections::BTreeSet<_>>();
+    // Normal admission gives us the already-selected surfaces. An ambiguous
+    // folder intentionally carries only the equally ranked candidate paths;
+    // re-admit those candidates locally so ambiguity is judged against this
+    // explicit subset, not against unrelated tracks elsewhere in the folder.
+    // This preserves the established admission/ranking policy: we only narrow
+    // its tied candidate set by the user's selected carriers.
+    let surfaces = if let Some(prompt) = &admission.selection_prompt {
+        let mut surfaces = Vec::with_capacity(prompt.candidates.len());
+        for cue_path in &prompt.candidates {
+            let member = crate::convert::split_cue_album::admit_split_cue_member(cue_path)
+                .map_err(|error| {
+                    format!(
+                        "Transfer tags: CUE candidate '{}' changed during unsupported-file classification: {error}",
+                        cue_path.display()
+                    )
+                })?;
+            let surface = metadata_cue_surface_from_admitted_member(member).ok_or_else(|| {
+                format!(
+                    "Transfer tags: CUE candidate '{}' could not be materialized during unsupported-file classification",
+                    cue_path.display()
+                )
+            })?;
+            surfaces.push(surface);
+        }
+        surfaces
+    } else {
+        transfer_admission_surfaces(admission).cloned().collect()
+    };
+    let mut matching = surfaces
+        .iter()
+        .filter(|surface| selected.is_subset(&metadata_surface_coverage_keys(surface)))
+        .collect::<Vec<_>>();
+    matching.sort_by(|left, right| left.cue_path.cmp(&right.cue_path));
+    match matching.len() {
+        0 => Ok(None),
+        1 => {
+            let surface = matching[0];
+            let mut carrier = transfer_carrier_from_admitted_surface(
+                surface,
+                &EmbeddedCueCandidate::Absent,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+            )?;
+            let super::tag_interchange::TransferCarrier::SidecarCue {
+                image_paths,
+                track_audio_paths,
+                write_method,
+                ..
+            } = &mut carrier
+            else {
+                return Err(
+                    "internal error: unsupported explicit-file sidecar fallback materialized as a non-sidecar carrier"
+                        .to_string(),
+                );
+            };
+            // `track_audio_paths` is already normalized to authored TRACK-number
+            // order by the carrier materializer. Derive the selected physical
+            // carriers from that map so both the projection and blocked-write
+            // reporting use the same deterministic authored order, while a
+            // multi-track physical image appears only once in `image_paths`.
+            let mut seen = std::collections::BTreeSet::new();
+            let selected_image_paths = track_audio_paths
+                .iter()
+                .filter_map(|path| {
+                    let key = metadata_cue_surface_key(path);
+                    (selected.contains(&key) && seen.insert(key)).then(|| path.clone())
+                })
+                .collect::<Vec<_>>();
+            if selected_image_paths.len() != selected.len() {
+                return Err(
+                    "internal error: unsupported explicit-file CUE coverage did not map every selected carrier exactly once"
+                        .to_string(),
+                );
+            }
+            *image_paths = selected_image_paths;
+            *write_method =
+                super::tag_interchange::SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly;
+            Ok(Some(carrier))
+        }
+        _ => Err(
+            "Transfer tags: multiple CUE sheets cover the selected unsupported files; select the intended .cue explicitly"
+                .to_string(),
+        ),
+    }
+}
+
 fn classify_tag_transfer_roots_with_priority_and_limits(
     roots: &[std::path::PathBuf],
     metadata_target_priority: &[crate::config::AggregateMetadataTarget],
@@ -18057,7 +18275,7 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
     }
 
     if cue_count == 1 {
-        return transfer_carrier_from_explicit_cue(&roots[0]);
+        return transfer_carrier_from_explicit_cue(&roots[0], cancel);
     }
 
     let explicit_audio_selection = roots.iter().all(|root| {
@@ -18073,6 +18291,27 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
             metadata_target_priority,
             cancel,
             traversal_limits,
+        );
+    }
+
+    if explicit_audio_selection {
+        let capabilities = inspect_transfer_path_capabilities(roots, cancel)?;
+        let all_unsupported = !roots.is_empty()
+            && roots.iter().all(|path| {
+                capabilities
+                    .unsupported_paths
+                    .contains(&metadata_cue_surface_key(path))
+            });
+        if all_unsupported {
+            let admission = collect_transfer_metadata_cue_admission(roots);
+            if let Some(carrier) = unsupported_explicit_audio_sidecar_carrier(roots, &admission)? {
+                return Ok(carrier);
+            }
+        }
+        return explicit_audio_transfer_carrier(
+            roots,
+            &capabilities.embedded_candidates,
+            cancel,
         );
     }
 
@@ -18095,10 +18334,6 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
         explicit_audio_selection,
         cancel,
     )?;
-    if explicit_audio_selection {
-        return explicit_audio_transfer_carrier(roots, &embedded_candidates, cancel);
-    }
-
     let mut files = Vec::new();
     let mut non_file_carrier = None;
     for root in roots {
@@ -47882,12 +48117,13 @@ pub(super) fn commit_browse_create(
             let affects_current_directory = dir == app.browse.current_dir;
             app.browse.rebuild_tree_preserving_expansion();
             if affects_current_directory {
-                app.browse.cursor_restore_target = Some(name.to_string());
+                app.browse.arm_cursor_restore(name.to_string(), None);
                 app.browse.refresh_with_search(Some(tx));
                 if let Some(index) = app.browse.entries.iter().position(|entry| entry.path == target) {
                     app.browse.selected_index = index;
                     app.browse.ensure_visible();
                     app.browse.cursor_restore_target = None;
+                    app.browse.cursor_restore_scroll_offset = None;
                 }
                 app.browse.probe_current_with_db(tx, Some(&app.db));
             }
@@ -68586,8 +68822,16 @@ mod metadata_cue_source_coverage_tests {
         assert!(checks.get() >= 4);
     }
 
+    // Explicit selection of taggable audio files (FLAC) short-circuits straight
+    // to a direct `Files` carrier — tags are written into the files themselves.
+    // It deliberately does NOT run the folder-admission (sidecar-CUE discovery)
+    // pass or a classification-time embedded read: cue authority is reserved for
+    // UNTAGGABLE carriers, and reads for the Files path are deferred to transfer
+    // time. (An all-unsupported explicit selection still batches admission in a
+    // single `collect_transfer_metadata_cue_admission(roots)` call; see the
+    // unsupported-sidecar coverage.)
     #[test]
-    fn multi_file_transfer_classification_batches_admission_and_embedded_reads_once() {
+    fn explicit_taggable_multi_file_selection_writes_files_without_folder_admission() {
         TRANSFER_CLASSIFICATION_ADMISSION_PASSES.with(|count| count.set(0));
         TRANSFER_CLASSIFICATION_EMBEDDED_BATCH_READS.with(|count| count.set(0));
 
@@ -68597,17 +68841,27 @@ mod metadata_cue_source_coverage_tests {
         std::fs::write(&first, b"not a real FLAC").expect("first fixture");
         std::fs::write(&second, b"not a real FLAC").expect("second fixture");
         let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
-        let _ = classify_tag_transfer_roots_with_default_priority_for_test(&[first, second], &cancel);
+        let carrier = classify_tag_transfer_roots_with_default_priority_for_test(
+            &[first.clone(), second.clone()],
+            &cancel,
+        )
+        .expect("taggable multi-file selection classifies");
 
+        match carrier {
+            super::super::tag_interchange::TransferCarrier::Files { paths } => {
+                assert_eq!(paths, vec![first, second], "both selected files are the transfer targets");
+            }
+            other => panic!("explicit taggable multi-file selection must yield a Files carrier, got {other:?}"),
+        }
         assert_eq!(
             TRANSFER_CLASSIFICATION_ADMISSION_PASSES.with(|count| count.get()),
-            1,
-            "all selected roots must enter one batched folder-admission pass"
+            0,
+            "taggable explicit selection must short-circuit before folder-admission",
         );
         assert_eq!(
             TRANSFER_CLASSIFICATION_EMBEDDED_BATCH_READS.with(|count| count.get()),
-            1,
-            "all selected audio roots must share one merged embedded-tag read"
+            0,
+            "Files path defers tag reads to transfer time; no classification-time read",
         );
     }
 
@@ -71017,6 +71271,580 @@ FILE "a.flac" WAVE
         assert_eq!(surfaces[1].cue_path, album.join("side_b.cue"));
         assert_eq!(surfaces[1].audio_path, album.join("side_b.tta"));
         assert_eq!(surfaces[1].sheet.tracks.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod transfer_untaggable_sidecar_authority_tests {
+    use super::*;
+    use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+    fn unsupported_album_fixture(
+        extension: &str,
+    ) -> (tempfile::TempDir, Vec<std::path::PathBuf>, std::path::PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join(format!("album-{extension}"));
+        std::fs::create_dir_all(&album).expect("album directory");
+        let first = album.join(format!("01.{extension}"));
+        let second = album.join(format!("02.{extension}"));
+        std::fs::write(&first, b"unsupported-carrier-one").expect("first carrier");
+        std::fs::write(&second, b"unsupported-carrier-two").expect("second carrier");
+        let cue = album.join("album.cue");
+        std::fs::write(
+            &cue,
+            format!(
+                concat!(
+                    "PERFORMER \"Cue Artist\"\n",
+                    "TITLE \"Cue Album\"\n",
+                    "FILE \"01.{0}\" WAVE\n",
+                    "  TRACK 01 AUDIO\n",
+                    "    TITLE \"Cue One\"\n",
+                    "    INDEX 01 00:00:00\n",
+                    "FILE \"02.{0}\" WAVE\n",
+                    "  TRACK 02 AUDIO\n",
+                    "    TITLE \"Cue Two\"\n",
+                    "    INDEX 01 00:00:00\n",
+                ),
+                extension,
+            ),
+        )
+        .expect("sidecar cue");
+        (temp, vec![first, second], cue)
+    }
+
+    fn unsupported_three_track_album_fixture() -> (
+        tempfile::TempDir,
+        Vec<std::path::PathBuf>,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album-dff-three");
+        std::fs::create_dir_all(&album).expect("album directory");
+        let paths = (1..=3)
+            .map(|number| album.join(format!("{number:02}.dff")))
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            std::fs::write(path, format!("unsupported-carrier-{}", index + 1))
+                .expect("unsupported carrier");
+        }
+        let cue = album.join("album.cue");
+        std::fs::write(
+            &cue,
+            r#"PERFORMER "Cue Artist"
+TITLE "Cue Album"
+REM DATE "1982"
+FILE "01.dff" WAVE
+  TRACK 01 AUDIO
+    TITLE "Cue One"
+    PERFORMER "Track Artist One"
+    INDEX 01 00:00:00
+FILE "02.dff" WAVE
+  TRACK 02 AUDIO
+    TITLE "Cue Two"
+    PERFORMER "Track Artist Two"
+    INDEX 01 00:00:00
+FILE "03.dff" WAVE
+  TRACK 03 AUDIO
+    TITLE "Cue Three"
+    PERFORMER "Track Artist Three"
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("sidecar cue");
+        (temp, paths, cue)
+    }
+
+    fn cue_transfer_snapshot(path: &std::path::Path) -> Vec<super::super::probe::TagEntry> {
+        let text = std::fs::read_to_string(path).expect("read CUE snapshot");
+        let sheet = super::super::cue_parser::parse_cue(&text);
+        super::super::tag_interchange::cue_sheet_transfer_entries(&sheet)
+    }
+
+    fn cue_value_at(
+        entries: &[super::super::probe::TagEntry],
+        key: &str,
+        index: usize,
+    ) -> String {
+        entries
+            .iter()
+            .find(|entry| {
+                super::super::probe::canonical_metadata_display_key(&entry.display_key) == key
+            })
+            .and_then(|entry| entry.per_file_values.get(index))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn assert_cue_position_unchanged(
+        before: &[super::super::probe::TagEntry],
+        after: &[super::super::probe::TagEntry],
+        index: usize,
+    ) {
+        for before_entry in before {
+            let key =
+                super::super::probe::canonical_metadata_display_key(&before_entry.display_key);
+            let Some(after_entry) = after.iter().find(|entry| {
+                super::super::probe::canonical_metadata_display_key(&entry.display_key) == key
+            }) else {
+                panic!("CUE field {key} disappeared after projected write");
+            };
+            assert_eq!(
+                before_entry.per_file_values.get(index),
+                after_entry.per_file_values.get(index),
+                "unselected authored CUE position {} changed for {key}",
+                index + 1
+            );
+        }
+    }
+
+    fn text_transfer_entry(key: &str, values: &[&str]) -> super::super::probe::TagEntry {
+        let values = values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        super::super::probe::TagEntry {
+            display_key: key.to_string(),
+            item_key: lofty::tag::ItemKey::Unknown(key.to_string()),
+            value: values.first().cloned().unwrap_or_default(),
+            original: values.first().cloned().unwrap_or_default(),
+            is_binary: false,
+            is_mixed: values.windows(2).any(|pair| pair[0] != pair[1]),
+            has_multiple_stored_values: false,
+            row_scope: super::super::probe::RowScope::File,
+            per_file_stored_value_counts: vec![1; values.len()],
+            per_file_originals: values.clone(),
+            per_file_values: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    fn assert_unsupported_sidecar(carrier: &super::super::tag_interchange::TransferCarrier) {
+        assert!(matches!(
+            carrier,
+            super::super::tag_interchange::TransferCarrier::SidecarCue {
+                role: crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar,
+                write_method: super::super::tag_interchange::SidecarCueWriteMethod::
+                    UnsupportedCarriersSidecarOnly,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unsupported_partial_single_file_reads_only_its_cue_track() {
+        let (_temp, paths, _cue) = unsupported_three_track_album_fixture();
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
+        let carrier = classify_tag_transfer_roots(
+            std::slice::from_ref(&paths[1]),
+            &priority,
+            &cancel,
+        )
+        .expect("single unsupported file must resolve through its covering sidecar");
+        assert_unsupported_sidecar(&carrier);
+        assert_eq!(carrier.count(), 1);
+        let super::super::tag_interchange::TransferCarrier::SidecarCue {
+            image_paths, ..
+        } = &carrier
+        else {
+            unreachable!();
+        };
+        assert_eq!(image_paths, &vec![paths[1].clone()]);
+
+        let entries = super::super::tag_interchange::read_transfer_carrier_entries(
+            &carrier,
+            super::super::app::TagTransferScope::Canonical,
+            &cancel,
+        )
+        .expect("single unsupported file must read metadata from the CUE projection");
+        let title = entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("projected TITLE row");
+        assert_eq!(title.per_file_values, vec!["Cue Two"]);
+        assert_eq!(cue_value_at(&entries, "ALBUM", 0), "Cue Album");
+    }
+
+    #[test]
+    fn unsupported_partial_single_file_write_changes_only_selected_cue_track() {
+        let (_temp, paths, cue) = unsupported_three_track_album_fixture();
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
+        let carrier = classify_tag_transfer_roots(
+            std::slice::from_ref(&paths[1]),
+            &priority,
+            &cancel,
+        )
+        .expect("single unsupported file must resolve through its covering sidecar");
+        assert_unsupported_sidecar(&carrier);
+
+        let cue_before = cue_transfer_snapshot(&cue);
+        let carrier_before = paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("carrier before"))
+            .collect::<Vec<_>>();
+        let source = vec![text_transfer_entry("TITLE", &["Only Two Changed"])];
+        let report = super::super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            super::super::tag_interchange::TransferDimension::Tracks(1),
+            Some(&[2]),
+            &carrier,
+            super::super::app::TagTransferScope::Canonical,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("projected unsupported sidecar write");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.target_count, 1, "{report:?}");
+        assert_eq!(report.blocked.len(), 1, "{report:?}");
+        assert_eq!(report.blocked[0].0, paths[1], "{report:?}");
+        assert_eq!(report.target_paths, vec![cue.clone()], "{report:?}");
+        assert_eq!(report.written_paths, vec![cue.clone()], "{report:?}");
+
+        let cue_after = cue_transfer_snapshot(&cue);
+        assert_eq!(cue_value_at(&cue_after, "TITLE", 1), "Only Two Changed");
+        assert_cue_position_unchanged(&cue_before, &cue_after, 0);
+        assert_cue_position_unchanged(&cue_before, &cue_after, 2);
+        for (path, before) in paths.iter().zip(&carrier_before) {
+            assert_eq!(
+                std::fs::read(path).expect("carrier after"),
+                *before,
+                "unsupported carrier {} must remain untouched",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_partial_non_contiguous_subset_preserves_authored_order_and_middle_track() {
+        let (_temp, paths, cue) = unsupported_three_track_album_fixture();
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
+        // Deliberately reverse the explicit UI selection. Projection order is
+        // authored CUE order, never caller/path order.
+        let carrier = classify_tag_transfer_roots(
+            &[paths[2].clone(), paths[0].clone()],
+            &priority,
+            &cancel,
+        )
+        .expect("non-contiguous unsupported subset must resolve through its covering sidecar");
+        assert_unsupported_sidecar(&carrier);
+        assert_eq!(carrier.count(), 2);
+        assert_eq!(carrier.authored_track_numbers(), Some(vec![1, 3]));
+
+        let read_entries = super::super::tag_interchange::read_transfer_carrier_entries(
+            &carrier,
+            super::super::app::TagTransferScope::All,
+            &cancel,
+        )
+        .expect("non-contiguous projected read");
+        let title = read_entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("projected TITLE row");
+        assert_eq!(title.per_file_values, vec!["Cue One", "Cue Three"]);
+
+        let cue_before = cue_transfer_snapshot(&cue);
+        // A deliberately field-subset transfer: only TITLE participates, with
+        // All scope. Scope/planner behavior remains generic; projection only
+        // controls which target CUE positions receive those planned values.
+        let source = vec![text_transfer_entry(
+            "TITLE",
+            &["Changed One", "Changed Three"],
+        )];
+        let report = super::super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            super::super::tag_interchange::TransferDimension::Tracks(2),
+            Some(&[1, 3]),
+            &carrier,
+            super::super::app::TagTransferScope::All,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("non-contiguous projected write");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.target_count, 2, "{report:?}");
+        assert_eq!(report.blocked.len(), 2, "{report:?}");
+        assert_eq!(
+            report.blocked.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            vec![&paths[0], &paths[2]],
+            "{report:?}"
+        );
+        assert_eq!(report.target_paths, vec![cue.clone()], "{report:?}");
+        assert_eq!(report.written_paths, vec![cue.clone()], "{report:?}");
+
+        let cue_after = cue_transfer_snapshot(&cue);
+        assert_eq!(cue_value_at(&cue_after, "TITLE", 0), "Changed One");
+        assert_eq!(cue_value_at(&cue_after, "TITLE", 2), "Changed Three");
+        assert_cue_position_unchanged(&cue_before, &cue_after, 1);
+    }
+
+    #[test]
+    fn unsupported_partial_selection_narrows_tied_cues_by_actual_coverage() {
+        let (_temp, paths, cue) = unsupported_three_track_album_fixture();
+        let album = cue.parent().expect("cue parent");
+        std::fs::write(
+            album.join("alternate.cue"),
+            r#"TITLE "Alternate"
+FILE "01.dff" WAVE
+  TRACK 01 AUDIO
+    TITLE "Alternate One"
+    INDEX 01 00:00:00
+FILE "03.dff" WAVE
+  TRACK 03 AUDIO
+    TITLE "Alternate Three"
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("alternate sidecar");
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
+
+        // The folder has two equally ranked overlapping CUE candidates, but
+        // only album.cue covers 02.dff. The explicit subset makes authority
+        // unambiguous without changing the folder-level admission ranking.
+        let carrier = classify_tag_transfer_roots(
+            std::slice::from_ref(&paths[1]),
+            &priority,
+            &cancel,
+        )
+        .expect("only one tied CUE covers selected 02.dff");
+        assert_unsupported_sidecar(&carrier);
+        let entries = super::super::tag_interchange::read_transfer_carrier_entries(
+            &carrier,
+            super::super::app::TagTransferScope::All,
+            &cancel,
+        )
+        .expect("selected track from narrowed CUE");
+        assert_eq!(cue_value_at(&entries, "TITLE", 0), "Cue Two");
+
+        // 01.dff is covered by both candidates, so the existing honest
+        // ambiguity contract still wins rather than guessing an authority.
+        let error = classify_tag_transfer_roots(
+            std::slice::from_ref(&paths[0]),
+            &priority,
+            &cancel,
+        )
+        .expect_err("two CUEs genuinely cover selected 01.dff");
+        assert!(
+            error.contains("multiple CUE sheets cover the selected unsupported files"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_partial_selection_without_covering_cue_fails_honestly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let selected = temp.path().join("02.dff");
+        std::fs::write(&selected, b"unsupported-two").expect("unsupported carrier");
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
+        match classify_tag_transfer_roots(std::slice::from_ref(&selected), &priority, &cancel) {
+            Ok(carrier) => {
+                assert!(matches!(
+                    carrier,
+                    super::super::tag_interchange::TransferCarrier::Files { .. }
+                ));
+                let error = super::super::tag_interchange::read_transfer_carrier_entries(
+                    &carrier,
+                    super::super::app::TagTransferScope::All,
+                    &cancel,
+                )
+                .expect_err("unsupported file without a covering CUE must fail");
+                assert!(error.contains("tag transfer source read failed"), "{error}");
+            }
+            Err(error) => {
+                assert!(
+                    error.contains("failed to read") || error.contains("unsupported"),
+                    "unexpected honest failure: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn taggable_partial_file_selection_stays_on_direct_file_path_and_writes() {
+        use super::single_image_metadata_editor_regression_tests::{
+            create_flac_fixture, fixture_tool_available,
+        };
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping taggable partial-file control: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("taggable-album");
+        std::fs::create_dir_all(&album).expect("album directory");
+        let first = album.join("01.flac");
+        let second = album.join("02.flac");
+        let third = album.join("03.flac");
+        for path in [&first, &second, &third] {
+            assert!(
+                create_flac_fixture(path),
+                "FLAC fixture: {}",
+                path.display()
+            );
+        }
+        std::fs::write(
+            album.join("album.cue"),
+            r#"TITLE "Cue Album"
+FILE "01.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "One"
+    INDEX 01 00:00:00
+FILE "02.flac" WAVE
+  TRACK 02 AUDIO
+    TITLE "Two"
+    INDEX 01 00:00:00
+FILE "03.flac" WAVE
+  TRACK 03 AUDIO
+    TITLE "Three"
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("taggable sidecar");
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
+        let carrier = classify_tag_transfer_roots(
+            std::slice::from_ref(&second),
+            &priority,
+            &cancel,
+        )
+        .expect("taggable partial selection classification");
+        assert!(matches!(
+            &carrier,
+            super::super::tag_interchange::TransferCarrier::Files { paths }
+                if paths == &vec![second.clone()]
+        ));
+
+        let source = vec![text_transfer_entry("TITLE", &["Direct File Title"])];
+        let report = super::super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
+            &source,
+            super::super::tag_interchange::TransferDimension::Files(1),
+            None,
+            &carrier,
+            super::super::app::TagTransferScope::Canonical,
+            tui_file_picker::VerificationMode::Strong,
+            &cancel,
+            None,
+        )
+        .expect("direct taggable-file write");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.written_paths, vec![second.clone()], "{report:?}");
+        let merged = super::super::probe::read_all_tags_merged(&[second.clone()])
+            .expect("read written taggable file");
+        assert_eq!(cue_value_at(&merged, "TITLE", 0), "Direct File Title");
+    }
+
+    #[test]
+    fn dff_shn_dts_folder_file_and_explicit_cue_classification_use_sidecar_authority() {
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let individual_first = [IndividualFiles, SidecarCue, EmbeddedCue];
+
+        for extension in ["dff", "shn", "dts"] {
+            let (_temp, paths, cue) = unsupported_album_fixture(extension);
+            let album = cue.parent().expect("cue parent").to_path_buf();
+
+            let folder = classify_tag_transfer_roots(&[album], &individual_first, &cancel)
+                .unwrap_or_else(|error| panic!("{extension} folder classification failed: {error}"));
+            assert_unsupported_sidecar(&folder);
+
+            let files = classify_tag_transfer_roots(&paths, &individual_first, &cancel)
+                .unwrap_or_else(|error| panic!("{extension} file classification failed: {error}"));
+            assert_unsupported_sidecar(&files);
+
+            let explicit_cue = classify_tag_transfer_roots(&[cue], &individual_first, &cancel)
+                .unwrap_or_else(|error| {
+                    panic!("{extension} explicit CUE classification failed: {error}")
+                });
+            assert_unsupported_sidecar(&explicit_cue);
+
+            let entries = super::super::tag_interchange::read_transfer_carrier_entries(
+                &files,
+                super::super::app::TagTransferScope::All,
+                &cancel,
+            )
+            .unwrap_or_else(|error| panic!("{extension} transfer FROM sidecar failed: {error}"));
+            let title = entries
+                .iter()
+                .find(|entry| entry.display_key == "TITLE")
+                .expect("CUE title row");
+            assert_eq!(title.per_file_values, vec!["Cue One", "Cue Two"]);
+
+            let source = vec![super::super::probe::TagEntry {
+                display_key: "TITLE".to_string(),
+                item_key: lofty::tag::ItemKey::Unknown("TITLE".to_string()),
+                value: "New One".to_string(),
+                original: "New One".to_string(),
+                is_binary: false,
+                is_mixed: true,
+                has_multiple_stored_values: false,
+                row_scope: super::super::probe::RowScope::File,
+                per_file_stored_value_counts: vec![1, 1],
+                per_file_values: vec!["New One".to_string(), "New Two".to_string()],
+                per_file_originals: vec!["New One".to_string(), "New Two".to_string()],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            }];
+            let before = paths
+                .iter()
+                .map(|path| std::fs::read(path).expect("carrier before"))
+                .collect::<Vec<_>>();
+            let report =
+                super::super::tag_interchange::execute_tag_transfer_from_entries_to_carrier(
+                    &source,
+                    super::super::tag_interchange::TransferDimension::Tracks(2),
+                    Some(&[1, 2]),
+                    &files,
+                    super::super::app::TagTransferScope::Canonical,
+                    tui_file_picker::VerificationMode::Strong,
+                    &cancel,
+                    None,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{extension} transfer TO sidecar failed: {error}")
+                });
+            assert!(report.failed.is_empty(), "{extension}: {report:?}");
+            assert_eq!(report.blocked.len(), 2, "{extension}: {report:?}");
+            assert_eq!(report.written_paths.len(), 1, "{extension}: {report:?}");
+            for (path, original) in paths.iter().zip(before) {
+                assert_eq!(
+                    std::fs::read(path).expect("carrier after"),
+                    original,
+                    "{extension} carrier must remain untouched"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_album_without_valid_cue_still_fails_honestly_on_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("no-cue");
+        std::fs::create_dir_all(&album).expect("album directory");
+        std::fs::write(album.join("01.dff"), b"unsupported-one").expect("first carrier");
+        std::fs::write(album.join("02.dff"), b"unsupported-two").expect("second carrier");
+        let cancel = super::super::probe::MetadataWriteCancelFlag::new();
+        let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
+        let carrier = classify_tag_transfer_roots(&[album], &priority, &cancel)
+            .expect("classification may retain the honest file representation without a valid CUE");
+        assert!(matches!(
+            carrier,
+            super::super::tag_interchange::TransferCarrier::Files { .. }
+        ));
+        let error = super::super::tag_interchange::read_transfer_carrier_entries(
+            &carrier,
+            super::super::app::TagTransferScope::All,
+            &cancel,
+        )
+        .expect_err("unsupported carriers without a valid CUE must not fabricate metadata");
+        assert!(
+            error.contains("tag transfer source read failed"),
+            "unexpected failure text: {error}"
+        );
     }
 }
 
@@ -77114,6 +77942,74 @@ mod live_mount_perf_harness {
 mod rename_outcome_diagnostics_tests {
     use super::*;
     use crate::config::TonepoetConfig;
+
+    #[test]
+    fn completed_inline_rename_restores_renamed_entry_and_viewport() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..160 {
+            std::fs::write(
+                temp.path().join(format!("item-{index:03}.txt")),
+                format!("fixture-{index}"),
+            )
+            .expect("fixture file");
+        }
+        let source = temp.path().join("item-084.txt");
+        let destination = temp.path().join("item-084-renamed.txt");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.refresh();
+        app.browse.set_visible_height(12);
+        let source_index = app
+            .browse
+            .entries
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source entry in fixture");
+        app.browse.selected_index = source_index;
+        let initial_scroll = source_index.saturating_sub(5);
+        app.browse.set_scroll_offset(initial_scroll);
+        assert!(source_index >= app.browse.scroll_offset);
+        assert!(source_index < app.browse.scroll_offset + app.browse.visible_height);
+
+        std::fs::rename(&source, &destination).expect("fixture rename");
+        let source_manifest = tui_file_picker::capture_manifest(&destination)
+            .expect("rename fixture proof");
+        let proof = tui_file_picker::FileTaskRootProof {
+            destination_manifest: source_manifest.destination_identity_for_same_tree(),
+            source_manifest,
+        };
+        let report = crate::tui::rename_plan::RenameExecutionReport {
+            succeeded_count: 1,
+            roots: vec![crate::tui::rename_plan::RenameExecutionRoot {
+                source,
+                destination: destination.clone(),
+                proof: Ok(proof),
+            }],
+            warning: None,
+        };
+        let (tx, _rx) = mpsc::channel(8);
+
+        complete_rename_plan(
+            &mut app,
+            "rename".to_string(),
+            temp.path().to_path_buf(),
+            Ok(report),
+            &tx,
+        );
+
+        let selected = app.browse.selected_entry().expect("selected renamed entry");
+        assert_eq!(selected.path, destination);
+        assert_eq!(
+            app.browse.scroll_offset, initial_scroll,
+            "a same-sort-neighborhood rename should preserve the exact viewport"
+        );
+        assert!(app.browse.selected_index >= app.browse.scroll_offset);
+        assert!(
+            app.browse.selected_index < app.browse.scroll_offset + app.browse.visible_height,
+            "restored entry must remain visible"
+        );
+    }
 
     #[test]
     fn rename_failure_is_retained_for_messages_review_with_full_text() {

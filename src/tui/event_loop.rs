@@ -1951,6 +1951,7 @@ fn reduce_file_task_complete(
             .last()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned());
+        app.browse.cursor_restore_scroll_offset = None;
         app.browse.refresh_after_file_task_nonblocking();
     }
 
@@ -5271,13 +5272,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             // listing under an open search UI.
             app.browse.reapply_after_directory_scan_complete(Some(tx));
 
-            // Cursor restoration (e.g., after go_parent).
-            if let Some(target) = app.browse.cursor_restore_target.take() {
-                if let Some(idx) = app.browse.entries.iter().position(|e| e.name == target) {
-                    app.browse.selected_index = idx;
-                    app.browse.ensure_visible();
-                }
-            }
+            // Cursor restoration (e.g., after go_parent or a completed inline
+            // rename). Rename restores may also carry the pre-refresh viewport
+            // offset; Browse reapplies it before minimally ensuring visibility.
+            app.browse.restore_cursor_after_refresh();
 
             // Sequential inline rename continuation (Tab / Shift+Tab). Filesystem
             // rename refreshes are async in the normal TUI runtime and clear

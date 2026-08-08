@@ -2464,6 +2464,9 @@ fn record_tag_transfer_report_side_effects(
     for (path, reason) in &report.failed {
         log::error!("tag transfer failed for '{}': {}", path.display(), reason);
     }
+    for (path, reason) in &report.blocked {
+        log::info!("tag transfer skipped unsupported carrier '{}': {}", path.display(), reason);
+    }
     for warning in &report.cardinality_warnings {
         log::warn!("tag transfer: {warning}");
     }

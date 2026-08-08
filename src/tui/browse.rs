@@ -2376,6 +2376,7 @@ impl PreparedTagTransfer {
             ),
             crate::tui::tag_interchange::TransferCarrier::SidecarCue {
                 sheet,
+                image_paths,
                 track_audio_paths,
                 write_method,
                 ..
@@ -2392,6 +2393,18 @@ impl PreparedTagTransfer {
                     track_audio_paths.len(),
                     if track_audio_paths.len() == 1 { "" } else { "s" },
                     sheet.tracks.len(),
+                ),
+                (
+                    crate::tui::tag_interchange::SidecarCueWriteMethod::
+                        UnsupportedCarriersSidecarOnly,
+                    _,
+                ) => format!(
+                    "Write {} field{} to sidecar CUE only ({} tracks; {} carrier tag write{} blocked/unsupported)?",
+                    self.field_count,
+                    if self.field_count == 1 { "" } else { "s" },
+                    sheet.tracks.len(),
+                    image_paths.len(),
+                    if image_paths.len() == 1 { "" } else { "s" },
                 ),
                 _ => format!(
                     "Write {} field{} to sidecar CUE only ({} tracks)?",
@@ -2736,6 +2749,11 @@ pub struct BrowseState {
     /// After `go_parent`, the name of the directory we came from — so the
     /// DirScanComplete handler can position the cursor on it.
     pub cursor_restore_target: Option<String>,
+    /// Optional viewport offset paired with `cursor_restore_target`. Rename
+    /// refreshes populate this so a deep-list inline rename can survive the
+    /// async scan's temporary reset to row zero. Other navigation restores
+    /// intentionally leave it unset.
+    pub cursor_restore_scroll_offset: Option<usize>,
 
     /// Type-ahead navigation buffer: accumulated keystrokes for prefix jump.
     pub type_ahead_buffer: String,
@@ -3169,6 +3187,7 @@ impl BrowseState {
             scan_pending: None,
             scan_generation: 0,
             cursor_restore_target: None,
+            cursor_restore_scroll_offset: None,
             type_ahead_buffer: String::new(),
             type_ahead_last_keystroke: None,
             navigation_pane: BrowseNavigationPane::Files,
@@ -4554,6 +4573,7 @@ impl BrowseState {
                 .current_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
+            self.cursor_restore_scroll_offset = None;
             let parent = parent.to_path_buf();
             if same_path(&self.current_dir, &parent) {
                 self.refresh();
@@ -5029,6 +5049,37 @@ impl BrowseState {
         } else if self.selected_index >= self.scroll_offset + self.visible_height {
             self.scroll_offset = self.selected_index - self.visible_height + 1;
         }
+    }
+
+    /// Arm a name-based cursor restore for the next completed refresh. When a
+    /// viewport is supplied, it is restored first and then minimally adjusted
+    /// only if the renamed entry moved outside that viewport after sorting.
+    pub(crate) fn arm_cursor_restore(
+        &mut self,
+        target: String,
+        scroll_offset: Option<usize>,
+    ) {
+        self.cursor_restore_target = Some(target);
+        self.cursor_restore_scroll_offset = scroll_offset;
+    }
+
+    /// Consume the pending name/viewport restore against the currently
+    /// published entries. Returns true only when the named entry was found.
+    pub(crate) fn restore_cursor_after_refresh(&mut self) -> bool {
+        let target = self.cursor_restore_target.take();
+        let scroll_offset = self.cursor_restore_scroll_offset.take();
+        let Some(target) = target else {
+            return false;
+        };
+        let Some(index) = self.entries.iter().position(|entry| entry.name == target) else {
+            return false;
+        };
+        self.selected_index = index;
+        if let Some(scroll_offset) = scroll_offset {
+            self.set_scroll_offset(scroll_offset);
+        }
+        self.ensure_visible();
+        true
     }
 
     fn selectable_entry_path_at(&self, index: usize) -> Option<PathBuf> {
@@ -12138,6 +12189,60 @@ pub fn is_editable_text_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Host-file activation policy for Browse Enter. Keep this deliberately small
+/// and table-driven: it is the seed of future configurable associations, not a
+/// second general-purpose MIME/type classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowseEnterFileAction {
+    Edit,
+    View,
+}
+
+const BROWSE_ENTER_FILE_ASSOCIATIONS: &[(&str, BrowseEnterFileAction)] = &[
+    ("log", BrowseEnterFileAction::View),
+    ("txt", BrowseEnterFileAction::Edit),
+    ("nfo", BrowseEnterFileAction::Edit),
+    ("md", BrowseEnterFileAction::Edit),
+    ("cue", BrowseEnterFileAction::View),
+];
+
+pub(crate) fn browse_enter_file_action(path: &Path) -> Option<BrowseEnterFileAction> {
+    let extension = path.extension()?.to_str()?;
+    BROWSE_ENTER_FILE_ASSOCIATIONS
+        .iter()
+        .find_map(|(candidate, action)| extension.eq_ignore_ascii_case(candidate).then_some(*action))
+}
+
+#[cfg(test)]
+mod browse_enter_file_association_tests {
+    use super::{browse_enter_file_action, BrowseEnterFileAction};
+    use std::path::Path;
+
+    #[test]
+    fn enter_association_table_routes_requested_text_extensions() {
+        for extension in ["txt", "nfo", "md"] {
+            assert_eq!(
+                browse_enter_file_action(Path::new(&format!("notes.{extension}"))),
+                Some(BrowseEnterFileAction::Edit),
+                "{extension} should open in the editor"
+            );
+        }
+        for extension in ["log", "cue"] {
+            assert_eq!(
+                browse_enter_file_action(Path::new(&format!("notes.{extension}"))),
+                Some(BrowseEnterFileAction::View),
+                "{extension} should open through the read-only viewer path"
+            );
+        }
+        assert_eq!(
+            browse_enter_file_action(Path::new("NOTES.MD")),
+            Some(BrowseEnterFileAction::Edit),
+            "extension matching must be case-insensitive"
+        );
+        assert_eq!(browse_enter_file_action(Path::new("cover.jpg")), None);
+    }
+}
+
 /// Derive a short display label for an archive from its extension.
 fn archive_label(path: &Path) -> String {
     let name = path
@@ -12398,6 +12503,30 @@ mod tests {
         assert_eq!(
             sidecar.confirmation_prompt(),
             "Write 1 field to sidecar CUE only (12 tracks)?"
+        );
+
+        let unsupported_sidecar = prepared_transfer_for_prompt(
+            3,
+            crate::tui::tag_interchange::TransferCarrier::SidecarCue {
+                cue_path: PathBuf::from("/music/album.cue"),
+                image_paths: vec![
+                    PathBuf::from("/music/01.dff"),
+                    PathBuf::from("/music/02.dff"),
+                ],
+                track_audio_paths: vec![
+                    PathBuf::from("/music/01.dff"),
+                    PathBuf::from("/music/02.dff"),
+                ],
+                role: crate::convert::split_cue_album::SplitCueMemberRole::MetadataSidecar,
+                write_method: crate::tui::tag_interchange::SidecarCueWriteMethod::
+                    UnsupportedCarriersSidecarOnly,
+                cue_text: String::new(),
+                sheet: transfer_test_sheet(2),
+            },
+        );
+        assert_eq!(
+            unsupported_sidecar.confirmation_prompt(),
+            "Write 3 fields to sidecar CUE only (2 tracks; 2 carrier tag writes blocked/unsupported)?"
         );
 
         let embedded = prepared_transfer_for_prompt(

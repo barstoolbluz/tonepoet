@@ -91,6 +91,7 @@
           lame
           _7zz
           atomicparsley
+          bat
         ]);
 
       in

@@ -325,6 +325,23 @@ fn is_supported_browse_filter(value: &str) -> bool {
 }
 
 /// UI-related configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogViewer {
+    /// Prefer `bat` for `.log` files, falling back to the existing read-only
+    /// viewer path when `bat` is unavailable at runtime.
+    Bat,
+    /// Use the user's normal viewer/editor selection, still with the existing
+    /// read-only flags applied by the viewer launcher.
+    Editor,
+}
+
+impl Default for LogViewer {
+    fn default() -> Self {
+        Self::Bat
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     /// Screen shown when the TUI starts. One of: browse, library, convert, queue, config.
@@ -360,6 +377,13 @@ pub struct UiConfig {
     /// reachable only by hand-editing config.toml.
     #[serde(default)]
     pub manage_tmux_clipboard: bool,
+    /// Read-only `.log` viewer policy. `bat` (default) prefers bat's styled
+    /// pager output and gracefully falls back to the normal read-only viewer;
+    /// `editor` uses the user's configured editor/viewer directly, still in
+    /// read-only mode. TODO(config-screen): expose this choice in the Config
+    /// screen once file associations are configurable there.
+    #[serde(default)]
+    pub log_viewer: LogViewer,
 }
 
 fn default_initial_screen() -> String {
@@ -379,6 +403,7 @@ impl Default for UiConfig {
             compare_keep_reference: false,
             theme: crate::tui::theme::default_theme_name(),
             manage_tmux_clipboard: false,
+            log_viewer: LogViewer::Bat,
         }
     }
 }
@@ -1707,6 +1732,27 @@ fn next_config_secret_reference(
     })
 }
 
+const LOG_VIEWER_CONFIG_NOTE: &str = concat!(
+    "# TODO(config-screen): set log_viewer = \"editor\" to use your own read-only ",
+    "editor/viewer for .log files; default \"bat\" falls back safely when bat is unavailable.\n",
+);
+
+/// Serialize the public config and inject the one hand-editing note that must
+/// survive generated/reset config files. Serde itself does not retain field
+/// comments, so publication owns this deterministic decoration explicitly.
+fn serialize_public_config(config: &TonepoetConfig) -> Result<String, toml::ser::Error> {
+    let mut content = toml::to_string_pretty(config)?;
+    if !content.contains(LOG_VIEWER_CONFIG_NOTE) {
+        if let Some(marker) = content.find("log_viewer = ") {
+            let line_start = content[..marker]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            content.insert_str(line_start, LOG_VIEWER_CONFIG_NOTE);
+        }
+    }
+    Ok(content)
+}
 
 impl TonepoetConfig {
     /// Load config from the default path (~/.config/tonepoet/config.toml)
@@ -1842,7 +1888,7 @@ impl TonepoetConfig {
             config.conversion.archive_password_ref = Some(reference.clone());
             let mut persisted = config.clone();
             persisted.conversion.archive_password = None;
-            let save_outcome = match toml::to_string_pretty(&persisted)
+            let save_outcome = match serialize_public_config(&persisted)
                 .map_err(anyhow::Error::new)
                 .and_then(|content| atomic_write_config_locked(config_path, content.as_bytes()))
             {
@@ -2109,7 +2155,7 @@ impl TonepoetConfig {
             .cloned()
             .collect::<Vec<_>>();
 
-        let result = toml::to_string_pretty(&persisted)
+        let result = serialize_public_config(&persisted)
             .map_err(anyhow::Error::new)
             .and_then(|content| atomic_write_config_locked(target_path, content.as_bytes()));
         match result {
@@ -2442,6 +2488,49 @@ show_conversion_actions = false
         assert_eq!(config.ui.theme, crate::tui::theme::default_theme_slug());
     }
 
+    #[test]
+    fn ui_log_viewer_defaults_to_bat_when_missing_from_toml() {
+        let serialized = toml::to_string_pretty(&TonepoetConfig::default())
+            .expect("serialize default config");
+        let mut legacy_value: toml::Value =
+            toml::from_str(&serialized).expect("parse serialized config as TOML value");
+        legacy_value
+            .get_mut("ui")
+            .and_then(toml::Value::as_table_mut)
+            .expect("ui table")
+            .remove("log_viewer");
+
+        let legacy = toml::to_string_pretty(&legacy_value)
+            .expect("serialize config without log_viewer");
+        let parsed: TonepoetConfig =
+            toml::from_str(&legacy).expect("deserialize config without log_viewer");
+        assert_eq!(parsed.ui.log_viewer, LogViewer::Bat);
+    }
+
+    #[test]
+    fn ui_log_viewer_editor_round_trips_losslessly() {
+        let mut config = TonepoetConfig::default();
+        config.ui.log_viewer = LogViewer::Editor;
+        let serialized = toml::to_string_pretty(&config).expect("serialize editor policy");
+        let parsed: TonepoetConfig =
+            toml::from_str(&serialized).expect("deserialize editor policy");
+        assert_eq!(parsed.ui.log_viewer, LogViewer::Editor);
+    }
+
+    #[test]
+    fn generated_public_config_documents_log_viewer_hand_editing() {
+        let rendered = serialize_public_config(&TonepoetConfig::default())
+            .expect("serialize generated public config");
+        let marker = format!("{LOG_VIEWER_CONFIG_NOTE}log_viewer = \"bat\"");
+        assert!(
+            rendered.contains(&marker),
+            "generated config must place the TODO(config-screen) guidance directly above log_viewer"
+        );
+
+        let parsed: TonepoetConfig =
+            toml::from_str(&rendered).expect("commented generated config remains valid TOML");
+        assert_eq!(parsed.ui.log_viewer, LogViewer::Bat);
+    }
 
     #[test]
     fn performance_browsing_defaults_when_missing_from_toml() {
