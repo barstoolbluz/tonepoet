@@ -6332,23 +6332,39 @@ fn metadata_issue_line(label: &str, kind: &str, err: &str, theme: super::theme::
 
 fn metadata_editor_detail_slot_block_reason(
     state: &super::app::MetadataEditorState,
+    entry_idx: usize,
     slot_index: usize,
-    row_count: usize,
 ) -> Option<String> {
-    if row_count != state.active_surface().paths.len() {
-        // Per-track sidecar/CUESHEET rows are scoped to tracks rather than
-        // file-backed slots, so file save eligibility does not apply here.
-        return None;
-    }
-    let file = state.active_surface().technical_details.files.get(slot_index)?;
+    let surface = state.active_surface();
+    let file_slot = super::keybindings::metadata_editor_detail_slot_file_index(
+        state,
+        entry_idx,
+        slot_index,
+    )?;
+    let file = surface.technical_details.files.get(file_slot)?;
     match &file.file_facts.read_state {
         super::app::FileReadState::Readable => {}
         super::app::FileReadState::Unreadable { reason } => {
             return Some(format!("unreadable: {}", reason));
         }
         super::app::FileReadState::Unsupported { reason } => {
+            if super::keybindings::metadata_editor_untaggable_sidecar_authority(state) {
+                // The sidecar is the established read/write authority for
+                // formats whose native tag reader does not support tags. Do
+                // not mask the already-projected CUE value with the carrier's
+                // expected format-level read error.
+                return None;
+            }
             return Some(format!("unsupported: {}", reason));
         }
+    }
+    let row_count = surface.entries.get(entry_idx)?.per_file_values.len();
+    if row_count != surface.paths.len() {
+        // Per-track sidecar/CUESHEET rows are scoped to tracks rather than
+        // file-backed slots, so file save eligibility does not apply here.
+        // Carrier read failures still apply and were checked above through
+        // the shared detail-slot -> carrier mapping.
+        return None;
     }
     file.file_facts
         .write_eligibility
@@ -6461,7 +6477,7 @@ fn draw_metadata_detail(
         };
 
         let val_sanitized = val.replace('\n', "↵").replace('\r', "");
-        let block_reason = metadata_editor_detail_slot_block_reason(state, i, entry.per_file_values.len());
+        let block_reason = metadata_editor_detail_slot_block_reason(state, field_idx, i);
         let val_display = if let Some(reason) = block_reason.as_deref() {
             let suffix = format!("  <{}>", reason);
             let combined = if val_sanitized.trim().is_empty() {
@@ -8676,6 +8692,203 @@ mod tests {
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
+    }
+
+    fn metadata_state_with_read_state(
+        read_state: super::super::app::FileReadState,
+        sidecar_authority: bool,
+    ) -> MetadataEditorState {
+        let audio_path = PathBuf::from("/album/disc.dff");
+        let cue_path = PathBuf::from("/album/disc.cue");
+        let write_eligibility = if matches!(
+            &read_state,
+            super::super::app::FileReadState::Unsupported { .. }
+        ) {
+            super::super::app::FileWriteEligibility::Blocked {
+                reason: "unsupported native tags".to_string(),
+            }
+        } else {
+            super::super::app::FileWriteEligibility::Writable
+        };
+        let technical = super::super::app::MetadataTechnicalDetails::from_files(vec![
+            super::super::app::MetadataFileDetails {
+                file_facts: super::super::app::FileFacts {
+                    path: audio_path.clone(),
+                    read_state,
+                    write_eligibility,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ]);
+        let mut state = MetadataEditorState::for_files(
+            vec![audio_path.clone()],
+            vec![tag("TITLE", "Cue Title", vec!["Cue Title"])],
+            vec!["Track 01".to_string()],
+            technical,
+        );
+        if sidecar_authority {
+            let surface = state.active_surface_mut();
+            surface.cue_source = Some(super::super::app::MetadataCueSource::Sidecar(
+                cue_path.clone(),
+            ));
+            surface.cue_album_synthetic_sheet = Some(super::super::app::CueAlbumSyntheticSheet {
+                cue_paths: vec![cue_path.clone()],
+                audio_paths: vec![audio_path.clone()],
+                track_sources: vec![super::super::app::CueAlbumTrackSource {
+                    cue_path,
+                    audio_path,
+                    local_track_index: 0,
+                    original_track_number: 1,
+                    file_ref: "disc.dff".to_string(),
+                    index00_frames: None,
+                    index01_frames: Some(0),
+                    isrc: None,
+                    directives: Vec::new(),
+                }],
+                album_title: None,
+                album_performer: None,
+                album_date: None,
+                album_genre: None,
+                album_catalog: None,
+            });
+        }
+        state
+    }
+
+    #[test]
+    fn untaggable_sidecar_authority_displays_projected_cue_value_instead_of_format_error() {
+        let state = metadata_state_with_read_state(
+            super::super::app::FileReadState::Unsupported {
+                reason: "DFF tags are unsupported".to_string(),
+            },
+            true,
+        );
+        assert_eq!(state.active_surface().entries[0].per_file_values[0], "Cue Title");
+        assert_eq!(metadata_editor_detail_slot_block_reason(&state, 0, 0), None);
+    }
+
+    #[test]
+    fn unsupported_without_sidecar_authority_and_unreadable_with_authority_still_surface_errors() {
+        let unsupported = metadata_state_with_read_state(
+            super::super::app::FileReadState::Unsupported {
+                reason: "DFF tags are unsupported".to_string(),
+            },
+            false,
+        );
+        assert_eq!(
+            metadata_editor_detail_slot_block_reason(&unsupported, 0, 0).as_deref(),
+            Some("unsupported: DFF tags are unsupported"),
+        );
+
+        let unreadable = metadata_state_with_read_state(
+            super::super::app::FileReadState::Unreadable {
+                reason: "permission denied".to_string(),
+            },
+            true,
+        );
+        assert_eq!(
+            metadata_editor_detail_slot_block_reason(&unreadable, 0, 0).as_deref(),
+            Some("unreadable: permission denied"),
+        );
+    }
+
+    #[test]
+    fn unreadable_single_image_cue_carrier_surfaces_on_every_track_detail_slot() {
+        let mut state = metadata_state_with_read_state(
+            super::super::app::FileReadState::Unreadable {
+                reason: "I/O error while reading carrier".to_string(),
+            },
+            true,
+        );
+        {
+            let surface = state.active_surface_mut();
+            let title = &mut surface.entries[0];
+            title.row_scope = crate::tui::probe::RowScope::Track;
+            title.value = "<multiple values>".to_string();
+            title.original = "<multiple values>".to_string();
+            title.is_mixed = true;
+            title.per_file_values = vec!["Cue One".to_string(), "Cue Two".to_string()];
+            title.per_file_originals = title.per_file_values.clone();
+
+            let sheet = surface
+                .cue_album_synthetic_sheet
+                .as_mut()
+                .expect("sidecar synthetic sheet");
+            let mut second = sheet.track_sources[0].clone();
+            second.local_track_index = 1;
+            second.original_track_number = 2;
+            second.index01_frames = Some(75);
+            sheet.track_sources.push(second);
+        }
+
+        for slot in 0..2 {
+            assert_eq!(
+                metadata_editor_detail_slot_block_reason(&state, 0, slot).as_deref(),
+                Some("unreadable: I/O error while reading carrier"),
+                "track detail slot {slot} must surface the physical carrier failure",
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_detail_row_dimension_mismatch_falls_back_without_indexing_file_facts() {
+        let first = PathBuf::from("/album/side-a.dff");
+        let second = PathBuf::from("/album/side-b.dff");
+        let cue_path = PathBuf::from("/album/album.cue");
+        let technical = super::super::app::MetadataTechnicalDetails::from_files(vec![
+            super::super::app::MetadataFileDetails {
+                file_facts: super::super::app::FileFacts {
+                    path: first.clone(),
+                    read_state: super::super::app::FileReadState::Unsupported {
+                        reason: "DFF tags are unsupported".to_string(),
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            super::super::app::MetadataFileDetails {
+                file_facts: super::super::app::FileFacts {
+                    path: second.clone(),
+                    read_state: super::super::app::FileReadState::Unsupported {
+                        reason: "DFF tags are unsupported".to_string(),
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ]);
+        let mut state = MetadataEditorState::for_files(
+            vec![first.clone(), second.clone()],
+            vec![tag("TITLE", "<multiple values>", vec!["One", "Two"])],
+            vec!["Track 01".to_string(), "Track 02".to_string()],
+            technical,
+        );
+        let surface = state.active_surface_mut();
+        surface.cue_source = Some(super::super::app::MetadataCueSource::Sidecar(cue_path.clone()));
+        surface.cue_album_synthetic_sheet = Some(super::super::app::CueAlbumSyntheticSheet {
+            cue_paths: vec![cue_path.clone()],
+            audio_paths: vec![first.clone(), second],
+            // Deliberately incomplete: slot 1 has no track->carrier mapping.
+            track_sources: vec![super::super::app::CueAlbumTrackSource {
+                cue_path,
+                audio_path: first,
+                local_track_index: 0,
+                original_track_number: 1,
+                file_ref: "side-a.dff".to_string(),
+                index00_frames: None,
+                index01_frames: Some(0),
+                isrc: None,
+                directives: Vec::new(),
+            }],
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+
+        assert_eq!(metadata_editor_detail_slot_block_reason(&state, 0, 1), None);
     }
 
     #[test]

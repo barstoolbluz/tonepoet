@@ -1197,7 +1197,7 @@ fn reduce_file_picker_complete(
                             app.set_status("metadata editor: resolving tag-transfer target carrier...");
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
-                                    super::keybindings::classify_tag_transfer_roots(
+                                    super::keybindings::classify_tag_transfer_target_roots(
                                         &selected_roots,
                                         &worker_priority,
                                         &prepare_cancel,

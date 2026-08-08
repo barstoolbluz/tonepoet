@@ -555,6 +555,67 @@ pub fn create_cue_sidecar_from_cuesheet(
     })
 }
 
+/// Return whether one exact sidecar byte snapshot has enough CUE structure to
+/// carry metadata authority. This deliberately ignores metadata richness: a
+/// valid sidecar needs authored tracks, unique positive track numbers, FILE
+/// references, and INDEX 01 geometry.
+pub fn cue_sidecar_bytes_are_structurally_valid(raw: &[u8], cue_path: &Path) -> bool {
+    let Ok(decoded) = decode_cue_bytes_for_path(raw, cue_path) else {
+        return false;
+    };
+    let parsed = parse_cue(&decoded);
+    if parsed.tracks.is_empty() {
+        return false;
+    }
+    let mut numbers = std::collections::BTreeSet::new();
+    parsed.tracks.iter().all(|track| {
+        track.number > 0
+            && numbers.insert(track.number)
+            && track
+                .file
+                .as_deref()
+                .is_some_and(|file_ref| !file_ref.trim().is_empty())
+            && track.index01_frames.is_some()
+    })
+}
+
+/// Replace the exact structurally-invalid placeholder observed during target
+/// classification. A changed, removed, or newly-valid sidecar fails closed;
+/// this function never upgrades the write into authority over a new snapshot.
+pub fn replace_invalid_cue_sidecar_from_cuesheet_if_unchanged(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+    expected_original: &[u8],
+) -> Result<CueSidecarWritebackOutcome, String> {
+    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, false)?;
+    let desired = explicit_cue_metadata(replacement_cuesheet);
+    if desired.tracks.is_empty() {
+        return Err("replacement CUESHEET has no audio tracks".to_string());
+    }
+    if cue_sidecar_bytes_are_structurally_valid(expected_original, cue_path) {
+        return Err(format!(
+            "sidecar CUE '{}' was valid at classification; refusing invalid-placeholder replacement",
+            cue_path.display()
+        ));
+    }
+    let metadata = std::fs::metadata(cue_path)
+        .map_err(|e| format!("failed to stat sidecar CUE '{}': {}", cue_path.display(), e))?;
+    if metadata.permissions().readonly() {
+        return Err(format!(
+            "sidecar CUE '{}' is read-only; no tags were written",
+            cue_path.display()
+        ));
+    }
+    atomic_replace_if_unchanged(
+        cue_path,
+        replacement_cuesheet.as_bytes(),
+        Some(expected_original),
+    )?;
+    Ok(CueSidecarWritebackOutcome::Rewritten {
+        encoding: "UTF-8".to_string(),
+    })
+}
+
 /// Rewrite CUE metadata only if `validate_snapshot` accepts the exact bytes
 /// read by this mutator. The validator therefore observes the same snapshot
 /// from which byte-preserving edits are composed, rather than a prior read by
@@ -2823,6 +2884,39 @@ mod tests {
             std::fs::read_to_string(&cue_path).expect("existing sidecar unchanged"),
             concurrent,
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_sidecar_replacement_refuses_read_only_placeholder_without_mutation() {
+        let dir = unique_cue_parser_test_dir("invalid_sidecar_readonly");
+        let cue_path = dir.join("album.cue");
+        let invalid = b"not a cue\n";
+        let replacement = concat!(
+            "TITLE \"Album\"\n",
+            "FILE \"album.dff\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"One\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        std::fs::write(&cue_path, invalid).expect("write invalid placeholder");
+        let mut permissions = std::fs::metadata(&cue_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&cue_path, permissions).expect("make placeholder read-only");
+
+        let error = replace_invalid_cue_sidecar_from_cuesheet_if_unchanged(
+            &cue_path,
+            replacement,
+            invalid,
+        )
+        .expect_err("read-only invalid placeholder must fail closed");
+        assert!(error.contains("read-only"));
+        assert!(error.contains("no tags were written"));
+        assert_eq!(std::fs::read(&cue_path).unwrap(), invalid);
+
+        let mut permissions = std::fs::metadata(&cue_path).unwrap().permissions();
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&cue_path, permissions);
         let _ = std::fs::remove_dir_all(dir);
     }
 

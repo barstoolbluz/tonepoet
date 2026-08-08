@@ -2181,7 +2181,7 @@ fn launch_tag_transfer(
                     &worker_priority,
                     &worker_cancel,
                 )?;
-                let target = super::keybindings::classify_tag_transfer_roots(
+                let target = super::keybindings::classify_tag_transfer_target_roots(
                     &target_roots,
                     &worker_priority,
                     &worker_cancel,
@@ -2250,7 +2250,7 @@ fn launch_tag_transfer(
                 };
                 let target = match target {
                     super::browse::PendingTagTransferTarget::Roots(target_roots) => {
-                        super::keybindings::classify_tag_transfer_roots(
+                        super::keybindings::classify_tag_transfer_target_roots(
                             &target_roots,
                             &worker_priority,
                             &worker_cancel,
@@ -2345,7 +2345,7 @@ fn reverify_prepared_target(
     if prepared.target_roots.is_empty() {
         return Ok(());
     }
-    let current = super::keybindings::classify_tag_transfer_roots(
+    let current = super::keybindings::classify_tag_transfer_target_roots(
         &prepared.target_roots,
         metadata_target_priority,
         cancel,

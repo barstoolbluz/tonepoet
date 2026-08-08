@@ -27,7 +27,7 @@ pub(crate) fn tag_transfer_picker_filter() -> tui_file_picker::FilePickerFilter 
 /// Carrier selected at the transfer boundary. CUE carriers retain both their
 /// policy-selected text and the concrete write authority needed for TOCTOU
 /// revalidation immediately before a write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarCueWriteMethod {
     /// Rewrite only the authored sidecar. This is the explicit `.cue`
     /// contract and the only supported target shape for synthetic multi-part
@@ -39,9 +39,36 @@ pub enum SidecarCueWriteMethod {
     /// carriers for field data, and transfer writes must report their embedded
     /// tag surfaces as blocked/unsupported while still committing the sidecar.
     UnsupportedCarriersSidecarOnly,
+    /// Target-only authority for cue-less unsupported carriers. Classification
+    /// captures the exact sidecar state so execution cannot silently adopt a
+    /// sidecar created or changed by another writer after classification.
+    UnsupportedCarriersCreateOrRewriteSidecarOnly {
+        /// `None` means the path was absent. `Some(bytes)` is the exact
+        /// structurally-invalid placeholder observed during classification.
+        expected_original: Option<Vec<u8>>,
+    },
     /// Write full Files-dimension tags to each one-file-per-track member, then
     /// rewrite the CUE-capped sidecar only after every member write succeeds.
     PerFileAndSidecar,
+}
+
+impl SidecarCueWriteMethod {
+    fn is_unsupported_authority(&self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedCarriersSidecarOnly
+                | Self::UnsupportedCarriersCreateOrRewriteSidecarOnly { .. }
+        )
+    }
+
+    fn materialization_expected_original(&self) -> Option<&Option<Vec<u8>>> {
+        match self {
+            Self::UnsupportedCarriersCreateOrRewriteSidecarOnly { expected_original } => {
+                Some(expected_original)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,8 +94,9 @@ pub enum TransferCarrier {
         track_audio_paths: Vec<std::path::PathBuf>,
         role: crate::convert::split_cue_album::SplitCueMemberRole,
         write_method: SidecarCueWriteMethod,
-        // Written by classification; read by carrier regression tests.
-        #[allow(dead_code)]
+        // Exact CUE snapshot/template admitted by classification. Existing
+        // sidecar rewrites revalidate the live snapshot; target-only
+        // materialization composes metadata onto this FILE/TRACK structure.
         cue_text: String,
         sheet: crate::convert::cue_parser::CueSheet,
     },
@@ -128,9 +156,9 @@ impl TransferCarrier {
             Self::SidecarCue {
                 image_paths,
                 track_audio_paths,
-                write_method: SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly,
+                write_method,
                 ..
-            } => TransferDimension::Tracks(
+            } if write_method.is_unsupported_authority() => TransferDimension::Tracks(
                 unsupported_sidecar_selected_track_indices_unchecked(
                     image_paths,
                     track_audio_paths,
@@ -171,10 +199,10 @@ impl TransferCarrier {
             Self::SidecarCue {
                 image_paths,
                 track_audio_paths,
-                write_method: SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly,
+                write_method,
                 sheet,
                 ..
-            } => {
+            } if write_method.is_unsupported_authority() => {
                 let selected = unsupported_sidecar_selected_track_indices_unchecked(
                     image_paths,
                     track_audio_paths,
@@ -234,9 +262,9 @@ impl TransferCarrier {
             } => track_audio_paths.len().saturating_add(1),
             Self::SidecarCue {
                 image_paths,
-                write_method: SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly,
+                write_method,
                 ..
-            } => image_paths.len().saturating_add(1),
+            } if write_method.is_unsupported_authority() => image_paths.len().saturating_add(1),
             Self::SidecarCue { .. } | Self::EmbeddedCue { .. } => 1,
             Self::EmbeddedCues { carriers } => carriers.len(),
             Self::Aggregate { carriers } => carriers
@@ -2648,6 +2676,163 @@ fn canonical_transfer_item_key(
     }
 }
 
+fn plan_transfer_values_for_unified_cue_editor(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    scope: super::app::TagTransferScope,
+    dimensions: super::probe::UnifiedCueDimensions,
+    target_scopes: &std::collections::HashMap<String, super::probe::RowScope>,
+) -> Result<TransferValuePlan, String> {
+    let source_count = source_dimension.count();
+    if source_count == 0 {
+        return Err("tag transfer has no source positions".to_string());
+    }
+    if dimensions.files == 0 || dimensions.tracks == 0 {
+        return Err("unified CUE target has no file or logical-track positions".to_string());
+    }
+
+    let mut plan = TransferValuePlan::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in source_entries {
+        if !transfer_entry_selected(entry, scope, source_dimension) {
+            continue;
+        }
+        let canonical_key = super::probe::canonical_metadata_display_key(&entry.display_key);
+        if !seen.insert(canonical_key.clone()) {
+            return Err(format!(
+                "tag transfer source contains duplicate field {canonical_key}"
+            ));
+        }
+        if canonical_key == "SONGWRITER" {
+            plan.skipped_fields
+                .push("SONGWRITER excluded from CUE transfer this round".to_string());
+            continue;
+        }
+        if canonical_key == "ISRC" {
+            plan.skipped_fields
+                .push("ISRC skipped: CUE writeback is read-only this round".to_string());
+            continue;
+        }
+        if canonical_key == "TRACKNUMBER" {
+            plan.skipped_fields
+                .push("TRACKNUMBER skipped: CUE TRACK numbers are structural".to_string());
+            continue;
+        }
+        if cue_target_key(&canonical_key).is_none() {
+            plan.skipped_fields.push(format!(
+                "{} skipped: not representable by the CUE field cap",
+                canonical_key
+            ));
+            continue;
+        }
+
+        let declared_scope = target_scopes
+            .get(&canonical_key)
+            .copied()
+            .unwrap_or_else(|| {
+                if canonical_key == "ARTIST" {
+                    super::probe::RowScope::Track
+                } else {
+                    super::probe::RowScope::File
+                }
+            });
+        let shape = super::probe::unified_cue_row_shape(&canonical_key, declared_scope)
+            .ok_or_else(|| format!("{canonical_key} has no unified-CUE row shape"))?;
+        let target_count = shape.dimension(dimensions);
+
+        let source_values = (0..source_count)
+            .map(|source_index| {
+                entry
+                    .per_file_values
+                    .get(source_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "{} has no source value at position {}",
+                            canonical_key,
+                            source_index + 1
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let all_source_same = source_values
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]);
+
+        let values = match shape.scope {
+            super::probe::RowScope::File => {
+                if matches!(source_dimension, TransferDimension::Files(_))
+                    && source_count == target_count
+                {
+                    // Preserve legitimate per-carrier album values only when
+                    // the source itself is file-dimensional. Equal cardinality
+                    // alone is not enough: a track-dimensional source with the
+                    // same count has no defined track->target-carrier mapping.
+                    source_values.clone()
+                } else if source_count == 1 || all_source_same {
+                    vec![source_values[0].clone(); target_count]
+                } else {
+                    // Album-scoped values cannot be mapped positionally when
+                    // source and target carrier shapes differ.  The value is
+                    // semantically singular at album scope, so use a stable
+                    // winner instead of rejecting a legitimate transfer.
+                    plan.cardinality_warnings.push(format!(
+                        "{} had conflicting album-scoped source values across {} positions; used the first source value for {} target carrier{}",
+                        canonical_key,
+                        source_count,
+                        target_count,
+                        if target_count == 1 { "" } else { "s" },
+                    ));
+                    vec![source_values[0].clone(); target_count]
+                }
+            }
+            super::probe::RowScope::Track => {
+                if matches!(source_dimension, TransferDimension::Files(1)) {
+                    plan.skipped_fields.push(format!(
+                        "{} skipped: one file cannot broadcast a per-track CUE field",
+                        canonical_key
+                    ));
+                    continue;
+                }
+                if source_count != target_count {
+                    return Err(format!(
+                        "tag transfer carrier dimensions do not match for per-track {}: {} source positions and {} logical tracks",
+                        canonical_key, source_count, target_count
+                    ));
+                }
+                source_values.clone()
+            }
+        };
+
+        let mut warned_stored_sources = std::collections::BTreeSet::new();
+        for source_index in 0..source_count {
+            let stored_count = entry.stored_value_count_for_slot(source_index);
+            if stored_count > 1 && warned_stored_sources.insert(source_index) {
+                plan.cardinality_warnings.push(format!(
+                    "{} source {} collapsed {} stored values to its display value",
+                    canonical_key,
+                    source_index + 1,
+                    stored_count
+                ));
+            }
+        }
+
+        plan.fields.push(PlannedTransferField {
+            item_key: canonical_transfer_item_key(&canonical_key, &entry.item_key),
+            canonical_key,
+            values,
+        });
+    }
+
+    if plan.fields.is_empty()
+        && plan.skipped_numbering_keys.is_empty()
+        && plan.skipped_fields.is_empty()
+    {
+        return Err("tag transfer source contains no applicable text fields".to_string());
+    }
+    Ok(plan)
+}
+
 fn plan_transfer_values_for_dimensions(
     source_entries: &[TagEntry],
     source_dimension: TransferDimension,
@@ -3408,7 +3593,7 @@ pub(crate) fn read_transfer_carrier_entries(
                     "tag transfer sidecar track/image ownership cardinality mismatch".to_string(),
                 );
             }
-            if *write_method == SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly {
+            if write_method.is_unsupported_authority() {
                 // Classification already established that the physical audio
                 // carriers cannot provide metadata through lofty. The CUE is
                 // therefore the complete readable metadata authority for this
@@ -4154,21 +4339,59 @@ fn write_sidecar_transfer(
     cue_path: &std::path::Path,
     track_audio_paths: &[std::path::PathBuf],
     sheet: &crate::convert::cue_parser::CueSheet,
+    classified_cue_text: &str,
     replacement: &str,
+    materialization_expected_original: Option<&Option<Vec<u8>>>,
 ) -> Result<Option<super::probe::MetadataWriteCommitReport>, String> {
-    crate::convert::cue_parser::rewrite_cue_sidecar_metadata_from_cuesheet_validated(
-        cue_path,
-        replacement,
-        |_raw, current_cue_text| {
+    let outcome = match materialization_expected_original {
+        Some(expected_original) => {
+            // A target-only sidecar starts from the FILE/TRACK structure built
+            // during classification. Overlay only the requested metadata, then
+            // validate the exact FILE-bearing text that will be published.
+            // This keeps carrier ownership single-sourced and closes the gap
+            // where a metadata-only replacement was validated before FILE
+            // references could exist.
+            let materialized = crate::convert::cue_parser::compose_cue_metadata_replacement(
+                classified_cue_text,
+                replacement,
+            )?;
             validate_sidecar_transfer_snapshot(
                 cue_path,
-                current_cue_text,
+                &materialized,
                 track_audio_paths,
                 sheet,
-            )
-        },
-    )
-    .map(|outcome| match outcome {
+            )?;
+            match expected_original {
+                None => crate::convert::cue_parser::create_cue_sidecar_from_cuesheet(
+                    cue_path,
+                    &materialized,
+                ),
+                Some(expected_original) => {
+                    crate::convert::cue_parser::replace_invalid_cue_sidecar_from_cuesheet_if_unchanged(
+                        cue_path,
+                        &materialized,
+                        expected_original,
+                    )
+                }
+            }
+        }
+        None => crate::convert::cue_parser::rewrite_cue_sidecar_metadata_from_cuesheet_validated(
+            cue_path,
+            replacement,
+            |_raw, current_cue_text| {
+                // Existing sidecars already own their FILE/TRACK structure.
+                // Validate the exact snapshot consumed by the byte-preserving
+                // mutator, not the intentionally FILE-less metadata overlay.
+                validate_sidecar_transfer_snapshot(
+                    cue_path,
+                    current_cue_text,
+                    track_audio_paths,
+                    sheet,
+                )
+            },
+        ),
+    }?;
+    Ok(match outcome {
         crate::convert::cue_parser::CueSidecarWritebackOutcome::Unchanged => None,
         crate::convert::cue_parser::CueSidecarWritebackOutcome::Rewritten { .. } => {
             Some(super::probe::MetadataWriteCommitReport::default())
@@ -4589,21 +4812,23 @@ fn execute_tag_transfer_to_cue(
     if let TransferCarrier::SidecarCue {
         image_paths,
         track_audio_paths,
-        write_method: SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly,
+        write_method,
         sheet,
         ..
     } = target
     {
-        let selected_track_indices = unsupported_sidecar_selected_track_indices(
-            image_paths,
-            track_audio_paths,
-            sheet,
-        )?;
-        cue_value_plan = overlay_projected_transfer_plan_on_cue_sheet(
-            &cue_value_plan,
-            sheet,
-            &selected_track_indices,
-        )?;
+        if write_method.is_unsupported_authority() {
+            let selected_track_indices = unsupported_sidecar_selected_track_indices(
+                image_paths,
+                track_audio_paths,
+                sheet,
+            )?;
+            cue_value_plan = overlay_projected_transfer_plan_on_cue_sheet(
+                &cue_value_plan,
+                sheet,
+                &selected_track_indices,
+            )?;
+        }
     }
     let replacement = cue_metadata_replacement_text(&cue_value_plan, target_sheet)?;
 
@@ -4611,65 +4836,75 @@ fn execute_tag_transfer_to_cue(
         cue_path,
         image_paths,
         track_audio_paths,
-        write_method: SidecarCueWriteMethod::UnsupportedCarriersSidecarOnly,
+        write_method,
+        cue_text,
         sheet,
         ..
     } = target
     {
-        if cancel.is_cancelled() {
-            return Err("tag transfer cancelled before sidecar CUE write".to_string());
-        }
-        let total = image_paths.len().saturating_add(1);
-        let mut report = TagTransferReport {
-            source_count: source_dimension.count(),
-            target_count: target_dimension.count(),
-            written_fields: cue_value_plan.fields.len(),
-            source_carrier: Some(if source_dimension.is_tracks() {
-                "CUE tracks".to_string()
-            } else {
-                "files".to_string()
-            }),
-            target_carrier: Some("sidecar CUE".to_string()),
-            target_paths: vec![cue_path.clone()],
-            first_track_collapse: cue_value_plan.first_track_collapse,
-            skipped_numbering_keys: cue_value_plan.skipped_numbering_keys,
-            skipped_fields: cue_value_plan.skipped_fields,
-            cardinality_warnings: cue_value_plan.cardinality_warnings,
-            blocked: image_paths
-                .iter()
-                .cloned()
-                .map(|path| {
-                    (
-                        path,
-                        "embedded tag write blocked: metadata format unsupported; sidecar CUE is authoritative"
-                            .to_string(),
-                    )
-                })
-                .collect(),
-            ..TagTransferReport::default()
-        };
+        if write_method.is_unsupported_authority() {
+            if cancel.is_cancelled() {
+                return Err("tag transfer cancelled before sidecar CUE write".to_string());
+            }
+            let total = image_paths.len().saturating_add(1);
+            let mut report = TagTransferReport {
+                source_count: source_dimension.count(),
+                target_count: target_dimension.count(),
+                written_fields: cue_value_plan.fields.len(),
+                source_carrier: Some(if source_dimension.is_tracks() {
+                    "CUE tracks".to_string()
+                } else {
+                    "files".to_string()
+                }),
+                target_carrier: Some("sidecar CUE".to_string()),
+                target_paths: vec![cue_path.clone()],
+                first_track_collapse: cue_value_plan.first_track_collapse,
+                skipped_numbering_keys: cue_value_plan.skipped_numbering_keys,
+                skipped_fields: cue_value_plan.skipped_fields,
+                cardinality_warnings: cue_value_plan.cardinality_warnings,
+                blocked: image_paths
+                    .iter()
+                    .cloned()
+                    .map(|path| {
+                        (
+                            path,
+                            "embedded tag write blocked: metadata format unsupported; sidecar CUE is authoritative"
+                                .to_string(),
+                        )
+                    })
+                    .collect(),
+                ..TagTransferReport::default()
+            };
 
-        for (index, path) in image_paths.iter().enumerate() {
+            for (index, path) in image_paths.iter().enumerate() {
+                if let Some(progress) = progress {
+                    progress(index + 1, total, path);
+                }
+            }
+            if cancel.is_cancelled() {
+                return Err("tag transfer cancelled before sidecar CUE write".to_string());
+            }
+            match write_sidecar_transfer(
+                cue_path,
+                track_audio_paths,
+                sheet,
+                cue_text,
+                &replacement,
+                write_method.materialization_expected_original(),
+            ) {
+                Ok(Some(commit)) => {
+                    report.written = 1;
+                    report.written_paths.push(cue_path.clone());
+                    report.durability_warnings.extend(commit.durability_warnings);
+                }
+                Ok(None) => report.unchanged = 1,
+                Err(error) => report.failed.push((cue_path.clone(), error)),
+            }
             if let Some(progress) = progress {
-                progress(index + 1, total, path);
+                progress(total, total, cue_path);
             }
+            return Ok(report);
         }
-        if cancel.is_cancelled() {
-            return Err("tag transfer cancelled before sidecar CUE write".to_string());
-        }
-        match write_sidecar_transfer(cue_path, track_audio_paths, sheet, &replacement) {
-            Ok(Some(commit)) => {
-                report.written = 1;
-                report.written_paths.push(cue_path.clone());
-                report.durability_warnings.extend(commit.durability_warnings);
-            }
-            Ok(None) => report.unchanged = 1,
-            Err(error) => report.failed.push((cue_path.clone(), error)),
-        }
-        if let Some(progress) = progress {
-            progress(total, total, cue_path);
-        }
-        return Ok(report);
     }
 
     if let TransferCarrier::SidecarCue {
@@ -4677,6 +4912,7 @@ fn execute_tag_transfer_to_cue(
         track_audio_paths,
         role,
         write_method: SidecarCueWriteMethod::PerFileAndSidecar,
+        cue_text,
         sheet,
         ..
     } = target
@@ -4758,7 +4994,14 @@ fn execute_tag_transfer_to_cue(
             }
             return Ok(report);
         }
-        match write_sidecar_transfer(cue_path, track_audio_paths, sheet, &replacement) {
+        match write_sidecar_transfer(
+            cue_path,
+            track_audio_paths,
+            sheet,
+            cue_text,
+            &replacement,
+            None,
+        ) {
             Ok(Some(commit)) => {
                 report.written += 1;
                 report.written_paths.push(cue_path.clone());
@@ -4798,9 +5041,18 @@ fn execute_tag_transfer_to_cue(
         TransferCarrier::SidecarCue {
             cue_path,
             track_audio_paths,
+            write_method,
+            cue_text,
             sheet,
             ..
-        } => write_sidecar_transfer(cue_path, track_audio_paths, sheet, &replacement),
+        } => write_sidecar_transfer(
+            cue_path,
+            track_audio_paths,
+            sheet,
+            cue_text,
+            &replacement,
+            write_method.materialization_expected_original(),
+        ),
         TransferCarrier::EmbeddedCue {
             image_path,
             cue_text,
@@ -5329,15 +5581,9 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
     if target_count == 0 {
         return Err("metadata editor has no transfer target positions".to_string());
     }
-    let value_plan = plan_transfer_values_for_dimensions_with_collapse(
-        source_entries,
-        source_dimension,
-        target_dimension,
-        scope,
-        metadata_editor_first_track_collapse_eligibility(state, target_dimension),
-    )?;
 
     let mut target_rows = std::collections::HashMap::new();
+    let mut target_scopes = std::collections::HashMap::new();
     for (index, entry) in state.active_surface().entries.iter().enumerate() {
         let key = super::probe::canonical_metadata_display_key(&entry.display_key);
         if target_rows.insert(key.clone(), index).is_some() {
@@ -5345,18 +5591,37 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
                 "metadata editor contains duplicate field {key}; resolve it before transferring tags"
             ));
         }
+        target_scopes.insert(key, entry.row_scope);
     }
 
-    let mode = if source_dimension.count() == 1 && target_count > 1 {
-        FieldBlockValueMode::Broadcast
+    let presentation_dimension = state.active_surface().paths.len();
+    let cue_dimensions = state
+        .active_surface()
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| super::probe::UnifiedCueDimensions {
+            files: sheet.audio_paths.len(),
+            tracks: sheet.track_sources.len(),
+            presentation: presentation_dimension,
+        });
+    let value_plan = if let Some(dimensions) = cue_dimensions {
+        plan_transfer_values_for_unified_cue_editor(
+            source_entries,
+            source_dimension,
+            scope,
+            dimensions,
+            &target_scopes,
+        )?
     } else {
-        FieldBlockValueMode::Positional
+        plan_transfer_values_for_dimensions_with_collapse(
+            source_entries,
+            source_dimension,
+            target_dimension,
+            scope,
+            metadata_editor_first_track_collapse_eligibility(state, target_dimension),
+        )?
     };
-    let row_scope = if target_dimension.is_tracks() {
-        super::probe::RowScope::Track
-    } else {
-        super::probe::RowScope::File
-    };
+
     let mut report = EditorTransferApplyReport {
         skipped_numbering_keys: value_plan.skipped_numbering_keys,
         skipped_fields: value_plan.skipped_fields,
@@ -5371,6 +5636,37 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
         values,
     } in value_plan.fields
     {
+        let existing_scope = target_scopes
+            .get(&canonical_key)
+            .copied()
+            .unwrap_or(super::probe::RowScope::Track);
+        let (row_scope, field_target_count) = if let Some(dimensions) = cue_dimensions {
+            let shape = super::probe::unified_cue_row_shape(&canonical_key, existing_scope)
+                .ok_or_else(|| format!("{canonical_key} has no unified-CUE target shape"))?;
+            (shape.scope, shape.dimension(dimensions))
+        } else {
+            (
+                if target_dimension.is_tracks() {
+                    super::probe::RowScope::Track
+                } else {
+                    super::probe::RowScope::File
+                },
+                target_count,
+            )
+        };
+        if values.len() != field_target_count {
+            return Err(format!(
+                "internal tag-transfer shape error: {} projected {} values for a target dimension of {}",
+                canonical_key,
+                values.len(),
+                field_target_count,
+            ));
+        }
+        let mode = if source_dimension.count() == 1 && field_target_count > 1 {
+            FieldBlockValueMode::Broadcast
+        } else {
+            FieldBlockValueMode::Positional
+        };
         let all_same = values.windows(2).all(|pair| pair[0] == pair[1]);
         let display = if all_same {
             values.first().cloned().unwrap_or_default()
@@ -5398,9 +5694,9 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
                 is_mixed: !all_same,
                 has_multiple_stored_values: false,
                 row_scope,
-                per_file_stored_value_counts: vec![0; target_count],
+                per_file_stored_value_counts: Vec::new(),
                 per_file_values: values,
-                per_file_originals: vec![String::new(); target_count],
+                per_file_originals: vec![String::new(); field_target_count],
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
@@ -5409,6 +5705,11 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
         report.applied.push((canonical_key, mode));
     }
 
+    if cue_dimensions.is_some() {
+        report.cardinality_warnings.extend(
+            super::keybindings::cue_album_reconcile_row_shapes(state.active_surface_mut()),
+        );
+    }
     state.recompute_active_dirty();
     Ok(report)
 }

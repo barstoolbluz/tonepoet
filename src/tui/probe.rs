@@ -5957,6 +5957,160 @@ pub enum RowScope {
     Track,
 }
 
+/// Semantic axis for a row on a unified-CUE metadata surface.
+///
+/// Scope and axis are intentionally separate: CUESHEET is File-scoped for the
+/// editor model but lives on the presentation axis, while ordinary album rows
+/// live on the save/audio-file axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnifiedCueAxis {
+    File,
+    Track,
+    Presentation,
+}
+
+/// Named dimensions for a unified-CUE surface.  Keeping these counts in a
+/// struct prevents adjacent `usize` arguments from being silently swapped at
+/// classifier call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnifiedCueDimensions {
+    pub files: usize,
+    pub tracks: usize,
+    pub presentation: usize,
+}
+
+impl UnifiedCueDimensions {
+    pub(crate) fn resolve(self, axis: UnifiedCueAxis) -> usize {
+        match axis {
+            UnifiedCueAxis::File => self.files,
+            UnifiedCueAxis::Track => self.tracks,
+            UnifiedCueAxis::Presentation => self.presentation,
+        }
+    }
+}
+
+/// Canonical semantic shape for a row on a unified-CUE metadata surface.
+///
+/// Unified CUEs deliberately have three independent dimensions:
+/// presentation files, save/audio files, and logical tracks.  The classifier
+/// returns policy (`File`, `Track`, or `Presentation`) rather than a caller-
+/// supplied count, so equal-looking vector lengths can never determine scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnifiedCueRowShape {
+    pub scope: RowScope,
+    pub axis: UnifiedCueAxis,
+    pub dimension_name: &'static str,
+}
+
+impl UnifiedCueRowShape {
+    pub(crate) fn dimension(self, dimensions: UnifiedCueDimensions) -> usize {
+        dimensions.resolve(self.axis)
+    }
+}
+
+pub(crate) fn unified_cue_row_shape(
+    display_key: &str,
+    declared_scope: RowScope,
+) -> Option<UnifiedCueRowShape> {
+    let canonical = canonical_metadata_display_key(display_key);
+    let (scope, axis, dimension_name) = match canonical.as_str() {
+        "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER" => {
+            (RowScope::File, UnifiedCueAxis::File, "album/file")
+        }
+        "TITLE" | "ISRC" | "TRACKNUMBER" => {
+            (RowScope::Track, UnifiedCueAxis::Track, "logical-track")
+        }
+        // ARTIST intentionally remains declared-scope.  Track ARTIST is the
+        // normal unified-CUE representation, while File ARTIST is retained as
+        // an album-performer compatibility fallback.
+        "ARTIST" => match declared_scope {
+            RowScope::File => (
+                RowScope::File,
+                UnifiedCueAxis::File,
+                "album/file compatibility",
+            ),
+            RowScope::Track => (
+                RowScope::Track,
+                UnifiedCueAxis::Track,
+                "logical-track",
+            ),
+        },
+        "CUESHEET" => (
+            RowScope::File,
+            UnifiedCueAxis::Presentation,
+            "presentation CUESHEET",
+        ),
+        _ => return None,
+    };
+    Some(UnifiedCueRowShape {
+        scope,
+        axis,
+        dimension_name,
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn unified_cue_row_shape_contract_is_semantic_when_dimensions_are_equal() {
+    use UnifiedCueAxis::{File, Presentation, Track};
+
+    let equal_dimensions = UnifiedCueDimensions {
+        files: 2,
+        tracks: 2,
+        presentation: 2,
+    };
+    let distinct_dimensions = UnifiedCueDimensions {
+        files: 3,
+        tracks: 5,
+        presentation: 7,
+    };
+    let cases = [
+        ("ALBUM", RowScope::Track, Some((RowScope::File, File))),
+        ("ALBUMARTIST", RowScope::Track, Some((RowScope::File, File))),
+        ("DATE", RowScope::Track, Some((RowScope::File, File))),
+        ("GENRE", RowScope::Track, Some((RowScope::File, File))),
+        ("CATALOGNUMBER", RowScope::Track, Some((RowScope::File, File))),
+        ("TITLE", RowScope::File, Some((RowScope::Track, Track))),
+        ("ISRC", RowScope::File, Some((RowScope::Track, Track))),
+        ("TRACKNUMBER", RowScope::File, Some((RowScope::Track, Track))),
+        ("ARTIST", RowScope::File, Some((RowScope::File, File))),
+        ("ARTIST", RowScope::Track, Some((RowScope::Track, Track))),
+        (
+            "CUESHEET",
+            RowScope::Track,
+            Some((RowScope::File, Presentation)),
+        ),
+        ("CUSTOM_FIELD", RowScope::Track, None),
+    ];
+
+    for (key, declared_scope, expected) in cases {
+        let actual = unified_cue_row_shape(key, declared_scope);
+        match expected {
+            Some((scope, axis)) => {
+                let shape = actual.unwrap_or_else(|| panic!("{key} should be classified"));
+                assert_eq!(shape.scope, scope, "scope for {key}");
+                assert_eq!(shape.axis, axis, "axis for {key}");
+                assert_eq!(
+                    shape.dimension(equal_dimensions),
+                    2,
+                    "equal cardinality must not alter the semantic axis for {key}"
+                );
+                let distinct_count = match axis {
+                    File => 3,
+                    Track => 5,
+                    Presentation => 7,
+                };
+                assert_eq!(
+                    shape.dimension(distinct_dimensions),
+                    distinct_count,
+                    "dimension resolution for {key}"
+                );
+            }
+            None => assert!(actual.is_none(), "{key} should remain unclassified"),
+        }
+    }
+}
+
 /// A single tag entry read from an audio file (or merged across files).
 #[derive(Debug, Clone)]
 pub struct TagEntry {
