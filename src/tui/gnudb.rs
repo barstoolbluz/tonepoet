@@ -125,7 +125,7 @@ pub fn compute_disc_id_from_sectors(sectors: &[u32]) -> Result<DiscIdResult, Str
 // ── GNUDB HTTP client ───────────────────────────────────────────────
 
 const GNUDB_BASE: &str = "http://gnudb.gnudb.org/~cddb/cddb.cgi";
-const HELLO: &str = "tonepoet+localhost+tonepoet+0.1";
+const HELLO: &str = concat!("foo+foobar.com+tonepoet+", env!("CARGO_PKG_VERSION"));
 
 /// Query GNUDB for matching discs.
 pub async fn query_gnudb(id: &DiscIdResult) -> Result<Vec<GnudbMatch>, String> {
@@ -807,9 +807,21 @@ pub fn collect_durations(
 #[cfg(test)]
 mod gnudb_per_track_tests {
     //! Phase A: gnudb parity with MB's per-track populate flow.
+
     use super::*;
     use crate::tui::app::MetadataEditorState;
     use crate::tui::probe::TagEntry;
+
+    #[test]
+    fn gnudb_hello_uses_contact_email_and_crate_version() {
+        let parts = super::HELLO.split('+').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(format!("{}@{}", parts[0], parts[1]), "foo@foobar.com");
+        assert_eq!(parts[2], "tonepoet");
+        assert_eq!(parts[3], env!("CARGO_PKG_VERSION"));
+        assert!(!super::HELLO.contains("localhost"));
+        assert!(!super::HELLO.ends_with("+0.1"));
+    }
 
     fn empty_state(n: usize) -> (MetadataEditorState, tempfile::TempDir) {
         let td = tempfile::tempdir().expect("tempdir");

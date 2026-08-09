@@ -6521,6 +6521,24 @@ pub(crate) fn handle_browse_filesystem_clipboard_key(
     true
 }
 
+fn browse_context_menu_keyboard_anchor(app: &AppState) -> (u16, u16) {
+    let Some(area) = app.browse.last_render_area else {
+        return (2, 2);
+    };
+    let row = app
+        .browse
+        .selected_index
+        .saturating_sub(app.browse.scroll_offset)
+        .min(u16::MAX as usize) as u16;
+    let entry_y = super::draw_browse::browse_entry_y_start(area, app.browse.search.active);
+    let max_x = area.x.saturating_add(area.width.saturating_sub(1));
+    let max_y = area.y.saturating_add(area.height.saturating_sub(1));
+    (
+        area.x.saturating_add(2).min(max_x),
+        entry_y.saturating_add(row).min(max_y),
+    )
+}
+
 fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use crate::convert::classify::EntryKind;
 
@@ -6541,6 +6559,11 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     // In particular, `/` and `.` must not become tree-prefix characters merely
     // because Explore currently owns keyboard navigation.
     match (key.code, key.modifiers) {
+        (KeyCode::Char('m'), KeyModifiers::ALT) => {
+            let (x, y) = browse_context_menu_keyboard_anchor(app);
+            open_context_menu_with_tx(app, x, y, Some(tx));
+            return;
+        }
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
             if app.bookmarks.dropdown_open {
                 app.bookmarks.close_dropdown();
@@ -7014,6 +7037,18 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
 /// Handle keys when the search panel is active.
 fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use super::browse::SearchFocus;
+
+    // Alt+M is Browse-global even while the search panel owns dispatch. Route
+    // it through the normal Browse handler so keyboard and right-click menu
+    // construction continue to share one implementation and the anchor keeps
+    // using the search-aware rendered row geometry.
+    if matches!(
+        (key.code, key.modifiers),
+        (KeyCode::Char('m'), KeyModifiers::ALT)
+    ) {
+        handle_browse_key(app, key, tx);
+        return;
+    }
 
     // File paste is valid from every non-text search focus and is handled
     // below before the generic search-local clipboard refusal. Copy/cut still
@@ -78069,6 +78104,82 @@ mod file_picker_browse_parity_regression_tests {
             .status_message
             .as_ref()
             .is_some_and(|(message, _)| message.contains("unavailable in search results")));
+    }
+
+    #[test]
+    fn browse_alt_m_opens_context_menu_at_selected_row_and_plain_m_does_not() {
+        use ratatui::layout::Rect;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.flac");
+        let second = temp.path().join("second.flac");
+        std::fs::write(&first, b"audio").expect("first fixture");
+        std::fs::write(&second, b"audio").expect("second fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_audio_entry(first), browse_audio_entry(second)];
+        app.browse.selected_index = 1;
+        app.browse.scroll_offset = 0;
+        app.browse.last_render_area = Some(Rect::new(10, 20, 40, 12));
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            &tx,
+        );
+        let ActiveOverlay::ContextMenu { origin, .. } = &app.active_overlay else {
+            panic!("Alt+M must open the Browse context menu");
+        };
+        assert_eq!(*origin, (12, 23));
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
+    #[test]
+    fn browse_alt_m_opens_context_menu_while_search_input_owns_dispatch() {
+        use crate::tui::browse::SearchFocus;
+        use ratatui::layout::Rect;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.flac");
+        let second = temp.path().join("second.flac");
+        std::fs::write(&first, b"audio").expect("first fixture");
+        std::fs::write(&second, b"audio").expect("second fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_audio_entry(first), browse_audio_entry(second)];
+        app.browse.selected_index = 1;
+        app.browse.scroll_offset = 0;
+        app.browse.last_render_area = Some(Rect::new(10, 20, 40, 12));
+        app.browse.search.active = true;
+        app.browse.search.focus = SearchFocus::Input;
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            &tx,
+        );
+        let ActiveOverlay::ContextMenu { origin, .. } = &app.active_overlay else {
+            panic!("Alt+M must open the Browse context menu while search owns dispatch");
+        };
+        assert_eq!(*origin, (12, 25));
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
     }
 
     #[test]

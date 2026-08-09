@@ -44,11 +44,13 @@ use crate::convert::pipeline::{
     ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
     ScratchStagingConfig, SharedWorkerPool, SourceKind, StageOutcome, ToolBinary, ToolConcurrencyLimits,
     TrackMetadata, TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
+    source_text_tag_key_from_extra,
 };
 use crate::convert::pipeline::stages::{
     disk_staging_parent_for, independent_single_file_album_batch_lifecycle_key,
     pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
     prepare_independent_single_file_album_batch_for_completion_order_dispatch,
+    prepare_verified_single_file_album_batch_completion_order_fallback,
 };
 use crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings;
 #[cfg(test)]
@@ -436,45 +438,93 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
         }
 
         let mut prepared = Vec::with_capacity(group.len());
-        let mut missing_track_identity = None;
-        let mut ambiguous_track_identity = None;
+        let mut unavailable_order_reason = None;
         for candidate in group.iter() {
-            let metadata_track_context = track_context_from_dispatch_metadata(&candidate.request.container);
             let source_probe = batch_identity_probe_for_request(&candidate.request, candidate.source_kind);
             let disc_number = candidate
                 .request
                 .album_batch_track
                 .as_ref()
                 .and_then(|track| track.disc_number)
-                .or_else(|| source_probe.disc_number)
-                .or_else(|| metadata_track_context.and_then(|context| context.0))
+                .or(source_probe.disc_number)
                 .or_else(|| disc_number_from_dispatch_path(&candidate.request.container));
-            let track_number = candidate
-                .request
-                .album_batch_track
-                .as_ref()
-                .map(|track| track.track_number)
-                .or(source_probe.track_number)
-                .or_else(|| metadata_track_context.map(|context| context.1))
-                .or_else(|| strict_track_number_from_dispatch_path(&candidate.request.container));
-            let Some(track_number) = track_number.filter(|value| *value > 0) else {
-                if filename_contains_non_prefix_digits(&candidate.request.container) {
-                    ambiguous_track_identity = Some(candidate.request.container.clone());
-                } else {
-                    missing_track_identity = Some(candidate.request.container.clone());
+
+            let order_key = if let Some(track) = candidate.request.album_batch_track.as_ref() {
+                SchedulerTrackOrderKey::Numeric {
+                    disc_number: track.disc_number.unwrap_or(0),
+                    track_number: track.track_number,
                 }
-                break;
+            } else {
+                match source_probe.scheduler_track_number.clone() {
+                    Some(DispatchTrackNumber::Numeric(track_number)) => {
+                        SchedulerTrackOrderKey::Numeric {
+                            disc_number: disc_number.unwrap_or(0),
+                            track_number,
+                        }
+                    }
+                    Some(DispatchTrackNumber::Vinyl(vinyl)) => {
+                        SchedulerTrackOrderKey::Vinyl(vinyl)
+                    }
+                    Some(DispatchTrackNumber::Unorderable) => {
+                        unavailable_order_reason = Some(format!(
+                            "{} has explicit TRACKNUMBER metadata that is neither a valid numeric ordinal nor a valid vinyl side/position value",
+                            candidate.request.container.display()
+                        ));
+                        break;
+                    }
+                    None => {
+                        let track_number = source_probe
+                            .track_number
+                            .or_else(|| strict_track_number_from_dispatch_path(&candidate.request.container));
+                        let Some(track_number) = track_number.filter(|value| *value > 0) else {
+                            let reason = if filename_contains_non_prefix_digits(&candidate.request.container) {
+                                format!(
+                                    "{} has no unambiguous TRACKNUMBER metadata and contains only non-prefix filename digits",
+                                    candidate.request.container.display()
+                                )
+                            } else {
+                                format!(
+                                    "{} has no unambiguous TRACKNUMBER metadata or strict filename track prefix",
+                                    candidate.request.container.display()
+                                )
+                            };
+                            unavailable_order_reason = Some(reason);
+                            break;
+                        };
+                        SchedulerTrackOrderKey::Numeric {
+                            disc_number: disc_number.unwrap_or(0),
+                            track_number,
+                        }
+                    }
+                }
             };
+
             prepared.push((
-                disc_number.unwrap_or(0),
-                track_number,
+                order_key,
                 normalized_path_key(&candidate.request.container),
                 candidate.item_index,
                 candidate.request.clone(),
             ));
         }
 
-        if let Some(path) = missing_track_identity.or(ambiguous_track_identity) {
+        if let Some(reason) = unavailable_order_reason {
+            prepare_completion_order_album_batch(
+                items,
+                &group,
+                resolved_identity_by_key.get(&key),
+                &album_output_dir,
+                &source_grouping_root,
+                &reason,
+            );
+            continue;
+        }
+
+        let first_uses_vinyl = prepared
+            .first()
+            .is_some_and(|(order, _, _, _)| matches!(order, SchedulerTrackOrderKey::Vinyl(_)));
+        if let Some((_, _, _, request)) = prepared.iter().find(|(order, _, _, _)| {
+            matches!(order, SchedulerTrackOrderKey::Vinyl(_)) != first_uses_vinyl
+        }) {
             prepare_completion_order_album_batch(
                 items,
                 &group,
@@ -482,28 +532,22 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                 &album_output_dir,
                 &source_grouping_root,
                 &format!(
-                    "{} has no unambiguous TRACKNUMBER metadata or strict filename track prefix",
-                    path.display()
+                    "{} prevents one consistent numeric-or-vinyl TRACKNUMBER ordering scheme for the batch",
+                    request.container.display()
                 ),
             );
             continue;
         }
 
-        let mut seen_track_identities: BTreeMap<(u32, u32), PathBuf> = BTreeMap::new();
+        let mut seen_track_identities: BTreeMap<SchedulerTrackOrderKey, PathBuf> = BTreeMap::new();
         let mut duplicate_track_identity = None;
-        for (disc_number, track_number, _path_key, _item_index, request) in prepared.iter() {
-            let key = (*disc_number, *track_number);
-            if let Some(first_path) = seen_track_identities.insert(key, request.container.clone()) {
-                duplicate_track_identity = Some((key, first_path, request.container.clone()));
+        for (order_key, _path_key, _item_index, request) in prepared.iter() {
+            if let Some(first_path) = seen_track_identities.insert(order_key.clone(), request.container.clone()) {
+                duplicate_track_identity = Some((order_key.clone(), first_path, request.container.clone()));
                 break;
             }
         }
-        if let Some(((disc_number, track_number), first_path, duplicate_path)) = duplicate_track_identity {
-            let disc_label = if disc_number == 0 {
-                "unknown".to_string()
-            } else {
-                disc_number.to_string()
-            };
+        if let Some((order_key, first_path, duplicate_path)) = duplicate_track_identity {
             prepare_completion_order_album_batch(
                 items,
                 &group,
@@ -511,7 +555,7 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
                 &album_output_dir,
                 &source_grouping_root,
                 &format!(
-                    "duplicate track identity disc={disc_label} track={track_number} for {} and {}",
+                    "duplicate scheduler track identity {order_key:?} for {} and {}",
                     first_path.display(),
                     duplicate_path.display()
                 ),
@@ -523,27 +567,33 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
             left.0
                 .cmp(&right.0)
                 .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.cmp(&right.2))
         });
 
         let mut requests = Vec::with_capacity(prepared.len());
         let mut item_indices = Vec::with_capacity(prepared.len());
 
-        for (ordinal_index, (disc_number_for_sort, track_number, _path_key, item_index, mut request)) in prepared.into_iter().enumerate() {
+        for (ordinal_index, (order_key, _path_key, item_index, mut request)) in prepared.into_iter().enumerate() {
             if let Some(identity) = resolved_identity_by_key.get(&key) {
                 request.batch_resolved_identity = Some(identity.clone());
             }
             if request.album_batch_track.is_none() {
                 let source_ordinal = u32::try_from(ordinal_index + 1).unwrap_or(u32::MAX);
-                let disc_number = if disc_number_for_sort == 0 {
-                    None
-                } else {
-                    Some(disc_number_for_sort)
+                let (disc_number, coordination_track_number) = match order_key {
+                    SchedulerTrackOrderKey::Numeric { disc_number, track_number } => {
+                        ((disc_number > 0).then_some(disc_number), track_number)
+                    }
+                    SchedulerTrackOrderKey::Vinyl(_) => {
+                        // The sorted ordinal is only a durable batch coordination
+                        // identity. It represents the already-proven vinyl order
+                        // for fragment machinery; it is never promoted to the
+                        // source TRACKNUMBER or used to normalize A1/B2 metadata.
+                        (None, source_ordinal)
+                    }
                 };
                 request.album_batch_track = Some(AlbumBatchTrackContext::new(
                     source_ordinal,
                     disc_number,
-                    track_number,
+                    coordination_track_number,
                 ));
             }
             request.suppress_incremental_conversion_log_append = false;
@@ -596,6 +646,51 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VinylTrackOrderKey {
+    side: String,
+    position: u32,
+}
+
+impl Ord for VinylTrackOrderKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Spreadsheet-style alphabetic ordering without a fixed side ceiling:
+        // A..Z, AA..AZ, BA..BZ, ... . Comparing length first is equivalent to
+        // a bijective base-26 ordinal for uppercase ASCII designators, while
+        // avoiding integer overflow for long-but-valid prefixes.
+        self.side
+            .len()
+            .cmp(&other.side.len())
+            .then_with(|| self.side.cmp(&other.side))
+            .then_with(|| self.position.cmp(&other.position))
+    }
+}
+
+impl PartialOrd for VinylTrackOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DispatchTrackNumber {
+    Numeric(u32),
+    Vinyl(VinylTrackOrderKey),
+    Unorderable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchTrackOrderContext {
+    disc_number: Option<u32>,
+    track_number: DispatchTrackNumber,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SchedulerTrackOrderKey {
+    Numeric { disc_number: u32, track_number: u32 },
+    Vinyl(VinylTrackOrderKey),
+}
+
 #[derive(Debug, Clone, Default)]
 struct BatchIdentityProbe {
     path_key: String,
@@ -606,6 +701,7 @@ struct BatchIdentityProbe {
     disc_number: Option<u32>,
     total_discs: Option<u32>,
     track_number: Option<u32>,
+    scheduler_track_number: Option<DispatchTrackNumber>,
 }
 
 fn resolve_batch_album_identity(
@@ -732,13 +828,33 @@ fn batch_identity_probe_for_request(req: &PipelineRequest, source_kind: SourceKi
         _ => BatchIdentityProbe::default(),
     };
     probe.path_key = normalized_path_key(&req.container);
-    if let Some((disc, track)) = track_context_from_dispatch_metadata(&req.container) {
-        probe.disc_number = probe.disc_number.or(disc);
-        probe.track_number = probe.track_number.or(Some(track));
+    if let Some(context) = track_order_context_from_dispatch_metadata(&req.container) {
+        probe.disc_number = probe.disc_number.or(context.disc_number);
+        match context.track_number {
+            DispatchTrackNumber::Numeric(track) => {
+                probe.track_number = probe.track_number.or(Some(track));
+                probe.scheduler_track_number = Some(DispatchTrackNumber::Numeric(track));
+            }
+            DispatchTrackNumber::Vinyl(vinyl) => {
+                // A raw lexical TRACKNUMBER is stronger scheduler evidence than a
+                // library-derived numeric suffix. Preserve Vinyl/Unorderable so the
+                // batch cannot silently fall back to filename digits and invent a
+                // canonical ordering.
+                probe.scheduler_track_number = Some(DispatchTrackNumber::Vinyl(vinyl));
+            }
+            DispatchTrackNumber::Unorderable => {
+                probe.scheduler_track_number = Some(DispatchTrackNumber::Unorderable);
+            }
+        }
     }
     probe.disc_number = probe
         .disc_number
         .or_else(|| disc_number_from_dispatch_path(&req.container));
+    if probe.scheduler_track_number.is_none() {
+        if let Some(track) = probe.track_number {
+            probe.scheduler_track_number = Some(DispatchTrackNumber::Numeric(track));
+        }
+    }
     probe.track_number = probe
         .track_number
         .or_else(|| strict_track_number_from_dispatch_path(&req.container));
@@ -848,6 +964,9 @@ fn batch_identity_probe_from_track_metadata(metadata: &TrackMetadata) -> Option<
         .extra
         .get("disctotal")
         .and_then(|value| parse_metadata_ordinal(value));
+    let scheduler_track_number = source_track_number_value(metadata)
+        .map(parse_dispatch_track_number)
+        .or_else(|| metadata.track_number.map(DispatchTrackNumber::Numeric));
 
     let probe = BatchIdentityProbe {
         path_key: String::new(),
@@ -858,6 +977,7 @@ fn batch_identity_probe_from_track_metadata(metadata: &TrackMetadata) -> Option<
         disc_number: metadata.disc_number,
         total_discs,
         track_number: metadata.track_number,
+        scheduler_track_number,
     };
 
     if probe.album.is_none()
@@ -867,6 +987,7 @@ fn batch_identity_probe_from_track_metadata(metadata: &TrackMetadata) -> Option<
         && probe.disc_number.is_none()
         && probe.total_discs.is_none()
         && probe.track_number.is_none()
+        && probe.scheduler_track_number.is_none()
     {
         None
     } else {
@@ -888,6 +1009,10 @@ fn cue_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
         disc_number: disc_number_from_dispatch_path(path),
         total_discs: None,
         track_number: cue.tracks.first().map(|track| track.number),
+        scheduler_track_number: cue
+            .tracks
+            .first()
+            .map(|track| DispatchTrackNumber::Numeric(track.number)),
         path_key: String::new(),
     })
 }
@@ -1244,39 +1369,50 @@ fn prepare_completion_order_album_batch(
         .clone()
         .unwrap_or_else(|| provisional_album_output_dir.to_path_buf());
 
-    match prepare_independent_single_file_album_batch_for_completion_order_dispatch(
-        requests,
+    let primary_requests = requests.clone();
+    let dispatch = match prepare_independent_single_file_album_batch_for_completion_order_dispatch(
+        primary_requests,
         dispatch_album_output_dir.clone(),
         source_grouping_root.to_path_buf(),
     ) {
-        Ok(dispatch) => {
-            log::warn!(
-                "independent single-file album batch at {} cannot prove canonical track ordering ({reason}); publishing through one structural album batch and logging in completion order",
+        Ok(dispatch) => dispatch,
+        Err(primary_error) => {
+            log::error!(
+                "independent single-file album batch at {} could not complete full completion-order dispatch after {reason}: {primary_error}; attempting verified structural publish fallback",
                 source_grouping_root.display()
             );
-            for (item_index, mut request) in
-                item_indices.into_iter().zip(dispatch.requests.into_iter())
-            {
-                if planner_resolved_album_output_dir.is_some() {
-                    if let Some(batch) = request.album_batch.take() {
-                        request.album_batch = Some(
-                            batch.with_planner_resolved_album_output_dir(
-                                dispatch_album_output_dir.clone(),
-                            ),
-                        );
-                    }
-                }
-                if let Some(item) = items.get_mut(item_index) {
-                    item.pipeline_request = Some(request);
+            match prepare_verified_single_file_album_batch_completion_order_fallback(
+                requests,
+                dispatch_album_output_dir.clone(),
+                source_grouping_root.to_path_buf(),
+            ) {
+                Ok(dispatch) => dispatch,
+                Err(fallback_error) => {
+                    log::error!(
+                        "independent single-file album batch at {} could not establish even verified structural publication after {reason}: {fallback_error}; suppressing incremental append",
+                        source_grouping_root.display()
+                    );
+                    mark_queued_album_batch_as_ordering_unavailable(items, group);
+                    return;
                 }
             }
         }
-        Err(error) => {
-            log::error!(
-                "independent single-file album batch at {} could not establish structural completion-order publication after {reason}: {error}; failing closed by suppressing incremental append",
-                source_grouping_root.display()
-            );
-            mark_queued_album_batch_as_ordering_unavailable(items, group);
+    };
+
+    log::warn!(
+        "independent single-file album batch at {} cannot prove canonical track ordering ({reason}); publishing through one structural album batch and logging in completion order",
+        source_grouping_root.display()
+    );
+    for (item_index, mut request) in item_indices.into_iter().zip(dispatch.requests.into_iter()) {
+        if planner_resolved_album_output_dir.is_some() {
+            if let Some(batch) = request.album_batch.take() {
+                request.album_batch = Some(
+                    batch.with_planner_resolved_album_output_dir(dispatch_album_output_dir.clone()),
+                );
+            }
+        }
+        if let Some(item) = items.get_mut(item_index) {
+            item.pipeline_request = Some(request);
         }
     }
 }
@@ -1294,6 +1430,82 @@ fn mark_queued_album_batch_as_ordering_unavailable(
             request.suppress_incremental_conversion_log_append = true;
             item.pipeline_request = Some(request);
         }
+    }
+}
+
+fn parse_vinyl_track_order(value: &str) -> Option<VinylTrackOrderKey> {
+    let value = value.trim();
+    let side_len = value
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphabetic())
+        .count();
+    if side_len == 0 || side_len == value.len() {
+        return None;
+    }
+    let side = &value[..side_len];
+    let position = &value[side_len..];
+    if position.is_empty() || !position.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let position = position
+        .parse::<u32>()
+        .ok()
+        .filter(|position| *position > 0)?;
+    Some(VinylTrackOrderKey {
+        side: side.to_ascii_uppercase(),
+        position,
+    })
+}
+
+fn parse_dispatch_track_number(value: &str) -> DispatchTrackNumber {
+    if let Some(vinyl) = parse_vinyl_track_order(value) {
+        return DispatchTrackNumber::Vinyl(vinyl);
+    }
+
+    // Preserve the scheduler's pre-existing numeric TRACKNUMBER semantics for
+    // ordinary numeric metadata (including forms such as `7/12`). Vinyl is an
+    // adjacent extension, not a reason to tighten or redirect the numeric fast
+    // path. Alphabetic malformed values still fail this leading-numeric parse
+    // and therefore remain explicitly unorderable.
+    if let Some(track) = parse_metadata_ordinal(value) {
+        return DispatchTrackNumber::Numeric(track);
+    }
+    DispatchTrackNumber::Unorderable
+}
+
+fn merge_dispatch_track_number(
+    current: Option<DispatchTrackNumber>,
+    candidate: Option<DispatchTrackNumber>,
+) -> Option<DispatchTrackNumber> {
+    match candidate {
+        // Match the old numeric-reader behavior when duplicate TRACKNUMBER
+        // fields exist: a later malformed field must not erase earlier valid
+        // evidence, but a malformed field must remain visible when it is the
+        // only evidence so filename digits cannot silently manufacture order.
+        Some(DispatchTrackNumber::Unorderable) => {
+            current.or(Some(DispatchTrackNumber::Unorderable))
+        }
+        Some(valid) => Some(valid),
+        None => current,
+    }
+}
+
+fn source_track_number_value(metadata: &TrackMetadata) -> Option<&str> {
+    metadata.extra.iter().find_map(|(marker_key, marker_value)| {
+        let source_key = source_text_tag_key_from_extra(&metadata.extra, marker_key, marker_value)?;
+        (source_key.eq_ignore_ascii_case("TRACKNUMBER") || source_key.eq_ignore_ascii_case("TRACK"))
+            .then_some(marker_value.as_str())
+    })
+}
+
+#[cfg(test)]
+fn numeric_track_context(
+    context: DispatchTrackOrderContext,
+) -> Option<(Option<u32>, u32)> {
+    match context.track_number {
+        DispatchTrackNumber::Numeric(track) => Some((context.disc_number, track)),
+        DispatchTrackNumber::Vinyl(_) | DispatchTrackNumber::Unorderable => None,
     }
 }
 
@@ -1327,34 +1539,45 @@ pub(crate) fn has_strict_track_prefix_separator(rest: &str) -> bool {
     matches!(trimmed.chars().next(), Some('-' | '_' | '.'))
 }
 
-fn track_context_from_dispatch_metadata(path: &Path) -> Option<(Option<u32>, u32)> {
+fn track_order_context_from_dispatch_metadata(path: &Path) -> Option<DispatchTrackOrderContext> {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase());
 
     match extension.as_deref() {
-        Some("flac") => flac_vorbis_comment_track_context(path)
-            .or_else(|| id3v2_track_context(path))
-            .or_else(|| apev2_track_context(path)),
-        Some("mp3") | Some("aif") | Some("aiff") => id3v2_track_context(path)
-            .or_else(|| id3v1_track_context(path))
-            .or_else(|| apev2_track_context(path)),
-        Some("ape") | Some("wv") | Some("mpc") | Some("mp+") => apev2_track_context(path)
-            .or_else(|| id3v2_track_context(path))
-            .or_else(|| id3v1_track_context(path)),
-        _ => id3v2_track_context(path)
-            .or_else(|| id3v1_track_context(path))
-            .or_else(|| apev2_track_context(path)),
+        Some("flac") => flac_vorbis_comment_track_order_context(path)
+            .or_else(|| id3v2_track_order_context(path))
+            .or_else(|| apev2_track_order_context(path)),
+        Some("mp3") | Some("aif") | Some("aiff") => id3v2_track_order_context(path)
+            .or_else(|| id3v1_track_context(path).map(|(disc_number, track)| DispatchTrackOrderContext {
+                disc_number,
+                track_number: DispatchTrackNumber::Numeric(track),
+            }))
+            .or_else(|| apev2_track_order_context(path)),
+        Some("ape") | Some("wv") | Some("mpc") | Some("mp+") => apev2_track_order_context(path)
+            .or_else(|| id3v2_track_order_context(path))
+            .or_else(|| id3v1_track_context(path).map(|(disc_number, track)| DispatchTrackOrderContext {
+                disc_number,
+                track_number: DispatchTrackNumber::Numeric(track),
+            })),
+        _ => id3v2_track_order_context(path)
+            .or_else(|| id3v1_track_context(path).map(|(disc_number, track)| DispatchTrackOrderContext {
+                disc_number,
+                track_number: DispatchTrackNumber::Numeric(track),
+            }))
+            .or_else(|| apev2_track_order_context(path)),
     }
 }
 
-fn flac_vorbis_comment_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
+fn flac_vorbis_comment_track_order_context(path: &Path) -> Option<DispatchTrackOrderContext> {
     let mut file = fs::File::open(path).ok()?;
-    read_flac_vorbis_comment_track_context(&mut file)
+    read_flac_vorbis_comment_track_order_context(&mut file)
 }
 
-fn read_flac_vorbis_comment_track_context<R: Read + Seek>(reader: &mut R) -> Option<(Option<u32>, u32)> {
+fn read_flac_vorbis_comment_track_order_context<R: Read + Seek>(
+    reader: &mut R,
+) -> Option<DispatchTrackOrderContext> {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic).ok()?;
     if &magic != b"fLaC" {
@@ -1373,7 +1596,7 @@ fn read_flac_vorbis_comment_track_context<R: Read + Seek>(reader: &mut R) -> Opt
         if block_type == 4 {
             let mut block = vec![0u8; length];
             reader.read_exact(&mut block).ok()?;
-            return parse_vorbis_comment_track_context(&block);
+            return parse_vorbis_comment_track_order_context(&block);
         }
 
         reader.seek(SeekFrom::Current(i64::try_from(length).ok()?)).ok()?;
@@ -1385,7 +1608,17 @@ fn read_flac_vorbis_comment_track_context<R: Read + Seek>(reader: &mut R) -> Opt
 }
 
 #[cfg(test)]
+fn read_flac_vorbis_comment_track_context<R: Read + Seek>(reader: &mut R) -> Option<(Option<u32>, u32)> {
+    numeric_track_context(read_flac_vorbis_comment_track_order_context(reader)?)
+}
+
+#[cfg(test)]
 fn parse_flac_vorbis_comment_track_context(bytes: &[u8]) -> Option<(Option<u32>, u32)> {
+    numeric_track_context(parse_flac_vorbis_comment_track_order_context(bytes)?)
+}
+
+#[cfg(test)]
+fn parse_flac_vorbis_comment_track_order_context(bytes: &[u8]) -> Option<DispatchTrackOrderContext> {
     if bytes.len() < 4 || &bytes[..4] != b"fLaC" {
         return None;
     }
@@ -1404,7 +1637,7 @@ fn parse_flac_vorbis_comment_track_context(bytes: &[u8]) -> Option<(Option<u32>,
             return None;
         }
         if block_type == 4 {
-            return parse_vorbis_comment_track_context(&bytes[offset..end]);
+            return parse_vorbis_comment_track_order_context(&bytes[offset..end]);
         }
         offset = end;
         if is_last {
@@ -1414,7 +1647,7 @@ fn parse_flac_vorbis_comment_track_context(bytes: &[u8]) -> Option<(Option<u32>,
     None
 }
 
-fn parse_vorbis_comment_track_context(block: &[u8]) -> Option<(Option<u32>, u32)> {
+fn parse_vorbis_comment_track_order_context(block: &[u8]) -> Option<DispatchTrackOrderContext> {
     let mut offset = 0usize;
     let vendor_len = read_le_u32(block, &mut offset)? as usize;
     offset = offset.checked_add(vendor_len)?;
@@ -1437,7 +1670,10 @@ fn parse_vorbis_comment_track_context(block: &[u8]) -> Option<(Option<u32>, u32)
         };
         match key.trim().to_ascii_uppercase().as_str() {
             "TRACKNUMBER" | "TRACK" => {
-                track_number = parse_metadata_ordinal(value).or(track_number);
+                track_number = merge_dispatch_track_number(
+                    track_number,
+                    Some(parse_dispatch_track_number(value)),
+                );
             }
             "DISCNUMBER" | "DISC" => {
                 disc_number = parse_metadata_ordinal(value).or(disc_number);
@@ -1445,10 +1681,13 @@ fn parse_vorbis_comment_track_context(block: &[u8]) -> Option<(Option<u32>, u32)
             _ => {}
         }
     }
-    track_number.map(|track| (disc_number, track))
+    track_number.map(|track_number| DispatchTrackOrderContext {
+        disc_number,
+        track_number,
+    })
 }
 
-fn id3v2_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
+fn id3v2_track_order_context(path: &Path) -> Option<DispatchTrackOrderContext> {
     let mut file = fs::File::open(path).ok()?;
     let mut header = [0u8; 10];
     file.read_exact(&mut header).ok()?;
@@ -1465,10 +1704,19 @@ fn id3v2_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
     }
     let mut body = vec![0u8; tag_size];
     file.read_exact(&mut body).ok()?;
-    parse_id3v2_track_context(major, header[5], &body)
+    parse_id3v2_track_order_context(major, header[5], &body)
 }
 
+#[cfg(test)]
 fn parse_id3v2_track_context(major: u8, flags: u8, body: &[u8]) -> Option<(Option<u32>, u32)> {
+    numeric_track_context(parse_id3v2_track_order_context(major, flags, body)?)
+}
+
+fn parse_id3v2_track_order_context(
+    major: u8,
+    flags: u8,
+    body: &[u8],
+) -> Option<DispatchTrackOrderContext> {
     let deunsynchronized;
     let body = if id3v2_tag_uses_unsynchronization(flags) {
         deunsynchronized = id3v2_deunsynchronize(body);
@@ -1499,7 +1747,12 @@ fn parse_id3v2_track_context(major: u8, flags: u8, body: &[u8]) -> Option<(Optio
                 break;
             }
             match id {
-                b"TRK" => track_number = parse_id3_text_ordinal(&body[offset..end]).or(track_number),
+                b"TRK" => {
+                    track_number = merge_dispatch_track_number(
+                        track_number,
+                        parse_id3_text_track_number(&body[offset..end]),
+                    );
+                }
                 b"TPA" => disc_number = parse_id3_text_ordinal(&body[offset..end]).or(disc_number),
                 _ => {}
             }
@@ -1524,7 +1777,12 @@ fn parse_id3v2_track_context(major: u8, flags: u8, body: &[u8]) -> Option<(Optio
                 break;
             }
             match id {
-                b"TRCK" => track_number = parse_id3_text_ordinal(&body[offset..end]).or(track_number),
+                b"TRCK" => {
+                    track_number = merge_dispatch_track_number(
+                        track_number,
+                        parse_id3_text_track_number(&body[offset..end]),
+                    );
+                }
                 b"TPOS" => disc_number = parse_id3_text_ordinal(&body[offset..end]).or(disc_number),
                 _ => {}
             }
@@ -1532,7 +1790,10 @@ fn parse_id3v2_track_context(major: u8, flags: u8, body: &[u8]) -> Option<(Optio
         }
     }
 
-    track_number.map(|track| (disc_number, track))
+    track_number.map(|track_number| DispatchTrackOrderContext {
+        disc_number,
+        track_number,
+    })
 }
 
 fn id3v2_tag_uses_unsynchronization(flags: u8) -> bool {
@@ -1567,6 +1828,11 @@ fn id3v2_frame_start_offset(major: u8, flags: u8, body: &[u8]) -> Option<usize> 
         return size.checked_add(4).filter(|offset| *offset <= body.len());
     }
     Some(0)
+}
+
+fn parse_id3_text_track_number(frame: &[u8]) -> Option<DispatchTrackNumber> {
+    let value = decode_id3_text_frame(frame)?;
+    Some(parse_dispatch_track_number(value.trim_matches(char::from(0))))
 }
 
 fn parse_id3_text_ordinal(frame: &[u8]) -> Option<u32> {
@@ -1632,7 +1898,7 @@ fn parse_id3v1_track_context(tag: &[u8]) -> Option<(Option<u32>, u32)> {
     Some((None, u32::from(track)))
 }
 
-fn apev2_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
+fn apev2_track_order_context(path: &Path) -> Option<DispatchTrackOrderContext> {
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let footer_offset = apev2_footer_offset(&mut file, len)?;
@@ -1662,7 +1928,7 @@ fn apev2_track_context(path: &Path) -> Option<(Option<u32>, u32)> {
     let mut items = vec![0u8; item_bytes_len];
     file.seek(SeekFrom::Start(item_start)).ok()?;
     file.read_exact(&mut items).ok()?;
-    parse_apev2_track_context(&items, item_count)
+    parse_apev2_track_order_context(&items, item_count)
 }
 
 fn apev2_footer_offset(file: &mut fs::File, len: u64) -> Option<u64> {
@@ -1686,7 +1952,15 @@ fn file_has_signature_at(file: &mut fs::File, offset: u64, signature: &[u8]) -> 
     file.read_exact(&mut buf).is_ok() && buf == signature
 }
 
+#[cfg(test)]
 fn parse_apev2_track_context(items: &[u8], item_count: usize) -> Option<(Option<u32>, u32)> {
+    numeric_track_context(parse_apev2_track_order_context(items, item_count)?)
+}
+
+fn parse_apev2_track_order_context(
+    items: &[u8],
+    item_count: usize,
+) -> Option<DispatchTrackOrderContext> {
     let mut offset = 0usize;
     let mut track_number = None;
     let mut disc_number = None;
@@ -1712,13 +1986,23 @@ fn parse_apev2_track_context(items: &[u8], item_count: usize) -> Option<(Option<
         }
         let value = std::str::from_utf8(&items[offset..value_end]).ok()?;
         match key.trim().to_ascii_uppercase().as_str() {
-            "TRACK" | "TRACKNUMBER" => track_number = parse_metadata_ordinal(value).or(track_number),
-            "DISC" | "DISCNUMBER" => disc_number = parse_metadata_ordinal(value).or(disc_number),
+            "TRACK" | "TRACKNUMBER" => {
+                track_number = merge_dispatch_track_number(
+                    track_number,
+                    Some(parse_dispatch_track_number(value)),
+                );
+            }
+            "DISC" | "DISCNUMBER" => {
+                disc_number = parse_metadata_ordinal(value).or(disc_number);
+            }
             _ => {}
         }
         offset = value_end;
     }
-    track_number.map(|track| (disc_number, track))
+    track_number.map(|track_number| DispatchTrackOrderContext {
+        disc_number,
+        track_number,
+    })
 }
 
 fn read_synchsafe_u32(bytes: &[u8]) -> Option<u32> {
@@ -4709,6 +4993,8 @@ mod tests {
         assert_eq!(batch_01.conversion_log_batch_id, batch_02.conversion_log_batch_id);
         assert_eq!(batch_01.expected_track_count, 2);
         assert_eq!(batch_02.expected_track_count, 2);
+        assert!(!batch_01.uses_completion_order());
+        assert!(!batch_02.uses_completion_order());
 
         let order_01 = prepared_01
             .album_batch_track
@@ -4760,6 +5046,7 @@ mod tests {
 
         prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
 
+        let mut coordination_ids = BTreeSet::new();
         let batches = items
             .iter()
             .map(|item| {
@@ -4767,7 +5054,11 @@ mod tests {
                     .pipeline_request
                     .as_ref()
                     .expect("heterogeneous item keeps explicit request");
-                assert!(request.album_batch_track.is_some());
+                let coordination = request
+                    .album_batch_track
+                    .as_ref()
+                    .expect("settings mismatch retains coordination identity");
+                assert!(coordination_ids.insert(coordination.source_ordinal));
                 assert!(!request.suppress_incremental_conversion_log_append);
                 let batch = request
                     .album_batch
@@ -4777,6 +5068,7 @@ mod tests {
                 batch
             })
             .collect::<Vec<_>>();
+        assert_eq!(coordination_ids.len(), 2);
         assert_eq!(
             batches[0].conversion_log_batch_id,
             batches[1].conversion_log_batch_id
@@ -4831,24 +5123,211 @@ mod tests {
     }
 
     #[test]
-    fn vinyl_lettered_tracknumber_tags_dispatch_as_structural_completion_order() {
-        // §1.5 leg (d): the Mazzy Star field shape — A1/B2-style
-        // TRACKNUMBER tag VALUES present but lexically unparseable.
+    fn completion_order_dispatch_validation_error_retains_structural_membership() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_root = temp.path().join("Artist").join("Album");
         std::fs::create_dir_all(&album_root).expect("album dir");
-        let track_a = album_root.join("Fade Into You.wv");
-        let track_b = album_root.join("Five String Serenade.wv");
-        std::fs::write(&track_a, fake_apev2_with_items(&[("Track", "A1")]))
-            .expect("track a apev2");
-        std::fs::write(&track_b, fake_apev2_with_items(&[("Track", "B2")]))
-            .expect("track b apev2");
+        let track_a = album_root.join("First.flac");
+        let track_b = album_root.join("Second.flac");
+        std::fs::write(&track_a, b"not real audio; dispatch test only").expect("track a");
+        std::fs::write(&track_b, b"not real audio; dispatch test only").expect("track b");
 
-        let req_a = processor_dispatch_request_for_path(temp.path(), "item-a", "job-a", track_a);
-        let req_b = processor_dispatch_request_for_path(temp.path(), "item-b", "job-b", track_b);
+        let mut req_a =
+            processor_dispatch_request_for_path(temp.path(), "item-a", "job-a", track_a);
+        let mut req_b =
+            processor_dispatch_request_for_path(temp.path(), "item-b", "job-b", track_b);
+        // Force the primary completion-order helper through validate_request()'s
+        // InvalidTemplate branch. The scheduler safety net must preserve the
+        // already-verified same-album publish contract instead of converting
+        // these siblings into colliding singleton publishes.
+        req_a.naming.template.clear();
+        req_b.naming.template.clear();
+
         let mut items = vec![
             conversion_item_with_pipeline_request("item-a", req_a),
             conversion_item_with_pipeline_request("item-b", req_b),
+        ];
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let mut coordination_ids = BTreeSet::new();
+        let batches = items
+            .iter()
+            .map(|item| {
+                let request = item.pipeline_request.as_ref().expect("request retained");
+                assert!(!request.suppress_incremental_conversion_log_append);
+                let coordination = request
+                    .album_batch_track
+                    .as_ref()
+                    .expect("dispatch validation error retains coordination identity");
+                assert!(coordination_ids.insert(coordination.source_ordinal));
+                let batch = request
+                    .album_batch
+                    .as_ref()
+                    .expect("dispatch validation error must retain structural membership");
+                assert!(batch.uses_completion_order());
+                batch
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(coordination_ids.len(), 2);
+        assert_eq!(
+            batches[0].conversion_log_batch_id,
+            batches[1].conversion_log_batch_id
+        );
+        assert_eq!(batches[0].expected_track_count, 2);
+    }
+
+    #[test]
+    fn vinyl_track_order_parser_is_generic_case_insensitive_and_numeric_within_side() {
+        let mut values = [
+            "E2", "D2", "C2", "B2", "A10", "A9", "A2", "A1", "b1", "c1", "d1", "e1",
+        ]
+        .into_iter()
+        .map(|value| (parse_vinyl_track_order(value).expect("valid vinyl order"), value))
+        .collect::<Vec<_>>();
+        values.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            values.into_iter().map(|(_, raw)| raw).collect::<Vec<_>>(),
+            vec!["A1", "A2", "A9", "A10", "b1", "B2", "c1", "C2", "d1", "D2", "e1", "E2"]
+        );
+        assert_eq!(parse_vinyl_track_order("a1"), parse_vinyl_track_order("A1"));
+        assert_eq!(parse_vinyl_track_order("c2"), parse_vinyl_track_order("C2"));
+        assert_eq!(parse_vinyl_track_order("e3"), parse_vinyl_track_order("E3"));
+
+        let z = parse_vinyl_track_order("Z1").expect("Z side");
+        let aa = parse_vinyl_track_order("AA1").expect("AA side");
+        let ab = parse_vinyl_track_order("AB1").expect("AB side");
+        assert!(z < aa && aa < ab, "multi-letter sides remain monotonic after Z");
+
+        for rejected in ["", "A", "1", "A0", "A1/2", "A 1", "A-1", "1A"] {
+            assert_eq!(parse_vinyl_track_order(rejected), None, "{rejected}");
+        }
+        assert_eq!(parse_dispatch_track_number("7/12"), DispatchTrackNumber::Numeric(7));
+        assert_eq!(parse_dispatch_track_number("7 of 12"), DispatchTrackNumber::Numeric(7));
+        assert_eq!(parse_dispatch_track_number("B2/5"), DispatchTrackNumber::Unorderable);
+    }
+
+    #[test]
+    fn source_vinyl_tracknumber_is_scheduler_evidence_without_metadata_mutation() {
+        let mut metadata = TrackMetadata {
+            track_number: Some(2),
+            ..TrackMetadata::default()
+        };
+        crate::convert::pipeline::insert_source_text_tag(
+            &mut metadata.extra,
+            "TRACKNUMBER",
+            "C2",
+        );
+        let before = metadata.extra.clone();
+
+        let probe = batch_identity_probe_from_track_metadata(&metadata)
+            .expect("vinyl source metadata produces a batch probe");
+
+        assert_eq!(
+            probe.scheduler_track_number,
+            Some(DispatchTrackNumber::Vinyl(VinylTrackOrderKey {
+                side: "C".to_string(),
+                position: 2,
+            }))
+        );
+        assert_eq!(metadata.track_number, Some(2));
+        assert_eq!(metadata.extra, before, "scheduler probing must not rewrite source tags");
+    }
+
+    #[test]
+    fn vinyl_lettered_tracknumber_tags_dispatch_in_proven_side_position_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let input = [
+            ("E2", "item-e2"),
+            ("C2", "item-c2"),
+            ("A10", "item-a10"),
+            ("B2", "item-b2"),
+            ("D2", "item-d2"),
+            ("D1", "item-d1"),
+            ("A2", "item-a2"),
+            ("E1", "item-e1"),
+            ("C1", "item-c1"),
+            ("B1", "item-b1"),
+            ("A1", "item-a1"),
+        ];
+        let expected_order = ["A1", "A2", "A10", "B1", "B2", "C1", "C2", "D1", "D2", "E1", "E2"];
+        let mut items = Vec::new();
+        for (raw_track_number, item_id) in input {
+            let path = album_root.join(format!("{item_id}.flac"));
+            std::fs::write(
+                &path,
+                fake_flac_with_vorbis_comments(&[
+                    ("ALBUM", "Vinyl Album"),
+                    ("TRACKNUMBER", raw_track_number),
+                ]),
+            )
+            .expect("vinyl FLAC fixture");
+            let request = processor_dispatch_request_for_path(
+                temp.path(),
+                item_id,
+                &format!("job-{item_id}"),
+                path,
+            );
+            items.push(conversion_item_with_pipeline_request(item_id, request));
+        }
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let mut by_ordinal = BTreeMap::new();
+        let mut batch_id = None;
+        for item in &items {
+            let request = item.pipeline_request.as_ref().expect("request retained");
+            assert!(!request.suppress_incremental_conversion_log_append);
+            let batch = request
+                .album_batch
+                .as_ref()
+                .expect("vinyl-numbered siblings share an album batch");
+            assert!(
+                !batch.uses_completion_order(),
+                "fully parseable vinyl numbering must use proven scheduler order"
+            );
+            assert_eq!(batch.expected_track_count, expected_order.len());
+            if let Some(existing) = batch_id.as_ref() {
+                assert_eq!(existing, &batch.conversion_log_batch_id);
+            } else {
+                batch_id = Some(batch.conversion_log_batch_id.clone());
+            }
+            let track = request
+                .album_batch_track
+                .as_ref()
+                .expect("vinyl track receives internal coordination identity");
+            assert_eq!(track.source_ordinal, track.track_number);
+            assert!(track.disc_number.is_none());
+            let raw = item.id.strip_prefix("item-").expect("item id").to_ascii_uppercase();
+            by_ordinal.insert(track.source_ordinal, raw);
+        }
+        assert!(batch_id.is_some());
+        assert_eq!(
+            by_ordinal.into_values().collect::<Vec<_>>(),
+            expected_order.iter().map(|value| value.to_ascii_uppercase()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn malformed_explicit_vinyl_tracknumber_uses_structural_fallback_not_filename_guessing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let first = album_root.join("01 - First.wv");
+        let second = album_root.join("02 - Second.wv");
+        std::fs::write(&first, fake_apev2_with_items(&[("Album", "Vinyl Album"), ("Track", "A1")])).expect("first fixture");
+        std::fs::write(&second, fake_apev2_with_items(&[("Album", "Vinyl Album"), ("Track", "B2/5")])).expect("second fixture");
+
+        let mut items = vec![
+            conversion_item_with_pipeline_request(
+                "item-a",
+                processor_dispatch_request_for_path(temp.path(), "item-a", "job-a", first),
+            ),
+            conversion_item_with_pipeline_request(
+                "item-b",
+                processor_dispatch_request_for_path(temp.path(), "item-b", "job-b", second),
+            ),
         ];
         prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
 
@@ -4857,19 +5336,70 @@ mod tests {
             .map(|item| {
                 let request = item.pipeline_request.as_ref().expect("request retained");
                 assert!(!request.suppress_incremental_conversion_log_append);
-                let batch = request
-                    .album_batch
-                    .as_ref()
-                    .expect("vinyl-lettered tags keep structural membership");
+                let batch = request.album_batch.as_ref().expect("shared structural batch");
                 assert!(batch.uses_completion_order());
-                batch
+                batch.conversion_log_batch_id.clone()
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            batches[0].conversion_log_batch_id,
-            batches[1].conversion_log_batch_id
-        );
-        assert_eq!(batches[0].expected_track_count, 2);
+        assert_eq!(batches[0], batches[1]);
+    }
+
+    #[test]
+    fn mixed_numeric_and_vinyl_tracknumbers_preserve_album_via_structural_completion_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let vinyl = album_root.join("vinyl.wv");
+        let numeric = album_root.join("numeric.wv");
+        std::fs::write(&vinyl, fake_apev2_with_items(&[("Album", "Vinyl Album"), ("Track", "A1")]))
+            .expect("vinyl fixture");
+        std::fs::write(&numeric, fake_apev2_with_items(&[("Album", "Vinyl Album"), ("Track", "2")]))
+            .expect("numeric fixture");
+
+        let mut items = vec![
+            conversion_item_with_pipeline_request(
+                "item-vinyl",
+                processor_dispatch_request_for_path(
+                    temp.path(),
+                    "item-vinyl",
+                    "job-vinyl",
+                    vinyl,
+                ),
+            ),
+            conversion_item_with_pipeline_request(
+                "item-numeric",
+                processor_dispatch_request_for_path(
+                    temp.path(),
+                    "item-numeric",
+                    "job-numeric",
+                    numeric,
+                ),
+            ),
+        ];
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let mut batch_id = None;
+        let mut coordination_ids = BTreeSet::new();
+        for item in &items {
+            let request = item.pipeline_request.as_ref().expect("request retained");
+            assert!(!request.suppress_incremental_conversion_log_append);
+            let batch = request
+                .album_batch
+                .as_ref()
+                .expect("mixed numbering remains one structural album batch");
+            assert!(batch.uses_completion_order());
+            if let Some(existing) = batch_id.as_ref() {
+                assert_eq!(existing, &batch.conversion_log_batch_id);
+            } else {
+                batch_id = Some(batch.conversion_log_batch_id.clone());
+            }
+            let coordination = request
+                .album_batch_track
+                .as_ref()
+                .expect("structural fallback retains distinct coordination identities");
+            assert!(coordination_ids.insert(coordination.source_ordinal));
+        }
+        assert_eq!(coordination_ids.len(), 2);
     }
 
     #[test]
@@ -5156,6 +5686,7 @@ mod tests {
             disc_number,
             total_discs,
             track_number,
+            scheduler_track_number: track_number.map(DispatchTrackNumber::Numeric),
         }
     }
 
@@ -5463,6 +5994,21 @@ FILE "disc2.flac" WAVE
             ("TRACKNUMBER", "07/12"),
         ]);
         assert_eq!(parse_flac_vorbis_comment_track_context(&bytes), Some((Some(2), 7)));
+    }
+
+    #[test]
+    fn flac_metadata_track_context_preserves_generic_vinyl_scheduler_order() {
+        let bytes = fake_flac_with_vorbis_comments(&[("TRACKNUMBER", "c10")]);
+        let context = parse_flac_vorbis_comment_track_order_context(&bytes)
+            .expect("vinyl FLAC track context");
+        assert_eq!(context.disc_number, None);
+        assert_eq!(
+            context.track_number,
+            DispatchTrackNumber::Vinyl(VinylTrackOrderKey {
+                side: "C".to_string(),
+                position: 10,
+            })
+        );
     }
 
     #[test]

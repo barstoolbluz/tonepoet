@@ -1609,7 +1609,7 @@ fn browse_search_controls_y(area: Rect) -> u16 {
     area.y + 2
 }
 
-fn browse_entry_y_start(area: Rect, search_active: bool) -> u16 {
+pub(super) fn browse_entry_y_start(area: Rect, search_active: bool) -> u16 {
     area.y + 2 + browse_search_rows(search_active)
 }
 

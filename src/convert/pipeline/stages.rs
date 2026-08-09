@@ -671,6 +671,101 @@ pub(crate) fn prepare_independent_single_file_album_batch_for_completion_order_d
     )
 }
 
+/// Structural safety net for an already-grouped independent single-file album.
+///
+/// The queue dispatcher has already established that these requests are siblings
+/// for one album output root. This helper intentionally re-checks only the
+/// invariants needed to make shared publication safe, rather than rerunning all
+/// request validation that caused the primary completion-order dispatch to fail.
+/// It never widens grouping or publish collision policy.
+pub(crate) fn prepare_verified_single_file_album_batch_completion_order_fallback(
+    mut requests: Vec<PipelineRequest>,
+    album_output_dir: PathBuf,
+    source_grouping_root: PathBuf,
+) -> Result<AlbumBatchDispatch, RequestValidationError> {
+    if requests.is_empty() {
+        return Err(RequestValidationError::InvalidStagePolicy(
+            "completion-order fallback requires at least one request".to_string(),
+        ));
+    }
+
+    let normalized_grouping_root = normalize_path(&source_grouping_root);
+    let mut source_paths = Vec::with_capacity(requests.len());
+    for request in &requests {
+        match detect_source_kind(request) {
+            Ok(SourceKind::SingleFile) => {}
+            Ok(kind) => {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "completion-order fallback accepts only independent single-file jobs, got {kind:?} for {}",
+                    request.container.display()
+                )));
+            }
+            Err(error) => {
+                return Err(RequestValidationError::InvalidStagePolicy(format!(
+                    "completion-order fallback could not classify {}: {error}",
+                    request.container.display()
+                )));
+            }
+        }
+        let Some(track) = request.album_batch_track.as_ref() else {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "completion-order fallback for {} requires dispatcher-supplied album_batch_track",
+                request.item_id
+            )));
+        };
+        if track.source_ordinal == 0 || track.track_number == 0 {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "completion-order fallback track context for {} must use nonzero source_ordinal and track_number",
+                request.item_id
+            )));
+        }
+        if request.album_batch.is_some() {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "completion-order fallback for {} refuses to replace an existing album_batch",
+                request.item_id
+            )));
+        }
+        let normalized_container = normalize_path(&request.container);
+        if normalized_container != normalized_grouping_root
+            && !path_is_under_root(&normalized_container, &normalized_grouping_root)
+        {
+            return Err(RequestValidationError::InvalidStagePolicy(format!(
+                "completion-order fallback source {} is not under source grouping root {}",
+                normalized_container.display(),
+                normalized_grouping_root.display()
+            )));
+        }
+        source_paths.push(normalized_container);
+    }
+
+    let mut album_batch = AlbumBatchContext::from_dispatcher_source_count(
+        new_conversion_log_batch_id(),
+        requests.len(),
+        album_output_dir,
+        source_grouping_root,
+    )
+    .map_err(RequestValidationError::InvalidStagePolicy)?
+    .with_source_paths(source_paths)
+    .with_ordering(AlbumBatchOrdering::CompletionOrder);
+    if let Some(identity) = requests
+        .iter()
+        .find_map(|request| request.batch_resolved_identity.clone())
+    {
+        album_batch = album_batch.with_resolved_identity(identity);
+    }
+
+    for request in &mut requests {
+        request.album_batch = Some(album_batch.clone());
+        request.expected_album_track_count = None;
+        request.suppress_incremental_conversion_log_append = false;
+    }
+
+    Ok(AlbumBatchDispatch {
+        album_batch,
+        requests,
+    })
+}
+
 fn prepare_independent_single_file_album_batch_for_dispatch_with_policy(
     mut requests: Vec<PipelineRequest>,
     conversion_log_batch_id: String,
