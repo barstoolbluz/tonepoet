@@ -2673,6 +2673,19 @@ fn set_options_menu_panel(app: &mut AppState, menu: BrowseOptionsMenu) {
     ensure_options_menu_highlight(app);
 }
 
+/// The submenu a root Options row opens, if it is a submenu-opener. Leaf/action
+/// rows (Show Hidden, Save Layout, …) and submenu choice rows return `None`.
+fn options_button_submenu(button: TuiButton) -> Option<BrowseOptionsMenu> {
+    match button {
+        TuiButton::BrowseOptionsLayout => Some(BrowseOptionsMenu::Layout),
+        TuiButton::BrowseOptionsColumns => Some(BrowseOptionsMenu::Columns),
+        TuiButton::BrowseOptionsSort => Some(BrowseOptionsMenu::Sort),
+        TuiButton::BrowseOptionsFilter => Some(BrowseOptionsMenu::Filter),
+        TuiButton::BrowseOptionsArchiveListing => Some(BrowseOptionsMenu::ArchiveListing),
+        _ => None,
+    }
+}
+
 fn handle_browse_options_menu_key(
     app: &mut AppState,
     key: &KeyEvent,
@@ -2708,10 +2721,24 @@ fn handle_browse_options_menu_key(
             back_or_close_options_menu_with_focus(app);
             true
         }
+        (KeyCode::Right, KeyModifiers::NONE) => {
+            // Right descends into a submenu (the mirror of Left = back/ascend).
+            // On a submenu-opener row it opens that submenu; on any other row it
+            // is a consumed no-op. Either way Right must NOT reach the Browse
+            // pane, where it would open the highlighted folder.
+            clear_options_menu_hover_for_keyboard(app);
+            ensure_options_menu_highlight(app);
+            if let Some(submenu) =
+                highlighted_options_menu_button(app).and_then(options_button_submenu)
+            {
+                set_options_menu_panel(app, submenu);
+            }
+            true
+        }
         // Modified forms are intentionally not bindings, but while the menu
         // is open they must not leak through to range selection or Browse
         // navigation underneath the dropdown.
-        (KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Left, _)
+        (KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Left | KeyCode::Right, _)
         | (KeyCode::Char(' '), _) => true,
         _ => false,
     }
@@ -3209,6 +3236,42 @@ mod options_menu_hover_tests {
 
         handle_key(&mut app, key(KeyCode::Down), &tx);
         assert_eq!(app.browse.selected_index, 1);
+    }
+
+    #[test]
+    fn options_right_opens_submenu_and_does_not_reach_browse_pane() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        // Down to the Layout row (a submenu opener).
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsLayout)
+        );
+
+        // Right descends into the submenu (mirror of Left). If Right leaked to
+        // the Browse pane the menu would still be Root; landing on Layout proves
+        // the menu captured it.
+        handle_key(&mut app, key(KeyCode::Right), &tx);
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Layout);
+        assert_eq!(app.browse.options_menu_highlight, Some(0));
+        assert_eq!(app.browse.selected_index, 0);
+    }
+
+    #[test]
+    fn options_right_on_leaf_row_is_a_consumed_noop() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        // Root opens highlighting the first activatable (leaf) row.
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsShowHidden)
+        );
+        // Right on a leaf opens no submenu and is consumed (menu stays open on
+        // Root, file cursor frozen) — it must not fall through to the file pane.
+        handle_key(&mut app, key(KeyCode::Right), &tx);
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Root);
+        assert_eq!(app.browse.selected_index, 0);
     }
 
     #[test]
