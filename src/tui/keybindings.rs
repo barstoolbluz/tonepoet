@@ -6767,16 +6767,10 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         }
 
         // Force archive listing even when Performance > Browsing would normally skip it.
-        (KeyCode::Char('l'), KeyModifiers::NONE) => {
-            if let Some(entry) = app.browse.selected_entry() {
-                if matches!(entry.kind, EntryKind::Archive) && !app.browse.is_in_archive() {
-                    start_browse_archive_listing(app, entry.path.clone(), tx, true);
-                } else {
-                    app.browse.type_ahead_push('l');
-                    selection_may_have_changed = true;
-                }
-            }
-        }
+        // NOTE: no plain-letter action bindings in the Browse file-list. Plain
+        // letters are reserved for type-ahead (user directive). Archive listing
+        // is reachable via Enter/Right on an archive and the right-click menu;
+        // there is intentionally no vi-style `l`/`j`/`k`/`g` here.
 
         // Rename stays available through the context menu and `:rename`.
         // Do not bind F-keys here: they are reserved by terminal multiplexers
