@@ -769,6 +769,14 @@ fn draw_options_menu(
         archive_listing_mode,
     );
     let active_parent = active_options_parent_button(browse.options_menu);
+    let root_selected = if browse.options_menu == BrowseOptionsMenu::Root {
+        browse
+            .options_menu_highlight
+            .and_then(|index| root_rows.get(index))
+            .and_then(|(_, button)| *button)
+    } else {
+        active_parent
+    };
 
     render_options_menu_panel(
         f,
@@ -777,7 +785,7 @@ fn draw_options_menu(
         &root_rows,
         buttons,
         hover,
-        active_parent,
+        root_selected,
         theme,
     );
 
@@ -785,6 +793,10 @@ fn draw_options_menu(
         options_submenu_rows(browse, archive_listing_mode),
         geometry.submenu_area,
     ) {
+        let submenu_selected = browse
+            .options_menu_highlight
+            .and_then(|index| submenu_rows.get(index))
+            .and_then(|(_, button)| *button);
         render_options_menu_panel(
             f,
             submenu_area,
@@ -792,7 +804,7 @@ fn draw_options_menu(
             &submenu_rows,
             buttons,
             hover,
-            None,
+            submenu_selected,
             theme,
         );
     }
@@ -1098,7 +1110,7 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
         && y < area.y.saturating_add(area.height)
 }
 
-fn options_root_rows(browse: &BrowseState) -> Vec<(String, Option<TuiButton>)> {
+pub(super) fn options_root_rows(browse: &BrowseState) -> Vec<(String, Option<TuiButton>)> {
     vec![
         (
             (if browse.show_hidden { " ● Show hidden files" } else { " ○ Show hidden files" }).to_string(),
@@ -1124,7 +1136,7 @@ fn options_root_rows(browse: &BrowseState) -> Vec<(String, Option<TuiButton>)> {
     ]
 }
 
-fn active_options_parent_button(menu: BrowseOptionsMenu) -> Option<TuiButton> {
+pub(super) fn active_options_parent_button(menu: BrowseOptionsMenu) -> Option<TuiButton> {
     match menu {
         BrowseOptionsMenu::Layout => Some(TuiButton::BrowseOptionsLayout),
         BrowseOptionsMenu::Columns => Some(TuiButton::BrowseOptionsColumns),
@@ -1135,7 +1147,7 @@ fn active_options_parent_button(menu: BrowseOptionsMenu) -> Option<TuiButton> {
     }
 }
 
-fn options_submenu_rows(
+pub(super) fn options_submenu_rows(
     browse: &BrowseState,
     archive_listing_mode: &str,
 ) -> Option<(&'static str, Vec<(String, Option<TuiButton>)>)> {
@@ -1371,6 +1383,17 @@ fn render_options_menu_panel(
         if let (Some(button), Some(hitbox)) = (button, options_menu_row_hitbox(area, idx)) {
             buttons.record_button(*button, hitbox);
         }
+    }
+}
+
+pub(super) fn active_options_menu_rows(
+    browse: &BrowseState,
+    archive_listing_mode: &str,
+) -> Option<Vec<(String, Option<TuiButton>)>> {
+    match browse.options_menu {
+        BrowseOptionsMenu::Closed => None,
+        BrowseOptionsMenu::Root => Some(options_root_rows(browse)),
+        _ => options_submenu_rows(browse, archive_listing_mode).map(|(_, rows)| rows),
     }
 }
 

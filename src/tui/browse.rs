@@ -2803,6 +2803,11 @@ pub struct BrowseState {
     /// Configurable visible columns and toolbar options-menu state.
     pub columns: Vec<BrowseColumn>,
     pub options_menu: BrowseOptionsMenu,
+    /// Row index highlighted for keyboard navigation in the currently active
+    /// Options-menu panel. `None` means no row has been established yet; the
+    /// key-routing layer resolves that to the first activatable row from the
+    /// renderer's row model when the menu opens or changes panel.
+    pub options_menu_highlight: Option<usize>,
 
     /// Last frame area used to render Browse. Mouse hit-testing for floating
     /// Browse overlays must use this rendered coordinate space rather than
@@ -3263,6 +3268,7 @@ impl BrowseState {
             browse_title_last_click: None,
             columns,
             options_menu: BrowseOptionsMenu::Closed,
+            options_menu_highlight: None,
             last_render_area: None,
             nav_history: vec![start_dir],
             nav_history_index: 0,
@@ -3275,6 +3281,7 @@ impl BrowseState {
         // after AppState construction, allowing the first frame to appear even
         // when HOME itself (or one of its children) is enormous.
         state.sync_tree_shell_to_current_dir();
+        state.mark_current_tree_disclosure_unresolved();
         state
     }
 
@@ -3477,6 +3484,7 @@ impl BrowseState {
 
     pub fn close_options_menu(&mut self) {
         self.options_menu = BrowseOptionsMenu::Closed;
+        self.options_menu_highlight = None;
     }
 
     pub fn back_or_close_options_menu(&mut self) {
@@ -3485,6 +3493,7 @@ impl BrowseState {
             BrowseOptionsMenu::Root => BrowseOptionsMenu::Closed,
             _ => BrowseOptionsMenu::Root,
         };
+        self.options_menu_highlight = None;
     }
 
     pub fn toggle_options_menu(&mut self) {
@@ -3493,6 +3502,7 @@ impl BrowseState {
         } else {
             BrowseOptionsMenu::Root
         };
+        self.options_menu_highlight = None;
     }
 
     pub fn set_visible_height(&mut self, height: usize) {
@@ -3775,14 +3785,36 @@ impl BrowseState {
             .iter()
             .position(|node| node.path == self.current_dir)
         {
-            // While the current listing is in flight we do not yet know
-            // whether the directory has child directories. Optimistically
-            // retain the disclosure affordance; terminal reconciliation clears
-            // it for a true leaf.
-            self.tree_nodes[index].has_children = true;
             self.tree_nodes[index].expanded = true;
             self.tree_cursor = index;
             self.ensure_tree_visible();
+        }
+    }
+
+    /// The current directory is already expanded, so an optimistic disclosure
+    /// marker buys nothing while its listing is unresolved and causes a visible
+    /// flash for a true leaf. Clear only this node before an async listing; the
+    /// first streamed child directory restores the marker, while terminal
+    /// reconciliation leaves a true leaf clear. Collapsed sibling/child nodes
+    /// remain optimistic.
+    fn mark_current_tree_disclosure_unresolved(&mut self) {
+        let index = self
+            .tree_nodes
+            .get(self.tree_cursor)
+            .filter(|node| node.path == self.current_dir)
+            .map(|_| self.tree_cursor)
+            .or_else(|| {
+                self.tree_nodes
+                    .iter()
+                    .position(|node| node.path == self.current_dir)
+            });
+        if let Some(index) = index {
+            let depth = self.tree_nodes[index].depth;
+            let has_materialized_child = self
+                .tree_nodes
+                .get(index + 1)
+                .is_some_and(|node| node.depth > depth);
+            self.tree_nodes[index].has_children = has_materialized_child;
         }
     }
 
@@ -3900,6 +3932,7 @@ impl BrowseState {
     /// worker streams bounded batches; terminal completion remains authoritative.
     fn begin_async_scan(&mut self) {
         self.sync_tree_shell_to_current_dir();
+        self.mark_current_tree_disclosure_unresolved();
 
         // Cancel previous scan if still running.
         if let Some(handle) = self.scan_pending.take() {
@@ -11702,12 +11735,16 @@ mod browse_pane_toggle_tests {
     fn back_or_close_options_menu_returns_from_submenu_before_closing_root() {
         let mut browse = BrowseState::new();
         browse.options_menu = BrowseOptionsMenu::Columns;
+        browse.options_menu_highlight = Some(3);
 
         browse.back_or_close_options_menu();
         assert_eq!(browse.options_menu, BrowseOptionsMenu::Root);
+        assert_eq!(browse.options_menu_highlight, None);
 
+        browse.options_menu_highlight = Some(1);
         browse.back_or_close_options_menu();
         assert_eq!(browse.options_menu, BrowseOptionsMenu::Closed);
+        assert_eq!(browse.options_menu_highlight, None);
 
         browse.back_or_close_options_menu();
         assert_eq!(browse.options_menu, BrowseOptionsMenu::Closed);
@@ -13044,33 +13081,118 @@ mod tests {
         assert!(!state.tree_nodes.iter().any(|node| node.path == stale_child.path));
     }
 
-    #[test]
-    fn optimistic_tree_leaf_resolves_empty_without_wedging() {
+    #[tokio::test]
+    async fn optimistic_tree_leaf_resolves_empty_without_wedging() {
         let td = tempfile::tempdir().expect("tempdir");
         let root = td.path().to_path_buf();
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).expect("empty fixture");
         let mut state = BrowseState::new_with_config_at(
             &crate::config::BrowsingConfig::default(),
             root.clone(),
         );
-        let index = state
-            .tree_nodes
-            .iter()
-            .position(|node| node.path == root)
-            .expect("current tree node");
-        state.tree_nodes[index].expanded = true;
-        state.tree_nodes[index].has_children = true;
-        let child_depth = state.tree_nodes[index].depth + 1;
-        let (handle, _cancel) = TreeScanHandle::new(7, root.clone());
-        state.tree_scan_pending = Some(handle);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        state.set_tx(tx);
 
-        assert!(state.apply_tree_scan_complete(7, &root, child_depth, Vec::new()));
+        state.navigate_to(empty.clone());
+
         let node = state
             .tree_nodes
             .iter()
-            .find(|node| node.path == root)
-            .expect("root retained");
+            .find(|node| node.path == empty)
+            .expect("current tree node");
+        assert!(node.expanded, "current directory stays logically expanded");
+        assert!(
+            !node.has_children,
+            "an unresolved current directory must not flash an optimistic disclosure"
+        );
+
+        let generation = state.pending_scan_generation().expect("async listing pending");
+        assert!(state.finish_dir_scan_if_current(generation, &empty));
+        state.publish_scanned_entries(None, Vec::new(), Vec::new());
+        let node = state
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == empty)
+            .expect("current node retained");
         assert!(!node.has_children);
         assert!(!node.expanded);
+    }
+
+    #[test]
+    fn current_tree_disclosure_reset_does_not_clear_collapsed_sibling_affordance() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        let sibling_path = root.join("sibling");
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root.clone(),
+        );
+        let root_index = state
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == root)
+            .expect("current node");
+        let sibling = BrowseTreeNode {
+            path: sibling_path.clone(),
+            name: "sibling".to_string(),
+            depth: state.tree_nodes[root_index].depth,
+            expanded: false,
+            has_children: true,
+        };
+        state.tree_nodes[root_index].has_children = true;
+        state.tree_nodes.insert(root_index + 1, sibling);
+
+        state.mark_current_tree_disclosure_unresolved();
+
+        let current = state
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == root)
+            .expect("current retained");
+        let sibling = state
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == sibling_path)
+            .expect("sibling retained");
+        assert!(!current.has_children);
+        assert!(sibling.has_children, "collapsed siblings remain optimistic");
+    }
+
+    #[test]
+    fn current_tree_rescan_keeps_disclosure_when_children_are_already_materialized() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        let child_path = root.join("child");
+        let mut state = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(),
+            root.clone(),
+        );
+        let root_index = state
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == root)
+            .expect("current node");
+        state.tree_nodes[root_index].has_children = true;
+        state.tree_nodes.insert(
+            root_index + 1,
+            BrowseTreeNode {
+                path: child_path.clone(),
+                name: "child".to_string(),
+                depth: state.tree_nodes[root_index].depth + 1,
+                expanded: false,
+                has_children: true,
+            },
+        );
+
+        state.mark_current_tree_disclosure_unresolved();
+
+        assert!(state.tree_nodes[root_index].has_children);
+        assert!(state
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == child_path)
+            .is_some_and(|node| node.has_children));
     }
 
     #[test]
@@ -13198,6 +13320,14 @@ mod tests {
         assert_eq!(state.entries.len(), 2);
         assert!(state.entries.iter().any(|entry| entry.path == child.path));
         assert!(state.entries.iter().any(|entry| entry.path == file.path));
+        assert!(
+            state
+                .tree_nodes
+                .iter()
+                .find(|node| node.path == root)
+                .is_some_and(|node| node.has_children),
+            "first streamed child directory must restore the current node disclosure promptly"
+        );
 
         let before = state
             .entries

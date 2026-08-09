@@ -11,8 +11,8 @@ use super::app::*;
 use super::browse::BrowseOptionsMenu;
 use super::button_map::{ScrollbarSurface, TuiButton};
 use super::draw_browse::{
-    browse_toolbar_area_for_screen, options_button_anchor_for_toolbar,
-    options_menu_geometry_for_area, OptionsMenuGeometry,
+    active_options_menu_rows, active_options_parent_button, browse_toolbar_area_for_screen,
+    options_button_anchor_for_toolbar, options_menu_geometry_for_area, OptionsMenuGeometry,
 };
 use super::message::AppMessage;
 use crate::convert::{ConversionOptions, ConversionStatus};
@@ -91,7 +91,19 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         && key.code == KeyCode::Esc
         && app.browse.options_menu.is_open()
     {
-        app.browse.back_or_close_options_menu();
+        back_or_close_options_menu_with_focus(app);
+        return;
+    }
+
+    // The Browse Options dropdown is not a modal overlay, but while it is
+    // open its navigation/activation keys belong to the menu rather than the
+    // Browse panes underneath it. Esc keeps the established first-refusal path
+    // above; the remaining plain menu keys are consumed here before any inline
+    // editor, search, tree, Info, or file-list dispatcher can see them.
+    if app.current_screen == AppScreen::Browse
+        && app.browse.options_menu.is_open()
+        && handle_browse_options_menu_key(app, &key, tx)
+    {
         return;
     }
 
@@ -2553,6 +2565,237 @@ fn save_browse_layout(app: &mut AppState) {
     }
 }
 
+fn ensure_options_menu_highlight(app: &mut AppState) {
+    if !app.browse.options_menu.is_open() {
+        app.browse.options_menu_highlight = None;
+        return;
+    }
+
+    let rows = active_options_menu_rows(
+        &app.browse,
+        &app.config.performance.browsing.archive_listing,
+    )
+    .unwrap_or_default();
+    let current_is_activatable = app
+        .browse
+        .options_menu_highlight
+        .and_then(|index| rows.get(index))
+        .is_some_and(|(_, button)| button.is_some());
+    if !current_is_activatable {
+        app.browse.options_menu_highlight = rows
+            .iter()
+            .position(|(_, button)| button.is_some());
+    }
+}
+
+fn move_options_menu_highlight(app: &mut AppState, direction: i8) {
+    let rows = active_options_menu_rows(
+        &app.browse,
+        &app.config.performance.browsing.archive_listing,
+    )
+    .unwrap_or_default();
+    let activatable = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, button))| button.is_some().then_some(index))
+        .collect::<Vec<_>>();
+    if activatable.is_empty() {
+        app.browse.options_menu_highlight = None;
+        return;
+    }
+
+    let current_position = app
+        .browse
+        .options_menu_highlight
+        .and_then(|current| activatable.iter().position(|index| *index == current));
+    let next_position = match (current_position, direction.is_negative()) {
+        (Some(position), false) => (position + 1) % activatable.len(),
+        (Some(position), true) => position
+            .checked_sub(1)
+            .unwrap_or_else(|| activatable.len().saturating_sub(1)),
+        (None, false) => 0,
+        (None, true) => activatable.len().saturating_sub(1),
+    };
+    app.browse.options_menu_highlight = activatable.get(next_position).copied();
+}
+
+fn highlighted_options_menu_button(app: &AppState) -> Option<TuiButton> {
+    let rows = active_options_menu_rows(
+        &app.browse,
+        &app.config.performance.browsing.archive_listing,
+    )?;
+    app.browse
+        .options_menu_highlight
+        .and_then(|index| rows.get(index))
+        .and_then(|(_, button)| *button)
+}
+
+fn set_options_menu_highlight_to_button(app: &mut AppState, target: TuiButton) -> bool {
+    let index = active_options_menu_rows(
+        &app.browse,
+        &app.config.performance.browsing.archive_listing,
+    )
+    .and_then(|rows| {
+        rows.iter()
+            .position(|(_, button)| *button == Some(target))
+    });
+    if let Some(index) = index {
+        app.browse.options_menu_highlight = Some(index);
+        true
+    } else {
+        false
+    }
+}
+
+fn clear_options_menu_hover_for_keyboard(app: &mut AppState) {
+    if app.hover_target.is_some_and(is_browse_options_menu_button) {
+        app.hover_target = None;
+    }
+}
+
+fn back_or_close_options_menu_with_focus(app: &mut AppState) {
+    clear_options_menu_hover_for_keyboard(app);
+    let parent = active_options_parent_button(app.browse.options_menu);
+    app.browse.back_or_close_options_menu();
+    if app.browse.options_menu == BrowseOptionsMenu::Root {
+        if let Some(parent) = parent {
+            if set_options_menu_highlight_to_button(app, parent) {
+                return;
+            }
+        }
+    }
+    ensure_options_menu_highlight(app);
+}
+
+fn set_options_menu_panel(app: &mut AppState, menu: BrowseOptionsMenu) {
+    app.browse.options_menu = menu;
+    app.browse.options_menu_highlight = None;
+    ensure_options_menu_highlight(app);
+}
+
+fn handle_browse_options_menu_key(
+    app: &mut AppState,
+    key: &KeyEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    if !app.browse.options_menu.is_open() {
+        return false;
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) => {
+            clear_options_menu_hover_for_keyboard(app);
+            ensure_options_menu_highlight(app);
+            move_options_menu_highlight(app, -1);
+            true
+        }
+        (KeyCode::Down, KeyModifiers::NONE) => {
+            clear_options_menu_hover_for_keyboard(app);
+            ensure_options_menu_highlight(app);
+            move_options_menu_highlight(app, 1);
+            true
+        }
+        (KeyCode::Enter | KeyCode::Char(' '), KeyModifiers::NONE) => {
+            clear_options_menu_hover_for_keyboard(app);
+            ensure_options_menu_highlight(app);
+            if let Some(button) = highlighted_options_menu_button(app) {
+                let handled = activate_browse_options_menu_button(app, button, tx);
+                debug_assert!(handled, "highlighted Options row must be activatable");
+            }
+            true
+        }
+        (KeyCode::Left, KeyModifiers::NONE) => {
+            back_or_close_options_menu_with_focus(app);
+            true
+        }
+        // Modified forms are intentionally not bindings, but while the menu
+        // is open they must not leak through to range selection or Browse
+        // navigation underneath the dropdown.
+        (KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Left, _)
+        | (KeyCode::Char(' '), _) => true,
+        _ => false,
+    }
+}
+
+fn activate_browse_options_menu_button(
+    app: &mut AppState,
+    button: TuiButton,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    match button {
+        TuiButton::BrowseOptionsShowHidden => {
+            app.browse.toggle_hidden_with_search(Some(tx));
+            app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
+            persist_browse_config(app);
+        }
+        TuiButton::BrowseOptionsLayout => {
+            set_options_menu_panel(app, BrowseOptionsMenu::Layout);
+        }
+        TuiButton::BrowseOptionsToggleExplore => {
+            app.browse
+                .toggle_pane_enabled(super::browse::BrowsePaneId::Explore);
+            repair_browse_focus_visibility(app);
+            persist_browse_config(app);
+        }
+        TuiButton::BrowseOptionsToggleInfo => {
+            app.browse
+                .toggle_pane_enabled(super::browse::BrowsePaneId::Info);
+            repair_browse_focus_visibility(app);
+            persist_browse_config(app);
+        }
+        TuiButton::BrowseOptionsColumns => {
+            set_options_menu_panel(app, BrowseOptionsMenu::Columns);
+        }
+        TuiButton::BrowseOptionsSort => {
+            set_options_menu_panel(app, BrowseOptionsMenu::Sort);
+        }
+        TuiButton::BrowseOptionsFilter => {
+            set_options_menu_panel(app, BrowseOptionsMenu::Filter);
+        }
+        TuiButton::BrowseOptionsArchiveListing => {
+            set_options_menu_panel(app, BrowseOptionsMenu::ArchiveListing);
+        }
+        TuiButton::BrowseOptionsSaveLayout => save_browse_layout(app),
+        TuiButton::BrowseOptionsRestoreDefaults => {
+            let browsing = crate::config::BrowsingConfig::default().normalized();
+            app.config.browsing = browsing.clone();
+            app.browse
+                .apply_browsing_config_with_search(&app.config.browsing, Some(tx));
+            repair_browse_focus_visibility(app);
+            if let Err(err) = app
+                .config
+                .update(|latest| latest.browsing = browsing.clone())
+            {
+                app.set_status(format!(
+                    "browse defaults restored, but config save failed: {err}"
+                ));
+            } else {
+                app.set_status("browse defaults restored");
+            }
+        }
+        TuiButton::BrowseOptionsColumn(column) => {
+            app.browse.toggle_column(column);
+            persist_browse_config(app);
+        }
+        TuiButton::BrowseOptionsSortChoice(by, dir) => {
+            app.browse
+                .set_default_sort_with_search(by, dir, true, Some(tx));
+            persist_browse_config(app);
+        }
+        TuiButton::BrowseOptionsFilterChoice(choice) => {
+            set_browse_filter_choice(app, choice, tx);
+            persist_browse_config(app);
+        }
+        TuiButton::BrowseOptionsArchiveChoice(choice) => {
+            set_archive_listing_choice(app, choice);
+            app.browse.close_options_menu();
+        }
+        _ => return false,
+    }
+
+    true
+}
+
 fn is_browse_options_menu_button(button: TuiButton) -> bool {
     matches!(
         button,
@@ -2576,12 +2819,36 @@ fn is_browse_options_menu_button(button: TuiButton) -> bool {
 
 fn options_menu_hover_update(app: &mut AppState, mouse_x: u16, mouse_y: u16) {
     let geometry = options_menu_geometry_for_current_browse_area(app);
-    app.browse.options_menu = options_menu_hover_next_menu_at(
+    let previous_menu = app.browse.options_menu;
+    let next_menu = options_menu_hover_next_menu_at(
         app.browse.options_menu,
         app.hover_target,
         Some((mouse_x, mouse_y)),
         geometry,
     );
+    if next_menu != previous_menu {
+        app.browse.options_menu = next_menu;
+        app.browse.options_menu_highlight = None;
+    }
+
+    if let Some(hovered) = app.hover_target {
+        let hovered_index = active_options_menu_rows(
+            &app.browse,
+            &app.config.performance.browsing.archive_listing,
+        )
+        .and_then(|rows| {
+            rows.iter()
+                .position(|(_, button)| *button == Some(hovered))
+        });
+        if hovered_index.is_some() {
+            app.browse.options_menu_highlight = hovered_index;
+            return;
+        }
+    }
+
+    if next_menu != previous_menu {
+        ensure_options_menu_highlight(app);
+    }
 }
 
 fn options_menu_geometry_for_current_browse_area(app: &AppState) -> Option<OptionsMenuGeometry> {
@@ -2648,6 +2915,35 @@ fn options_menu_hover_next_menu_at(
 #[cfg(test)]
 mod options_menu_hover_tests {
     use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn browse_options_app() -> AppState {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![
+            crate::tui::browse::BrowseEntry::new(
+                PathBuf::from("/tmp/options-a"),
+                "options-a".to_string(),
+                crate::convert::classify::EntryKind::OtherFile,
+                0,
+                None,
+            ),
+            crate::tui::browse::BrowseEntry::new(
+                PathBuf::from("/tmp/options-b"),
+                "options-b".to_string(),
+                crate::convert::classify::EntryKind::OtherFile,
+                0,
+                None,
+            ),
+        ];
+        app.browse.selected_index = 0;
+        app.browse.toggle_options_menu();
+        ensure_options_menu_highlight(&mut app);
+        app
+    }
 
     #[test]
     fn hover_over_root_submenu_items_opens_matching_submenu() {
@@ -2790,6 +3086,190 @@ mod options_menu_hover_tests {
                 Some(geometry),
             ),
             BrowseOptionsMenu::Root
+        );
+    }
+
+    #[test]
+    fn options_menu_opens_with_first_activatable_row_highlighted() {
+        let app = browse_options_app();
+
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Root);
+        assert_eq!(app.browse.options_menu_highlight, Some(0));
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsShowHidden)
+        );
+    }
+
+    #[test]
+    fn options_down_moves_menu_highlight_without_moving_file_cursor() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+
+        assert_eq!(app.browse.selected_index, 0);
+        assert_eq!(app.browse.options_menu_highlight, Some(1));
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsLayout)
+        );
+    }
+
+    #[test]
+    fn keyboard_navigation_replaces_stale_mouse_highlight() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        app.hover_target = Some(TuiButton::BrowseOptionsShowHidden);
+        options_menu_hover_update(&mut app, 0, 0);
+
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+
+        assert_eq!(app.browse.options_menu_highlight, Some(1));
+        assert_eq!(app.hover_target, None);
+    }
+
+    #[test]
+    fn modified_menu_navigation_does_not_leak_to_file_list() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+
+        handle_key(&mut app, key, &tx);
+
+        assert_eq!(app.browse.selected_index, 0);
+        assert_eq!(app.browse.options_menu_highlight, Some(0));
+        assert!(app.browse.multi_selected.is_empty());
+    }
+
+    #[test]
+    fn options_navigation_skips_separator_rows() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        app.browse.options_menu_highlight = Some(5);
+
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+
+        assert_eq!(app.browse.options_menu_highlight, Some(7));
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsSaveLayout)
+        );
+    }
+
+    #[test]
+    fn options_enter_opens_highlighted_submenu_and_resets_focus() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Layout);
+        assert_eq!(app.browse.options_menu_highlight, Some(0));
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsToggleExplore)
+        );
+        assert_eq!(app.browse.selected_index, 0);
+    }
+
+    #[test]
+    fn options_space_activates_highlighted_item() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+
+        handle_key(&mut app, key(KeyCode::Char(' ')), &tx);
+
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Layout);
+        assert_eq!(app.browse.options_menu_highlight, Some(0));
+        assert_eq!(app.browse.selected_index, 0);
+    }
+
+    #[test]
+    fn options_left_backs_out_then_file_navigation_resumes_after_close() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+
+        handle_key(&mut app, key(KeyCode::Left), &tx);
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Root);
+        assert_eq!(app.browse.selected_index, 0);
+        assert_eq!(app.browse.options_menu_highlight, Some(1));
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsLayout)
+        );
+
+        handle_key(&mut app, key(KeyCode::Left), &tx);
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Closed);
+        assert_eq!(app.browse.options_menu_highlight, None);
+
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+        assert_eq!(app.browse.selected_index, 1);
+    }
+
+    #[test]
+    fn options_escape_backs_out_and_keeps_keyboard_focus_in_menu() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+
+        handle_key(&mut app, key(KeyCode::Esc), &tx);
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Root);
+        assert_eq!(app.browse.options_menu_highlight, Some(1));
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsLayout)
+        );
+
+        handle_key(&mut app, key(KeyCode::Down), &tx);
+        assert_eq!(app.browse.selected_index, 0);
+    }
+
+    #[test]
+    fn mouse_hover_updates_keyboard_highlight_in_open_submenu() {
+        let mut app = browse_options_app();
+        set_options_menu_panel(&mut app, BrowseOptionsMenu::Columns);
+        let size_index = crate::tui::browse::BrowseColumn::ALL
+            .iter()
+            .position(|column| *column == crate::tui::browse::BrowseColumn::Size)
+            .expect("Size column row");
+        app.hover_target = Some(TuiButton::BrowseOptionsColumn(
+            crate::tui::browse::BrowseColumn::Size,
+        ));
+
+        options_menu_hover_update(&mut app, 0, 0);
+
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Columns);
+        assert_eq!(app.browse.options_menu_highlight, Some(size_index));
+    }
+
+    #[test]
+    fn mouse_click_uses_same_options_activation_path_as_keyboard() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = browse_options_app();
+        app.button_map.record_button(
+            TuiButton::BrowseOptionsLayout,
+            Rect::new(3, 3, 8, 1),
+        );
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, click, &tx);
+
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Layout);
+        assert_eq!(app.browse.options_menu_highlight, Some(0));
+        assert_eq!(
+            highlighted_options_menu_button(&app),
+            Some(TuiButton::BrowseOptionsToggleExplore)
         );
     }
 }
@@ -5986,6 +6466,14 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     // programmatic state changes must not leave a hidden pane owning the key.
     repair_browse_focus_visibility(app);
 
+    // Production dispatch gives the dropdown first refusal in `handle_key` so
+    // it also outranks Browse-local editors. Keep the Browse handler itself
+    // safe for direct callers/tests: menu navigation must never fall through
+    // into pane navigation while the dropdown is open.
+    if app.browse.options_menu.is_open() && handle_browse_options_menu_key(app, &key, tx) {
+        return;
+    }
+
     // Browse-global commands outrank pane-local navigation and type-ahead.
     // In particular, `/` and `.` must not become tree-prefix characters merely
     // because Explore currently owns keyboard navigation.
@@ -6397,7 +6885,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         // Esc escalation: options menu → type-ahead → search → visual mode → multi-selection → text filter → archive
         (KeyCode::Esc, _) => {
             if app.browse.options_menu.is_open() {
-                app.browse.back_or_close_options_menu();
+                back_or_close_options_menu_with_focus(app);
             } else if app.cancel_archive_listing() {
                 app.set_status("archive listing cancelled");
             } else if app.browse.type_ahead_active() {
@@ -52734,11 +53222,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::BrowseToolbarOptions => {
                 app.bookmarks.close_dropdown();
                 app.browse.toggle_options_menu();
+                ensure_options_menu_highlight(app);
             }
             TuiButton::BrowseToolbarSearch => {
                 open_browse_search(app);
             }
-            TuiButton::BrowseToolbarShowHidden | TuiButton::BrowseOptionsShowHidden => {
+            TuiButton::BrowseToolbarShowHidden => {
                 app.browse.toggle_hidden_with_search(Some(tx));
                 app.cancel_browse_convert_expansion_for_browse_change("browse filter changed");
                 persist_browse_config(app);
@@ -52798,48 +53287,22 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 handle_browse_tree_node_click(app, index, std::time::Instant::now(), tx);
             }
             TuiButton::BrowseTreeInlineEdit => {}
-            TuiButton::BrowseOptionsLayout => app.browse.options_menu = super::browse::BrowseOptionsMenu::Layout,
-            TuiButton::BrowseOptionsToggleExplore => {
-                app.browse.toggle_pane_enabled(super::browse::BrowsePaneId::Explore);
-                repair_browse_focus_visibility(app);
-                persist_browse_config(app);
-            }
-            TuiButton::BrowseOptionsToggleInfo => {
-                app.browse.toggle_pane_enabled(super::browse::BrowsePaneId::Info);
-                repair_browse_focus_visibility(app);
-                persist_browse_config(app);
-            }
-            TuiButton::BrowseOptionsColumns => app.browse.options_menu = super::browse::BrowseOptionsMenu::Columns,
-            TuiButton::BrowseOptionsSort => app.browse.options_menu = super::browse::BrowseOptionsMenu::Sort,
-            TuiButton::BrowseOptionsFilter => app.browse.options_menu = super::browse::BrowseOptionsMenu::Filter,
-            TuiButton::BrowseOptionsArchiveListing => app.browse.options_menu = super::browse::BrowseOptionsMenu::ArchiveListing,
-            TuiButton::BrowseOptionsSaveLayout => save_browse_layout(app),
-            TuiButton::BrowseOptionsRestoreDefaults => {
-                let browsing = crate::config::BrowsingConfig::default().normalized();
-                app.config.browsing = browsing.clone();
-                app.browse.apply_browsing_config_with_search(&app.config.browsing, Some(tx));
-                repair_browse_focus_visibility(app);
-                if let Err(err) = app.config.update(|latest| latest.browsing = browsing.clone()) {
-                    app.set_status(format!("browse defaults restored, but config save failed: {err}"));
-                } else {
-                    app.set_status("browse defaults restored");
-                }
-            }
-            TuiButton::BrowseOptionsColumn(column) => {
-                app.browse.toggle_column(column);
-                persist_browse_config(app);
-            }
-            TuiButton::BrowseOptionsSortChoice(by, dir) => {
-                app.browse.set_default_sort_with_search(by, dir, true, Some(tx));
-                persist_browse_config(app);
-            }
-            TuiButton::BrowseOptionsFilterChoice(choice) => {
-                set_browse_filter_choice(app, choice, tx);
-                persist_browse_config(app);
-            }
-            TuiButton::BrowseOptionsArchiveChoice(choice) => {
-                set_archive_listing_choice(app, choice);
-                app.browse.close_options_menu();
+            TuiButton::BrowseOptionsShowHidden
+            | TuiButton::BrowseOptionsLayout
+            | TuiButton::BrowseOptionsToggleExplore
+            | TuiButton::BrowseOptionsToggleInfo
+            | TuiButton::BrowseOptionsColumns
+            | TuiButton::BrowseOptionsSort
+            | TuiButton::BrowseOptionsFilter
+            | TuiButton::BrowseOptionsArchiveListing
+            | TuiButton::BrowseOptionsSaveLayout
+            | TuiButton::BrowseOptionsRestoreDefaults
+            | TuiButton::BrowseOptionsColumn(_)
+            | TuiButton::BrowseOptionsSortChoice(_, _)
+            | TuiButton::BrowseOptionsFilterChoice(_)
+            | TuiButton::BrowseOptionsArchiveChoice(_) => {
+                let handled = activate_browse_options_menu_button(app, button, tx);
+                debug_assert!(handled, "Browse Options button must be handled");
             }
             TuiButton::BrowseInfoMeta(field) => {
                 if app.browse.is_in_archive() && app.browse.active_archive_staging().is_none() {
