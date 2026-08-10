@@ -332,17 +332,19 @@ impl FilePickerState {
             let marker = if info.active { "▐" } else { " " };
             let selected = if info.has_selection { "•" } else { "" };
             let close = if width >= 6 { "[×]" } else { "" };
-            let reserved = marker.chars().count() + selected.chars().count() + close.chars().count() + 1;
-            let label_width = (width as usize).saturating_sub(reserved).max(1);
+            let close_width = if width >= 6 { 3u16 } else { 0 };
+            // Right-align the close affordance so the drawn [×] sits exactly
+            // under its registered click region (below); a left-aligned close
+            // floats next to short labels and never receives the click.
+            let left_cols = width.saturating_sub(close_width) as usize;
+            let fixed = marker.chars().count() + selected.chars().count();
+            let label_width = left_cols.saturating_sub(fixed).max(1);
             let label = middle_truncate(&info.label, label_width);
-            let text = fit_text_left(
-                &format!("{marker}{label}{selected}{close}"),
-                width as usize,
-            );
+            let left = fit_text_left(&format!("{marker}{label}{selected}"), left_cols);
+            let text = format!("{left}{close}");
             let style = if info.active { self.theme.toolbar_active } else { self.theme.toolbar };
             frame.render_widget(Paragraph::new(text).style(style), cell);
 
-            let close_width = if width >= 6 { 3 } else { 0 };
             let body_width = width.saturating_sub(close_width);
             if body_width > 0 {
                 self.record_hit_region(
@@ -2405,6 +2407,42 @@ mod tests {
         assert!(!picker.hit_regions().iter().any(|hit| {
             matches!(hit.action, FilePickerHitAction::ConflictPolicy(_))
         }));
+    }
+
+    #[test]
+    fn picker_tab_close_glyph_sits_under_its_click_region() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("aa");
+        let b = temp.path().join("bb");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: a,
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.open_dir_in_new_tab(b, true));
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let area = Rect::new(0, 0, 60, 12);
+        terminal.draw(|frame| picker.render(frame, area)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+
+        let closes: Vec<_> = picker
+            .hit_regions()
+            .iter()
+            .filter_map(|h| match h.action {
+                FilePickerHitAction::TabClose(_) => Some(h.rect),
+                _ => None,
+            })
+            .collect();
+        assert!(!closes.is_empty(), "two tabs must register close regions");
+        for rect in closes {
+            let has_cross = (rect.x..rect.right()).any(|x| buf.get(x, rect.y).symbol() == "×");
+            assert!(
+                has_cross,
+                "no close glyph under picker close region {rect:?} — [×] drawn elsewhere"
+            );
+        }
     }
 
     #[test]

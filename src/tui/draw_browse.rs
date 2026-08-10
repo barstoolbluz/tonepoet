@@ -252,18 +252,24 @@ fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
         let loading = if info.loading { "◐" } else { "" };
         let selected = if info.has_selection { "•" } else { "" };
         let close = if width >= 6 { "[×]" } else { "" };
-        let reserved = active_mark.chars().count() + loading.chars().count()
-            + selected.chars().count() + close.chars().count() + 1;
-        let label_w = (width as usize).saturating_sub(reserved).max(1);
+        let close_w = close.chars().count() as u16; // 3 or 0
+        // Right-align the close affordance to the cell edge so the drawn [×]
+        // sits exactly under its registered click region (below). A left-aligned
+        // close floats next to short labels and never receives the click.
+        let left_cols = width.saturating_sub(close_w) as usize;
+        let fixed =
+            active_mark.chars().count() + loading.chars().count() + selected.chars().count();
+        let label_w = left_cols.saturating_sub(fixed).max(1);
         let label = middle_truncate_tab_label(&info.label, label_w);
-        let text = truncate_to(&format!("{active_mark}{loading}{label}{selected}{close}"), width as usize);
+        let left = truncate_to(&format!("{active_mark}{loading}{label}{selected}"), left_cols);
+        let pad = left_cols.saturating_sub(super::display_width::width(&left));
+        let text = format!("{left}{}{close}", " ".repeat(pad));
         let style = if info.active {
             Style::default().fg(theme.bg).bg(theme.tab_active).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.tab_inactive)
         };
         f.render_widget(Paragraph::new(text).style(style), cell);
-        let close_w = if width >= 6 { 3 } else { 0 };
         let body_w = width.saturating_sub(close_w);
         if body_w > 0 {
             app.button_map.record_button(TuiButton::BrowseDirTab(info.index), Rect::new(x, area.y, body_w, 1));
@@ -5463,6 +5469,46 @@ mod path_field_render_tests {
             .button_map
             .find_button_rect(&TuiButton::BrowseDirTab(0))
             .is_some(), "width pressure must not zero out all tab cells");
+    }
+
+    #[test]
+    fn browse_tab_close_glyph_sits_under_its_click_region() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("aa");
+        let b = temp.path().join("bb");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = a;
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        assert!(app.browse.open_dir_in_new_tab(b, false));
+
+        app.button_map.clear();
+        let area = Rect::new(0, 0, 60, 1);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_browse_tab_strip(frame, area, &mut app, theme))
+            .expect("draw strip");
+        let buf = terminal.backend().buffer().clone();
+
+        // The registered close region for every tab must actually contain the
+        // drawn close glyph; otherwise a real click on the visible [×] misses.
+        for i in 0..app.browse.tab_count() {
+            if let Some(rect) = app.button_map.find_button_rect(&TuiButton::BrowseDirTabClose(i)) {
+                let has_cross = (rect.x..rect.right()).any(|x| buf.get(x, 0).symbol() == "×");
+                assert!(
+                    has_cross,
+                    "tab {i}: no close glyph under its click region {rect:?} — the [×] is drawn elsewhere"
+                );
+            }
+        }
     }
 
     #[test]
