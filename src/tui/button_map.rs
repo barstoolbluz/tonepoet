@@ -237,6 +237,11 @@ pub enum TuiButton {
     CuePreviewEditCancel,
 
     // Browse screen
+    BrowseDirTab(usize),
+    BrowseDirTabClose(usize),
+    BrowseDirTabNew,
+    BrowseDirTabDuplicate,
+    BrowseDirTabReopenClosed,
     BrowseEntry(usize),
     /// Browse row selection gutter (checkbox column). Click toggles mark without moving cursor.
     BrowseEntryGutter(usize),
@@ -595,7 +600,12 @@ impl TuiButton {
             | Self::RetryFailed
             | Self::QueueItem(_)
             | Self::QueueItemExpand(_) => Some(AppScreen::Queue),
-            Self::BrowseEntry(_)
+            Self::BrowseDirTab(_)
+            | Self::BrowseDirTabClose(_)
+            | Self::BrowseDirTabNew
+            | Self::BrowseDirTabDuplicate
+            | Self::BrowseDirTabReopenClosed
+            | Self::BrowseEntry(_)
             | Self::BrowseEntryGutter(_)
             | Self::BrowseColumn(_)
             | Self::BrowseList

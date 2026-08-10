@@ -109,10 +109,10 @@ impl FilePickerState {
         self.bookmarks.poll_target_statuses();
         self.clear_hit_regions();
         self.set_last_area(area);
-        if area.width < 48 || area.height < 10 {
+        if area.width < 48 || area.height < 11 {
             frame.render_widget(Clear, area);
             frame.render_widget(
-                Paragraph::new("File picker needs at least 48x10 cells").style(self.theme.error),
+                Paragraph::new("File picker needs at least 48x11 cells").style(self.theme.error),
                 area,
             );
             return;
@@ -130,11 +130,24 @@ impl FilePickerState {
         let title = fit_text_left(&format!(" {disclosure} {}", self.title), title_area.width as usize);
         frame.render_widget(Paragraph::new(title).style(self.theme.toolbar_active), title_area);
         self.record_hit_region(title_area, FilePickerHitAction::TitleToggleMaximize);
+
+        // The tab strip only claims a row when there are 2+ tabs, so a
+        // single-tab picker keeps its exact pre-tabs layout (no wasted row).
+        let strip_rows: u16 = if self.tab_count() > 1 { 1 } else { 0 };
+        if strip_rows > 0 {
+            let tab_area = Rect::new(
+                outer_inner.x,
+                outer_inner.y.saturating_add(1),
+                outer_inner.width,
+                1,
+            );
+            self.render_tab_strip(frame, tab_area);
+        }
         let inner = Rect::new(
             outer_inner.x,
-            outer_inner.y.saturating_add(1),
+            outer_inner.y.saturating_add(1 + strip_rows),
             outer_inner.width,
-            outer_inner.height.saturating_sub(1),
+            outer_inner.height.saturating_sub(1 + strip_rows),
         );
 
         let toolbar_area;
@@ -216,6 +229,129 @@ impl FilePickerState {
         }
         if let Some(task) = self.paste_task.as_mut() {
             task.progress.render(frame, area);
+        }
+    }
+
+    fn render_tab_strip(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width == 0 {
+            return;
+        }
+        let middle_truncate = |value: &str, max_chars: usize| -> String {
+            let chars: Vec<char> = value.chars().collect();
+            if chars.len() <= max_chars { return value.to_string(); }
+            if max_chars <= 1 { return "…".chars().take(max_chars).collect(); }
+            let keep = max_chars - 1;
+            let left = (keep + 1) / 2;
+            let right = keep / 2;
+            let mut out: String = chars[..left].iter().collect();
+            out.push('…');
+            out.extend(chars[chars.len() - right..].iter());
+            out
+        };
+        let tabs = self.tab_infos();
+        if tabs.is_empty() {
+            return;
+        }
+
+        // Reserve controls first so the active tab and the new-tab affordance are
+        // always reachable even when the strip overflows.
+        let reopen_width = if self.has_closed_tabs() { 4u16 } else { 0 };
+        let duplicate_width = 4u16;
+        let new_width = 4u16;
+        let control_width = reopen_width + duplicate_width + new_width;
+        let tabs_width = area.width.saturating_sub(control_width);
+        if tabs_width == 0 {
+            return;
+        }
+
+        let min_cell = 7usize;
+        let max_cell = 24usize;
+        let capacity = ((tabs_width as usize) / min_cell).max(1);
+        let visible_count = tabs.len().min(capacity);
+        let active = self.active_tab_index().min(tabs.len().saturating_sub(1));
+        let mut start = active.saturating_sub(visible_count / 2);
+        if start + visible_count > tabs.len() {
+            start = tabs.len().saturating_sub(visible_count);
+        }
+        let end = (start + visible_count).min(tabs.len());
+        let hidden_left = start;
+        let hidden_right = tabs.len().saturating_sub(end);
+        let indicator_width = (if hidden_left > 0 { 2 } else { 0 }) + (if hidden_right > 0 { 4 } else { 0 });
+        let usable = tabs_width.saturating_sub(indicator_width);
+        let cell_width = ((usable as usize) / visible_count.max(1)).clamp(min_cell, max_cell) as u16;
+
+        let mut x = area.x;
+        if hidden_left > 0 && x < area.right() {
+            let r = Rect::new(x, area.y, 2.min(area.right().saturating_sub(x)), 1);
+            frame.render_widget(Paragraph::new("‹ ").style(self.theme.text_dim), r);
+            x = x.saturating_add(r.width);
+        }
+
+        for info in &tabs[start..end] {
+            if x >= area.x.saturating_add(tabs_width) {
+                break;
+            }
+            let remaining = area.x.saturating_add(tabs_width).saturating_sub(x);
+            let width = cell_width.min(remaining);
+            if width == 0 {
+                break;
+            }
+            let cell = Rect::new(x, area.y, width, 1);
+            let marker = if info.active { "▐" } else { " " };
+            let selected = if info.has_selection { "•" } else { "" };
+            let close = if width >= 5 { " ×" } else { "" };
+            let reserved = marker.chars().count() + selected.chars().count() + close.chars().count() + 1;
+            let label_width = (width as usize).saturating_sub(reserved).max(1);
+            let label = middle_truncate(&info.label, label_width);
+            let text = fit_text_left(
+                &format!("{marker}{label}{selected}{close}"),
+                width as usize,
+            );
+            let style = if info.active { self.theme.toolbar_active } else { self.theme.toolbar };
+            frame.render_widget(Paragraph::new(text).style(style), cell);
+
+            let close_width = if width >= 5 { 2 } else { 0 };
+            let body_width = width.saturating_sub(close_width);
+            if body_width > 0 {
+                self.record_hit_region(
+                    Rect::new(x, area.y, body_width, 1),
+                    FilePickerHitAction::TabActivate(info.index),
+                );
+            }
+            if close_width > 0 {
+                self.record_hit_region(
+                    Rect::new(x.saturating_add(body_width), area.y, close_width, 1),
+                    FilePickerHitAction::TabClose(info.index),
+                );
+            }
+            x = x.saturating_add(width);
+        }
+
+        if hidden_right > 0 && x < area.x.saturating_add(tabs_width) {
+            let remaining = area.x.saturating_add(tabs_width).saturating_sub(x);
+            let text = format!("›+{}", hidden_right);
+            let width = (text.chars().count() as u16).min(remaining);
+            let r = Rect::new(x, area.y, width, 1);
+            frame.render_widget(Paragraph::new(fit_text_left(&text, width as usize)).style(self.theme.text_dim), r);
+        }
+
+        let mut control_x = area.x.saturating_add(tabs_width);
+        if self.has_closed_tabs() {
+            let r = Rect::new(control_x, area.y, reopen_width.min(area.right().saturating_sub(control_x)), 1);
+            frame.render_widget(Paragraph::new(" ↶ ").style(self.theme.button), r);
+            self.record_hit_region(r, FilePickerHitAction::TabReopenClosed);
+            control_x = control_x.saturating_add(r.width);
+        }
+        let duplicate = Rect::new(control_x, area.y, duplicate_width.min(area.right().saturating_sub(control_x)), 1);
+        if duplicate.width > 0 {
+            frame.render_widget(Paragraph::new(" ⧉ ").style(self.theme.button), duplicate);
+            self.record_hit_region(duplicate, FilePickerHitAction::TabDuplicate);
+            control_x = control_x.saturating_add(duplicate.width);
+        }
+        let new_tab = Rect::new(control_x, area.y, new_width.min(area.right().saturating_sub(control_x)), 1);
+        if new_tab.width > 0 {
+            frame.render_widget(Paragraph::new(" + ").style(self.theme.button), new_tab);
+            self.record_hit_region(new_tab, FilePickerHitAction::TabNew);
         }
     }
 
@@ -2191,6 +2327,62 @@ mod tests {
         assert!(!picker.hit_regions().iter().any(|hit| {
             matches!(hit.action, FilePickerHitAction::ConflictPolicy(_))
         }));
+    }
+
+    #[test]
+    fn tab_strip_is_hidden_at_a_single_tab_and_appears_at_two() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&other).expect("other");
+        std::fs::write(temp.path().join("cover.png"), b"png").expect("file");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            filter: FilePickerFilter::Images,
+            ..FilePickerConfig::default()
+        });
+        let backend = TestBackend::new(54, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let area = Rect::new(0, 0, 48, 12);
+
+        // One tab: no strip row; the toolbar sits directly under the title
+        // (y=2), and no tab-strip controls are registered.
+        terminal.draw(|frame| picker.render(frame, area)).expect("draw one");
+        let toolbar_y_one = picker
+            .hit_regions()
+            .iter()
+            .find_map(|hit| match hit.action {
+                FilePickerHitAction::Toolbar(_) => Some(hit.rect.y),
+                _ => None,
+            })
+            .expect("a toolbar hit at one tab");
+        assert_eq!(toolbar_y_one, 2, "single-tab toolbar keeps its pre-tabs row");
+        assert!(
+            !picker.hit_regions().iter().any(|hit| matches!(
+                hit.action,
+                FilePickerHitAction::TabActivate(_) | FilePickerHitAction::TabNew
+            )),
+            "a single tab shows no tab-strip controls"
+        );
+
+        // Two tabs: the strip claims a row and pushes the toolbar to y=3.
+        assert!(picker.open_dir_in_new_tab(other, true));
+        terminal.draw(|frame| picker.render(frame, area)).expect("draw two");
+        let toolbar_y_two = picker
+            .hit_regions()
+            .iter()
+            .find_map(|hit| match hit.action {
+                FilePickerHitAction::Toolbar(_) => Some(hit.rect.y),
+                _ => None,
+            })
+            .expect("a toolbar hit at two tabs");
+        assert_eq!(toolbar_y_two, 3, "two-tab toolbar is pushed down by the strip");
+        assert!(
+            picker
+                .hit_regions()
+                .iter()
+                .any(|hit| matches!(hit.action, FilePickerHitAction::TabActivate(_))),
+            "two tabs show the strip controls"
+        );
     }
 
     #[test]

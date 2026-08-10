@@ -2450,6 +2450,76 @@ impl PreparedTagTransfer {
     }
 }
 
+pub type BrowseTabId = u64;
+
+#[derive(Debug, Clone)]
+pub(crate) struct BrowseTabSlot {
+    pub(crate) id: BrowseTabId,
+    pub(crate) state: Option<Box<BrowseState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseArchiveRestoreDescriptor {
+    pub(crate) archive_path: PathBuf,
+    pub(crate) inner_path: String,
+    pub(crate) password: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClosedBrowseTab {
+    pub(crate) original_index: usize,
+    pub(crate) state: Box<BrowseState>,
+    pub(crate) archive_restore: Option<BrowseArchiveRestoreDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BrowseTabDrag {
+    pub(crate) index: usize,
+    pub(crate) start_column: u16,
+    pub(crate) reordered: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BrowseTabs {
+    pub(crate) slots: Vec<BrowseTabSlot>,
+    pub(crate) active: usize,
+    pub(crate) closed: Vec<ClosedBrowseTab>,
+    pub(crate) next_id: BrowseTabId,
+    pub(crate) drag: Option<BrowseTabDrag>,
+}
+
+impl BrowseTabs {
+    fn new() -> Self {
+        Self {
+            slots: vec![BrowseTabSlot { id: 1, state: None }],
+            active: 0,
+            closed: Vec::new(),
+            next_id: 2,
+            drag: None,
+        }
+    }
+
+    fn allocate_id(&mut self) -> BrowseTabId {
+        loop {
+            let id = self.next_id.max(2);
+            self.next_id = id.wrapping_add(1).max(2);
+            if self.slots.iter().all(|slot| slot.id != id) {
+                return id;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseTabInfo {
+    pub index: usize,
+    pub id: BrowseTabId,
+    pub label: String,
+    pub active: bool,
+    pub loading: bool,
+    pub has_selection: bool,
+}
+
 /// State for the browse screen
 #[derive(Debug, Clone)]
 pub struct BrowseState {
@@ -2829,6 +2899,13 @@ pub struct BrowseState {
     /// Channel sender for async messages. Set after construction by the
     /// event loop. `None` during the initial synchronous scan.
     scan_tx: Option<tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+
+    /// Session-local directory tabs. Detached inactive states always carry
+    /// `tabs: None`, so the mature single-tab BrowseState remains the active
+    /// working state without a recursive tab-manager graph.
+    pub(crate) tabs: Option<BrowseTabs>,
+    /// Stable identity carried by every async Browse launch/completion.
+    pub(crate) tab_id: BrowseTabId,
 }
 
 /// Handle to a cancellable background directory scan.
@@ -3138,6 +3215,17 @@ pub(crate) struct ScopedMultiSelection {
     pub dropped_stale_count: usize,
 }
 
+fn browse_tab_label(state: &BrowseState) -> String {
+    if let Some(archive) = state.archive.as_ref() {
+        if let Some(name) = archive.listing.archive_path.file_name().and_then(|name| name.to_str()) {
+            return name.to_string();
+        }
+    }
+    state.current_dir.file_name().and_then(|name| name.to_str()).filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| state.current_dir.display().to_string())
+}
+
 impl BrowseState {
     pub fn new() -> Self {
         Self::new_with_config(&crate::config::BrowsingConfig::default())
@@ -3275,6 +3363,8 @@ impl BrowseState {
             search_result_cap: config.search_result_cap,
             pending_inline_rename_after_scan: None,
             scan_tx: None,
+            tabs: Some(BrowseTabs::new()),
+            tab_id: 1,
         };
         // Construction is intentionally filesystem-enumeration-free. The event
         // loop installs `scan_tx` and explicitly starts the initial async scan
@@ -3290,6 +3380,478 @@ impl BrowseState {
     /// channel without causing surprise work.
     pub fn set_tx(&mut self, tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>) {
         self.scan_tx = Some(tx);
+    }
+
+    fn swap_tab_shared_state(&mut self, other: &mut Self) {
+        // Session/app-global state follows the active Browse screen, not a
+        // directory tab. The explicit list is intentionally reviewable; all
+        // fields omitted here are per-tab by default.
+        std::mem::swap(&mut self.filesystem_clipboard, &mut other.filesystem_clipboard);
+        std::mem::swap(&mut self.filesystem_clipboard_generation, &mut other.filesystem_clipboard_generation);
+        std::mem::swap(&mut self.tag_clipboard, &mut other.tag_clipboard);
+        std::mem::swap(&mut self.tag_clipboard_copy_generation, &mut other.tag_clipboard_copy_generation);
+        std::mem::swap(&mut self.tag_clipboard_copy_active_generation, &mut other.tag_clipboard_copy_active_generation);
+        std::mem::swap(&mut self.tag_clipboard_copy_cancel, &mut other.tag_clipboard_copy_cancel);
+        std::mem::swap(&mut self.tag_clipboard_copy_pending, &mut other.tag_clipboard_copy_pending);
+        std::mem::swap(&mut self.tag_transfer_generation, &mut other.tag_transfer_generation);
+        std::mem::swap(&mut self.tag_transfer_active_generation, &mut other.tag_transfer_active_generation);
+        std::mem::swap(&mut self.tag_transfer_cancel, &mut other.tag_transfer_cancel);
+        std::mem::swap(&mut self.tag_transfer_pending, &mut other.tag_transfer_pending);
+        std::mem::swap(&mut self.tag_transfer_refresh_pending, &mut other.tag_transfer_refresh_pending);
+        std::mem::swap(&mut self.filesystem_clipboard_retry_plan, &mut other.filesystem_clipboard_retry_plan);
+
+        // Absolute-path caches and their worker ownership are shared. This
+        // avoids N independent probe/stats pipelines while per-view debounce,
+        // cursor, and deferred-work state remains tab-local.
+        std::mem::swap(&mut self.probe_cache, &mut other.probe_cache);
+        std::mem::swap(&mut self.probe_cache_needs_metadata_enrichment, &mut other.probe_cache_needs_metadata_enrichment);
+        std::mem::swap(&mut self.browse_cold_probe_queue, &mut other.browse_cold_probe_queue);
+        std::mem::swap(&mut self.browse_cold_probe_active, &mut other.browse_cold_probe_active);
+        std::mem::swap(&mut self.probe_cancel, &mut other.probe_cancel);
+        std::mem::swap(&mut self.probe_pending, &mut other.probe_pending);
+        std::mem::swap(&mut self.transient_probe_failures, &mut other.transient_probe_failures);
+        std::mem::swap(&mut self.archive_probe_epochs, &mut other.archive_probe_epochs);
+        std::mem::swap(&mut self.dir_stats_cache, &mut other.dir_stats_cache);
+        std::mem::swap(&mut self.dir_stats_pending, &mut other.dir_stats_pending);
+        std::mem::swap(&mut self.dir_stats_active, &mut other.dir_stats_active);
+        std::mem::swap(&mut self.dir_stats_queue, &mut other.dir_stats_queue);
+        std::mem::swap(&mut self.directory_summary_cache, &mut other.directory_summary_cache);
+        std::mem::swap(&mut self.directory_summary_db_miss_cache, &mut other.directory_summary_db_miss_cache);
+        std::mem::swap(&mut self.directory_summary_persistent_cache_mode, &mut other.directory_summary_persistent_cache_mode);
+        std::mem::swap(&mut self.directory_summary_persistent_cache_path, &mut other.directory_summary_persistent_cache_path);
+        std::mem::swap(&mut self.directory_summary_cold_work_policy, &mut other.directory_summary_cold_work_policy);
+        std::mem::swap(&mut self.directory_stats_cold_work_policy, &mut other.directory_stats_cold_work_policy);
+        std::mem::swap(&mut self.folder_classification_cache, &mut other.folder_classification_cache);
+        std::mem::swap(&mut self.folder_classification_pending, &mut other.folder_classification_pending);
+        std::mem::swap(&mut self.folder_cue_availability_probe_requested, &mut other.folder_cue_availability_probe_requested);
+        std::mem::swap(&mut self.folder_classification_queue, &mut other.folder_classification_queue);
+        std::mem::swap(&mut self.sacd_classify_cache, &mut other.sacd_classify_cache);
+        std::mem::swap(&mut self.dvda_iso_classify_cache, &mut other.dvda_iso_classify_cache);
+        std::mem::swap(&mut self.dvda_dir_classify_cache, &mut other.dvda_dir_classify_cache);
+        std::mem::swap(&mut self.dvdv_iso_classify_cache, &mut other.dvdv_iso_classify_cache);
+        std::mem::swap(&mut self.dvdv_dir_classify_cache, &mut other.dvdv_dir_classify_cache);
+        std::mem::swap(&mut self.bluray_iso_classify_cache, &mut other.bluray_iso_classify_cache);
+        std::mem::swap(&mut self.bluray_dir_classify_cache, &mut other.bluray_dir_classify_cache);
+        std::mem::swap(&mut self.disc_probe_cache, &mut other.disc_probe_cache);
+        std::mem::swap(&mut self.disc_probe_pending, &mut other.disc_probe_pending);
+        std::mem::swap(&mut self.disc_probe_active, &mut other.disc_probe_active);
+        std::mem::swap(&mut self.disc_probe_followup, &mut other.disc_probe_followup);
+
+        std::mem::swap(&mut self.return_target, &mut other.return_target);
+        std::mem::swap(&mut self.default_sort_by, &mut other.default_sort_by);
+        std::mem::swap(&mut self.default_sort_dir, &mut other.default_sort_dir);
+        std::mem::swap(&mut self.explore_enabled, &mut other.explore_enabled);
+        std::mem::swap(&mut self.info_enabled, &mut other.info_enabled);
+        std::mem::swap(&mut self.explore_collapsed, &mut other.explore_collapsed);
+        std::mem::swap(&mut self.info_collapsed, &mut other.info_collapsed);
+        std::mem::swap(&mut self.browse_maximized, &mut other.browse_maximized);
+        std::mem::swap(&mut self.browse_title_last_click, &mut other.browse_title_last_click);
+        std::mem::swap(&mut self.columns, &mut other.columns);
+        std::mem::swap(&mut self.options_menu, &mut other.options_menu);
+        std::mem::swap(&mut self.options_menu_highlight, &mut other.options_menu_highlight);
+        std::mem::swap(&mut self.last_render_area, &mut other.last_render_area);
+        std::mem::swap(&mut self.search_result_cap, &mut other.search_result_cap);
+        // `scan_tx` is clonable runtime wiring, not active-tab-owned state.
+        // Every live tab must retain a sender so tab-addressed completions can
+        // launch follow-on directory scans without falling back to synchronous
+        // filesystem enumeration on the TUI thread.
+    }
+
+    fn switch_to_tab_internal(&mut self, index: usize) -> bool {
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let already_active = index == tabs.active;
+        if index >= tabs.slots.len() || already_active {
+            self.tabs = Some(tabs);
+            return already_active;
+        }
+        let old_index = tabs.active;
+        let Some(mut incoming) = tabs.slots[index].state.take() else {
+            self.tabs = Some(tabs);
+            return false;
+        };
+        debug_assert!(incoming.tabs.is_none());
+        debug_assert_eq!(incoming.tab_id, tabs.slots[index].id);
+
+        std::mem::swap(self, incoming.as_mut());
+        self.swap_tab_shared_state(incoming.as_mut());
+        debug_assert!(self.tabs.is_none());
+        debug_assert!(incoming.tabs.is_none());
+
+        tabs.slots[old_index].state = Some(incoming);
+        tabs.active = index;
+        tabs.slots[index].state = None;
+        tabs.drag = None;
+        self.tabs = Some(tabs);
+        true
+    }
+
+    pub fn active_tab_id(&self) -> BrowseTabId { self.tab_id }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.as_ref().map(|tabs| tabs.slots.len()).unwrap_or(1)
+    }
+
+    pub fn active_tab_index(&self) -> usize {
+        self.tabs.as_ref().map(|tabs| tabs.active).unwrap_or(0)
+    }
+
+    pub fn has_closed_tabs(&self) -> bool {
+        self.tabs.as_ref().is_some_and(|tabs| !tabs.closed.is_empty())
+    }
+
+    pub fn first_archive_staging_tab_id(&self) -> Option<BrowseTabId> {
+        if self.archive.as_ref().and_then(|arc| arc.staging.as_ref()).is_some() {
+            return Some(self.tab_id);
+        }
+        let tabs = self.tabs.as_ref()?;
+        tabs.slots.iter().filter_map(|slot| slot.state.as_deref()).find_map(|state| {
+            state.archive.as_ref().and_then(|arc| arc.staging.as_ref()).map(|_| state.tab_id)
+        })
+    }
+
+    pub fn first_dirty_archive_tab_id(&self) -> Option<BrowseTabId> {
+        if self.archive.as_ref().and_then(|arc| arc.staging.as_ref()).is_some_and(|staging| staging.dirty) {
+            return Some(self.tab_id);
+        }
+        let tabs = self.tabs.as_ref()?;
+        tabs.slots.iter().filter_map(|slot| slot.state.as_deref()).find_map(|state| {
+            state.archive.as_ref().and_then(|arc| arc.staging.as_ref())
+                .filter(|staging| staging.dirty)
+                .map(|_| state.tab_id)
+        })
+    }
+
+    pub fn tab_index_by_id(&self, id: BrowseTabId) -> Option<usize> {
+        self.tabs.as_ref()?.slots.iter().position(|slot| slot.id == id)
+    }
+
+    pub fn tab_infos(&self) -> Vec<BrowseTabInfo> {
+        let Some(tabs) = self.tabs.as_ref() else {
+            return vec![BrowseTabInfo {
+                index: 0,
+                id: self.tab_id,
+                label: browse_tab_label(self),
+                active: true,
+                loading: self.scan_pending.is_some(),
+                has_selection: !self.multi_selected.is_empty(),
+            }];
+        };
+        tabs.slots.iter().enumerate().map(|(index, slot)| {
+            let state = if index == tabs.active { self } else { slot.state.as_deref().expect("inactive browse tab state") };
+            BrowseTabInfo {
+                index,
+                id: slot.id,
+                label: browse_tab_label(state),
+                active: index == tabs.active,
+                loading: state.scan_pending.is_some(),
+                has_selection: !state.multi_selected.is_empty(),
+            }
+        }).collect()
+    }
+
+    pub(crate) fn inactive_tab_mut(&mut self, id: BrowseTabId) -> Option<&mut BrowseState> {
+        if id == self.tab_id { return None; }
+        let tabs = self.tabs.as_mut()?;
+        tabs.slots.iter_mut().find(|slot| slot.id == id)?.state.as_deref_mut()
+    }
+
+    pub(crate) fn tab_mut(&mut self, id: BrowseTabId) -> Option<&mut BrowseState> {
+        if id == self.tab_id {
+            return Some(self);
+        }
+        self.inactive_tab_mut(id)
+    }
+
+    pub fn switch_to_tab(&mut self, index: usize) -> bool { self.switch_to_tab_internal(index) }
+
+    pub fn switch_to_tab_id(&mut self, id: BrowseTabId) -> bool {
+        self.tab_index_by_id(id).is_some_and(|index| self.switch_to_tab_internal(index))
+    }
+
+    pub fn switch_tab_relative(&mut self, delta: isize) -> bool {
+        let count = self.tab_count();
+        if count <= 1 { return false; }
+        let current = self.active_tab_index() as isize;
+        let next = (current + delta).rem_euclid(count as isize) as usize;
+        self.switch_to_tab_internal(next)
+    }
+
+    fn detached_clone_of_active(&mut self) -> Box<BrowseState> {
+        let tabs = self.tabs.take();
+
+        // Move session-wide caches/workers/chrome out before cloning. A tab
+        // duplicate should scale with the navigation/view context, not with
+        // every probe/stat/classification cache accumulated this session. The
+        // canonical shared state is restored immediately and will be swapped
+        // into the clone if/when it becomes active.
+        let mut shared_holder = Box::new(BrowseState::new_with_config_at(
+            &self.capture_browsing_config(),
+            self.current_dir.clone(),
+        ));
+        shared_holder.tabs = None;
+        self.swap_tab_shared_state(shared_holder.as_mut());
+        let mut cloned = Box::new(self.clone());
+        self.swap_tab_shared_state(shared_holder.as_mut());
+        self.tabs = tabs;
+
+        cloned.tabs = None;
+        // Staging is an ownership-bearing lifecycle object. A duplicated
+        // archive view never aliases the source tab's staging session.
+        if let Some(archive) = cloned.archive.as_mut() {
+            archive.staging = None;
+        }
+        cloned
+    }
+
+    fn detach_async_ownership_for_new_tab_identity(state: &mut BrowseState) {
+        // Do not cancel shared Arc-backed handles here: this state may be a
+        // clone of a still-live source tab. Dropping the cloned handle severs
+        // ownership; the new tab launches fresh work under its own tab id.
+        state.scan_pending = None;
+        state.scan_discovered_count = 0;
+        state.tree_scan_pending = None;
+        state.search.cancel = None;
+        state.search.searching = false;
+        state.probe_cache_warm_pending.clear();
+        state.pending_inline_rename_after_scan = None;
+    }
+
+    fn quiesce_for_closed_tab(&mut self) {
+        if let Some(handle) = self.scan_pending.take() { handle.cancel(); }
+        if let Some(handle) = self.tree_scan_pending.take() { handle.cancel(); }
+        if let Some(cancel) = self.search.cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.search.searching = false;
+        self.invalidate_path_validation();
+        self.pending_inline_rename_after_scan = None;
+    }
+
+    fn restart_after_tab_identity_change(&mut self) {
+        let tx = self.scan_tx.clone();
+        self.refresh_with_search(tx.as_ref());
+    }
+
+    fn fresh_detached_tab_at(&self, dir: PathBuf, id: BrowseTabId) -> Box<BrowseState> {
+        let mut state = Box::new(BrowseState::new_with_config_at(&self.capture_browsing_config(), dir));
+        state.tabs = None;
+        state.tab_id = id;
+        state.scan_tx = self.scan_tx.clone();
+        state.default_sort_by = self.default_sort_by;
+        state.default_sort_dir = self.default_sort_dir;
+        state.start_initial_async_scan();
+        state
+    }
+
+    pub fn new_tab(&mut self) -> bool {
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let id = tabs.allocate_id();
+        let insert_at = tabs.active.saturating_add(1).min(tabs.slots.len());
+        let state = self.fresh_detached_tab_at(home, id);
+        tabs.slots.insert(insert_at, BrowseTabSlot { id, state: Some(state) });
+        self.tabs = Some(tabs);
+        self.switch_to_tab_internal(insert_at)
+    }
+
+    pub fn open_dir_in_new_tab(&mut self, dir: PathBuf, activate: bool) -> bool {
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let id = tabs.allocate_id();
+        let insert_at = tabs.active.saturating_add(1).min(tabs.slots.len());
+        let state = self.fresh_detached_tab_at(dir, id);
+        tabs.slots.insert(insert_at, BrowseTabSlot { id, state: Some(state) });
+        self.tabs = Some(tabs);
+        !activate || self.switch_to_tab_internal(insert_at)
+    }
+
+    /// Open a directory context in an adjacent tab. Filesystem directories get
+    /// a fresh async-scanning context. Archive directories clone the committed
+    /// listing but never alias a staging session; dirty staged edits remain
+    /// exclusively owned by the source tab.
+    pub fn open_directory_context_in_new_tab(&mut self, path: PathBuf, activate: bool) -> Result<(), String> {
+        if self.archive.is_none() {
+            return self.open_dir_in_new_tab(path, activate).then_some(()).ok_or_else(|| "could not create Browse tab".to_string());
+        }
+        let inner = self.entries.iter().find(|entry| entry.path == path)
+            .and_then(|entry| self.archive_inner_path_for_entry(entry))
+            .ok_or_else(|| "archive folder is no longer present".to_string())?;
+        let mut state = self.detached_clone_of_active();
+        Self::detach_async_ownership_for_new_tab_identity(state.as_mut());
+        state.enter_archive_dir(&inner);
+        let Some(mut tabs) = self.tabs.take() else { return Err("Browse tab manager unavailable".to_string()); };
+        let id = tabs.allocate_id();
+        state.tab_id = id;
+        let insert_at = tabs.active.saturating_add(1).min(tabs.slots.len());
+        tabs.slots.insert(insert_at, BrowseTabSlot { id, state: Some(state) });
+        self.tabs = Some(tabs);
+        if activate { let _ = self.switch_to_tab_internal(insert_at); }
+        Ok(())
+    }
+
+    pub fn duplicate_tab(&mut self) -> bool {
+        let mut state = self.detached_clone_of_active();
+        Self::detach_async_ownership_for_new_tab_identity(state.as_mut());
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let id = tabs.allocate_id();
+        state.tab_id = id;
+        let insert_at = tabs.active.saturating_add(1).min(tabs.slots.len());
+        tabs.slots.insert(insert_at, BrowseTabSlot { id, state: Some(state) });
+        self.tabs = Some(tabs);
+        if self.switch_to_tab_internal(insert_at) {
+            self.restart_after_tab_identity_change();
+            true
+        } else { false }
+    }
+
+    pub(crate) fn active_archive_restore_descriptor(&self) -> Option<BrowseArchiveRestoreDescriptor> {
+        let archive = self.archive.as_ref()?;
+        Some(BrowseArchiveRestoreDescriptor {
+            archive_path: archive.listing.archive_path.clone(),
+            inner_path: archive.inner_path.clone(),
+            password: archive.password.clone(),
+        })
+    }
+
+    pub(crate) fn close_tab_with_archive_restore(
+        &mut self,
+        index: usize,
+        archive_restore: Option<BrowseArchiveRestoreDescriptor>,
+    ) -> bool {
+        let count = self.tab_count();
+        if count <= 1 || index >= count { return false; }
+        if index != self.active_tab_index() && !self.switch_to_tab_internal(index) { return false; }
+
+        let mut tabs = self.tabs.take().expect("active browse tab owns manager");
+        let active = tabs.active;
+        let original_index = active;
+        let incoming_index = if active > 0 { active - 1 } else { 1 };
+        let mut incoming = tabs.slots[incoming_index].state.take().expect("close target tab state");
+        std::mem::swap(self, incoming.as_mut());
+        self.swap_tab_shared_state(incoming.as_mut());
+        // `incoming` now owns the closed tab's per-tab state. Quiesce work that
+        // can no longer receive completions while preserving view state for
+        // reopen-closed. Archive staging itself is never retained here; when a
+        // close had to exit/repackage an archive, `archive_restore` remembers
+        // only the committed navigation identity needed for a fresh relist.
+        incoming.quiesce_for_closed_tab();
+        tabs.closed.push(ClosedBrowseTab {
+            original_index,
+            state: incoming,
+            archive_restore,
+        });
+        const CLOSED_TAB_LIMIT: usize = 16;
+        if tabs.closed.len() > CLOSED_TAB_LIMIT { tabs.closed.remove(0); }
+        tabs.slots.remove(active);
+        let new_active = if active > 0 { active - 1 } else { 0 };
+        tabs.active = new_active;
+        tabs.slots[new_active].state = None;
+        tabs.drag = None;
+        self.tabs = Some(tabs);
+        true
+    }
+
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        self.close_tab_with_archive_restore(index, None)
+    }
+
+    pub(crate) fn close_active_tab_with_archive_restore(
+        &mut self,
+        archive_restore: Option<BrowseArchiveRestoreDescriptor>,
+    ) -> bool {
+        self.close_tab_with_archive_restore(self.active_tab_index(), archive_restore)
+    }
+
+    pub fn close_active_tab(&mut self) -> bool { self.close_tab(self.active_tab_index()) }
+
+    pub(crate) fn reopen_closed_tab_with_archive_restore(
+        &mut self,
+    ) -> Option<Option<BrowseArchiveRestoreDescriptor>> {
+        let Some(mut tabs) = self.tabs.take() else { return None; };
+        let Some(mut closed) = tabs.closed.pop() else {
+            self.tabs = Some(tabs);
+            return None;
+        };
+        let archive_restore = closed.archive_restore.take();
+        let id = tabs.allocate_id();
+        closed.state.tab_id = id;
+        closed.state.tabs = None;
+        let index = closed.original_index.min(tabs.slots.len());
+        tabs.slots.insert(index, BrowseTabSlot { id, state: Some(closed.state) });
+        // Inserting at/before the live tab shifts that live tab one slot to
+        // the right. Keep `tabs.active` attached to the state currently held
+        // in `self` until the normal switch below activates the reopened tab.
+        // Otherwise an insertion at the active index creates an impossible
+        // stateful active slot and `switch_to_tab_internal` short-circuits as
+        // "already active" without performing the required state swap.
+        if index <= tabs.active {
+            tabs.active = tabs.active.saturating_add(1);
+        }
+        debug_assert!(tabs.slots.get(tabs.active).is_some_and(|slot| slot.state.is_none()));
+        self.tabs = Some(tabs);
+        if self.switch_to_tab_internal(index) {
+            // A staging-backed archive close intentionally exited to the host
+            // directory before entering the closed-tab stack. Do not launch a
+            // host-directory scan here; the caller will relist the committed
+            // archive asynchronously under this newly allocated tab id.
+            if archive_restore.is_none() {
+                self.restart_after_tab_identity_change();
+            }
+            Some(archive_restore)
+        } else {
+            None
+        }
+    }
+
+    pub fn reopen_closed_tab(&mut self) -> bool {
+        self.reopen_closed_tab_with_archive_restore().is_some()
+    }
+
+    pub fn reorder_tab(&mut self, from: usize, to: usize) -> bool {
+        let Some(tabs) = self.tabs.as_mut() else { return false; };
+        if from >= tabs.slots.len() || to >= tabs.slots.len() || from == to { return false; }
+        let slot = tabs.slots.remove(from);
+        tabs.slots.insert(to, slot);
+        if tabs.active == from { tabs.active = to; }
+        else if from < tabs.active && to >= tabs.active { tabs.active -= 1; }
+        else if from > tabs.active && to <= tabs.active { tabs.active += 1; }
+        true
+    }
+
+    pub fn reorder_active_tab(&mut self, delta: isize) -> bool {
+        let from = self.active_tab_index();
+        let count = self.tab_count();
+        if count <= 1 { return false; }
+        let to = (from as isize + delta).clamp(0, count.saturating_sub(1) as isize) as usize;
+        self.reorder_tab(from, to)
+    }
+
+    pub fn begin_tab_drag(&mut self, index: usize, column: u16) {
+        if let Some(tabs) = self.tabs.as_mut() {
+            if index < tabs.slots.len() { tabs.drag = Some(BrowseTabDrag { index, start_column: column, reordered: false }); }
+        }
+    }
+
+    pub fn update_tab_drag(&mut self, over_index: usize, column: u16) -> bool {
+        let Some(tabs) = self.tabs.as_mut() else { return false; };
+        let Some(drag) = tabs.drag.as_mut() else { return false; };
+        if column.abs_diff(drag.start_column) < 2 || over_index >= tabs.slots.len() || over_index == drag.index { return false; }
+        let from = drag.index;
+        let slot = tabs.slots.remove(from);
+        tabs.slots.insert(over_index, slot);
+        if tabs.active == from { tabs.active = over_index; }
+        else if from < tabs.active && over_index >= tabs.active { tabs.active -= 1; }
+        else if from > tabs.active && over_index <= tabs.active { tabs.active += 1; }
+        drag.index = over_index;
+        drag.reordered = true;
+        true
+    }
+
+    pub fn finish_tab_drag(&mut self) -> Option<(usize, bool)> {
+        self.tabs.as_mut()?.drag.take().map(|drag| (drag.index, drag.reordered))
+    }
+
+    pub fn tab_drag_active(&self) -> bool {
+        self.tabs.as_ref().is_some_and(|tabs| tabs.drag.is_some())
     }
 
     /// Start the first Browse listing once the runtime channel exists.
@@ -3758,6 +4320,7 @@ impl BrowseState {
             path,
             child_depth,
             self.show_hidden,
+            self.tab_id,
             generation,
             cancel,
             tx,
@@ -3979,7 +4542,7 @@ impl BrowseState {
         let (handle, cancel_flag) = ScanHandle::new(generation);
         self.scan_pending = Some(handle);
 
-        spawn_dir_scan(self.current_dir.clone(), generation, cancel_flag, tx);
+        spawn_dir_scan(self.current_dir.clone(), self.tab_id, generation, cancel_flag, tx);
     }
 
     /// Whether we're currently browsing inside an archive.
@@ -5244,6 +5807,7 @@ impl BrowseState {
             let input_str = input.to_string();
             let origin_dir = self.current_dir.clone();
             let generation = self.next_path_validation_generation();
+            let tab_id = self.tab_id;
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let final_path = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
@@ -5258,6 +5822,7 @@ impl BrowseState {
 
                 let _ = tx
                     .send(crate::tui::message::AppMessage::PathValidationComplete {
+                        tab_id,
                         generation,
                         origin_dir,
                         input: input_str,
@@ -6535,6 +7100,7 @@ impl BrowseState {
         self.search.searching = true;
 
         let root = self.current_dir.clone();
+        let tab_id = self.tab_id;
         let archive_path = arc.listing.archive_path.clone();
         let archive_inner_path = arc.inner_path.clone();
         let password = arc.password.clone();
@@ -6574,6 +7140,7 @@ impl BrowseState {
             if let Some(output) = result {
                 let _ = tx
                     .send(crate::tui::message::AppMessage::SearchComplete {
+                        tab_id,
                         generation,
                         root,
                         recursive,
@@ -7003,6 +7570,7 @@ impl BrowseState {
         self.search.searching = true;
 
         let root = self.current_dir.clone();
+        let tab_id = self.tab_id;
         let query = query.to_string();
         let root_for_worker = root.clone();
         let query_for_worker = query.clone();
@@ -7176,6 +7744,7 @@ impl BrowseState {
             if let Some((results, total_matches)) = results {
                 let _ = tx
                     .send(crate::tui::message::AppMessage::SearchComplete {
+                        tab_id,
                         generation,
                         root,
                         recursive: true,
@@ -7325,6 +7894,19 @@ impl BrowseState {
         self.selected_index = idx;
         self.ensure_visible();
         Some(pending.target_path)
+    }
+
+    /// Resume a sequential inline rename whose directory refresh completed while
+    /// this tab was in the background. If the scan is still live, the ordinary
+    /// scan reducer remains responsible for the continuation.
+    pub fn take_ready_inline_rename_after_tab_activation(&mut self) -> Option<PathBuf> {
+        if self.scan_pending.is_some() {
+            return None;
+        }
+        let pending = self.pending_inline_rename_after_scan.as_ref()?;
+        let generation = pending.scan_generation;
+        let directory = pending.directory.clone();
+        self.take_inline_rename_after_scan_target(generation, &directory)
     }
 
     /// Resolve the range-select anchor to an index in the current `entries` vec.
@@ -8943,6 +9525,7 @@ impl BrowseState {
             return;
         }
 
+        let tab_id = self.tab_id;
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || -> Result<Vec<ProbeCacheWarmRow>, String> {
                 let db = crate::db::Database::open()?;
@@ -8979,6 +9562,7 @@ impl BrowseState {
             for chunk in rows.chunks(PROBE_CACHE_WARM_MESSAGE_CHUNK) {
                 let _ = tx
                     .send(crate::tui::message::AppMessage::ProbeCacheWarmComplete {
+                        tab_id,
                         generation,
                         path: path.clone(),
                         rows: chunk.to_vec(),
@@ -10024,6 +10608,7 @@ fn spawn_browse_tree_scan(
     path: PathBuf,
     child_depth: usize,
     show_hidden: bool,
+    tab_id: BrowseTabId,
     generation: u64,
     cancel: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
@@ -10054,6 +10639,7 @@ fn spawn_browse_tree_scan(
         };
         let _ = tx
             .send(crate::tui::message::AppMessage::BrowseTreeChildrenComplete {
+                tab_id,
                 generation,
                 path,
                 child_depth,
@@ -10072,6 +10658,7 @@ fn spawn_browse_tree_scan(
 /// ever fires.
 fn spawn_dir_scan(
     path: PathBuf,
+    tab_id: BrowseTabId,
     generation: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
@@ -10087,7 +10674,7 @@ fn spawn_dir_scan(
                 scan_directory_blocking(
                     &scan_path,
                     &cancel_flag,
-                    Some((generation, &batch_tx)),
+                    Some((tab_id, generation, &batch_tx)),
                 )
             }),
         )
@@ -10120,6 +10707,7 @@ fn spawn_dir_scan(
 
         let _ = tx
             .send(crate::tui::message::AppMessage::DirScanComplete {
+                tab_id,
                 generation,
                 path,
                 parent_entry,
@@ -10388,6 +10976,7 @@ fn scan_directory_blocking(
     dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,
     batch_sink: Option<(
+        BrowseTabId,
         u64,
         &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
     )>,
@@ -10424,7 +11013,7 @@ fn scan_directory_blocking(
                        batch_files: &mut Vec<BrowseEntry>,
                        discovered: usize|
      -> Result<(), String> {
-        let Some((generation, tx)) = batch_sink else {
+        let Some((tab_id, generation, tx)) = batch_sink else {
             batch_dirs.clear();
             batch_files.clear();
             return Ok(());
@@ -10436,6 +11025,7 @@ fn scan_directory_blocking(
             return Err("cancelled".to_string());
         }
         tx.blocking_send(crate::tui::message::AppMessage::DirScanBatch {
+            tab_id,
             generation,
             path: dir.to_path_buf(),
             dirs: std::mem::take(batch_dirs),
@@ -13428,7 +14018,7 @@ mod tests {
         let worker_tx = tx.clone();
         let result = tokio::task::spawn_blocking(move || {
             let cancel = AtomicBool::new(false);
-            scan_directory_blocking(&path, &cancel, Some((91, &worker_tx)))
+            scan_directory_blocking(&path, &cancel, Some((1, 91, &worker_tx)))
         })
         .await
         .expect("join")
@@ -16302,7 +16892,7 @@ mod tests {
         archive_listing_for_tests_at(std::path::PathBuf::from("/tmp/test-album.zip"), entries)
     }
 
-    fn archive_listing_for_tests_at(
+    pub(super) fn archive_listing_for_tests_at(
         archive_path: std::path::PathBuf,
         entries: Vec<crate::tui::archive_listing::ArchiveEntry>,
     ) -> crate::tui::archive_listing::ArchiveListing {
@@ -16314,7 +16904,7 @@ mod tests {
         }
     }
 
-    fn archive_entry_for_tests(path: &str, is_dir: bool) -> crate::tui::archive_listing::ArchiveEntry {
+    pub(super) fn archive_entry_for_tests(path: &str, is_dir: bool) -> crate::tui::archive_listing::ArchiveEntry {
         crate::tui::archive_listing::ArchiveEntry {
             path: path.to_string(),
             size: if is_dir { 0 } else { 100 },
@@ -19324,5 +19914,175 @@ mod selection_behavior_tests {
         let mut expected = vec![b_one, b_two];
         expected.sort();
         assert_eq!(collected, expected);
+    }
+}
+
+#[cfg(test)]
+mod tabbed_browsing_tests {
+    use super::*;
+    use super::tests::{archive_entry_for_tests, archive_listing_for_tests_at};
+    use tui_file_picker::{FilePickerClipboardMode, FilesystemClipboard};
+
+    #[test]
+    fn tabs_preserve_independent_view_state_while_clipboard_stays_shared() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("alpha");
+        let b = temp.path().join("beta");
+        std::fs::create_dir(&a).expect("alpha");
+        std::fs::create_dir(&b).expect("beta");
+        let a_file = a.join("a.flac");
+        std::fs::write(&a_file, b"a").expect("a file");
+
+        let mut browse = BrowseState::new();
+        browse.current_dir = a.clone();
+        browse.search.input = TextInputState::new("alpha-query".to_string());
+        browse.multi_selected = vec![a_file.clone()];
+        browse.show_hidden = false;
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Copy,
+            vec![a_file.clone()],
+        )
+        .expect("clipboard");
+        browse.filesystem_clipboard = Some(clipboard.clone());
+        let alpha_id = browse.active_tab_id();
+
+        assert!(browse.open_dir_in_new_tab(b.clone(), false));
+        assert_eq!(browse.active_tab_id(), alpha_id);
+        assert_eq!(browse.current_dir, a);
+        assert_eq!(browse.tab_count(), 2);
+
+        assert!(browse.switch_to_tab(1));
+        assert_eq!(browse.current_dir, b);
+        assert!(browse.multi_selected.is_empty());
+        assert_eq!(browse.filesystem_clipboard.as_ref(), Some(&clipboard));
+        browse.search.input = TextInputState::new("beta-query".to_string());
+        browse.show_hidden = true;
+        browse.scroll_offset = 7;
+
+        assert!(browse.switch_to_tab(0));
+        assert_eq!(browse.search.input.text, "alpha-query");
+        assert_eq!(browse.multi_selected, vec![a_file]);
+        assert!(!browse.show_hidden);
+        assert_eq!(browse.scroll_offset, 0);
+        assert_eq!(browse.filesystem_clipboard.as_ref(), Some(&clipboard));
+
+        assert!(browse.switch_to_tab(1));
+        assert_eq!(browse.search.input.text, "beta-query");
+        assert!(browse.show_hidden);
+        assert_eq!(browse.scroll_offset, 7);
+        assert_eq!(browse.filesystem_clipboard.as_ref(), Some(&clipboard));
+    }
+
+    #[test]
+    fn duplicate_reorder_close_reopen_and_last_close_are_deterministic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+
+        let mut browse = BrowseState::new();
+        browse.current_dir = a;
+        assert!(browse.open_dir_in_new_tab(b.clone(), true));
+        assert_eq!(browse.active_tab_index(), 1);
+        assert!(browse.duplicate_tab());
+        assert_eq!(browse.tab_count(), 3);
+        assert_eq!(browse.active_tab_index(), 2);
+        assert_eq!(browse.current_dir, b);
+
+        assert!(browse.reorder_active_tab(-1));
+        assert_eq!(browse.active_tab_index(), 1);
+        assert_eq!(browse.current_dir, b);
+        assert!(browse.close_active_tab());
+        assert_eq!(browse.tab_count(), 2);
+        assert_eq!(browse.active_tab_index(), 0, "focused close prefers the left neighbor");
+        assert!(browse.has_closed_tabs());
+        assert!(browse.reopen_closed_tab());
+        assert_eq!(browse.tab_count(), 3);
+        assert_eq!(browse.active_tab_index(), 1, "reopen restores original index and focuses it");
+        assert_eq!(browse.current_dir, b);
+
+        while browse.tab_count() > 1 {
+            assert!(browse.close_active_tab());
+        }
+        assert!(!browse.close_active_tab(), "last Browse tab remains open");
+        assert_eq!(browse.tab_count(), 1);
+    }
+
+    #[test]
+    fn unstaged_archive_close_reopen_preserves_archive_directory_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let other = temp.path().join("other");
+        std::fs::write(&archive, b"archive placeholder").expect("archive");
+        std::fs::create_dir(&other).expect("other");
+
+        let mut browse = BrowseState::new();
+        browse.current_dir = temp.path().to_path_buf();
+        browse.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![
+                    archive_entry_for_tests("Disc 2", true),
+                    archive_entry_for_tests("Disc 2/01.flac", false),
+                ],
+            ),
+            Some("secret".to_string()),
+        );
+        browse.enter_archive_dir("Disc 2");
+        assert!(browse.open_dir_in_new_tab(other.clone(), false));
+
+        assert!(browse.close_active_tab());
+        assert_eq!(browse.current_dir, other);
+        assert!(browse.reopen_closed_tab());
+
+        let restored = browse.archive.as_ref().expect("restored archive");
+        assert_eq!(restored.listing.archive_path, archive);
+        assert_eq!(restored.inner_path, "Disc 2");
+        assert_eq!(restored.password.as_deref(), Some("secret"));
+        assert!(restored.staging.is_none());
+    }
+
+    #[test]
+    fn duplicate_archive_tab_never_aliases_staging_ownership() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive");
+        let mut browse = BrowseState::new();
+        browse.enter_archive(
+            archive_listing_for_tests_at(
+                archive.clone(),
+                vec![archive_entry_for_tests("folder/track.flac", false)],
+            ),
+            None,
+        );
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir(&staging_dir).expect("staging");
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive.clone(),
+            0,
+            0,
+            0,
+        );
+        staging.append_edit(ArchiveEdit::ContentModified {
+            inner_path: "folder/track.flac".to_string(),
+            kind: "test-edit".to_string(),
+        });
+        staging.install_clone_into_browse_state(&mut browse).expect("install staging");
+        let source_staging = browse
+            .active_archive_staging()
+            .map(|session| session.staging_dir.clone())
+            .expect("source staging");
+
+        assert!(browse.duplicate_tab());
+        assert!(browse.active_archive_staging().is_none(), "duplicate cannot share staging ownership");
+        assert!(source_staging.exists(), "source staging remains owned by the original tab");
+        assert!(browse.switch_to_tab(0));
+        assert_eq!(
+            browse.active_archive_staging().map(|session| session.staging_dir.clone()),
+            Some(source_staging),
+        );
+        assert!(browse.active_archive_staging().is_some_and(|session| session.dirty));
     }
 }

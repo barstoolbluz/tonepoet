@@ -39,6 +39,7 @@ struct StatusJob {
 
 #[derive(Debug)]
 struct ActivationJob {
+    tab_id: crate::tui::browse::BrowseTabId,
     generation: u64,
     request_id: u64,
     path: PathBuf,
@@ -48,6 +49,7 @@ struct ActivationJob {
 
 #[derive(Debug)]
 struct DetailJob {
+    tab_id: crate::tui::browse::BrowseTabId,
     generation: u64,
     path: PathBuf,
     generation_guard: Arc<AtomicU64>,
@@ -397,6 +399,7 @@ fn run_activation_job(job: ActivationJob) {
         return;
     }
     let _ = job.tx.blocking_send(AppMessage::BookmarkActivationResolved {
+        tab_id: job.tab_id,
         generation: job.generation,
         request_id: job.request_id,
         path: job.path,
@@ -411,6 +414,7 @@ fn run_detail_job(job: DetailJob) {
     if job
         .tx
         .blocking_send(AppMessage::BookmarkDetailStarted {
+            tab_id: job.tab_id,
             generation: job.generation,
             path: job.path.clone(),
         })
@@ -426,6 +430,7 @@ fn run_detail_job(job: DetailJob) {
         return;
     }
     let _ = job.tx.blocking_send(AppMessage::BookmarkDetailLoaded {
+        tab_id: job.tab_id,
         generation: job.generation,
         path: job.path,
         result,
@@ -467,6 +472,7 @@ pub fn try_queue_status(
 }
 
 pub fn try_queue_activation(
+    tab_id: crate::tui::browse::BrowseTabId,
     generation: u64,
     request_id: u64,
     path: PathBuf,
@@ -474,6 +480,7 @@ pub fn try_queue_activation(
     tx: tokio_mpsc::Sender<AppMessage>,
 ) -> Result<(), BookmarkEnqueueError> {
     let job = ActivationJob {
+        tab_id,
         generation,
         request_id,
         path,
@@ -486,12 +493,14 @@ pub fn try_queue_activation(
 }
 
 pub fn try_queue_detail(
+    tab_id: crate::tui::browse::BrowseTabId,
     generation: u64,
     path: PathBuf,
     generation_guard: Arc<AtomicU64>,
     tx: tokio_mpsc::Sender<AppMessage>,
 ) -> Result<(), BookmarkEnqueueError> {
     let job = DetailJob {
+        tab_id,
         generation,
         path,
         generation_guard,
@@ -505,6 +514,49 @@ pub fn try_queue_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_worker_messages_preserve_launching_tab_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let generation = 17;
+        let tab_id = 42;
+        let guard = Arc::new(AtomicU64::new(generation));
+        let (tx, mut rx) = tokio_mpsc::channel(2);
+
+        run_detail_job(DetailJob {
+            tab_id,
+            generation,
+            path: temp.path().to_path_buf(),
+            generation_guard: guard,
+            tx,
+        });
+
+        match rx.blocking_recv().expect("detail started") {
+            AppMessage::BookmarkDetailStarted {
+                tab_id: actual,
+                generation: actual_generation,
+                path,
+            } => {
+                assert_eq!(actual, tab_id);
+                assert_eq!(actual_generation, generation);
+                assert_eq!(path, temp.path().to_path_buf());
+            }
+            other => panic!("unexpected first detail message: {other:?}"),
+        }
+        match rx.blocking_recv().expect("detail loaded") {
+            AppMessage::BookmarkDetailLoaded {
+                tab_id: actual,
+                generation: actual_generation,
+                path,
+                ..
+            } => {
+                assert_eq!(actual, tab_id);
+                assert_eq!(actual_generation, generation);
+                assert_eq!(path, temp.path().to_path_buf());
+            }
+            other => panic!("unexpected second detail message: {other:?}"),
+        }
+    }
 
     #[test]
     fn stale_generation_is_detected_before_filesystem_work() {

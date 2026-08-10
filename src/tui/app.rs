@@ -11445,6 +11445,24 @@ pub struct AppState {
     /// open long enough for the user to see the error.
     pub quit_after_browse_archive_repackage: bool,
 
+    /// Tab close deferred until the active archive staging session has been
+    /// repackaged successfully. The descriptor is staging-free: it preserves
+    /// only the committed archive navigation context needed by reopen-closed.
+    pub pending_browse_tab_close_after_archive_repackage: Option<(
+        crate::tui::browse::BrowseTabId,
+        Option<crate::tui::browse::BrowseTabId>,
+        crate::tui::browse::BrowseArchiveRestoreDescriptor,
+    )>,
+
+    /// Archive directory contexts being restored after reopening a staged
+    /// archive tab. Kept by stable tab id so password retries and background
+    /// listing completion can restore the original inner directory without
+    /// retaining or reattaching any staging ownership.
+    pub pending_browse_archive_tab_restores: std::collections::HashMap<
+        crate::tui::browse::BrowseTabId,
+        crate::tui::browse::BrowseArchiveRestoreDescriptor,
+    >,
+
     /// True when quit is waiting for an in-flight Browse archive-entry rename to
     /// finish. The rename worker owns active extraction/repackage I/O, so quit
     /// must never remove its staging directory out from under it.
@@ -11569,9 +11587,14 @@ pub struct AppState {
     /// priority over keychain MRU when committing archives.
     pub archive_passwords: std::collections::HashMap<std::path::PathBuf, String>,
 
-    /// In-flight Browse archive listing, if any. Esc, a new listing, or screen
-    /// changes cancel this token and stale completions are ignored by id.
-    pub pending_archive_listing: Option<PendingArchiveListing>,
+    /// In-flight Browse archive listings, at most one per live Browse tab.
+    /// Navigation/Esc replace or cancel only the focused tab's request; screen
+    /// changes and quit cancel the whole registry. Completion routing remains
+    /// additionally guarded by the global generation id carried in the message.
+    pub pending_archive_listings: std::collections::HashMap<
+        crate::tui::browse::BrowseTabId,
+        PendingArchiveListing,
+    >,
 
     /// Monotonic generation for Browse archive listing workers.
     pub archive_listing_generation: u64,
@@ -12372,6 +12395,8 @@ impl AppState {
             archive_recovery_prompt_active,
             quit_after_browse_archive_metadata_resolution: false,
             quit_after_browse_archive_repackage: false,
+            pending_browse_tab_close_after_archive_repackage: None,
+            pending_browse_archive_tab_restores: std::collections::HashMap::new(),
             quit_after_browse_archive_rename: false,
             quit_after_browse_archive_delete: false,
             deferred_browse_archive_screen_switch: None,
@@ -12402,7 +12427,7 @@ impl AppState {
             config_focus: ConfigFocus::default(),
             keychain: KeychainState::default(),
             archive_passwords: std::collections::HashMap::new(),
-            pending_archive_listing: None,
+            pending_archive_listings: std::collections::HashMap::new(),
             archive_listing_generation: 0,
             archive_listing_cache: std::collections::HashMap::new(),
             archive_listing_cache_lru: std::collections::VecDeque::new(),
@@ -12566,42 +12591,79 @@ impl AppState {
         &mut self,
         archive_path: std::path::PathBuf,
     ) -> (u64, tokio_util::sync::CancellationToken) {
-        self.cancel_archive_listing();
+        let tab_id = self.browse.active_tab_id();
+        self.cancel_archive_listing_for(tab_id);
         self.archive_listing_generation = self.archive_listing_generation.saturating_add(1);
         let id = self.archive_listing_generation;
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.pending_archive_listing = Some(PendingArchiveListing {
-            id,
-            archive_path,
-            cancel: cancel.clone(),
-            started_at: std::time::Instant::now(),
-        });
+        self.pending_archive_listings.insert(
+            tab_id,
+            PendingArchiveListing {
+                id,
+                archive_path,
+                cancel: cancel.clone(),
+                started_at: std::time::Instant::now(),
+            },
+        );
         (id, cancel)
     }
 
-    pub fn archive_listing_pending_for(&self, id: u64, archive_path: &std::path::Path) -> bool {
-        self.pending_archive_listing
-            .as_ref()
-            .map(|pending| pending.id == id && pending.archive_path == archive_path)
-            .unwrap_or(false)
+    pub fn archive_listing_pending_for(
+        &self,
+        tab_id: crate::tui::browse::BrowseTabId,
+        id: u64,
+        archive_path: &std::path::Path,
+    ) -> bool {
+        self.pending_archive_listings
+            .get(&tab_id)
+            .is_some_and(|pending| pending.id == id && pending.archive_path == archive_path)
     }
 
-    pub fn complete_archive_listing(&mut self, id: u64, archive_path: &std::path::Path) -> bool {
-        if self.archive_listing_pending_for(id, archive_path) {
-            self.pending_archive_listing = None;
+    pub fn complete_archive_listing(
+        &mut self,
+        tab_id: crate::tui::browse::BrowseTabId,
+        id: u64,
+        archive_path: &std::path::Path,
+    ) -> bool {
+        if self.archive_listing_pending_for(tab_id, id, archive_path) {
+            self.pending_archive_listings.remove(&tab_id);
             true
         } else {
             false
         }
     }
 
-    pub fn cancel_archive_listing(&mut self) -> bool {
-        if let Some(pending) = self.pending_archive_listing.take() {
+    /// Cancel the in-flight archive listing owned by `tab_id`, if any.
+    /// This is the primitive used by tab close and by focused-tab navigation.
+    pub fn cancel_archive_listing_for(
+        &mut self,
+        tab_id: crate::tui::browse::BrowseTabId,
+    ) -> bool {
+        if let Some(pending) = self.pending_archive_listings.remove(&tab_id) {
             pending.cancel.cancel();
             true
         } else {
             false
         }
+    }
+
+    /// Cancel only the focused Browse tab's archive listing. Ordinary Browse
+    /// navigation and Esc must never cancel another tab's background work.
+    pub fn cancel_archive_listing(&mut self) -> bool {
+        let tab_id = self.browse.active_tab_id();
+        self.cancel_archive_listing_for(tab_id)
+    }
+
+    /// Cancel every in-flight Browse archive listing. This is reserved for
+    /// leaving Browse or quitting, where no tab remains entitled to continue.
+    pub fn cancel_all_archive_listings(&mut self) -> bool {
+        if self.pending_archive_listings.is_empty() {
+            return false;
+        }
+        for (_, pending) in self.pending_archive_listings.drain() {
+            pending.cancel.cancel();
+        }
+        true
     }
 
     pub fn cached_archive_listing(
@@ -13159,7 +13221,8 @@ impl AppState {
             ));
             return;
         }
-        if let Some(pending) = &self.pending_archive_listing {
+        let active_browse_tab_id = self.browse.active_tab_id();
+        if let Some(pending) = self.pending_archive_listings.get(&active_browse_tab_id) {
             let elapsed = pending.started_at.elapsed().as_secs();
             let name = pending
                 .archive_path
@@ -17878,6 +17941,67 @@ mod metadata_presentation_tab_tests {
                 id: "test-client".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn all_picker_purposes_remain_session_global_across_directory_tabs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).expect("mkdir child");
+        let purposes = vec![
+            FilePickerPurpose::SelectArtwork {
+                picture_type: lofty::picture::PictureType::CoverFront,
+            },
+            FilePickerPurpose::SelectFile,
+            FilePickerPurpose::SelectDirectory,
+            FilePickerPurpose::SelectDestination,
+            FilePickerPurpose::SelectPreset,
+            FilePickerPurpose::SavePreset,
+            FilePickerPurpose::CopyTo {
+                sources: vec![temp.path().join("copy-source.flac")],
+                force: false,
+            },
+            FilePickerPurpose::MoveTo {
+                sources: vec![temp.path().join("move-source.flac")],
+                force: true,
+            },
+            FilePickerPurpose::BrowseTagTransfer {
+                direction: TagTransferDirection::To,
+                scope: TagTransferScope::Canonical,
+                fixed_roots: vec![temp.path().to_path_buf()],
+                metadata_target_priority: Vec::new(),
+            },
+            FilePickerPurpose::MetadataTagBlocksFile,
+            FilePickerPurpose::MetadataTagTransfer {
+                direction: TagTransferDirection::From,
+                scope: TagTransferScope::All,
+                metadata_target_priority: Vec::new(),
+            },
+            FilePickerPurpose::Generic {
+                id: "tab-purpose-contract".to_string(),
+            },
+        ];
+
+        for purpose in purposes {
+            let picker = tui_file_picker::FilePickerState::new(tui_file_picker::FilePickerConfig {
+                start_dir: temp.path().to_path_buf(),
+                filter: tui_file_picker::FilePickerFilter::All,
+                title: "Purpose contract".to_string(),
+                ..tui_file_picker::FilePickerConfig::default()
+            });
+            let mut session = MetadataFilePickerState::new(purpose.clone(), picker);
+            let session_id = session.session_id;
+
+            assert!(session.picker.open_dir_in_new_tab(child.clone(), true));
+            assert_eq!(session.picker.tab_count(), 2);
+            assert_eq!(session.picker.current_dir(), child.as_path());
+            assert_eq!(session.session_id, session_id);
+            assert_eq!(session.purpose, purpose);
+
+            assert!(session.picker.switch_to_tab(0));
+            assert_eq!(session.session_id, session_id);
+            assert_eq!(session.purpose, purpose);
+        }
     }
 
     #[test]

@@ -91,8 +91,8 @@ pub async fn run_app(
         if app.current_screen != AppScreen::Browse && app.bookmarks.overlay_open {
             app.bookmarks.close_overlay();
         }
-        if app.current_screen != AppScreen::Browse && app.cancel_archive_listing() {
-            app.set_status("archive listing cancelled: Browse screen changed");
+        if app.current_screen != AppScreen::Browse && app.cancel_all_archive_listings() {
+            app.set_status("archive listings cancelled: Browse screen changed");
         }
         if app.current_screen != AppScreen::Browse && app.cancel_browse_convert_expansion() {
             app.set_status("folder expansion cancelled: Browse screen changed");
@@ -149,24 +149,9 @@ pub async fn run_app(
             if defer_quit_for_queued_file_transfers(app) {
                 continue;
             }
-            if app.pending_browse_archive_rename.is_some() {
-                app.should_quit = false;
-                app.quit_after_browse_archive_rename = true;
-                app.set_status("quit deferred: waiting for archive rename to finish".to_string());
-                continue;
-            }
-            if app.pending_browse_archive_delete.is_some() {
-                app.should_quit = false;
-                app.quit_after_browse_archive_delete = true;
-                app.set_status("quit deferred: waiting for archive delete to finish".to_string());
-                continue;
-            }
-            app.cancel_archive_listing();
+            app.cancel_all_archive_listings();
             app.convert.clear_pending_archive_preview();
             app.convert.source.mode.cleanup_archive_preview_staging();
-            if let Some(pending) = app.pending_browse_archive_metadata.take() {
-                pending.cancel_and_cleanup();
-            }
             // An active Browse archive repackage owns staged user edits. Never
             // delete that staging directory from the quit fast path; wait for
             // the repackage result so success can clean it and failure can keep
@@ -557,16 +542,66 @@ fn defer_quit_for_browse_archive_metadata(
         return true;
     }
 
-    if app
-        .browse
-        .active_archive_staging()
-        .is_some_and(|staging| staging.dirty)
-    {
+    // First-edit archive workers own staging lifecycle until their terminal
+    // reducer runs. Defer rename/delete before attempting to drain any clean
+    // tab staging: `exit_browse_archive` intentionally refuses to tear down an
+    // archive while one of these mutations is still reconciling.
+    if app.pending_browse_archive_rename.is_some() {
         app.should_quit = false;
-        app.quit_after_browse_archive_repackage = true;
-        super::keybindings::exit_browse_archive(app, tx);
-        app.set_status("quit deferred: saving staged archive changes".to_string());
+        app.quit_after_browse_archive_rename = true;
+        app.set_status("quit deferred: waiting for archive rename to finish".to_string());
         return true;
+    }
+    if app.pending_browse_archive_delete.is_some() {
+        app.should_quit = false;
+        app.quit_after_browse_archive_delete = true;
+        app.set_status("quit deferred: waiting for archive delete to finish".to_string());
+        return true;
+    }
+
+    // Metadata preparation has not committed user edits yet. Cancel it before
+    // draining tab-owned staging so `exit_browse_archive` cannot keep refusing
+    // the same clean staging session forever. `from_existing` preparations do
+    // not own the Browse staging tree, so cancellation safely leaves that tree
+    // for the normal clean/dirty drain below.
+    if let Some(pending) = app.pending_browse_archive_metadata.take() {
+        pending.cancel_and_cleanup();
+    }
+
+    // Archive staging is tab-owned. Drain clean sessions synchronously and
+    // serialize dirty repackages before allowing process exit; checking only
+    // the focused tab would strand staging owned by a background tab.
+    while let Some(tab_id) = app.browse.first_archive_staging_tab_id() {
+        if app.browse.active_tab_id() != tab_id {
+            let _ = app.browse.switch_to_tab_id(tab_id);
+        }
+        let dirty = app
+            .browse
+            .active_archive_staging()
+            .is_some_and(|staging| staging.dirty);
+        if dirty {
+            app.should_quit = false;
+            app.quit_after_browse_archive_repackage = true;
+            super::keybindings::exit_browse_archive(app, tx);
+            app.set_status("quit deferred: saving staged archive changes".to_string());
+            return true;
+        }
+        // Clean staging is still lifecycle-owned temporary state and must be
+        // cleaned by the exact same path as ordinary archive exit.
+        super::keybindings::exit_browse_archive(app, tx);
+        if app.browse.first_archive_staging_tab_id() == Some(tab_id) {
+            // Defensive liveness backstop: if a future exit guard is added
+            // without a matching quit preflight, never spin on the same tab.
+            // Known in-flight archive-edit guards are handled above and resume
+            // quit automatically; an unknown blocker leaves the app responsive
+            // so the user can retry after it resolves.
+            app.should_quit = false;
+            app.set_status(
+                "quit deferred: archive staging cleanup is waiting for an in-flight operation"
+                    .to_string(),
+            );
+            return true;
+        }
     }
 
     false
@@ -3241,11 +3276,46 @@ fn handle_archive_repackage_result(
                 },
             );
             let path_str = archive_path.display().to_string();
-            let browse_holds_same_archive = app
-                .browse
-                .archive
+            let focus_before_deferred_tab_close = app.browse.active_tab_id();
+            let pending_close_target = app
+                .pending_browse_tab_close_after_archive_repackage
                 .as_ref()
-                .is_some_and(|arc| arc.listing.archive_path == archive_path);
+                .map(|(closing_tab_id, _, _)| *closing_tab_id);
+            let pending_close_target_activated = match pending_close_target {
+                Some(closing_tab_id) if app.browse.active_tab_id() != closing_tab_id => {
+                    app.browse.switch_to_tab_id(closing_tab_id)
+                }
+                Some(_) | None => true,
+            };
+
+            // A deferred tab close may have lost focus while the archive save
+            // was running. Rebind cleanup to the tab that actually requested
+            // the save before applying the normal successful-exit lifecycle.
+            // If activation is unexpectedly unavailable, clear an exact
+            // matching staging owner in place so the closed-tab stack can
+            // never retain a dangling staging handle.
+            if let Some(closing_tab_id) = pending_close_target.filter(|_| !pending_close_target_activated) {
+                if let Some(target) = app.browse.tab_mut(closing_tab_id) {
+                    let owns_completed_staging = target.archive.as_ref().is_some_and(|arc| {
+                        arc.listing.archive_path == archive_path
+                            && arc
+                                .staging
+                                .as_ref()
+                                .is_some_and(|staging| staging.staging_dir == staging_dir)
+                    });
+                    if owns_completed_staging {
+                        let _ = target.take_active_archive_staging();
+                        target.exit_archive();
+                    }
+                }
+            }
+
+            let browse_holds_same_archive = pending_close_target_activated
+                && app
+                    .browse
+                    .archive
+                    .as_ref()
+                    .is_some_and(|arc| arc.listing.archive_path == archive_path);
             clear_preserved_editor_archive_repackage_context(app, &context);
             context.cleanup_staging();
             app.invalidate_archive_listing_cache_for_path(&archive_path);
@@ -3270,6 +3340,32 @@ fn handle_archive_repackage_result(
                 app.browse.exit_archive();
             }
             app.deferred_browse_archive_exit = false;
+
+            if let Some((closing_tab_id, return_tab_id, archive_restore)) =
+                app.pending_browse_tab_close_after_archive_repackage.take()
+            {
+                let resume_tab_id = return_tab_id.or(
+                    (focus_before_deferred_tab_close != closing_tab_id)
+                        .then_some(focus_before_deferred_tab_close),
+                );
+                let closed = match app.browse.tab_index_by_id(closing_tab_id) {
+                    Some(index) => app
+                        .browse
+                        .close_tab_with_archive_restore(index, Some(archive_restore.clone())),
+                    None => true,
+                };
+                if closed {
+                    if let Some(resume_tab_id) = resume_tab_id {
+                        let _ = app.browse.switch_to_tab_id(resume_tab_id);
+                    }
+                } else {
+                    // Never consume a deferred close merely because focus or
+                    // tab-manager state changed underneath the completion.
+                    app.pending_browse_tab_close_after_archive_repackage =
+                        Some((closing_tab_id, return_tab_id, archive_restore));
+                }
+            }
+
             if quit_after_repackage {
                 app.should_quit = true;
                 app.deferred_browse_archive_screen_switch = None;
@@ -3311,6 +3407,7 @@ fn handle_archive_repackage_result(
             app.deferred_browse_archive_exit = false;
             app.deferred_browse_archive_screen_switch = None;
             app.quit_after_browse_archive_repackage = false;
+            app.pending_browse_tab_close_after_archive_repackage = None;
             app.should_quit = false;
             if editor_owns_staging {
                 preserve_editor_owned_archive_repackage_context(app, &context);
@@ -3344,6 +3441,7 @@ fn handle_archive_repackage_result(
             }
         }
         Err(err) => {
+            app.pending_browse_tab_close_after_archive_repackage = None;
             terminal_totals.errors = 1;
             apply_archive_repackage_terminal_update(
                 app,
@@ -3789,6 +3887,7 @@ fn handle_convert_audio_probe_complete(
 fn handle_bookmark_detail_loaded_with_retry<F>(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    tab_id: crate::tui::browse::BrowseTabId,
     generation: u64,
     path: std::path::PathBuf,
     result: Result<super::bookmarks::BookmarkDetail, String>,
@@ -3796,6 +3895,9 @@ fn handle_bookmark_detail_loaded_with_retry<F>(
 ) where
     F: FnOnce(&mut AppState, &mpsc::Sender<AppMessage>),
 {
+    if app.browse.tab_index_by_id(tab_id).is_none() {
+        return;
+    }
     if app.bookmarks.apply_detail_result(generation, path, result) {
         // A previously selected detail may have been refused because the
         // bounded queue was full. Every current-generation completion releases
@@ -3807,6 +3909,7 @@ fn handle_bookmark_detail_loaded_with_retry<F>(
 pub(super) fn handle_bookmark_detail_loaded(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    tab_id: crate::tui::browse::BrowseTabId,
     generation: u64,
     path: std::path::PathBuf,
     result: Result<super::bookmarks::BookmarkDetail, String>,
@@ -3814,6 +3917,7 @@ pub(super) fn handle_bookmark_detail_loaded(
     handle_bookmark_detail_loaded_with_retry(
         app,
         tx,
+        tab_id,
         generation,
         path,
         result,
@@ -3839,6 +3943,7 @@ mod bookmark_detail_retry_regression_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.bookmarks.open_overlay();
         let generation = app.bookmarks.detail_generation;
+        let tab_id = app.browse.active_tab_id();
         let completed_path = std::path::PathBuf::from("/completed");
         let (tx, _rx) = mpsc::channel(1);
         let mut retried = false;
@@ -3846,6 +3951,7 @@ mod bookmark_detail_retry_regression_tests {
         handle_bookmark_detail_loaded_with_retry(
             &mut app,
             &tx,
+            tab_id,
             generation,
             completed_path,
             Ok(empty_detail()),
@@ -3856,16 +3962,73 @@ mod bookmark_detail_retry_regression_tests {
     }
 
     #[test]
+    fn stale_bookmark_detail_owner_cannot_mutate_global_presentation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.bookmarks.open_overlay();
+        let generation = app.bookmarks.detail_generation;
+        let path = std::path::PathBuf::from("/owned-by-closed-tab");
+        assert!(app.bookmarks.mark_detail_queued(path.clone()));
+        let stale_tab_id = app.browse.active_tab_id().saturating_add(10_000);
+        let (tx, _rx) = mpsc::channel(2);
+
+        handle_message(
+            &mut app,
+            AppMessage::BookmarkDetailStarted {
+                tab_id: stale_tab_id,
+                generation,
+                path: path.clone(),
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.bookmarks.detail_state(&path),
+            Some(super::super::bookmarks::BookmarkDetailState::Queued)
+        ));
+
+        handle_message(
+            &mut app,
+            AppMessage::BookmarkDetailLoaded {
+                tab_id: stale_tab_id,
+                generation,
+                path: path.clone(),
+                result: Ok(empty_detail()),
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.bookmarks.detail_state(&path),
+            Some(super::super::bookmarks::BookmarkDetailState::Queued)
+        ));
+
+        let owner = app.browse.active_tab_id();
+        handle_message(
+            &mut app,
+            AppMessage::BookmarkDetailStarted {
+                tab_id: owner,
+                generation,
+                path: path.clone(),
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.bookmarks.detail_state(&path),
+            Some(super::super::bookmarks::BookmarkDetailState::Loading)
+        ));
+    }
+
+    #[test]
     fn stale_detail_completion_does_not_invoke_retry() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.bookmarks.open_overlay();
         let stale_generation = app.bookmarks.detail_generation.wrapping_sub(1);
+        let tab_id = app.browse.active_tab_id();
         let (tx, _rx) = mpsc::channel(1);
         let mut retried = false;
 
         handle_bookmark_detail_loaded_with_retry(
             &mut app,
             &tx,
+            tab_id,
             stale_generation,
             std::path::PathBuf::from("/stale"),
             Ok(empty_detail()),
@@ -4405,20 +4568,32 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             super::keybindings::request_selected_bookmark_detail(app, tx);
         }
         AppMessage::BookmarkActivationResolved {
+            tab_id,
             generation,
             request_id,
             path,
             result,
         } => {
             super::keybindings::handle_bookmark_activation_result(
-                app, tx, generation, request_id, path, result,
+                app, tx, tab_id, generation, request_id, path, result,
             );
         }
-        AppMessage::BookmarkDetailStarted { generation, path } => {
-            app.bookmarks.apply_detail_started(generation, &path);
+        AppMessage::BookmarkDetailStarted {
+            tab_id,
+            generation,
+            path,
+        } => {
+            if app.browse.tab_index_by_id(tab_id).is_some() {
+                app.bookmarks.apply_detail_started(generation, &path);
+            }
         }
-        AppMessage::BookmarkDetailLoaded { generation, path, result } => {
-            handle_bookmark_detail_loaded(app, tx, generation, path, result);
+        AppMessage::BookmarkDetailLoaded {
+            tab_id,
+            generation,
+            path,
+            result,
+        } => {
+            handle_bookmark_detail_loaded(app, tx, tab_id, generation, path, result);
         }
         AppMessage::BrowseConvertExpansionComplete {
             generation,
@@ -4556,11 +4731,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 baseline,
             );
         }
-        AppMessage::ProbeCacheWarmComplete { generation, path, rows } => {
-            // Do not merge here. Queue rows and let the post-drain flush merge a
-            // bounded slice, generation/path-checked again, so warm-cache bursts
-            // cannot create a long reducer frame.
-            let queued = app.browse.enqueue_probe_cache_warm_rows(generation, path.clone(), rows);
+        AppMessage::ProbeCacheWarmComplete { tab_id, generation, path, rows } => {
+            // Do not merge here. Queue rows on the owning tab and let the
+            // post-drain flush merge a bounded slice, generation/path-checked
+            // again, so warm-cache bursts cannot bleed across tabs.
+            let queued = app
+                .browse
+                .tab_mut(tab_id)
+                .map(|browse| browse.enqueue_probe_cache_warm_rows(generation, path.clone(), rows))
+                .unwrap_or(0);
             if queued == 0 {
                 log::debug!("discarded stale or empty probe-cache warm result for generation {} path {}", generation, path.display());
             }
@@ -5206,41 +5385,50 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
         }
         AppMessage::PathValidationComplete {
+            tab_id,
             generation,
             origin_dir,
             input,
             result,
         } => {
-            if !app.browse.is_current_path_validation(generation, &origin_dir) {
+            let active = app.browse.active_tab_id() == tab_id;
+            let mut status = None;
+            let Some(browse) = app.browse.tab_mut(tab_id) else {
+                log::debug!("discarded path validation for closed Browse tab {}", tab_id);
+                return;
+            };
+            if !browse.is_current_path_validation(generation, &origin_dir) {
                 return;
             }
             match result {
                 Ok(path) => {
                     let display = path.display().to_string();
-                    app.browse.navigate_to(path);
-                    app.set_status(&format!("cd: {}", display));
+                    browse.navigate_to(path);
+                    if active { status = Some(format!("cd: {}", display)); }
                 }
                 Err(e) => {
-                    app.set_status(&format!(":cd {}: {}", input, e));
+                    browse.error = Some(format!(":cd {}: {}", input, e));
+                    if active { status = browse.error.clone(); }
                 }
             }
+            if let Some(status) = status { app.set_status(status); }
         },
         AppMessage::DirScanBatch {
+            tab_id,
             generation,
             path,
             dirs,
             files,
             discovered,
         } => {
-            if !app.browse.apply_dir_scan_batch_if_current(
-                generation,
-                &path,
-                dirs,
-                files,
-                discovered,
-            ) {
+            let Some(browse) = app.browse.tab_mut(tab_id) else {
+                log::debug!("discarded directory batch for closed Browse tab {}", tab_id);
+                return;
+            };
+            if !browse.apply_dir_scan_batch_if_current(generation, &path, dirs, files, discovered) {
                 log::debug!(
-                    "discarded stale directory scan batch for generation {} path {}",
+                    "discarded stale directory scan batch for tab {} generation {} path {}",
+                    tab_id,
                     generation,
                     path.display()
                 );
@@ -5248,22 +5436,22 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
         },
         AppMessage::BrowseTreeChildrenComplete {
+            tab_id,
             generation,
             path,
             child_depth,
             children,
             error,
         } => {
-            if app
-                .browse
-                .apply_tree_scan_complete(generation, &path, child_depth, children)
-            {
+            let Some(browse) = app.browse.tab_mut(tab_id) else { return; };
+            if browse.apply_tree_scan_complete(generation, &path, child_depth, children) {
                 if let Some(error) = error {
                     log::debug!("Browse tree expansion {}: {}", path.display(), error);
                 }
             }
         },
         AppMessage::DirScanComplete {
+            tab_id,
             generation,
             path,
             parent_entry,
@@ -5272,84 +5460,82 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             classification_updates,
             error,
         } => {
-            // Race protection: discard stale scans, including stale successful
-            // scans for the same directory. Directory path alone is not a
-            // sufficient identity because cancelled scans can still complete
-            // after a newer refresh has started.
-            if !app.browse.is_current_dir_scan(generation, &path) {
-                log::debug!("discarded stale directory scan completion for generation {} path {}", generation, path.display());
-                app.browse
-                    .clear_pending_inline_rename_after_scan_generation(generation);
-                return;
-            }
-
-            if let Some(err) = error {
-                let partial_count = app.browse.scan_discovered_count;
-                app.browse.finish_dir_scan_if_current(generation, &path);
-                app.browse
-                    .clear_pending_inline_rename_after_scan_generation(generation);
-                if partial_count > 0 {
-                    // Streaming may already have produced a useful partial
-                    // listing. Keep it visible and surface the terminal failure
-                    // through status instead of replacing the pane with an
-                    // error-only row.
-                    app.set_status(&format!(
-                        "Reading {} stopped after {} entries: {}",
-                        path.display(),
-                        partial_count,
-                        err
-                    ));
-                } else {
-                    app.browse.error = Some(err);
+            let active = app.browse.active_tab_id() == tab_id;
+            let is_current = app
+                .browse
+                .tab_mut(tab_id)
+                .is_some_and(|browse| browse.is_current_dir_scan(generation, &path));
+            if !is_current {
+                log::debug!(
+                    "discarded stale directory scan completion for tab {} generation {} path {}",
+                    tab_id,
+                    generation,
+                    path.display()
+                );
+                if let Some(browse) = app.browse.tab_mut(tab_id) {
+                    browse.clear_pending_inline_rename_after_scan_generation(generation);
                 }
                 return;
             }
 
-            // Success — clear the scan handle/progress indicator.
-            app.browse.finish_dir_scan_if_current(generation, &path);
+            if let Some(err) = error {
+                let mut status = None;
+                if let Some(browse) = app.browse.tab_mut(tab_id) {
+                    let partial_count = browse.scan_discovered_count;
+                    browse.finish_dir_scan_if_current(generation, &path);
+                    browse.clear_pending_inline_rename_after_scan_generation(generation);
+                    if partial_count > 0 {
+                        let message = format!(
+                            "Reading {} stopped after {} entries: {}",
+                            path.display(), partial_count, err
+                        );
+                        browse.error = Some(message.clone());
+                        if active { status = Some(message); }
+                    } else {
+                        browse.error = Some(err.clone());
+                        if active { status = Some(err); }
+                    }
+                }
+                if let Some(status) = status { app.set_status(status); }
+                return;
+            }
 
-            // Directory scanning intentionally avoids cold disc-source probes.
-            // Any identity-bound cache updates remain terminal-only plumbing so
-            // settled-focus classification behavior is unchanged.
-            app.browse.apply_classification_cache_updates(classification_updates);
-            app.browse.publish_scanned_entries(parent_entry, dirs, files);
+            // Classification caches are absolute-path keyed and session-global.
+            // For a background tab, merge a clone into the canonical active
+            // cache as well as the tab-local snapshot used to build this view.
+            if !active {
+                app.browse.apply_classification_cache_updates(classification_updates.clone());
+            }
 
-            // Warm the in-memory probe cache from SQLite off the reducer path.
-            // Large folders must publish promptly; warm rows merge later only
-            // if this generation/path remains current.
-            app.browse
-                .spawn_probe_cache_warm_from_db(generation, path.clone(), tx.clone());
-
-            // Apply current filter/sort. While search is active, the search
-            // panel owns `entries`; re-run the active search against the
-            // refreshed scan data instead of publishing the ordinary Browse
-            // listing under an open search UI.
-            app.browse.reapply_after_directory_scan_complete(Some(tx));
-
-            // Cursor restoration (e.g., after go_parent or a completed inline
-            // rename). Rename restores may also carry the pre-refresh viewport
-            // offset; Browse reapplies it before minimally ensuring visibility.
-            app.browse.restore_cursor_after_refresh();
-
-            // Sequential inline rename continuation (Tab / Shift+Tab). Filesystem
-            // rename refreshes are async in the normal TUI runtime and clear
-            // entries immediately, so resume the captured next/previous target
-            // only after the same directory scan publishes the new view.
-            let resume_inline_rename_target = app
-                .browse
-                .take_inline_rename_after_scan_target(generation, &path);
-            let resumed_inline_rename = if let Some(target_path) = resume_inline_rename_target {
-                super::keybindings::begin_browse_inline_rename(app, target_path);
-                true
-            } else {
-                false
+            let resume_inline_rename_target = {
+                let browse = app.browse.tab_mut(tab_id).expect("validated Browse tab exists");
+                browse.finish_dir_scan_if_current(generation, &path);
+                browse.apply_classification_cache_updates(classification_updates);
+                browse.publish_scanned_entries(parent_entry, dirs, files);
+                browse.reapply_after_directory_scan_complete(Some(tx));
+                browse.restore_cursor_after_refresh();
+                if active {
+                    browse.take_inline_rename_after_scan_target(generation, &path)
+                } else {
+                    // Background tabs cannot own a global inline editor. Keep
+                    // the captured target for a future active refresh instead
+                    // of opening UI on the wrong tab.
+                    None
+                }
             };
 
-            // Probe the newly selected entry unless it is being edited inline;
-            // the next probe will run on commit/cursor movement.
-            if !resumed_inline_rename {
-                app.browse.probe_current_with_db(tx, Some(&app.db));
-                super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+            if active {
+                app.browse.spawn_probe_cache_warm_from_db(generation, path.clone(), tx.clone());
+                let resumed_inline_rename = if let Some(target_path) = resume_inline_rename_target {
+                    super::keybindings::begin_browse_inline_rename(app, target_path);
+                    true
+                } else {
+                    false
+                };
+                if !resumed_inline_rename {
+                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+                }
             }
         }
         AppMessage::MetadataWriteProgress {
@@ -5452,66 +5638,106 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
         }
         AppMessage::ArchiveListingProgress {
+            tab_id,
             id,
             archive_path,
             message,
         } => {
-            if app.archive_listing_pending_for(id, &archive_path) {
+            if app.archive_listing_pending_for(tab_id, id, &archive_path)
+                && app.browse.active_tab_id() == tab_id
+            {
                 app.set_status(message);
             }
         }
         AppMessage::ArchiveListingComplete {
+            tab_id,
             id,
             archive_path,
             cache_key,
             result,
             password,
         } => {
-            if !app.complete_archive_listing(id, &archive_path) {
+            if !app.complete_archive_listing(tab_id, id, &archive_path) {
                 return;
             }
+            let active = app.browse.active_tab_id() == tab_id;
+            let restore_inner_path = app
+                .pending_browse_archive_tab_restores
+                .get(&tab_id)
+                .filter(|restore| restore.archive_path == archive_path)
+                .map(|restore| restore.inner_path.clone());
             match *result {
                 Ok(listing) => {
                     let count = listing.entries.len();
                     if let Some(key) = cache_key {
                         let _ = app.insert_archive_listing_cache(key, listing.clone());
                     }
-                    if app
-                        .browse
-                        .archive
-                        .as_ref()
-                        .is_some_and(|arc| arc.listing.archive_path == archive_path)
-                    {
-                        app.browse.replace_active_archive_listing_with_search(listing, password, Some(tx));
-                    } else {
-                        app.browse.enter_archive(listing, password);
-                    }
+
                     let resumed_recovery = app
                         .pending_archive_recovery_resume
                         .as_ref()
                         .is_some_and(|session| session.archive_path == archive_path);
-                    if resumed_recovery {
-                        if let Some(session) = app.pending_archive_recovery_resume.take() {
-                            if let Some(arc) = app.browse.archive.as_mut() {
+                    let recovery_session = resumed_recovery
+                        .then(|| app.pending_archive_recovery_resume.take())
+                        .flatten();
+                    if app.browse.tab_index_by_id(tab_id).is_none() {
+                        // A closed tab no longer owns UI state. The listing is
+                        // still safe in the shared cache; never apply it to the
+                        // newly focused tab.
+                        app.pending_browse_archive_tab_restores.remove(&tab_id);
+                        if let Some(session) = recovery_session {
+                            app.pending_archive_recovery_resume = Some(session);
+                        }
+                        return;
+                    }
+                    {
+                        let browse = app
+                            .browse
+                            .tab_mut(tab_id)
+                            .expect("validated live Browse tab");
+                        if browse
+                            .archive
+                            .as_ref()
+                            .is_some_and(|arc| arc.listing.archive_path == archive_path)
+                        {
+                            browse.replace_active_archive_listing_with_search(listing, password, Some(tx));
+                        } else {
+                            browse.enter_archive(listing, password);
+                        }
+                        if let Some(session) = recovery_session {
+                            if let Some(arc) = browse.archive.as_mut() {
                                 if arc.listing.archive_path == archive_path {
                                     arc.staging = Some(session);
                                 }
                             }
-                            app.browse.refresh_archive_view_with_search(Some(tx));
+                            browse.refresh_archive_view_with_search(Some(tx));
+                        }
+                        if let Some(inner_path) = restore_inner_path.as_deref() {
+                            if !inner_path.is_empty() {
+                                browse.enter_archive_dir(inner_path);
+                            }
                         }
                     }
-                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                    if restore_inner_path.is_some() {
+                        app.pending_browse_archive_tab_restores.remove(&tab_id);
+                    }
+
+                    if active {
+                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                    }
                     if resumed_recovery {
                         if app.pending_archive_recovery_resume_conflicted {
-                            app.set_status(format!(
-                                "Recovered staged archive edits for {}; archive changed externally, save will require overwrite/discard choice",
-                                archive_path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default(),
-                            ));
+                            if active {
+                                app.set_status(format!(
+                                    "Recovered staged archive edits for {}; archive changed externally, save will require overwrite/discard choice",
+                                    archive_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default(),
+                                ));
+                            }
                             app.pending_archive_recovery_resume_conflicted = false;
-                        } else {
+                        } else if active {
                             app.set_status(format!(
                                 "Recovered staged archive edits for {} ({} entries)",
                                 archive_path
@@ -5521,7 +5747,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                 count,
                             ));
                         }
-                    } else {
+                    } else if active {
                         app.set_status(format!(
                             "Opened {} ({} entries)",
                             archive_path
@@ -5541,64 +5767,94 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         if let Some(session) = app.pending_archive_recovery_resume.take() {
                             match build_recovery_listing_from_staging(&archive_path, &session.staging_dir) {
                                 Ok(listing) => {
-                                    app.browse.enter_archive(listing, password);
-                                    if let Some(arc) = app.browse.archive.as_mut() {
+                                    let Some(browse) = app.browse.tab_mut(tab_id) else {
+                                        app.pending_archive_recovery_resume = Some(session);
+                                        return;
+                                    };
+                                    browse.enter_archive(listing, password);
+                                    if let Some(arc) = browse.archive.as_mut() {
                                         arc.staging = Some(session);
                                     }
-                                    app.browse.refresh_archive_view_with_search(Some(tx));
+                                    browse.refresh_archive_view_with_search(Some(tx));
                                     let conflict_note = if app.pending_archive_recovery_resume_conflicted {
                                         "; original archive needs overwrite/discard review before save"
                                     } else {
                                         ""
                                     };
                                     app.pending_archive_recovery_resume_conflicted = false;
-                                    app.set_status(format!(
-                                        "Recovered staged archive edits from staging{}: {}",
-                                        conflict_note,
-                                        archive_path.display()
-                                    ));
-                                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                                    if active {
+                                        app.set_status(format!(
+                                            "Recovered staged archive edits from staging{}: {}",
+                                            conflict_note,
+                                            archive_path.display()
+                                        ));
+                                        app.browse.probe_current_with_db(tx, Some(&app.db));
+                                    }
                                     return;
                                 }
                                 Err(recovery_err) => {
                                     app.pending_archive_recovery_resume_conflicted = false;
-                                    app.set_status(format!(
-                                        "Archive recovery failed: could not list archive ({e}) or staged tree ({recovery_err}); staged edits remain on disk"
-                                    ));
+                                    if active {
+                                        app.set_status(format!(
+                                            "Archive recovery failed: could not list archive ({e}) or staged tree ({recovery_err}); staged edits remain on disk"
+                                        ));
+                                    } else if let Some(browse) = app.browse.tab_mut(tab_id) {
+                                        browse.error = Some(format!(
+                                            "Archive recovery failed: could not list archive ({e}) or staged tree ({recovery_err}); staged edits remain on disk"
+                                        ));
+                                    }
                                     return;
                                 }
                             }
                         }
                         app.pending_archive_recovery_resume_conflicted = false;
                     }
+
+                    let error_message = format!("Archive error: {}", e);
+                    if app.browse.tab_index_by_id(tab_id).is_none() {
+                        app.pending_browse_archive_tab_restores.remove(&tab_id);
+                        return;
+                    }
+                    app.browse
+                        .tab_mut(tab_id)
+                        .expect("validated live Browse tab")
+                        .error = Some(error_message.clone());
                     if super::app::looks_like_archive_password_error(&e) {
-                        // Overlay-slot authority: the wrong-password Enter
-                        // path may already have RESTORED a parked dirty
-                        // metadata editor into the slot before this failure
-                        // arrives — installing the re-prompt over it would
-                        // drop unsaved edits. Prompt only into an empty
-                        // slot; otherwise surface the retry path in the
-                        // status instead of clobbering.
-                        if matches!(app.active_overlay, ActiveOverlay::None) {
+                        // Password UI is global, so only the owning *focused*
+                        // tab may install it. Background failure remains bound
+                        // to that tab and is surfaced without clobbering the
+                        // user's current overlay.
+                        if active && matches!(app.active_overlay, ActiveOverlay::None) {
                             app.active_overlay = ActiveOverlay::TextEdit {
                                 input: TextInputState::empty(),
                                 target: TextEditTarget::ArchivePassword(archive_path.clone()),
                                 label: "archive password".to_string(),
                             };
                             app.set_status(format!("Archive error: {}; enter password", e));
-                        } else {
+                        } else if active {
                             app.set_status(format!(
                                 "Archive error: {}; close the current overlay and use :password to retry",
                                 e
                             ));
+                        } else {
+                            app.set_status(format!(
+                                "Background Browse tab needs an archive password: {}",
+                                archive_path.display()
+                            ));
                         }
+                    } else if active {
+                        app.set_status(error_message);
                     } else {
-                        app.set_status(format!("Archive error: {}", e));
+                        app.set_status(format!(
+                            "Background Browse tab archive error: {}",
+                            archive_path.display()
+                        ));
                     }
                 }
             }
         },
         AppMessage::SearchComplete {
+            tab_id,
             generation,
             root,
             recursive,
@@ -5617,44 +5873,51 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             archive_tag_cache_updates,
             results,
         } => {
-            if !app.browse.search.active {
-                return; // Search was closed while task was running.
-            }
-
-            let current_query = app.browse.search.input.text.trim().to_ascii_lowercase();
-            let current_cap = app.browse.search_result_cap.max(1);
-            let current_archive_path = app
-                .browse
-                .archive
-                .as_ref()
-                .map(|archive| archive.listing.archive_path.clone());
-            let current_archive_inner_path = app
-                .browse
-                .archive
-                .as_ref()
-                .map(|archive| archive.inner_path.clone());
-            if generation != app.browse.search.generation
-                || root != app.browse.current_dir
-                || recursive != app.browse.search.recursive
-                || archive_path != current_archive_path
-                || archive_inner_path != current_archive_inner_path
-                || query != current_query
-                || mode != app.browse.search.mode
-                || show_hidden != app.browse.show_hidden
-                || audio_only != app.browse.search.audio_only
-                || format_filter != app.browse.format_filter
-                || sort != app.browse.search.sort
-                || sort_dir != app.browse.search.sort_dir
-                || result_cap != current_cap
-            {
-                log::debug!("discarded stale Browse search completion for generation {} root {}", generation, root.display());
+            let active = app.browse.active_tab_id() == tab_id;
+            let mut truncated_status = None;
+            let Some(browse) = app.browse.tab_mut(tab_id) else {
+                log::debug!("discarded search completion for closed Browse tab {}", tab_id);
+                return;
+            };
+            if !browse.search.active {
                 return;
             }
 
-            app.browse.search.searching = false;
-            app.browse.search.cancel = None;
+            let current_query = browse.search.input.text.trim().to_ascii_lowercase();
+            let current_cap = browse.search_result_cap.max(1);
+            let current_archive_path = browse
+                .archive
+                .as_ref()
+                .map(|archive| archive.listing.archive_path.clone());
+            let current_archive_inner_path = browse
+                .archive
+                .as_ref()
+                .map(|archive| archive.inner_path.clone());
+            if generation != browse.search.generation
+                || root != browse.current_dir
+                || recursive != browse.search.recursive
+                || archive_path != current_archive_path
+                || archive_inner_path != current_archive_inner_path
+                || query != current_query
+                || mode != browse.search.mode
+                || show_hidden != browse.show_hidden
+                || audio_only != browse.search.audio_only
+                || format_filter != browse.format_filter
+                || sort != browse.search.sort
+                || sort_dir != browse.search.sort_dir
+                || result_cap != current_cap
+            {
+                log::debug!(
+                    "discarded stale Browse search completion for tab {} generation {} root {}",
+                    tab_id, generation, root.display()
+                );
+                return;
+            }
+
+            browse.search.searching = false;
+            browse.search.cancel = None;
             for (synthetic_path, archive_fingerprint, password_identity, tags) in archive_tag_cache_updates {
-                app.browse.search.archive_tag_cache.insert(
+                browse.search.archive_tag_cache.insert(
                     synthetic_path,
                     super::browse::CachedArchiveTagSearchString {
                         archive_fingerprint,
@@ -5671,20 +5934,21 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             scored.truncate(result_cap);
 
             let mut entries: Vec<super::browse::BrowseEntry> = Vec::new();
-            if let Some(ref parent) = app.browse.parent_entry {
+            if let Some(ref parent) = browse.parent_entry {
                 entries.push(parent.clone());
             }
             entries.extend(scored.into_iter().map(|(e, _)| e));
-            app.browse.entries = entries;
-            app.browse.selected_index = 0;
-            app.browse.scroll_offset = 0;
+            browse.entries = entries;
+            browse.selected_index = 0;
+            browse.scroll_offset = 0;
 
-            if total_matches > result_cap {
-                app.set_status(format!(
+            if active && total_matches > result_cap {
+                truncated_status = Some(format!(
                     "search: showing best {} of {} matches; raise [browsing] search_result_cap to show more",
                     result_cap, total_matches
                 ));
             }
+            if let Some(status) = truncated_status { app.set_status(status); }
         },
         AppMessage::FilePickerComplete {
             session_id,
@@ -10207,9 +10471,11 @@ mod archive_listing_overlay_authority_tests {
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(editor));
         let (tx, _rx) = mpsc::channel(4);
 
+        let __tab_id_fix = app.browse.active_tab_id();
         handle_message(
             &mut app,
             AppMessage::ArchiveListingComplete {
+                tab_id: __tab_id_fix,
                 id,
                 archive_path: archive.clone(),
                 cache_key: None,
@@ -10231,9 +10497,11 @@ mod archive_listing_overlay_authority_tests {
         // The empty-slot case still prompts.
         let (id, _cancel) = app.begin_archive_listing(archive.clone());
         app.active_overlay = ActiveOverlay::None;
+        let __tab_id_fix = app.browse.active_tab_id();
         handle_message(
             &mut app,
             AppMessage::ArchiveListingComplete {
+                tab_id: __tab_id_fix,
                 id,
                 archive_path: archive,
                 cache_key: None,
@@ -10774,7 +11042,7 @@ mod browse_archive_quit_lifecycle_tests {
     };
     use crate::tui::app::{
         ArchiveMetadataEditContext, ConfirmAction, MetadataEditorState, MetadataTechnicalDetails,
-        PendingBrowseArchiveRename,
+        PendingBrowseArchiveDelete, PendingBrowseArchiveRename,
     };
     use std::fs;
 
@@ -10967,6 +11235,118 @@ mod browse_archive_quit_lifecycle_tests {
         // above panics, the staging tree is removed; after this assignment,
         // AppState's test Drop owns cleanup.
         app.browse.archive.as_mut().expect("archive").staging = Some(session_guard.into_inner());
+    }
+
+    fn install_clean_archive_staging(
+        app: &mut AppState,
+        archive: std::path::PathBuf,
+        staging: std::path::PathBuf,
+    ) {
+        let listing = crate::tui::archive_listing::ArchiveListing {
+            archive_path: archive.clone(),
+            format: "zip".to_string(),
+            physical_size: 7,
+            entries: Vec::new(),
+        };
+        app.browse.enter_archive(listing, None);
+        let (secs, nanos, size) = crate::tui::app::archive_fingerprint(&archive).expect("fingerprint");
+        let session_guard = crate::tui::browse::ArchiveStagingSession::new_test_owned(
+            staging,
+            archive,
+            secs,
+            nanos,
+            size,
+        );
+        app.browse.archive.as_mut().expect("archive").staging = Some(session_guard.into_inner());
+    }
+
+    #[test]
+    fn quit_defers_pending_archive_rename_before_clean_staging_drain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("clean-staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+        let (secs, nanos, size) = crate::tui::app::archive_fingerprint(&archive).expect("fingerprint");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.should_quit = true;
+        install_clean_archive_staging(&mut app, archive.clone(), staging.clone());
+        app.pending_browse_archive_rename = Some(PendingBrowseArchiveRename::new(
+            archive,
+            "old.flac".to_string(),
+            "new.flac".to_string(),
+            secs,
+            nanos,
+            size,
+            None,
+        ));
+
+        assert!(defer_quit_for_browse_archive_metadata(&mut app, &tx()));
+        assert!(!app.should_quit);
+        assert!(app.quit_after_browse_archive_rename);
+        assert!(app.pending_browse_archive_rename.is_some());
+        assert!(app.browse.active_archive_staging().is_some());
+        assert!(staging.exists());
+    }
+
+    #[test]
+    fn quit_defers_pending_archive_delete_before_clean_staging_drain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("clean-staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+        let (secs, nanos, size) = crate::tui::app::archive_fingerprint(&archive).expect("fingerprint");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.should_quit = true;
+        install_clean_archive_staging(&mut app, archive.clone(), staging.clone());
+        app.pending_browse_archive_delete = Some(PendingBrowseArchiveDelete::new(
+            archive,
+            vec!["old.flac".to_string()],
+            secs,
+            nanos,
+            size,
+            None,
+        ));
+
+        assert!(defer_quit_for_browse_archive_metadata(&mut app, &tx()));
+        assert!(!app.should_quit);
+        assert!(app.quit_after_browse_archive_delete);
+        assert!(app.pending_browse_archive_delete.is_some());
+        assert!(app.browse.active_archive_staging().is_some());
+        assert!(staging.exists());
+    }
+
+    #[test]
+    fn quit_cancels_pending_archive_metadata_then_drains_clean_staging() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("clean-staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir(&staging).expect("staging");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.should_quit = true;
+        app.browse.current_dir = temp.path().to_path_buf();
+        install_clean_archive_staging(&mut app, archive.clone(), staging.clone());
+        let pending = super::super::app::PendingBrowseArchiveMetadataEdit::from_existing(
+            archive,
+            staging.clone(),
+            None,
+        );
+        let cancel = pending.cancel.clone();
+        app.pending_browse_archive_metadata = Some(pending);
+
+        assert!(!defer_quit_for_browse_archive_metadata(&mut app, &tx()));
+        assert!(app.pending_browse_archive_metadata.is_none());
+        assert!(cancel.is_cancelled());
+        assert!(app.browse.active_archive_staging().is_none());
+        assert!(!staging.exists());
     }
 
     #[tokio::test]
@@ -15821,6 +16201,7 @@ mod async_message_drain_tests {
         let generation = app.browse.scan_generation;
         let directory = app.browse.current_dir.clone();
         tx.try_send(AppMessage::ProbeCacheWarmComplete {
+            tab_id: app.browse.active_tab_id(),
             generation,
             path: directory,
             rows: Vec::new(),
@@ -15929,9 +16310,11 @@ mod async_message_drain_tests {
         let directory = app.browse.current_dir.clone();
         let (tx, _rx) = mpsc::channel(4);
 
+        let __tab_id_fix = app.browse.active_tab_id();
         handle_message(
             &mut app,
             AppMessage::ProbeCacheWarmComplete {
+                tab_id: __tab_id_fix,
                 generation,
                 path: directory,
                 rows: vec![crate::tui::browse::ProbeCacheWarmRow {
@@ -17003,5 +17386,274 @@ mod minimized_file_transfer_attention_tests {
             ActiveOverlay::Confirmation { message, .. } if message == "return to this modal"
         ));
         assert!(app.file_task_preempted_overlay.is_none());
+    }
+}
+
+#[cfg(test)]
+mod browse_tab_async_routing_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    #[tokio::test]
+    async fn colliding_scan_generations_complete_into_the_owning_background_tab() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+
+        let (tx, _rx) = mpsc::channel(32);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a.clone();
+        app.browse.set_tx(tx.clone());
+        app.browse.refresh();
+        let a_id = app.browse.active_tab_id();
+        let a_generation = app.browse.pending_scan_generation().expect("tab A scan");
+
+        assert!(app.browse.open_dir_in_new_tab(b.clone(), true));
+        let b_id = app.browse.active_tab_id();
+        let b_generation = app.browse.pending_scan_generation().expect("tab B scan");
+        assert_ne!(a_id, b_id);
+        assert_eq!(
+            a_generation, b_generation,
+            "the test intentionally exercises colliding per-tab generations",
+        );
+
+        handle_message(
+            &mut app,
+            AppMessage::DirScanComplete {
+                tab_id: a_id,
+                generation: a_generation,
+                path: a.clone(),
+                parent_entry: None,
+                dirs: Vec::new(),
+                files: Vec::new(),
+                classification_updates: Default::default(),
+                error: None,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), b_id, "background completion cannot switch focus");
+        assert_eq!(app.browse.current_dir, b, "active tab directory is untouched");
+        assert_eq!(app.browse.pending_scan_generation(), Some(b_generation));
+        let background = app.browse.tab_mut(a_id).expect("tab A remains live");
+        assert_eq!(background.current_dir, a);
+        assert_eq!(background.pending_scan_generation(), None, "tab A consumed its own completion");
+    }
+
+    #[tokio::test]
+    async fn duplicated_tabs_retain_async_sender_for_background_path_validation_follow_on_scan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let foreground_dir = temp.path().join("foreground");
+        let target_dir = temp.path().join("target");
+        std::fs::create_dir(&source_dir).expect("source");
+        std::fs::create_dir(&foreground_dir).expect("foreground");
+        std::fs::create_dir(&target_dir).expect("target");
+
+        let (tx, _rx) = mpsc::channel(32);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = source_dir.clone();
+        app.browse.set_tx(tx.clone());
+        let source_id = app.browse.active_tab_id();
+
+        assert!(app.browse.duplicate_tab());
+        let duplicate_id = app.browse.active_tab_id();
+        assert_ne!(source_id, duplicate_id);
+        assert!(app.browse.is_async_enabled(), "active duplicate retains runtime sender");
+        assert!(
+            app.browse
+                .tab_mut(source_id)
+                .is_some_and(|browse| browse.is_async_enabled()),
+            "detached source retains runtime sender",
+        );
+
+        // Give the foreground duplicate a visibly distinct context, then launch
+        // :cd validation from the source and switch away before its completion.
+        app.browse.current_dir = foreground_dir.clone();
+        assert!(app.browse.switch_to_tab_id(source_id));
+        assert!(app.browse.is_async_enabled());
+        app.browse
+            .navigate_to_str(target_dir.to_str().expect("utf8 target"))
+            .expect("launch async path validation");
+        let generation = app.browse.path_validation_generation;
+        assert_eq!(
+            app.browse.current_dir, source_dir,
+            "runtime-enabled validation must not synchronously navigate on the TUI thread",
+        );
+
+        assert!(app.browse.switch_to_tab_id(duplicate_id));
+        assert_eq!(app.browse.current_dir, foreground_dir);
+        let foreground_entries: Vec<_> = app
+            .browse
+            .entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.name.clone()))
+            .collect();
+
+        handle_message(
+            &mut app,
+            AppMessage::PathValidationComplete {
+                tab_id: source_id,
+                generation,
+                origin_dir: source_dir.clone(),
+                input: target_dir.display().to_string(),
+                result: Ok(target_dir.clone()),
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), duplicate_id);
+        assert_eq!(app.browse.current_dir, foreground_dir);
+        assert_eq!(
+            app.browse
+                .entries
+                .iter()
+                .map(|entry| (entry.path.clone(), entry.name.clone()))
+                .collect::<Vec<_>>(),
+            foreground_entries,
+        );
+        let background = app.browse.tab_mut(source_id).expect("source tab remains live");
+        assert_eq!(background.current_dir, target_dir);
+        assert!(background.is_async_enabled());
+        assert!(
+            background.pending_scan_generation().is_some(),
+            "background path completion must launch an async directory scan rather than scan inline",
+        );
+    }
+
+    #[tokio::test]
+    async fn bookmark_activation_navigates_the_tab_that_owned_the_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        let bookmarked = temp.path().join("bookmarked");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        std::fs::create_dir(&bookmarked).expect("bookmarked");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a.clone();
+        let a_id = app.browse.active_tab_id();
+        assert!(app.browse.open_dir_in_new_tab(b.clone(), true));
+        let b_id = app.browse.active_tab_id();
+        assert_ne!(a_id, b_id);
+
+        app.bookmarks.overlay_open = true;
+        let pending = app.bookmarks.begin_activation(
+            bookmarked.clone(),
+            crate::tui::bookmarks::BookmarkActivationSurface::Manager,
+        );
+        handle_message(
+            &mut app,
+            AppMessage::BookmarkActivationResolved {
+                tab_id: b_id,
+                generation: pending.generation,
+                request_id: pending.request_id,
+                path: bookmarked.clone(),
+                result: Ok(()),
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), b_id);
+        assert_eq!(app.browse.current_dir, bookmarked);
+        let first = app.browse.tab_mut(a_id).expect("first tab");
+        assert_eq!(first.current_dir, a, "bookmark activation must not navigate tab 0");
+    }
+
+    #[tokio::test]
+    async fn archive_listing_requests_coexist_and_complete_into_their_own_tabs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let archive_a = a.join("a.zip");
+        let archive_b = b.join("b.zip");
+        std::fs::write(&archive_a, b"placeholder-a").expect("archive A");
+        std::fs::write(&archive_b, b"placeholder-b").expect("archive B");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a;
+        let a_id = app.browse.active_tab_id();
+        let (a_listing_id, a_cancel) = app.begin_archive_listing(archive_a.clone());
+
+        assert!(app.browse.open_dir_in_new_tab(b.clone(), true));
+        let b_id = app.browse.active_tab_id();
+        assert_ne!(a_id, b_id);
+        let (b_listing_id, b_cancel) = app.begin_archive_listing(archive_b.clone());
+
+        assert_eq!(app.pending_archive_listings.len(), 2);
+        assert!(app.archive_listing_pending_for(a_id, a_listing_id, &archive_a));
+        assert!(app.archive_listing_pending_for(b_id, b_listing_id, &archive_b));
+        assert!(!a_cancel.is_cancelled());
+        assert!(!b_cancel.is_cancelled());
+
+        let listing_a = crate::tui::archive_listing::ArchiveListing {
+            archive_path: archive_a.clone(),
+            format: "zip".to_string(),
+            physical_size: 0,
+            entries: Vec::new(),
+        };
+        handle_message(
+            &mut app,
+            AppMessage::ArchiveListingComplete {
+                tab_id: a_id,
+                id: a_listing_id,
+                archive_path: archive_a.clone(),
+                cache_key: None,
+                result: Box::new(Ok(listing_a)),
+                password: None,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), b_id);
+        assert_eq!(app.browse.current_dir, b);
+        assert!(app.browse.archive.is_none(), "B cannot absorb A's archive");
+        assert!(!app.archive_listing_pending_for(a_id, a_listing_id, &archive_a));
+        assert!(app.archive_listing_pending_for(b_id, b_listing_id, &archive_b));
+        assert!(!b_cancel.is_cancelled(), "A completion cannot cancel B");
+        {
+            let background = app.browse.tab_mut(a_id).expect("A tab");
+            assert!(background
+                .archive
+                .as_ref()
+                .is_some_and(|state| state.listing.archive_path == archive_a));
+        }
+
+        let listing_b = crate::tui::archive_listing::ArchiveListing {
+            archive_path: archive_b.clone(),
+            format: "zip".to_string(),
+            physical_size: 0,
+            entries: Vec::new(),
+        };
+        handle_message(
+            &mut app,
+            AppMessage::ArchiveListingComplete {
+                tab_id: b_id,
+                id: b_listing_id,
+                archive_path: archive_b.clone(),
+                cache_key: None,
+                result: Box::new(Ok(listing_b)),
+                password: None,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), b_id);
+        assert!(app.browse.archive.as_ref().is_some_and(|state| {
+            state.listing.archive_path == archive_b
+        }));
+        assert!(!app.archive_listing_pending_for(b_id, b_listing_id, &archive_b));
+        assert!(app.pending_archive_listings.is_empty());
     }
 }

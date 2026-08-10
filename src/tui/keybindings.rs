@@ -5833,9 +5833,11 @@ mod inline_edit_behavior_tests {
         assert!(app.browse_inline_edit.is_none());
 
         let scan_generation = app.browse.pending_scan_generation().expect("scan generation");
+        let __tab_id_fix = app.browse.active_tab_id();
         super::super::event_loop::handle_message(
             &mut app,
             AppMessage::DirScanComplete {
+                tab_id: __tab_id_fix,
                 generation: scan_generation,
                 path: temp.path().to_path_buf(),
                 parent_entry: None,
@@ -5900,9 +5902,11 @@ mod inline_edit_behavior_tests {
         assert!(app.browse_inline_edit.is_none());
 
         let scan_generation = app.browse.pending_scan_generation().expect("scan generation");
+        let __tab_id_fix = app.browse.active_tab_id();
         super::super::event_loop::handle_message(
             &mut app,
             AppMessage::DirScanComplete {
+                tab_id: __tab_id_fix,
                 generation: scan_generation,
                 path: temp.path().to_path_buf(),
                 parent_entry: None,
@@ -6008,9 +6012,11 @@ mod inline_edit_behavior_tests {
         let current_generation = app.browse.pending_scan_generation().expect("second scan generation");
         assert_ne!(stale_generation, current_generation);
 
+        let __tab_id_fix = app.browse.active_tab_id();
         super::super::event_loop::handle_message(
             &mut app,
             AppMessage::DirScanComplete {
+                tab_id: __tab_id_fix,
                 generation: stale_generation,
                 path: temp.path().to_path_buf(),
                 parent_entry: None,
@@ -6045,9 +6051,11 @@ mod inline_edit_behavior_tests {
             target,
         );
 
+        let __tab_id_fix = app.browse.active_tab_id();
         super::super::event_loop::handle_message(
             &mut app,
             AppMessage::DirScanComplete {
+                tab_id: __tab_id_fix,
                 generation: scan_generation,
                 path: temp.path().to_path_buf(),
                 parent_entry: None,
@@ -6539,6 +6547,177 @@ fn browse_context_menu_keyboard_anchor(app: &AppState) -> (u16, u16) {
     )
 }
 
+pub(super) fn browse_tab_action_ready(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if app.browse_archive_repackage.is_some()
+        || app.pending_browse_archive_metadata.is_some()
+        || app.pending_browse_archive_rename.is_some()
+        || app.pending_browse_archive_delete.is_some()
+    {
+        app.set_status("tab action deferred: finish the active archive operation first");
+        return false;
+    }
+    if app.browse_inline_edit.is_some() {
+        finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
+        if app.browse_inline_edit.is_some() {
+            return false;
+        }
+    }
+    app.browse.close_options_menu();
+    app.bookmarks.close_dropdown();
+    true
+}
+
+fn finish_browse_tab_activation(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    clear_browse_info_focus(app);
+    app.cancel_browse_convert_expansion_for_browse_change("browse tab changed");
+    if let Some(target_path) = app.browse.take_ready_inline_rename_after_tab_activation() {
+        begin_browse_inline_rename(app, target_path);
+        return;
+    }
+    app.browse.probe_current_with_db(tx, Some(&app.db));
+    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+}
+
+fn request_switch_browse_tab(app: &mut AppState, index: usize, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if index == app.browse.active_tab_index() {
+        return true;
+    }
+    if index >= app.browse.tab_count() {
+        return false;
+    }
+    if !browse_tab_action_ready(app, tx) {
+        return false;
+    }
+    if app.browse.switch_to_tab(index) {
+        finish_browse_tab_activation(app, tx);
+        true
+    } else {
+        false
+    }
+}
+
+fn request_switch_browse_tab_relative(app: &mut AppState, delta: isize, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if app.browse.tab_count() <= 1 || !browse_tab_action_ready(app, tx) {
+        return false;
+    }
+    if app.browse.switch_tab_relative(delta) {
+        finish_browse_tab_activation(app, tx);
+        true
+    } else {
+        false
+    }
+}
+
+fn request_reorder_browse_tab(app: &mut AppState, delta: isize, tx: &mpsc::Sender<AppMessage>) -> bool {
+    let count = app.browse.tab_count();
+    if count <= 1 {
+        return false;
+    }
+    let from = app.browse.active_tab_index();
+    let to = (from as isize + delta).clamp(0, count.saturating_sub(1) as isize) as usize;
+    if to == from {
+        return false;
+    }
+    if !browse_tab_action_ready(app, tx) {
+        return false;
+    }
+    app.browse.reorder_active_tab(delta)
+}
+
+fn request_close_browse_tab(app: &mut AppState, index: usize, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if index >= app.browse.tab_count() {
+        return false;
+    }
+    if app.browse.tab_count() <= 1 {
+        app.set_status("The last Browse tab stays open");
+        return false;
+    }
+    if !browse_tab_action_ready(app, tx) {
+        return false;
+    }
+
+    let original_id = app.browse.active_tab_id();
+    let target_id = app.browse.tab_infos().get(index).map(|info| info.id);
+    let Some(target_id) = target_id else { return false; };
+    let return_id = (target_id != original_id).then_some(original_id);
+    app.pending_browse_archive_tab_restores.remove(&target_id);
+    app.cancel_archive_listing_for(target_id);
+    if target_id != original_id && !app.browse.switch_to_tab_id(target_id) {
+        return false;
+    }
+
+    let mut archive_restore = None;
+    if let Some(staging) = app.browse.active_archive_staging().cloned() {
+        let restore = app
+            .browse
+            .active_archive_restore_descriptor()
+            .expect("archive staging requires an active archive context");
+        if staging.dirty {
+            app.pending_browse_tab_close_after_archive_repackage =
+                Some((target_id, return_id, restore));
+            exit_browse_archive(app, tx);
+            app.set_status("Saving archive changes before closing tab...");
+            return true;
+        }
+        // Clean staging still owns temporary resources and recovery records.
+        // Capture the archive directory first because ordinary exit correctly
+        // destroys the staging owner and returns the live state to the host dir.
+        archive_restore = Some(restore);
+        exit_browse_archive(app, tx);
+    }
+
+    let closed = app
+        .browse
+        .close_active_tab_with_archive_restore(archive_restore);
+    if closed {
+        if let Some(return_id) = return_id {
+            let _ = app.browse.switch_to_tab_id(return_id);
+        }
+        finish_browse_tab_activation(app, tx);
+    }
+    closed
+}
+
+fn request_duplicate_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if !browse_tab_action_ready(app, tx) { return false; }
+    if app.browse.duplicate_tab() {
+        finish_browse_tab_activation(app, tx);
+        true
+    } else { false }
+}
+
+fn request_new_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if !browse_tab_action_ready(app, tx) { return false; }
+    if app.browse.new_tab() {
+        finish_browse_tab_activation(app, tx);
+        true
+    } else { false }
+}
+
+fn request_reopen_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if !app.browse.has_closed_tabs() {
+        app.set_status("No recently closed Browse tab");
+        return false;
+    }
+    if !browse_tab_action_ready(app, tx) { return false; }
+    match app.browse.reopen_closed_tab_with_archive_restore() {
+        Some(Some(restore)) => {
+            clear_browse_info_focus(app);
+            app.cancel_browse_convert_expansion_for_browse_change("browse tab changed");
+            start_browse_archive_restore_listing(app, restore, tx);
+            true
+        }
+        Some(None) => {
+            finish_browse_tab_activation(app, tx);
+            true
+        }
+        None => {
+            app.set_status("No recently closed Browse tab");
+            false
+        }
+    }
+}
+
 fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     use crate::convert::classify::EntryKind;
 
@@ -6559,6 +6738,64 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     // In particular, `/` and `.` must not become tree-prefix characters merely
     // because Explore currently owns keyboard navigation.
     match (key.code, key.modifiers) {
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            request_new_browse_tab(app, tx);
+            return;
+        }
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+            request_close_browse_tab(app, app.browse.active_tab_index(), tx);
+            return;
+        }
+        (KeyCode::Left, KeyModifiers::ALT) | (KeyCode::Char('['), KeyModifiers::ALT) => {
+            request_switch_browse_tab_relative(app, -1, tx);
+            return;
+        }
+        (KeyCode::Right, KeyModifiers::ALT) | (KeyCode::Char(']'), KeyModifiers::ALT) => {
+            request_switch_browse_tab_relative(app, 1, tx);
+            return;
+        }
+        // Multiplexer-reliable tab switching. In byobu/tmux baseline mode the
+        // terminal strips the modifiers off Shift+Ctrl++ (it arrives as a bare
+        // '+') and mangles Shift+Ctrl+- into Ctrl+7, so we bind the events that
+        // are actually delivered — giving a clean mnemonic +/- (next/prev) pair.
+        // The bare-'+' arm is gated on having 2+ tabs so a single-tab view keeps
+        // '+' available for type-ahead; Ctrl+7 carries a modifier and never
+        // shadows type-ahead.
+        (KeyCode::Char('+'), KeyModifiers::NONE) | (KeyCode::Char('+'), KeyModifiers::SHIFT)
+            if app.browse.tab_count() > 1 =>
+        {
+            request_switch_browse_tab_relative(app, 1, tx);
+            return;
+        }
+        (KeyCode::Char('7'), KeyModifiers::CONTROL) => {
+            request_switch_browse_tab_relative(app, -1, tx);
+            return;
+        }
+        (KeyCode::Char('u'), KeyModifiers::ALT) => {
+            request_reopen_browse_tab(app, tx);
+            return;
+        }
+        (KeyCode::Char('d'), KeyModifiers::ALT) => {
+            request_duplicate_browse_tab(app, tx);
+            return;
+        }
+        (KeyCode::Char(','), KeyModifiers::ALT) => {
+            if request_reorder_browse_tab(app, -1, tx) {
+                app.set_status("Browse tab moved left");
+            }
+            return;
+        }
+        (KeyCode::Char('.'), KeyModifiers::ALT) => {
+            if request_reorder_browse_tab(app, 1, tx) {
+                app.set_status("Browse tab moved right");
+            }
+            return;
+        }
+        (KeyCode::Char(digit @ '1'..='9'), KeyModifiers::ALT) => {
+            let index = (digit as u8 - b'1') as usize;
+            request_switch_browse_tab(app, index, tx);
+            return;
+        }
         (KeyCode::Char('m'), KeyModifiers::ALT) => {
             let (x, y) = browse_context_menu_keyboard_anchor(app);
             open_context_menu_with_tx(app, x, y, Some(tx));
@@ -7388,6 +7625,53 @@ pub(super) fn start_browse_archive_listing(
     tx: &mpsc::Sender<AppMessage>,
     force: bool,
 ) {
+    let tab_id = app.browse.active_tab_id();
+    let restoring_same_archive = app
+        .pending_browse_archive_tab_restores
+        .get(&tab_id)
+        .is_some_and(|restore| restore.archive_path == path);
+    if !restoring_same_archive
+        && app.pending_browse_archive_tab_restores.contains_key(&tab_id)
+    {
+        // An explicit open of a different archive abandons any unresolved
+        // reopen-closed continuation for this tab. A same-archive retry (most
+        // notably after entering a password) intentionally keeps it and must
+        // still bypass the cache so it observes the committed archive.
+        app.pending_browse_archive_tab_restores.remove(&tab_id);
+    }
+    start_browse_archive_listing_inner(
+        app,
+        path,
+        tx,
+        force,
+        restoring_same_archive,
+        None,
+    );
+}
+
+fn start_browse_archive_restore_listing(
+    app: &mut AppState,
+    restore: crate::tui::browse::BrowseArchiveRestoreDescriptor,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let tab_id = app.browse.active_tab_id();
+    let archive_path = restore.archive_path.clone();
+    let password = restore.password.clone();
+    app.pending_browse_archive_tab_restores.insert(tab_id, restore);
+    // Reopen-closed must observe the committed archive after cleanup/repackage,
+    // not a pre-close cache snapshot. Force listing policy and bypass the LRU
+    // for this one restoration; the successful result refreshes the cache.
+    start_browse_archive_listing_inner(app, archive_path, tx, true, true, password);
+}
+
+fn start_browse_archive_listing_inner(
+    app: &mut AppState,
+    path: std::path::PathBuf,
+    tx: &mpsc::Sender<AppMessage>,
+    force: bool,
+    bypass_cache: bool,
+    password_override: Option<String>,
+) {
     let mode = super::archive_listing::ArchiveListingMode::from_config(
         &app.config.performance.browsing.archive_listing,
     );
@@ -7413,29 +7697,38 @@ pub(super) fn start_browse_archive_listing(
         }
     };
 
-    if let Some(listing) = app.cached_archive_listing(&cache_key) {
-        let count = listing.entries.len();
-        let password = match archive_listing_password_for_path(app, &path) {
+    if !bypass_cache {
+        if let Some(listing) = app.cached_archive_listing(&cache_key) {
+            let count = listing.entries.len();
+            let password = match password_override.clone() {
+                Some(password) => Some(password),
+                None => match archive_listing_password_for_path(app, &path) {
+                    Ok(password) => password,
+                    Err(error) => {
+                        app.set_status(error);
+                        return;
+                    }
+                },
+            };
+            app.browse.enter_archive(listing, password);
+            app.force_redraw = true;
+            app.set_status(format!("Opened from cache ({} entries)", count));
+            return;
+        }
+    }
+
+    let password = match password_override {
+        Some(password) => Some(password),
+        None => match archive_listing_password_for_path(app, &path) {
             Ok(password) => password,
             Err(error) => {
                 app.set_status(error);
                 return;
             }
-        };
-        app.browse.enter_archive(listing, password);
-        app.force_redraw = true;
-        app.set_status(format!("Opened from cache ({} entries)", count));
-        return;
-    }
-
-    let password = match archive_listing_password_for_path(app, &path) {
-        Ok(password) => password,
-        Err(error) => {
-            app.set_status(error);
-            return;
-        }
+        },
     };
     let timeout = archive_listing_timeout_from_config(app);
+    let tab_id = app.browse.active_tab_id();
     let (id, cancel) = app.begin_archive_listing(path.clone());
     let tx = tx.clone();
     let path_for_worker = path.clone();
@@ -7452,6 +7745,7 @@ pub(super) fn start_browse_archive_listing(
     tokio::spawn(async move {
         let _ = tx
             .send(AppMessage::ArchiveListingProgress {
+                tab_id,
                 id,
                 archive_path: path_for_worker.clone(),
                 message: "Listing archive contents... Esc cancels".to_string(),
@@ -7468,6 +7762,7 @@ pub(super) fn start_browse_archive_listing(
 
         let _ = tx
             .send(AppMessage::ArchiveListingComplete {
+                tab_id,
                 id,
                 archive_path: path_for_worker,
                 cache_key: cache_key_for_result,
@@ -49487,6 +49782,7 @@ fn queue_bookmark_activation(
 
     let pending = app.bookmarks.begin_activation(path.clone(), surface);
     let queued = super::bookmark_workers::try_queue_activation(
+        app.browse.active_tab_id(),
         pending.generation,
         pending.request_id,
         path.clone(),
@@ -49532,6 +49828,7 @@ fn queue_bookmark_activation(
 pub(super) fn handle_bookmark_activation_result(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
+    tab_id: super::browse::BrowseTabId,
     generation: u64,
     request_id: u64,
     path: std::path::PathBuf,
@@ -49570,10 +49867,18 @@ pub(super) fn handle_bookmark_activation_result(
     }
 
     let display = path.display().to_string();
-    app.browse.navigate_to(path);
-    app.browse.probe_current_with_db(tx, Some(&app.db));
-    super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
-    app.set_status(format!("cd: {display}"));
+    let active = app.browse.active_tab_id() == tab_id;
+    let Some(browse) = app.browse.tab_mut(tab_id) else {
+        return;
+    };
+    browse.navigate_to(path);
+    if active {
+        app.browse.probe_current_with_db(tx, Some(&app.db));
+        super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+        app.set_status(format!("cd: {display}"));
+    } else {
+        app.set_status(format!("bookmark opened in background tab: {display}"));
+    }
 }
 
 fn activate_bookmark_dropdown_choice(
@@ -49716,7 +50021,9 @@ pub(super) fn request_selected_bookmark_detail(
         return;
     }
     let generation = app.bookmarks.detail_generation;
+    let tab_id = app.browse.active_tab_id();
     match super::bookmark_workers::try_queue_detail(
+        tab_id,
         generation,
         path.clone(),
         app.bookmarks.worker_generation_guard(),
@@ -52129,6 +52436,56 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
+    // Directory-tab strip pointer ownership. Middle-click is deliberately
+    // scoped to these hit regions only so terminal primary-paste keeps working
+    // everywhere else. Left-down begins a possible reorder; activation waits
+    // for mouse-up so crossing the drag threshold cannot also switch tabs.
+    if app.current_screen == AppScreen::Browse
+        && matches!(app.active_overlay, ActiveOverlay::None)
+        && !app.bookmarks.dropdown_open
+    {
+        let tab_target = app.button_map.find_button_at(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Middle) => {
+                let index = match tab_target {
+                    Some(TuiButton::BrowseDirTab(index)) | Some(TuiButton::BrowseDirTabClose(index)) => Some(index),
+                    _ => None,
+                };
+                if let Some(index) = index {
+                    request_close_browse_tab(app, index, tx);
+                    return;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(TuiButton::BrowseDirTab(index)) = tab_target {
+                    if index < app.browse.tab_count() && browse_tab_action_ready(app, tx) {
+                        app.browse.begin_tab_drag(index, mouse.column);
+                    }
+                    return;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if app.browse.tab_drag_active() => {
+                let over = match tab_target {
+                    Some(TuiButton::BrowseDirTab(index)) | Some(TuiButton::BrowseDirTabClose(index)) => Some(index),
+                    _ => None,
+                };
+                if let Some(index) = over {
+                    let _ = app.browse.update_tab_drag(index, mouse.column);
+                }
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) if app.browse.tab_drag_active() => {
+                if let Some((index, reordered)) = app.browse.finish_tab_drag() {
+                    if !reordered {
+                        request_switch_browse_tab(app, index, tx);
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // An open Browse editor owns mouse drags even when a terminal delivers a
     // drag/up event without the matching down event or after a stale hit map.
     // Never let those events mutate list range selection underneath the editor.
@@ -52645,6 +53002,23 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
         }
         match button {
+            // ── Browse directory tabs ──
+            TuiButton::BrowseDirTab(index) => {
+                request_switch_browse_tab(app, index, tx);
+            }
+            TuiButton::BrowseDirTabClose(index) => {
+                request_close_browse_tab(app, index, tx);
+            }
+            TuiButton::BrowseDirTabNew => {
+                request_new_browse_tab(app, tx);
+            }
+            TuiButton::BrowseDirTabDuplicate => {
+                request_duplicate_browse_tab(app, tx);
+            }
+            TuiButton::BrowseDirTabReopenClosed => {
+                request_reopen_browse_tab(app, tx);
+            }
+
             // ── Config screen: appearance pane ──
             TuiButton::ConfigThemePrev => {
                 open_theme_apply_dialog(app, false);
@@ -80745,5 +81119,663 @@ mod file_transfer_queue_state_tests {
         assert_eq!(app.file_transfers.queued.len(), 1);
         assert_eq!(app.file_transfers.queued[0].queue_id, second_id);
         assert_eq!(app.file_transfers.active_session_id, Some(9001));
+    }
+}
+
+#[cfg(test)]
+mod browse_tab_input_tests {
+    use super::*;
+
+    fn archive_entry(path: &str, is_dir: bool) -> crate::tui::archive_listing::ArchiveEntry {
+        crate::tui::archive_listing::ArchiveEntry {
+            path: path.to_string(),
+            size: if is_dir { 0 } else { 100 },
+            packed_size: if is_dir { 0 } else { 80 },
+            is_dir,
+            encrypted: false,
+        }
+    }
+
+    fn archive_listing(
+        archive_path: std::path::PathBuf,
+        entries: Vec<crate::tui::archive_listing::ArchiveEntry>,
+    ) -> crate::tui::archive_listing::ArchiveListing {
+        crate::tui::archive_listing::ArchiveListing {
+            archive_path,
+            format: "zip".to_string(),
+            physical_size: 4096,
+            entries,
+        }
+    }
+
+    fn install_archive_staging(
+        app: &mut AppState,
+        staging_dir: std::path::PathBuf,
+        archive_path: std::path::PathBuf,
+        dirty: bool,
+    ) -> crate::tui::browse::TestArchiveStagingSession {
+        std::fs::create_dir_all(&staging_dir).expect("staging");
+        let (secs, nanos, size) =
+            crate::tui::app::archive_fingerprint(&archive_path).expect("fingerprint");
+        let staging = crate::tui::browse::ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            secs,
+            nanos,
+            size,
+        );
+        staging
+            .install_clone_into_browse_state(&mut app.browse)
+            .expect("install staging");
+        if dirty {
+            app.browse
+                .active_archive_staging_mut()
+                .expect("active staging")
+                .append_edit(crate::tui::browse::ArchiveEdit::ContentModified {
+                    inner_path: "Disc 2/01.flac".to_string(),
+                    kind: "test-edit".to_string(),
+                });
+        }
+        staging
+    }
+
+    #[test]
+    fn byobu_safe_browse_tab_chords_create_switch_jump_reorder_reopen_and_close() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a.clone();
+        assert!(app.browse.open_dir_in_new_tab(b.clone(), true));
+        assert_eq!(app.browse.active_tab_index(), 1);
+
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_index(), 0);
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_index(), 1);
+
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_index(), 0, "Alt+, reorders the focused tab left");
+
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.browse.tab_count(), 1);
+        assert!(app.browse.has_closed_tabs());
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(app.browse.tab_count(), 2);
+
+        let before = app.browse.tab_count();
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.browse.tab_count(), before + 1);
+    }
+
+    #[test]
+    fn browse_tab_plus_and_ctrl7_switch_next_and_prev() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a.clone();
+
+        // Single tab: bare '+' must NOT be consumed as a tab switch (guarded on
+        // tab_count > 1), so it stays available for type-ahead.
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(app.browse.tab_count(), 1);
+        assert_eq!(app.browse.active_tab_index(), 0);
+
+        // Two tabs (new tab inserted after the active one, focus kept on 0):
+        // '+' = next, Ctrl+7 = previous — the multiplexer-reliable pair.
+        assert!(app.browse.open_dir_in_new_tab(b.clone(), false));
+        assert_eq!(app.browse.active_tab_index(), 0);
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_index(), 1, "'+' switches to the next tab");
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(
+            app.browse.active_tab_index(),
+            0,
+            "Ctrl+7 switches to the previous tab"
+        );
+    }
+
+    #[test]
+    fn dead_browse_tab_chords_do_not_commit_edit_or_close_menus() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("file");
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.options_menu = BrowseOptionsMenu::Root;
+        app.bookmarks.dropdown_open = true;
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename { path: file },
+            input: crate::tui::text_input::TextInputState::new("track.flac".to_string()),
+        });
+
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_index(), 0);
+        assert!(app.browse.options_menu.is_open());
+        assert!(app.bookmarks.dropdown_open);
+        assert!(app.browse_inline_edit.is_some());
+
+        // Reordering beyond the left edge is another dead tab chord and must
+        // preserve the exact same UI/edit state.
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_index(), 0);
+        assert!(app.browse.options_menu.is_open());
+        assert!(app.bookmarks.dropdown_open);
+        assert!(app.browse_inline_edit.is_some());
+    }
+
+    #[test]
+    fn successful_browse_tab_switch_commits_edit_and_closes_menus() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let file = a.join("track.flac");
+        std::fs::write(&file, b"audio").expect("file");
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a.clone();
+        assert!(app.browse.open_dir_in_new_tab(b.clone(), false));
+        app.browse.options_menu = BrowseOptionsMenu::Root;
+        app.bookmarks.dropdown_open = true;
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Rename { path: file },
+            input: crate::tui::text_input::TextInputState::new("track.flac".to_string()),
+        });
+
+        assert!(request_switch_browse_tab(&mut app, 1, &tx));
+        assert_eq!(app.browse.active_tab_index(), 1);
+        assert_eq!(app.browse.current_dir, b);
+        assert!(!app.browse.options_menu.is_open());
+        assert!(!app.bookmarks.dropdown_open);
+        assert!(app.browse_inline_edit.is_none());
+    }
+
+    #[test]
+    fn archive_listing_cancellation_is_scoped_to_focused_or_closed_tab() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let archive_a = a.join("a.zip");
+        let archive_b = b.join("b.zip");
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a;
+        let a_id = app.browse.active_tab_id();
+        let (a_listing_id, a_cancel) = app.begin_archive_listing(archive_a.clone());
+
+        assert!(app.browse.open_dir_in_new_tab(b, true));
+        let b_id = app.browse.active_tab_id();
+        assert_ne!(a_id, b_id);
+
+        // Ordinary navigation in B must not cancel A's background listing.
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(app.archive_listing_pending_for(a_id, a_listing_id, &archive_a));
+        assert!(!a_cancel.is_cancelled());
+
+        // A and B may each own one independent archive listing.
+        let (b_listing_id, b_cancel) = app.begin_archive_listing(archive_b.clone());
+        assert_eq!(app.pending_archive_listings.len(), 2);
+        assert!(app.archive_listing_pending_for(a_id, a_listing_id, &archive_a));
+        assert!(app.archive_listing_pending_for(b_id, b_listing_id, &archive_b));
+        assert!(!a_cancel.is_cancelled());
+        assert!(!b_cancel.is_cancelled());
+
+        // Esc is focused-tab cancellation: B stops, A remains live.
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(b_cancel.is_cancelled());
+        assert!(!app.archive_listing_pending_for(b_id, b_listing_id, &archive_b));
+        assert!(app.archive_listing_pending_for(a_id, a_listing_id, &archive_a));
+        assert!(!a_cancel.is_cancelled());
+
+        // Closing A cancels A only; an independent B request survives.
+        let (b_listing_id, b_cancel) = app.begin_archive_listing(archive_b.clone());
+        let a_index = app.browse.tab_index_by_id(a_id).expect("A tab index");
+        assert!(request_close_browse_tab(&mut app, a_index, &tx));
+        assert!(a_cancel.is_cancelled());
+        assert!(!app.archive_listing_pending_for(a_id, a_listing_id, &archive_a));
+        assert!(app.archive_listing_pending_for(b_id, b_listing_id, &archive_b));
+        assert!(!b_cancel.is_cancelled());
+        assert_eq!(app.browse.active_tab_id(), b_id);
+
+        // Session boundaries (screen exit / quit) use the explicit all-cancel path.
+        assert!(app.cancel_all_archive_listings());
+        assert!(b_cancel.is_cancelled());
+        assert!(app.pending_archive_listings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dirty_archive_duplicate_and_open_in_new_tab_keep_staging_source_owned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        std::fs::write(&archive, b"archive placeholder").expect("archive");
+        let listing = archive_listing(
+            archive.clone(),
+            vec![
+                archive_entry("Disc 2", true),
+                archive_entry("Disc 2/01.flac", false),
+                archive_entry("Disc 2/Folder", true),
+                archive_entry("Disc 2/Folder/02.flac", false),
+            ],
+        );
+        let staging_dir = temp.path().join("staging");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.enter_archive(listing, Some("secret".to_string()));
+        app.browse.enter_archive_dir("Disc 2");
+        let _staging_guard = install_archive_staging(
+            &mut app,
+            staging_dir.clone(),
+            archive.clone(),
+            true,
+        );
+        let source_id = app.browse.active_tab_id();
+        let (tx, _rx) = mpsc::channel(16);
+
+        assert!(request_duplicate_browse_tab(&mut app, &tx));
+        let duplicate_id = app.browse.active_tab_id();
+        assert_ne!(duplicate_id, source_id);
+        assert!(app.browse.active_archive_staging().is_none());
+        let duplicate_archive = app.browse.archive.as_ref().expect("duplicate archive");
+        assert_eq!(duplicate_archive.listing.archive_path, archive);
+        assert_eq!(duplicate_archive.inner_path, "Disc 2");
+
+        let source = app.browse.tab_mut(source_id).expect("source tab");
+        let source_staging = source.active_archive_staging().expect("source staging");
+        assert!(source_staging.dirty);
+        assert_eq!(source_staging.staging_dir, staging_dir);
+
+        assert!(app.browse.switch_to_tab_id(source_id));
+        let folder_path = app
+            .browse
+            .entries
+            .iter()
+            .find(|entry| entry.name == "Folder")
+            .map(|entry| entry.path.clone())
+            .expect("archive folder entry");
+        crate::tui::context_menu::execute_context_action(
+            &mut app,
+            crate::tui::context_menu::ContextAction::OpenEntryInNewTab(folder_path),
+            &tx,
+            false,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), source_id, "Open in New Tab stays background");
+        assert_eq!(app.browse.tab_count(), 3);
+        let background_id = app
+            .browse
+            .tab_infos()
+            .into_iter()
+            .map(|info| info.id)
+            .find(|id| *id != source_id && *id != duplicate_id)
+            .expect("new background tab");
+        let background = app.browse.tab_mut(background_id).expect("background tab");
+        let background_archive = background.archive.as_ref().expect("background archive");
+        assert_eq!(background_archive.listing.archive_path, archive);
+        assert_eq!(background_archive.inner_path, "Disc 2/Folder");
+        assert!(background.active_archive_staging().is_none());
+
+        let source = app.browse.tab_mut(source_id).expect("source tab");
+        let source_staging = source.active_archive_staging().expect("source staging");
+        assert!(source_staging.dirty);
+        assert_eq!(source_staging.staging_dir, staging_dir);
+        assert!(staging_dir.exists(), "source remains the sole live staging owner");
+    }
+
+    #[tokio::test]
+    async fn clean_staged_archive_close_reopen_relists_same_inner_directory_without_staging() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let other = temp.path().join("other");
+        std::fs::write(&archive, b"archive placeholder").expect("archive");
+        std::fs::create_dir(&other).expect("other");
+        let initial_listing = archive_listing(
+            archive.clone(),
+            vec![
+                archive_entry("Disc 2", true),
+                archive_entry("Disc 2/01.flac", false),
+            ],
+        );
+        let staging_dir = temp.path().join("clean-staging");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.enter_archive(initial_listing, Some("secret".to_string()));
+        app.browse.enter_archive_dir("Disc 2");
+        let _staging_guard = install_archive_staging(
+            &mut app,
+            staging_dir.clone(),
+            archive.clone(),
+            false,
+        );
+        assert!(app.browse.open_dir_in_new_tab(other.clone(), false));
+        let (tx, _rx) = mpsc::channel(32);
+
+        assert!(request_close_browse_tab(&mut app, 0, &tx));
+        assert_eq!(app.browse.tab_count(), 1);
+        assert_eq!(app.browse.current_dir, other);
+        assert!(!staging_dir.exists(), "clean staging is cleaned during ordinary archive exit");
+
+        let foreground_id = app.browse.active_tab_id();
+        assert!(request_reopen_browse_tab(&mut app, &tx));
+        let reopened_id = app.browse.active_tab_id();
+        let pending = app
+            .pending_archive_listings
+            .get(&reopened_id)
+            .expect("archive relist pending");
+        assert_eq!(pending.archive_path, archive);
+        let listing_id = pending.id;
+
+        // A staged-archive restore is background work just like an ordinary
+        // archive open. Switching away and navigating must not cancel it.
+        let foreground_index = app
+            .browse
+            .tab_index_by_id(foreground_id)
+            .expect("foreground tab index");
+        assert!(request_switch_browse_tab(&mut app, foreground_index, &tx));
+        handle_browse_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_id(), foreground_id);
+        assert!(app.archive_listing_pending_for(reopened_id, listing_id, &archive));
+
+        let refreshed_listing = archive_listing(
+            archive.clone(),
+            vec![
+                archive_entry("Disc 2", true),
+                archive_entry("Disc 2/01.flac", false),
+                archive_entry("Disc 2/new-after-close.flac", false),
+            ],
+        );
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::ArchiveListingComplete {
+                tab_id: reopened_id,
+                id: listing_id,
+                archive_path: archive.clone(),
+                cache_key: None,
+                result: Box::new(Ok(refreshed_listing)),
+                password: Some("secret".to_string()),
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), foreground_id);
+        assert_eq!(app.browse.current_dir, other);
+        assert!(app.browse.archive.is_none(), "foreground tab stays untouched");
+        assert!(!app.archive_listing_pending_for(reopened_id, listing_id, &archive));
+
+        let reopened_index = app
+            .browse
+            .tab_index_by_id(reopened_id)
+            .expect("reopened tab index");
+        assert!(request_switch_browse_tab(&mut app, reopened_index, &tx));
+        let restored = app.browse.archive.as_ref().expect("restored archive");
+        assert_eq!(restored.listing.archive_path, archive);
+        assert_eq!(restored.inner_path, "Disc 2");
+        assert!(restored.staging.is_none());
+        assert!(app.browse.entries.iter().any(|entry| entry.name == "new-after-close.flac"));
+        assert!(!app.pending_browse_archive_tab_restores.contains_key(&reopened_id));
+    }
+
+    #[test]
+    fn deferred_dirty_archive_tab_close_completes_after_focus_switch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let other = temp.path().join("other");
+        std::fs::write(&archive, b"archive placeholder").expect("archive");
+        std::fs::create_dir(&other).expect("other");
+        let listing = archive_listing(
+            archive.clone(),
+            vec![archive_entry("Disc 2/01.flac", false)],
+        );
+        let staging_dir = temp.path().join("dirty-staging-focus-switch");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.enter_archive(listing, Some("secret".to_string()));
+        let _staging_guard = install_archive_staging(
+            &mut app,
+            staging_dir.clone(),
+            archive.clone(),
+            true,
+        );
+        assert!(app.browse.open_dir_in_new_tab(other.clone(), false));
+        let closing_tab_id = app.browse.active_tab_id();
+        let other_tab_id = app
+            .browse
+            .tab_infos()
+            .into_iter()
+            .map(|info| info.id)
+            .find(|id| *id != closing_tab_id)
+            .expect("other tab");
+        let restore = app
+            .browse
+            .active_archive_restore_descriptor()
+            .expect("archive restore descriptor");
+        let staging = app.browse.active_archive_staging().cloned().expect("dirty staging");
+        let context = crate::tui::app::ArchiveMetadataEditContext::browse_active_staging_with_fingerprint(
+            archive.clone(),
+            staging_dir.clone(),
+            staging.archive_mtime_secs,
+            staging.archive_mtime_nanos,
+            staging.archive_size,
+            None,
+        );
+        let progress_session_id = 78;
+        app.browse_archive_repackage = Some(context);
+        app.browse_archive_repackage_progress_session_id = Some(progress_session_id);
+        app.pending_browse_tab_close_after_archive_repackage =
+            Some((closing_tab_id, Some(other_tab_id), restore));
+        assert!(app.browse.switch_to_tab_id(other_tab_id));
+        assert_eq!(app.browse.active_tab_id(), other_tab_id);
+        let (tx, _rx) = mpsc::channel(32);
+
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::ArchiveRepackageResult {
+                archive_path: archive,
+                staging_dir: staging_dir.clone(),
+                progress_session_id,
+                result: Ok(
+                    crate::convert::pipeline::materializer_archive::ArchiveRepackageReport::default(),
+                ),
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.tab_count(), 1);
+        assert_eq!(app.browse.active_tab_id(), other_tab_id);
+        assert_eq!(app.browse.current_dir, other);
+        assert!(app.browse.tab_index_by_id(closing_tab_id).is_none());
+        assert!(app.pending_browse_tab_close_after_archive_repackage.is_none());
+        assert!(!staging_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn dirty_staged_archive_repackage_close_reopen_uses_post_save_listing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let other = temp.path().join("other");
+        std::fs::write(&archive, b"archive placeholder").expect("archive");
+        std::fs::create_dir(&other).expect("other");
+        let initial_listing = archive_listing(
+            archive.clone(),
+            vec![
+                archive_entry("Disc 2", true),
+                archive_entry("Disc 2/old-name.flac", false),
+            ],
+        );
+        let staging_dir = temp.path().join("dirty-staging");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.enter_archive(initial_listing, Some("secret".to_string()));
+        app.browse.enter_archive_dir("Disc 2");
+        let _staging_guard = install_archive_staging(
+            &mut app,
+            staging_dir.clone(),
+            archive.clone(),
+            true,
+        );
+        assert!(app.browse.open_dir_in_new_tab(other.clone(), false));
+        let closing_tab_id = app.browse.active_tab_id();
+        let restore = app
+            .browse
+            .active_archive_restore_descriptor()
+            .expect("archive restore descriptor");
+        let staging = app.browse.active_archive_staging().cloned().expect("dirty staging");
+        let context = crate::tui::app::ArchiveMetadataEditContext::browse_active_staging_with_fingerprint(
+            archive.clone(),
+            staging_dir.clone(),
+            staging.archive_mtime_secs,
+            staging.archive_mtime_nanos,
+            staging.archive_size,
+            None,
+        );
+        let progress_session_id = 77;
+        app.browse_archive_repackage = Some(context);
+        app.browse_archive_repackage_progress_session_id = Some(progress_session_id);
+        app.pending_browse_tab_close_after_archive_repackage =
+            Some((closing_tab_id, None, restore));
+        let (tx, _rx) = mpsc::channel(32);
+
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::ArchiveRepackageResult {
+                archive_path: archive.clone(),
+                staging_dir: staging_dir.clone(),
+                progress_session_id,
+                result: Ok(
+                    crate::convert::pipeline::materializer_archive::ArchiveRepackageReport::default(),
+                ),
+            },
+            &tx,
+        );
+
+        assert_eq!(app.browse.tab_count(), 1);
+        assert_eq!(app.browse.current_dir, other);
+        assert!(!staging_dir.exists(), "successful repackage cleans staging before the tab closes");
+        // Duplicate terminal delivery is stale and must not re-clean or close
+        // another tab after the first completion consumed session authority.
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::ArchiveRepackageResult {
+                archive_path: archive.clone(),
+                staging_dir: staging_dir.clone(),
+                progress_session_id,
+                result: Ok(
+                    crate::convert::pipeline::materializer_archive::ArchiveRepackageReport::default(),
+                ),
+            },
+            &tx,
+        );
+        assert_eq!(app.browse.tab_count(), 1);
+        assert!(!staging_dir.exists());
+
+        assert!(request_reopen_browse_tab(&mut app, &tx));
+        let reopened_id = app.browse.active_tab_id();
+        let pending = app
+            .pending_archive_listings
+            .get(&reopened_id)
+            .expect("post-save relist pending");
+        let listing_id = pending.id;
+        let post_save_listing = archive_listing(
+            archive.clone(),
+            vec![
+                archive_entry("Disc 2", true),
+                archive_entry("Disc 2/renamed-after-save.flac", false),
+            ],
+        );
+        super::super::event_loop::handle_message(
+            &mut app,
+            AppMessage::ArchiveListingComplete {
+                tab_id: reopened_id,
+                id: listing_id,
+                archive_path: archive.clone(),
+                cache_key: None,
+                result: Box::new(Ok(post_save_listing)),
+                password: Some("secret".to_string()),
+            },
+            &tx,
+        );
+
+        let restored = app.browse.archive.as_ref().expect("restored archive");
+        assert_eq!(restored.listing.archive_path, archive);
+        assert_eq!(restored.inner_path, "Disc 2");
+        assert!(restored.staging.is_none());
+        assert!(app.browse.entries.iter().any(|entry| entry.name == "renamed-after-save.flac"));
+        assert!(!app.browse.entries.iter().any(|entry| entry.name == "old-name.flac"));
     }
 }

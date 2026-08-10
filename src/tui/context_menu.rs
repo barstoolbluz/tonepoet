@@ -112,6 +112,9 @@ pub enum ContextAction {
     ConvertDiscStream(crate::disc::PresentationId),
     /// Open the selected file/directory (same as Enter on browse).
     OpenEntry,
+    /// Open a directory in a new adjacent background Browse tab. The explicit
+    /// path binds the action to the context-menu target.
+    OpenEntryInNewTab(PathBuf),
     /// Toggle the current entry's selection.
     Select,
     /// Select all non-ParentDir entries.
@@ -586,6 +589,7 @@ fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry>
         }
         EntryKind::Directory => {
             items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(separator());
             items.push(build_select_submenu(true));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
@@ -1161,6 +1165,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item("Open", ContextAction::OpenEntry));
+            items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(item("Analyze", ContextAction::Analyze));
             // Directory menu construction must not synchronously scan the
             // directory for CUE files. Both sidecar-import and embedded-only
@@ -1359,6 +1364,8 @@ pub fn build_browse_tree_menu(app: &AppState, index: usize) -> Vec<ContextMenuEn
             !clipboard.is_empty() && clipboard.paths().iter().all(|source| source.exists())
         });
     vec![
+        item("Open in New Tab", ContextAction::OpenEntryInNewTab(path.clone())),
+        separator(),
         ContextMenuEntry::Submenu {
             label: "New".to_string(),
             children: vec![
@@ -2608,6 +2615,16 @@ pub fn execute_context_action(
             if app.current_screen == AppScreen::Browse {
                 let index = app.browse.selected_index;
                 super::keybindings::activate_browse_entry(app, index, tx);
+            }
+        }
+        ContextAction::OpenEntryInNewTab(path) => {
+            if app.current_screen == AppScreen::Browse
+                && super::keybindings::browse_tab_action_ready(app, tx)
+            {
+                match app.browse.open_directory_context_in_new_tab(path.clone(), false) {
+                    Ok(()) => app.set_status(format!("Opened {} in a background tab", path.display())),
+                    Err(err) => app.set_status(format!("Open in New Tab: {err}")),
+                }
             }
         }
         ContextAction::NewFile => {
@@ -6027,6 +6044,51 @@ mod tests {
         assert_eq!(clipboard.mode(), tui_file_picker::FilePickerClipboardMode::Cut);
         let expected = file.to_string_lossy().to_string();
         assert_eq!(published.borrow().as_slice(), &[expected.clone(), expected]);
+    }
+
+    #[test]
+    fn browse_tab_paste_snapshots_the_focused_destination_and_survives_later_switches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tab_a = temp.path().join("tab-a");
+        let tab_b = temp.path().join("tab-b");
+        std::fs::create_dir(&tab_a).expect("tab a");
+        std::fs::create_dir(&tab_b).expect("tab b");
+        let source = tab_a.join("track.flac");
+        std::fs::write(&source, b"audio").expect("fixture");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = tab_a.clone();
+        app.browse.entries = vec![BrowseEntry::new(
+            source.clone(),
+            "track.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            5,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        let (tx, _rx) = mpsc::channel(4);
+
+        execute_context_action(&mut app, ContextAction::CopySelection, &tx, false);
+        assert!(app.browse.open_dir_in_new_tab(tab_b.clone(), true));
+        assert_eq!(app.browse.current_dir, tab_b);
+        assert!(app.browse.filesystem_clipboard.is_some(), "clipboard must cross tabs");
+
+        // Keep the transfer queued so the enqueue-time destination snapshot is
+        // directly inspectable without starting a filesystem worker.
+        app.file_transfers.blocked_for_attention = true;
+        execute_context_action(&mut app, ContextAction::PasteSelection, &tx, false);
+        let queued = app.file_transfers.queued.front().expect("queued transfer");
+        assert_eq!(queued.destination_dir, tab_b);
+        assert_eq!(queued.clipboard.paths(), &[source]);
+
+        assert!(app.browse.switch_to_tab(0));
+        assert_eq!(app.browse.current_dir, tab_a);
+        assert_eq!(
+            app.file_transfers.queued.front().expect("queued transfer").destination_dir,
+            tab_b,
+            "later tab switches must not retarget an in-flight/queued transfer",
+        );
     }
 
     #[test]

@@ -291,6 +291,7 @@ pub enum AppMessage {
     },
     /// Bookmark activation revalidated on the dedicated filesystem worker pool.
     BookmarkActivationResolved {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         request_id: u64,
         path: std::path::PathBuf,
@@ -298,11 +299,13 @@ pub enum AppMessage {
     },
     /// A dedicated bookmark detail worker has begun the filesystem scan.
     BookmarkDetailStarted {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         path: std::path::PathBuf,
     },
     /// Lazy, non-recursive bookmark detail loaded off the event thread.
     BookmarkDetailLoaded {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         path: std::path::PathBuf,
         result: Result<crate::tui::bookmarks::BookmarkDetail, String>,
@@ -414,6 +417,7 @@ pub enum AppMessage {
     /// slices, so a slow warm worker cannot repopulate a later listing or make
     /// one reducer frame absorb thousands of cache inserts.
     ProbeCacheWarmComplete {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         path: std::path::PathBuf,
         rows: Vec<crate::tui::browse::ProbeCacheWarmRow>,
@@ -504,6 +508,7 @@ pub enum AppMessage {
     /// Carries the launch generation and origin directory so late completions
     /// from superseded path navigations cannot move Browse backward.
     PathValidationComplete {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         origin_dir: std::path::PathBuf,
         input: String,
@@ -512,6 +517,7 @@ pub enum AppMessage {
     /// Incremental results from the active async directory scan. Batches are
     /// generation/path scoped exactly like the terminal completion.
     DirScanBatch {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         path: std::path::PathBuf,
         dirs: Vec<crate::tui::browse::BrowseEntry>,
@@ -520,6 +526,7 @@ pub enum AppMessage {
     },
     /// Result of an async directory scan (readdir + lstat per entry).
     DirScanComplete {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         path: std::path::PathBuf,
         parent_entry: Option<crate::tui::browse::BrowseEntry>,
@@ -530,6 +537,7 @@ pub enum AppMessage {
     },
     /// Result of one async Browse-tree directory-only enumeration.
     BrowseTreeChildrenComplete {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         path: std::path::PathBuf,
         child_depth: usize,
@@ -553,6 +561,7 @@ pub enum AppMessage {
     /// the reducer can reject stale completions after query, root, mode,
     /// visibility, audio/format filter, sort, or cap changes.
     SearchComplete {
+        tab_id: crate::tui::browse::BrowseTabId,
         generation: u64,
         root: std::path::PathBuf,
         /// Whether the launch was recursive. Archive-local tag search can also
@@ -690,12 +699,14 @@ pub enum AppMessage {
     },
     /// Progress for an async archive listing (`7zz l -slt`).
     ArchiveListingProgress {
+        tab_id: crate::tui::browse::BrowseTabId,
         id: u64,
         archive_path: std::path::PathBuf,
         message: String,
     },
     /// Result of an async archive listing (`7zz l -slt`).
     ArchiveListingComplete {
+        tab_id: crate::tui::browse::BrowseTabId,
         id: u64,
         archive_path: std::path::PathBuf,
         cache_key: Option<crate::tui::archive_listing::ArchiveListingCacheKey>,

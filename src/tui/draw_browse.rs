@@ -158,24 +158,145 @@ fn browse_preemphasis_status_text(
     }
 }
 
+fn middle_truncate_tab_label(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars { return value.to_string(); }
+    if max_chars <= 1 { return "…".chars().take(max_chars).collect(); }
+    let keep = max_chars - 1;
+    let left = (keep + 1) / 2;
+    let right = keep / 2;
+    let mut out: String = chars[..left].iter().collect();
+    out.push('…');
+    out.extend(chars[chars.len() - right..].iter());
+    out
+}
+
+fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let infos = app.browse.tab_infos();
+    if infos.is_empty() {
+        return;
+    }
+
+    let reopen_w = if app.browse.has_closed_tabs() { 4u16 } else { 0 };
+    let duplicate_w = 4u16;
+    let new_w = 4u16;
+    let controls_w = reopen_w + duplicate_w + new_w;
+    let tabs_w = area.width.saturating_sub(controls_w);
+    if tabs_w == 0 {
+        return;
+    }
+
+    let min_cell = 7usize;
+    let max_cell = 24usize;
+    let capacity = ((tabs_w as usize) / min_cell).max(1);
+    let visible_count = infos.len().min(capacity);
+    let active = app.browse.active_tab_index().min(infos.len().saturating_sub(1));
+    let mut start = active.saturating_sub(visible_count / 2);
+    if start + visible_count > infos.len() {
+        start = infos.len().saturating_sub(visible_count);
+    }
+    let end = (start + visible_count).min(infos.len());
+    let hidden_left = start;
+    let hidden_right = infos.len().saturating_sub(end);
+    let indicator_w = (if hidden_left > 0 { 2 } else { 0 }) + (if hidden_right > 0 { 4 } else { 0 });
+    let usable = tabs_w.saturating_sub(indicator_w);
+    let cell_w = ((usable as usize) / visible_count.max(1)).clamp(min_cell, max_cell) as u16;
+    let mut x = area.x;
+
+    if hidden_left > 0 {
+        let r = Rect::new(x, area.y, 2.min(area.right().saturating_sub(x)), 1);
+        f.render_widget(Paragraph::new("‹ ").style(Style::default().fg(theme.text_dim)), r);
+        x = x.saturating_add(r.width);
+    }
+
+    for info in &infos[start..end] {
+        if x >= area.x.saturating_add(tabs_w) { break; }
+        let width = cell_w.min(area.x.saturating_add(tabs_w).saturating_sub(x));
+        if width == 0 { break; }
+        let cell = Rect::new(x, area.y, width, 1);
+        let active_mark = if info.active { "▐" } else { " " };
+        let loading = if info.loading { "◐" } else { "" };
+        let selected = if info.has_selection { "•" } else { "" };
+        let close = if width >= 5 { " ×" } else { "" };
+        let reserved = active_mark.chars().count() + loading.chars().count()
+            + selected.chars().count() + close.chars().count() + 1;
+        let label_w = (width as usize).saturating_sub(reserved).max(1);
+        let label = middle_truncate_tab_label(&info.label, label_w);
+        let text = truncate_to(&format!("{active_mark}{loading}{label}{selected}{close}"), width as usize);
+        let style = if info.active {
+            Style::default().fg(theme.bg).bg(theme.tab_active).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.tab_inactive)
+        };
+        f.render_widget(Paragraph::new(text).style(style), cell);
+        let close_w = if width >= 5 { 2 } else { 0 };
+        let body_w = width.saturating_sub(close_w);
+        if body_w > 0 {
+            app.button_map.record_button(TuiButton::BrowseDirTab(info.index), Rect::new(x, area.y, body_w, 1));
+        }
+        if close_w > 0 {
+            app.button_map.record_button(TuiButton::BrowseDirTabClose(info.index), Rect::new(x + body_w, area.y, close_w, 1));
+        }
+        x = x.saturating_add(width);
+    }
+
+    if hidden_right > 0 && x < area.x.saturating_add(tabs_w) {
+        let text = format!("›+{}", hidden_right);
+        let width = (text.chars().count() as u16).min(area.x.saturating_add(tabs_w).saturating_sub(x));
+        if width > 0 {
+            f.render_widget(Paragraph::new(truncate_to(&text, width as usize)).style(Style::default().fg(theme.text_dim)), Rect::new(x, area.y, width, 1));
+        }
+    }
+
+    let mut cx = area.x.saturating_add(tabs_w);
+    if app.browse.has_closed_tabs() {
+        let r = Rect::new(cx, area.y, reopen_w.min(area.right().saturating_sub(cx)), 1);
+        f.render_widget(Paragraph::new(" ↶ ").style(Style::default().fg(theme.text_bright).bg(theme.surface)), r);
+        app.button_map.record_button(TuiButton::BrowseDirTabReopenClosed, r);
+        cx = cx.saturating_add(r.width);
+    }
+    let duplicate = Rect::new(cx, area.y, duplicate_w.min(area.right().saturating_sub(cx)), 1);
+    if duplicate.width > 0 {
+        f.render_widget(Paragraph::new(" ⧉ ").style(Style::default().fg(theme.text_bright).bg(theme.surface)), duplicate);
+        app.button_map.record_button(TuiButton::BrowseDirTabDuplicate, duplicate);
+        cx = cx.saturating_add(duplicate.width);
+    }
+    let add = Rect::new(cx, area.y, new_w.min(area.right().saturating_sub(cx)), 1);
+    if add.width > 0 {
+        f.render_widget(Paragraph::new(" + ").style(Style::default().fg(theme.text_bright).bg(theme.surface)), add);
+        app.button_map.record_button(TuiButton::BrowseDirTabNew, add);
+    }
+}
+
 /// Draw the full browse screen.
 pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: super::theme::Theme) {
     app.browse.last_render_area = Some(area);
 
+    // The directory tab strip only claims a row when there are 2+ tabs, so a
+    // single-tab Browse view keeps its exact pre-tabs layout (no wasted row).
+    let tab_strip_rows: u16 = if app.browse.tab_count() > 1 { 1 } else { 0 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // header banner
-            Constraint::Length(5), // toolbar + path bar (two boxes, shared middle border)
-            Constraint::Min(10),   // three-pane browse content
-            Constraint::Length(2), // footer (tabs + context)
+            Constraint::Length(7),              // header banner
+            Constraint::Length(5),              // toolbar + path bar (two boxes, shared middle border)
+            Constraint::Length(tab_strip_rows), // directory tab strip (hidden at a single tab)
+            Constraint::Min(10),                // three-pane browse content
+            Constraint::Length(2),              // footer (screen tabs + context)
         ])
         .split(area);
 
     draw_header(f, chunks[0], theme);
     draw_browse_toolbar(f, chunks[1], app, theme);
+    if tab_strip_rows > 0 {
+        draw_browse_tab_strip(f, chunks[2], app, theme);
+    }
 
-    let content_chunks = browse_content_layout(chunks[2], &app.browse);
+    let content_chunks = browse_content_layout(chunks[3], &app.browse);
     let explore_area = content_chunks[0];
     let list_area = content_chunks[1];
     let info_area = content_chunks[2];
@@ -261,7 +382,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
         f,
-        chunks[3],
+        chunks[4],
         app.current_screen,
         &mut app.button_map,
         status_msg,

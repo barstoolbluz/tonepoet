@@ -198,6 +198,7 @@ pub enum FilePickerMenuAction {
     RenameUppercase,
     RenameLowercase,
     OpenSystemDefault,
+    OpenInNewTab,
     AddBookmark,
     OpenBookmarks,
 }
@@ -244,6 +245,11 @@ pub(crate) enum FilePickerSubmenuEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePickerHitAction {
     Toolbar(ToolbarAction),
+    TabActivate(usize),
+    TabClose(usize),
+    TabNew,
+    TabDuplicate,
+    TabReopenClosed,
     TitleToggleMaximize,
     Address,
     TreeDisclosure(usize),
@@ -1012,6 +1018,66 @@ impl Clone for PickerPasteTask {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct FilePickerTabSlot {
+    pub(crate) id: u64,
+    /// Active slot owns no detached state; every inactive slot owns exactly one.
+    pub(crate) state: Option<Box<FilePickerState>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClosedFilePickerTab {
+    pub(crate) original_index: usize,
+    pub(crate) state: Box<FilePickerState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FilePickerTabDrag {
+    pub(crate) index: usize,
+    pub(crate) start_column: u16,
+    pub(crate) reordered: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilePickerTabs {
+    pub(crate) slots: Vec<FilePickerTabSlot>,
+    pub(crate) active: usize,
+    pub(crate) closed: Vec<ClosedFilePickerTab>,
+    pub(crate) next_id: u64,
+    pub(crate) drag: Option<FilePickerTabDrag>,
+}
+
+impl FilePickerTabs {
+    fn new() -> Self {
+        Self {
+            slots: vec![FilePickerTabSlot { id: 1, state: None }],
+            active: 0,
+            closed: Vec::new(),
+            next_id: 2,
+            drag: None,
+        }
+    }
+
+    fn allocate_id(&mut self) -> u64 {
+        loop {
+            let id = self.next_id.max(2);
+            self.next_id = id.wrapping_add(1).max(2);
+            if self.slots.iter().all(|slot| slot.id != id) {
+                return id;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePickerTabInfo {
+    pub index: usize,
+    pub id: u64,
+    pub label: String,
+    pub active: bool,
+    pub has_selection: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct FilePickerState {
     pub(crate) current_dir: PathBuf,
     pub(crate) history_back: Vec<PathBuf>,
@@ -1110,6 +1176,11 @@ pub struct FilePickerState {
     pub(crate) save_name_input: TextInputState,
     pub(crate) pending_save_path: Option<PathBuf>,
     pub(crate) title_case: fn(&str) -> String,
+
+    /// Session-local browser tabs. Detached tab states deliberately contain
+    /// `tabs: None`, preventing recursive managers while preserving the mature
+    /// single-tab state shape for all existing code paths.
+    pub(crate) tabs: Option<FilePickerTabs>,
 }
 
 impl FilePickerState {
@@ -1207,6 +1278,7 @@ impl FilePickerState {
             ),
             pending_save_path: None,
             title_case: config.title_case,
+            tabs: Some(FilePickerTabs::new()),
         };
         state.refresh();
         state.select_tree_node_for_current_dir();
@@ -1214,6 +1286,434 @@ impl FilePickerState {
             state.focus = FilePickerFocus::SaveName;
         }
         state
+    }
+
+    fn swap_tab_shared_state(&mut self, other: &mut Self) {
+        // These fields are picker-session contract, modal/operation state, or
+        // render plumbing. They remain attached to the picker session rather
+        // than travelling with a directory tab.
+        std::mem::swap(&mut self.filter, &mut other.filter);
+        std::mem::swap(&mut self.menu_open, &mut other.menu_open);
+        std::mem::swap(&mut self.menu_cursor, &mut other.menu_cursor);
+        std::mem::swap(&mut self.submenu_open, &mut other.submenu_open);
+        std::mem::swap(&mut self.submenu_cursor, &mut other.submenu_cursor);
+        std::mem::swap(&mut self.submenu_kind, &mut other.submenu_kind);
+        std::mem::swap(&mut self.case_submenu_open, &mut other.case_submenu_open);
+        std::mem::swap(&mut self.case_submenu_cursor, &mut other.case_submenu_cursor);
+        std::mem::swap(&mut self.context_menu_kind, &mut other.context_menu_kind);
+        std::mem::swap(&mut self.context_menu_target, &mut other.context_menu_target);
+        std::mem::swap(&mut self.context_menu_anchor, &mut other.context_menu_anchor);
+        std::mem::swap(&mut self.title, &mut other.title);
+        std::mem::swap(&mut self.theme, &mut other.theme);
+        std::mem::swap(&mut self.selection_mode, &mut other.selection_mode);
+        std::mem::swap(&mut self.show_preview, &mut other.show_preview);
+        std::mem::swap(&mut self.conflict_policy, &mut other.conflict_policy);
+        #[cfg(feature = "image-preview")]
+        std::mem::swap(&mut self.image_preview_cache, &mut other.image_preview_cache);
+        std::mem::swap(&mut self.clipboard, &mut other.clipboard);
+        std::mem::swap(
+            &mut self.host_clipboard_paste_requested,
+            &mut other.host_clipboard_paste_requested,
+        );
+        std::mem::swap(&mut self.paste_task, &mut other.paste_task);
+        std::mem::swap(&mut self.paste_retry_plan, &mut other.paste_retry_plan);
+        std::mem::swap(&mut self.pending_delete, &mut other.pending_delete);
+        std::mem::swap(&mut self.delete_confirm_button, &mut other.delete_confirm_button);
+        std::mem::swap(&mut self.properties_open, &mut other.properties_open);
+        std::mem::swap(&mut self.last_error, &mut other.last_error);
+        std::mem::swap(&mut self.hit_regions, &mut other.hit_regions);
+        std::mem::swap(&mut self.toolbar_button_geometry, &mut other.toolbar_button_geometry);
+        std::mem::swap(&mut self.last_layout, &mut other.last_layout);
+        std::mem::swap(&mut self.last_click, &mut other.last_click);
+        std::mem::swap(&mut self.text_pointer, &mut other.text_pointer);
+        std::mem::swap(&mut self.text_last_click, &mut other.text_last_click);
+        std::mem::swap(&mut self.double_click_window, &mut other.double_click_window);
+        std::mem::swap(&mut self.bookmarks, &mut other.bookmarks);
+        std::mem::swap(&mut self.maximized, &mut other.maximized);
+        std::mem::swap(&mut self.operation_policy, &mut other.operation_policy);
+        std::mem::swap(&mut self.pending_create, &mut other.pending_create);
+        std::mem::swap(&mut self.pending_name_action, &mut other.pending_name_action);
+        std::mem::swap(&mut self.pending_name_source, &mut other.pending_name_source);
+        std::mem::swap(&mut self.pending_name_parent, &mut other.pending_name_parent);
+        std::mem::swap(&mut self.create_name_input, &mut other.create_name_input);
+        std::mem::swap(&mut self.hide_extension, &mut other.hide_extension);
+        std::mem::swap(&mut self.save_mode, &mut other.save_mode);
+        std::mem::swap(&mut self.save_name_input, &mut other.save_name_input);
+        std::mem::swap(&mut self.pending_save_path, &mut other.pending_save_path);
+        std::mem::swap(&mut self.title_case, &mut other.title_case);
+    }
+
+    fn switch_to_tab_internal(&mut self, index: usize) -> bool {
+        // Save-as name editing is picker-session UI, not directory navigation.
+        // Preserve it across tab swaps while parking each tab's navigation
+        // focus in `previous_focus`. Other modal states block switching.
+        let shared_focus = (self.focus == FilePickerFocus::SaveName)
+            .then_some((self.focus, self.previous_focus));
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let already_active = index == tabs.active;
+        if index >= tabs.slots.len() || already_active {
+            self.tabs = Some(tabs);
+            return already_active;
+        }
+        let old_index = tabs.active;
+        let Some(mut incoming) = tabs.slots[index].state.take() else {
+            self.tabs = Some(tabs);
+            return false;
+        };
+        debug_assert!(incoming.tabs.is_none());
+
+        // Swap the complete mature picker state, then swap session-global fields
+        // back. This makes newly-added navigation fields per-tab by default and
+        // keeps the explicit shared list reviewable.
+        std::mem::swap(self, incoming.as_mut());
+        self.swap_tab_shared_state(incoming.as_mut());
+        if let Some((focus, old_navigation_focus)) = shared_focus {
+            let new_navigation_focus = self.focus;
+            incoming.focus = old_navigation_focus;
+            self.focus = focus;
+            self.previous_focus = new_navigation_focus;
+        }
+        debug_assert!(self.tabs.is_none());
+        debug_assert!(incoming.tabs.is_none());
+
+        tabs.slots[old_index].state = Some(incoming);
+        tabs.active = index;
+        tabs.slots[index].state = None;
+        tabs.drag = None;
+        self.tabs = Some(tabs);
+        self.hit_regions.clear();
+        self.toolbar_button_geometry.clear();
+        self.last_layout = None;
+        true
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.as_ref().map(|tabs| tabs.slots.len()).unwrap_or(1)
+    }
+
+    pub fn active_tab_index(&self) -> usize {
+        self.tabs.as_ref().map(|tabs| tabs.active).unwrap_or(0)
+    }
+
+    pub fn active_tab_id(&self) -> u64 {
+        self.tabs
+            .as_ref()
+            .and_then(|tabs| tabs.slots.get(tabs.active))
+            .map(|slot| slot.id)
+            .unwrap_or(1)
+    }
+
+    pub fn has_closed_tabs(&self) -> bool {
+        self.tabs.as_ref().is_some_and(|tabs| !tabs.closed.is_empty())
+    }
+
+    pub fn tab_infos(&self) -> Vec<FilePickerTabInfo> {
+        let Some(tabs) = self.tabs.as_ref() else {
+            return vec![FilePickerTabInfo {
+                index: 0,
+                id: 1,
+                label: tab_label_for_dir(&self.current_dir),
+                active: true,
+                has_selection: !self.multi_selected.is_empty(),
+            }];
+        };
+        tabs.slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let (dir, has_selection) = if index == tabs.active {
+                    (&self.current_dir, !self.multi_selected.is_empty())
+                } else if let Some(state) = slot.state.as_deref() {
+                    (&state.current_dir, !state.multi_selected.is_empty())
+                } else {
+                    (&self.current_dir, false)
+                };
+                FilePickerTabInfo {
+                    index,
+                    id: slot.id,
+                    label: tab_label_for_dir(dir),
+                    active: index == tabs.active,
+                    has_selection,
+                }
+            })
+            .collect()
+    }
+
+    pub fn switch_to_tab(&mut self, index: usize) -> bool {
+        if self.tab_switch_blocked_by_modal() {
+            return false;
+        }
+        self.switch_to_tab_internal(index)
+    }
+
+    pub fn switch_tab_relative(&mut self, delta: isize) -> bool {
+        let count = self.tab_count();
+        if count <= 1 || self.tab_switch_blocked_by_modal() {
+            return false;
+        }
+        let current = self.active_tab_index() as isize;
+        let next = (current + delta).rem_euclid(count as isize) as usize;
+        self.switch_to_tab_internal(next)
+    }
+
+    fn detached_clone_of_active(&mut self) -> Box<Self> {
+        let tabs = self.tabs.take();
+        let mut cloned = Box::new(self.clone());
+        self.tabs = tabs;
+        cloned.tabs = None;
+        cloned.menu_open = false;
+        cloned.submenu_open = false;
+        cloned.case_submenu_open = false;
+        cloned.context_menu_target = None;
+        cloned.context_menu_anchor = None;
+        cloned.properties_open = false;
+        cloned.pending_delete.clear();
+        cloned.pending_create = None;
+        cloned.pending_name_action = None;
+        cloned.pending_name_source = None;
+        cloned.pending_name_parent = None;
+        cloned.pending_save_path = None;
+        cloned.hit_regions.clear();
+        cloned.toolbar_button_geometry.clear();
+        cloned.last_layout = None;
+        cloned.last_click = None;
+        cloned.text_pointer = None;
+        cloned.text_last_click = None;
+        cloned.paste_task = None;
+        cloned
+    }
+
+    fn fresh_detached_tab_at(&self, dir: PathBuf) -> Box<Self> {
+        // Build a fresh context instead of cloning and clearing a potentially
+        // huge directory listing. New/Open-in-New-Tab stay O(size of target
+        // directory), while Duplicate deliberately clones the current view.
+        let mut state = Box::new(Self::new(FilePickerConfig {
+            start_dir: dir,
+            filter: self.filter.clone(),
+            title: self.title.clone(),
+            theme: self.theme.clone(),
+            selection_mode: self.selection_mode,
+            show_hidden: self.show_hidden,
+            sort_key: self.sort_key,
+            sort_reverse: self.sort_reverse,
+            show_preview: self.show_preview,
+            conflict_policy: self.conflict_policy,
+            operation_policy: self.operation_policy,
+            hide_extension: self.hide_extension.clone(),
+            save_mode: self.save_mode.clone(),
+            title_case: self.title_case,
+        }));
+        state.tabs = None;
+        state
+    }
+
+    pub fn new_tab(&mut self) -> bool {
+        if self.tab_switch_blocked_by_modal() {
+            return false;
+        }
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/"));
+        let detached = self.fresh_detached_tab_at(home);
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let insert_at = (tabs.active + 1).min(tabs.slots.len());
+        let id = tabs.allocate_id();
+        tabs.slots.insert(insert_at, FilePickerTabSlot { id, state: Some(detached) });
+        self.tabs = Some(tabs);
+        self.switch_to_tab_internal(insert_at)
+    }
+
+    pub fn open_dir_in_new_tab(&mut self, dir: PathBuf, activate: bool) -> bool {
+        if !dir.is_dir() {
+            return false;
+        }
+        let detached = self.fresh_detached_tab_at(dir);
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let insert_at = (tabs.active + 1).min(tabs.slots.len());
+        let id = tabs.allocate_id();
+        tabs.slots.insert(insert_at, FilePickerTabSlot { id, state: Some(detached) });
+        self.tabs = Some(tabs);
+        if activate { self.switch_to_tab_internal(insert_at) } else { true }
+    }
+
+    pub fn duplicate_tab(&mut self) -> bool {
+        if self.tab_switch_blocked_by_modal() {
+            return false;
+        }
+        let detached = self.detached_clone_of_active();
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let insert_at = (tabs.active + 1).min(tabs.slots.len());
+        let id = tabs.allocate_id();
+        tabs.slots.insert(insert_at, FilePickerTabSlot { id, state: Some(detached) });
+        self.tabs = Some(tabs);
+        self.switch_to_tab_internal(insert_at)
+    }
+
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        if self.tab_switch_blocked_by_modal() {
+            return false;
+        }
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        if tabs.slots.len() <= 1 || index >= tabs.slots.len() {
+            self.tabs = Some(tabs);
+            return false;
+        }
+        let original_index = index;
+        if index == tabs.active {
+            let shared_focus = (self.focus == FilePickerFocus::SaveName)
+                .then_some((self.focus, self.previous_focus));
+            let incoming_index = if index > 0 { index - 1 } else { 1 };
+            let Some(mut incoming) = tabs.slots[incoming_index].state.take() else {
+                self.tabs = Some(tabs);
+                return false;
+            };
+            std::mem::swap(self, incoming.as_mut());
+            self.swap_tab_shared_state(incoming.as_mut());
+            if let Some((focus, old_navigation_focus)) = shared_focus {
+                let new_navigation_focus = self.focus;
+                incoming.focus = old_navigation_focus;
+                self.focus = focus;
+                self.previous_focus = new_navigation_focus;
+            }
+            tabs.closed.push(ClosedFilePickerTab { original_index, state: incoming });
+            tabs.slots.remove(index);
+            tabs.active = if index > 0 { index - 1 } else { 0 };
+            tabs.slots[tabs.active].state = None;
+        } else {
+            let removed = tabs.slots.remove(index);
+            let Some(state) = removed.state else {
+                self.tabs = Some(tabs);
+                return false;
+            };
+            tabs.closed.push(ClosedFilePickerTab { original_index, state });
+            if index < tabs.active {
+                tabs.active -= 1;
+            }
+        }
+        if tabs.closed.len() > 16 {
+            let excess = tabs.closed.len() - 16;
+            tabs.closed.drain(0..excess);
+        }
+        tabs.drag = None;
+        self.tabs = Some(tabs);
+        self.hit_regions.clear();
+        true
+    }
+
+    pub fn close_active_tab(&mut self) -> bool {
+        let index = self.active_tab_index();
+        self.close_tab(index)
+    }
+
+    pub fn reopen_closed_tab(&mut self) -> bool {
+        if self.tab_switch_blocked_by_modal() {
+            return false;
+        }
+        let Some(mut tabs) = self.tabs.take() else { return false; };
+        let Some(closed) = tabs.closed.pop() else {
+            self.tabs = Some(tabs);
+            return false;
+        };
+        let index = closed.original_index.min(tabs.slots.len());
+        let id = tabs.allocate_id();
+        tabs.slots.insert(index, FilePickerTabSlot { id, state: Some(closed.state) });
+        // `self` still owns the live active tab. An insertion at/before that
+        // slot shifts its index, so preserve the active-slot-is-empty invariant
+        // until `switch_to_tab_internal` swaps in the reopened state.
+        if index <= tabs.active {
+            tabs.active = tabs.active.saturating_add(1);
+        }
+        debug_assert!(tabs.slots.get(tabs.active).is_some_and(|slot| slot.state.is_none()));
+        self.tabs = Some(tabs);
+        self.switch_to_tab_internal(index)
+    }
+
+    pub fn reorder_tab(&mut self, from: usize, to: usize) -> bool {
+        let Some(tabs) = self.tabs.as_mut() else { return false; };
+        if from >= tabs.slots.len() || to >= tabs.slots.len() || from == to {
+            return false;
+        }
+        let slot = tabs.slots.remove(from);
+        tabs.slots.insert(to, slot);
+        if tabs.active == from {
+            tabs.active = to;
+        } else if from < tabs.active && to >= tabs.active {
+            tabs.active -= 1;
+        } else if from > tabs.active && to <= tabs.active {
+            tabs.active += 1;
+        }
+        true
+    }
+
+    pub fn reorder_active_tab(&mut self, delta: isize) -> bool {
+        let count = self.tab_count();
+        if count <= 1 { return false; }
+        let from = self.active_tab_index();
+        let to = if delta < 0 {
+            from.saturating_sub(1)
+        } else {
+            (from + 1).min(count - 1)
+        };
+        self.reorder_tab(from, to)
+    }
+
+    pub(crate) fn begin_tab_drag(&mut self, index: usize, column: u16) {
+        if self.tab_switch_blocked_by_modal() {
+            return;
+        }
+        if let Some(tabs) = self.tabs.as_mut() {
+            tabs.drag = Some(FilePickerTabDrag { index, start_column: column, reordered: false });
+        }
+    }
+
+    pub(crate) fn update_tab_drag(&mut self, column: u16, target: Option<usize>) -> bool {
+        let Some(tabs) = self.tabs.as_mut() else { return false; };
+        let Some(mut drag) = tabs.drag else { return false; };
+        if column.abs_diff(drag.start_column) < 2 { return false; }
+        let Some(target) = target else { return false; };
+        if target == drag.index || target >= tabs.slots.len() { return false; }
+        let slot = tabs.slots.remove(drag.index);
+        tabs.slots.insert(target, slot);
+        if tabs.active == drag.index { tabs.active = target; }
+        else if drag.index < tabs.active && target >= tabs.active { tabs.active -= 1; }
+        else if drag.index > tabs.active && target <= tabs.active { tabs.active += 1; }
+        drag.index = target;
+        drag.reordered = true;
+        tabs.drag = Some(drag);
+        true
+    }
+
+    pub(crate) fn finish_tab_drag(&mut self) -> Option<(usize, bool)> {
+        self.tabs.as_mut().and_then(|tabs| tabs.drag.take()).map(|drag| (drag.index, drag.reordered))
+    }
+
+    pub(crate) fn tab_close_key_available(&self) -> bool {
+        !matches!(
+            self.focus,
+            FilePickerFocus::Address
+                | FilePickerFocus::Search
+                | FilePickerFocus::BookmarkName
+                | FilePickerFocus::CreateName
+                | FilePickerFocus::SaveName
+        )
+    }
+
+    pub(crate) fn tab_switch_blocked_by_modal(&self) -> bool {
+        self.paste_task.is_some()
+            || self.menu_open
+            || self.submenu_open
+            || self.properties_open
+            || matches!(
+                self.focus,
+                FilePickerFocus::Bookmarks
+                    | FilePickerFocus::BookmarkName
+                    | FilePickerFocus::Menu
+                    | FilePickerFocus::Submenu
+                    | FilePickerFocus::Properties
+                    | FilePickerFocus::DeleteConfirm
+                    | FilePickerFocus::CreateName
+                    | FilePickerFocus::SaveOverwriteConfirm
+            )
     }
 
     /// Consume a host-clipboard paste request raised by the focused picker
@@ -3744,6 +4244,7 @@ impl FilePickerState {
                 ("Fix capitalization ▸", Entry::CaseSubmenu),
             ],
             Kind::Tree => vec![
+                ("Open in New Tab", Entry::Action(Action::OpenInNewTab)),
                 ("New      ▸", Entry::NewSubmenu),
                 ("Add bookmark", Entry::Action(Action::AddBookmark)),
                 ("Cut", Entry::Action(Action::Cut)),
@@ -3753,6 +4254,7 @@ impl FilePickerState {
                 ("Delete", Entry::Action(Action::Delete)),
             ],
             Kind::File => vec![
+                ("Open in New Tab", Entry::Action(Action::OpenInNewTab)),
                 ("Cut", Entry::Action(Action::Cut)),
                 ("Copy", Entry::Action(Action::Copy)),
                 ("Paste", Entry::Action(Action::Paste)),
@@ -3869,12 +4371,22 @@ impl FilePickerState {
             | FilePickerMenuAction::RenameLowercase => !action_paths.is_empty(),
             FilePickerMenuAction::OpenSystemDefault => single
                 && action_paths.first().is_some_and(|path| path.is_file()),
+            FilePickerMenuAction::OpenInNewTab => single
+                && action_paths.first().is_some_and(|path| path.is_dir()),
             FilePickerMenuAction::AddBookmark => {
                 self.context_menu_kind != FilePickerContextMenuKind::File
             }
             FilePickerMenuAction::OpenBookmarks => true,
         }
     }
+}
+
+
+fn tab_label_for_dir(dir: &Path) -> String {
+    dir.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
 }
 
 /// One source-to-destination mapping in a planned or completed paste.
@@ -9852,4 +10364,198 @@ mod exact_replay_authority_tests {
         assert_eq!(dispatch_plan.mappings[0].source, missing);
     }
 
+}
+
+#[cfg(test)]
+mod tabbed_browsing_tests {
+    use super::*;
+
+    fn picker_at(path: &Path, mode: FilePickerSelectionMode) -> FilePickerState {
+        FilePickerState::new(FilePickerConfig {
+            start_dir: path.to_path_buf(),
+            selection_mode: mode,
+            ..FilePickerConfig::default()
+        })
+    }
+
+    #[test]
+    fn tabs_preserve_independent_navigation_state_and_session_clipboard() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("alpha");
+        let b = temp.path().join("beta");
+        fs::create_dir(&a).expect("alpha");
+        fs::create_dir(&b).expect("beta");
+        let a_file = a.join("a.flac");
+        let b_file = b.join("b.flac");
+        fs::write(&a_file, b"a").expect("a file");
+        fs::write(&b_file, b"b").expect("b file");
+
+        let mut picker = picker_at(&a, FilePickerSelectionMode::FilesOrDirectories);
+        picker.replace_multi_selected([a_file.clone()]);
+        picker.search.input = TextInputState::new("alpha-query".to_string());
+        let clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Copy,
+            vec![a_file.clone()],
+        )
+        .expect("clipboard");
+        picker.clipboard = Some(clipboard.clone());
+        let alpha_id = picker.active_tab_id();
+
+        assert!(picker.open_dir_in_new_tab(b.clone(), false));
+        assert_eq!(picker.active_tab_id(), alpha_id, "Open in New Tab is background-only");
+        assert_eq!(picker.current_dir(), a.as_path());
+        assert_eq!(picker.tab_count(), 2);
+
+        assert!(picker.switch_to_tab(1));
+        assert_eq!(picker.current_dir(), b.as_path());
+        assert!(picker.multi_selected.is_empty());
+        assert_eq!(picker.clipboard.as_ref(), Some(&clipboard), "clipboard is session-global");
+        picker.show_hidden = true;
+        picker.search.input = TextInputState::new("beta-query".to_string());
+        let b_index = picker
+            .entries
+            .iter()
+            .position(|entry| entry.path == b_file)
+            .expect("beta file");
+        picker.set_file_cursor(b_index, 8);
+
+        assert!(picker.switch_to_tab(0));
+        assert_eq!(picker.current_dir(), a.as_path());
+        assert_eq!(picker.search.input.text, "alpha-query");
+        assert_eq!(picker.multi_selected, vec![a_file]);
+        assert!(!picker.show_hidden);
+        assert_eq!(picker.clipboard.as_ref(), Some(&clipboard));
+
+        assert!(picker.switch_to_tab(1));
+        assert_eq!(picker.current_dir(), b.as_path());
+        assert_eq!(picker.search.input.text, "beta-query");
+        assert!(picker.show_hidden);
+        assert_eq!(picker.entries[picker.file_cursor].path, b_file);
+    }
+
+    #[test]
+    fn duplicate_reorder_close_reopen_and_last_close_follow_browser_semantics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+
+        let mut picker = picker_at(&a, FilePickerSelectionMode::Files);
+        assert!(picker.open_dir_in_new_tab(b.clone(), true));
+        assert_eq!(picker.active_tab_index(), 1);
+        assert!(picker.duplicate_tab());
+        assert_eq!(picker.tab_count(), 3);
+        assert_eq!(picker.active_tab_index(), 2);
+        assert_eq!(picker.current_dir(), b.as_path());
+
+        assert!(picker.reorder_active_tab(-1));
+        assert_eq!(picker.active_tab_index(), 1);
+        assert_eq!(picker.current_dir(), b.as_path());
+
+        assert!(picker.close_active_tab());
+        assert_eq!(picker.tab_count(), 2);
+        assert_eq!(picker.active_tab_index(), 0, "closing focused tab prefers the left neighbor");
+        assert!(picker.has_closed_tabs());
+        assert!(picker.reopen_closed_tab());
+        assert_eq!(picker.tab_count(), 3);
+        assert_eq!(picker.active_tab_index(), 1, "reopen restores the original index and focuses it");
+        assert_eq!(picker.current_dir(), b.as_path());
+
+        while picker.tab_count() > 1 {
+            assert!(picker.close_active_tab());
+        }
+        assert!(!picker.close_active_tab(), "the last picker tab is a no-op");
+        assert_eq!(picker.tab_count(), 1);
+    }
+
+    #[test]
+    fn reopening_closed_leftmost_tab_activates_its_restored_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+
+        let mut picker = picker_at(&a, FilePickerSelectionMode::Files);
+        assert!(picker.open_dir_in_new_tab(b.clone(), false));
+        assert_eq!(picker.active_tab_index(), 0);
+        assert_eq!(picker.current_dir(), a.as_path());
+
+        assert!(picker.close_active_tab());
+        assert_eq!(picker.tab_count(), 1);
+        assert_eq!(picker.current_dir(), b.as_path());
+
+        assert!(picker.reopen_closed_tab());
+        assert_eq!(picker.tab_count(), 2);
+        assert_eq!(picker.active_tab_index(), 0);
+        assert_eq!(picker.current_dir(), a.as_path());
+    }
+
+    #[test]
+    fn save_as_keeps_the_session_name_but_targets_the_focused_tab() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: a.clone(),
+            save_mode: Some(SaveModeConfig {
+                default_name: "album".to_string(),
+                confirm_overwrite: true,
+                hide_extension: Some(".flac".to_string()),
+                style: SaveModeStyle::Inline,
+            }),
+            ..FilePickerConfig::default()
+        });
+        picker.save_name_input = TextInputState::new("final-master".to_string());
+        assert_eq!(picker.focus, FilePickerFocus::SaveName);
+
+        assert!(picker.open_dir_in_new_tab(b.clone(), true));
+        assert_eq!(picker.focus, FilePickerFocus::SaveName);
+        assert_eq!(picker.save_name_input.text, "final-master");
+        assert_eq!(
+            picker.commit_save_name(),
+            FilePickerAction::Selected(b.join("final-master.flac")),
+        );
+
+        assert!(picker.switch_to_tab(0));
+        assert_eq!(picker.focus, FilePickerFocus::SaveName);
+        assert_eq!(picker.save_name_input.text, "final-master");
+        assert_eq!(
+            picker.commit_save_name(),
+            FilePickerAction::Selected(a.join("final-master.flac")),
+        );
+    }
+
+    #[test]
+    fn all_selection_modes_keep_their_result_contract_after_tab_switches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let file = b.join("track.flac");
+        let directory = b.join("folder");
+        fs::write(&file, b"audio").expect("file");
+        fs::create_dir(&directory).expect("folder");
+
+        for mode in [FilePickerSelectionMode::Files, FilePickerSelectionMode::FilesOrDirectories] {
+            let mut picker = picker_at(&a, mode);
+            assert!(picker.open_dir_in_new_tab(b.clone(), true));
+            let index = picker.entries.iter().position(|entry| entry.path == file).expect("file row");
+            picker.set_file_cursor(index, 8);
+            assert_eq!(picker.accept_current_selection(), FilePickerAction::Selected(file.clone()));
+        }
+
+        let mut directories = picker_at(&a, FilePickerSelectionMode::Directories);
+        assert!(directories.open_dir_in_new_tab(b.clone(), true));
+        assert_eq!(
+            directories.accept_current_selection(),
+            FilePickerAction::Selected(b),
+            "directory mode still returns the current directory"
+        );
+    }
 }

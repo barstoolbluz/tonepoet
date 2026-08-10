@@ -108,6 +108,62 @@ impl FilePickerState {
         if self.handle_paste_task_key(key) {
             return FilePickerAction::None;
         }
+
+        // Tab commands live above pane-local dispatch so their byobu-safe
+        // chords are consistent in Tree and Files focus. Ctrl+W deliberately
+        // stays with text editors (delete-word) and modal/editor focus blocks
+        // tab mutations until the edit is committed/cancelled.
+        if !self.tab_switch_blocked_by_modal() {
+            let exact = key.modifiers;
+            match (key.code, exact) {
+                (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                    self.new_tab();
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char('w'), KeyModifiers::CONTROL) if self.tab_close_key_available() => {
+                    self.close_active_tab();
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char('u'), KeyModifiers::ALT) => {
+                    self.reopen_closed_tab();
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char('d'), KeyModifiers::ALT) => {
+                    self.duplicate_tab();
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char('['), KeyModifiers::ALT) => {
+                    self.switch_tab_relative(-1);
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char(']'), KeyModifiers::ALT) => {
+                    self.switch_tab_relative(1);
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char(','), KeyModifiers::ALT) => {
+                    self.reorder_active_tab(-1);
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char('.'), KeyModifiers::ALT) => {
+                    self.reorder_active_tab(1);
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Left, KeyModifiers::ALT) if self.tab_count() > 1 => {
+                    self.switch_tab_relative(-1);
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Right, KeyModifiers::ALT) if self.tab_count() > 1 => {
+                    self.switch_tab_relative(1);
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char(digit @ '1'..='9'), KeyModifiers::ALT) => {
+                    let index = digit.to_digit(10).unwrap_or(1) as usize - 1;
+                    self.switch_to_tab(index);
+                    return FilePickerAction::None;
+                }
+                _ => {}
+            }
+        }
         if matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
             && key
                 .modifiers
@@ -306,6 +362,69 @@ impl FilePickerState {
                     return FilePickerAction::None;
                 }
             }
+        }
+
+        let tab_hit = || {
+            self.hit_regions.iter().rev().find_map(|region| {
+                point_in_rect(mouse.column, mouse.row, region.rect).then_some(region.action)
+            })
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Middle) => {
+                match tab_hit() {
+                    Some(FilePickerHitAction::TabActivate(index))
+                    | Some(FilePickerHitAction::TabClose(index)) => {
+                        self.close_tab(index);
+                        return FilePickerAction::None;
+                    }
+                    _ => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => match tab_hit() {
+                Some(FilePickerHitAction::TabActivate(index)) => {
+                    self.begin_tab_drag(index, mouse.column);
+                    return FilePickerAction::None;
+                }
+                Some(FilePickerHitAction::TabClose(index)) => {
+                    self.close_tab(index);
+                    return FilePickerAction::None;
+                }
+                Some(FilePickerHitAction::TabNew) => {
+                    self.new_tab();
+                    return FilePickerAction::None;
+                }
+                Some(FilePickerHitAction::TabDuplicate) => {
+                    self.duplicate_tab();
+                    return FilePickerAction::None;
+                }
+                Some(FilePickerHitAction::TabReopenClosed) => {
+                    self.reopen_closed_tab();
+                    return FilePickerAction::None;
+                }
+                _ => {}
+            },
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let target = match tab_hit() {
+                    Some(FilePickerHitAction::TabActivate(index))
+                    | Some(FilePickerHitAction::TabClose(index)) => Some(index),
+                    _ => None,
+                };
+                if self.tabs.as_ref().is_some_and(|tabs| tabs.drag.is_some()) {
+                    self.update_tab_drag(mouse.column, target);
+                    return FilePickerAction::None;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.tabs.as_ref().is_some_and(|tabs| tabs.drag.is_some()) {
+                    if let Some((index, reordered)) = self.finish_tab_drag() {
+                        if !reordered {
+                            self.switch_to_tab(index);
+                        }
+                    }
+                    return FilePickerAction::None;
+                }
+            }
+            _ => {}
         }
 
         if self.handle_picker_text_pointer(&mouse) {
@@ -655,7 +774,7 @@ impl FilePickerState {
                     FilePickerAction::None
                 }
             }
-            KeyCode::Char('o') if key.modifiers == KeyModifiers::ALT => {
+            KeyCode::Char('o' | 'm') if key.modifiers == KeyModifiers::ALT => {
                 self.open_menu();
                 FilePickerAction::None
             }
@@ -1046,6 +1165,26 @@ impl FilePickerState {
 
     fn apply_hit_action(&mut self, action: FilePickerHitAction) -> FilePickerAction {
         match action {
+            FilePickerHitAction::TabActivate(index) => {
+                self.switch_to_tab(index);
+                FilePickerAction::None
+            }
+            FilePickerHitAction::TabClose(index) => {
+                self.close_tab(index);
+                FilePickerAction::None
+            }
+            FilePickerHitAction::TabNew => {
+                self.new_tab();
+                FilePickerAction::None
+            }
+            FilePickerHitAction::TabDuplicate => {
+                self.duplicate_tab();
+                FilePickerAction::None
+            }
+            FilePickerHitAction::TabReopenClosed => {
+                self.reopen_closed_tab();
+                FilePickerAction::None
+            }
             FilePickerHitAction::Toolbar(toolbar) => self.apply_toolbar_action(toolbar),
             FilePickerHitAction::TitleToggleMaximize => {
                 self.toggle_maximized();
@@ -1493,6 +1632,18 @@ impl FilePickerState {
                 self.close_menu();
                 path.map(FilePickerAction::OpenSystemDefault)
                     .unwrap_or(FilePickerAction::None)
+            }
+            FilePickerMenuAction::OpenInNewTab => {
+                let target = if self.context_menu_kind == FilePickerContextMenuKind::Tree {
+                    self.context_menu_target.clone()
+                } else {
+                    self.action_paths().into_iter().next()
+                };
+                self.close_menu();
+                if let Some(path) = target {
+                    self.open_dir_in_new_tab(path, false);
+                }
+                FilePickerAction::None
             }
             FilePickerMenuAction::AddBookmark => {
                 let path = if self.context_menu_kind == FilePickerContextMenuKind::Tree {
@@ -3296,4 +3447,94 @@ mod tests {
         assert_eq!(picker.file_cursor, source_index);
     }
 
+}
+
+#[cfg(test)]
+mod tabbed_input_tests {
+    use super::*;
+    use crate::{FilePickerConfig, FilePickerSelectionMode};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+    use std::fs;
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn ctrl_w_remains_delete_word_in_picker_text_editors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.open_dir_in_new_tab(temp.path().to_path_buf(), true));
+        assert_eq!(picker.tab_count(), 2);
+        picker.begin_address_edit();
+        picker.address_input = crate::text_input::TextInputState::new("/tmp/alpha beta".to_string());
+
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            FilePickerAction::None,
+        );
+        assert_eq!(picker.tab_count(), 2, "Ctrl+W in an editor must not close a tab");
+        assert_eq!(picker.address_input.text, "/tmp/alpha ");
+    }
+
+    #[test]
+    fn alt_arrows_preserve_single_tab_history_then_switch_when_tabs_exist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: a.clone(),
+            selection_mode: FilePickerSelectionMode::Directories,
+            ..FilePickerConfig::default()
+        });
+
+        picker.navigate_to_dir_with_history(b.clone(), true);
+        assert_eq!(picker.current_dir(), b.as_path());
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(picker.current_dir(), a.as_path(), "single-tab Alt+Left remains history back");
+
+        assert!(picker.open_dir_in_new_tab(b.clone(), true));
+        assert_eq!(picker.active_tab_index(), 1);
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(picker.active_tab_index(), 0, "multi-tab Alt+Left switches tabs");
+        assert_eq!(picker.current_dir(), a.as_path());
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
+        assert_eq!(picker.active_tab_index(), 1, "Alt+] is an always-available tab alias");
+    }
+
+    #[test]
+    fn middle_click_close_is_scoped_to_tab_cells_and_drag_reorders_without_closing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: a,
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.open_dir_in_new_tab(b, false));
+        picker.hit_regions.clear();
+        picker.record_hit_region(Rect::new(0, 0, 8, 1), FilePickerHitAction::TabActivate(0));
+        picker.record_hit_region(Rect::new(8, 0, 8, 1), FilePickerHitAction::TabActivate(1));
+        picker.record_hit_region(Rect::new(0, 2, 20, 1), FilePickerHitAction::Address);
+
+        let _ = picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Middle), 2, 2), Rect::default());
+        assert_eq!(picker.tab_count(), 2, "middle-click outside the strip must remain unclaimed by tabs");
+
+        let _ = picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0), Rect::default());
+        let _ = picker.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 10, 0), Rect::default());
+        let _ = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 10, 0), Rect::default());
+        assert_eq!(picker.tab_count(), 2);
+        assert_eq!(picker.active_tab_index(), 1, "drag moves the active slot instead of treating the drop as a click");
+
+        let _ = picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Middle), 10, 0), Rect::default());
+        assert_eq!(picker.tab_count(), 1, "middle-click over a tab cell closes exactly that tab");
+    }
 }

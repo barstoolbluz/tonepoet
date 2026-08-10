@@ -73,7 +73,7 @@ pub use state::{
     ConflictPolicyPreset, CrossDeviceCutPolicy, DeleteMode, DeletePolicy, FileOperationPolicy, FilePickerAction,
     FilePickerClipboard, FilePickerClipboardMode, FilePickerConfig, FilePickerCreateKind,
     FilePickerEntry, FilePickerError, FilePickerFocus, FilePickerHitAction,
-    FilePickerMenuAction, FilePickerSelectionMode, FilePickerSortKey, FilePickerState,
+    FilePickerMenuAction, FilePickerSelectionMode, FilePickerSortKey, FilePickerState, FilePickerTabInfo,
     duplicate_files_in_place, execute_exact_paste_plan, plan_filesystem_paste_for_dispatch,
     execute_exact_paste_plan_with_proofs,
     execute_exact_paste_plan_with_proofs_and_expected_sources,
