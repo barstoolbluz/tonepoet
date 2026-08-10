@@ -301,7 +301,7 @@ fn hint_groups_for(
             ];
             if browse_tab_count > 1 {
                 hints.extend([
-                    h("+/^7", "switch", theme.blue, 1),
+                    h("⇧^+/-", "switch", theme.blue, 1),
                     h("^T", "new", theme.green, 2),
                     h("^W", "close", theme.destructive, 2),
                 ]);
@@ -405,11 +405,11 @@ mod tests {
             crate::tui::theme::default_theme_slug(),
         );
         let one = hint_groups_for(AppScreen::Browse, 1, theme);
-        assert!(!one.iter().flatten().any(|hint| hint.key == "+/^7"));
+        assert!(!one.iter().flatten().any(|hint| hint.key == "⇧^+/-"));
 
         let many = hint_groups_for(AppScreen::Browse, 2, theme);
         let keys: Vec<_> = many.iter().flatten().map(|hint| hint.key).collect();
-        assert!(keys.contains(&"+/^7"));
+        assert!(keys.contains(&"⇧^+/-"));
         assert!(keys.contains(&"^T"));
         assert!(keys.contains(&"^W"));
     }
