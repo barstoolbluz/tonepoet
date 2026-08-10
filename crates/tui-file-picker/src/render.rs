@@ -329,7 +329,10 @@ impl FilePickerState {
                 break;
             }
             let cell = Rect::new(x, area.y, width, 1);
-            let marker = if info.active { "▐" } else { " " };
+            // The active tab is shown by its highlighted style; a leading marker
+            // glyph would be a redundant, confusing vertical bar. Keep a single
+            // leading pad space for both states so cell widths are stable.
+            let marker = " ";
             let selected = if info.has_selection { "•" } else { "" };
             let close = if width >= 6 { "[×]" } else { "" };
             let close_width = if width >= 6 { 3u16 } else { 0 };

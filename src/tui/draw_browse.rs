@@ -248,7 +248,10 @@ fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
         let width = cell_w.min(area.x.saturating_add(tabs_w).saturating_sub(x));
         if width == 0 { break; }
         let cell = Rect::new(x, area.y, width, 1);
-        let active_mark = if info.active { "▐" } else { " " };
+        // The active tab is shown by its highlighted background/bold; a leading
+        // marker glyph would be a redundant, confusing vertical bar. Keep a
+        // single leading pad space for both states so cell widths are stable.
+        let active_mark = " ";
         let loading = if info.loading { "◐" } else { "" };
         let selected = if info.has_selection { "•" } else { "" };
         let close = if width >= 6 { "[×]" } else { "" };
@@ -290,8 +293,12 @@ fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
 
     if controls_w > 0 {
         let mut cx = area.x.saturating_add(tabs_w);
-        let separator_style = Style::default().fg(theme.border_dim).bg(theme.surface);
-        let button_style = Style::default().fg(theme.text_bright).bg(theme.surface);
+        // Buttons use the same high-contrast style as the file picker's tab
+        // buttons (dark text on cyan) so they read unmistakably as buttons —
+        // theme.surface was nearly the app background. Separators sit on the
+        // plain background so each button reads as a distinct chip.
+        let separator_style = Style::default().fg(theme.border_dim);
+        let button_style = Style::default().fg(theme.bg).bg(theme.cyan);
 
         let leading_separator = Rect::new(cx, area.y, 1.min(area.right().saturating_sub(cx)), 1);
         if leading_separator.width > 0 {
