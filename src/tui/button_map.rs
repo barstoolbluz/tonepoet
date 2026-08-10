@@ -237,10 +237,13 @@ pub enum TuiButton {
     CuePreviewEditCancel,
 
     // Browse screen
+    /// Catch-all ownership region for the one-line Browse directory-tab strip.
+    /// Specific tab/control hit regions are recorded after this and therefore
+    /// win reverse hit-testing; this claims only otherwise-empty strip space.
+    BrowseDirTabStrip,
     BrowseDirTab(usize),
     BrowseDirTabClose(usize),
     BrowseDirTabNew,
-    BrowseDirTabDuplicate,
     BrowseDirTabReopenClosed,
     BrowseEntry(usize),
     /// Browse row selection gutter (checkbox column). Click toggles mark without moving cursor.
@@ -600,10 +603,10 @@ impl TuiButton {
             | Self::RetryFailed
             | Self::QueueItem(_)
             | Self::QueueItemExpand(_) => Some(AppScreen::Queue),
-            Self::BrowseDirTab(_)
+            Self::BrowseDirTabStrip
+            | Self::BrowseDirTab(_)
             | Self::BrowseDirTabClose(_)
             | Self::BrowseDirTabNew
-            | Self::BrowseDirTabDuplicate
             | Self::BrowseDirTabReopenClosed
             | Self::BrowseEntry(_)
             | Self::BrowseEntryGutter(_)

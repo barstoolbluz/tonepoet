@@ -115,6 +115,12 @@ pub enum ContextAction {
     /// Open a directory in a new adjacent background Browse tab. The explicit
     /// path binds the action to the context-menu target.
     OpenEntryInNewTab(PathBuf),
+    /// Tab-strip actions carry their clicked tab index explicitly so the menu
+    /// cannot be retargeted by a later focus change while it is open.
+    BrowseTabNew,
+    BrowseTabDuplicate(usize),
+    BrowseTabClose(usize),
+    BrowseTabReopenClosed,
     /// Toggle the current entry's selection.
     Select,
     /// Select all non-ParentDir entries.
@@ -394,6 +400,28 @@ fn item_enabled(label: &str, action: ContextAction, enabled: bool) -> ContextMen
 
 fn separator() -> ContextMenuEntry {
     ContextMenuEntry::Separator
+}
+
+/// Build the Browse directory-tab strip context menu. `target` is the tab cell
+/// under the pointer; empty strip space intentionally omits tab-scoped actions.
+pub fn build_browse_tab_menu(
+    target: Option<usize>,
+    can_reopen: bool,
+) -> Vec<ContextMenuEntry> {
+    let mut items = vec![item("New Tab", ContextAction::BrowseTabNew)];
+    if let Some(index) = target {
+        items.push(item(
+            "Duplicate",
+            ContextAction::BrowseTabDuplicate(index),
+        ));
+        items.push(item("Close", ContextAction::BrowseTabClose(index)));
+    }
+    items.push(item_enabled(
+        "Reopen Closed Tab",
+        ContextAction::BrowseTabReopenClosed,
+        can_reopen,
+    ));
+    items
 }
 
 /// Build the disc stream-conversion submenu from the probed disc model.
@@ -2625,6 +2653,26 @@ pub fn execute_context_action(
                     Ok(()) => app.set_status(format!("Opened {} in a background tab", path.display())),
                     Err(err) => app.set_status(format!("Open in New Tab: {err}")),
                 }
+            }
+        }
+        ContextAction::BrowseTabNew => {
+            if app.current_screen == AppScreen::Browse {
+                super::keybindings::request_new_browse_tab(app, tx);
+            }
+        }
+        ContextAction::BrowseTabDuplicate(index) => {
+            if app.current_screen == AppScreen::Browse {
+                super::keybindings::request_duplicate_browse_tab_at(app, index, tx);
+            }
+        }
+        ContextAction::BrowseTabClose(index) => {
+            if app.current_screen == AppScreen::Browse {
+                super::keybindings::request_close_browse_tab(app, index, tx);
+            }
+        }
+        ContextAction::BrowseTabReopenClosed => {
+            if app.current_screen == AppScreen::Browse {
+                super::keybindings::request_reopen_browse_tab(app, tx);
             }
         }
         ContextAction::NewFile => {

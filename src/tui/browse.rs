@@ -3703,6 +3703,19 @@ impl BrowseState {
         } else { false }
     }
 
+    /// Duplicate a specific tab by index. The target is resolved before the
+    /// active-only clone path runs, so callers (notably context menus) cannot
+    /// accidentally duplicate whichever tab happens to be focused later.
+    pub fn duplicate_tab_at(&mut self, index: usize) -> bool {
+        if index >= self.tab_count() {
+            return false;
+        }
+        if index != self.active_tab_index() && !self.switch_to_tab_internal(index) {
+            return false;
+        }
+        self.duplicate_tab()
+    }
+
     pub(crate) fn active_archive_restore_descriptor(&self) -> Option<BrowseArchiveRestoreDescriptor> {
         let archive = self.archive.as_ref()?;
         Some(BrowseArchiveRestoreDescriptor {
@@ -3848,6 +3861,12 @@ impl BrowseState {
 
     pub fn finish_tab_drag(&mut self) -> Option<(usize, bool)> {
         self.tabs.as_mut()?.drag.take().map(|drag| (drag.index, drag.reordered))
+    }
+
+    pub fn cancel_tab_drag(&mut self) {
+        if let Some(tabs) = self.tabs.as_mut() {
+            tabs.drag = None;
+        }
     }
 
     pub fn tab_drag_active(&self) -> bool {

@@ -253,18 +253,50 @@ impl FilePickerState {
             return;
         }
 
-        // Reserve controls first so the active tab and the new-tab affordance are
-        // always reachable even when the strip overflows.
-        let reopen_width = if self.has_closed_tabs() { 4u16 } else { 0 };
-        let duplicate_width = 4u16;
-        let new_width = 4u16;
-        let control_width = reopen_width + duplicate_width + new_width;
+        // Claim the full row before recording specific controls so empty strip
+        // space remains owned by the tab strip rather than leaking to the file
+        // pane behind it. Reverse hit-testing still prefers the later regions.
+        self.record_hit_region(area, FilePickerHitAction::TabStrip);
+
+        // Reserve action width first. Prefer labelled controls, drop Reopen
+        // first under pressure (it remains guaranteed in the context menu),
+        // then compact New Tab to '+' only when necessary.
+        let min_cell = 7usize;
+        let min_tabs_width = min_cell as u16;
+        let separator_width = 1u16;
+        let full_reopen_width = 8u16; // " Reopen "
+        let full_new_width = 9u16; // " New Tab "
+        let compact_new_width = 3u16; // " + "
+        let full_new = area.width
+            >= min_tabs_width.saturating_add(separator_width + full_new_width);
+        let new_width = if full_new {
+            full_new_width
+        } else if area.width >= min_tabs_width.saturating_add(compact_new_width) {
+            compact_new_width
+        } else {
+            0
+        };
+        let show_reopen = self.has_closed_tabs()
+            && full_new
+            && area.width
+                >= min_tabs_width.saturating_add(
+                    separator_width
+                        + full_reopen_width
+                        + separator_width
+                        + full_new_width,
+                );
+        let control_width = if new_width == 0 {
+            0
+        } else if show_reopen {
+            separator_width + full_reopen_width + separator_width + new_width
+        } else {
+            separator_width + new_width
+        };
         let tabs_width = area.width.saturating_sub(control_width);
         if tabs_width == 0 {
             return;
         }
 
-        let min_cell = 7usize;
         let max_cell = 24usize;
         let capacity = ((tabs_width as usize) / min_cell).max(1);
         let visible_count = tabs.len().min(capacity);
@@ -299,7 +331,7 @@ impl FilePickerState {
             let cell = Rect::new(x, area.y, width, 1);
             let marker = if info.active { "▐" } else { " " };
             let selected = if info.has_selection { "•" } else { "" };
-            let close = if width >= 5 { " ×" } else { "" };
+            let close = if width >= 6 { "[×]" } else { "" };
             let reserved = marker.chars().count() + selected.chars().count() + close.chars().count() + 1;
             let label_width = (width as usize).saturating_sub(reserved).max(1);
             let label = middle_truncate(&info.label, label_width);
@@ -310,7 +342,7 @@ impl FilePickerState {
             let style = if info.active { self.theme.toolbar_active } else { self.theme.toolbar };
             frame.render_widget(Paragraph::new(text).style(style), cell);
 
-            let close_width = if width >= 5 { 2 } else { 0 };
+            let close_width = if width >= 6 { 3 } else { 0 };
             let body_width = width.saturating_sub(close_width);
             if body_width > 0 {
                 self.record_hit_region(
@@ -335,23 +367,57 @@ impl FilePickerState {
             frame.render_widget(Paragraph::new(fit_text_left(&text, width as usize)).style(self.theme.text_dim), r);
         }
 
-        let mut control_x = area.x.saturating_add(tabs_width);
-        if self.has_closed_tabs() {
-            let r = Rect::new(control_x, area.y, reopen_width.min(area.right().saturating_sub(control_x)), 1);
-            frame.render_widget(Paragraph::new(" ↶ ").style(self.theme.button), r);
-            self.record_hit_region(r, FilePickerHitAction::TabReopenClosed);
-            control_x = control_x.saturating_add(r.width);
-        }
-        let duplicate = Rect::new(control_x, area.y, duplicate_width.min(area.right().saturating_sub(control_x)), 1);
-        if duplicate.width > 0 {
-            frame.render_widget(Paragraph::new(" ⧉ ").style(self.theme.button), duplicate);
-            self.record_hit_region(duplicate, FilePickerHitAction::TabDuplicate);
-            control_x = control_x.saturating_add(duplicate.width);
-        }
-        let new_tab = Rect::new(control_x, area.y, new_width.min(area.right().saturating_sub(control_x)), 1);
-        if new_tab.width > 0 {
-            frame.render_widget(Paragraph::new(" + ").style(self.theme.button), new_tab);
-            self.record_hit_region(new_tab, FilePickerHitAction::TabNew);
+        if control_width > 0 {
+            let mut control_x = area.x.saturating_add(tabs_width);
+            let leading_separator = Rect::new(
+                control_x,
+                area.y,
+                1.min(area.right().saturating_sub(control_x)),
+                1,
+            );
+            if leading_separator.width > 0 {
+                frame.render_widget(
+                    Paragraph::new("│").style(self.theme.text_dim),
+                    leading_separator,
+                );
+                control_x = control_x.saturating_add(leading_separator.width);
+            }
+
+            if show_reopen {
+                let reopen = Rect::new(
+                    control_x,
+                    area.y,
+                    full_reopen_width.min(area.right().saturating_sub(control_x)),
+                    1,
+                );
+                if reopen.width == full_reopen_width {
+                    frame.render_widget(Paragraph::new(" Reopen ").style(self.theme.button), reopen);
+                    self.record_hit_region(reopen, FilePickerHitAction::TabReopenClosed);
+                    control_x = control_x.saturating_add(reopen.width);
+                }
+                let separator = Rect::new(
+                    control_x,
+                    area.y,
+                    1.min(area.right().saturating_sub(control_x)),
+                    1,
+                );
+                if separator.width > 0 {
+                    frame.render_widget(Paragraph::new("│").style(self.theme.text_dim), separator);
+                    control_x = control_x.saturating_add(separator.width);
+                }
+            }
+
+            let new_tab = Rect::new(
+                control_x,
+                area.y,
+                new_width.min(area.right().saturating_sub(control_x)),
+                1,
+            );
+            if new_tab.width == new_width {
+                let label = if full_new { " New Tab " } else { " + " };
+                frame.render_widget(Paragraph::new(label).style(self.theme.button), new_tab);
+                self.record_hit_region(new_tab, FilePickerHitAction::TabNew);
+            }
         }
     }
 
@@ -1241,6 +1307,10 @@ impl FilePickerState {
         let menu_y = anchor.y.saturating_add(1).min(max_y).max(bounds.y);
         let menu_area = Rect::new(menu_x, menu_y, menu_width, menu_height);
         frame.render_widget(Clear, menu_area);
+        self.hit_regions.push(HitRegion {
+            rect: menu_area,
+            action: FilePickerHitAction::MenuSurface,
+        });
         let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
         let inner = block.inner(menu_area);
         frame.render_widget(block, menu_area);
@@ -1318,6 +1388,10 @@ impl FilePickerState {
             .min(bounds.y.saturating_add(bounds.height).saturating_sub(submenu_height));
         let submenu_area = Rect::new(submenu_x, submenu_y, submenu_width, submenu_height);
         frame.render_widget(Clear, submenu_area);
+        self.hit_regions.push(HitRegion {
+            rect: submenu_area,
+            action: FilePickerHitAction::MenuSurface,
+        });
         let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
         let inner = block.inner(submenu_area);
         frame.render_widget(block, submenu_area);
@@ -1385,6 +1459,10 @@ impl FilePickerState {
             .min(bounds.y.saturating_add(bounds.height).saturating_sub(nested_height));
         let nested_area = Rect::new(nested_x, nested_y, nested_width, nested_height);
         frame.render_widget(Clear, nested_area);
+        self.hit_regions.push(HitRegion {
+            rect: nested_area,
+            action: FilePickerHitAction::MenuSurface,
+        });
         let block = Block::default().borders(Borders::ALL).border_style(self.theme.border_dim);
         let inner = block.inner(nested_area);
         frame.render_widget(block, nested_area);
@@ -2359,7 +2437,9 @@ mod tests {
         assert!(
             !picker.hit_regions().iter().any(|hit| matches!(
                 hit.action,
-                FilePickerHitAction::TabActivate(_) | FilePickerHitAction::TabNew
+                FilePickerHitAction::TabStrip
+                    | FilePickerHitAction::TabActivate(_)
+                    | FilePickerHitAction::TabNew
             )),
             "a single tab shows no tab-strip controls"
         );
@@ -2383,6 +2463,21 @@ mod tests {
                 .any(|hit| matches!(hit.action, FilePickerHitAction::TabActivate(_))),
             "two tabs show the strip controls"
         );
+        assert!(picker
+            .hit_regions()
+            .iter()
+            .any(|hit| matches!(hit.action, FilePickerHitAction::TabStrip)));
+        assert!(picker
+            .hit_regions()
+            .iter()
+            .filter(|hit| matches!(hit.action, FilePickerHitAction::TabClose(_)))
+            .all(|hit| hit.rect.width == 3), "drawn [×] and close hit region must match");
+        let strip_row = (0..area.width).fold(String::new(), |mut row, x| {
+            row.push_str(terminal.backend().buffer().get(x, 2).symbol());
+            row
+        });
+        assert!(strip_row.contains("New Tab"), "wide strips use a labelled New Tab control");
+        assert!(!strip_row.contains('⧉'), "standalone Duplicate control is removed");
     }
 
     #[test]
@@ -2602,6 +2697,72 @@ mod tests {
 
         assert_eq!(menu_new.rect.x, file_ops.x.saturating_add(1));
         assert_eq!(menu_new.rect.y, file_ops.y.saturating_add(2));
+    }
+
+    #[test]
+    fn disabled_context_menu_rows_are_owned_by_the_inert_menu_surface() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.context_menu_kind = FilePickerContextMenuKind::TabStrip;
+        picker.context_menu_tab_target = None;
+        picker.context_menu_anchor = Some((20, 3));
+        picker.previous_focus = FilePickerFocus::Files;
+        picker.menu_open = true;
+        picker.focus = FilePickerFocus::Menu;
+        assert!(!picker.is_menu_action_enabled(FilePickerMenuAction::TabReopenClosed));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| picker.render(frame, Rect::new(0, 0, 96, 24)))
+            .expect("draw");
+
+        let surface_index = picker
+            .hit_regions()
+            .iter()
+            .position(|hit| hit.action == FilePickerHitAction::MenuSurface)
+            .expect("menu surface hit region");
+        let new_tab_index = picker
+            .hit_regions()
+            .iter()
+            .position(|hit| {
+                hit.action == FilePickerHitAction::Menu(FilePickerMenuAction::TabNew)
+            })
+            .expect("enabled New Tab hit region");
+        assert!(
+            surface_index < new_tab_index,
+            "surface must be recorded before enabled items so reverse hit-testing gives items priority",
+        );
+        assert!(
+            !picker.hit_regions().iter().any(|hit| {
+                hit.action
+                    == FilePickerHitAction::Menu(FilePickerMenuAction::TabReopenClosed)
+            }),
+            "disabled Reopen Closed Tab has no actionable hit region",
+        );
+
+        let surface = picker.hit_regions()[surface_index].rect;
+        let reopen_x = surface.x.saturating_add(1);
+        let reopen_y = surface.y.saturating_add(2);
+        let top_hit = picker
+            .hit_regions()
+            .iter()
+            .rev()
+            .find(|hit| {
+                reopen_x >= hit.rect.x
+                    && reopen_x < hit.rect.x.saturating_add(hit.rect.width)
+                    && reopen_y >= hit.rect.y
+                    && reopen_y < hit.rect.y.saturating_add(hit.rect.height)
+            })
+            .expect("disabled Reopen row is owned by a hit region");
+        assert_eq!(
+            top_hit.action,
+            FilePickerHitAction::MenuSurface,
+            "disabled Reopen resolves to the inert surface, not an underlying picker hit",
+        );
     }
 
     #[test]

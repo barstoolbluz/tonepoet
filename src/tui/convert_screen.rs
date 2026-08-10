@@ -129,6 +129,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
         f,
         chunks[11],
         app.current_screen,
+        app.browse.tab_count(),
         &mut app.button_map,
         status_msg,
         file_task_footer,

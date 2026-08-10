@@ -171,6 +171,10 @@ pub enum ToolbarAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePickerMenuAction {
+    TabNew,
+    TabDuplicate(usize),
+    TabClose(usize),
+    TabReopenClosed,
     NewFile,
     NewFolder,
     Cut,
@@ -207,6 +211,7 @@ pub enum FilePickerMenuAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePickerContextMenuKind {
     Toolbar,
+    TabStrip,
     Address,
     NameEditor,
     SaveNameEditor,
@@ -245,10 +250,10 @@ pub(crate) enum FilePickerSubmenuEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilePickerHitAction {
     Toolbar(ToolbarAction),
+    TabStrip,
     TabActivate(usize),
     TabClose(usize),
     TabNew,
-    TabDuplicate,
     TabReopenClosed,
     TitleToggleMaximize,
     Address,
@@ -269,6 +274,7 @@ pub enum FilePickerHitAction {
     BookmarkDelete,
     BookmarkClose,
     ConflictPolicy(ConflictPolicyPreset),
+    MenuSurface,
     Menu(FilePickerMenuAction),
     MenuNew,
     MenuSelection,
@@ -1105,6 +1111,7 @@ pub struct FilePickerState {
     pub(crate) case_submenu_cursor: usize,
     pub(crate) context_menu_kind: FilePickerContextMenuKind,
     pub(crate) context_menu_target: Option<PathBuf>,
+    pub(crate) context_menu_tab_target: Option<usize>,
     pub(crate) context_menu_anchor: Option<(u16, u16)>,
     pub(crate) selected: Option<PathBuf>,
     pub(crate) multi_selected: Vec<PathBuf>,
@@ -1212,6 +1219,7 @@ impl FilePickerState {
             case_submenu_cursor: 0,
             context_menu_kind: FilePickerContextMenuKind::Toolbar,
             context_menu_target: None,
+            context_menu_tab_target: None,
             context_menu_anchor: None,
             selected: None,
             multi_selected: Vec::new(),
@@ -1465,6 +1473,7 @@ impl FilePickerState {
         cloned.submenu_open = false;
         cloned.case_submenu_open = false;
         cloned.context_menu_target = None;
+        cloned.context_menu_tab_target = None;
         cloned.context_menu_anchor = None;
         cloned.properties_open = false;
         cloned.pending_delete.clear();
@@ -1547,6 +1556,16 @@ impl FilePickerState {
         tabs.slots.insert(insert_at, FilePickerTabSlot { id, state: Some(detached) });
         self.tabs = Some(tabs);
         self.switch_to_tab_internal(insert_at)
+    }
+
+    pub fn duplicate_tab_at(&mut self, index: usize) -> bool {
+        if self.tab_switch_blocked_by_modal() || index >= self.tab_count() {
+            return false;
+        }
+        if index != self.active_tab_index() && !self.switch_to_tab_internal(index) {
+            return false;
+        }
+        self.duplicate_tab()
     }
 
     pub fn close_tab(&mut self, index: usize) -> bool {
@@ -1685,6 +1704,12 @@ impl FilePickerState {
 
     pub(crate) fn finish_tab_drag(&mut self) -> Option<(usize, bool)> {
         self.tabs.as_mut().and_then(|tabs| tabs.drag.take()).map(|drag| (drag.index, drag.reordered))
+    }
+
+    pub(crate) fn cancel_tab_drag(&mut self) {
+        if let Some(tabs) = self.tabs.as_mut() {
+            tabs.drag = None;
+        }
     }
 
     pub(crate) fn tab_close_key_available(&self) -> bool {
@@ -4222,6 +4247,18 @@ impl FilePickerState {
         use FilePickerMenuAction as Action;
         use FilePickerMenuEntry as Entry;
         match self.context_menu_kind {
+            Kind::TabStrip => {
+                let mut entries = vec![("New Tab", Entry::Action(Action::TabNew))];
+                if let Some(index) = self.context_menu_tab_target {
+                    entries.push(("Duplicate", Entry::Action(Action::TabDuplicate(index))));
+                    entries.push(("Close", Entry::Action(Action::TabClose(index))));
+                }
+                entries.push((
+                    "Reopen Closed Tab",
+                    Entry::Action(Action::TabReopenClosed),
+                ));
+                entries
+            }
             Kind::Toolbar => vec![
                 ("New      ▸", Entry::NewSubmenu),
                 ("Sort     ▸", Entry::SortSubmenu),
@@ -4323,6 +4360,10 @@ impl FilePickerState {
         let action_paths = self.action_paths();
         let single = action_paths.len() == 1;
         match action {
+            FilePickerMenuAction::TabNew => true,
+            FilePickerMenuAction::TabDuplicate(index) => index < self.tab_count(),
+            FilePickerMenuAction::TabClose(index) => self.tab_count() > 1 && index < self.tab_count(),
+            FilePickerMenuAction::TabReopenClosed => self.has_closed_tabs(),
             FilePickerMenuAction::NewFile => self.operation_policy.allow_new_file,
             FilePickerMenuAction::NewFolder => self.operation_policy.allow_new_folder,
             FilePickerMenuAction::Cut => self.operation_policy.allow_cut && !action_paths.is_empty(),

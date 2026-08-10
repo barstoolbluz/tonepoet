@@ -6624,7 +6624,7 @@ fn request_reorder_browse_tab(app: &mut AppState, delta: isize, tx: &mpsc::Sende
     app.browse.reorder_active_tab(delta)
 }
 
-fn request_close_browse_tab(app: &mut AppState, index: usize, tx: &mpsc::Sender<AppMessage>) -> bool {
+pub(super) fn request_close_browse_tab(app: &mut AppState, index: usize, tx: &mpsc::Sender<AppMessage>) -> bool {
     if index >= app.browse.tab_count() {
         return false;
     }
@@ -6686,7 +6686,23 @@ fn request_duplicate_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage
     } else { false }
 }
 
-fn request_new_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
+pub(super) fn request_duplicate_browse_tab_at(
+    app: &mut AppState,
+    index: usize,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    if index >= app.browse.tab_count() || !browse_tab_action_ready(app, tx) {
+        return false;
+    }
+    if app.browse.duplicate_tab_at(index) {
+        finish_browse_tab_activation(app, tx);
+        true
+    } else {
+        false
+    }
+}
+
+pub(super) fn request_new_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
     if !browse_tab_action_ready(app, tx) { return false; }
     if app.browse.new_tab() {
         finish_browse_tab_activation(app, tx);
@@ -6694,7 +6710,7 @@ fn request_new_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> 
     } else { false }
 }
 
-fn request_reopen_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
+pub(super) fn request_reopen_browse_tab(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
     if !app.browse.has_closed_tabs() {
         app.set_status("No recently closed Browse tab");
         return false;
@@ -10544,6 +10560,38 @@ fn browse_context_paths_for_current_entry(app: &AppState) -> Option<Vec<std::pat
 /// position, or a computed position for keyboard `m`).
 pub fn open_context_menu(app: &mut AppState, x: u16, y: u16) {
     open_context_menu_with_tx(app, x, y, None);
+}
+
+fn open_browse_tab_context_menu(
+    app: &mut AppState,
+    x: u16,
+    y: u16,
+    target: Option<usize>,
+) {
+    let entries = super::context_menu::build_browse_tab_menu(
+        target.filter(|index| *index < app.browse.tab_count()),
+        app.browse.has_closed_tabs(),
+    );
+    app.browse_context_action_paths = None;
+    app.active_overlay = ActiveOverlay::ContextMenu {
+        levels: vec![super::context_menu::MenuLevel::new(entries)],
+        origin: (x, y),
+        anchor_bottom: false,
+    };
+}
+
+fn browse_tab_context_target(button: Option<TuiButton>) -> Option<Option<usize>> {
+    match button {
+        Some(TuiButton::BrowseDirTab(index)) | Some(TuiButton::BrowseDirTabClose(index)) => {
+            Some(Some(index))
+        }
+        Some(
+            TuiButton::BrowseDirTabStrip
+            | TuiButton::BrowseDirTabNew
+            | TuiButton::BrowseDirTabReopenClosed,
+        ) => Some(None),
+        _ => None,
+    }
 }
 
 pub(super) fn open_context_menu_with_tx(
@@ -52446,6 +52494,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     {
         let tab_target = app.button_map.find_button_at(mouse.column, mouse.row);
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                let target = browse_tab_context_target(tab_target);
+                if let Some(target) = target {
+                    // A right-click is a menu gesture, never a drag continuation.
+                    app.browse.cancel_tab_drag();
+                    open_browse_tab_context_menu(app, mouse.column, mouse.row, target);
+                    return;
+                }
+            }
             MouseEventKind::Down(MouseButton::Middle) => {
                 let index = match tab_target {
                     Some(TuiButton::BrowseDirTab(index)) | Some(TuiButton::BrowseDirTabClose(index)) => Some(index),
@@ -52457,11 +52514,30 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(TuiButton::BrowseDirTab(index)) = tab_target {
-                    if index < app.browse.tab_count() && browse_tab_action_ready(app, tx) {
-                        app.browse.begin_tab_drag(index, mouse.column);
+                match tab_target {
+                    Some(TuiButton::BrowseDirTab(index)) => {
+                        if index < app.browse.tab_count() && browse_tab_action_ready(app, tx) {
+                            app.browse.begin_tab_drag(index, mouse.column);
+                        }
+                        return;
                     }
-                    return;
+                    Some(TuiButton::BrowseDirTabClose(index)) => {
+                        request_close_browse_tab(app, index, tx);
+                        return;
+                    }
+                    Some(TuiButton::BrowseDirTabNew) => {
+                        request_new_browse_tab(app, tx);
+                        return;
+                    }
+                    Some(TuiButton::BrowseDirTabReopenClosed) => {
+                        request_reopen_browse_tab(app, tx);
+                        return;
+                    }
+                    Some(TuiButton::BrowseDirTabStrip) => {
+                        // Empty tab-row space is owned by the strip and inert.
+                        return;
+                    }
+                    _ => {}
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if app.browse.tab_drag_active() => {
@@ -52693,6 +52769,20 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     close_context_menu_restoring_parked(app);
                     handle_metadata_editor_mouse(app, mouse, tx);
                     return;
+                }
+
+                // Re-right-clicking the tab strip while a screen-owned context
+                // menu is open must rebuild the tab menu, not fall through to
+                // the generic Browse entry/empty menu after dismissal.
+                if app.current_screen == AppScreen::Browse {
+                    if let Some(target) = browse_tab_context_target(
+                        app.button_map.find_button_at(mouse.column, mouse.row),
+                    ) {
+                        close_context_menu_restoring_parked(app);
+                        app.browse.cancel_tab_drag();
+                        open_browse_tab_context_menu(app, mouse.column, mouse.row, target);
+                        return;
+                    }
                 }
 
                 // Other origins preserve the existing desktop behavior: close
@@ -53012,12 +53102,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             TuiButton::BrowseDirTabNew => {
                 request_new_browse_tab(app, tx);
             }
-            TuiButton::BrowseDirTabDuplicate => {
-                request_duplicate_browse_tab(app, tx);
-            }
             TuiButton::BrowseDirTabReopenClosed => {
                 request_reopen_browse_tab(app, tx);
             }
+            TuiButton::BrowseDirTabStrip => {}
 
             // ── Config screen: appearance pane ──
             TuiButton::ConfigThemePrev => {
@@ -81126,6 +81214,31 @@ mod file_transfer_queue_state_tests {
 mod browse_tab_input_tests {
     use super::*;
 
+    fn root_menu_items(app: &AppState) -> Vec<crate::tui::context_menu::ContextMenuItem> {
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("expected context menu");
+        };
+        levels
+            .first()
+            .expect("root menu")
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Item(item) => Some(item.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tab_mouse(kind: MouseEventKind, column: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn archive_entry(path: &str, is_dir: bool) -> crate::tui::archive_listing::ArchiveEntry {
         crate::tui::archive_listing::ArchiveEntry {
             path: path.to_string(),
@@ -81177,6 +81290,189 @@ mod browse_tab_input_tests {
                 });
         }
         staging
+    }
+
+    #[test]
+    fn browse_tab_strip_right_click_builds_tab_scoped_or_empty_space_menu() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a.clone();
+        assert!(app.browse.open_dir_in_new_tab(b.clone(), false));
+        assert_eq!(app.browse.active_tab_index(), 0);
+
+        app.button_map.record_button(
+            TuiButton::BrowseDirTabStrip,
+            ratatui::layout::Rect::new(0, 3, 40, 1),
+        );
+        app.button_map.record_button(
+            TuiButton::BrowseDirTab(1),
+            ratatui::layout::Rect::new(10, 3, 8, 1),
+        );
+        app.browse.begin_tab_drag(0, 1);
+        assert!(app.browse.tab_drag_active());
+
+        handle_mouse(
+            &mut app,
+            tab_mouse(MouseEventKind::Down(MouseButton::Right), 12),
+            &tx,
+        );
+        assert!(!app.browse.tab_drag_active(), "right-click cancels an in-flight tab drag");
+        let items = root_menu_items(&app);
+        assert_eq!(
+            items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
+            vec!["New Tab", "Duplicate", "Close", "Reopen Closed Tab"],
+        );
+        assert!(!items[3].enabled, "reopen is disabled without a closed tab");
+        assert!(matches!(
+            items[1].action,
+            crate::tui::context_menu::ContextAction::BrowseTabDuplicate(1)
+        ));
+        assert!(matches!(
+            items[2].action,
+            crate::tui::context_menu::ContextAction::BrowseTabClose(1)
+        ));
+
+        // Re-right-clicking elsewhere on the strip replaces the existing menu
+        // in-place; it must not dismiss and then fall through to Browse's
+        // generic entry/empty menu.
+        handle_mouse(
+            &mut app,
+            tab_mouse(MouseEventKind::Down(MouseButton::Right), 30),
+            &tx,
+        );
+        let items = root_menu_items(&app);
+        assert_eq!(
+            items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
+            vec!["New Tab", "Reopen Closed Tab"],
+            "empty strip space must never expose untargeted Duplicate/Close",
+        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
+    #[test]
+    fn browse_tab_context_actions_bind_to_non_active_target_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let (tx, _rx) = mpsc::channel(16);
+
+        let mut duplicate_app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        duplicate_app.current_screen = AppScreen::Browse;
+        duplicate_app.browse.current_dir = a.clone();
+        assert!(duplicate_app.browse.open_dir_in_new_tab(b.clone(), false));
+        assert_eq!(duplicate_app.browse.current_dir, a);
+        crate::tui::context_menu::execute_context_action(
+            &mut duplicate_app,
+            crate::tui::context_menu::ContextAction::BrowseTabDuplicate(1),
+            &tx,
+            false,
+        );
+        assert_eq!(duplicate_app.browse.tab_count(), 3);
+        assert_eq!(
+            duplicate_app.browse.current_dir, b,
+            "duplicate must clone the right-clicked non-active tab, not the active tab",
+        );
+
+        let mut close_app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        close_app.current_screen = AppScreen::Browse;
+        close_app.browse.current_dir = a.clone();
+        assert!(close_app.browse.open_dir_in_new_tab(b.clone(), false));
+        crate::tui::context_menu::execute_context_action(
+            &mut close_app,
+            crate::tui::context_menu::ContextAction::BrowseTabClose(1),
+            &tx,
+            false,
+        );
+        assert_eq!(close_app.browse.tab_count(), 1);
+        assert_eq!(close_app.browse.current_dir, a);
+        assert!(close_app.browse.has_closed_tabs());
+
+        close_app.button_map.record_button(
+            TuiButton::BrowseDirTabStrip,
+            ratatui::layout::Rect::new(0, 3, 40, 1),
+        );
+        handle_mouse(
+            &mut close_app,
+            tab_mouse(MouseEventKind::Down(MouseButton::Right), 30),
+            &tx,
+        );
+        let items = root_menu_items(&close_app);
+        assert!(items
+            .iter()
+            .find(|item| item.label == "Reopen Closed Tab")
+            .is_some_and(|item| item.enabled));
+    }
+
+    #[test]
+    fn browse_tab_strip_left_close_body_middle_close_and_empty_space_are_owned() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = a;
+        assert!(app.browse.open_dir_in_new_tab(b, false));
+        app.button_map.record_button(
+            TuiButton::BrowseDirTabStrip,
+            ratatui::layout::Rect::new(0, 3, 40, 1),
+        );
+        app.button_map.record_button(
+            TuiButton::BrowseDirTab(1),
+            ratatui::layout::Rect::new(10, 3, 7, 1),
+        );
+        app.button_map.record_button(
+            TuiButton::BrowseDirTabClose(1),
+            ratatui::layout::Rect::new(17, 3, 3, 1),
+        );
+
+        handle_mouse(
+            &mut app,
+            tab_mouse(MouseEventKind::Down(MouseButton::Left), 12),
+            &tx,
+        );
+        handle_mouse(
+            &mut app,
+            tab_mouse(MouseEventKind::Up(MouseButton::Left), 12),
+            &tx,
+        );
+        assert_eq!(app.browse.active_tab_index(), 1, "left-click body still activates");
+
+        handle_mouse(
+            &mut app,
+            tab_mouse(MouseEventKind::Down(MouseButton::Left), 18),
+            &tx,
+        );
+        assert_eq!(app.browse.tab_count(), 1, "left-click [×] deterministically closes");
+
+        assert!(app.browse.reopen_closed_tab_with_archive_restore().is_some());
+        assert_eq!(app.browse.tab_count(), 2);
+        handle_mouse(
+            &mut app,
+            tab_mouse(MouseEventKind::Down(MouseButton::Middle), 12),
+            &tx,
+        );
+        assert_eq!(app.browse.tab_count(), 1, "middle-click close remains intact");
+
+        let before = app.browse.selected_index;
+        handle_mouse(
+            &mut app,
+            tab_mouse(MouseEventKind::Down(MouseButton::Left), 30),
+            &tx,
+        );
+        assert_eq!(app.browse.selected_index, before, "empty strip left-click is inert");
+        assert!(!app.browse.drag_state.active);
     }
 
     #[test]

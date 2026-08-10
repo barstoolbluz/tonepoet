@@ -180,16 +180,47 @@ fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
         return;
     }
 
-    let reopen_w = if app.browse.has_closed_tabs() { 4u16 } else { 0 };
-    let duplicate_w = 4u16;
-    let new_w = 4u16;
-    let controls_w = reopen_w + duplicate_w + new_w;
+    // Record strip ownership first. More specific tab/control regions are
+    // recorded later and win reverse hit-testing, leaving this as the target
+    // for otherwise-empty row space (not the file list behind it).
+    app.button_map.record_button(TuiButton::BrowseDirTabStrip, area);
+
+    // Reserve actions before tabs, but never at the cost of the minimum tab
+    // cell. Prefer descriptive labels; shed Reopen first, then compact New Tab
+    // to the legacy '+' affordance only under real width pressure. Reopen is
+    // always available from the strip context menu even when its button drops.
+    let min_cell = 7usize;
+    let min_tabs_w = min_cell as u16;
+    let separator_w = 1u16;
+    let full_reopen_w = 8u16; // " Reopen "
+    let full_new_w = 9u16; // " New Tab "
+    let compact_new_w = 3u16; // " + "
+    let full_new = area.width >= min_tabs_w.saturating_add(separator_w + full_new_w);
+    let new_w = if full_new {
+        full_new_w
+    } else if area.width >= min_tabs_w.saturating_add(compact_new_w) {
+        compact_new_w
+    } else {
+        0
+    };
+    let show_reopen = app.browse.has_closed_tabs()
+        && full_new
+        && area.width
+            >= min_tabs_w.saturating_add(
+                separator_w + full_reopen_w + separator_w + full_new_w,
+            );
+    let controls_w = if new_w == 0 {
+        0
+    } else if show_reopen {
+        separator_w + full_reopen_w + separator_w + new_w
+    } else {
+        separator_w + new_w
+    };
     let tabs_w = area.width.saturating_sub(controls_w);
     if tabs_w == 0 {
         return;
     }
 
-    let min_cell = 7usize;
     let max_cell = 24usize;
     let capacity = ((tabs_w as usize) / min_cell).max(1);
     let visible_count = infos.len().min(capacity);
@@ -220,7 +251,7 @@ fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
         let active_mark = if info.active { "▐" } else { " " };
         let loading = if info.loading { "◐" } else { "" };
         let selected = if info.has_selection { "•" } else { "" };
-        let close = if width >= 5 { " ×" } else { "" };
+        let close = if width >= 6 { "[×]" } else { "" };
         let reserved = active_mark.chars().count() + loading.chars().count()
             + selected.chars().count() + close.chars().count() + 1;
         let label_w = (width as usize).saturating_sub(reserved).max(1);
@@ -232,7 +263,7 @@ fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
             Style::default().fg(theme.tab_inactive)
         };
         f.render_widget(Paragraph::new(text).style(style), cell);
-        let close_w = if width >= 5 { 2 } else { 0 };
+        let close_w = if width >= 6 { 3 } else { 0 };
         let body_w = width.saturating_sub(close_w);
         if body_w > 0 {
             app.button_map.record_button(TuiButton::BrowseDirTab(info.index), Rect::new(x, area.y, body_w, 1));
@@ -251,23 +282,43 @@ fn draw_browse_tab_strip(f: &mut Frame, area: Rect, app: &mut AppState, theme: s
         }
     }
 
-    let mut cx = area.x.saturating_add(tabs_w);
-    if app.browse.has_closed_tabs() {
-        let r = Rect::new(cx, area.y, reopen_w.min(area.right().saturating_sub(cx)), 1);
-        f.render_widget(Paragraph::new(" ↶ ").style(Style::default().fg(theme.text_bright).bg(theme.surface)), r);
-        app.button_map.record_button(TuiButton::BrowseDirTabReopenClosed, r);
-        cx = cx.saturating_add(r.width);
-    }
-    let duplicate = Rect::new(cx, area.y, duplicate_w.min(area.right().saturating_sub(cx)), 1);
-    if duplicate.width > 0 {
-        f.render_widget(Paragraph::new(" ⧉ ").style(Style::default().fg(theme.text_bright).bg(theme.surface)), duplicate);
-        app.button_map.record_button(TuiButton::BrowseDirTabDuplicate, duplicate);
-        cx = cx.saturating_add(duplicate.width);
-    }
-    let add = Rect::new(cx, area.y, new_w.min(area.right().saturating_sub(cx)), 1);
-    if add.width > 0 {
-        f.render_widget(Paragraph::new(" + ").style(Style::default().fg(theme.text_bright).bg(theme.surface)), add);
-        app.button_map.record_button(TuiButton::BrowseDirTabNew, add);
+    if controls_w > 0 {
+        let mut cx = area.x.saturating_add(tabs_w);
+        let separator_style = Style::default().fg(theme.border_dim).bg(theme.surface);
+        let button_style = Style::default().fg(theme.text_bright).bg(theme.surface);
+
+        let leading_separator = Rect::new(cx, area.y, 1.min(area.right().saturating_sub(cx)), 1);
+        if leading_separator.width > 0 {
+            f.render_widget(Paragraph::new("│").style(separator_style), leading_separator);
+            cx = cx.saturating_add(leading_separator.width);
+        }
+
+        if show_reopen {
+            let reopen = Rect::new(
+                cx,
+                area.y,
+                full_reopen_w.min(area.right().saturating_sub(cx)),
+                1,
+            );
+            if reopen.width == full_reopen_w {
+                f.render_widget(Paragraph::new(" Reopen ").style(button_style), reopen);
+                app.button_map
+                    .record_button(TuiButton::BrowseDirTabReopenClosed, reopen);
+                cx = cx.saturating_add(reopen.width);
+            }
+            let separator = Rect::new(cx, area.y, 1.min(area.right().saturating_sub(cx)), 1);
+            if separator.width > 0 {
+                f.render_widget(Paragraph::new("│").style(separator_style), separator);
+                cx = cx.saturating_add(separator.width);
+            }
+        }
+
+        let add = Rect::new(cx, area.y, new_w.min(area.right().saturating_sub(cx)), 1);
+        if add.width == new_w {
+            let label = if full_new { " New Tab " } else { " + " };
+            f.render_widget(Paragraph::new(label).style(button_style), add);
+            app.button_map.record_button(TuiButton::BrowseDirTabNew, add);
+        }
     }
 }
 
@@ -384,6 +435,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         f,
         chunks[4],
         app.current_screen,
+        app.browse.tab_count(),
         &mut app.button_map,
         status_msg,
         file_task_footer,
@@ -5326,6 +5378,92 @@ fn size_str(bytes: u64) -> String {
 #[cfg(test)]
 mod path_field_render_tests {
     use super::*;
+
+    #[test]
+    fn browse_tab_strip_draws_owned_labelled_controls_with_exact_close_hits() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = a;
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+
+        // Option B is a layout invariant: one tab does not register or consume
+        // a strip row at all.
+        app.button_map.clear();
+        let single_area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(single_area.width, single_area.height);
+        let mut terminal = Terminal::new(backend).expect("single-tab terminal");
+        terminal
+            .draw(|frame| draw_browse_screen(frame, single_area, &mut app, theme))
+            .expect("draw single-tab Browse");
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::BrowseDirTabStrip)
+            .is_none(), "single-tab Browse must not allocate a tab strip");
+
+        assert!(app.browse.open_dir_in_new_tab(b, false));
+        app.button_map.clear();
+        let area = Rect::new(0, 0, 60, 1);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_browse_tab_strip(frame, area, &mut app, theme))
+            .expect("draw strip");
+
+        assert_eq!(
+            app.button_map.find_button_rect(&TuiButton::BrowseDirTabStrip),
+            Some(area),
+            "the complete row must be owned before narrower hit targets are layered on top",
+        );
+        assert_eq!(
+            app.button_map
+                .find_button_rect(&TuiButton::BrowseDirTabClose(0))
+                .expect("first close hit")
+                .width,
+            3,
+            "[×] is a three-cell drawing and must own exactly three cells",
+        );
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::BrowseDirTabNew)
+            .is_some());
+
+        let row = (0..area.width).fold(String::new(), |mut row, x| {
+            row.push_str(terminal.backend().buffer().get(x, 0).symbol());
+            row
+        });
+        assert!(row.contains("New Tab"), "wide strips label the new-tab button");
+        assert!(!row.contains('⧉'), "the standalone Duplicate button is removed");
+
+        // Width degradation must preserve a non-zero tab allocation and never
+        // register a control beyond the one-line strip.
+        app.button_map.clear();
+        let narrow = Rect::new(0, 0, 10, 1);
+        let backend = TestBackend::new(narrow.width, narrow.height);
+        let mut terminal = Terminal::new(backend).expect("narrow terminal");
+        terminal
+            .draw(|frame| draw_browse_tab_strip(frame, narrow, &mut app, theme))
+            .expect("draw narrow strip");
+        let new_rect = app
+            .button_map
+            .find_button_rect(&TuiButton::BrowseDirTabNew)
+            .expect("compact new-tab hit");
+        assert_eq!(new_rect.width, 3);
+        assert!(new_rect.right() <= narrow.right());
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::BrowseDirTab(0))
+            .is_some(), "width pressure must not zero out all tab cells");
+    }
 
     #[test]
     fn browse_scan_progress_renders_for_empty_and_populated_streams() {

@@ -132,6 +132,17 @@ impl FilePickerState {
                     self.duplicate_tab();
                     return FilePickerAction::None;
                 }
+                (KeyCode::Char('+'), KeyModifiers::NONE)
+                | (KeyCode::Char('+'), KeyModifiers::SHIFT)
+                    if self.tab_count() > 1 =>
+                {
+                    self.switch_tab_relative(1);
+                    return FilePickerAction::None;
+                }
+                (KeyCode::Char('7'), KeyModifiers::CONTROL) => {
+                    self.switch_tab_relative(-1);
+                    return FilePickerAction::None;
+                }
                 (KeyCode::Char('['), KeyModifiers::ALT) => {
                     self.switch_tab_relative(-1);
                     return FilePickerAction::None;
@@ -364,14 +375,115 @@ impl FilePickerState {
             }
         }
 
-        let tab_hit = || {
-            self.hit_regions.iter().rev().find_map(|region| {
-                point_in_rect(mouse.column, mouse.row, region.rect).then_some(region.action)
-            })
-        };
+        // Capture the topmost hit once for this mouse event. Context-menu
+        // dismissal may mutate focus/menu state, but the click must still be
+        // routed against the geometry that was visible when it happened.
+        let pointer_hit = self.hit_regions.iter().rev().find_map(|region| {
+            point_in_rect(mouse.column, mouse.row, region.rect).then_some(region.action)
+        });
+        let tab_hit = || pointer_hit;
+
+        // Context menus own mouse-down while visible. Enabled menu items keep
+        // their existing action dispatch; an inert MenuSurface owns borders and
+        // disabled rows so clicks cannot reach controls behind the popup.
+        if self.menu_open || self.submenu_open {
+            let menu_owned_hit = matches!(
+                pointer_hit,
+                Some(
+                    FilePickerHitAction::MenuSurface
+                        | FilePickerHitAction::Menu(_)
+                        | FilePickerHitAction::MenuNew
+                        | FilePickerHitAction::MenuSelection
+                        | FilePickerHitAction::MenuSort
+                        | FilePickerHitAction::MenuRename
+                        | FilePickerHitAction::MenuCase
+                        | FilePickerHitAction::SubmenuCase
+                        | FilePickerHitAction::Submenu(_)
+                        | FilePickerHitAction::NestedSubmenu(_)
+                )
+            );
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.last_click = None;
+                    self.tree_last_click = None;
+                    if pointer_hit == Some(FilePickerHitAction::MenuSurface) {
+                        return FilePickerAction::None;
+                    }
+                    if let Some(action) = pointer_hit.filter(|_| menu_owned_hit) {
+                        // Dispatch menu entries here, before text-pointer or
+                        // underlying picker handlers can observe the click.
+                        return self.apply_click_action(action, mouse.modifiers);
+                    }
+                    self.close_menu();
+                    return FilePickerAction::None;
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    if menu_owned_hit {
+                        return FilePickerAction::None;
+                    }
+                    // Restore the pane focus before the existing right-click
+                    // path opens a replacement menu. Because `pointer_hit` was
+                    // captured above, closing the old popup cannot retarget the
+                    // click or make `previous_focus` become Menu.
+                    self.close_menu();
+                }
+                MouseEventKind::Down(MouseButton::Middle) => {
+                    if !menu_owned_hit {
+                        self.close_menu();
+                    }
+                    return FilePickerAction::None;
+                }
+                _ => {}
+            }
+        }
+
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                let action = tab_hit();
+                if matches!(
+                    action,
+                    Some(
+                        FilePickerHitAction::TabStrip
+                            | FilePickerHitAction::TabActivate(_)
+                            | FilePickerHitAction::TabClose(_)
+                            | FilePickerHitAction::TabNew
+                            | FilePickerHitAction::TabReopenClosed
+                    )
+                ) {
+                    if self.menu_open || self.submenu_open {
+                        self.close_menu();
+                    }
+                    // A non-menu modal still owns the picker. Do not stack a
+                    // tab context menu over confirmations/editors that block
+                    // tab switching; an existing context menu was dismissed
+                    // above so an ordinary screen-owned re-right-click works.
+                    if self.tab_switch_blocked_by_modal() {
+                        return FilePickerAction::None;
+                    }
+                    self.cancel_tab_drag();
+                    self.last_click = None;
+                    self.tree_last_click = None;
+                    return self.open_context_menu(action, mouse.column, mouse.row);
+                }
+            }
             MouseEventKind::Down(MouseButton::Middle) => {
-                match tab_hit() {
+                let action = tab_hit();
+                if self.menu_open
+                    && matches!(
+                        action,
+                        Some(
+                            FilePickerHitAction::TabStrip
+                                | FilePickerHitAction::TabActivate(_)
+                                | FilePickerHitAction::TabClose(_)
+                                | FilePickerHitAction::TabNew
+                                | FilePickerHitAction::TabReopenClosed
+                        )
+                    )
+                {
+                    self.close_menu();
+                    return FilePickerAction::None;
+                }
+                match action {
                     Some(FilePickerHitAction::TabActivate(index))
                     | Some(FilePickerHitAction::TabClose(index)) => {
                         self.close_tab(index);
@@ -380,29 +492,46 @@ impl FilePickerState {
                     _ => {}
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) => match tab_hit() {
-                Some(FilePickerHitAction::TabActivate(index)) => {
-                    self.begin_tab_drag(index, mouse.column);
+            MouseEventKind::Down(MouseButton::Left) => {
+                let action = tab_hit();
+                if self.menu_open
+                    && matches!(
+                        action,
+                        Some(
+                            FilePickerHitAction::TabStrip
+                                | FilePickerHitAction::TabActivate(_)
+                                | FilePickerHitAction::TabClose(_)
+                                | FilePickerHitAction::TabNew
+                                | FilePickerHitAction::TabReopenClosed
+                        )
+                    )
+                {
+                    self.close_menu();
                     return FilePickerAction::None;
                 }
-                Some(FilePickerHitAction::TabClose(index)) => {
-                    self.close_tab(index);
-                    return FilePickerAction::None;
+                match action {
+                    Some(FilePickerHitAction::TabActivate(index)) => {
+                        self.begin_tab_drag(index, mouse.column);
+                        return FilePickerAction::None;
+                    }
+                    Some(FilePickerHitAction::TabClose(index)) => {
+                        self.close_tab(index);
+                        return FilePickerAction::None;
+                    }
+                    Some(FilePickerHitAction::TabNew) => {
+                        self.new_tab();
+                        return FilePickerAction::None;
+                    }
+                    Some(FilePickerHitAction::TabReopenClosed) => {
+                        self.reopen_closed_tab();
+                        return FilePickerAction::None;
+                    }
+                    Some(FilePickerHitAction::TabStrip) => {
+                        return FilePickerAction::None;
+                    }
+                    _ => {}
                 }
-                Some(FilePickerHitAction::TabNew) => {
-                    self.new_tab();
-                    return FilePickerAction::None;
-                }
-                Some(FilePickerHitAction::TabDuplicate) => {
-                    self.duplicate_tab();
-                    return FilePickerAction::None;
-                }
-                Some(FilePickerHitAction::TabReopenClosed) => {
-                    self.reopen_closed_tab();
-                    return FilePickerAction::None;
-                }
-                _ => {}
-            },
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let target = match tab_hit() {
                     Some(FilePickerHitAction::TabActivate(index))
@@ -457,10 +586,7 @@ impl FilePickerState {
                 FilePickerAction::None
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let action = self.hit_regions.iter().rev().find_map(|region| {
-                    point_in_rect(mouse.column, mouse.row, region.rect).then_some(region.action)
-                });
-                let action = match self.resolve_name_edit_before_pointer_action(action) {
+                let action = match self.resolve_name_edit_before_pointer_action(pointer_hit) {
                     Ok(action) => action,
                     Err(()) => return FilePickerAction::None,
                 };
@@ -474,15 +600,12 @@ impl FilePickerState {
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 self.last_click = None;
-                let action = self.hit_regions.iter().rev().find_map(|region| {
-                    point_in_rect(mouse.column, mouse.row, region.rect).then_some(region.action)
-                });
                 let action = if self.focus == FilePickerFocus::CreateName
-                    && action == Some(FilePickerHitAction::CreateNameEditor)
+                    && pointer_hit == Some(FilePickerHitAction::CreateNameEditor)
                 {
-                    action
+                    pointer_hit
                 } else {
-                    match self.resolve_name_edit_before_pointer_action(action) {
+                    match self.resolve_name_edit_before_pointer_action(pointer_hit) {
                         Ok(action) => action,
                         Err(()) => return FilePickerAction::None,
                     }
@@ -1177,14 +1300,11 @@ impl FilePickerState {
                 self.new_tab();
                 FilePickerAction::None
             }
-            FilePickerHitAction::TabDuplicate => {
-                self.duplicate_tab();
-                FilePickerAction::None
-            }
             FilePickerHitAction::TabReopenClosed => {
                 self.reopen_closed_tab();
                 FilePickerAction::None
             }
+            FilePickerHitAction::TabStrip => FilePickerAction::None,
             FilePickerHitAction::Toolbar(toolbar) => self.apply_toolbar_action(toolbar),
             FilePickerHitAction::TitleToggleMaximize => {
                 self.toggle_maximized();
@@ -1279,6 +1399,7 @@ impl FilePickerState {
                 self.conflict_policy = Some(policy);
                 FilePickerAction::None
             }
+            FilePickerHitAction::MenuSurface => FilePickerAction::None,
             FilePickerHitAction::MenuNew => self.open_submenu(FilePickerSubmenuKind::New),
             FilePickerHitAction::MenuSelection => {
                 self.open_submenu(FilePickerSubmenuKind::Selection)
@@ -1447,6 +1568,26 @@ impl FilePickerState {
 
     fn apply_menu_action(&mut self, action: FilePickerMenuAction) -> FilePickerAction {
         match action {
+            FilePickerMenuAction::TabNew => {
+                self.close_menu();
+                self.new_tab();
+                FilePickerAction::None
+            }
+            FilePickerMenuAction::TabDuplicate(index) => {
+                self.close_menu();
+                self.duplicate_tab_at(index);
+                FilePickerAction::None
+            }
+            FilePickerMenuAction::TabClose(index) => {
+                self.close_menu();
+                self.close_tab(index);
+                FilePickerAction::None
+            }
+            FilePickerMenuAction::TabReopenClosed => {
+                self.close_menu();
+                self.reopen_closed_tab();
+                FilePickerAction::None
+            }
             FilePickerMenuAction::NewFile | FilePickerMenuAction::NewFolder => {
                 let kind = if action == FilePickerMenuAction::NewFile {
                     FilePickerCreateKind::File
@@ -1668,6 +1809,7 @@ impl FilePickerState {
     fn open_menu(&mut self) {
         self.context_menu_kind = FilePickerContextMenuKind::Toolbar;
         self.context_menu_target = None;
+        self.context_menu_tab_target = None;
         self.context_menu_anchor = None;
         self.menu_open = true;
         self.submenu_open = false;
@@ -1685,7 +1827,19 @@ impl FilePickerState {
         column: u16,
         row: u16,
     ) -> FilePickerAction {
+        self.context_menu_target = None;
+        self.context_menu_tab_target = None;
         let kind = match action {
+            Some(FilePickerHitAction::TabActivate(index))
+            | Some(FilePickerHitAction::TabClose(index)) => {
+                self.context_menu_tab_target = (index < self.tab_count()).then_some(index);
+                FilePickerContextMenuKind::TabStrip
+            }
+            Some(
+                FilePickerHitAction::TabStrip
+                | FilePickerHitAction::TabNew
+                | FilePickerHitAction::TabReopenClosed,
+            ) => FilePickerContextMenuKind::TabStrip,
             Some(FilePickerHitAction::Address) => {
                 if self.focus != FilePickerFocus::Address {
                     self.begin_address_edit();
@@ -1750,12 +1904,14 @@ impl FilePickerState {
     pub(crate) fn close_menu(&mut self) {
         if !self.menu_open && !self.submenu_open {
             self.context_menu_anchor = None;
+            self.context_menu_tab_target = None;
             return;
         }
         self.menu_open = false;
         self.submenu_open = false;
         self.case_submenu_open = false;
         self.context_menu_anchor = None;
+        self.context_menu_tab_target = None;
         self.focus = self.previous_focus;
         self.tree_focused = self.focus == FilePickerFocus::Tree;
     }
@@ -1765,6 +1921,7 @@ impl FilePickerState {
         self.submenu_open = false;
         self.case_submenu_open = false;
         self.context_menu_anchor = None;
+        self.context_menu_tab_target = None;
     }
 
     fn type_ahead_files(&mut self, c: char) {
@@ -3506,6 +3663,260 @@ mod tabbed_input_tests {
         assert_eq!(picker.current_dir(), a.as_path());
         let _ = picker.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
         assert_eq!(picker.active_tab_index(), 1, "Alt+] is an always-available tab alias");
+    }
+
+    #[test]
+    fn plus_and_ctrl7_match_browse_tab_switching_without_stealing_single_tab_typeahead() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: a,
+            ..FilePickerConfig::default()
+        });
+
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(picker.tab_count(), 1);
+        assert_eq!(picker.type_ahead.buffer(), "+", "single-tab '+' remains type-ahead");
+
+        picker.type_ahead.clear();
+        assert!(picker.open_dir_in_new_tab(b, false));
+        assert_eq!(picker.active_tab_index(), 0);
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(picker.active_tab_index(), 1, "'+' switches to the next picker tab");
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL));
+        assert_eq!(picker.active_tab_index(), 0, "Ctrl+7 switches to the previous picker tab");
+    }
+
+    #[test]
+    fn open_tab_menu_left_click_away_closes_without_dispatching_underlying_file_hit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let other = temp.path().join("other");
+        fs::create_dir(&other).expect("other");
+        fs::write(temp.path().join("a.flac"), b"a").expect("a");
+        fs::write(temp.path().join("b.flac"), b"b").expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.open_dir_in_new_tab(other, false));
+        assert!(picker.entries.len() >= 2);
+        let target = if picker.file_cursor == 0 { 1 } else { 0 };
+        let original_cursor = picker.file_cursor;
+
+        picker.hit_regions.clear();
+        picker.record_hit_region(Rect::new(0, 0, 8, 1), FilePickerHitAction::TabActivate(1));
+        picker.record_hit_region(Rect::new(0, 5, 20, 1), FilePickerHitAction::FileRow(target));
+
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 2, 0),
+            Rect::default(),
+        );
+        assert!(picker.menu_open);
+        assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::TabStrip);
+
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 5),
+            Rect::default(),
+        );
+        assert!(!picker.menu_open, "left click-away dismisses the tab menu");
+        assert_eq!(picker.focus, FilePickerFocus::Files);
+        assert_eq!(
+            picker.file_cursor, original_cursor,
+            "dismissal must consume the click instead of selecting the file behind the menu",
+        );
+    }
+
+    #[test]
+    fn right_click_away_replaces_tab_menu_and_restores_real_pane_focus_after_escape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let other = temp.path().join("other");
+        fs::create_dir(&other).expect("other");
+        fs::write(temp.path().join("a.flac"), b"a").expect("a");
+        fs::write(temp.path().join("b.flac"), b"b").expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.open_dir_in_new_tab(other, false));
+        assert!(!picker.entries.is_empty());
+
+        picker.hit_regions.clear();
+        picker.record_hit_region(Rect::new(0, 0, 8, 1), FilePickerHitAction::TabActivate(1));
+        picker.record_hit_region(Rect::new(0, 5, 20, 1), FilePickerHitAction::FileRow(0));
+
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 2, 0),
+            Rect::default(),
+        );
+        assert_eq!(picker.focus, FilePickerFocus::Menu);
+        assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::TabStrip);
+
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 2, 5),
+            Rect::default(),
+        );
+        assert!(picker.menu_open);
+        assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::File);
+        assert_eq!(
+            picker.previous_focus,
+            FilePickerFocus::Files,
+            "replacement menu must capture the restored pane, never Menu",
+        );
+
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!picker.menu_open);
+        assert_eq!(picker.focus, FilePickerFocus::Files);
+    }
+
+    #[test]
+    fn enabled_menu_item_hit_still_dispatches_over_menu_surface() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        picker.context_menu_kind = FilePickerContextMenuKind::TabStrip;
+        picker.context_menu_tab_target = None;
+        picker.previous_focus = FilePickerFocus::Files;
+        picker.focus = FilePickerFocus::Menu;
+        picker.menu_open = true;
+
+        picker.hit_regions.clear();
+        picker.record_hit_region(Rect::new(0, 5, 20, 1), FilePickerHitAction::MenuSurface);
+        picker.record_hit_region(
+            Rect::new(0, 5, 20, 1),
+            FilePickerHitAction::Menu(FilePickerMenuAction::TabNew),
+        );
+
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 5),
+            Rect::default(),
+        );
+        assert_eq!(picker.tab_count(), 2, "enabled menu items retain their action dispatch");
+        assert!(!picker.menu_open);
+    }
+
+    #[test]
+    fn disabled_tab_reopen_row_is_inert_and_cannot_click_through() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("a.flac"), b"a").expect("a");
+        fs::write(temp.path().join("b.flac"), b"b").expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.entries.len() >= 2);
+        assert!(!picker.has_closed_tabs());
+        assert!(!picker.is_menu_action_enabled(FilePickerMenuAction::TabReopenClosed));
+
+        picker.context_menu_kind = FilePickerContextMenuKind::TabStrip;
+        picker.context_menu_tab_target = None;
+        picker.previous_focus = FilePickerFocus::Files;
+        picker.focus = FilePickerFocus::Menu;
+        picker.menu_open = true;
+        let original_cursor = picker.file_cursor;
+        let target = if original_cursor == 0 { 1 } else { 0 };
+
+        picker.hit_regions.clear();
+        // Rendering records the underlying picker hit first and the popup
+        // surface later. Reverse hit-testing must therefore stop at the inert
+        // surface for disabled rows such as Reopen Closed Tab.
+        picker.record_hit_region(Rect::new(0, 5, 20, 1), FilePickerHitAction::FileRow(target));
+        picker.record_hit_region(Rect::new(0, 5, 20, 1), FilePickerHitAction::MenuSurface);
+
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 5),
+            Rect::default(),
+        );
+        assert!(picker.menu_open, "clicking a disabled row leaves the menu open");
+        assert_eq!(picker.focus, FilePickerFocus::Menu);
+        assert_eq!(
+            picker.file_cursor, original_cursor,
+            "disabled menu rows must own their cells instead of clicking through",
+        );
+    }
+
+    #[test]
+    fn tab_strip_right_click_targets_clicked_tab_and_empty_space_has_no_tab_actions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: a.clone(),
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.open_dir_in_new_tab(b.clone(), false));
+        picker.hit_regions.clear();
+        picker.record_hit_region(Rect::new(0, 0, 40, 1), FilePickerHitAction::TabStrip);
+        picker.record_hit_region(Rect::new(10, 0, 8, 1), FilePickerHitAction::TabActivate(1));
+        picker.begin_tab_drag(0, 1);
+
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 12, 0),
+            Rect::default(),
+        );
+        assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::TabStrip);
+        assert_eq!(picker.context_menu_tab_target, Some(1));
+        assert!(picker.tabs.as_ref().is_some_and(|tabs| tabs.drag.is_none()));
+        let entries = picker.menu_entries();
+        assert_eq!(
+            entries.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+            vec!["New Tab", "Duplicate", "Close", "Reopen Closed Tab"],
+        );
+        assert!(matches!(
+            entries[1].1,
+            FilePickerMenuEntry::Action(FilePickerMenuAction::TabDuplicate(1))
+        ));
+        assert!(!picker.is_menu_action_enabled(FilePickerMenuAction::TabReopenClosed));
+
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let _ = picker.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 30, 0),
+            Rect::default(),
+        );
+        assert_eq!(picker.context_menu_tab_target, None);
+        assert_eq!(
+            picker.menu_entries().iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+            vec!["New Tab", "Reopen Closed Tab"],
+        );
+
+        picker.close_menu();
+        picker.apply_menu_action(FilePickerMenuAction::TabDuplicate(1));
+        assert_eq!(picker.tab_count(), 3);
+        assert_eq!(picker.current_dir(), b.as_path(), "duplicate binds to the clicked non-active tab");
+    }
+
+    #[test]
+    fn tab_strip_context_close_and_reopen_enablement_are_targeted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).expect("a");
+        fs::create_dir(&b).expect("b");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: a.clone(),
+            ..FilePickerConfig::default()
+        });
+        assert!(picker.open_dir_in_new_tab(b, false));
+        assert_eq!(picker.current_dir(), a.as_path());
+
+        picker.apply_menu_action(FilePickerMenuAction::TabClose(1));
+        assert_eq!(picker.tab_count(), 1);
+        assert_eq!(picker.current_dir(), a.as_path());
+        assert!(picker.has_closed_tabs());
+
+        picker.context_menu_kind = FilePickerContextMenuKind::TabStrip;
+        picker.context_menu_tab_target = None;
+        assert!(picker.is_menu_action_enabled(FilePickerMenuAction::TabReopenClosed));
+        assert_eq!(
+            picker.menu_entries().iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+            vec!["New Tab", "Reopen Closed Tab"],
+        );
     }
 
     #[test]

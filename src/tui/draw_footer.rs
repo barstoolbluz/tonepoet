@@ -18,6 +18,7 @@ pub fn draw_footer(
     f: &mut Frame,
     area: Rect,
     current_screen: AppScreen,
+    browse_tab_count: usize,
     buttons: &mut ButtonRenderMap,
     status_message: Option<&str>,
     file_task: Option<FileTaskFooterState>,
@@ -37,6 +38,7 @@ pub fn draw_footer(
         f,
         chunks[1],
         current_screen,
+        browse_tab_count,
         buttons,
         status_message,
         file_task,
@@ -107,6 +109,7 @@ fn draw_context_bar(
     f: &mut Frame,
     area: Rect,
     current: AppScreen,
+    browse_tab_count: usize,
     buttons: &mut ButtonRenderMap,
     status_message: Option<&str>,
     file_task: Option<FileTaskFooterState>,
@@ -138,7 +141,7 @@ fn draw_context_bar(
         )));
         f.render_widget(bar, content_area);
     } else {
-        let groups = hint_groups_for(current, theme);
+        let groups = hint_groups_for(current, browse_tab_count, theme);
         let visible = truncate_groups_to_width(&groups, content_area.width as usize);
 
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
@@ -275,7 +278,11 @@ const fn h(
 }
 
 /// Hint groups per screen. Groups are separated by ` │ ` dividers when rendered.
-fn hint_groups_for(current: AppScreen, theme: super::theme::Theme) -> Vec<Vec<Hint>> {
+fn hint_groups_for(
+    current: AppScreen,
+    browse_tab_count: usize,
+    theme: super::theme::Theme,
+) -> Vec<Vec<Hint>> {
     // Minimal hints: 3-5 essentials per screen + universal `: command │ ? help`.
     // Full keybinding reference available via `?` help overlay.
     let screen_hints = match current {
@@ -285,12 +292,22 @@ fn hint_groups_for(current: AppScreen, theme: super::theme::Theme) -> Vec<Vec<Hi
             h(":max", "pane", theme.blue, 2),
             h(":commit", "enqueue", theme.green, 0),
         ],
-        AppScreen::Browse => vec![
-            h("↑↓", "navigate", theme.blue, 0),
-            h("enter", "open", theme.green, 0),
-            h("space", "select", theme.blue, 0),
-            h("Ctrl+P", "paste", theme.cyan, 1),
-        ],
+        AppScreen::Browse => {
+            let mut hints = vec![
+                h("↑↓", "navigate", theme.blue, 0),
+                h("enter", "open", theme.green, 0),
+                h("space", "select", theme.blue, 0),
+                h("Ctrl+P", "paste", theme.cyan, 1),
+            ];
+            if browse_tab_count > 1 {
+                hints.extend([
+                    h("+/^7", "switch", theme.blue, 1),
+                    h("^T", "new", theme.green, 2),
+                    h("^W", "close", theme.destructive, 2),
+                ]);
+            }
+            hints
+        }
         AppScreen::Queue => vec![
             h("↑↓", "navigate", theme.blue, 0),
             h("s", "start", theme.green, 0),
@@ -360,8 +377,8 @@ fn truncate_groups_to_width(groups: &[Vec<Hint>], available: usize) -> Vec<Vec<H
 
 #[cfg(test)]
 mod tests {
-    use super::{file_task_details_label, file_task_details_rect};
-    use crate::tui::app::FileTaskFooterState;
+    use super::{file_task_details_label, file_task_details_rect, hint_groups_for};
+    use crate::tui::app::{AppScreen, FileTaskFooterState};
     use ratatui::layout::Rect;
 
     fn retained() -> Option<FileTaskFooterState> {
@@ -380,6 +397,21 @@ mod tests {
             queued,
             attention,
         })
+    }
+
+    #[test]
+    fn browse_tab_switch_hints_only_appear_when_multiple_tabs_exist() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let one = hint_groups_for(AppScreen::Browse, 1, theme);
+        assert!(!one.iter().flatten().any(|hint| hint.key == "+/^7"));
+
+        let many = hint_groups_for(AppScreen::Browse, 2, theme);
+        let keys: Vec<_> = many.iter().flatten().map(|hint| hint.key).collect();
+        assert!(keys.contains(&"+/^7"));
+        assert!(keys.contains(&"^T"));
+        assert!(keys.contains(&"^W"));
     }
 
     #[test]
