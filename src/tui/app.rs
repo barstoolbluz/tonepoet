@@ -6240,7 +6240,7 @@ impl QueuedFileTransfer {
 pub struct FileTransferQueueState {
     pub active_session_id: Option<u64>,
     pub queued: VecDeque<QueuedFileTransfer>,
-    pub pending_by_session: BTreeMap<u64, crate::tui::browse::PendingClipboardPaste>,
+    pub(crate) pending_by_session: BTreeMap<u64, crate::tui::browse::PendingClipboardPaste>,
     pub keep_minimized_across_jobs: bool,
     pub blocked_for_attention: bool,
 }

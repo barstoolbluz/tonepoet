@@ -18,10 +18,14 @@ use crate::convert::formats::{AacProfile, Mp3BitrateMode, QualitySettings, WavPa
 use crate::convert::pipeline::{
     CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy, NamingCollisionPolicy,
     MetadataTextOverride, NamingPolicy, OverwritePolicy, PipelineRequest, PublishPolicy,
-    RequestMetadataOverrides, SecretString, SidecarCueTrackMetadataSource, SourceOptions, StagePolicy,
+    RequestMetadataOverrides, SecretString, SourceOptions, StagePolicy,
     StageRequirement, TrackSelection,
 };
 use crate::convert::{ConversionError, ConversionItem, ConversionResult};
+// Used only by the cue-sidecar override tests below (via `use super::*`); keep
+// it test-gated so non-test builds don't flag it as an unused import.
+#[cfg(test)]
+use crate::convert::pipeline::SidecarCueTrackMetadataSource;
 
 pub fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<PipelineRequest> {
     // Return a prebuilt PipelineRequest with full PipelineSettings, while still

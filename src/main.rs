@@ -1690,6 +1690,7 @@ struct PlannedCliQueue {
 /// explicit semantics — naming a CUE on the command line queues it. Expansion
 /// does not follow symlinks inside directories (matching Browse); symlinked
 /// layouts need explicit file arguments.
+#[allow(dead_code)] // CLI queue planner retained pending wire-up; not yet called
 fn plan_cli_convert_queue(paths: &[PathBuf]) -> PlannedCliQueue {
     plan_cli_convert_queue_with_grouping_decisions(
         paths,
@@ -1714,6 +1715,7 @@ fn plan_cli_convert_queue_for_conversion(
 /// authoritative split-CUE grouping evidence. The ordinary one-shot CLI has no
 /// prior grouping session and therefore passes an empty map rather than
 /// fabricating membership from filenames or directory co-location.
+#[allow(dead_code)] // CLI queue planner retained pending wire-up; called only by the above
 fn plan_cli_convert_queue_with_grouping_decisions(
     paths: &[PathBuf],
     grouping_decisions: &tonepoet::convert::queue_expansion::QueueSplitCueAlbumGroupingDecisions,

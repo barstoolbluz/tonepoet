@@ -332,6 +332,7 @@ const AUDITED_CATALOG_ALIAS_ROWS: &[AuditedCatalogAliasRow] = &[
 ];
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // parsed provenance retained for review/debugging, not read at runtime
 struct CatalogNegativeReference {
     normalized: String,
     source_row: usize,
@@ -344,6 +345,7 @@ struct ReferenceCatalog {
     aliases: Vec<CatalogReference>,
     /// Explicitly reviewed non-PE disc IDs tied to otherwise positive rows.
     explicit_negatives: HashMap<String, CatalogNegativeReference>,
+    #[allow(dead_code)] // parsed row count retained for diagnostics, not read at runtime
     source_rows: usize,
 }
 

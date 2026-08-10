@@ -2299,6 +2299,7 @@ impl BrowsePasteRetryPlan {
 /// source-to-destination mapping and any reusable publication proof.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingClipboardPaste {
+    #[allow(dead_code)] // retained for clarity; the map key already carries this
     pub session_id: u64,
     pub clipboard: tui_file_picker::FilesystemClipboard,
     /// User clipboard revision that this job may reconcile. `None` is used for

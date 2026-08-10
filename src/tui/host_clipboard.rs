@@ -767,7 +767,7 @@ fn run_clipboard_read(program: &str, args: &[&str]) -> Result<String, String> {
         .spawn()
         .map_err(|error| error.to_string())?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| format!("{program} did not provide stdout"))?;
@@ -809,7 +809,7 @@ fn run_clipboard_read(program: &str, args: &[&str]) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "clipboard text is not valid UTF-8".to_string())
 }
 
-fn read_bounded_stderr(mut stderr: impl Read) -> Result<String, String> {
+fn read_bounded_stderr(stderr: impl Read) -> Result<String, String> {
     let mut bytes = Vec::new();
     stderr
         .take(8 * 1024)

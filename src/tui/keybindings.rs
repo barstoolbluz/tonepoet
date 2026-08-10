@@ -11454,6 +11454,7 @@ fn metadata_editor_dedicated_sidecar_unsupported_message(
     )
 }
 
+#[allow(dead_code)] // retained helper; not currently wired into a call site
 fn metadata_editor_native_multi_file_sidecar_preflight_error(
     state: &super::app::MetadataEditorState,
 ) -> Option<String> {
@@ -16756,6 +16757,7 @@ fn inspect_transfer_path_capabilities(
     Ok(snapshot)
 }
 
+#[allow(dead_code)] // retained helper; not currently wired into a call site
 fn usable_embedded_transfer_carriers_for_paths(
     paths: &[std::path::PathBuf],
     cancel: &super::probe::MetadataWriteCancelFlag,
@@ -19658,7 +19660,8 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
         );
     }
     let admission_index = TransferAdmissionIndex::new(&admission);
-    let embedded_candidates = read_transfer_embedded_candidates(
+    // Called for its validation/early-return (`?`) effect; the value is unused.
+    let _embedded_candidates = read_transfer_embedded_candidates(
         roots,
         &admission_index,
         explicit_audio_selection,
@@ -38728,6 +38731,7 @@ enum FileTaskApplyAllPolicy {
 
 #[derive(Clone)]
 enum FileTaskEventSink {
+    #[allow(dead_code)] // in-process sink retained alongside the Wire variant
     App(mpsc::Sender<AppMessage>),
     Wire(std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::io::Stdout>>>),
 }
@@ -39044,6 +39048,7 @@ struct FileTaskWorker {
 }
 
 impl FileTaskWorker {
+    #[allow(dead_code)] // retained constructor; workers are built via the wire path
     fn new(
         job: FileTaskJob,
         tx: mpsc::Sender<AppMessage>,
