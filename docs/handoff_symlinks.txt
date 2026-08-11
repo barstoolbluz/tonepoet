@@ -1,3 +1,0 @@
-# tonepoet handoff symlink ledger v1
-# path<TAB>literal-target
-crates/dvda-demuxer/tests/fixtures	../../../tests/fixtures

@@ -1,7 +1,6 @@
 //! Conversion pipeline rebuild — PR 1 contracts module.
 //!
-//! Implements PR 1 of
-//! `docs/phase0_sequencing_plan_hardened_ready_for_execution.md`:
+//! Implements PR 1 of the staged pipeline rebuild plan:
 //! every public type, error, trait, and stage-function signature the
 //! staged pipeline (PRs 2–10) implements against, plus compiling
 //! non-panicking stub bodies, a transcript-backed `StubToolRunner`,
