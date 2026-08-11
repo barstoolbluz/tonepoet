@@ -264,88 +264,195 @@ impl Database {
 
     /// Run forward migrations up to CURRENT_VERSION.
     fn migrate(&mut self) -> Result<(), String> {
-        let version: u32 = self
+        let mut version: u32 = self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("read user_version: {}", e))?;
 
-        if version < 1 {
-            self.migrate_v1()?;
+        if version > CURRENT_VERSION {
+            return Err(format!(
+                "database schema is newer than this build (found {}, supports {})",
+                version, CURRENT_VERSION
+            ));
         }
-        if version < 2 {
-            self.migrate_v2()?;
-        }
-        if version < 3 {
-            self.migrate_v3()?;
-        }
-        if version < 4 {
-            self.migrate_v4()?;
-        }
-        if version < 5 {
-            self.migrate_v5()?;
-        }
-        if version < 6 {
-            self.migrate_v6()?;
-        }
-        if version < 7 {
-            self.migrate_v7()?;
-        }
-        if version < 8 {
-            self.migrate_v8()?;
-        }
-        if version < 9 {
-            self.migrate_v9()?;
-        }
-        if version < 10 {
-            self.migrate_v10()?;
-        }
-        if version < 11 {
-            self.migrate_v11()?;
-        }
-        if version < 12 {
-            self.migrate_v12()?;
-        }
-        if version < 13 {
-            self.migrate_v13()?;
-        }
-        if version < 14 {
-            self.migrate_v14()?;
-        }
-        if version < 15 {
-            self.migrate_v15()?;
-        }
-        if version < 16 {
-            self.migrate_v16()?;
-        }
-        if version < 17 {
-            self.migrate_v17()?;
-        }
-        if version < 18 {
-            self.migrate_v18()?;
-        }
-        if version < 19 {
-            self.migrate_v19()?;
-        }
-        if version < 20 {
-            self.migrate_v20()?;
-        }
-        if version < 21 {
-            self.migrate_v21()?;
-        }
-        if version < 22 {
-            self.migrate_v22()?;
+        if version == CURRENT_VERSION {
+            return Ok(());
         }
 
-        self.conn
-            .pragma_update(None, "user_version", CURRENT_VERSION)
-            .map_err(|e| format!("set user_version: {}", e))?;
+        if version < 1 {
+            self.run_migration_step(1, Self::migrate_v1)?;
+            version = 1;
+        }
+        if version < 2 {
+            self.run_migration_step(2, Self::migrate_v2)?;
+            version = 2;
+        }
+        if version < 3 {
+            self.run_migration_step(3, Self::migrate_v3)?;
+            version = 3;
+        }
+        if version < 4 {
+            self.run_migration_step(4, Self::migrate_v4)?;
+            version = 4;
+        }
+        if version < 5 {
+            self.run_migration_step(5, Self::migrate_v5)?;
+            version = 5;
+        }
+        if version < 6 {
+            self.run_migration_step(6, Self::migrate_v6)?;
+            version = 6;
+        }
+        if version < 7 {
+            self.run_migration_step(7, Self::migrate_v7)?;
+            version = 7;
+        }
+        if version < 8 {
+            self.run_migration_step(8, Self::migrate_v8)?;
+            version = 8;
+        }
+        if version < 9 {
+            self.run_migration_step(9, Self::migrate_v9)?;
+            version = 9;
+        }
+        if version < 10 {
+            self.run_migration_step(10, Self::migrate_v10)?;
+            version = 10;
+        }
+        if version < 11 {
+            self.run_migration_step(11, Self::migrate_v11)?;
+            version = 11;
+        }
+        if version < 12 {
+            self.run_migration_step(12, Self::migrate_v12)?;
+            version = 12;
+        }
+        if version < 13 {
+            self.run_migration_step(13, Self::migrate_v13)?;
+            version = 13;
+        }
+        if version < 14 {
+            self.run_migration_step(14, Self::migrate_v14)?;
+            version = 14;
+        }
+        if version < 15 {
+            self.run_migration_step(15, Self::migrate_v15)?;
+            version = 15;
+        }
+        if version < 16 {
+            self.run_migration_step(16, Self::migrate_v16)?;
+            version = 16;
+        }
+        if version < 17 {
+            self.run_migration_step(17, Self::migrate_v17)?;
+            version = 17;
+        }
+        if version < 18 {
+            self.run_migration_step(18, Self::migrate_v18)?;
+            version = 18;
+        }
+        if version < 19 {
+            self.run_migration_step(19, Self::migrate_v19)?;
+            version = 19;
+        }
+        if version < 20 {
+            self.run_migration_step(20, Self::migrate_v20)?;
+            version = 20;
+        }
+        if version < 21 {
+            self.run_migration_step(21, Self::migrate_v21)?;
+            version = 21;
+        }
+        if version < 22 {
+            self.run_migration_step(22, Self::migrate_v22)?;
+        }
 
         Ok(())
     }
 
+    fn run_migration_step(
+        &mut self,
+        version: u32,
+        migration: fn(&Connection) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let transaction = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin v{} migration: {}", version, e))?;
+
+        migration(&transaction)?;
+        transaction
+            .pragma_update(None, "user_version", version)
+            .map_err(|e| format!("set user_version to {}: {}", version, e))?;
+        transaction
+            .commit()
+            .map_err(|e| format!("commit v{} migration: {}", version, e))?;
+
+        Ok(())
+    }
+
+    // Narrow recovery helper for historical ADD COLUMN migrations that could
+    // have committed before user_version advanced. This is intentionally not a
+    // general schema reconciliation mechanism.
+    fn legacy_add_column_present(
+        conn: &Connection,
+        migration: &str,
+        table: &str,
+        column: &str,
+        expected_type: &str,
+        expected_not_null: bool,
+        expected_default: Option<&str>,
+    ) -> Result<bool, String> {
+        let pragma = format!("PRAGMA table_info({})", table);
+        let mut columns = conn
+            .prepare(&pragma)
+            .map_err(|e| format!("{} migration inspect {}: {}", migration, table, e))?;
+        let rows = columns
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|e| format!("{} migration inspect {}: {}", migration, table, e))?;
+
+        for row in rows {
+            let (name, declared_type, not_null, default_value) = row
+                .map_err(|e| format!("{} migration decode {} column: {}", migration, table, e))?;
+            if name != column {
+                continue;
+            }
+
+            let type_matches = declared_type.trim().eq_ignore_ascii_case(expected_type);
+            let default_matches = default_value.as_deref() == expected_default;
+            if type_matches && not_null == expected_not_null && default_matches {
+                return Ok(true);
+            }
+
+            let expected_default = expected_default.unwrap_or("<none>");
+            let actual_default = default_value.as_deref().unwrap_or("<none>");
+            return Err(format!(
+                "{} migration found incompatible existing column {}.{}: expected type {} NOT NULL={} DEFAULT {}, found type {} NOT NULL={} DEFAULT {}",
+                migration,
+                table,
+                column,
+                expected_type,
+                expected_not_null,
+                expected_default,
+                declared_type,
+                not_null,
+                actual_default
+            ));
+        }
+
+        Ok(false)
+    }
+
     /// v1: metadata journal, probe cache, recent files, bookmarks.
-    fn migrate_v1(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v1(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS metadata_journal (
@@ -400,8 +507,8 @@ impl Database {
     }
 
     /// v2: presets table.
-    fn migrate_v2(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v2(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS presets (
@@ -425,8 +532,8 @@ impl Database {
     }
 
     /// v3: conversion history table.
-    fn migrate_v3(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v3(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS conversion_history (
@@ -458,8 +565,8 @@ impl Database {
     }
 
     /// v4: batch state table for Convert screen recovery.
-    fn migrate_v4(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v4(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS batch_state (
@@ -570,20 +677,29 @@ impl Database {
     }
 
     /// v5: add access_count to recent_files.
-    fn migrate_v5(&mut self) -> Result<(), String> {
-        self.conn
-            .execute_batch(
+    fn migrate_v5(conn: &Connection) -> Result<(), String> {
+        if !Self::legacy_add_column_present(
+            conn,
+            "v5",
+            "recent_files",
+            "access_count",
+            "INTEGER",
+            true,
+            Some("1"),
+        )? {
+            conn.execute_batch(
                 "
             ALTER TABLE recent_files ADD COLUMN access_count INTEGER NOT NULL DEFAULT 1;
         ",
             )
             .map_err(|e| format!("v5 migration failed: {}", e))?;
+        }
         Ok(())
     }
 
     /// v6: conversion queue table.
-    fn migrate_v6(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v6(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS conversion_queue (
@@ -597,8 +713,8 @@ impl Database {
     }
 
     /// v7: analysis cache table.
-    fn migrate_v7(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v7(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS analysis_cache (
@@ -627,8 +743,8 @@ impl Database {
 
     /// v8: drop + recreate analysis_cache with algo_version column.
     /// Invalidates all v7 cached results (algorithm was buggy).
-    fn migrate_v8(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v8(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             DROP TABLE IF EXISTS analysis_cache;
@@ -658,8 +774,8 @@ impl Database {
     }
 
     /// v9: search tag cache table.
-    fn migrate_v9(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v9(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS search_tag_cache (
@@ -681,23 +797,45 @@ impl Database {
     }
 
     /// v10: add preemphasis column to analysis_cache + bump algo version.
-    fn migrate_v10(&mut self) -> Result<(), String> {
-        // Add column; existing rows have NULL which is fine — the algo
-        // version bump means they won't be served from cache anyway.
-        self.conn
-            .execute_batch(
-                "
-            ALTER TABLE analysis_cache ADD COLUMN preemphasis INTEGER;
-            ALTER TABLE analysis_cache ADD COLUMN preemphasis_corr REAL;
-        ",
+    fn migrate_v10(conn: &Connection) -> Result<(), String> {
+        // Add columns independently because historical runs could commit the
+        // first ALTER before failing on the second. Existing rows have NULL,
+        // which is fine — the algo version bump means they won't be served
+        // from cache anyway.
+        if !Self::legacy_add_column_present(
+            conn,
+            "v10",
+            "analysis_cache",
+            "preemphasis",
+            "INTEGER",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE analysis_cache ADD COLUMN preemphasis INTEGER;",
             )
             .map_err(|e| format!("v10 migration failed: {}", e))?;
+        }
+        if !Self::legacy_add_column_present(
+            conn,
+            "v10",
+            "analysis_cache",
+            "preemphasis_corr",
+            "REAL",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE analysis_cache ADD COLUMN preemphasis_corr REAL;",
+            )
+            .map_err(|e| format!("v10 migration failed: {}", e))?;
+        }
         Ok(())
     }
 
     /// v11: add preemph_corpus table for spectral scorer model storage.
-    fn migrate_v11(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v11(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS preemph_corpus (
@@ -716,20 +854,29 @@ impl Database {
     }
 
     /// v12: add empirical PE template column to preemph_corpus.
-    fn migrate_v12(&mut self) -> Result<(), String> {
-        self.conn
-            .execute_batch(
+    fn migrate_v12(conn: &Connection) -> Result<(), String> {
+        if !Self::legacy_add_column_present(
+            conn,
+            "v12",
+            "preemph_corpus",
+            "pe_template",
+            "BLOB",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
                 "
             ALTER TABLE preemph_corpus ADD COLUMN pe_template BLOB;
         ",
             )
             .map_err(|e| format!("v12 migration failed: {}", e))?;
+        }
         Ok(())
     }
 
     /// v13: add preemph_classifier table for trained LDA classifier storage.
-    fn migrate_v13(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v13(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS preemph_classifier (
@@ -752,33 +899,62 @@ impl Database {
     }
 
     /// v14: add preemphasis_detail column to analysis_cache.
-    fn migrate_v14(&mut self) -> Result<(), String> {
-        self.conn
-            .execute_batch(
+    fn migrate_v14(conn: &Connection) -> Result<(), String> {
+        if !Self::legacy_add_column_present(
+            conn,
+            "v14",
+            "analysis_cache",
+            "preemphasis_detail",
+            "TEXT",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
                 "
             ALTER TABLE analysis_cache ADD COLUMN preemphasis_detail TEXT;
         ",
             )
             .map_err(|e| format!("v14 migration failed: {}", e))?;
+        }
         Ok(())
     }
 
     /// v15: add HDCD columns to analysis_cache.
-    fn migrate_v15(&mut self) -> Result<(), String> {
-        self.conn
-            .execute_batch(
-                "
-            ALTER TABLE analysis_cache ADD COLUMN hdcd_detected INTEGER;
-            ALTER TABLE analysis_cache ADD COLUMN hdcd_detail TEXT;
-        ",
+    fn migrate_v15(conn: &Connection) -> Result<(), String> {
+        if !Self::legacy_add_column_present(
+            conn,
+            "v15",
+            "analysis_cache",
+            "hdcd_detected",
+            "INTEGER",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE analysis_cache ADD COLUMN hdcd_detected INTEGER;",
             )
             .map_err(|e| format!("v15 migration failed: {}", e))?;
+        }
+        if !Self::legacy_add_column_present(
+            conn,
+            "v15",
+            "analysis_cache",
+            "hdcd_detail",
+            "TEXT",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE analysis_cache ADD COLUMN hdcd_detail TEXT;",
+            )
+            .map_err(|e| format!("v15 migration failed: {}", e))?;
+        }
         Ok(())
     }
 
     /// v16: AccurateRip result cache.
-    fn migrate_v16(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v16(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS ar_cache (
@@ -802,8 +978,8 @@ impl Database {
     }
 
     /// v17: CTDB parity matrix cache (LRU by accessed_at).
-    fn migrate_v17(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v17(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS ctdb_parity_cache (
@@ -823,8 +999,8 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v18(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v18(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS musicbrainz_toc_cache (
@@ -845,8 +1021,8 @@ impl Database {
     /// Distinct from the TOC cache so the two namespaces evict independently
     /// — text search rows churn faster than TOC rows since the same disc
     /// can produce many search-query keys but only one TOC.
-    fn migrate_v19(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v19(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS musicbrainz_search_cache (
@@ -865,8 +1041,8 @@ impl Database {
 
 
     /// v20: crash recovery records for deferred archive-edit staging sessions.
-    fn migrate_v20(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v20(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS pending_archive_sessions (
@@ -892,8 +1068,8 @@ impl Database {
     /// valid only for the focused directory identity, while recursive stats are
     /// explicitly best-effort because ancestor directory mtimes do not reliably
     /// reflect deep descendant edits on all filesystems.
-    fn migrate_v21(&mut self) -> Result<(), String> {
-        self.conn
+    fn migrate_v21(conn: &Connection) -> Result<(), String> {
+        conn
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS directory_summary_cache (
@@ -1055,9 +1231,8 @@ impl Database {
     /// v22: distinguish in-flight writes from committed and rolled-back
     /// cleanup states. This prevents startup recovery from restoring an old
     /// backup over a write that committed before cleanup failed.
-    fn migrate_v22(&mut self) -> Result<(), String> {
-        let mut columns = self
-            .conn
+    fn migrate_v22(conn: &Connection) -> Result<(), String> {
+        let mut columns = conn
             .prepare("PRAGMA table_info(metadata_journal)")
             .map_err(|error| format!("v22 migration inspect metadata_journal: {error}"))?;
         let names = columns
@@ -1076,7 +1251,7 @@ impl Database {
         drop(columns);
 
         if !has_state {
-            self.conn
+            conn
                 .execute_batch(
                     "ALTER TABLE metadata_journal ADD COLUMN state TEXT NOT NULL DEFAULT 'prepared';",
                 )
@@ -3735,6 +3910,37 @@ impl Database {
 mod tests {
     use super::*;
 
+    fn table_columns(conn: &Connection, table: &str) -> Vec<(String, String)> {
+        let mut statement = conn
+            .prepare(&format!("PRAGMA table_info({})", table))
+            .expect("prepare table_info");
+        statement
+            .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+            .expect("query table_info")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode table_info")
+    }
+
+    fn seed_schema_through_v8(conn: &Connection) {
+        Database::migrate_v1(conn).expect("seed v1");
+        Database::migrate_v2(conn).expect("seed v2");
+        Database::migrate_v3(conn).expect("seed v3");
+        Database::migrate_v4(conn).expect("seed v4");
+        Database::migrate_v5(conn).expect("seed v5");
+        Database::migrate_v6(conn).expect("seed v6");
+        Database::migrate_v7(conn).expect("seed v7");
+        Database::migrate_v8(conn).expect("seed v8");
+        conn.pragma_update(None, "user_version", 8)
+            .expect("stamp v8");
+    }
+
+    fn seed_schema_through_v9(conn: &Connection) {
+        seed_schema_through_v8(conn);
+        Database::migrate_v9(conn).expect("seed v9");
+        conn.pragma_update(None, "user_version", 9)
+            .expect("stamp v9");
+    }
+
     #[test]
     fn open_and_migrate() {
         let db = Database::open_memory().unwrap();
@@ -3743,6 +3949,209 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn failed_migration_step_rolls_back_schema_and_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create v9 database");
+            conn.execute_batch(
+                "CREATE TABLE analysis_cache (
+                    file_path TEXT PRIMARY KEY,
+                    preemphasis_corr TEXT
+                 );
+                 PRAGMA user_version = 9;",
+            )
+            .expect("seed incompatible v10 database");
+        }
+
+        let error = Database::open_path(&path)
+            .err()
+            .expect("v10 must reject incompatible column");
+        assert!(
+            error.contains(
+                "v10 migration found incompatible existing column analysis_cache.preemphasis_corr"
+            ),
+            "unexpected migration error: {error}"
+        );
+
+        let conn = Connection::open(&path).expect("reopen failed migration database");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back version");
+        let columns = table_columns(&conn, "analysis_cache");
+
+        assert_eq!(version, 9, "failed v10 must not advance user_version");
+        assert!(
+            !columns.iter().any(|(name, _)| name == "preemphasis"),
+            "v10's first ALTER must roll back when the second column is incompatible"
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .find(|(name, _)| name == "preemphasis_corr")
+                .map(|(_, declared_type)| declared_type.as_str()),
+            Some("TEXT"),
+            "pre-existing incompatible column must remain untouched"
+        );
+    }
+
+    #[test]
+    fn resumes_after_committed_v8_without_rerunning_v8() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create v8 database");
+            seed_schema_through_v8(&conn);
+            conn.execute(
+                "INSERT INTO analysis_cache (
+                    file_path, file_mtime, file_size, algo_version, analyzed_at
+                 ) VALUES (?1, 1, 1, 8, '2026-08-10T00:00:00Z')",
+                ["/music/resume.flac"],
+            )
+            .expect("insert v8 sentinel row");
+        }
+
+        let db = Database::open_path(&path).expect("resume from committed v8");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read resumed version");
+        let sentinel_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM analysis_cache WHERE file_path = '/music/resume.flac'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read v8 sentinel row");
+
+        assert_eq!(version, CURRENT_VERSION);
+        assert_eq!(
+            sentinel_count, 1,
+            "resume must start at v9; rerunning destructive v8 would delete the sentinel"
+        );
+    }
+
+    #[test]
+    fn historical_partial_v10_add_column_resumes_without_data_loss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create partial v10 database");
+            seed_schema_through_v9(&conn);
+            conn.execute(
+                "INSERT INTO analysis_cache (
+                    file_path, file_mtime, file_size, algo_version, analyzed_at
+                 ) VALUES (?1, 1, 1, 8, '2026-08-10T00:00:00Z')",
+                ["/music/partial-v10.flac"],
+            )
+            .expect("insert pre-v10 sentinel row");
+            conn.execute_batch(
+                "ALTER TABLE analysis_cache ADD COLUMN preemphasis INTEGER;
+                 UPDATE analysis_cache SET preemphasis = 1 WHERE file_path = '/music/partial-v10.flac';
+                 PRAGMA user_version = 9;",
+            )
+            .expect("seed historical partial v10");
+        }
+
+        let db = Database::open_path(&path).expect("finish historical partial v10");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        let preemphasis: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT preemphasis FROM analysis_cache
+                 WHERE file_path = '/music/partial-v10.flac'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read preserved partial-v10 row");
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM analysis_cache
+                 WHERE file_path = '/music/partial-v10.flac'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved partial-v10 row");
+        let columns = table_columns(&db.conn, "analysis_cache");
+
+        assert_eq!(version, CURRENT_VERSION);
+        assert_eq!(preemphasis, Some(1));
+        assert_eq!(count, 1, "historical row must survive migration recovery");
+        assert!(
+            columns
+                .iter()
+                .any(|(name, declared_type)| name == "preemphasis_corr" && declared_type == "REAL"),
+            "v10 must add the independently missing second column"
+        );
+    }
+
+    #[test]
+    fn rejects_database_newer_than_current_version_without_downgrade() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        let newer_version = CURRENT_VERSION + 1;
+        {
+            let conn = Connection::open(&path).expect("create newer database");
+            conn.pragma_update(None, "user_version", newer_version)
+                .expect("stamp newer database");
+        }
+
+        let error = Database::open_path(&path)
+            .err()
+            .expect("newer schema must be rejected");
+        assert_eq!(
+            error,
+            format!(
+                "database schema is newer than this build (found {}, supports {})",
+                newer_version, CURRENT_VERSION
+            )
+        );
+
+        let conn = Connection::open(&path).expect("reopen newer database directly");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read newer version after rejected open");
+        assert_eq!(version, newer_version, "rejected open must not downgrade schema");
+    }
+
+    #[test]
+    fn current_version_open_is_a_migration_noop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create current-version database");
+            conn.pragma_update(None, "user_version", CURRENT_VERSION)
+                .expect("stamp current version");
+        }
+
+        let db = Database::open_path(&path).expect("open current-version database");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read current version");
+        let application_table_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count application tables");
+
+        assert_eq!(version, CURRENT_VERSION);
+        assert_eq!(
+            application_table_count, 0,
+            "current-version open must not execute any migration DDL"
+        );
     }
 
     #[test]
