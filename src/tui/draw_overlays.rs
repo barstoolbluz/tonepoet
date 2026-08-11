@@ -1600,6 +1600,7 @@ fn draw_item_info(f: &mut Frame, item: &crate::convert::ConversionItem, theme: s
         }
         ConversionStatus::Failed { error, .. } => format!("Failed: {}", error),
         ConversionStatus::Paused => "Paused".to_string(),
+        ConversionStatus::Interrupted => "Interrupted — Retry required".to_string(),
         ConversionStatus::Cancelled => "Cancelled".to_string(),
     };
 

@@ -1572,14 +1572,13 @@ pub fn build_queue_item_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item(label, ContextAction::ToggleTrackCollapse));
         }
 
-        match &qi.status {
-            ConversionStatus::Failed { .. } => {
-                items.push(item("Retry", ContextAction::RetryFailed));
-            }
-            ConversionStatus::Queued | ConversionStatus::NotConfigured => {
-                items.push(item("Remove", ContextAction::RemoveSelected));
-            }
-            _ => {}
+        if qi.can_retry() {
+            items.push(item("Retry", ContextAction::RetryFailed));
+        } else if matches!(
+            qi.status,
+            ConversionStatus::Queued | ConversionStatus::NotConfigured
+        ) {
+            items.push(item("Remove", ContextAction::RemoveSelected));
         }
     }
 
@@ -3699,8 +3698,11 @@ pub fn execute_context_action(
                 Err(())
             };
             match result {
-                Ok(0) => app.set_status("no failed items to retry"),
-                Ok(n) => app.set_status(format!("{} failed item(s) queued for retry", n)),
+                Ok(0) => app.set_status("no retryable items to retry"),
+                Ok(n) => {
+                    app.save_queue();
+                    app.set_status(format!("{} item(s) queued for retry", n));
+                }
                 Err(()) => app.set_status("retry: queue locked, try again"),
             }
         }

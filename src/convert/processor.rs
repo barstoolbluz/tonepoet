@@ -196,7 +196,10 @@ fn terminal_progress_for_status(
         ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
             last_known_progress.unwrap_or(0.0).clamp(0.0, 100.0)
         }
-        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => 0.0,
+        ConversionStatus::Queued
+        | ConversionStatus::Paused
+        | ConversionStatus::Interrupted
+        | ConversionStatus::NotConfigured => 0.0,
     }
 }
 
@@ -2632,6 +2635,7 @@ fn record_terminal_status(
         }
         ConversionStatus::Queued
         | ConversionStatus::Paused
+        | ConversionStatus::Interrupted
         | ConversionStatus::Processing { .. }
         | ConversionStatus::NotConfigured => {}
     }

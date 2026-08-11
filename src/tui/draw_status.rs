@@ -41,6 +41,10 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState, theme: 
         .iter()
         .filter(|i| matches!(i.status, crate::convert::ConversionStatus::Queued))
         .count();
+    let interrupted = items
+        .iter()
+        .filter(|i| matches!(i.status, crate::convert::ConversionStatus::Interrupted))
+        .count();
 
     let workers = app.config.conversion.worker_count;
 
@@ -68,6 +72,13 @@ pub fn draw_queue_stats_strip(f: &mut Frame, area: Rect, app: &AppState, theme: 
         if queued > 0 {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(format!("{} queued", queued), theme.bright()));
+        }
+        if interrupted > 0 {
+            spans.push(Span::raw(" | "));
+            spans.push(Span::styled(
+                format!("{} interrupted", interrupted),
+                Style::default().fg(theme.warning),
+            ));
         }
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(format!("{} workers", workers), theme.muted()));

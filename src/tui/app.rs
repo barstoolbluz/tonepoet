@@ -11570,7 +11570,7 @@ pub struct AppState {
     /// user presses Enter or starts typing.
     pub browse_info_focus: Option<BrowseInfoFocus>,
 
-    /// Recent files list + overlay state (persisted to ~/.cache/tonepoet/recent.json).
+    /// Recent files list + overlay state (durably persisted in SQLite).
     pub recent: crate::tui::recent_files::RecentFilesState,
 
     /// Bookmarks list + overlay state (persisted to ~/.config/tonepoet/bookmarks.toml).
@@ -12199,30 +12199,113 @@ impl AppState {
             worker_count: config.conversion.worker_count,
             ..ConversionConfig::default()
         };
-        let mut manager = ConversionManager::new(conv_config);
+        let manager = ConversionManager::new(conv_config);
 
-        // Load persisted queue: try SQLite first, fall back to JSON import.
+        // Load the durable queue authority. Legacy JSON is consulted only when
+        // the explicit v23 import marker says the one-time import is pending.
         if config.conversion.persist_queue {
-            let db_items = db.load_queue_items();
-            if !db_items.is_empty() {
-                if let Ok(mut q) = manager.queue.try_write() {
-                    for item in db_items {
-                        q.items_mut().push_back(item);
+            let mut authority_ready = false;
+            match db.queue_legacy_import_done() {
+                Ok(true) => authority_ready = true,
+                Ok(false) => match db.has_queue_items() {
+                    Ok(true) => {
+                        // Defensive recovery for an inconsistent marker: rows
+                        // already in SQLite always win over legacy JSON.
+                        match db.publish_legacy_queue_import(&[], &[]) {
+                            Ok(_) => authority_ready = true,
+                            Err(error) => {
+                                let queue_status = format!(
+                                    "queue persistence degraded: could not establish existing SQLite authority: {error}"
+                                );
+                                theme_startup_status = Some(match theme_startup_status.take() {
+                                    Some(existing) => format!("{existing}; {queue_status}"),
+                                    None => queue_status,
+                                });
+                            }
+                        }
                     }
-                }
-            } else {
-                // SQLite empty — try importing from JSON (first-run migration).
-                manager.load_persisted_queue();
-                // Sync the imported items to SQLite.
-                if let Ok(q) = manager.queue.try_read() {
-                    let items: Vec<&crate::convert::ConversionItem> = q.all_items();
-                    if let Err(error) = db.sync_queue(&items) {
-                        log::error!(
-                            "could not import the persisted JSON queue into SQLite: {}",
-                            error
-                        );
+                    Ok(false) => match ConversionManager::load_legacy_queue_for_import() {
+                        Ok((legacy_items, retire_after_import)) => {
+                            match db.publish_legacy_queue_import(
+                                &legacy_items,
+                                &retire_after_import,
+                            ) {
+                                Ok(crate::db::LegacyImportPublication::Imported) => {
+                                    ConversionManager::remove_legacy_queue_file_after_import();
+                                    authority_ready = true;
+                                }
+                                Ok(
+                                    crate::db::LegacyImportPublication::AlreadyDone
+                                    | crate::db::LegacyImportPublication::ExistingSqliteAuthority,
+                                ) => authority_ready = true,
+                                Err(error) => {
+                                    let queue_status = format!(
+                                        "queue persistence degraded: legacy JSON import was retained because SQLite publication failed: {error}"
+                                    );
+                                    theme_startup_status =
+                                        Some(match theme_startup_status.take() {
+                                            Some(existing) => {
+                                                format!("{existing}; {queue_status}")
+                                            }
+                                            None => queue_status,
+                                        });
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let queue_status = format!(
+                                "queue persistence degraded: legacy queue import could not be read: {error}"
+                            );
+                            theme_startup_status = Some(match theme_startup_status.take() {
+                                Some(existing) => format!("{existing}; {queue_status}"),
+                                None => queue_status,
+                            });
+                        }
+                    },
+                    Err(error) => {
                         let queue_status = format!(
-                            "queue persistence degraded: JSON import was retained because SQLite publication failed: {error}"
+                            "queue persistence degraded: SQLite queue authority could not be inspected: {error}"
+                        );
+                        theme_startup_status = Some(match theme_startup_status.take() {
+                            Some(existing) => format!("{existing}; {queue_status}"),
+                            None => queue_status,
+                        });
+                    }
+                },
+                Err(error) => {
+                    let queue_status = format!(
+                        "queue persistence degraded: queue import marker could not be read: {error}"
+                    );
+                    theme_startup_status = Some(match theme_startup_status.take() {
+                        Some(existing) => format!("{existing}; {queue_status}"),
+                        None => queue_status,
+                    });
+                }
+            }
+
+            if authority_ready {
+                match db.load_queue_items() {
+                    Ok(outcome) => {
+                        if let Ok(mut q) = manager.queue.try_write() {
+                            for item in outcome.items {
+                                q.add_item_direct(item);
+                            }
+                        }
+                        if let Some(error) = outcome.degradation {
+                            let queue_status = format!(
+                                "queue persistence degraded: {error}"
+                            );
+                            theme_startup_status = Some(match theme_startup_status.take() {
+                                Some(existing) => format!("{existing}; {queue_status}"),
+                                None => queue_status,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        // A failed SQLite read is not an empty queue and must
+                        // never reactivate the legacy JSON import path.
+                        let queue_status = format!(
+                            "queue persistence degraded: SQLite queue could not be read: {error}"
                         );
                         theme_startup_status = Some(match theme_startup_status.take() {
                             Some(existing) => format!("{existing}; {queue_status}"),
@@ -12239,8 +12322,20 @@ impl AppState {
 
         let initial_screen = AppScreen::from_config_name(&config.ui.default_screen);
 
-        // Load recent files + bookmarks from DB.
-        let recent = crate::tui::recent_files::RecentFilesState::load_from_db(&db);
+        // Load recent files + bookmarks from DB. Recent Files follows the same
+        // explicit one-time import marker as the queue; load failures degrade
+        // the feature without reviving JSON as an authority.
+        let recent = match crate::tui::recent_files::RecentFilesState::load_from_db(&db) {
+            Ok(recent) => recent,
+            Err(error) => {
+                let recent_status = format!("recent-files persistence degraded: {error}");
+                theme_startup_status = Some(match theme_startup_status.take() {
+                    Some(existing) => format!("{existing}; {recent_status}"),
+                    None => recent_status,
+                });
+                crate::tui::recent_files::RecentFilesState::default()
+            }
+        };
         let bookmarks = crate::tui::bookmarks::BookmarksState::load_from_db(&db);
         // Import TOML presets into DB on first run.
         crate::tui::presets::import_presets_to_db(&db);
@@ -13092,42 +13187,101 @@ impl AppState {
         let _ = changed;
     }
 
-    /// Set a status message that will auto-clear after 5 seconds
-    /// Save the conversion queue to both JSON (legacy) and SQLite.
-    pub fn save_queue(&mut self) {
-        if !self.config.conversion.persist_queue {
-            return;
+    /// Establish the crash-safe durable boundary for a new conversion run.
+    ///
+    /// The live queue stays `Queued` until the processor owns it, but SQLite
+    /// publishes those exact lifecycle identities as `Interrupted` first. A
+    /// crash after this commit therefore requires an explicit Retry instead of
+    /// making the stale pre-run `Queued` row eligible for automatic work. The
+    /// queue read lock remains held through publication so a concurrent queue
+    /// mutation cannot be overwritten by the acquisition snapshot.
+    pub(crate) fn persist_conversion_run_acquisition(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+        String,
+    > {
+        let q = self
+            .manager
+            .queue
+            .try_read()
+            .map_err(|_| "queue is busy".to_string())?;
+        q.validate_full_settings_handoff()?;
+
+        let ready_items = q
+            .all_items()
+            .into_iter()
+            .filter(|item| matches!(&item.status, crate::convert::ConversionStatus::Queued))
+            .map(|item| (item.id.clone(), item.queued_at.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        if ready_items.is_empty() || !self.config.conversion.persist_queue {
+            return Ok(ready_items);
         }
-        let mut errors = Vec::new();
-        // Legacy JSON save (kept for backward compat during migration).
-        if let Err(error) = self.manager.save_queue(true) {
-            log::error!("could not persist conversion queue JSON: {}", error);
-            errors.push(format!("JSON: {error}"));
-        }
-        // SQLite sync (ACID, transactional).
-        if let Ok(q) = self.manager.queue.try_read() {
-            let items: Vec<&crate::convert::ConversionItem> = q
-                .all_items()
-                .into_iter()
-                .filter(|item| {
-                    !matches!(
-                        item.status,
-                        crate::convert::ConversionStatus::Processing { .. }
-                            | crate::convert::ConversionStatus::Cancelled
-                    )
-                })
-                .collect();
-            if let Err(error) = self.db.sync_queue(&items) {
-                log::error!("could not persist conversion queue SQLite state: {}", error);
-                errors.push(format!("SQLite: {error}"));
+
+        let mut durable_items = q
+            .all_items()
+            .into_iter()
+            .map(|item| item.clone())
+            .collect::<Vec<_>>();
+        for item in &mut durable_items {
+            if ready_items.get(&item.id) == Some(&item.queued_at)
+                && matches!(&item.status, crate::convert::ConversionStatus::Queued)
+            {
+                item.status = crate::convert::ConversionStatus::Interrupted;
+                item.started_at = None;
+                item.completed_at = None;
+                item.active_tracks.clear();
+                item.closed_track_epochs.clear();
             }
-        } else {
-            errors.push("queue is busy".to_string());
         }
-        if !errors.is_empty() {
+        let refs = durable_items.iter().collect::<Vec<_>>();
+        let report = self.db.sync_queue(&refs)?;
+        drop(q);
+        self.manager
+            .retire_queue_secret_references_after_persistence(
+                &report.retire_references,
+                &report.live_references,
+            );
+        Ok(ready_items)
+    }
+
+    /// Publish the current durable queue intent to the sole SQLite authority.
+    ///
+    /// Callers that are about to launch external work may require this to
+    /// succeed before proceeding. Ordinary UI mutations use `save_queue`,
+    /// which reports degradation without changing their existing call shape.
+    pub(crate) fn persist_queue_state(&self) -> Result<(), String> {
+        if !self.config.conversion.persist_queue {
+            return Ok(());
+        }
+
+        let report = {
+            let q = self
+                .manager
+                .queue
+                .try_read()
+                .map_err(|_| "queue is busy".to_string())?;
+            let items: Vec<&crate::convert::ConversionItem> = q.all_items();
+            self.db.sync_queue(&items)?
+        };
+
+        self.manager
+            .retire_queue_secret_references_after_persistence(
+                &report.retire_references,
+                &report.live_references,
+            );
+        Ok(())
+    }
+
+    /// Persist durable queue intent to the sole SQLite authority.
+    pub fn save_queue(&mut self) {
+        if let Err(error) = self.persist_queue_state() {
+            log::error!(
+                "could not persist conversion queue SQLite state: {}",
+                error
+            );
             self.set_status(format!(
-                "Queue persistence degraded; in-memory work is unchanged ({})",
-                errors.join("; ")
+                "Queue persistence degraded; in-memory work is unchanged ({error})"
             ));
         }
     }
@@ -15201,6 +15355,55 @@ mod app_startup_options_tests {
             1,
             "explicit file-backed test DB should persist across AppState instances"
         );
+    }
+}
+
+#[cfg(test)]
+mod queue_persistence_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn run_acquisition_is_durable_as_interrupted_without_mutating_live_queued_state() {
+        // new_for_test disables persist_queue (to avoid the legacy real-JSON
+        // fallback), but this test exercises the durable acquisition write,
+        // which is gated on persist_queue. The database is an isolated temp DB
+        // and no startup JSON-import path runs here, so opting persistence back
+        // on is safe and is what makes the durable assertion meaningful.
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.config.conversion.persist_queue = true;
+        let mut item = ConversionItem::new_with_pipeline_settings(
+            PathBuf::from("/offline/Album..Remaster/track.flac"),
+            crate::convert::formats::FileFormat::Audio(AudioFormat::Flac),
+            crate::convert::formats::ConversionOptions::default(),
+            tonepoet_pipeline::PipelineSettings::default(),
+        );
+        item.status = crate::convert::ConversionStatus::Queued;
+        let item_id = item.id.clone();
+        let queued_at = item.queued_at.clone();
+        app.manager
+            .queue
+            .try_write()
+            .expect("queue write")
+            .add_item_direct(item);
+
+        let acquired = app
+            .persist_conversion_run_acquisition()
+            .expect("publish run acquisition");
+        assert_eq!(acquired.get(&item_id), Some(&queued_at));
+
+        let live = app.manager.get_items_clone();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].status, crate::convert::ConversionStatus::Queued);
+
+        let durable = app.db.load_queue_items().expect("load durable queue");
+        assert!(durable.degradation.is_none());
+        assert_eq!(durable.items.len(), 1);
+        assert_eq!(durable.items[0].id, item_id);
+        assert_eq!(
+            durable.items[0].status,
+            crate::convert::ConversionStatus::Interrupted
+        );
+        assert!(durable.items[0].can_retry());
     }
 }
 

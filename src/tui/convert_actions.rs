@@ -599,18 +599,18 @@ fn map_dither(dither: crate::convert::simple_wizard::DitherType) -> pipeline_enu
 
 /// Start processing all queued items. Shared between convert screen and queue screen.
 pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let ready_items: std::collections::HashMap<
-        String,
-        chrono::DateTime<chrono::Utc>,
-    > = app
-        .manager
-        .get_items_clone()
-        .into_iter()
-        .filter(|item| matches!(&item.status, ConversionStatus::Queued))
-        .map(|item| (item.id, item.queued_at))
-        .collect();
+    let acquired_items = match app.persist_conversion_run_acquisition() {
+        Ok(items) => items,
+        Err(error) => {
+            log::error!(
+                "conversion run not started because durable acquisition failed: {error}"
+            );
+            app.set_status(format!("Conversion not started: {error}"));
+            return;
+        }
+    };
 
-    if ready_items.is_empty() {
+    if acquired_items.is_empty() {
         app.set_status("No items ready for conversion");
         return;
     }
@@ -618,7 +618,7 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     app.processing_active = true;
     let cancel_token = app
         .manager
-        .conversion_cancel_token_for_items(ready_items);
+        .conversion_cancel_token_for_items(acquired_items);
 
     let queue = app.manager.queue.clone();
     let processor_config = crate::convert::ProcessorConfig {
@@ -645,21 +645,23 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
             forward_conversion_events(progress_rx, lifecycle_rx, ui_tx).await;
         });
 
-        if let Err(e) = processor
+        let process_result = processor
             .process_queue_with_progress(queue.clone(), None)
-            .await
-        {
-            let _ = tx_clone
-                .send(AppMessage::ConversionError {
-                    message: format!("Conversion error: {}", e),
-                })
-                .await;
-        }
+            .await;
 
         // Processor finished — drop it so its broadcast sender closes,
         // which causes the forwarder to exit.
         drop(processor);
         let _ = progress_forwarder.await;
+
+        if let Err(error) = process_result {
+            let _ = tx_clone
+                .send(AppMessage::ConversionError {
+                    message: format!("Conversion error: {}", error),
+                })
+                .await;
+            return;
+        }
 
         if let Ok(q) = queue.try_read() {
             let completed = q

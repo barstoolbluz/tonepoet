@@ -49785,7 +49785,10 @@ fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
         }
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             let idx = app.recent.overlay_selected;
-            app.recent.remove(idx);
+            if let Err(error) = app.recent.remove_with_db(idx, &app.db) {
+                app.set_status(format!("recent: could not delete entry: {error}"));
+                return;
+            }
             if app.recent.entries.is_empty() {
                 app.recent.close_overlay();
             }
@@ -49805,7 +49808,11 @@ fn handle_recent_overlay_key(app: &mut AppState, key: KeyEvent) {
                 // Drop the dead entry.
                 let idx = app.recent.entries.iter().position(|e| e.path == path);
                 if let Some(i) = idx {
-                    app.recent.remove(i);
+                    if let Err(error) = app.recent.remove_with_db(i, &app.db) {
+                        app.set_status(format!(
+                            "recent: file is missing and history cleanup failed: {error}"
+                        ));
+                    }
                 }
                 return;
             }
@@ -51354,6 +51361,7 @@ fn execute_confirm_action(
         }
         ConfirmAction::ClearQueue => {
             app.manager.clear_queue();
+            app.save_queue();
             app.set_status("Cleared queue");
         }
         ConfirmAction::QuitWithQueuedFileTransfers {
@@ -51874,7 +51882,7 @@ fn retry_failed(app: &mut AppState) {
         queue.retry_failed();
     }
     app.save_queue();
-    app.set_status("Re-queued failed items for retry");
+    app.set_status("Re-queued selected retryable items");
 }
 
 /// Handle mouse events

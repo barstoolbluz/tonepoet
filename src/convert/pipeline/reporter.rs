@@ -367,6 +367,7 @@ impl BroadcastReporter {
                 | crate::convert::ConversionStatus::Cancelled => state.last_progress,
                 crate::convert::ConversionStatus::Queued
                 | crate::convert::ConversionStatus::Paused
+                | crate::convert::ConversionStatus::Interrupted
                 | crate::convert::ConversionStatus::NotConfigured => 0.0,
             };
             state.last_progress = progress;

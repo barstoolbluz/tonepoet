@@ -400,6 +400,13 @@ fn render_item_status(item: &ConversionItem, _width: u16, theme: super::theme::T
             vec![Span::styled("Paused", Style::default().fg(theme.amber))],
             Style::default(),
         ),
+        ConversionStatus::Interrupted => (
+            vec![Span::styled(
+                "Interrupted — Retry",
+                Style::default().fg(theme.warning),
+            )],
+            Style::default(),
+        ),
         ConversionStatus::Cancelled => (
             vec![Span::styled(
                 "Cancelled",

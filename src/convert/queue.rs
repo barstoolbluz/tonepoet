@@ -138,6 +138,9 @@ pub enum ConversionStatus {
     },
     /// Paused by user
     Paused,
+    /// A worker was active when the process stopped. This is durable work
+    /// intent, not a resumable checkpoint: the user must explicitly Retry.
+    Interrupted,
     /// Cancelled by user
     Cancelled,
 }
@@ -432,7 +435,10 @@ impl ConversionItem {
             .and_then(|request| request.source.archive_password.as_ref())
             .map(|secret| secret.expose().to_string());
 
-        if self.is_finished() {
+        if matches!(
+            self.status,
+            ConversionStatus::Completed { .. } | ConversionStatus::CompletedWithActionErrors { .. }
+        ) {
             if self.archive_password.is_some()
                 || nested_legacy.is_some()
                 || self.archive_password_ref.is_some()
@@ -614,6 +620,7 @@ impl ConversionItem {
             self.status,
             ConversionStatus::Failed { .. }
                 | ConversionStatus::Partial { .. }
+                | ConversionStatus::Interrupted
                 | ConversionStatus::Cancelled
         )
     }
@@ -656,8 +663,10 @@ pub(crate) struct QueueSecretPersistReport {
 /// a legacy cleartext password, this boundary first publishes or validates an
 /// opaque reference. Any backend error aborts the queue publication rather
 /// than silently persisting a row that can no longer recover its credential.
-/// Terminal rows discard all archive-password state and report queue-owned
-/// references that may be retired only after the sanitized snapshot commits.
+/// Successful terminal rows discard all archive-password state and report
+/// queue-owned references that may be retired only after the sanitized
+/// snapshot commits. Retryable Failed/Partial/Cancelled rows retain their
+/// opaque reference so Retry remains executable after restart.
 pub(crate) fn prepare_archive_passwords_for_persistence(
     items: &mut [ConversionItem],
 ) -> Result<QueueSecretPersistReport, String> {
@@ -670,7 +679,10 @@ pub(crate) fn prepare_archive_passwords_for_persistence(
             .and_then(|request| request.source.archive_password.as_ref())
             .map(|secret| secret.expose().to_string());
 
-        if item.is_finished() {
+        if matches!(
+            item.status,
+            ConversionStatus::Completed { .. } | ConversionStatus::CompletedWithActionErrors { .. }
+        ) {
             if let Some(reference) = item.archive_password_ref.take() {
                 if crate::secret_store::reference_has_namespace(&reference, "queue-item") {
                     report.retire_references.push(reference);
@@ -793,7 +805,9 @@ fn _status_progress(status: &ConversionStatus) -> f32 {
         ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => {
             0.0
         }
-        ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => 0.0,
+        ConversionStatus::Failed { .. }
+        | ConversionStatus::Interrupted
+        | ConversionStatus::Cancelled => 0.0,
     }
 }
 
@@ -1307,6 +1321,11 @@ impl ConversionQueue {
 
     /// Retry failed items
     pub fn retry_failed(&mut self) {
+        for item in &mut self.items {
+            if item.selected && matches!(item.status, ConversionStatus::Interrupted) {
+                Self::reset_item_for_retry(item);
+            }
+        }
         // Failed/cancelled items may still reside in the active deque until a
         // reducer settles them. Normalize first so selected retry semantics do
         // not depend on reducer timing.
@@ -1316,12 +1335,7 @@ impl ConversionQueue {
 
         for mut item in self.completed.drain(..) {
             if item.selected && item.can_retry() {
-                item.status = ConversionStatus::Queued;
-                item.queued_at = Utc::now();
-                item.started_at = None;
-                item.completed_at = None;
-                item.output_path = None;
-                item.selected = false;
+                Self::reset_item_for_retry(&mut item);
                 to_retry.push(item);
             } else {
                 retained_completed.push(item);
@@ -1342,18 +1356,20 @@ impl ConversionQueue {
     /// stranded Queued rows inside `completed` that the processor never scans
     /// and persistence resurrected on the next session.
     pub fn retry_all_failed(&mut self) -> usize {
+        let mut count = 0usize;
+        for item in &mut self.items {
+            if matches!(item.status, ConversionStatus::Interrupted) {
+                Self::reset_item_for_retry(item);
+                count += 1;
+            }
+        }
         self.settle_finished();
         let mut to_retry = Vec::new();
         let mut retained_completed = Vec::with_capacity(self.completed.len());
 
         for mut item in self.completed.drain(..) {
             if item.can_retry() {
-                item.status = ConversionStatus::Queued;
-                item.queued_at = Utc::now();
-                item.started_at = None;
-                item.completed_at = None;
-                item.output_path = None;
-                item.selected = false;
+                Self::reset_item_for_retry(&mut item);
                 to_retry.push(item);
             } else {
                 retained_completed.push(item);
@@ -1361,11 +1377,20 @@ impl ConversionQueue {
         }
 
         self.completed = retained_completed;
-        let count = to_retry.len();
+        count += to_retry.len();
         for item in to_retry {
             self.items.push_back(item);
         }
         count
+    }
+
+    fn reset_item_for_retry(item: &mut ConversionItem) {
+        item.status = ConversionStatus::Queued;
+        item.queued_at = Utc::now();
+        item.started_at = None;
+        item.completed_at = None;
+        item.output_path = None;
+        item.selected = false;
     }
 
     /// Remove selected items and return the removed records' (id, status)
@@ -2031,6 +2056,28 @@ mod cue_sidecar_override_queue_tests {
             queue.all_items().into_iter().filter(|item| item.id == "failed-1").count() == 1,
             "no duplicate lifecycle records after bulk retry"
         );
+    }
+
+    #[test]
+    fn retry_all_failed_requeues_interrupted_active_item_explicitly() {
+        let mut queue = ConversionQueue::new();
+        let mut interrupted = ConversionItem::default();
+        interrupted.id = "interrupted-1".to_string();
+        interrupted.status = ConversionStatus::Interrupted;
+        interrupted.started_at = Some(chrono::Utc::now());
+        interrupted.completed_at = Some(chrono::Utc::now());
+        interrupted.output_path = Some(PathBuf::from("/tmp/stale.flac"));
+        queue.items_mut().push_back(interrupted);
+
+        let retried = queue.retry_all_failed();
+        assert_eq!(retried, 1);
+        let queued = queue.queued_items();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, "interrupted-1");
+        assert_eq!(queued[0].status, ConversionStatus::Queued);
+        assert!(queued[0].started_at.is_none());
+        assert!(queued[0].completed_at.is_none());
+        assert!(queued[0].output_path.is_none());
     }
 
     #[test]

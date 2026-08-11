@@ -1,16 +1,15 @@
 //! Recent files history — persistent list of files recently loaded as source.
 //!
-//! Stored at `~/.cache/tonepoet/recent.json`. Capped at MAX_ENTRIES (most recent
-//! first). Duplicates are deduplicated by path on insert, with the new timestamp
-//! floating the entry to the top.
+//! SQLite is the durable authority. `~/.cache/tonepoet/recent.json` is read only
+//! for the explicitly gated one-time legacy import. The list is capped at
+//! MAX_ENTRIES (most recent first), with duplicates deduplicated by path.
 
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Maximum number of recent entries to retain.
-pub const MAX_ENTRIES: usize = 50;
+pub const MAX_ENTRIES: usize = crate::db::RECENT_FILES_RETENTION_LIMIT;
 
 /// A single recent-files entry: path and last-used timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,68 +66,81 @@ pub struct RecentFilesState {
 }
 
 impl RecentFilesState {
-    /// Load the recent files list from disk, or return an empty state if the
-    /// file doesn't exist or can't be parsed.
-    pub fn load() -> Self {
-        let path = Self::storage_path();
-        let mut state = Self::default();
-        if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(entries) = serde_json::from_str::<Vec<RecentEntry>>(&text) {
-                state.entries = entries;
+    /// Load the SQLite authority, performing the one-time JSON import only
+    /// while the durable marker says it has not completed.
+    pub fn load_from_db(db: &crate::db::Database) -> Result<Self, String> {
+        if !db.recent_legacy_import_done()? {
+            if db.has_recent_items()? {
+                let _ = db.publish_legacy_recent_import(&[])?;
+            } else {
+                let entries = Self::load_legacy_json_for_import()?;
+                let rows = entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.path.display().to_string(),
+                            entry.timestamp.min(i64::MAX as u64) as i64,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if matches!(
+                    db.publish_legacy_recent_import(&rows)?,
+                    crate::db::LegacyImportPublication::Imported
+                ) {
+                    Self::remove_legacy_json_after_import();
+                }
             }
         }
-        state
+
+        let rows = db.list_recent(MAX_ENTRIES)?;
+        Ok(Self {
+            entries: rows
+                .into_iter()
+                .map(|(path, ts)| RecentEntry {
+                    path: PathBuf::from(path),
+                    timestamp: ts.max(0) as u64,
+                })
+                .collect(),
+            ..Self::default()
+        })
     }
 
-    /// Record a file as recently used: prepend (deduping), trim to MAX_ENTRIES,
-    /// persist to disk. Safe to call frequently.
-    pub fn record_use(&mut self, path: &Path) {
-        self.record_use_in_memory(path);
-        let _ = self.save();
+    fn load_legacy_json_for_import() -> Result<Vec<RecentEntry>, String> {
+        let path = Self::legacy_json_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "read legacy recent-files JSON {:?}: {error}",
+                    path
+                ));
+            }
+        };
+        serde_json::from_str::<Vec<RecentEntry>>(&text)
+            .map_err(|e| format!("parse legacy recent-files JSON {:?}: {e}", path))
     }
 
-    /// Record a file as recently used, persisting to both JSON and SQLite.
+    fn remove_legacy_json_after_import() {
+        let path = Self::legacy_json_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::info!("Retired legacy recent-files JSON after SQLite import"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "SQLite recent-files import succeeded, but legacy JSON could not be removed: {}",
+                error
+            ),
+        }
+    }
+
+    /// Record a file as recently used. SQLite is the only durable writer.
     pub fn record_use_with_db(&mut self, path: &Path, db: &crate::db::Database) {
         self.record_use_in_memory(path);
-        let _ = self.save();
-        let _ = db.record_recent(&path.display().to_string());
-    }
-
-    /// Load entries from SQLite DB (preferred) with JSON import fallback.
-    /// On first run: if DB is empty and JSON exists, imports JSON → DB.
-    pub fn load_from_db(db: &crate::db::Database) -> Self {
-        let mut state = Self::default();
-
-        // Try loading from DB first.
-        if let Ok(rows) = db.list_recent(MAX_ENTRIES) {
-            if !rows.is_empty() {
-                state.entries = rows
-                    .into_iter()
-                    .map(|(path, ts)| RecentEntry {
-                        path: PathBuf::from(path),
-                        timestamp: ts as u64,
-                    })
-                    .collect();
-                return state;
-            }
+        if let Err(error) = db.record_recent(&path.display().to_string()) {
+            log::error!("could not persist recent-file access: {error}");
         }
-
-        // DB empty — try importing from JSON.
-        let json_path = Self::storage_path();
-        if let Ok(text) = std::fs::read_to_string(&json_path) {
-            if let Ok(entries) = serde_json::from_str::<Vec<RecentEntry>>(&text) {
-                // Import into DB with original timestamps.
-                for entry in &entries {
-                    let _ = db.record_recent_at(
-                        &entry.path.display().to_string(),
-                        entry.timestamp as i64,
-                    );
-                }
-                state.entries = entries;
-            }
-        }
-
-        state
     }
 
     /// In-memory half of `record_use`: state mutation only, no disk IO.
@@ -150,11 +162,19 @@ impl RecentFilesState {
         }
     }
 
-    /// Remove the entry at `index`. Persists to disk.
-    pub fn remove(&mut self, index: usize) {
-        if self.remove_in_memory(index) {
-            let _ = self.save();
-        }
+    /// Remove an entry durably. The SQLite delete commits before the in-memory
+    /// list changes, so a failed write cannot present a deletion that will
+    /// resurrect on restart.
+    pub fn remove_with_db(
+        &mut self,
+        index: usize,
+        db: &crate::db::Database,
+    ) -> Result<bool, String> {
+        let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
+            return Ok(false);
+        };
+        db.remove_recent(&path.display().to_string())?;
+        Ok(self.remove_in_memory(index))
     }
 
     /// In-memory half of `remove`: state mutation only, no disk IO.
@@ -174,20 +194,8 @@ impl RecentFilesState {
         true
     }
 
-    /// Persist current entries to disk. Best-effort: returns Err on I/O failure
-    /// but callers can ignore it (non-critical feature).
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::storage_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(&self.entries)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        fs::write(&path, text)
-    }
-
-    /// Path to the recent files JSON file.
-    fn storage_path() -> PathBuf {
+    /// Path to the import-only legacy recent-files JSON file.
+    fn legacy_json_path() -> PathBuf {
         dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tonepoet")
@@ -492,6 +500,90 @@ mod tests {
         assert!(s.remove_in_memory(0));
         assert_eq!(s.entries.len(), 0);
         assert_eq!(s.overlay_selected, 0);
+    }
+
+    #[test]
+    fn remove_with_db_deletes_sqlite_before_memory() {
+        let db = crate::db::Database::open_memory().expect("database");
+        db.record_recent_at("/tmp/durable.flac", 123)
+            .expect("seed durable recent");
+        let mut state = RecentFilesState {
+            entries: vec![RecentEntry {
+                path: PathBuf::from("/tmp/durable.flac"),
+                timestamp: 123,
+            }],
+            ..RecentFilesState::default()
+        };
+
+        assert!(state.remove_with_db(0, &db).expect("durable remove"));
+        assert!(state.entries.is_empty());
+        assert!(db.list_recent(MAX_ENTRIES).expect("list recents").is_empty());
+    }
+
+    #[test]
+    fn durable_delete_stays_deleted_after_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        {
+            let db = crate::db::Database::open_path(&db_path).expect("database");
+            db.record_recent_at("/tmp/restart-delete.flac", 123)
+                .expect("seed recent");
+            let mut state = RecentFilesState::load_from_db(&db).expect("load recent authority");
+            assert_eq!(state.entries.len(), 1);
+            assert!(state.remove_with_db(0, &db).expect("durable delete"));
+        }
+
+        let db = crate::db::Database::open_path(&db_path).expect("reopen database");
+        let state = RecentFilesState::load_from_db(&db).expect("reload recent authority");
+        assert!(state.entries.is_empty(), "deleted recent must not resurrect");
+    }
+
+    #[test]
+    fn missing_file_auto_drop_path_stays_deleted_after_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let missing = temp.path().join("unmounted-source.flac");
+        assert!(!missing.exists());
+        {
+            let db = crate::db::Database::open_path(&db_path).expect("database");
+            db.record_recent_at(&missing.display().to_string(), 321)
+                .expect("seed missing recent");
+            let mut state = RecentFilesState::load_from_db(&db).expect("load recent authority");
+            assert_eq!(state.entries.len(), 1);
+            // This is the same durable operation used by the Enter-key
+            // missing-file auto-drop path in keybindings.rs.
+            assert!(state.remove_with_db(0, &db).expect("auto-drop missing recent"));
+        }
+
+        let db = crate::db::Database::open_path(&db_path).expect("reopen database");
+        let state = RecentFilesState::load_from_db(&db).expect("reload recent authority");
+        assert!(state.entries.is_empty(), "auto-dropped recent must not resurrect");
+    }
+
+    #[test]
+    fn remove_with_db_failure_preserves_memory_for_restart_consistency() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("missing-recent-table.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw database");
+            conn.pragma_update(None, "user_version", 23)
+                .expect("stamp current version without tables");
+        }
+        // A current-version database intentionally bypasses migration DDL, so
+        // this fixture gives the durable delete path a deterministic missing
+        // table failure without exposing Database internals across modules.
+        let db = crate::db::Database::open_path(&path).expect("database without recent table");
+        let mut state = RecentFilesState {
+            entries: vec![RecentEntry {
+                path: PathBuf::from("/tmp/durable.flac"),
+                timestamp: 123,
+            }],
+            ..RecentFilesState::default()
+        };
+
+        assert!(state.remove_with_db(0, &db).is_err());
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].path, PathBuf::from("/tmp/durable.flac"));
     }
 
     // ── relative_time boundaries ─────────────────────────────────────

@@ -8,7 +8,42 @@ use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 22;
+const CURRENT_VERSION: u32 = 23;
+
+const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
+pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyImportPublication {
+    Imported,
+    AlreadyDone,
+    ExistingSqliteAuthority,
+}
+
+#[derive(Debug)]
+pub struct QueueLoadOutcome {
+    pub items: Vec<crate::convert::ConversionItem>,
+    /// A non-fatal persistence error that occurred after the authoritative
+    /// rows were read. The caller must surface this as degraded persistence
+    /// while still presenting `items`; hiding salvageable work would turn a
+    /// maintenance-write failure into an apparent empty queue.
+    pub degradation: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueSyncReport {
+    pub rows_written: usize,
+    pub rows_deleted: usize,
+    /// References removed or superseded by the committed SQLite mutation.
+    /// Callers that can still have live workers must defer retirement for any
+    /// reference those workers still own.
+    pub retire_references: Vec<String>,
+    /// Queue-owned references that remain durably reachable from the rows
+    /// published by this transaction. Callers use this to avoid retiring a
+    /// reference that was removed and then deliberately reused before the
+    /// persistence boundary completed.
+    pub live_references: Vec<String>,
+}
 
 // ── CTDB parity matrix cache tunables ─────────────────────────────────
 //
@@ -365,6 +400,10 @@ impl Database {
         }
         if version < 22 {
             self.run_migration_step(22, Self::migrate_v22)?;
+            version = 22;
+        }
+        if version < 23 {
+            self.run_migration_step(23, Self::migrate_v23)?;
         }
 
         Ok(())
@@ -1260,6 +1299,80 @@ impl Database {
         Ok(())
     }
 
+    /// v23: make SQLite the explicit queue/recent-files authority.
+    ///
+    /// The queue gains a durable ordinal, while the singleton import-state row
+    /// records whether each legacy JSON store has already been retired as a
+    /// startup authority. Existing dual-write users are initialized as done
+    /// whenever the corresponding SQLite table already contains rows.
+    fn migrate_v23(conn: &Connection) -> Result<(), String> {
+        if !Self::legacy_add_column_present(
+            conn,
+            "v23",
+            "conversion_queue",
+            "position",
+            "INTEGER",
+            true,
+            Some("0"),
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE conversion_queue ADD COLUMN position INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|error| format!("v23 migration add conversion_queue.position: {error}"))?;
+        }
+
+        // Rowid is the best ordering signal available in the pre-v23 schema:
+        // the historical full rewrite inserted rows in queue order. Re-number
+        // every row inside this migration transaction so an idempotent retry
+        // cannot leave duplicate default-zero ordinals behind.
+        let mut rows = conn
+            .prepare("SELECT rowid, id FROM conversion_queue ORDER BY rowid")
+            .map_err(|error| format!("v23 migration read queue row order: {error}"))?;
+        let queue_rows = rows
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| format!("v23 migration query queue row order: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("v23 migration decode queue row order: {error}"))?;
+        drop(rows);
+        for (position, (rowid, _id)) in queue_rows.iter().enumerate() {
+            conn.execute(
+                "UPDATE conversion_queue SET position = ?1 WHERE rowid = ?2",
+                params![position as i64, rowid],
+            )
+            .map_err(|error| format!("v23 migration assign queue position: {error}"))?;
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS legacy_json_import_state (
+                id                  INTEGER PRIMARY KEY CHECK (id = 1),
+                queue_import_done   INTEGER NOT NULL CHECK (queue_import_done IN (0, 1)),
+                recent_import_done  INTEGER NOT NULL CHECK (recent_import_done IN (0, 1))
+            );",
+        )
+        .map_err(|error| format!("v23 migration create legacy import state: {error}"))?;
+
+        // Existing dual-write builds could already have accumulated an
+        // unbounded SQLite recent-files table. Enforce the product retention
+        // bound during the upgrade itself; subsequent record/update calls keep
+        // the bound transactionally.
+        Self::prune_recent_rows(conn, RECENT_FILES_RETENTION_LIMIT)
+            .map_err(|error| format!("v23 migration {error}"))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO legacy_json_import_state (
+                id, queue_import_done, recent_import_done
+             ) VALUES (
+                ?1,
+                CASE WHEN EXISTS (SELECT 1 FROM conversion_queue LIMIT 1) THEN 1 ELSE 0 END,
+                CASE WHEN EXISTS (SELECT 1 FROM recent_files LIMIT 1) THEN 1 ELSE 0 END
+             )",
+            [LEGACY_IMPORT_STATE_ROW_ID],
+        )
+        .map_err(|error| format!("v23 migration initialize legacy import state: {error}"))?;
+
+        Ok(())
+    }
+
     /// Look up cached AR results for a file. Returns None if not cached
     /// or stale (mtime/size changed).
     pub fn get_cached_ar(
@@ -1957,131 +2070,477 @@ impl Database {
 
     // ── Conversion queue ─────────────────────────────────────────
 
-    /// Full sync: replace all queue rows with the current in-memory state.
-    /// Runs in a transaction for atomicity.
-    pub fn sync_queue(&self, items: &[&crate::convert::ConversionItem]) -> Result<(), String> {
+    fn prepare_queue_items_for_persistence(
+        items: &[&crate::convert::ConversionItem],
+    ) -> Result<
+        (
+            Vec<crate::convert::ConversionItem>,
+            crate::convert::queue::QueueSecretPersistReport,
+        ),
+        String,
+    > {
         let mut persisted_items = items
             .iter()
+            .filter(|item| {
+                !crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+                    &item.input_path,
+                )
+            })
             .map(|item| (*item).clone())
             .collect::<Vec<_>>();
+
+        for item in &mut persisted_items {
+            if matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
+                item.status = crate::convert::ConversionStatus::Interrupted;
+                item.started_at = None;
+                item.completed_at = None;
+            } else if matches!(item.status, crate::convert::ConversionStatus::Interrupted) {
+                // Interrupted work is a durable intent state, never a resumable
+                // worker checkpoint. Keep timestamps/progress from implying a
+                // mid-tool invocation can continue after restart.
+                item.started_at = None;
+                item.completed_at = None;
+            }
+        }
+
         let persist_report =
             crate::convert::queue::prepare_archive_passwords_for_persistence(
                 &mut persisted_items,
             )?;
+        Ok((persisted_items, persist_report))
+    }
+
+    fn persisted_queue_reference(item_json: &str) -> Option<String> {
+        // Extract the top-level reference even when the rest of a historical
+        // row is no longer decodable as `ConversionItem`. This lets salvage
+        // deletes retire a queue-owned credential after commit instead of
+        // leaking it merely because an unrelated field is malformed.
+        serde_json::from_str::<serde_json::Value>(item_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("archive_password_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|reference| {
+                crate::secret_store::reference_has_namespace(reference, "queue-item")
+            })
+    }
+
+    fn dedup_unreferenced_queue_secret_refs(
+        references: &mut Vec<String>,
+        persisted_items: &[crate::convert::ConversionItem],
+    ) {
+        let live = persisted_items
+            .iter()
+            .filter_map(|item| item.archive_password_ref.as_ref())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        references.retain(|reference| !live.contains(reference));
+        references.sort();
+        references.dedup();
+    }
+
+    fn durable_queue_secret_refs(
+        persisted_items: &[crate::convert::ConversionItem],
+    ) -> Vec<String> {
+        let mut references = persisted_items
+            .iter()
+            .filter_map(|item| item.archive_password_ref.as_ref())
+            .filter(|reference| {
+                crate::secret_store::reference_has_namespace(reference, "queue-item")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        references.sort();
+        references.dedup();
+        references
+    }
+
+    /// Incrementally reconcile SQLite with the current durable queue intent.
+    ///
+    /// The method serializes the desired snapshot to detect changes, but only
+    /// writes rows whose JSON or ordinal changed and only deletes rows that are
+    /// no longer present. This keeps terminal updates O(changed rows) at the
+    /// SQLite write layer while preserving one transaction for row/order
+    /// consistency. Queue-owned references stripped from successful terminal
+    /// rows are retired only after commit. References belonging to
+    /// deleted/superseded rows are returned to the caller because a live
+    /// worker may still own one.
+    pub fn sync_queue(
+        &self,
+        items: &[&crate::convert::ConversionItem],
+    ) -> Result<QueueSyncReport, String> {
+        let (persisted_items, persist_report) =
+            Self::prepare_queue_items_for_persistence(items)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("queue tx begin: {e}"))?;
+
+        let mut statement = tx
+            .prepare("SELECT id, item_json, position FROM conversion_queue")
+            .map_err(|e| format!("queue reconcile prepare existing rows: {e}"))?;
+        let existing_rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| format!("queue reconcile query existing rows: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("queue reconcile decode existing row: {e}"))?;
+        drop(statement);
+
+        let mut existing = existing_rows
+            .into_iter()
+            .map(|(id, json, position)| (id, (json, position)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut report = QueueSyncReport::default();
+
+        for (position, item) in persisted_items.iter().enumerate() {
+            let json = serde_json::to_string(item)
+                .map_err(|e| format!("queue item serialize: {e}"))?;
+            match existing.remove(&item.id) {
+                Some((old_json, old_position)) => {
+                    let old_reference = Self::persisted_queue_reference(&old_json);
+                    if old_reference.as_deref() != item.archive_password_ref.as_deref() {
+                        if let Some(reference) = old_reference {
+                            report.retire_references.push(reference);
+                        }
+                    }
+                    if old_json != json || old_position != position as i64 {
+                        tx.execute(
+                            "INSERT INTO conversion_queue (id, item_json, position)
+                             VALUES (?1, ?2, ?3)
+                             ON CONFLICT(id) DO UPDATE SET
+                                item_json = excluded.item_json,
+                                position = excluded.position",
+                            params![item.id, json, position as i64],
+                        )
+                        .map_err(|e| format!("queue item upsert: {e}"))?;
+                        report.rows_written += 1;
+                    }
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO conversion_queue (id, item_json, position)
+                         VALUES (?1, ?2, ?3)",
+                        params![item.id, json, position as i64],
+                    )
+                    .map_err(|e| format!("queue item insert: {e}"))?;
+                    report.rows_written += 1;
+                }
+            }
+        }
+
+        for (id, (old_json, _)) in existing {
+            if let Some(reference) = Self::persisted_queue_reference(&old_json) {
+                report.retire_references.push(reference);
+            }
+            tx.execute("DELETE FROM conversion_queue WHERE id = ?1", [&id])
+                .map_err(|e| format!("queue item delete: {e}"))?;
+            report.rows_deleted += 1;
+        }
+
+        tx.commit().map_err(|e| format!("queue tx commit: {e}"))?;
+
+        let mut immediately_retirable = persist_report.retire_references;
+        Self::dedup_unreferenced_queue_secret_refs(
+            &mut immediately_retirable,
+            &persisted_items,
+        );
+        crate::convert::queue::retire_queue_owned_secret_references(
+            &immediately_retirable,
+        );
+        Self::dedup_unreferenced_queue_secret_refs(
+            &mut report.retire_references,
+            &persisted_items,
+        );
+        report.live_references = Self::durable_queue_secret_refs(&persisted_items);
+        Ok(report)
+    }
+
+    /// Full-snapshot publication retained for imports, repair tooling, and
+    /// tests. Ordinary application saves use `sync_queue` above.
+    pub fn sync_queue_snapshot(
+        &self,
+        items: &[&crate::convert::ConversionItem],
+    ) -> Result<QueueSyncReport, String> {
+        let (persisted_items, persist_report) =
+            Self::prepare_queue_items_for_persistence(items)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("queue snapshot tx begin: {e}"))?;
+
+        let mut old_statement = tx
+            .prepare("SELECT item_json FROM conversion_queue")
+            .map_err(|e| format!("queue snapshot read old refs: {e}"))?;
+        let old_json = old_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("queue snapshot query old refs: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("queue snapshot decode old row: {e}"))?;
+        drop(old_statement);
+        let old_row_count = old_json.len();
+        let mut retire_references = old_json
+            .iter()
+            .filter_map(|json| Self::persisted_queue_reference(json))
+            .collect::<Vec<_>>();
+
+        tx.execute("DELETE FROM conversion_queue", [])
+            .map_err(|e| format!("queue snapshot clear: {e}"))?;
+        for (position, item) in persisted_items.iter().enumerate() {
+            let json = serde_json::to_string(item)
+                .map_err(|e| format!("queue item serialize: {e}"))?;
+            tx.execute(
+                "INSERT INTO conversion_queue (id, item_json, position) VALUES (?1, ?2, ?3)",
+                params![item.id, json, position as i64],
+            )
+            .map_err(|e| format!("queue snapshot insert: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("queue snapshot tx commit: {e}"))?;
+        let mut immediately_retirable = persist_report.retire_references;
+        Self::dedup_unreferenced_queue_secret_refs(
+            &mut immediately_retirable,
+            &persisted_items,
+        );
+        crate::convert::queue::retire_queue_owned_secret_references(
+            &immediately_retirable,
+        );
+        Self::dedup_unreferenced_queue_secret_refs(
+            &mut retire_references,
+            &persisted_items,
+        );
+        Ok(QueueSyncReport {
+            rows_written: persisted_items.len(),
+            rows_deleted: old_row_count,
+            retire_references,
+            live_references: Self::durable_queue_secret_refs(&persisted_items),
+        })
+    }
+
+    pub fn queue_legacy_import_done(&self) -> Result<bool, String> {
+        self.legacy_import_flag("queue_import_done")
+    }
+
+    /// Publish the one-time legacy JSON queue import and its marker in the same
+    /// SQLite transaction. Existing SQLite rows always win over legacy JSON.
+    pub fn publish_legacy_queue_import(
+        &self,
+        items: &[crate::convert::ConversionItem],
+        retire_after_import: &[String],
+    ) -> Result<LegacyImportPublication, String> {
+        // Fast no-op before secret preparation. The transaction below still
+        // rechecks the marker to close a concurrent-start race, but ordinary
+        // restarts must not touch secret storage once import is complete.
+        if self.queue_legacy_import_done()? {
+            return Ok(LegacyImportPublication::AlreadyDone);
+        }
 
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("queue tx begin: {}", e))?;
+            .map_err(|e| format!("queue legacy import tx begin: {e}"))?;
 
-        tx.execute("DELETE FROM conversion_queue", [])
-            .map_err(|e| format!("queue clear: {}", e))?;
+        let done = Self::legacy_import_flag_on(&tx, "queue_import_done")?;
+        if done {
+            tx.commit()
+                .map_err(|e| format!("queue legacy import no-op commit: {e}"))?;
+            return Ok(LegacyImportPublication::AlreadyDone);
+        }
 
-        for item in &persisted_items {
-            let json =
-                serde_json::to_string(item).map_err(|e| format!("queue item serialize: {}", e))?;
-            tx.execute(
-                "INSERT INTO conversion_queue (id, item_json) VALUES (?1, ?2)",
-                params![item.id, json],
+        let existing: i64 = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversion_queue LIMIT 1)",
+                [],
+                |row| row.get(0),
             )
-            .map_err(|e| format!("queue item insert: {}", e))?;
+            .map_err(|e| format!("queue legacy import probe existing rows: {e}"))?;
+        if existing != 0 {
+            tx.execute(
+                "UPDATE legacy_json_import_state SET queue_import_done = 1 WHERE id = ?1",
+                [LEGACY_IMPORT_STATE_ROW_ID],
+            )
+            .map_err(|e| format!("queue legacy import mark existing authority: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("queue legacy import authority commit: {e}"))?;
+            return Ok(LegacyImportPublication::ExistingSqliteAuthority);
         }
 
-        tx.commit().map_err(|e| format!("queue tx commit: {}", e))?;
-        crate::convert::queue::retire_queue_owned_secret_references(
-            &persist_report.retire_references,
-        );
-        Ok(())
+        // Claim SQLite's write reservation before secret preparation. Two app
+        // processes can observe a pending marker concurrently; the loser must
+        // fail here, before it can overwrite a stable secret reference that
+        // belongs to the winner's committed import. The update is intentionally
+        // value-preserving and remains part of the import transaction.
+        tx.execute(
+            "UPDATE legacy_json_import_state
+             SET queue_import_done = queue_import_done
+             WHERE id = ?1",
+            [LEGACY_IMPORT_STATE_ROW_ID],
+        )
+        .map_err(|e| format!("queue legacy import claim authority: {e}"))?;
+
+        let refs = items.iter().collect::<Vec<_>>();
+        let (persisted_items, persist_report) =
+            Self::prepare_queue_items_for_persistence(&refs)?;
+
+        for (position, item) in persisted_items.iter().enumerate() {
+            let json = serde_json::to_string(item)
+                .map_err(|e| format!("queue legacy import serialize: {e}"))?;
+            tx.execute(
+                "INSERT INTO conversion_queue (id, item_json, position) VALUES (?1, ?2, ?3)",
+                params![item.id, json, position as i64],
+            )
+            .map_err(|e| format!("queue legacy import insert: {e}"))?;
+        }
+        tx.execute(
+            "UPDATE legacy_json_import_state SET queue_import_done = 1 WHERE id = ?1",
+            [LEGACY_IMPORT_STATE_ROW_ID],
+        )
+        .map_err(|e| format!("queue legacy import mark done: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("queue legacy import commit: {e}"))?;
+
+        let mut retire = persist_report.retire_references;
+        retire.extend(retire_after_import.iter().cloned());
+        Self::dedup_unreferenced_queue_secret_refs(&mut retire, &persisted_items);
+        crate::convert::queue::retire_queue_owned_secret_references(&retire);
+        Ok(LegacyImportPublication::Imported)
     }
 
-    /// Load all queue items from SQLite. Returns deserialized items with
-    /// path validation (same as the JSON loader).
-    pub fn load_queue_items(&self) -> Vec<crate::convert::ConversionItem> {
-        let mut stmt = match self.conn.prepare("SELECT item_json FROM conversion_queue") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+    /// Load all queue items from SQLite in explicit durable order. Whole-query
+    /// failures are returned to the caller; malformed individual rows are
+    /// salvaged by omission and reconciled transactionally afterward.
+    pub fn load_queue_items(&self) -> Result<QueueLoadOutcome, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, item_json FROM conversion_queue ORDER BY position ASC, id ASC",
+            )
+            .map_err(|e| format!("queue load prepare: {e}"))?;
 
-        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("queue load query: {e}"))?;
 
-        let mut discarded_row = false;
+        let mut maintenance_needed = false;
+        let mut retire_after_maintenance = Vec::new();
         let mut items = Vec::<crate::convert::ConversionItem>::new();
-        for row in rows {
-            match row {
-                Ok(json) => match serde_json::from_str::<crate::convert::ConversionItem>(&json) {
-                    Ok(item) => items.push(item),
-                    Err(error) => {
-                        discarded_row = true;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("queue load step: {e}"))?
+        {
+            let id = match row.get::<_, String>(0) {
+                Ok(id) => id,
+                Err(error) => {
+                    maintenance_needed = true;
+                    log::error!(
+                        "Discarding persisted SQLite queue row with unreadable id: {error}"
+                    );
+                    continue;
+                }
+            };
+            let json = match row.get::<_, String>(1) {
+                Ok(json) => json,
+                Err(error) => {
+                    maintenance_needed = true;
+                    log::error!(
+                        "Discarding persisted SQLite queue row '{id}' with unreadable payload: {error}"
+                    );
+                    continue;
+                }
+            };
+            match serde_json::from_str::<crate::convert::ConversionItem>(&json) {
+                Ok(mut item) => {
+                    if item.id != id {
+                        maintenance_needed = true;
                         log::error!(
-                            "Discarding malformed persisted SQLite queue row during secret sanitization: {}",
-                            error
+                            "Discarding persisted SQLite queue row whose primary key '{}' disagrees with payload id '{}'",
+                            id,
+                            item.id
                         );
+                        if let Some(reference) = item.archive_password_ref.take() {
+                            retire_after_maintenance.push(reference);
+                        }
+                        continue;
                     }
-                },
+                    if matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
+                        item.status = crate::convert::ConversionStatus::Interrupted;
+                        item.started_at = None;
+                        item.completed_at = None;
+                        maintenance_needed = true;
+                    }
+                    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+                        &item.input_path,
+                    ) {
+                        maintenance_needed = true;
+                        if let Some(reference) = item.archive_password_ref.take() {
+                            retire_after_maintenance.push(reference);
+                        }
+                        log::warn!(
+                            "Discarding synthetic CUE artifact from persisted SQLite queue: {:?}",
+                            item.input_path
+                        );
+                        continue;
+                    }
+                    items.push(item);
+                }
                 Err(error) => {
-                    discarded_row = true;
+                    maintenance_needed = true;
                     log::error!(
-                        "Discarding unreadable persisted SQLite queue row during secret sanitization: {}",
+                        "Discarding malformed persisted SQLite queue row '{}': {}",
+                        id,
                         error
                     );
                 }
             }
         }
+        drop(rows);
         drop(stmt);
-        let mut secret_report =
+
+        let secret_report =
             crate::convert::queue::restore_archive_passwords_after_load(&mut items);
-        let original_len = items.len();
-        items.retain(|item| {
-            let path_str = item.input_path.to_string_lossy();
-            if path_str.contains("..") {
-                if let Some(reference) = item.archive_password_ref.as_ref() {
-                    secret_report.retire_references.push(reference.clone());
-                }
-                log::warn!(
-                    "Filtered queue item with suspicious path: {:?}",
-                    item.input_path
-                );
-                return false;
-            }
-            if !item.input_path.exists() {
-                if let Some(reference) = item.archive_password_ref.as_ref() {
-                    secret_report.retire_references.push(reference.clone());
-                }
-                log::info!("Filtered queue item - file gone: {:?}", item.input_path);
-                return false;
-            }
-            true
-        });
-        if discarded_row || secret_report.rewrite_required || items.len() != original_len {
-            let refs: Vec<&crate::convert::ConversionItem> = items.iter().collect();
+        maintenance_needed |= secret_report.rewrite_required;
+        let mut degradation = None;
+        if maintenance_needed {
+            let refs = items.iter().collect::<Vec<_>>();
             match self.sync_queue(&refs) {
-                Ok(()) => {
+                Ok(sync_report) => {
+                    retire_after_maintenance.extend(secret_report.retire_references);
+                    retire_after_maintenance.extend(sync_report.retire_references);
                     crate::convert::queue::retire_queue_owned_secret_references(
-                        &secret_report.retire_references,
+                        &retire_after_maintenance,
                     );
                 }
                 Err(error) => {
-                    log::error!(
-                        "Sanitized SQLite queue state but could not rewrite queue rows: {}",
-                        error
+                    let message = format!(
+                        "SQLite queue rows were loaded and sanitized in memory, but the maintenance publication failed: {error}"
                     );
+                    log::error!("{message}");
+                    degradation = Some(message);
                 }
             }
         }
-        items
+        Ok(QueueLoadOutcome { items, degradation })
     }
 
-    /// Check if the queue table has any rows.
-    pub fn has_queue_items(&self) -> bool {
+    /// Check if the queue table has any rows without collapsing read errors to
+    /// an empty authority.
+    pub fn has_queue_items(&self) -> Result<bool, String> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM conversion_queue", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap_or(0)
-            > 0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversion_queue LIMIT 1)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(|e| format!("queue authority probe: {e}"))
     }
 
     // ── Conversion history ───────────────────────────────────────
@@ -3333,6 +3792,24 @@ impl Database {
 
     // ── Recent files ─────────────────────────────────────────────
 
+    fn legacy_import_flag(&self, flag: &str) -> Result<bool, String> {
+        Self::legacy_import_flag_on(&self.conn, flag)
+    }
+
+    fn legacy_import_flag_on(conn: &Connection, flag: &str) -> Result<bool, String> {
+        let column = match flag {
+            "queue_import_done" => "queue_import_done",
+            "recent_import_done" => "recent_import_done",
+            _ => return Err(format!("unknown legacy import flag: {flag}")),
+        };
+        let sql = format!(
+            "SELECT {column} FROM legacy_json_import_state WHERE id = ?1"
+        );
+        conn.query_row(&sql, [LEGACY_IMPORT_STATE_ROW_ID], |row| row.get::<_, i64>(0))
+            .map(|value| value != 0)
+            .map_err(|e| format!("read {column}: {e}"))
+    }
+
     /// Record a file access (upsert with current timestamp).
     pub fn record_recent(&self, file_path: &str) -> Result<(), String> {
         let now = std::time::SystemTime::now()
@@ -3344,16 +3821,42 @@ impl Database {
 
     /// Record a file access with a specific timestamp (for imports).
     pub fn record_recent_at(&self, file_path: &str, timestamp: i64) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT INTO recent_files (file_path, accessed_at, access_count)
-             VALUES (?1, ?2, 1)
-             ON CONFLICT(file_path) DO UPDATE SET
-                accessed_at = ?2,
-                access_count = access_count + 1",
-                params![file_path, timestamp],
-            )
-            .map_err(|e| format!("recent insert: {}", e))?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("recent tx begin: {e}"))?;
+        // REPLACE intentionally refreshes rowid. `accessed_at` has second
+        // resolution, so rowid is the best in-schema tie-break signal for two
+        // accesses in the same second (and for re-accessing an existing path).
+        // Preserve access_count explicitly across the delete+insert semantics.
+        tx.execute(
+            "INSERT OR REPLACE INTO recent_files (file_path, accessed_at, access_count)
+             VALUES (
+                 ?1,
+                 ?2,
+                 COALESCE((
+                     SELECT access_count + 1 FROM recent_files WHERE file_path = ?1
+                 ), 1)
+             )",
+            params![file_path, timestamp],
+        )
+        .map_err(|e| format!("recent insert: {e}"))?;
+        Self::prune_recent_rows(&tx, RECENT_FILES_RETENTION_LIMIT)?;
+        tx.commit().map_err(|e| format!("recent tx commit: {e}"))?;
+        Ok(())
+    }
+
+    fn prune_recent_rows(conn: &Connection, limit: usize) -> Result<(), String> {
+        conn.execute(
+            "DELETE FROM recent_files
+             WHERE file_path IN (
+                 SELECT file_path FROM recent_files
+                 ORDER BY accessed_at DESC, rowid DESC, file_path ASC
+                 LIMIT -1 OFFSET ?1
+             )",
+            [limit as i64],
+        )
+        .map_err(|e| format!("recent prune: {e}"))?;
         Ok(())
     }
 
@@ -3363,7 +3866,7 @@ impl Database {
             .conn
             .prepare(
                 "SELECT file_path, accessed_at FROM recent_files
-             ORDER BY accessed_at DESC LIMIT ?1",
+             ORDER BY accessed_at DESC, rowid DESC, file_path ASC LIMIT ?1",
             )
             .map_err(|e| format!("recent query: {}", e))?;
 
@@ -3375,11 +3878,103 @@ impl Database {
 
         let mut entries = Vec::new();
         for row in rows {
-            if let Ok(entry) = row {
-                entries.push(entry);
-            }
+            entries.push(row.map_err(|e| format!("recent row decode: {e}"))?);
         }
         Ok(entries)
+    }
+
+    pub fn remove_recent(&self, file_path: &str) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM recent_files WHERE file_path = ?1", [file_path])
+            .map_err(|e| format!("recent delete: {e}"))?;
+        Ok(())
+    }
+
+    pub fn recent_legacy_import_done(&self) -> Result<bool, String> {
+        self.legacy_import_flag("recent_import_done")
+    }
+
+    pub fn has_recent_items(&self) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM recent_files LIMIT 1)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(|e| format!("recent authority probe: {e}"))
+    }
+
+    pub fn publish_legacy_recent_import(
+        &self,
+        entries: &[(String, i64)],
+    ) -> Result<LegacyImportPublication, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("recent legacy import tx begin: {e}"))?;
+
+        let done = Self::legacy_import_flag_on(&tx, "recent_import_done")?;
+        if done {
+            tx.commit()
+                .map_err(|e| format!("recent legacy import no-op commit: {e}"))?;
+            return Ok(LegacyImportPublication::AlreadyDone);
+        }
+
+        let existing: i64 = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM recent_files LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("recent legacy import probe existing rows: {e}"))?;
+        if existing != 0 {
+            tx.execute(
+                "UPDATE legacy_json_import_state SET recent_import_done = 1 WHERE id = ?1",
+                [LEGACY_IMPORT_STATE_ROW_ID],
+            )
+            .map_err(|e| format!("recent legacy import mark existing authority: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("recent legacy import authority commit: {e}"))?;
+            return Ok(LegacyImportPublication::ExistingSqliteAuthority);
+        }
+
+        // Claim the write reservation before reading the import payload into
+        // SQLite. This makes two simultaneous first starts deterministic: only
+        // one transaction can publish rows and advance the marker.
+        tx.execute(
+            "UPDATE legacy_json_import_state
+             SET recent_import_done = recent_import_done
+             WHERE id = ?1",
+            [LEGACY_IMPORT_STATE_ROW_ID],
+        )
+        .map_err(|e| format!("recent legacy import claim authority: {e}"))?;
+
+        // Legacy recent.json is stored newest-first. Insert oldest-first so
+        // rowid DESC preserves that source order when timestamps tie.
+        for (file_path, timestamp) in entries.iter().rev() {
+            tx.execute(
+                "INSERT OR REPLACE INTO recent_files (file_path, accessed_at, access_count)
+                 VALUES (
+                     ?1,
+                     ?2,
+                     COALESCE((
+                         SELECT access_count + 1 FROM recent_files WHERE file_path = ?1
+                     ), 1)
+                 )",
+                params![file_path, timestamp],
+            )
+            .map_err(|e| format!("recent legacy import insert: {e}"))?;
+        }
+        Self::prune_recent_rows(&tx, RECENT_FILES_RETENTION_LIMIT)?;
+        tx.execute(
+            "UPDATE legacy_json_import_state SET recent_import_done = 1 WHERE id = ?1",
+            [LEGACY_IMPORT_STATE_ROW_ID],
+        )
+        .map_err(|e| format!("recent legacy import mark done: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("recent legacy import commit: {e}"))?;
+        Ok(LegacyImportPublication::Imported)
     }
 
     // ── Bookmarks ────────────────────────────────────────────────
@@ -3910,6 +4505,33 @@ impl Database {
 mod tests {
     use super::*;
 
+    fn create_v23_prerequisite_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE conversion_queue (
+                id        TEXT PRIMARY KEY,
+                item_json TEXT NOT NULL
+             );
+             CREATE TABLE recent_files (
+                file_path    TEXT PRIMARY KEY,
+                accessed_at  INTEGER NOT NULL,
+                access_count INTEGER NOT NULL DEFAULT 1
+             );",
+        )
+        .expect("create v23 prerequisite tables");
+    }
+
+    fn queue_item(
+        id: &str,
+        input_path: &str,
+        status: crate::convert::ConversionStatus,
+    ) -> crate::convert::ConversionItem {
+        let mut item = crate::convert::ConversionItem::default();
+        item.id = id.to_string();
+        item.input_path = PathBuf::from(input_path);
+        item.status = status;
+        item
+    }
+
     fn table_columns(conn: &Connection, table: &str) -> Vec<(String, String)> {
         let mut statement = conn
             .prepare(&format!("PRAGMA table_info({})", table))
@@ -4160,6 +4782,7 @@ mod tests {
         let path = temp.path().join("tonepoet.db");
         {
             let conn = rusqlite::Connection::open(&path).expect("create partial v22 database");
+            create_v23_prerequisite_tables(&conn);
             conn.execute_batch(
                 "CREATE TABLE metadata_journal (
                     file_path TEXT PRIMARY KEY,
@@ -4195,6 +4818,7 @@ mod tests {
         let path = temp.path().join("tonepoet.db");
         {
             let conn = rusqlite::Connection::open(&path).expect("create v21 database");
+            create_v23_prerequisite_tables(&conn);
             conn.execute_batch(
                 "CREATE TABLE metadata_journal (
                     file_path TEXT PRIMARY KEY,
@@ -4221,6 +4845,657 @@ mod tests {
         assert_eq!(entry.state, METADATA_STATE_PREPARED);
         assert_eq!(entry.backup_path, "/music/legacy.dsf.tonepoet-bak");
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn v23_migrates_queue_order_and_initializes_existing_authority_markers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create v22 database");
+            create_v23_prerequisite_tables(&conn);
+            conn.execute(
+                "INSERT INTO conversion_queue (id, item_json) VALUES ('A', '{}')",
+                [],
+            )
+            .expect("insert queue A");
+            conn.execute(
+                "INSERT INTO conversion_queue (id, item_json) VALUES ('B', '{}')",
+                [],
+            )
+            .expect("insert queue B");
+            conn.execute(
+                "INSERT INTO conversion_queue (id, item_json) VALUES ('C', '{}')",
+                [],
+            )
+            .expect("insert queue C");
+            conn.execute(
+                "INSERT INTO recent_files (file_path, accessed_at, access_count)
+                 VALUES ('/music/recent.flac', 123, 1)",
+                [],
+            )
+            .expect("insert recent row");
+            conn.pragma_update(None, "user_version", 22)
+                .expect("stamp v22");
+        }
+
+        let db = Database::open_path(&path).expect("migrate v22 to v23");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, 23);
+
+        let positions = {
+            let mut statement = db
+                .conn
+                .prepare("SELECT id, position FROM conversion_queue ORDER BY position")
+                .expect("prepare positions");
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .expect("query positions");
+            rows
+                .collect::<Result<Vec<_>, _>>()
+                .expect("decode positions")
+        };
+        assert_eq!(
+            positions,
+            vec![
+                ("A".to_string(), 0),
+                ("B".to_string(), 1),
+                ("C".to_string(), 2),
+            ]
+        );
+        assert!(db.queue_legacy_import_done().expect("queue marker"));
+        assert!(db.recent_legacy_import_done().expect("recent marker"));
+
+        let legacy_queue = queue_item(
+            "legacy",
+            "/music/legacy.flac",
+            crate::convert::ConversionStatus::Paused,
+        );
+        assert_eq!(
+            db.publish_legacy_queue_import(&[legacy_queue], &[])
+                .expect("existing queue authority no-op"),
+            LegacyImportPublication::AlreadyDone
+        );
+        let queue_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM conversion_queue", [], |row| row.get(0))
+            .expect("queue count");
+        assert_eq!(queue_count, 3, "legacy JSON must not clobber existing rows");
+
+        assert_eq!(
+            db.publish_legacy_recent_import(&[("/legacy/recent.flac".to_string(), 999)])
+                .expect("existing recent authority no-op"),
+            LegacyImportPublication::AlreadyDone
+        );
+        let recent_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM recent_files", [], |row| row.get(0))
+            .expect("recent count");
+        assert_eq!(recent_count, 1);
+    }
+
+    #[test]
+    fn v23_prunes_preexisting_recent_rows_to_retention_bound() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create v22 database");
+            create_v23_prerequisite_tables(&conn);
+            for index in 0..75i64 {
+                conn.execute(
+                    "INSERT INTO recent_files (file_path, accessed_at, access_count)
+                     VALUES (?1, ?2, 1)",
+                    params![format!("/music/{index:03}.flac"), index],
+                )
+                .expect("seed recent row");
+            }
+            conn.pragma_update(None, "user_version", 22)
+                .expect("stamp v22");
+        }
+
+        let db = Database::open_path(&path).expect("migrate v22 to v23");
+        assert!(db.recent_legacy_import_done().expect("recent marker"));
+        let retained = db
+            .list_recent(RECENT_FILES_RETENTION_LIMIT + 10)
+            .expect("list migrated recents");
+        assert_eq!(retained.len(), RECENT_FILES_RETENTION_LIMIT);
+        assert_eq!(retained.first().map(|row| row.0.as_str()), Some("/music/074.flac"));
+        assert_eq!(retained.last().map(|row| row.0.as_str()), Some("/music/025.flac"));
+    }
+
+    #[test]
+    fn v23_empty_authorities_import_once_then_mark_done() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create v22 database");
+            create_v23_prerequisite_tables(&conn);
+            conn.pragma_update(None, "user_version", 22)
+                .expect("stamp v22");
+        }
+
+        let db = Database::open_path(&path).expect("migrate v22 to v23");
+        assert!(!db.queue_legacy_import_done().expect("queue marker pending"));
+        assert!(!db.recent_legacy_import_done().expect("recent marker pending"));
+
+        let first = queue_item(
+            "legacy-a",
+            "/offline/Album..Remaster/a.flac",
+            crate::convert::ConversionStatus::Paused,
+        );
+        assert_eq!(
+            db.publish_legacy_queue_import(&[first], &[])
+                .expect("first queue import"),
+            LegacyImportPublication::Imported
+        );
+        assert!(db.queue_legacy_import_done().expect("queue marker done"));
+
+        let second = queue_item(
+            "legacy-b",
+            "/music/b.flac",
+            crate::convert::ConversionStatus::Paused,
+        );
+        assert_eq!(
+            db.publish_legacy_queue_import(&[second], &[])
+                .expect("second queue import"),
+            LegacyImportPublication::AlreadyDone
+        );
+        let queue_ids = db
+            .load_queue_items()
+            .expect("load imported queue")
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(queue_ids, vec!["legacy-a"]);
+
+        assert_eq!(
+            db.publish_legacy_recent_import(&[("/music/a.flac".to_string(), 1)])
+                .expect("first recent import"),
+            LegacyImportPublication::Imported
+        );
+        assert!(db.recent_legacy_import_done().expect("recent marker done"));
+        assert_eq!(
+            db.publish_legacy_recent_import(&[("/music/b.flac".to_string(), 2)])
+                .expect("second recent import"),
+            LegacyImportPublication::AlreadyDone
+        );
+        assert_eq!(
+            db.list_recent(50).expect("load imported recents"),
+            vec![("/music/a.flac".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn v23_partial_schema_reentry_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create partial v23 database");
+            conn.execute_batch(
+                "CREATE TABLE conversion_queue (
+                    id        TEXT PRIMARY KEY,
+                    item_json TEXT NOT NULL,
+                    position  INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE recent_files (
+                    file_path    TEXT PRIMARY KEY,
+                    accessed_at  INTEGER NOT NULL,
+                    access_count INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE legacy_json_import_state (
+                    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+                    queue_import_done  INTEGER NOT NULL CHECK (queue_import_done IN (0, 1)),
+                    recent_import_done INTEGER NOT NULL CHECK (recent_import_done IN (0, 1))
+                 );
+                 INSERT INTO conversion_queue (id, item_json, position) VALUES ('A', '{}', 0);
+                 INSERT INTO conversion_queue (id, item_json, position) VALUES ('B', '{}', 0);
+                 PRAGMA user_version = 22;",
+            )
+            .expect("seed partial v23 schema");
+        }
+
+        let db = Database::open_path(&path).expect("finish idempotent v23");
+        let positions = {
+            let mut statement = db
+                .conn
+                .prepare("SELECT id, position FROM conversion_queue ORDER BY position")
+                .expect("prepare positions");
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .expect("query positions");
+            rows
+                .collect::<Result<Vec<_>, _>>()
+                .expect("decode positions")
+        };
+        assert_eq!(
+            positions,
+            vec![("A".to_string(), 0), ("B".to_string(), 1)]
+        );
+        assert!(db.queue_legacy_import_done().expect("queue marker"));
+        assert!(!db.recent_legacy_import_done().expect("recent marker"));
+    }
+
+    #[test]
+    fn failed_v23_rolls_back_schema_and_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create incompatible v22 database");
+            conn.execute_batch(
+                "CREATE TABLE conversion_queue (
+                    id        TEXT PRIMARY KEY,
+                    item_json TEXT NOT NULL,
+                    position  TEXT NOT NULL DEFAULT '0'
+                 );
+                 CREATE TABLE recent_files (
+                    file_path    TEXT PRIMARY KEY,
+                    accessed_at  INTEGER NOT NULL,
+                    access_count INTEGER NOT NULL DEFAULT 1
+                 );
+                 PRAGMA user_version = 22;",
+            )
+            .expect("seed incompatible v23 column");
+        }
+
+        let error = Database::open_path(&path)
+            .err()
+            .expect("incompatible v23 must fail");
+        assert!(error.contains("incompatible existing column conversion_queue.position"));
+
+        let conn = Connection::open(&path).expect("reopen failed migration database");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read version after failure");
+        assert_eq!(version, 22, "failed migration must not advance user_version");
+        let marker_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'legacy_json_import_state'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect marker table");
+        assert_eq!(marker_table_count, 0, "failed v23 must roll back later DDL");
+    }
+
+    #[test]
+    fn failed_v23_after_schema_mutation_rolls_back_column_marker_and_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let conn = Connection::open(&path).expect("create v22 database");
+            create_v23_prerequisite_tables(&conn);
+            for index in 0..51i64 {
+                conn.execute(
+                    "INSERT INTO recent_files (file_path, accessed_at, access_count)
+                     VALUES (?1, ?2, 1)",
+                    params![format!("/music/{index:03}.flac"), index],
+                )
+                .expect("seed recent row");
+            }
+            conn.execute_batch(
+                "CREATE TRIGGER reject_v23_recent_prune
+                 BEFORE DELETE ON recent_files
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected v23 prune failure');
+                 END;
+                 PRAGMA user_version = 22;",
+            )
+            .expect("seed failing v23 trigger");
+        }
+
+        let error = Database::open_path(&path)
+            .err()
+            .expect("injected v23 prune failure must abort migration");
+        assert!(error.contains("injected v23 prune failure"));
+
+        let conn = Connection::open(&path).expect("reopen failed migration database");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read version after failure");
+        assert_eq!(version, 22);
+        let mut columns = conn
+            .prepare("PRAGMA table_info(conversion_queue)")
+            .expect("inspect queue schema");
+        let names = columns
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query queue schema")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode queue schema");
+        assert!(
+            !names.iter().any(|name| name == "position"),
+            "the guarded ADD COLUMN must roll back with the failed migration"
+        );
+        let marker_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'legacy_json_import_state'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect marker table");
+        assert_eq!(marker_table_count, 0);
+        let recent_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recent_files", [], |row| row.get(0))
+            .expect("recent rows survive rollback");
+        assert_eq!(recent_count, 51);
+    }
+
+    #[test]
+    fn queue_sync_round_trips_order_and_only_writes_changed_rows() {
+        let db = Database::open_memory().expect("database");
+        let mut items = vec![
+            queue_item("A", "/music/a.flac", crate::convert::ConversionStatus::Paused),
+            queue_item("B", "/music/b.flac", crate::convert::ConversionStatus::Paused),
+            queue_item("C", "/music/c.flac", crate::convert::ConversionStatus::Paused),
+        ];
+
+        let refs = items.iter().collect::<Vec<_>>();
+        let first = db.sync_queue(&refs).expect("initial queue sync");
+        assert_eq!(first.rows_written, 3);
+        assert_eq!(first.rows_deleted, 0);
+
+        let second = db.sync_queue(&refs).expect("unchanged queue sync");
+        assert_eq!(second.rows_written, 0, "unchanged rows must not be rewritten");
+        assert_eq!(second.rows_deleted, 0);
+
+        for _ in 0..3 {
+            let ids = db
+                .load_queue_items()
+                .expect("ordered queue load")
+                .items
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec!["A", "B", "C"]);
+        }
+
+        items[1].status = crate::convert::ConversionStatus::NotConfigured;
+        let refs = items.iter().collect::<Vec<_>>();
+        let changed = db.sync_queue(&refs).expect("single-row queue sync");
+        assert_eq!(changed.rows_written, 1, "only the changed row should be upserted");
+        assert_eq!(changed.rows_deleted, 0);
+    }
+
+    #[test]
+    fn queue_processing_is_persisted_as_interrupted_without_stale_progress() {
+        let db = Database::open_memory().expect("database");
+        let mut completed = queue_item(
+            "A",
+            "/music/a.flac",
+            crate::convert::ConversionStatus::Completed {
+                output_path: PathBuf::from("/out/a.flac"),
+                log_path: None,
+                warning_count: 0,
+            },
+        );
+        completed.completed_at = Some(chrono::Utc::now());
+        let mut processing_b = queue_item(
+            "B",
+            "/music/b.flac",
+            crate::convert::ConversionStatus::Processing {
+                progress: 87.0,
+                message: Some("encoding".to_string()),
+                file_progress: Some((4, 5)),
+                phase: None,
+                phase_progress: Some(0.75),
+            },
+        );
+        processing_b.started_at = Some(chrono::Utc::now());
+        processing_b.active_tracks.insert(
+            4,
+            crate::convert::queue::TrackProgress {
+                track_label: "Track 5".to_string(),
+                step_description: "encoding".to_string(),
+                progress_fraction: 0.91,
+                epoch: 99,
+            },
+        );
+        let mut processing_c = queue_item(
+            "C",
+            "/music/c.flac",
+            crate::convert::ConversionStatus::Processing {
+                progress: 12.0,
+                message: Some("decoding".to_string()),
+                file_progress: None,
+                phase: None,
+                phase_progress: None,
+            },
+        );
+        processing_c.started_at = Some(chrono::Utc::now());
+        let items = vec![completed, processing_b, processing_c];
+
+        db.sync_queue(&items.iter().collect::<Vec<_>>())
+            .expect("persist processing snapshot");
+        let loaded = db.load_queue_items().expect("reload queue").items;
+        assert_eq!(
+            loaded.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+        for item in &loaded[1..] {
+            assert_eq!(item.status, crate::convert::ConversionStatus::Interrupted);
+            assert!(item.can_retry());
+            assert!(item.started_at.is_none());
+            assert!(item.completed_at.is_none());
+            assert!(item.active_tracks.is_empty());
+            assert!(item.closed_track_epochs.is_empty());
+        }
+
+        let raw_b: String = db
+            .conn
+            .query_row(
+                "SELECT item_json FROM conversion_queue WHERE id = 'B'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read persisted B");
+        let value: serde_json::Value = serde_json::from_str(&raw_b).expect("decode persisted B");
+        assert_eq!(value.get("status"), Some(&serde_json::Value::String("Interrupted".into())));
+        assert!(value.get("active_tracks").is_none());
+        assert!(value.get("closed_track_epochs").is_none());
+        assert!(value.get("started_at").is_some_and(serde_json::Value::is_null));
+    }
+
+    #[test]
+    fn queue_cancelled_partial_and_offline_dotdot_names_survive_restart() {
+        let db = Database::open_memory().expect("database");
+        let cancelled = queue_item(
+            "cancelled",
+            "/definitely/offline/Artist..Live/track.flac",
+            crate::convert::ConversionStatus::Cancelled,
+        );
+        let partial = queue_item(
+            "partial",
+            "/definitely/offline/Album...Remaster/disc.flac",
+            crate::convert::ConversionStatus::Partial {
+                output_path: PathBuf::from("/out/partial.flac"),
+                successful: 7,
+                failed: 1,
+                log_path: PathBuf::from("/out/partial.log"),
+            },
+        );
+        db.sync_queue(&[&cancelled, &partial])
+            .expect("persist retryable terminal rows");
+
+        let loaded = db.load_queue_items().expect("reload offline rows").items;
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|item| item.can_retry()));
+        assert_eq!(loaded[0].input_path, cancelled.input_path);
+        assert_eq!(loaded[1].input_path, partial.input_path);
+        assert_eq!(loaded[0].status, crate::convert::ConversionStatus::Cancelled);
+        assert!(matches!(
+            &loaded[1].status,
+            crate::convert::ConversionStatus::Partial { .. }
+        ));
+    }
+
+    #[test]
+    fn queue_whole_query_failure_is_distinct_from_empty() {
+        let db = Database::open_memory().expect("database");
+        db.conn
+            .execute("DROP TABLE conversion_queue", [])
+            .expect("drop queue table");
+        let error = db
+            .load_queue_items()
+            .expect_err("whole-query failure must surface");
+        assert!(error.contains("queue load prepare"));
+    }
+
+    #[test]
+    fn queue_maintenance_transaction_failure_surfaces_without_hiding_loaded_work() {
+        let db = Database::open_memory().expect("database");
+        let processing = queue_item(
+            "processing",
+            "/music/processing.flac",
+            crate::convert::ConversionStatus::Processing {
+                progress: 42.0,
+                message: Some("encoding".to_string()),
+                file_progress: None,
+                phase: None,
+                phase_progress: Some(0.42),
+            },
+        );
+        let json = serde_json::to_string(&processing).expect("serialize processing row");
+        db.conn
+            .execute(
+                "INSERT INTO conversion_queue (id, item_json, position) VALUES (?1, ?2, 0)",
+                params![processing.id, json],
+            )
+            .expect("seed legacy processing row");
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_queue_maintenance
+                 BEFORE UPDATE ON conversion_queue
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected maintenance failure');
+                 END;",
+            )
+            .expect("install maintenance failure trigger");
+
+        let outcome = db
+            .load_queue_items()
+            .expect("authoritative rows should still load");
+        assert_eq!(outcome.items.len(), 1);
+        assert_eq!(
+            outcome.items[0].status,
+            crate::convert::ConversionStatus::Interrupted
+        );
+        assert!(outcome.items[0].can_retry());
+        assert!(
+            outcome
+                .degradation
+                .as_deref()
+                .is_some_and(|message| message.contains("maintenance publication failed")),
+            "the failed reconciliation transaction must be surfaced to startup"
+        );
+
+        let raw: String = db
+            .conn
+            .query_row(
+                "SELECT item_json FROM conversion_queue WHERE id = 'processing'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read unchanged durable row");
+        assert!(raw.contains("Processing"));
+    }
+
+    #[test]
+    fn retryable_terminal_queue_row_keeps_secret_reference_across_reload() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let db = Database::open_memory().expect("database");
+        let mut failed = queue_item(
+            "failed-secret",
+            "/music/encrypted.7z",
+            crate::convert::ConversionStatus::Failed {
+                error: "source temporarily unavailable".to_string(),
+                log_path: None,
+            },
+        );
+        let reference = crate::secret_store::stable_reference("queue-item", &failed.id)
+            .expect("stable reference");
+        crate::secret_store::set(&reference, "archive-secret").expect("store secret");
+        failed.archive_password_ref = Some(reference.clone());
+        failed.archive_password_required = true;
+
+        db.sync_queue(&[&failed]).expect("persist failed item");
+        let loaded = db.load_queue_items().expect("reload failed item").items;
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].can_retry());
+        assert_eq!(loaded[0].archive_password_ref.as_deref(), Some(reference.as_str()));
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("secret remains usable"),
+            "archive-secret"
+        );
+    }
+
+    #[test]
+    fn failed_queue_publication_never_retires_the_only_secret_reference() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let db = Database::open_memory().expect("database");
+        let mut item = queue_item(
+            "publication-failure",
+            "/music/encrypted.7z",
+            crate::convert::ConversionStatus::Paused,
+        );
+        let reference = crate::secret_store::stable_reference("queue-item", &item.id)
+            .expect("stable reference");
+        crate::secret_store::set(&reference, "archive-secret").expect("store secret");
+        item.archive_password_ref = Some(reference.clone());
+        item.archive_password_required = true;
+        db.sync_queue(&[&item]).expect("persist initial row");
+
+        item.status = crate::convert::ConversionStatus::Completed {
+            output_path: PathBuf::from("/out/encrypted.flac"),
+            log_path: None,
+            warning_count: 0,
+        };
+        db.conn
+            .execute("DROP TABLE conversion_queue", [])
+            .expect("force queue publication failure");
+        assert!(db.sync_queue(&[&item]).is_err());
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("failed publication keeps secret"),
+            "archive-secret"
+        );
+    }
+
+    #[test]
+    fn recent_rows_are_bounded_newest_first_and_deletions_are_durable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tonepoet.db");
+        {
+            let db = Database::open_path(&path).expect("database");
+            for index in 0..1_000 {
+                db.record_recent_at(&format!("/music/{index:04}.flac"), index)
+                    .expect("record recent");
+            }
+
+            let count: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM recent_files", [], |row| row.get(0))
+                .expect("recent row count");
+            assert_eq!(count, RECENT_FILES_RETENTION_LIMIT as i64);
+
+            let retained = db
+                .list_recent(RECENT_FILES_RETENTION_LIMIT)
+                .expect("list bounded recents");
+            assert_eq!(retained.len(), RECENT_FILES_RETENTION_LIMIT);
+            assert_eq!(retained.first().map(|row| row.0.as_str()), Some("/music/0999.flac"));
+            assert_eq!(retained.last().map(|row| row.0.as_str()), Some("/music/0950.flac"));
+
+            db.remove_recent("/music/0999.flac")
+                .expect("durable recent delete");
+        }
+
+        let reopened = Database::open_path(&path).expect("reopen database");
+        let retained = reopened.list_recent(RECENT_FILES_RETENTION_LIMIT).expect("reload recents");
+        assert!(!retained.iter().any(|row| row.0 == "/music/0999.flac"));
+        assert_eq!(retained.len(), RECENT_FILES_RETENTION_LIMIT - 1);
     }
 
     #[test]
@@ -5255,6 +6530,32 @@ mod tests {
             cached.preemphasis_detail.as_deref(),
             Some("possible catalog evidence: folder exact 35DP-150"),
         );
+    }
+
+    #[test]
+    fn recent_same_second_reaccess_preserves_true_recency_order() {
+        let db = Database::open_memory().expect("database");
+        db.record_recent_at("/music/a.flac", 1000)
+            .expect("record a");
+        db.record_recent_at("/music/b.flac", 1000)
+            .expect("record b");
+        db.record_recent_at("/music/a.flac", 1000)
+            .expect("re-record a");
+
+        let recent = db.list_recent(10).expect("list recents");
+        assert_eq!(
+            recent.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec!["/music/a.flac".to_string(), "/music/b.flac".to_string()]
+        );
+        let access_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT access_count FROM recent_files WHERE file_path = '/music/a.flac'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read access count");
+        assert_eq!(access_count, 2);
     }
 
     #[test]

@@ -118,9 +118,20 @@ pub struct ConversionManager {
     pending_synthetic_cue_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
     /// Archive-password references owned by items that were CLEARED from the
     /// queue while still Processing. Their workers may still need the secret,
-    /// so retirement is deferred to the worker's terminal status (or manager
-    /// drop). Key: queue item id; value: the opaque reference.
+    /// so retirement is deferred until both the durable row deletion and the
+    /// worker's terminal status are known. Key: queue item id; value: the
+    /// opaque reference.
     cleared_processing_secret_refs: Arc<Mutex<HashMap<String, String>>>,
+    /// Queue-owned references removed from non-processing in-memory items.
+    /// They remain live until SQLite commits the corresponding durable
+    /// deletion/supersession, so a failed save cannot strand an older row with
+    /// a dead credential.
+    pending_persistence_secret_retirements: Arc<Mutex<HashSet<String>>>,
+    /// Cleared in-flight references whose durable SQLite rows have already
+    /// been removed. The worker still owns the credential until it terminates,
+    /// but a later terminal event may retire it without risking restart
+    /// recoverability. Values are opaque queue-item secret references.
+    cleared_processing_persisted_deletions: Arc<Mutex<HashSet<String>>>,
     /// Cancellation token for the active conversion run. Triggered by
     /// `stop_all_conversions()` to kill in-flight child processes.
     cancel_token: tokio_util::sync::CancellationToken,
@@ -447,9 +458,10 @@ fn _status_progress_for_update(status: &ConversionStatus, progress_hint: f32) ->
         ConversionStatus::Failed { .. } | ConversionStatus::Cancelled => {
             progress_hint.clamp(0.0, 100.0)
         }
-        ConversionStatus::Queued | ConversionStatus::Paused | ConversionStatus::NotConfigured => {
-            0.0
-        }
+        ConversionStatus::Queued
+        | ConversionStatus::Paused
+        | ConversionStatus::Interrupted
+        | ConversionStatus::NotConfigured => 0.0,
     }
 }
 
@@ -530,6 +542,8 @@ impl ConversionManager {
             synthetic_cue_artifacts: Arc::new(Mutex::new(HashMap::new())),
             pending_synthetic_cue_artifacts: Arc::new(Mutex::new(HashSet::new())),
             cleared_processing_secret_refs: Arc::new(Mutex::new(HashMap::new())),
+            pending_persistence_secret_retirements: Arc::new(Mutex::new(HashSet::new())),
+            cleared_processing_persisted_deletions: Arc::new(Mutex::new(HashSet::new())),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             conversion_run_generation: Arc::new(AtomicU64::new(0)),
             active_conversion_items: Arc::new(Mutex::new(HashMap::new())),
@@ -544,6 +558,92 @@ impl ConversionManager {
         decisions: QueueSplitCueAlbumGroupingDecisions,
     ) {
         self.split_cue_album_grouping_decisions = decisions;
+    }
+
+    fn defer_queue_secret_retirements_until_persisted<I>(&self, references: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut pending = self
+            .pending_persistence_secret_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned queue-secret persistence lock");
+                poisoned.into_inner()
+            });
+        pending.extend(references.into_iter().filter(|reference| {
+            crate::secret_store::reference_has_namespace(reference, "queue-item")
+        }));
+    }
+
+    /// Complete secret ownership changes only after the SQLite queue mutation
+    /// has committed. References still owned by a cleared in-flight worker are
+    /// not deleted yet; instead a committed row deletion is remembered so the
+    /// worker's eventual terminal event can retire the credential safely.
+    pub fn retire_queue_secret_references_after_persistence(
+        &self,
+        sqlite_retire_references: &[String],
+        durable_live_references: &[String],
+    ) {
+        let durable_live = durable_live_references
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let protected = self
+            .cleared_processing_secret_refs
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned cleared-processing secret lock");
+                poisoned.into_inner()
+            })
+            .values()
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        if !protected.is_empty() {
+            let mut persisted_deletions = self
+                .cleared_processing_persisted_deletions
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    log::warn!(
+                        "recovering poisoned cleared-processing persisted-deletion lock"
+                    );
+                    poisoned.into_inner()
+                });
+            persisted_deletions.extend(
+                sqlite_retire_references
+                    .iter()
+                    .filter(|reference| protected.contains(*reference))
+                    .cloned(),
+            );
+        }
+
+        let mut pending = self
+            .pending_persistence_secret_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned queue-secret persistence lock");
+                poisoned.into_inner()
+            });
+        let mut retire = sqlite_retire_references
+            .iter()
+            .filter(|reference| !durable_live.contains(*reference))
+            .cloned()
+            .collect::<Vec<_>>();
+        pending.retain(|reference| {
+            if durable_live.contains(reference) {
+                // The reference became live again before publication. Keep
+                // the deferred intent so a later durable removal can retire
+                // it, but never invalidate the row that just committed.
+                true
+            } else {
+                retire.push(reference.clone());
+                false
+            }
+        });
+        retire.retain(|reference| !protected.contains(reference));
+        drop(pending);
+        crate::convert::queue::retire_queue_owned_secret_references(&retire);
     }
 
     /// Add files to the conversion queue
@@ -1068,9 +1168,7 @@ impl ConversionManager {
         }
         drop(queue);
 
-        crate::convert::queue::retire_queue_owned_secret_references(
-            &retired_secret_references,
-        );
+        self.defer_queue_secret_retirements_until_persisted(retired_secret_references);
 
         let mut accounted_artifacts = transferred.clone();
         accounted_artifacts.extend(cleaned_after_completed_skip.iter().cloned());
@@ -1427,9 +1525,13 @@ impl ConversionManager {
                     // encrypted archive yet; retirement happens at the
                     // worker's terminal status (or manager drop).
                     if let Some(reference) = item.archive_password_ref.clone() {
-                        if let Ok(mut pending) = self.cleared_processing_secret_refs.lock() {
-                            pending.insert(item.id.clone(), reference);
-                        }
+                        self.cleared_processing_secret_refs
+                            .lock()
+                            .unwrap_or_else(|poisoned| {
+                                log::warn!("recovering poisoned cleared-processing secret lock");
+                                poisoned.into_inner()
+                            })
+                            .insert(item.id.clone(), reference);
                     }
                 }
             }
@@ -1439,7 +1541,7 @@ impl ConversionManager {
             None
         };
         if let Some((processing, processing_synthetic_inputs, secret_references)) = cleared_processing {
-            crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
+            self.defer_queue_secret_retirements_until_persisted(secret_references);
             // In-flight items keep their artifacts until the worker's terminal
             // status arrives (deferred cleanup in `update_item_status`).
             self.cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
@@ -2021,12 +2123,32 @@ impl ConversionManager {
             let deferred = self
                 .cleared_processing_secret_refs
                 .lock()
-                .ok()
-                .and_then(|mut pending| pending.remove(id));
+                .unwrap_or_else(|poisoned| {
+                    log::warn!("recovering poisoned cleared-processing secret lock");
+                    poisoned.into_inner()
+                })
+                .remove(id);
             if let Some(reference) = deferred {
-                crate::convert::queue::retire_queue_owned_secret_references(
-                    std::slice::from_ref(&reference),
-                );
+                let durable_delete_committed = self
+                    .cleared_processing_persisted_deletions
+                    .lock()
+                    .unwrap_or_else(|poisoned| {
+                        log::warn!(
+                            "recovering poisoned cleared-processing persisted-deletion lock"
+                        );
+                        poisoned.into_inner()
+                    })
+                    .remove(&reference);
+                if durable_delete_committed {
+                    crate::convert::queue::retire_queue_owned_secret_references(
+                        std::slice::from_ref(&reference),
+                    );
+                } else {
+                    // A terminal event can race ahead of the UI's SQLite save.
+                    // Preserve the credential until a later successful queue
+                    // publication proves that no durable row needs it.
+                    self.defer_queue_secret_retirements_until_persisted([reference]);
+                }
             }
         }
         if updated
@@ -2230,6 +2352,44 @@ impl ConversionManager {
         lock_active_conversion_items(&self.active_conversion_items).clear();
     }
 
+    /// Convert any non-terminal members of the acquired run into durable,
+    /// explicit retry-required intent after a processor-level failure.
+    ///
+    /// An acquired member can still be `Queued` if the processor failed before
+    /// dispatching it. Match the full lifecycle identity (id + queued_at) so a
+    /// replacement record that deliberately reuses an id is never interrupted.
+    /// Terminal items are left untouched. The caller persists the resulting
+    /// queue snapshot before surfacing the run failure to the user.
+    pub fn interrupt_active_conversion_run(&self) {
+        let active_items = lock_active_conversion_items(&self.active_conversion_items).clone();
+
+        if let Ok(mut queue) = self.queue.try_write() {
+            for (item_id, queued_at) in &active_items {
+                let Some(item) = queue.find_item_mut(item_id) else {
+                    continue;
+                };
+                if item.queued_at == *queued_at
+                    && matches!(
+                        &item.status,
+                        ConversionStatus::Queued | ConversionStatus::Processing { .. }
+                    )
+                {
+                    Self::record_and_clear_active_tracks(item);
+                    item.closed_track_epochs.clear();
+                    item.status = ConversionStatus::Interrupted;
+                    item.started_at = None;
+                    item.completed_at = None;
+                }
+            }
+        } else {
+            log::error!(
+                "queue was busy while normalizing a failed conversion run to Interrupted"
+            );
+        }
+
+        self.invalidate_deferred_stop_requests();
+    }
+
     /// Retire the active run ownership after the processor reaches a terminal
     /// completion. This invalidates any deferred Stop reducer still waiting on
     /// the queue lock and prevents a later Stop from inheriting stale item IDs.
@@ -2399,14 +2559,35 @@ impl ConversionManager {
                 .all_items()
                 .into_iter()
                 .filter(|item| item.selected)
-                .filter_map(|item| item.archive_password_ref.clone())
-                .collect();
+                .filter_map(|item| {
+                    item.archive_password_ref
+                        .clone()
+                        .map(|reference| (item.id.clone(), reference))
+                })
+                .collect::<HashMap<_, _>>();
             (queue.remove_selected_records(), secret_references)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), HashMap::new())
         };
-        crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
         let removed = removed_records.len();
+        let mut persist_then_retire = Vec::new();
+        for (id, status) in &removed_records {
+            let Some(reference) = secret_references.get(id).cloned() else {
+                continue;
+            };
+            if matches!(status, ConversionStatus::Processing { .. }) {
+                self.cleared_processing_secret_refs
+                    .lock()
+                    .unwrap_or_else(|poisoned| {
+                        log::warn!("recovering poisoned cleared-processing secret lock");
+                        poisoned.into_inner()
+                    })
+                    .insert(id.clone(), reference);
+            } else {
+                persist_then_retire.push(reference);
+            }
+        }
+        self.defer_queue_secret_retirements_until_persisted(persist_then_retire);
         // Never delete a synthetic input a worker is still reading: Processing
         // items keep their registry entries, and the worker's terminal status
         // message triggers the deferred cleanup in `update_item_status` (manager
@@ -2614,7 +2795,7 @@ impl ConversionManager {
         } else {
             (Vec::new(), Vec::new())
         };
-        crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
+        self.defer_queue_secret_retirements_until_persisted(secret_references);
         self.cleanup_synthetic_cue_artifacts_for_item_ids(removed_item_ids);
     }
 
@@ -2631,7 +2812,7 @@ impl ConversionManager {
         } else {
             (Vec::new(), Vec::new())
         };
-        crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
+        self.defer_queue_secret_retirements_until_persisted(secret_references);
         self.cleanup_synthetic_cue_artifacts_for_item_ids(removed_item_ids);
     }
 
@@ -2640,17 +2821,24 @@ impl ConversionManager {
         let cleared_processing = if let Ok(mut queue) = self.queue.try_write() {
             let mut processing = HashSet::new();
             let mut processing_synthetic_inputs = HashSet::new();
-            let secret_references = queue
-                .all_items()
-                .into_iter()
-                .filter_map(|item| item.archive_password_ref.clone())
-                .collect::<Vec<_>>();
+            let mut secret_references = Vec::new();
             for item in queue.all_items() {
                 if matches!(item.status, ConversionStatus::Processing { .. }) {
                     processing.insert(item.id.clone());
                     if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
                         processing_synthetic_inputs.insert(item.input_path.clone());
                     }
+                    if let Some(reference) = item.archive_password_ref.clone() {
+                        self.cleared_processing_secret_refs
+                            .lock()
+                            .unwrap_or_else(|poisoned| {
+                                log::warn!("recovering poisoned cleared-processing secret lock");
+                                poisoned.into_inner()
+                            })
+                            .insert(item.id.clone(), reference);
+                    }
+                } else if let Some(reference) = item.archive_password_ref.clone() {
+                    secret_references.push(reference);
                 }
             }
             queue.clear();
@@ -2659,7 +2847,7 @@ impl ConversionManager {
             None
         };
         if let Some((processing, processing_synthetic_inputs, secret_references)) = cleared_processing {
-            crate::convert::queue::retire_queue_owned_secret_references(&secret_references);
+            self.defer_queue_secret_retirements_until_persisted(secret_references);
             // In-flight items keep their artifacts until the worker's terminal
             // status arrives (deferred cleanup in `update_item_status`).
             self.cleanup_all_synthetic_cue_artifacts_except_with_processing_inputs(
@@ -2669,7 +2857,7 @@ impl ConversionManager {
         }
     }
 
-    /// Get path to persisted conversion queue file
+    /// Legacy JSON queue path. The file is import-only as of schema v23.
     fn queue_path() -> PathBuf {
         dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -2677,197 +2865,60 @@ impl ConversionManager {
             .join("conversion_queue.json")
     }
 
-    /// Load persisted queue from disk
-    pub fn load_persisted_queue(&mut self) {
-        let loaded_items = Self::load_queue();
-        if !loaded_items.is_empty() {
-            if let Ok(mut q) = self.queue.try_write() {
-                for item in loaded_items {
-                    q.items_mut().push_back(item);
-                }
-            }
-        }
-    }
-
-    /// Load queue items from disk with path validation
-    fn load_queue() -> Vec<ConversionItem> {
+    /// Read the legacy JSON queue for the one-time SQLite import.
+    ///
+    /// This function never rewrites JSON. Path availability is deliberately not
+    /// validated here: a persisted queue row represents user work intent even
+    /// when removable/network storage is currently offline.
+    pub fn load_legacy_queue_for_import() -> Result<(Vec<ConversionItem>, Vec<String>), String> {
         let queue_path = Self::queue_path();
-
-        // Return empty if file doesn't exist
-        if !queue_path.exists() {
-            return Vec::new();
-        }
-
-        // Read and parse JSON
-        match std::fs::read_to_string(&queue_path) {
-            Ok(content) => {
-                match serde_json::from_str::<Vec<ConversionItem>>(&content) {
-                    Ok(mut items) => {
-                        // Migrate/clear secrets before filtering. A stale or
-                        // suspicious row can still contain legacy cleartext,
-                        // and filtering it only in memory would leave that
-                        // secret in the persisted JSON forever.
-                        let mut secret_report =
-                            crate::convert::queue::restore_archive_passwords_after_load(&mut items);
-                        let original_len = items.len();
-                        // Validate paths for security (prevent path traversal attacks).
-                        items.retain(|item| {
-                            let path_str = item.input_path.to_string_lossy();
-                            if path_str.contains("..") {
-                                if let Some(reference) = item.archive_password_ref.as_ref() {
-                                    secret_report.retire_references.push(reference.clone());
-                                }
-                                log::warn!(
-                                    "Filtered out queue item with suspicious path: {:?}",
-                                    item.input_path
-                                );
-                                return false;
-                            }
-
-                            if !item.input_path.exists() {
-                                if let Some(reference) = item.archive_password_ref.as_ref() {
-                                    secret_report.retire_references.push(reference.clone());
-                                }
-                                log::info!(
-                                    "Filtered out queue item - file no longer exists: {:?}",
-                                    item.input_path
-                                );
-                                return false;
-                            }
-
-                            true
-                        });
-                        if secret_report.rewrite_required || items.len() != original_len {
-                            let mut persisted_items = items.clone();
-                            match crate::convert::queue::prepare_archive_passwords_for_persistence(
-                                &mut persisted_items,
-                            ) {
-                                Ok(persist_report) => match serde_json::to_vec_pretty(&persisted_items) {
-                                    Ok(json) => match crate::secret_store::atomic_write_private_file(
-                                        &queue_path,
-                                        &json,
-                                    ) {
-                                        Ok(crate::secret_store::PrivateFilePublishOutcome::Durable) => {
-                                            secret_report
-                                                .retire_references
-                                                .extend(persist_report.retire_references);
-                                            crate::convert::queue::retire_queue_owned_secret_references(
-                                                &secret_report.retire_references,
-                                            );
-                                        }
-                                        Ok(crate::secret_store::PrivateFilePublishOutcome::ReplacedButDurabilityUnconfirmed(detail)) => {
-                                            log::error!(
-                                                "Sanitized persisted queue state was replaced but durability is unconfirmed: {}",
-                                                detail
-                                            );
-                                        }
-                                        Err(error) => {
-                                            log::error!(
-                                                "Sanitized persisted queue state but could not rewrite {:?}: {}",
-                                                queue_path,
-                                                error
-                                            );
-                                        }
-                                    },
-                                    Err(error) => {
-                                        log::error!(
-                                            "Sanitized persisted queue state but could not serialize it: {}",
-                                            error
-                                        );
-                                    }
-                                },
-                                Err(error) => {
-                                    log::error!(
-                                        "Sanitized persisted queue state was retained in memory but could not be republished without risking archive-password loss: {}",
-                                        error
-                                    );
-                                }
-                            }
-                        }
-                        items
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to parse conversion queue from {:?}: {}",
-                            queue_path,
-                            e
-                        );
-                        Vec::new()
-                    }
-                }
+        let content = match std::fs::read_to_string(&queue_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()));
             }
-            Err(e) => {
-                log::error!(
-                    "Failed to read conversion queue from {:?}: {}",
-                    queue_path,
-                    e
+            Err(error) => {
+                return Err(format!(
+                    "read legacy conversion queue {:?}: {error}",
+                    queue_path
+                ));
+            }
+        };
+        let mut items = serde_json::from_str::<Vec<ConversionItem>>(&content)
+            .map_err(|e| format!("parse legacy conversion queue {:?}: {e}", queue_path))?;
+
+        let mut secret_report =
+            crate::convert::queue::restore_archive_passwords_after_load(&mut items);
+        items.retain(|item| {
+            if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
+                if let Some(reference) = item.archive_password_ref.as_ref() {
+                    secret_report.retire_references.push(reference.clone());
+                }
+                log::warn!(
+                    "Skipping synthetic CUE artifact during legacy queue import: {:?}",
+                    item.input_path
                 );
-                Vec::new()
-            }
-        }
-    }
-
-    /// Save queue to disk with atomic writes
-    pub fn save_queue(&self, persist_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
-        // Don't save if persistence is disabled
-        if !persist_enabled {
-            return Ok(());
-        }
-
-        let queue_path = Self::queue_path();
-
-        // Ensure parent directory exists
-        if let Some(parent) = queue_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Collect items to save (filter by status). Terminal rows omitted by
-        // the historical JSON policy still surrender queue-owned secret
-        // references, but only after the filtered snapshot is durably published.
-        let (mut items_to_save, mut omitted_terminal_references):
-            (Vec<ConversionItem>, Vec<String>) = if let Ok(queue) = self.queue.try_read() {
-                let mut persisted = Vec::new();
-                let mut omitted_terminal_references = Vec::new();
-                for item in queue.all_items() {
-                    if json_queue_item_is_persisted(item) {
-                        persisted.push(item.clone());
-                    } else if let Some(reference) = omitted_terminal_queue_secret_reference(item) {
-                        omitted_terminal_references.push(reference);
-                    }
-                }
-                (persisted, omitted_terminal_references)
+                false
             } else {
-                return Err("Queue is busy".into());
-            };
-
-        let mut persist_report =
-            crate::convert::queue::prepare_archive_passwords_for_persistence(&mut items_to_save)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-        persist_report
-            .retire_references
-            .append(&mut omitted_terminal_references);
-
-        let json = serde_json::to_vec_pretty(&items_to_save)?;
-        match crate::secret_store::atomic_write_private_file(&queue_path, &json)? {
-            crate::secret_store::PrivateFilePublishOutcome::Durable => {
-                crate::convert::queue::retire_queue_owned_secret_references(
-                    &persist_report.retire_references,
-                );
+                true
             }
-            crate::secret_store::PrivateFilePublishOutcome::ReplacedButDurabilityUnconfirmed(
-                detail,
-            ) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "queue file was replaced but parent-directory durability is unconfirmed: {detail}"
-                    ),
-                )
-                .into());
-            }
+        });
+
+        Ok((items, secret_report.retire_references))
+    }
+
+    /// Best-effort cleanup after SQLite has atomically published the legacy
+    /// queue import and the associated secret-reference lifecycle has run.
+    pub fn remove_legacy_queue_file_after_import() {
+        let queue_path = Self::queue_path();
+        match std::fs::remove_file(&queue_path) {
+            Ok(()) => log::info!("Retired legacy queue JSON after SQLite import"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "SQLite queue import succeeded, but legacy queue JSON could not be removed: {}",
+                error
+            ),
         }
-
-        Ok(())
     }
 
     /// Attach a persistable OS-secret-store reference to an in-memory queue
@@ -2902,14 +2953,26 @@ impl ConversionManager {
 impl Drop for ConversionManager {
     fn drop(&mut self) {
         self.cleanup_all_synthetic_cue_artifacts();
-        // Workers die with the manager; deferred cleared-while-Processing
-        // references can never be retired by a terminal status now.
-        if let Ok(mut pending) = self.cleared_processing_secret_refs.lock() {
-            if !pending.is_empty() {
-                let references: Vec<String> = pending.drain().map(|(_, r)| r).collect();
-                crate::convert::queue::retire_queue_owned_secret_references(&references);
-            }
-        }
+        // Workers die with the manager, but a secret is safe to retire here
+        // only when SQLite has already committed deletion of the row that
+        // owned it. If persistence failed, deliberately leave the reference in
+        // the secret store so a restarted process can still retry that row.
+        let persisted_deletions = self
+            .cleared_processing_persisted_deletions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut pending = self
+            .cleared_processing_secret_refs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let references = pending
+            .drain()
+            .map(|(_, reference)| reference)
+            .filter(|reference| persisted_deletions.contains(reference))
+            .collect::<Vec<_>>();
+        drop(pending);
+        crate::convert::queue::retire_queue_owned_secret_references(&references);
     }
 }
 
@@ -2963,66 +3026,7 @@ fn parse_track_message(message: &str) -> (String, String, f32) {
     (core.to_string(), String::new(), tool_pct)
 }
 
-fn json_queue_item_is_persisted(item: &ConversionItem) -> bool {
-    !crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path)
-        && matches!(
-            item.status,
-            ConversionStatus::NotConfigured
-                | ConversionStatus::Queued
-                | ConversionStatus::Paused
-                | ConversionStatus::Completed { .. }
-                | ConversionStatus::CompletedWithActionErrors { .. }
-                | ConversionStatus::Failed { .. }
-        )
-}
 
-fn omitted_terminal_queue_secret_reference(item: &ConversionItem) -> Option<String> {
-    (!json_queue_item_is_persisted(item) && item.is_finished())
-        .then(|| item.archive_password_ref.clone())
-        .flatten()
-}
-
-#[cfg(test)]
-mod queue_json_secret_retirement_tests {
-    use super::*;
-
-    fn item_with_status(status: ConversionStatus) -> ConversionItem {
-        let mut item = ConversionItem::default();
-        item.input_path = PathBuf::from("album/input.dsf");
-        item.status = status;
-        item.archive_password_ref =
-            Some("archive-password:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
-        item
-    }
-
-    #[test]
-    fn omitted_terminal_rows_surrender_secret_references_only_after_snapshot_publication() {
-        let completed = item_with_status(ConversionStatus::Completed {
-            output_path: PathBuf::from("album/output.dsf"),
-            log_path: None,
-            warning_count: 0,
-        });
-        assert!(json_queue_item_is_persisted(&completed));
-        assert_eq!(omitted_terminal_queue_secret_reference(&completed), None);
-
-        let cancelled = item_with_status(ConversionStatus::Cancelled);
-        assert!(!json_queue_item_is_persisted(&cancelled));
-        assert_eq!(
-            omitted_terminal_queue_secret_reference(&cancelled).as_deref(),
-            Some("archive-password:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-
-        let processing = item_with_status(ConversionStatus::Processing {
-            progress: 25.0,
-            message: Some("working".to_string()),
-            file_progress: Some((1, 4)),
-            phase: Some(ConversionPhase::Converting),
-            phase_progress: Some(25.0),
-        });
-        assert!(!json_queue_item_is_persisted(&processing));
-        assert_eq!(omitted_terminal_queue_secret_reference(&processing), None);
-    }
-}
 
 #[cfg(test)]
 mod bluray_queue_admission_tests {
@@ -4300,6 +4304,13 @@ mod per_track_epoch_tests {
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
         manager.clear_completed();
 
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            1,
+            "in-memory removal must not retire a reference before durable deletion commits"
+        );
+        manager.retire_queue_secret_references_after_persistence(&[], &[]);
+
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
         assert!(
             crate::secret_store::get(&reference)
@@ -4310,7 +4321,7 @@ mod per_track_epoch_tests {
     }
 
     #[test]
-    fn clear_queue_defers_processing_item_secret_retirement_to_terminal_status() {
+    fn clear_queue_terminal_before_persistence_keeps_secret_until_commit() {
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let (mut manager, item_id) = test_manager_with_item();
         let reference = crate::secret_store::stable_reference("queue-item", &item_id)
@@ -4343,13 +4354,67 @@ mod per_track_epoch_tests {
             "a Processing item's secret must not be retired by clear_queue"
         );
 
-        // ...and be retired when the worker reaches a terminal state, even
-        // though the item is no longer in the queue.
+        // A terminal event can race ahead of the durable delete. The worker is
+        // finished, but restart still needs the credential while SQLite could
+        // contain the old row.
+        manager.update_item_status(&item_id, ConversionStatus::Cancelled, 0.0);
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            1,
+            "terminal-before-commit must preserve the credential"
+        );
+
+        manager.retire_queue_secret_references_after_persistence(
+            std::slice::from_ref(&reference),
+            &[],
+        );
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            0,
+            "the reference is retired after both terminal status and durable deletion"
+        );
+    }
+
+    #[test]
+    fn clear_queue_persistence_before_terminal_keeps_secret_until_worker_finishes() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let (mut manager, item_id) = test_manager_with_item();
+        let reference = crate::secret_store::stable_reference("queue-item", &item_id)
+            .expect("queue-owned reference");
+        crate::secret_store::set(&reference, "archive-secret").expect("store secret");
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue
+                .items_mut()
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .expect("item exists");
+            item.archive_password_ref = Some(reference.clone());
+            item.status = ConversionStatus::Processing {
+                progress: 0.5,
+                phase: None,
+                file_progress: None,
+                message: None,
+                phase_progress: None,
+            };
+        }
+
+        manager.clear_queue();
+        manager.retire_queue_secret_references_after_persistence(
+            std::slice::from_ref(&reference),
+            &[],
+        );
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            1,
+            "committed deletion must not revoke a credential still owned by a live worker"
+        );
+
         manager.update_item_status(&item_id, ConversionStatus::Cancelled, 0.0);
         assert_eq!(
             crate::secret_store::insecure_test_secret_count(),
             0,
-            "the deferred reference is retired at the worker's terminal status"
+            "the credential retires once the worker is terminal and deletion is committed"
         );
     }
 
@@ -4368,14 +4433,20 @@ mod per_track_epoch_tests {
                 .find(|item| item.id == item_id)
                 .expect("item exists");
             item.archive_password_ref = Some(reference.clone());
-            // A NON-processing item: idle items retire immediately on clear.
-            // Processing items defer to the worker's terminal status (see
-            // clear_queue_defers_processing_item_secret_retirement...).
+            // A NON-processing item: it can retire as soon as the durable
+            // queue deletion commits because no worker can still need it.
             item.status = ConversionStatus::Queued;
         }
 
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 1);
         manager.clear_queue();
+
+        assert_eq!(
+            crate::secret_store::insecure_test_secret_count(),
+            1,
+            "clear_queue alone is not a durable deletion"
+        );
+        manager.retire_queue_secret_references_after_persistence(&[], &[]);
 
         assert_eq!(crate::secret_store::insecure_test_secret_count(), 0);
         assert!(
@@ -4384,6 +4455,42 @@ mod per_track_epoch_tests {
                 .is_not_found()
         );
         assert!(manager.get_items_clone().is_empty());
+    }
+
+    #[test]
+    fn deferred_retirement_never_revokes_a_reference_that_was_republished() {
+        let _backend = crate::secret_store::enable_insecure_test_backend();
+        let (mut manager, item_id) = test_manager_with_item();
+        let reference = crate::secret_store::stable_reference("queue-item", &item_id)
+            .expect("queue-owned reference");
+        crate::secret_store::set(&reference, "archive-secret").expect("store secret");
+        {
+            let mut queue = manager.queue.try_write().expect("queue write lock");
+            let item = queue
+                .items_mut()
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .expect("item exists");
+            item.archive_password_ref = Some(reference.clone());
+            item.status = ConversionStatus::Queued;
+        }
+
+        manager.clear_queue();
+        manager.retire_queue_secret_references_after_persistence(
+            &[],
+            std::slice::from_ref(&reference),
+        );
+        assert_eq!(
+            crate::secret_store::get(&reference).expect("republished reference remains live"),
+            "archive-secret"
+        );
+
+        manager.retire_queue_secret_references_after_persistence(&[], &[]);
+        assert!(
+            crate::secret_store::get(&reference)
+                .expect_err("later durable absence retires deferred reference")
+                .is_not_found()
+        );
     }
 
     #[test]

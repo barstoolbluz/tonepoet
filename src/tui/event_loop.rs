@@ -4085,7 +4085,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 return;
             }
 
-            // Capture terminal state info BEFORE the status is moved into the item.
+            // Capture durable terminal state BEFORE the status is moved into the item.
+            let should_persist_terminal = matches!(
+                &status,
+                crate::convert::ConversionStatus::Completed { .. }
+                    | crate::convert::ConversionStatus::CompletedWithActionErrors { .. }
+                    | crate::convert::ConversionStatus::Partial { .. }
+                    | crate::convert::ConversionStatus::Failed { .. }
+                    | crate::convert::ConversionStatus::Cancelled
+            );
+
+            // Capture conversion-history metadata BEFORE the status is moved
+            // into the item. Cancelled is intentionally excluded — it is not a
+            // conversion outcome and was never recorded historically.
             let history_data = match &status {
                 crate::convert::ConversionStatus::Completed { output_path, .. } => Some((
                     true,
@@ -4112,11 +4124,17 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
 
             app.manager.update_item_status(&item_id, status, progress);
 
-            // Save queue + record history on terminal states.
-            if let Some((success, output_path, error_msg)) = history_data {
+            // Publish every durable terminal status, including Cancelled.
+            if should_persist_terminal {
                 app.save_queue();
+            }
 
-                // Record in conversion history (read item from snapshot for metadata).
+            // Record the conversion in the durable history log. Write-only
+            // today (no reader is wired yet), but this is the data source for a
+            // future conversion-history view; this pre-existing writer was
+            // erroneously dropped during the queue-persistence redesign and is
+            // restored here unchanged.
+            if let Some((success, output_path, error_msg)) = history_data {
                 if let Some(item) = app.items_snapshot.iter().find(|i| i.id == item_id) {
                     let now = chrono::Utc::now().to_rfc3339();
                     let rg_mode = if item.options.calculate_replaygain {
@@ -4170,7 +4188,20 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         }
         AppMessage::ConversionError { message } => {
             app.processing_active = false;
-            app.set_status(format!("Error: {}", message));
+            app.manager.interrupt_active_conversion_run();
+            let persistence_error = app.persist_queue_state().err();
+            if let Some(error) = persistence_error {
+                log::error!(
+                    "could not persist interrupted queue state after conversion error: {}",
+                    error
+                );
+                app.set_status(format!(
+                    "Error: {}; queue persistence degraded ({error})",
+                    message
+                ));
+            } else {
+                app.set_status(format!("Error: {}", message));
+            }
         }
         AppMessage::FilesScanned { paths } => {
             let mut options = crate::convert::ConversionOptions::default();
