@@ -7260,12 +7260,24 @@ fn plan_move(
     })
 }
 
+/// Conservative collision namespace for action destinations.
+///
+/// This deliberately differs from conversion filesystem identity. Action plans
+/// must remain safe when their destination lives on a case-insensitive volume,
+/// including such volumes mounted from an otherwise case-sensitive host. Rust
+/// exposes no portable, side-effect-free query for prospective path case
+/// sensitivity, so rejecting case-only destination variants is the safer action
+/// transaction contract. Conversion batching must not reuse this key.
+fn portable_destination_collision_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
 fn register_planned_destination(
     planned: &mut BTreeMap<String, PathBuf>,
     destination: &Path,
     action_kind: &str,
 ) -> Result<(), ActionError> {
-    let key = destination.to_string_lossy().to_lowercase();
+    let key = portable_destination_collision_key(destination);
     if let Some(previous) = planned.insert(key, destination.to_path_buf()) {
         return Err(ActionError::Conflict(format!(
             "{action_kind} end-state collision: {} and {} resolve to the same destination",
@@ -12475,7 +12487,7 @@ fn rename_transaction_from_journal(
     }
     let mut destinations = BTreeSet::new();
     for entry in &entries {
-        let key = entry.destination.to_string_lossy().to_lowercase();
+        let key = portable_destination_collision_key(&entry.destination);
         if !destinations.insert(key) {
             return Err(ActionError::InvalidJournal(
                 "rename journal contains duplicate destination".to_string(),
@@ -18379,6 +18391,20 @@ mod conversion_actions_tests {
             error.to_string().contains("end-state collision"),
             "SR-5 requires a planned end-state collision refusal, got: {error}"
         );
+    }
+
+    #[test]
+    fn action_destination_collision_guard_remains_conservative_for_case_variants() {
+        let mut planned = BTreeMap::new();
+        let upper = PathBuf::from("/out/Album/track.flac");
+        let lower = PathBuf::from("/out/album/track.flac");
+
+        register_planned_destination(&mut planned, &upper, "copy")
+            .expect("first destination registers");
+        let error = register_planned_destination(&mut planned, &lower, "copy")
+            .expect_err("case-only destination variants remain a conservative action collision");
+        assert!(matches!(&error, ActionError::Conflict(_)));
+        assert!(error.to_string().contains("end-state collision"));
     }
 
     #[test]

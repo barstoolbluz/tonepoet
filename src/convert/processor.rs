@@ -26,6 +26,7 @@ use tonepoet_pipeline::PipelineSettings;
 use crate::config::DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT;
 
 use crate::convert::formats::naming_template_with_disc_subfolder;
+use crate::convert::path_identity::filesystem_identity_key;
 
 use crate::convert::pipeline::{
     boxed_work, build_pipeline_request as raw_build_pipeline_request, detect_source_kind,
@@ -337,8 +338,8 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
         let source_grouping_root = source_grouping_root_for_dispatch_request(&request);
         let album_output_dir = provisional_album_output_dir_for_dispatch_request(&request, &source_grouping_root);
         let key = IndependentSingleFileBatchKey {
-            source_grouping_root_key: normalized_path_key(&source_grouping_root),
-            provisional_album_output_dir_key: normalized_path_key(&album_output_dir),
+            source_grouping_root_key: filesystem_identity_key(&source_grouping_root),
+            provisional_album_output_dir_key: filesystem_identity_key(&album_output_dir),
             // Group by FOLDER-level identity only. Settings/lifecycle
             // fingerprints deliberately stay OUT of the key: heterogeneous
             // items in one album folder must land in ONE group so the
@@ -504,7 +505,7 @@ fn prepare_album_batches_for_queued_independent_single_file_jobs(items: &mut [Co
 
             prepared.push((
                 order_key,
-                normalized_path_key(&candidate.request.container),
+                casefolded_path_sort_key(&candidate.request.container),
                 candidate.item_index,
                 candidate.request.clone(),
             ));
@@ -736,10 +737,10 @@ fn resolve_batch_album_identity_from_probes(
     }
 
     for probe in &mut probes {
-        // Enforce the lookup key normalization here rather than trusting every
-        // probe constructor: disc_number_for_path() normalizes its argument,
-        // so stored keys must match or path-derived disc numbers vanish.
-        probe.path_key = probe.path_key.replace('\\', "/").to_ascii_lowercase();
+        // Enforce the shared filesystem-identity contract here rather than
+        // trusting every probe constructor: disc_number_for_path() derives the
+        // same key, so stored and lookup identities stay case-exact.
+        probe.path_key = filesystem_identity_key(Path::new(&probe.path_key));
         if probe.disc_number.is_none() {
             probe.disc_number = disc_number_from_dispatch_path(Path::new(&probe.path_key));
         }
@@ -830,7 +831,7 @@ fn batch_identity_probe_for_request(req: &PipelineRequest, source_kind: SourceKi
         SourceKind::CueImage => cue_batch_identity_probe(&req.container).unwrap_or_default(),
         _ => BatchIdentityProbe::default(),
     };
-    probe.path_key = normalized_path_key(&req.container);
+    probe.path_key = filesystem_identity_key(&req.container);
     if let Some(context) = track_order_context_from_dispatch_metadata(&req.container) {
         probe.disc_number = probe.disc_number.or(context.disc_number);
         match context.track_number {
@@ -940,7 +941,7 @@ fn planner_resolved_album_output_dir_for_dispatch(
         let metadata = dispatch_track_metadata_for_output_planning(req, source_kind)?;
         let album_dir = plan_album_dir_from_dispatch_metadata(req, source_kind, metadata).ok()?;
         match resolved.as_ref() {
-            Some(existing) if normalized_path_key(existing) != normalized_path_key(&album_dir) => {
+            Some(existing) if filesystem_identity_key(existing) != filesystem_identity_key(&album_dir) => {
                 return None;
             }
             Some(_) => {}
@@ -1335,8 +1336,8 @@ fn prepare_completion_order_album_batch(
 ) {
     let mut ordered = group.to_vec();
     ordered.sort_by(|left, right| {
-        normalized_path_key(&left.request.container)
-            .cmp(&normalized_path_key(&right.request.container))
+        casefolded_path_sort_key(&left.request.container)
+            .cmp(&casefolded_path_sort_key(&right.request.container))
             .then_with(|| left.item_index.cmp(&right.item_index))
     });
 
@@ -2067,7 +2068,7 @@ fn sanitize_album_batch_component(value: &str) -> String {
     }
 }
 
-fn normalized_path_key(path: &Path) -> String {
+fn casefolded_path_sort_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase()
@@ -4039,6 +4040,124 @@ mod tests {
     }
 
     #[test]
+    fn planned_album_destinations_preserve_case_before_they_exist() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut upper_request = processor_dispatch_request_for_path(
+            temp.path(),
+            "planned-upper",
+            "planned-upper-job",
+            temp.path().join("source-upper.flac"),
+        );
+        let mut lower_request = processor_dispatch_request_for_path(
+            temp.path(),
+            "planned-lower",
+            "planned-lower-job",
+            temp.path().join("source-lower.flac"),
+        );
+        upper_request.naming.folder_template = Some("%ALBUM%".to_string());
+        lower_request.naming.folder_template = Some("%ALBUM%".to_string());
+
+        let metadata = |album: &str| {
+            let mut metadata = TrackMetadata {
+                title: Some("Track".to_string()),
+                track_number: Some(1),
+                ..TrackMetadata::default()
+            };
+            metadata.extra.insert("album".to_string(), album.to_string());
+            metadata
+        };
+
+        let upper = plan_album_dir_from_dispatch_metadata(
+            &upper_request,
+            SourceKind::SingleFile,
+            metadata("Album"),
+        )
+        .expect("upper album plan");
+        let lower = plan_album_dir_from_dispatch_metadata(
+            &lower_request,
+            SourceKind::SingleFile,
+            metadata("album"),
+        )
+        .expect("lower album plan");
+
+        assert_eq!(upper, temp.path().join("out").join("Album"));
+        assert_eq!(lower, temp.path().join("out").join("album"));
+        assert!(!upper.exists() && !lower.exists(), "planned roots stay prospective in this test");
+        assert_ne!(
+            filesystem_identity_key(&upper),
+            filesystem_identity_key(&lower),
+            "lexical fallback must not collapse case-distinct planned destinations"
+        );
+    }
+
+    #[test]
+    fn planner_resolved_album_output_dir_rejects_case_variant_prospective_directories() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let upper_cue = temp.path().join("upper.cue");
+        let lower_cue = temp.path().join("lower.cue");
+        std::fs::write(
+            &upper_cue,
+            r#"PERFORMER "Artist"
+TITLE "Album"
+FILE "track.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track"
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("upper cue fixture");
+        std::fs::write(
+            &lower_cue,
+            r#"PERFORMER "Artist"
+TITLE "album"
+FILE "track.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track"
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("lower cue fixture");
+
+        let mut upper_request = processor_dispatch_request_for_path(
+            temp.path(),
+            "planner-upper",
+            "planner-upper-job",
+            upper_cue,
+        );
+        let mut lower_request = processor_dispatch_request_for_path(
+            temp.path(),
+            "planner-lower",
+            "planner-lower-job",
+            lower_cue,
+        );
+        upper_request.naming.folder_template = Some("%ALBUM%".to_string());
+        lower_request.naming.folder_template = Some("%ALBUM%".to_string());
+
+        let planned_dir = |request: &PipelineRequest| {
+            let source_kind = detect_source_kind(request).expect("source kind");
+            assert_eq!(source_kind, SourceKind::CueImage);
+            let metadata = dispatch_track_metadata_for_output_planning(request, source_kind)
+                .expect("CUE supplies output-planning metadata");
+            plan_album_dir_from_dispatch_metadata(request, source_kind, metadata)
+                .expect("album directory plan")
+        };
+        let upper_planned = planned_dir(&upper_request);
+        let lower_planned = planned_dir(&lower_request);
+
+        assert_eq!(upper_planned, temp.path().join("out").join("Album"));
+        assert_eq!(lower_planned, temp.path().join("out").join("album"));
+        assert!(
+            !upper_planned.exists() && !lower_planned.exists(),
+            "agreement check must exercise lexical identity for prospective directories"
+        );
+        assert_eq!(
+            planner_resolved_album_output_dir_for_dispatch(&[upper_request, lower_request]),
+            None,
+            "case-variant prospective album directories must not be accepted as one authoritative directory"
+        );
+    }
+
+    #[test]
     fn production_request_boundary_applies_disc_subfolder_template_to_raw_builder_output() {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut request = pipeline_request_for_processor_limit_test(temp.path());
@@ -4946,6 +5065,89 @@ mod tests {
     }
 
     #[test]
+    fn queued_folder_dispatch_keeps_case_variant_album_roots_in_distinct_batches() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let upper_root = temp.path().join("Artist").join("Album");
+        let lower_root = temp.path().join("Artist").join("album");
+        std::fs::create_dir_all(&upper_root).expect("upper album dir");
+        std::fs::create_dir_all(&lower_root).expect("lower album dir");
+
+        // This regression targets filesystems where case is part of identity.
+        // On a case-insensitive test volume the two spellings are one directory,
+        // so there is no distinct-identity behavior to assert.
+        if upper_root.canonicalize().ok() == lower_root.canonicalize().ok() {
+            return;
+        }
+
+        let upper_01 = upper_root.join("01 - Upper First.flac");
+        let upper_02 = upper_root.join("02 - Upper Second.flac");
+        let lower_01 = lower_root.join("01 - Lower First.flac");
+        let lower_02 = lower_root.join("02 - Lower Second.flac");
+        for path in [&upper_01, &upper_02, &lower_01, &lower_02] {
+            std::fs::write(path, b"not real audio; dispatch identity test only")
+                .expect("track fixture");
+        }
+
+        let mut items = vec![
+            conversion_item_with_pipeline_request(
+                "upper-01",
+                processor_dispatch_request_for_path(temp.path(), "upper-01", "job-upper-01", upper_01),
+            ),
+            conversion_item_with_pipeline_request(
+                "upper-02",
+                processor_dispatch_request_for_path(temp.path(), "upper-02", "job-upper-02", upper_02),
+            ),
+            conversion_item_with_pipeline_request(
+                "lower-01",
+                processor_dispatch_request_for_path(temp.path(), "lower-01", "job-lower-01", lower_01),
+            ),
+            conversion_item_with_pipeline_request(
+                "lower-02",
+                processor_dispatch_request_for_path(temp.path(), "lower-02", "job-lower-02", lower_02),
+            ),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let batch = |index: usize| {
+            items[index]
+                .pipeline_request
+                .as_ref()
+                .expect("prepared request")
+                .album_batch
+                .as_ref()
+                .expect("two-track folder receives album batch")
+        };
+        let upper_batch_01 = batch(0);
+        let upper_batch_02 = batch(1);
+        let lower_batch_01 = batch(2);
+        let lower_batch_02 = batch(3);
+
+        assert_eq!(
+            upper_batch_01.conversion_log_batch_id,
+            upper_batch_02.conversion_log_batch_id
+        );
+        assert_eq!(
+            lower_batch_01.conversion_log_batch_id,
+            lower_batch_02.conversion_log_batch_id
+        );
+        assert_ne!(
+            upper_batch_01.conversion_log_batch_id,
+            lower_batch_01.conversion_log_batch_id,
+            "case-distinct source roots must not merge through the BTreeMap batch key"
+        );
+        assert_eq!(upper_batch_01.source_grouping_root, upper_root);
+        assert_eq!(lower_batch_01.source_grouping_root, lower_root);
+        assert_eq!(upper_batch_01.album_output_dir, temp.path().join("out").join("Album"));
+        assert_eq!(lower_batch_01.album_output_dir, temp.path().join("out").join("album"));
+        assert_ne!(
+            filesystem_identity_key(&upper_batch_01.album_output_dir),
+            filesystem_identity_key(&lower_batch_01.album_output_dir),
+            "prospective case-variant output roots must remain distinct"
+        );
+    }
+
+    #[test]
     fn queued_folder_dispatch_attaches_fragment_batch_before_scheduler_enqueue() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_root = temp.path().join("Artist").join("Album");
@@ -5692,6 +5894,64 @@ mod tests {
             track_number,
             scheduler_track_number: track_number.map(DispatchTrackNumber::Numeric),
         }
+    }
+
+    #[test]
+    fn batch_identity_disc_lookup_is_case_exact() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let upper_album = temp.path().join("Album");
+        let lower_album = temp.path().join("album");
+        let upper_disc_1 = upper_album.join("disc 01");
+        let upper_disc_2 = upper_album.join("disc 02");
+        let lower_disc_1 = lower_album.join("disc 01");
+        std::fs::create_dir_all(&upper_disc_1).expect("upper disc 1");
+        std::fs::create_dir_all(&upper_disc_2).expect("upper disc 2");
+        std::fs::create_dir_all(&lower_disc_1).expect("lower disc 1");
+
+        if upper_album.canonicalize().ok() == lower_album.canonicalize().ok() {
+            return;
+        }
+
+        let upper_track_1 = upper_disc_1.join("01.flac");
+        let upper_track_2 = upper_disc_2.join("01.flac");
+        let lower_track_1 = lower_disc_1.join("01.flac");
+        for path in [&upper_track_1, &upper_track_2, &lower_track_1] {
+            std::fs::write(path, b"disc identity fixture").expect("disc track fixture");
+        }
+
+        let request_1 = processor_dispatch_request_for_path(
+            temp.path(),
+            "disc-upper-1",
+            "disc-upper-job-1",
+            upper_track_1.clone(),
+        );
+        let request_2 = processor_dispatch_request_for_path(
+            temp.path(),
+            "disc-upper-2",
+            "disc-upper-job-2",
+            upper_track_2.clone(),
+        );
+        let probe_1 = batch_identity_probe_for_request(&request_1, SourceKind::SingleFile);
+        let probe_2 = batch_identity_probe_for_request(&request_2, SourceKind::SingleFile);
+        assert_eq!(probe_1.path_key, filesystem_identity_key(&upper_track_1));
+        assert_eq!(probe_2.path_key, filesystem_identity_key(&upper_track_2));
+
+        let identity = resolve_batch_album_identity_from_probes(vec![probe_1, probe_2], None)
+            .expect("sibling disc directories prove multi-disc identity");
+
+        assert_eq!(identity.disc_number_for_path(&upper_track_1), Some(1));
+        assert_eq!(identity.disc_number_for_path(&upper_track_2), Some(2));
+        assert_eq!(
+            identity.disc_number_for_path(&lower_track_1),
+            None,
+            "disc evidence from Album must not cross into case-distinct album"
+        );
+        assert!(identity
+            .source_disc_numbers
+            .contains_key(&filesystem_identity_key(&upper_track_1)));
+        assert!(!identity
+            .source_disc_numbers
+            .contains_key(&filesystem_identity_key(&lower_track_1)));
     }
 
     #[test]

@@ -93,8 +93,8 @@ pub struct BatchResolvedAlbumIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_discs: Option<u32>,
     /// Per-source container path -> resolved one-based disc number. Keys are
-    /// deterministic lossy path strings so the contract survives serde and does
-    /// not depend on platform-specific Path hashing.
+    /// deterministic lossy filesystem-identity strings so the contract survives
+    /// serde and does not depend on platform-specific Path hashing.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub source_disc_numbers: BTreeMap<String, u32>,
 }
@@ -112,7 +112,7 @@ impl BatchResolvedAlbumIdentity {
     #[must_use]
     pub fn disc_number_for_path(&self, path: &std::path::Path) -> Option<u32> {
         self.source_disc_numbers
-            .get(&path.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+            .get(&crate::convert::path_identity::filesystem_identity_key(path))
             .copied()
     }
 }

@@ -28374,6 +28374,15 @@ fn companion_batch_finalization_key(
             "resolved_total_discs",
             &identity.total_discs.map(|value| value.to_string()).unwrap_or_default(),
         );
+        // NOTE: source_disc_numbers keys are now filesystem-*state*-dependent
+        // (path_identity::filesystem_identity_key canonicalizes existing paths)
+        // rather than the old purely-lexical lowercase form. This finalization
+        // key is only compared in-process within a single run (its backing set
+        // is a per-run OnceLock), so that state-dependence is harmless here. If
+        // this coordination key is ever persisted to a cross-restart recovery
+        // journal, revisit the derivation: a source moved/deleted between runs
+        // would canonicalize differently (or fall back to lexical) and change
+        // the key.
         for (path, disc) in &identity.source_disc_numbers {
             push_finalization_key_line(&mut key, "resolved_source_disc", &format!("{path}={disc}"));
         }
@@ -31374,10 +31383,11 @@ mod companion_copy_hardening_tests {
     fn fallback_authority_survives_real_batch_identity_mutation_without_tag_fabrication() {
         let temp = tempfile::tempdir().expect("temp dir");
         let source_path = temp.path().join("untagged-invalid-ape.wv");
-        let identity_key = source_path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
+        // Seed the disc-number map with the same identity contract the reader
+        // (disc_number_for_path) now uses, so the hand-built map matches the
+        // production writer/reader key derivation rather than the old lowercase
+        // scheme.
+        let identity_key = crate::convert::path_identity::filesystem_identity_key(&source_path);
 
         let make_source = || {
             let mut metadata = TrackMetadata {

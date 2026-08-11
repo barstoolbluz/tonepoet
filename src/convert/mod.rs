@@ -27,6 +27,7 @@ pub mod sacd;
 pub mod script_supervisor;
 pub mod labels;
 pub mod metadata;
+pub(crate) mod path_identity;
 pub mod pipeline;
 pub mod processor;
 pub mod queue;
