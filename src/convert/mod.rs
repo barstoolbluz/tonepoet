@@ -63,6 +63,7 @@ pub use wizard_integration::{
     apply_settings_to_queue, extract_wizard_settings, validate_conversion_ready,
     validate_wizard_selections,
 };
+pub(crate) use wizard_integration::reconfigure_items_in_place;
 
 /// Tagging module alias for backward compatibility
 pub mod tagging {
@@ -1237,6 +1238,7 @@ impl ConversionManager {
 
     /// Get current progress
     pub fn get_progress(&self) -> ConversionProgress {
+        // Fabricates a default on lock contention; currently unconsumed — do not wire a consumer without converting to a Try/Option form.
         // Since this is called from UI thread and we need non-blocking access,
         // we'll use try_read() and return defaults if busy
         if let Ok(queue) = self.queue.try_read() {
@@ -1479,6 +1481,7 @@ impl ConversionManager {
 
     /// Get queue size blocking - for UI compatibility
     pub fn queue_size(&self) -> usize {
+        // Fabricates a default on lock contention; currently unconsumed — do not wire a consumer without converting to a Try/Option form.
         if let Ok(queue) = self.queue.try_read() {
             queue.total_items()
         } else {
@@ -1488,6 +1491,7 @@ impl ConversionManager {
 
     /// Get count of active items (excluding completed/failed) - for routing logic
     pub fn active_items_count(&self) -> usize {
+        // Fabricates a default on lock contention; currently unconsumed — do not wire a consumer without converting to a Try/Option form.
         if let Ok(queue) = self.queue.try_read() {
             queue.active_items_count()
         } else {
@@ -2706,6 +2710,7 @@ impl ConversionManager {
     /// registration. The caller still owns the source artifacts and must report
     /// the failed commit rather than presenting a successful queue admission.
     pub fn item_ids_for_paths(&self, paths: &[PathBuf]) -> HashSet<String> {
+        // Fabricates a default on lock contention; currently unconsumed — do not wire a consumer without converting to a Try/Option form.
         if paths.is_empty() {
             return HashSet::new();
         }
@@ -2730,6 +2735,7 @@ impl ConversionManager {
         paths: &[PathBuf],
         preserve_item_ids: &HashSet<String>,
     ) -> Vec<String> {
+        // Fabricates a default on lock contention; currently unconsumed — do not wire a consumer without converting to a Try/Option form.
         if paths.is_empty() {
             return Vec::new();
         }
@@ -2769,13 +2775,24 @@ impl ConversionManager {
         )
     }
 
+    /// Try to clone all queue items for non-blocking UI display.
+    ///
+    /// `None` means the queue lock is currently contended; callers that cache
+    /// display state should retain their last good snapshot rather than
+    /// interpreting contention as an empty queue.
+    pub fn try_get_items_clone(&self) -> Option<Vec<ConversionItem>> {
+        self.queue.try_read().ok().map(|queue| {
+            queue
+                .all_items()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    }
+
     /// Get all items as a cloned vector for UI display
     pub fn get_items_clone(&self) -> Vec<ConversionItem> {
-        if let Ok(queue) = self.queue.try_read() {
-            queue.all_items().iter().map(|&item| item.clone()).collect()
-        } else {
-            Vec::new()
-        }
+        self.try_get_items_clone().unwrap_or_default()
     }
 
     /// Clear completed-success items from queue.

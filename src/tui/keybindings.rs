@@ -15,7 +15,7 @@ use super::draw_browse::{
     options_button_anchor_for_toolbar, options_menu_geometry_for_area, OptionsMenuGeometry,
 };
 use super::message::AppMessage;
-use crate::convert::{ConversionOptions, ConversionStatus};
+use crate::convert::{AudioFormat, ConversionOptions, ConversionStatus};
 
 /// Handle a key event, dispatching to the appropriate screen handler
 pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
@@ -8177,6 +8177,28 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
 
 // ── Wizard keybindings ───────────────────────────────────────────────
 
+fn apply_wizard_configuration(
+    app: &mut AppState,
+    format: AudioFormat,
+    options: &ConversionOptions,
+) {
+    app.manager.invalidate_deferred_stop_requests();
+    let queue = app.manager.queue.clone();
+    let write_succeeded = match queue.try_write() {
+        Ok(mut q) => {
+            crate::convert::reconfigure_items_in_place(&mut q, options);
+            true
+        }
+        Err(_) => false,
+    };
+
+    if write_succeeded {
+        app.set_status(format!("Configured items for {} conversion", format.name()));
+    } else {
+        app.set_status("Configure: queue busy, try again");
+    }
+}
+
 fn handle_wizard_key(app: &mut AppState, key: KeyEvent) {
     if let Some(wizard) = &mut app.wizard {
         wizard.handle_key(key);
@@ -8187,32 +8209,7 @@ fn handle_wizard_key(app: &mut AppState, key: KeyEvent) {
             app.wizard_mouse_areas = None;
             app.current_screen = AppScreen::Queue;
 
-            app.manager.invalidate_deferred_stop_requests();
-            let queue = app.manager.queue.clone();
-            let has_selected = if let Ok(q) = queue.try_read() {
-                q.all_items().iter().any(|i| i.selected)
-            } else {
-                false
-            };
-
-            if let Ok(mut q) = queue.try_write() {
-                for item in q.all_items_mut() {
-                    if has_selected && !item.selected {
-                        continue;
-                    }
-                    match item.status {
-                        ConversionStatus::NotConfigured
-                        | ConversionStatus::Queued
-                        | ConversionStatus::Paused => {
-                            item.output_format = options.output_format;
-                            item.options = options.clone();
-                            item.status = ConversionStatus::Queued;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            app.set_status(format!("Configured items for {} conversion", format.name()));
+            apply_wizard_configuration(app, format, &options);
             return;
         }
 
@@ -51878,11 +51875,142 @@ fn start_conversion(app: &mut AppState, tx: mpsc::Sender<AppMessage>) {
 
 fn retry_failed(app: &mut AppState) {
     app.manager.invalidate_deferred_stop_requests();
-    if let Ok(mut queue) = app.manager.queue.try_write() {
-        queue.retry_failed();
+    let queue = app.manager.queue.clone();
+    let write_succeeded = match queue.try_write() {
+        Ok(mut queue) => {
+            queue.retry_failed();
+            true
+        }
+        Err(_) => false,
+    };
+    if write_succeeded {
+        app.save_queue();
+        app.set_status("Re-queued selected retryable items");
+    } else {
+        app.set_status("retry: queue locked, try again");
     }
-    app.save_queue();
-    app.set_status("Re-queued selected retryable items");
+}
+
+#[cfg(test)]
+mod queue_contention_action_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::convert::FileFormat;
+    use std::path::PathBuf;
+
+    fn status(app: &AppState) -> &str {
+        app.status_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+            .unwrap_or("")
+    }
+
+    fn add_queue_item(app: &mut AppState, selected: bool, status: ConversionStatus) -> String {
+        let mut queue = app.manager.queue.try_write().expect("uncontended test queue");
+        queue.add_item(
+            PathBuf::from("queue-item.flac"),
+            FileFormat::Audio(AudioFormat::Flac),
+            ConversionOptions::default(),
+        );
+        let item = queue
+            .all_items_mut()
+            .into_iter()
+            .next()
+            .expect("inserted queue item");
+        item.selected = selected;
+        item.status = status;
+        item.id.clone()
+    }
+
+    #[test]
+    fn wizard_configuration_reports_busy_and_leaves_queue_unchanged_on_contention() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let item_id = add_queue_item(&mut app, true, ConversionStatus::Queued);
+        let mut options = ConversionOptions::default();
+        options.output_format = AudioFormat::Wav;
+
+        let queue = app.manager.queue.clone();
+        let guard = queue.try_write().expect("force write contention");
+        apply_wizard_configuration(&mut app, AudioFormat::Wav, &options);
+        assert_eq!(status(&app), "Configure: queue busy, try again");
+        let held_item = guard
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item remains present");
+        assert_eq!(held_item.output_format, AudioFormat::Flac);
+        assert_eq!(held_item.options.output_format, AudioFormat::Flac);
+    }
+
+    #[test]
+    fn wizard_configuration_reports_success_only_after_mutation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let item_id = add_queue_item(&mut app, true, ConversionStatus::Queued);
+        let mut options = ConversionOptions::default();
+        options.output_format = AudioFormat::Wav;
+
+        apply_wizard_configuration(&mut app, AudioFormat::Wav, &options);
+
+        assert_eq!(status(&app), "Configured items for WAV conversion");
+        let queue = app.manager.queue.try_read().expect("queue readable");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item remains present");
+        assert_eq!(item.output_format, AudioFormat::Wav);
+        assert_eq!(item.options.output_format, AudioFormat::Wav);
+    }
+
+    #[test]
+    fn retry_failed_reports_busy_and_does_not_requeue_on_contention() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let item_id = add_queue_item(
+            &mut app,
+            true,
+            ConversionStatus::Failed {
+                error: "fixture failure".to_string(),
+                log_path: None,
+            },
+        );
+
+        let queue = app.manager.queue.clone();
+        let guard = queue.try_write().expect("force write contention");
+        retry_failed(&mut app);
+        assert_eq!(status(&app), "retry: queue locked, try again");
+        let held_item = guard
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item remains present");
+        assert!(held_item.selected);
+        assert!(matches!(held_item.status, ConversionStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn retry_failed_reports_success_after_selected_item_is_requeued() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let item_id = add_queue_item(
+            &mut app,
+            true,
+            ConversionStatus::Failed {
+                error: "fixture failure".to_string(),
+                log_path: None,
+            },
+        );
+
+        retry_failed(&mut app);
+
+        assert_eq!(status(&app), "Re-queued selected retryable items");
+        let queue = app.manager.queue.try_read().expect("queue readable");
+        let item = queue
+            .all_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .expect("item remains present");
+        assert!(!item.selected);
+        assert_eq!(item.status, ConversionStatus::Queued);
+    }
 }
 
 /// Handle mouse events
@@ -53025,27 +53153,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.wizard_mouse_areas = None;
                 app.current_screen = AppScreen::Queue;
 
-                app.manager.invalidate_deferred_stop_requests();
-                let queue = app.manager.queue.clone();
-                if let Ok(mut q) = queue.try_write() {
-                    let has_selected = q.all_items().iter().any(|i| i.selected);
-                    for item in q.all_items_mut() {
-                        if has_selected && !item.selected {
-                            continue;
-                        }
-                        match item.status {
-                            ConversionStatus::NotConfigured
-                            | ConversionStatus::Queued
-                            | ConversionStatus::Paused => {
-                                item.output_format = options.output_format;
-                                item.options = options.clone();
-                                item.status = ConversionStatus::Queued;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                app.set_status(format!("Configured items for {} conversion", format.name()));
+                apply_wizard_configuration(app, format, &options);
             } else if wizard.should_exit {
                 app.wizard = None;
                 app.wizard_mouse_areas = None;

@@ -7,7 +7,7 @@ use crate::convert::formats::{
     AacProfile, AudioFormat, Mp3BitrateMode, QualitySettings, WavPackMode,
 };
 use crate::convert::simple_wizard::{DitherType, NyquistTransition};
-use crate::convert::{ConversionManager, ConversionOptions, ConversionStatus};
+use crate::convert::{ConversionManager, ConversionOptions, ConversionQueue, ConversionStatus};
 
 /// Extract conversion settings from the tui_wizard_core wizard
 ///
@@ -273,18 +273,23 @@ pub fn extract_wizard_settings(
     (format, options)
 }
 
-/// Apply wizard settings to all items in the conversion queue
-pub async fn apply_settings_to_queue(manager: &mut ConversionManager, options: ConversionOptions) {
-    let mut queue = manager.queue.write().await;
-
-    // Check if any items are selected
-    let has_selection = queue.all_items().iter().any(|item| item.selected);
-    let total_items = queue.all_items().len();
-    let selected_count = queue
-        .all_items()
-        .iter()
-        .filter(|item| item.selected)
-        .count();
+/// Apply wizard settings to an already-locked queue.
+///
+/// The selection decision and mutation deliberately share the same queue
+/// guard so lock contention can never turn an unknown selection state into
+/// "nothing selected" and broaden the operation to every item.
+pub(crate) fn reconfigure_items_in_place(
+    queue: &mut ConversionQueue,
+    options: &ConversionOptions,
+) {
+    let (has_selection, total_items, selected_count) = {
+        let items = queue.all_items();
+        (
+            items.iter().any(|item| item.selected),
+            items.len(),
+            items.iter().filter(|item| item.selected).count(),
+        )
+    };
 
     log::info!(
         "apply_settings_to_queue: has_selection={}, total_items={}, selected_count={}",
@@ -323,6 +328,12 @@ pub async fn apply_settings_to_queue(manager: &mut ConversionManager, options: C
             }
         }
     }
+}
+
+/// Apply wizard settings to all items in the conversion queue.
+pub async fn apply_settings_to_queue(manager: &mut ConversionManager, options: ConversionOptions) {
+    let mut queue = manager.queue.write().await;
+    reconfigure_items_in_place(&mut queue, &options);
 }
 
 /// Validate that conversion is ready to start
@@ -643,6 +654,25 @@ pub fn preset_to_conversion_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::{ConversionItem, FileFormat};
+    use std::path::PathBuf;
+
+    fn queued_item(name: &str, selected: bool) -> ConversionItem {
+        let mut item = ConversionItem::new(
+            PathBuf::from(name),
+            FileFormat::Audio(AudioFormat::Flac),
+            ConversionOptions::default(),
+        );
+        item.status = ConversionStatus::Queued;
+        item.selected = selected;
+        item
+    }
+
+    fn wav_options() -> ConversionOptions {
+        let mut options = ConversionOptions::default();
+        options.output_format = AudioFormat::Wav;
+        options
+    }
 
     #[test]
     fn test_flac_settings_extraction() {
@@ -662,6 +692,38 @@ mod tests {
         } else {
             panic!("Expected FLAC quality settings");
         }
+    }
+
+    #[test]
+    fn reconfigure_items_in_place_changes_only_selected_items_when_selection_exists() {
+        let mut queue = ConversionQueue::new();
+        queue.items_mut().push_back(queued_item("a.flac", true));
+        queue.items_mut().push_back(queued_item("b.flac", false));
+
+        reconfigure_items_in_place(&mut queue, &wav_options());
+
+        let items = queue.all_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].output_format, AudioFormat::Wav);
+        assert_eq!(items[0].options.output_format, AudioFormat::Wav);
+        assert_eq!(items[1].output_format, AudioFormat::Flac);
+        assert_eq!(items[1].options.output_format, AudioFormat::Flac);
+    }
+
+    #[test]
+    fn reconfigure_items_in_place_changes_all_items_when_nothing_is_selected() {
+        let mut queue = ConversionQueue::new();
+        queue.items_mut().push_back(queued_item("a.flac", false));
+        queue.items_mut().push_back(queued_item("b.flac", false));
+
+        reconfigure_items_in_place(&mut queue, &wav_options());
+
+        let items = queue.all_items();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item.output_format == AudioFormat::Wav));
+        assert!(items
+            .iter()
+            .all(|item| item.options.output_format == AudioFormat::Wav));
     }
 
     #[tokio::test]

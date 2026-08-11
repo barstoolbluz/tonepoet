@@ -50,6 +50,20 @@ fn lifecycle_to_app_message(event: LifecycleEvent) -> AppMessage {
     }
 }
 
+fn conversion_complete_counts(queue: &crate::convert::ConversionQueue) -> (usize, usize) {
+    // TODO: dedicated follow-up: extend ConversionComplete with a denominator/"other"
+    // bucket so Partial and Cancelled are represented without treating Partial as success.
+    queue.all_items().into_iter().fold(
+        (0usize, 0usize),
+        |(completed, failed), item| match item.status {
+            ConversionStatus::Completed { .. }
+            | ConversionStatus::CompletedWithActionErrors { .. } => (completed + 1, failed),
+            ConversionStatus::Failed { .. } => (completed, failed + 1),
+            _ => (completed, failed),
+        },
+    )
+}
+
 async fn forward_conversion_events(
     mut progress_rx: tokio::sync::broadcast::Receiver<ProgressUpdate>,
     mut lifecycle_rx: mpsc::UnboundedReceiver<LifecycleEvent>,
@@ -663,41 +677,75 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
             return;
         }
 
-        if let Ok(q) = queue.try_read() {
-            let completed = q
-                .all_items()
-                .iter()
-                .filter(|i| {
-                    matches!(
-                        i.status,
-                        ConversionStatus::Completed { .. }
-                            | ConversionStatus::CompletedWithActionErrors { .. }
-                    )
-                })
-                .count();
-            let failed = q
-                .all_items()
-                .iter()
-                .filter(|i| matches!(i.status, ConversionStatus::Failed { .. }))
-                .count();
-            let _ = tx_clone
-                .send(AppMessage::ConversionComplete { completed, failed })
-                .await;
-        } else {
-            let _ = tx_clone
-                .send(AppMessage::ConversionComplete {
-                    completed: 0,
-                    failed: 0,
-                })
-                .await;
-        }
+        let q = queue.read().await;
+        let (completed, failed) = conversion_complete_counts(&q);
+        drop(q);
+        let _ = tx_clone
+            .send(AppMessage::ConversionComplete { completed, failed })
+            .await;
     });
 }
 
 #[cfg(test)]
 mod lifecycle_forwarder_tests {
     use super::*;
+    use crate::convert::{ConversionItem, ConversionQueue, FileFormat};
     use std::path::PathBuf;
+
+    fn item_with_status(name: &str, status: ConversionStatus) -> ConversionItem {
+        let mut item = ConversionItem::new(
+            PathBuf::from(name),
+            FileFormat::Audio(AudioFormat::Flac),
+            ConversionOptions::default(),
+        );
+        item.status = status;
+        item
+    }
+
+    #[test]
+    fn conversion_complete_counts_only_success_and_failed_terminal_buckets() {
+        let mut queue = ConversionQueue::new();
+        queue.items_mut().push_back(item_with_status(
+            "completed.flac",
+            ConversionStatus::Completed {
+                output_path: PathBuf::from("completed-out.flac"),
+                log_path: None,
+                warning_count: 0,
+            },
+        ));
+        queue.items_mut().push_back(item_with_status(
+            "action-errors.flac",
+            ConversionStatus::CompletedWithActionErrors {
+                output_path: PathBuf::from("action-errors-out.flac"),
+                log_path: None,
+                errors: vec!["fixture warning".to_string()],
+            },
+        ));
+        queue.items_mut().push_back(item_with_status(
+            "failed.flac",
+            ConversionStatus::Failed {
+                error: "fixture failure".to_string(),
+                log_path: None,
+            },
+        ));
+        queue
+            .items_mut()
+            .push_back(item_with_status("queued.flac", ConversionStatus::Queued));
+        queue.items_mut().push_back(item_with_status(
+            "partial.flac",
+            ConversionStatus::Partial {
+                output_path: PathBuf::from("partial-out.flac"),
+                successful: 1,
+                failed: 1,
+                log_path: PathBuf::from("partial.log"),
+            },
+        ));
+        queue
+            .items_mut()
+            .push_back(item_with_status("cancelled.flac", ConversionStatus::Cancelled));
+
+        assert_eq!(conversion_complete_counts(&queue), (2, 1));
+    }
 
     fn processing_update(item_id: &str, progress: f32) -> ProgressUpdate {
         ProgressUpdate {

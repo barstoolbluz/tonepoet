@@ -13416,7 +13416,9 @@ impl AppState {
 
     /// Refresh the items snapshot from the manager
     pub fn refresh_items(&mut self) {
-        self.items_snapshot = self.manager.get_items_clone();
+        if let Some(items) = self.manager.try_get_items_clone() {
+            self.items_snapshot = items;
+        }
     }
 
     /// Ensure selected_index stays within bounds
@@ -13721,6 +13723,39 @@ impl AppState {
             )
         };
         self.set_status(status);
+    }
+}
+
+#[cfg(test)]
+mod queue_snapshot_contention_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::convert::{AudioFormat, ConversionOptions, FileFormat};
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn refresh_items_retains_last_good_snapshot_when_queue_is_write_locked() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        {
+            let mut queue = app.manager.queue.write().await;
+            queue.add_item(
+                PathBuf::from("snapshot.flac"),
+                FileFormat::Audio(AudioFormat::Flac),
+                ConversionOptions::default(),
+            );
+        }
+
+        app.refresh_items();
+        assert_eq!(app.items_snapshot.len(), 1);
+        let retained_id = app.items_snapshot[0].id.clone();
+
+        let queue = app.manager.queue.clone();
+        let _guard = queue.write().await;
+        assert!(app.manager.try_get_items_clone().is_none());
+
+        app.refresh_items();
+        assert_eq!(app.items_snapshot.len(), 1);
+        assert_eq!(app.items_snapshot[0].id, retained_id);
     }
 }
 
