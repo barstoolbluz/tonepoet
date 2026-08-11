@@ -4589,27 +4589,27 @@ fn validate_embedded_qualification_report(
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md"
+        "/assets/dsd_reference/tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md"
     ));
     let decimation = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/sox_ng_dsd_decimation_test_report_v5.md"
+        "/assets/dsd_reference/sox_ng_dsd_decimation_test_report_v5.md"
     ));
     let commission = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/brief_dsd_reference_p0_scope_and_commission.md"
+        "/assets/dsd_reference/brief_dsd_reference_p0_scope_and_commission.md"
     ));
     let amendment = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/brief_dsd_reference_p0_policy_v3_amendment.md"
+        "/assets/dsd_reference/brief_dsd_reference_p0_policy_v3_amendment.md"
     ));
     let analyzer_corrective_brief = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/brief_dsd_reference_p0_corrective_analyzer_carrier.md"
+        "/assets/dsd_reference/brief_dsd_reference_p0_corrective_analyzer_carrier.md"
     ));
     let runtime_defaults_corrective_brief = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/brief_dsd_reference_p0_corrective_runtime_defaults.md"
+        "/assets/dsd_reference/brief_dsd_reference_p0_corrective_runtime_defaults.md"
     ));
     let parse = |label: &str, value: &str| {
         Sha256Digest::from_hex(value).map_err(|error| {
@@ -5118,7 +5118,7 @@ async fn attest_reference_toolchain(
         let commission_attestation_digest = Sha256Digest::of_bytes(
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/docs/brief_dsd_reference_p0_scope_and_commission.md"
+                "/assets/dsd_reference/brief_dsd_reference_p0_scope_and_commission.md"
             ))
             .as_bytes(),
         );

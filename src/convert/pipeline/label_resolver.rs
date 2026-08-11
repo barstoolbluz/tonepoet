@@ -11,9 +11,9 @@ use std::sync::LazyLock;
 
 use super::types::AlbumMetadata;
 
-const HEXLOAD_LABELS_REFERENCE: &str = include_str!("../../../docs/hexload_labels_reference.rs");
+const HEXLOAD_LABELS_REFERENCE: &str = include_str!("../../../assets/reference/hexload_labels_reference.rs");
 const CANONICAL_ARTISTS_REFERENCE: &str =
-    include_str!("../../../docs/canonical_artists_reference.txt");
+    include_str!("../../../assets/reference/canonical_artists_reference.txt");
 
 const CATALOG_COUNTRY_MAPPINGS: &[(&str, &str)] = &[
     ("AMCE", "Japan"),

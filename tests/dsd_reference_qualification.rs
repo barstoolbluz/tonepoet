@@ -6932,7 +6932,7 @@ fn qualify_dst_oracle_fixture_authority() -> DstQualificationCounts {
 
     let commission = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/brief_dsd_reference_p0_scope_and_commission.md"
+        "/assets/dsd_reference/brief_dsd_reference_p0_scope_and_commission.md"
     ));
     assert_eq!(
         provenance["attestation"]["document_sha256"],

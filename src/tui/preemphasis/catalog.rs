@@ -1,7 +1,7 @@
 //! Authoritative catalog-number evidence for advisory pre-emphasis detection.
 //!
 //! The reference data is embedded directly from
-//! `docs/cds-with-preemphasis-shf.csv`. Matching is deliberately exact after
+//! `assets/reference/cds-with-preemphasis-shf.csv`. Matching is deliberately exact after
 //! punctuation/spacing normalization. The previous family/series regexes were
 //! removed because they asserted pre-emphasis for catalog numbers absent from
 //! the reference list.
@@ -15,7 +15,7 @@ use lazy_static::lazy_static;
 use super::metadata::PreemphasisEvidence;
 use super::PreemphasisConfidence;
 
-const REFERENCE_CSV: &str = include_str!("../../../docs/cds-with-preemphasis-shf.csv");
+const REFERENCE_CSV: &str = include_str!("../../../assets/reference/cds-with-preemphasis-shf.csv");
 
 /// Whether a catalog result is an exact reference-list hit or a weaker
 /// heuristic. The current implementation intentionally emits only `Exact`;

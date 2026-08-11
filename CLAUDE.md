@@ -222,10 +222,15 @@ The flake provides:
 - `BINDGEN_EXTRA_CLANG_ARGS` — C header include paths for sandboxed `nix build`
 - `ffmpeg_7-full` in `buildInputs` — provides libavformat/libavcodec/libavutil for ffmpeg-next linking
 
-## Reference Data (docs/)
+## Reference Data (assets/ = code-embedded; docs/ = prose briefs)
 
-- `docs/hexload_labels_reference.rs` — 370+ label/pressing/mastering-engineer/pressing-plant mappings vendored from hexload-tui. Used as the data source for the `DictionaryLabelResolver` implementation. Includes audiophile labels, country-specific labels (UK Harvest vs Japan Harvest), mastering engineers (RL, Sterling, KG, BG, Wally, etc.), and pressing plants (RTI, QRP, Pallas, Monarch, TML, etc.).
-- `docs/canonical_artists_reference.txt` — 2,273 canonical artist names for case normalization. One name per line. Used by `ArtistCanonicalizer` for case-insensitive exact matching (match → canonical casing, no match → pass through unchanged).
+Compile-time embedded reference data lives under `assets/` (`include_str!`/`include_bytes!` targets — never delete without updating the embedding source). Prose/design briefs live under `docs/`.
+
+
+- `assets/reference/hexload_labels_reference.rs` — 370+ label/pressing/mastering-engineer/pressing-plant mappings vendored from hexload-tui. `include_str!`'d by `label_resolver.rs` as the data source for the `DictionaryLabelResolver` implementation. Includes audiophile labels, country-specific labels (UK Harvest vs Japan Harvest), mastering engineers (RL, Sterling, KG, BG, Wally, etc.), and pressing plants (RTI, QRP, Pallas, Monarch, TML, etc.).
+- `assets/reference/canonical_artists_reference.txt` — 2,273 canonical artist names for case normalization. One name per line. `include_str!`'d by `label_resolver.rs`; used by `ArtistCanonicalizer` for case-insensitive exact matching (match → canonical casing, no match → pass through unchanged).
+- `assets/reference/cds-with-preemphasis-shf.csv` — authoritative pre-emphasis CD list. `include_str!`'d by `src/tui/preemphasis/catalog.rs`.
+- `assets/dsd_reference/` — 6 DSD guidance/brief docs `include_bytes!`'d by `track_executor.rs` (`validate_embedded_qualification_report`): `tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md`, `sox_ng_dsd_decimation_test_report_v5.md`, and 4 `brief_dsd_reference_p0_*` files.
 - `docs/label_resolver_implementation_brief.md` — Implementation brief for the `DictionaryLabelResolver` (replaces the `StubLabelResolver`).
 - `docs/naming_template_expansion_brief.md` — Implementation brief for the naming template system (folder + filename templates, custom variables).
 - `docs/hexload_log_writer_reference.rs` — Vendored log writer from hexload-tui predecessor project. Reference for conversion log structure and field coverage. **NOT created by a reasoning model** — use as inspiration for WHAT to include, not HOW to implement. Tonepoet's pipeline has richer data structures.
