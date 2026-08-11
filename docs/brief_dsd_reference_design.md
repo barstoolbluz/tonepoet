@@ -43,8 +43,8 @@ These are product-visible planner errors, not runtime tool failures or silent fa
 
 This design adopts the two supplied evidence documents without extending their empirical claims:
 
-- `docs/tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md`
-- `docs/sox_ng_dsd_decimation_test_report_v5.md`
+- `assets/dsd_reference/tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md`
+- `assets/dsd_reference/sox_ng_dsd_decimation_test_report_v5.md`
 
 The evidence establishes `rate -u → sinc`, explicit fixed headroom rather than `-G`, requested `sinc -a 180`, Reference profiles B1–B6, fixed DSD level compensation capped by true peak, final-only dither, process-before-split for continuous programmes, and a strict distinction between coherent stopband rejection, order nulls, and output noise. No direct commission/evidence conflict was found. The commission's compact B3/B4/B5 table is read together with v9's target-ceiling examples: the undefined DSD128/DSD256→88.2 kHz target-limited cells and conditionally qualified 96 kHz cells are not silently inferred.
 
