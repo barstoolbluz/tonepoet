@@ -19973,9 +19973,17 @@ fn cue_album_normalize_entry_keys(entries: &mut Vec<super::probe::TagEntry>) {
 
 fn cue_album_sort_entries(entries: &mut Vec<super::probe::TagEntry>) {
     super::probe::sort_entries_standard_first_existing_only(entries);
-    let mut tail = Vec::new();
+
+    // Large synthetic/generated CUE rows stay out of the normal metadata
+    // reading order. Keep merge notes immediately before CUESHEET so CUESHEET
+    // remains the final row even when non-standard fields sort after the
+    // canonical metadata keys.
+    let mut tail = Vec::with_capacity(2);
     for key in ["CUE MERGE NOTES", "CUESHEET"] {
-        if let Some(pos) = entries.iter().position(|entry| entry.display_key.eq_ignore_ascii_case(key)) {
+        if let Some(pos) = entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case(key))
+        {
             tail.push(entries.remove(pos));
         }
     }
@@ -21617,6 +21625,7 @@ fn build_metadata_editor_for_cue_surfaces_with_policy_and_member_file_order(
     if let Some(reason) = cue_album_surface_shape_error(&tab) {
         return Err(format!("metadata: {reason}"));
     }
+    super::probe::ensure_standard_fields_present(&mut tab.entries, tab.paths.len().max(1));
     cue_album_sort_entries(&mut tab.entries);
     tab.dirty = embedded_disagrees;
 
@@ -22057,6 +22066,7 @@ fn stage_cueless_untaggable_album_surface(
     if let Some(reason) = cue_album_surface_shape_error(tab) {
         return Err(format!("metadata: {reason}"));
     }
+    super::probe::ensure_standard_fields_present(&mut tab.entries, tab.paths.len().max(1));
     cue_album_sort_entries(&mut tab.entries);
     tab.dirty = false;
     Ok(true)
@@ -28229,6 +28239,37 @@ fn format_channel_count(channels: u8) -> String {
     }
 }
 
+/// Normalize a disc-backed editor through the canonical metadata order while
+/// materializing only the album-level numbering rows that Auto-populate needs.
+/// Per-track descriptive rows remain owned by each builder's skip-empty logic.
+fn sort_disc_editor_entries(entries: &mut Vec<super::probe::TagEntry>, n_tracks: usize) {
+    for display_key in ["TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+        if entries.iter().any(|entry| {
+            super::probe::canonical_metadata_display_key(&entry.display_key) == display_key
+        }) {
+            continue;
+        }
+
+        entries.push(super::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
+            display_key: display_key.to_string(),
+            item_key: super::probe::item_key_for_new_editor_row(display_key),
+            value: String::new(),
+            original: String::new(),
+            is_binary: false,
+            is_mixed: false,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: vec![0; n_tracks],
+            per_file_values: vec![String::new(); n_tracks],
+            per_file_originals: vec![String::new(); n_tracks],
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        });
+    }
+
+    super::probe::sort_entries_standard_first_existing_only(entries);
+}
+
 pub fn build_dvda_editor_state(
     source_path: &std::path::Path,
     disc: &crate::tui::dvda::DvdaDisc,
@@ -28383,6 +28424,10 @@ pub fn build_dvda_editor_state(
     };
 
     let label = dvda_presentation_label_for_group(disc, disc_contents, group.group_nr);
+    // Disc-backed sources are synthesized from parsed presentation metadata.
+    // Preserve each builder's skip-empty per-track policy while materializing
+    // the album-level numbering/count rows required by Auto-populate.
+    sort_disc_editor_entries(&mut entries, n_tracks);
     let technical_details = with_location_file_details(
         disc_contents
             .and_then(|contents| {
@@ -28816,6 +28861,7 @@ fn build_bluray_editor_state(
         })
         .unwrap_or(false);
     let label = bluray_presentation_label(presentation);
+    sort_disc_editor_entries(&mut entries, n_tracks);
     let technical_details = with_location_file_details(
         disc_technical_details_from_presentation(
             label.clone(),
@@ -29231,6 +29277,7 @@ pub fn build_dvdv_editor_state(
     let target_path = super::command::dvdv_metadata_sidecar_path_for_source(source_path).ok();
     let writable = super::command::dvdv_metadata_sidecar_target_is_writable(source_path);
     let label = dvdv_presentation_label(presentation, sidecar);
+    sort_disc_editor_entries(&mut entries, n_tracks);
     let technical_details = with_location_file_details(
         disc_technical_details_from_presentation(
             label.clone(),
@@ -30191,6 +30238,7 @@ pub fn build_sacd_editor_state(
     };
     let sacd_stereo_durations = md.stereo.as_ref().and_then(&area_durations);
     let sacd_multi_channel_durations = md.multi_channel.as_ref().and_then(&area_durations);
+    sort_disc_editor_entries(&mut entries, n_tracks);
     let technical_details = with_location_file_details(
         sacd_technical_details(area_label, n_tracks, area),
         &paths,
@@ -54524,6 +54572,52 @@ mod phase4_tests {
         }));
     }
 
+    #[test]
+    fn bluray_disc_builder_skips_empty_track_fields_but_keeps_numbering_rows() {
+        let source = std::path::PathBuf::from("/fixtures/Concert.iso");
+        let contents = crate::disc::model::DiscContents {
+            format: crate::disc::model::DiscFormat::BluRay,
+            label: "Concert".to_string(),
+            source_path: source.clone(),
+            presentations: vec![bluray_presentation(
+                12,
+                0x1100,
+                0,
+                "Mapped Stream",
+                &[90.0, 91.0],
+            )],
+            suppressed: Vec::new(),
+            copy_protection: crate::disc::model::CopyProtectionSummary {
+                description: "none".to_string(),
+            },
+            diagnostics: Vec::new(),
+            album_title: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+        };
+
+        let (state, _, n_tracks) =
+            build_bluray_editor_state(&source, &contents, 0).expect("build Blu-ray editor");
+        assert_eq!(n_tracks, 2);
+        assert!(state
+            .active_surface()
+            .entries
+            .iter()
+            .all(|entry| entry.display_key != "ARTIST" && entry.display_key != "PERFORMER"));
+
+        for display_key in ["TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+            let entry = state
+                .active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key == display_key)
+                .unwrap_or_else(|| panic!("missing {display_key}"));
+            assert_eq!(entry.row_scope, crate::tui::probe::RowScope::File);
+            assert_eq!(entry.per_file_values, vec![String::new(); n_tracks]);
+        }
+    }
+
     fn entry(key: &str, item_key: ItemKey, vals: &[&str], origs: &[&str]) -> TagEntry {
         let v: Vec<String> = vals.iter().map(|s| s.to_string()).collect();
         let o: Vec<String> = origs.iter().map(|s| s.to_string()).collect();
@@ -61454,6 +61548,96 @@ ignored".to_string()),
     }
 
     #[test]
+    fn sacd_and_regular_file_surfaces_share_the_canonical_field_order() {
+        let md = synth_sacd_metadata(
+            Some("Album"),
+            Some("Artist"),
+            2026,
+            Some("CAT-1"),
+            &["One", "Two", "Three"],
+            &["Artist", "Artist", "Artist"],
+            &[None, None, None],
+        );
+        let path = std::path::PathBuf::from("/tmp/order.iso");
+        let (mut sacd, _, _) = build_sacd_editor_state(&path, &md, None).expect("build");
+
+        let observed = sacd
+            .active_surface()
+            .entries
+            .iter()
+            .map(|entry| entry.display_key.as_str())
+            .filter(|key| crate::tui::probe::STANDARD_KEY_ORDER.contains(key))
+            .collect::<Vec<_>>();
+        let expected = crate::tui::probe::STANDARD_KEY_ORDER
+            .iter()
+            .copied()
+            .filter(|key| observed.contains(key))
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+
+        let regular_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/silence.flac");
+        let regular_entries = crate::tui::probe::read_all_tags_merged(&[regular_path])
+            .expect("read regular-file fixture");
+        let regular = regular_entries
+            .iter()
+            .map(|entry| entry.display_key.as_str())
+            .filter(|key| crate::tui::probe::STANDARD_KEY_ORDER.contains(key))
+            .collect::<Vec<_>>();
+        let regular_expected = crate::tui::probe::STANDARD_KEY_ORDER
+            .iter()
+            .copied()
+            .filter(|key| regular.contains(key))
+            .collect::<Vec<_>>();
+        assert_eq!(regular, regular_expected);
+
+        let shared_keys = crate::tui::probe::STANDARD_KEY_ORDER
+            .iter()
+            .copied()
+            .filter(|key| observed.contains(key) && regular.contains(key))
+            .collect::<Vec<_>>();
+        let sacd_shared = observed
+            .iter()
+            .copied()
+            .filter(|key| shared_keys.contains(key))
+            .collect::<Vec<_>>();
+        let regular_shared = regular
+            .iter()
+            .copied()
+            .filter(|key| shared_keys.contains(key))
+            .collect::<Vec<_>>();
+        assert_eq!(sacd_shared, regular_shared);
+
+        crate::tui::metadata_autonumber::auto_populate(
+            &mut sacd,
+            crate::tui::metadata_autonumber::AutoPopulateTarget::TrackTotal,
+        )
+        .expect("SACD TRACKTOTAL auto-populate");
+        crate::tui::metadata_autonumber::auto_populate(
+            &mut sacd,
+            crate::tui::metadata_autonumber::AutoPopulateTarget::DiscNumber,
+        )
+        .expect("SACD DISCNUMBER auto-populate");
+        crate::tui::metadata_autonumber::auto_populate(
+            &mut sacd,
+            crate::tui::metadata_autonumber::AutoPopulateTarget::DiscTotal,
+        )
+        .expect("SACD DISCTOTAL auto-populate");
+        let values = |key: &str| {
+            sacd.active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key == key)
+                .expect(key)
+                .per_file_values
+                .clone()
+        };
+        assert_eq!(values("TRACKTOTAL"), vec!["3"; 3]);
+        assert_eq!(values("DISCNUMBER"), vec!["1"; 3]);
+        assert_eq!(values("DISCTOTAL"), vec!["1"; 3]);
+    }
+
+    #[test]
     fn build_sacd_editor_state_album_level_fields_extracted() {
         let md = synth_sacd_metadata(
             Some("Kind of Blue"),
@@ -65869,10 +66053,12 @@ mod single_image_metadata_editor_regression_tests {
                     artist_id: Some(format!("track-artist-{position:02}")),
                     title: format!("MB Track {position}"),
                     artist: "Pink Floyd".to_string(),
+                    composer: None,
                     isrc: Some(format!("GBAYE03003{position:02}")),
                     length_ms: Some(30_000),
                 })
                 .collect(),
+            relationship_projection_complete: true,
             track_parse_error: None,
         }
     }
@@ -75785,6 +75971,7 @@ mod mb_picker_verification_lifecycle_tests {
                     ..Default::default()
                 },
             ],
+            relationship_projection_complete: true,
             ..Default::default()
         }
     }

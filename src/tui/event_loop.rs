@@ -7152,6 +7152,93 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
+        AppMessage::MbSelectedDetailComplete {
+            operation_id,
+            mut releases,
+            selected,
+            paths,
+            editor_session,
+            result,
+        } => {
+            let mut outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    recover_from_selected_mb_detail_failure(
+                        app,
+                        operation_id,
+                        format!(":tags-mb: selected release detail failed: {error}"),
+                    );
+                    return;
+                }
+            };
+
+            // A completed request is useful cache material even if its owning
+            // picker was cancelled while it was in flight. Authority checks
+            // below still prevent stale work from mutating editor state.
+            if let Some((key, body)) = outcome.cache_write.take() {
+                if let Err(error) = app.db.store_mb_search(&key, &body) {
+                    log::warn!("mb search cache store failed: {}", error);
+                }
+            }
+            if !tags_mb_operation_is_current_phase(
+                app,
+                operation_id,
+                super::app::TagsMbOperationPhase::Verifying,
+            ) {
+                return;
+            }
+
+            let Some(release) = outcome.release else {
+                recover_from_selected_mb_detail_failure(
+                    app,
+                    operation_id,
+                    ":tags-mb: selected MusicBrainz release no longer exists".to_string(),
+                );
+                return;
+            };
+            if !release.relationship_projection_complete {
+                recover_from_selected_mb_detail_failure(
+                    app,
+                    operation_id,
+                    ":tags-mb: MusicBrainz detail omitted required recording/work relationships; no tags were applied"
+                        .to_string(),
+                );
+                return;
+            }
+            let Some(slot) = releases.get_mut(selected) else {
+                recover_from_selected_mb_detail_failure(
+                    app,
+                    operation_id,
+                    ":tags-mb: invalid release index while resolving selected detail".to_string(),
+                );
+                return;
+            };
+            *slot = release.clone();
+
+            // Keep picker back-navigation/detail rendering coherent with the
+            // exact authoritative release that is about to be applied.
+            let release_id = release.release_id.clone();
+            if let ActiveOverlay::MbSelect(state) = &mut app.active_overlay {
+                if state.phase.verifying_operation() == Some(operation_id) {
+                    state.prefetch.insert(release_id.clone(), release.clone());
+                }
+            }
+            if let Some(state) = app.pending_mb_select.as_mut() {
+                if state.phase.verifying_operation() == Some(operation_id) {
+                    state.prefetch.insert(release_id, release);
+                }
+            }
+
+            open_editor_with_mb_release_for_operation(
+                app,
+                tx,
+                operation_id,
+                releases,
+                selected,
+                paths,
+                editor_session,
+            );
+        }
         AppMessage::AccurateRipComplete {
             operation_id,
             pages,
@@ -9722,6 +9809,87 @@ pub(super) fn spawn_mb_detail_prefetch(
     });
 }
 
+fn spawn_mb_selected_detail_resolution(
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    operation_id: super::message::TagsMbOperationId,
+    releases: Vec<super::musicbrainz::MbRelease>,
+    selected: usize,
+    paths: Vec<std::path::PathBuf>,
+    editor_session: Option<super::message::MetadataEditorSessionGuard>,
+    cached_body: Option<String>,
+) {
+    let Some(release_id) = releases
+        .get(selected)
+        .map(|release| release.release_id.clone())
+        .filter(|release_id| !release_id.is_empty())
+    else {
+        return;
+    };
+    let n_tracks = paths.len();
+    tokio::spawn(async move {
+        let result =
+            super::musicbrainz::fetch_release_detail(&release_id, n_tracks, cached_body).await;
+        let _ = tx
+            .send(crate::tui::message::AppMessage::MbSelectedDetailComplete {
+                operation_id,
+                releases,
+                selected,
+                paths,
+                editor_session,
+                result,
+            })
+            .await;
+    });
+}
+
+fn recover_from_selected_mb_detail_failure(
+    app: &mut AppState,
+    operation_id: super::message::TagsMbOperationId,
+    message: String,
+) {
+    if !tags_mb_operation_is_current_phase(
+        app,
+        operation_id,
+        super::app::TagsMbOperationPhase::Verifying,
+    ) {
+        return;
+    }
+
+    let mut picker_recovered = false;
+    if let ActiveOverlay::MbSelect(state) = &mut app.active_overlay {
+        if state.phase.verifying_operation() == Some(operation_id) {
+            state.phase = super::app::MbSelectPhase::Selecting;
+            picker_recovered = true;
+        }
+    }
+    if let Some(state) = app.pending_mb_select.as_mut() {
+        if state.phase.verifying_operation() == Some(operation_id) {
+            state.phase = super::app::MbSelectPhase::Selecting;
+            picker_recovered = true;
+        }
+    }
+
+    if picker_recovered {
+        if let Some(active) = app.active_tags_mb_operation.as_mut() {
+            if active.operation_id == operation_id {
+                active.phase = super::app::TagsMbOperationPhase::Selecting;
+            }
+        }
+        app.set_status(message);
+        return;
+    }
+
+    // A single-match flow has no picker to return to. Retire exactly this
+    // operation, keep any live editor in place, and only restore a parked one
+    // when there is no other modal occupying the overlay slot.
+    if finish_tags_mb_operation_if_current(app, operation_id)
+        && matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        restore_parked_editor_without_finishing(app);
+    }
+    app.set_status(message);
+}
+
 /// Open the metadata editor on the supplied `paths`, populated with the
 /// chosen MusicBrainz release (`releases[selected]`). Skips the
 /// GnudbReview "preview" step since the editor surfaces the same
@@ -9806,9 +9974,27 @@ fn start_mb_select_apply_operation(
         }
     };
     state.phase = super::app::MbSelectPhase::Verifying { operation_id };
+    // Acceptance supersedes speculative navigation prefetch. If the current
+    // row's debounce has not fired yet, invalidate it before the mandatory
+    // detail gate below can launch an authoritative fetch. A prefetch that
+    // already completed is promoted from `state.prefetch` immediately after.
+    state.bump_generation();
+    let mut releases = state.releases.clone();
+    if let Some(release_id) = releases
+        .get(selected)
+        .map(|release| release.release_id.clone())
+    {
+        if let Some(detail) = state.prefetch.get(&release_id) {
+            // The speculative prefetch has already paid for and parsed the
+            // authoritative release detail. Promote it into the apply payload
+            // before leaving the picker so acceptance never launches a
+            // duplicate detail request.
+            releases[selected] = detail.clone();
+        }
+    }
     let pending = PendingTagsMbApply {
         operation_id,
-        releases: state.releases.clone(),
+        releases,
         selected,
         paths: state.paths.clone(),
         editor_session: state.editor_session,
@@ -9917,6 +10103,31 @@ fn open_editor_with_mb_release_for_operation(
         app.set_status(":tags-mb: invalid release index".to_string());
         return;
     };
+    if !release.relationship_projection_complete {
+        if release.release_id.is_empty() {
+            recover_from_selected_mb_detail_failure(
+                app,
+                operation_id,
+                ":tags-mb: selected release has no MusicBrainz ID; cannot resolve composer relationships"
+                    .to_string(),
+            );
+            return;
+        }
+        let cached_body = app
+            .db
+            .get_cached_mb_search(&super::musicbrainz::detail_cache_key(&release.release_id));
+        app.set_status(":tags-mb: loading selected release relationships…".to_string());
+        spawn_mb_selected_detail_resolution(
+            tx.clone(),
+            operation_id,
+            releases,
+            selected,
+            paths,
+            editor_session,
+            cached_body,
+        );
+        return;
+    }
     if let Some(error) = release.track_parse_error.as_deref() {
         restore_parked_editor(app);
         app.set_status(format!(":tags-mb: refusing incomplete release data: {error}"));
@@ -12314,6 +12525,7 @@ mod musicbrainz_completion_dispatch_tests {
                     ..Default::default()
                 })
                 .collect(),
+            relationship_projection_complete: true,
             ..Default::default()
         }
     }
@@ -12401,6 +12613,7 @@ mod musicbrainz_completion_dispatch_tests {
         crate::tui::musicbrainz::MbRelease {
             release_id: id.to_string(),
             title: title.to_string(),
+            relationship_projection_complete: true,
             ..Default::default()
         }
     }
@@ -13137,6 +13350,51 @@ mod musicbrainz_completion_dispatch_tests {
         assert_eq!(
             app.status_message, status_after_first,
             "duplicate TOC completion must not dispatch or report another fallback"
+        );
+    }
+
+    #[test]
+    fn picker_accept_promotes_prefetched_relationship_detail_and_cancels_debounce() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = single_source_file_editor();
+        editor.model.tags_mb_in_flight = true;
+        let editor_paths = editor.active_surface().paths.clone();
+        app.pending_metadata_editor = Some(editor);
+
+        let mut shallow = release("prefetch-id", "Shallow search row");
+        shallow.relationship_projection_complete = false;
+        let mut detail = shallow.clone();
+        detail.title = "Authoritative release detail".to_string();
+        detail.relationship_projection_complete = true;
+
+        let mut picker = Box::new(crate::tui::app::MbSelectState::new(
+            vec![shallow],
+            editor_paths,
+        ));
+        picker.prefetch.insert(detail.release_id.clone(), detail.clone());
+        let generation_before = picker
+            .generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let pending = start_mb_select_apply_operation(&mut app, picker)
+            .expect("picker acceptance should enter verification");
+
+        assert_eq!(pending.releases.len(), 1);
+        assert_eq!(pending.releases[0].title, detail.title);
+        assert!(pending.releases[0].relationship_projection_complete);
+        let ActiveOverlay::MbSelect(state) = &app.active_overlay else {
+            panic!("accepted picker should remain visible while verification runs");
+        };
+        assert!(matches!(
+            state.phase,
+            crate::tui::app::MbSelectPhase::Verifying { .. }
+        ));
+        assert!(
+            state
+                .generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > generation_before,
+            "acceptance must invalidate a still-debouncing speculative prefetch"
         );
     }
 

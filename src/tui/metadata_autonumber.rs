@@ -6,7 +6,7 @@
 //! behavior cannot drift.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::app::MetadataEditorState;
 use super::text_input::TextInputState;
@@ -509,7 +509,8 @@ fn carrier_label(path: &Path) -> String {
 #[derive(Debug, Clone)]
 struct NumberingCarrier {
     label: String,
-    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    persistence_label: &'static str,
+    capabilities: crate::metadata_persistence::MetadataNumberingCapabilities,
 }
 
 #[derive(Debug, Clone)]
@@ -533,13 +534,8 @@ impl NumberingTargetContext {
         let incompatible = self
             .carriers
             .iter()
-            .filter(|carrier| {
-                !carrier
-                    .backend
-                    .numbering_capabilities()
-                    .supports(representation)
-            })
-            .map(|carrier| format!("{} ({})", carrier.label, carrier.backend.label()))
+            .filter(|carrier| !carrier.capabilities.supports(representation))
+            .map(|carrier| format!("{} ({})", carrier.label, carrier.persistence_label))
             .collect::<BTreeSet<_>>();
         let requirement = match representation {
             crate::metadata_persistence::MetadataNumberingRepresentation::PlainUnsigned => {
@@ -561,6 +557,15 @@ impl NumberingTargetContext {
             incompatible.into_iter().collect::<Vec<_>>().join(", ")
         ))
     }
+}
+
+fn numbering_uses_textual_sidecar(state: &MetadataEditorState) -> bool {
+    // Parsed optical-disc presentations persist through their dedicated
+    // metadata sidecars/metabase rather than through the repeated virtual
+    // source path exposed per track. CUE albums are intentionally *not*
+    // included here: numbering fields are ordinary audio-tag metadata there,
+    // and the generated CUE projection does not losslessly represent them.
+    state.active_surface().technical_details.disc.is_some()
 }
 
 fn numbering_target_context(
@@ -594,9 +599,18 @@ fn numbering_target_context(
         ));
     }
 
-    let writable_slots = (0..surface.paths.len())
-        .filter(|slot| super::keybindings::metadata_editor_slot_is_writable(state, *slot))
-        .collect::<Vec<_>>();
+    let textual_sidecar = numbering_uses_textual_sidecar(state);
+    let writable_slots = if textual_sidecar {
+        // Disc metadata sidecars are the persistence authority. The source image
+        // may itself be an ISO, directory, or read-only audio carrier, none of
+        // which describes the numbering representation accepted by the
+        // sidecar. `state.read_only` above is the authoritative write gate.
+        (0..surface.paths.len()).collect::<Vec<_>>()
+    } else {
+        (0..surface.paths.len())
+            .filter(|slot| super::keybindings::metadata_editor_slot_is_writable(state, *slot))
+            .collect::<Vec<_>>()
+    };
     if writable_slots.is_empty() {
         return Err("no writable files in this metadata editor session".to_string());
     }
@@ -610,15 +624,28 @@ fn numbering_target_context(
             .paths
             .get(*slot)
             .ok_or_else(|| format!("missing metadata carrier path for slot {}", slot + 1))?;
-        let capability =
-            crate::metadata_persistence::metadata_numbering_capability_for_path(path)?;
+        let (carrier_capabilities, persistence_label) = if textual_sidecar {
+            (
+                crate::metadata_persistence::MetadataNumberingCapabilities::TEXTUAL,
+                "metadata sidecar",
+            )
+        } else {
+            let capability =
+                crate::metadata_persistence::metadata_numbering_capability_for_path(path)?;
+            (capability.capabilities, capability.backend.label())
+        };
         capabilities = Some(match capabilities {
-            Some(current) => current.intersection(capability.capabilities),
-            None => capability.capabilities,
+            Some(current) => current.intersection(carrier_capabilities),
+            None => carrier_capabilities,
         });
         carriers.push(NumberingCarrier {
-            label: carrier_label(path),
-            backend: capability.backend,
+            label: if textual_sidecar {
+                "sidecar".to_string()
+            } else {
+                carrier_label(path)
+            },
+            persistence_label,
+            capabilities: carrier_capabilities,
         });
     }
     let capabilities = capabilities
@@ -787,7 +814,9 @@ fn apply_values(
         .entries
         .get(entry_idx)
         .is_some_and(|entry| !entry.is_track_scoped(path_count) && dim == path_count);
-    let writable: Vec<bool> = if file_scoped {
+    let writable: Vec<bool> = if file_scoped && numbering_uses_textual_sidecar(state) {
+        vec![true; dim]
+    } else if file_scoped {
         (0..dim)
             .map(|slot| super::keybindings::metadata_editor_slot_is_writable(state, slot))
             .collect()
@@ -958,6 +987,242 @@ fn parse_positive_component(value: &str) -> Option<usize> {
     (parsed > 0).then_some(parsed)
 }
 
+/// Semantic track count for Auto-populate. The storage dimension of a row is
+/// deliberately not used as the source of truth: one carrier can represent
+/// many tracks (single-image CUE, ISO), while a unified CUE surface can have a
+/// track-row dimension distinct from its file/save dimension.
+fn semantic_track_count(state: &MetadataEditorState) -> usize {
+    let surface = state.active_surface();
+    let disc_count = surface
+        .technical_details
+        .disc
+        .as_ref()
+        .map(|disc| disc.track_count)
+        .unwrap_or(0);
+    let cue_count = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.track_sources.len())
+        .unwrap_or(0);
+    let explicit_track_rows = surface
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.row_scope, super::probe::RowScope::Track))
+        .map(|entry| entry.per_file_values.len())
+        .max()
+        .unwrap_or(0);
+
+    disc_count
+        .max(cue_count)
+        .max(explicit_track_rows)
+        .max(surface.file_labels.len())
+        .max(surface.paths.len())
+        .max(1)
+}
+
+fn cue_structural_disc_numbers(state: &MetadataEditorState, dim: usize) -> Option<Vec<usize>> {
+    let surface = state.active_surface();
+    let sheet = surface.cue_album_synthetic_sheet.as_ref()?;
+    if dim != surface.paths.len() {
+        return None;
+    }
+
+    // CUE paths are physical-disc authorities. Preserve their declared order
+    // and map each save carrier back to the CUE that owns its tracks. This
+    // handles one-image, multi-file, and aggregate multi-CUE albums without
+    // deriving disc identity from filenames or directory names.
+    let mut cue_order = Vec::<&Path>::new();
+    for cue_path in &sheet.cue_paths {
+        if !cue_order.iter().any(|existing| *existing == cue_path.as_path()) {
+            cue_order.push(cue_path.as_path());
+        }
+    }
+    for source in &sheet.track_sources {
+        if !cue_order
+            .iter()
+            .any(|existing| *existing == source.cue_path.as_path())
+        {
+            cue_order.push(source.cue_path.as_path());
+        }
+    }
+    if cue_order.is_empty() {
+        return None;
+    }
+
+    surface
+        .paths
+        .iter()
+        .map(|path| {
+            let mut owner = None;
+            for source in &sheet.track_sources {
+                if source.audio_path != *path {
+                    continue;
+                }
+                let disc = cue_order
+                    .iter()
+                    .position(|cue| *cue == source.cue_path.as_path())?
+                    + 1;
+                match owner {
+                    None => owner = Some(disc),
+                    Some(existing) if existing == disc => {}
+                    Some(_) => return None,
+                }
+            }
+            owner
+        })
+        .collect()
+}
+
+/// Parse an explicit conventional disc-directory name.
+///
+/// This is intentionally narrower than general filename/disc heuristics: the
+/// plain-file Auto-populate fallback may use only structural directory
+/// evidence, never mutable tag values or fuzzy album-name inference.
+fn explicit_disc_directory_number(path: &Path) -> Option<usize> {
+    let name = path.file_name()?.to_str()?.trim().to_ascii_lowercase();
+    for prefix in ["disc", "disk", "cd"] {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let digits = rest.trim_start_matches(|ch: char| matches!(ch, ' ' | '-' | '_'));
+        if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let number = digits.parse::<usize>().ok()?;
+        if number > 0 {
+            return Some(number);
+        }
+    }
+    None
+}
+
+fn common_parent_directory(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut common = paths.first()?.parent()?.to_path_buf();
+    for path in &paths[1..] {
+        let parent = path.parent()?;
+        while !parent.starts_with(&common) {
+            common = common.parent()?.to_path_buf();
+        }
+    }
+    Some(common)
+}
+
+/// Derive disc assignments for an ordinary file-backed editor surface only
+/// when the selected files provide coherent, explicit directory structure.
+///
+/// Supported shapes are either one explicitly numbered common directory
+/// (`.../Disc 2/*.flac`) or sibling numbered disc directories immediately
+/// below one non-root album ancestor (`.../album/Disc 1/...`,
+/// `.../album/Disc 2/...`). Anything ambiguous falls back to the historical
+/// one-disc behavior in `semantic_disc_numbers`.
+fn plain_file_structural_disc_numbers(paths: &[PathBuf], dim: usize) -> Option<Vec<usize>> {
+    if paths.len() != dim || paths.is_empty() {
+        return None;
+    }
+
+    let common = common_parent_directory(paths)?;
+    if let Some(number) = explicit_disc_directory_number(&common) {
+        return Some(vec![number; dim]);
+    }
+
+    // A filesystem root is not meaningful album identity. Rejecting it also
+    // keeps unrelated trees such as `/Disc 7/album/...` and `/Disk_8/album/...`
+    // from being mistaken for one multi-disc album merely because `/` is
+    // their only common ancestor.
+    if common.file_name().is_none() {
+        return None;
+    }
+
+    let numbers = paths
+        .iter()
+        .map(|path| {
+            let parent = path.parent()?;
+            let relative_parent = parent.strip_prefix(&common).ok()?;
+            let disc_dir = relative_parent.components().next()?.as_os_str();
+            explicit_disc_directory_number(Path::new(disc_dir))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // Sibling-directory inference is useful only when it actually proves a
+    // multi-disc structure. One-disc selections are handled either by the
+    // explicitly numbered common-directory case above or by the conservative
+    // fallback below.
+    if numbers.iter().copied().collect::<BTreeSet<_>>().len() < 2 {
+        return None;
+    }
+
+    Some(numbers)
+}
+
+/// Disc assignment for the active editor surface. A parsed disc presentation
+/// is one physical disc even though it exposes one virtual path slot per
+/// track. CUE-backed surfaces derive disc grouping from their parsed CUE
+/// authorities. Plain file-backed surfaces may also derive disc grouping from
+/// coherent explicit numbered disc directories; otherwise they remain one
+/// logical disc. Existing DISCNUMBER values are mutable edit state and are
+/// therefore never used as structural evidence by Auto-populate.
+fn semantic_disc_numbers(state: &MetadataEditorState, dim: usize) -> Vec<usize> {
+    let surface = state.active_surface();
+    if surface.technical_details.disc.is_some() {
+        return vec![1; dim];
+    }
+    if let Some(numbers) = cue_structural_disc_numbers(state, dim) {
+        return numbers;
+    }
+    if surface.cue_source.is_some() || surface.pending_sidecar_cue_creation {
+        return vec![1; dim];
+    }
+
+    if let Some(numbers) = plain_file_structural_disc_numbers(&surface.paths, dim) {
+        return numbers;
+    }
+
+    // Without coherent structural directory evidence, a plain file-backed
+    // surface is one logical disc. Existing DISCNUMBER values are edit state,
+    // not structural evidence for Auto-populate: using a stale per-track
+    // series here is the exact failure mode this operation must eliminate.
+    vec![1; dim]
+}
+
+fn semantic_disc_total(state: &MetadataEditorState, dim: usize) -> usize {
+    semantic_disc_numbers(state, dim)
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1)
+}
+
+/// Whether the DISCNUMBER row has enough evidence for Auto-populate to be
+/// advertised in the row context menu.
+///
+/// Execution deliberately does not use this gate: direct Auto-populate must
+/// retain the repair behavior that collapses an unstructured/stale disc series
+/// to one logical disc. The menu, however, should not propose a guessed `1`
+/// when neither the source structure nor the field itself provides disc
+/// evidence.
+fn disc_number_offer_has_evidence(state: &MetadataEditorState, entry_idx: usize) -> bool {
+    let surface = state.active_surface();
+    let dim = row_dimension(state, entry_idx);
+
+    let has_structural_evidence = surface.technical_details.disc.is_some()
+        || surface.cue_source.is_some()
+        || surface.cue_album_synthetic_sheet.is_some()
+        || surface.pending_sidecar_cue_creation
+        || plain_file_structural_disc_numbers(&surface.paths, dim).is_some();
+    if has_structural_evidence {
+        return true;
+    }
+
+    let entry = &surface.entries[entry_idx];
+    entry
+        .per_file_values
+        .iter()
+        .chain(entry.per_file_originals.iter())
+        .chain(std::iter::once(&entry.value))
+        .chain(std::iter::once(&entry.original))
+        .any(|value| parse_positive_component(value).is_some())
+}
+
 #[derive(Debug, Clone)]
 struct AutoPopulatePlan {
     entry_idx: usize,
@@ -989,49 +1254,21 @@ fn plan_auto_populate(
         crate::metadata_persistence::MetadataNumberingRepresentation::PlainUnsigned,
     )?;
     let dim = row_dimension(state, entry_idx);
-    let current = state.active_surface().entries[entry_idx]
-        .per_file_values
-        .clone();
     let (values, restore_deleted) = match target {
-        AutoPopulateTarget::TrackTotal => (vec![dim.to_string(); dim], true),
-        AutoPopulateTarget::DiscNumber => {
-            // Existing tags are the only implemented source in the ordered
-            // policy for disc numbers. Cue sources remain explicit seams; path
-            // ancestry is intentionally not treated as metadata evidence.
-            let originals = &state.active_surface().entries[entry_idx].per_file_originals;
-            let mut derived_writable = false;
-            let values = (0..dim)
-                .map(|slot| {
-                    let derived = originals
-                        .get(slot)
-                        .and_then(|value| parse_positive_component(value));
-                    if derived.is_some()
-                        && writable_slots.binary_search(&slot).is_ok()
-                    {
-                        derived_writable = true;
-                    }
-                    derived
-                        .map(|number| number.to_string())
-                        .unwrap_or_else(|| current.get(slot).cloned().unwrap_or_default())
-                })
-                .collect::<Vec<_>>();
-            (values, derived_writable)
+        AutoPopulateTarget::TrackTotal => {
+            let count = semantic_track_count(state);
+            (vec![count.to_string(); dim], true)
         }
+        AutoPopulateTarget::DiscNumber => (
+            semantic_disc_numbers(state, dim)
+                .into_iter()
+                .map(|number| number.to_string())
+                .collect(),
+            true,
+        ),
         AutoPopulateTarget::DiscTotal => {
-            let distinct = canonical_entry_index(state, "DISCNUMBER")
-                .map(|disc_idx| {
-                    state.active_surface().entries[disc_idx]
-                        .per_file_values
-                        .iter()
-                        .filter_map(|value| parse_positive_component(value))
-                        .collect::<BTreeSet<_>>()
-                })
-                .unwrap_or_default();
-            if distinct.is_empty() {
-                (current, false)
-            } else {
-                (vec![distinct.len().to_string(); dim], true)
-            }
+            let total = semantic_disc_total(state, dim);
+            (vec![total.to_string(); dim], true)
         }
     };
     Ok(AutoPopulatePlan {
@@ -1042,14 +1279,21 @@ fn plan_auto_populate(
     })
 }
 
-/// Return whether Auto populate has at least one writable, persistence-safe
-/// effect. The plan is the same one consumed by execution, so menu state cannot
-/// drift from mutation semantics.
+/// Return whether Auto populate should be offered and has at least one
+/// writable, persistence-safe effect. DISCNUMBER additionally requires source
+/// or field evidence before the menu advertises the operation; direct
+/// execution intentionally remains available for repair workflows.
 pub fn auto_populate_has_useful_effect(
     state: &MetadataEditorState,
     target: AutoPopulateTarget,
 ) -> Result<bool, String> {
-    plan_auto_populate(state, target).map(|plan| plan.has_useful_effect(state))
+    let plan = plan_auto_populate(state, target)?;
+    if target == AutoPopulateTarget::DiscNumber
+        && !disc_number_offer_has_evidence(state, plan.entry_idx)
+    {
+        return Ok(false);
+    }
+    Ok(plan.has_useful_effect(state))
 }
 
 pub fn auto_populate(
@@ -1253,7 +1497,10 @@ impl AutoNumberOverlayState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::MetadataTechnicalDetails;
+    use crate::tui::app::{
+        CueAlbumSyntheticSheet, CueAlbumTrackSource, DiscTechnicalDetails, MetadataCueSource,
+        MetadataTechnicalDetails,
+    };
     use crate::tui::probe::{RowScope, TagEntry};
     use lofty::tag::ItemKey;
     use std::path::PathBuf;
@@ -1292,6 +1539,31 @@ mod tests {
             entries,
             paths.iter().map(|path| (*path).to_string()).collect(),
             MetadataTechnicalDetails::default(),
+        )
+    }
+
+    fn track_entry(display_key: &str, item_key: ItemKey, values: &[&str]) -> TagEntry {
+        let mut entry = entry(display_key, item_key, values);
+        entry.row_scope = RowScope::Track;
+        entry
+    }
+
+    fn disc_state(label: &str, track_count: usize) -> MetadataEditorState {
+        let paths = vec![PathBuf::from("disc.iso"); track_count];
+        let values = vec![""; track_count];
+        MetadataEditorState::for_files(
+            paths,
+            vec![
+                entry("TRACKTOTAL", ItemKey::TrackTotal, &values),
+                entry("DISCNUMBER", ItemKey::DiscNumber, &values),
+                entry("DISCTOTAL", ItemKey::DiscTotal, &values),
+            ],
+            (1..=track_count).map(|n| format!("Track {n:02}")).collect(),
+            MetadataTechnicalDetails::from_disc(DiscTechnicalDetails {
+                presentation_label: label.to_string(),
+                track_count,
+                ..DiscTechnicalDetails::default()
+            }),
         )
     }
 
@@ -1828,6 +2100,129 @@ mod tests {
     }
 
     #[test]
+    fn single_image_cue_tracktotal_uses_semantic_track_rows_not_carrier_count() {
+        let mut state = state(
+            &["album.flac"],
+            vec![
+                entry("TRACKTOTAL", ItemKey::TrackTotal, &[""]),
+                track_entry(
+                    "TITLE",
+                    ItemKey::TrackTitle,
+                    &["One", "Two", "Three", "Four", "Five"],
+                ),
+            ],
+        );
+
+        auto_populate(&mut state, AutoPopulateTarget::TrackTotal).unwrap();
+
+        assert_eq!(state.active_surface().entries[0].per_file_values, ["5"]);
+    }
+
+    #[test]
+    fn multi_file_cue_tracktotal_uses_track_count_and_audio_persistence() {
+        let mut state = state(
+            &["one.flac", "two.flac", "three.flac"],
+            vec![entry(
+                "TRACKTOTAL",
+                ItemKey::TrackTotal,
+                &["", "", ""],
+            )],
+        );
+        state.active_surface_mut().cue_source =
+            Some(MetadataCueSource::Sidecar(PathBuf::from("album.cue")));
+
+        auto_populate(&mut state, AutoPopulateTarget::TrackTotal).unwrap();
+
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            ["3", "3", "3"]
+        );
+    }
+
+    #[test]
+    fn aggregate_cue_disc_population_uses_cue_authority_grouping() {
+        let paths = ["d1t1.flac", "d1t2.flac", "d2t1.flac", "d2t2.flac"];
+        let mut state = state(
+            &paths,
+            vec![
+                entry("DISCNUMBER", ItemKey::DiscNumber, &["", "", "", ""]),
+                entry("DISCTOTAL", ItemKey::DiscTotal, &["", "", "", ""]),
+            ],
+        );
+        let cue1 = PathBuf::from("disc1.cue");
+        let cue2 = PathBuf::from("disc2.cue");
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: vec![cue1.clone(), cue2.clone()],
+            audio_paths: paths.iter().map(PathBuf::from).collect(),
+            track_sources: paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| CueAlbumTrackSource {
+                    cue_path: if index < 2 { cue1.clone() } else { cue2.clone() },
+                    audio_path: PathBuf::from(path),
+                    local_track_index: index % 2,
+                    original_track_number: (index % 2 + 1) as u32,
+                    file_ref: (*path).to_string(),
+                    index00_frames: None,
+                    index01_frames: Some(0),
+                    isrc: None,
+                    directives: Vec::new(),
+                })
+                .collect(),
+            album_title: Some("Album".to_string()),
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+        });
+        state.active_surface_mut().cue_source = Some(MetadataCueSource::Sidecar(cue1));
+
+        auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
+        auto_populate(&mut state, AutoPopulateTarget::DiscTotal).unwrap();
+
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            ["1", "1", "2", "2"]
+        );
+        assert_eq!(
+            state.active_surface().entries[1].per_file_values,
+            ["2", "2", "2", "2"]
+        );
+    }
+
+    #[test]
+    fn iso_disc_auto_population_uses_true_track_count_and_one_disc() {
+        for label in ["SACD Stereo", "DVD-A Group 1"] {
+            let mut state = disc_state(label, 6);
+
+            assert!(auto_populate_has_useful_effect(
+                &state,
+                AutoPopulateTarget::TrackTotal
+            )
+            .unwrap(), "{label}");
+            auto_populate(&mut state, AutoPopulateTarget::TrackTotal).unwrap();
+            auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
+            auto_populate(&mut state, AutoPopulateTarget::DiscTotal).unwrap();
+
+            assert_eq!(
+                state.active_surface().entries[0].per_file_values,
+                vec!["6"; 6],
+                "{label}"
+            );
+            assert_eq!(
+                state.active_surface().entries[1].per_file_values,
+                vec!["1"; 6],
+                "{label}: DISCNUMBER must be constant per physical disc"
+            );
+            assert_eq!(
+                state.active_surface().entries[2].per_file_values,
+                vec!["1"; 6],
+                "{label}: one source image is one disc"
+            );
+        }
+    }
+
+    #[test]
     fn applying_the_same_numbering_scheme_twice_is_idempotent() {
         let mut state = state(
             &["one.flac", "two.flac", "three.flac"],
@@ -1888,31 +2283,154 @@ mod tests {
     }
 
     #[test]
-    fn disc_population_uses_only_existing_tag_evidence() {
-        let mut disc_entry = entry("DISCNUMBER", ItemKey::DiscNumber, &["1", "2", "3"]);
-        disc_entry.per_file_values = vec![String::new(), String::new(), String::new()];
-        disc_entry.value.clear();
-        disc_entry.is_mixed = false;
+    fn disc_population_replaces_a_per_track_series_with_one_logical_disc() {
         let mut state = state(
             &[
                 "/album/Disc 9/one.flac",
                 "/album/Disk_9/two.flac",
                 "/album/CD-9/three.flac",
             ],
-            vec![disc_entry],
+            vec![entry("DISCNUMBER", ItemKey::DiscNumber, &["1", "2", "3"])],
         );
 
         let report = auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
 
-        assert_eq!(report.changed, 3);
+        assert_eq!(report.changed, 2);
+        assert_eq!(report.unchanged, 1);
         assert_eq!(
             state.active_surface().entries[0].per_file_values,
-            vec!["1", "2", "3"]
+            vec!["1", "1", "1"]
+        );
+        assert_eq!(state.active_surface().entries[0].value, "1");
+        assert!(!state.active_surface().entries[0].is_mixed);
+    }
+
+    #[test]
+    fn explicit_disc_directory_parser_is_narrow_and_conventional() {
+        for (name, expected) in [
+            ("Disc1", 1),
+            ("disc 2", 2),
+            ("DISC-03", 3),
+            ("Disc_4", 4),
+            ("Disk 5", 5),
+            ("CD6", 6),
+            ("cd 07", 7),
+        ] {
+            assert_eq!(
+                explicit_disc_directory_number(Path::new(name)),
+                Some(expected),
+                "{name}"
+            );
+        }
+
+        for name in [
+            "Disc",
+            "Disc 0",
+            "Disc 1 Bonus",
+            "Side 1",
+            "d01",
+            "Discography 2",
+        ] {
+            assert_eq!(
+                explicit_disc_directory_number(Path::new(name)),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_file_album_disc_directories_drive_disc_number_and_total() {
+        let mut state = state(
+            &[
+                "/album/Disc 1/01.flac",
+                "/album/Disc 1/02.flac",
+                "/album/Disc 2/01.flac",
+                "/album/Disc 2/02.flac",
+            ],
+            vec![
+                entry("DISCNUMBER", ItemKey::DiscNumber, &["", "", "", ""]),
+                entry("DISCTOTAL", ItemKey::DiscTotal, &["", "", "", ""]),
+            ],
+        );
+
+        auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
+        auto_populate(&mut state, AutoPopulateTarget::DiscTotal).unwrap();
+
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            ["1", "1", "2", "2"]
+        );
+        assert_eq!(
+            state.active_surface().entries[1].per_file_values,
+            ["2", "2", "2", "2"]
         );
     }
 
     #[test]
-    fn disc_population_ignores_folder_names_at_every_ancestor() {
+    fn plain_file_album_compact_cd_directories_drive_disc_number_and_total() {
+        let mut state = state(
+            &[
+                "/album/CD1/01.flac",
+                "/album/CD1/02.flac",
+                "/album/CD2/01.flac",
+                "/album/CD2/02.flac",
+            ],
+            vec![
+                entry("DISCNUMBER", ItemKey::DiscNumber, &["", "", "", ""]),
+                entry("DISCTOTAL", ItemKey::DiscTotal, &["", "", "", ""]),
+            ],
+        );
+
+        auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
+        auto_populate(&mut state, AutoPopulateTarget::DiscTotal).unwrap();
+
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            ["1", "1", "2", "2"]
+        );
+        assert_eq!(
+            state.active_surface().entries[1].per_file_values,
+            ["2", "2", "2", "2"]
+        );
+    }
+
+    #[test]
+    fn plain_files_in_one_explicit_disc_directory_keep_that_disc_number() {
+        let mut state = state(
+            &["/album/Disc-2/01.flac", "/album/Disc-2/02.flac"],
+            vec![entry("DISCNUMBER", ItemKey::DiscNumber, &["", ""])],
+        );
+
+        auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
+
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            ["2", "2"]
+        );
+    }
+
+    #[test]
+    fn flat_plain_folder_still_repairs_stale_per_track_disc_numbers_to_one_disc() {
+        let mut state = state(
+            &[
+                "/album/01.flac",
+                "/album/02.flac",
+                "/album/03.flac",
+            ],
+            vec![entry("DISCNUMBER", ItemKey::DiscNumber, &["1", "2", "3"])],
+        );
+
+        auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
+
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values,
+            ["1", "1", "1"]
+        );
+    }
+
+    #[test]
+    fn disc_population_ignores_folder_names_and_defaults_one_disc() {
         let mut state = state(
             &[
                 "/Disc 7/album/Disc 1/one.flac",
@@ -1923,16 +2441,16 @@ mod tests {
 
         let report = auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
 
-        assert_eq!(report.changed, 0);
-        assert_eq!(report.unchanged, 2);
+        assert_eq!(report.changed, 2);
+        assert_eq!(report.unchanged, 0);
         assert_eq!(
             state.active_surface().entries[0].per_file_values,
-            vec!["", ""]
+            vec!["1", "1"]
         );
     }
 
     #[test]
-    fn disc_total_counts_distinct_positive_disc_numbers() {
+    fn disc_total_comes_from_source_structure_not_stale_disc_tags() {
         let mut state = state(
             &["one.flac", "two.flac", "three.flac", "four.flac"],
             vec![
@@ -1945,28 +2463,27 @@ mod tests {
 
         assert_eq!(
             state.active_surface().entries[1].per_file_values,
-            vec!["2", "2", "2", "2"]
+            vec!["1", "1", "1", "1"]
         );
     }
 
     #[test]
-    fn disc_population_without_explicit_evidence_is_a_noop() {
+    fn disc_population_without_explicit_evidence_uses_one_constant_disc() {
         let mut state = state(
             &["/album/one.flac", "/album/two.flac"],
             vec![entry("DISCNUMBER", ItemKey::DiscNumber, &["", ""])],
         );
         state.active_surface_mut().deleted.push(0);
         let report = auto_populate(&mut state, AutoPopulateTarget::DiscNumber).unwrap();
-        assert_eq!(report.changed, 0);
-        assert_eq!(report.unchanged, 2);
+        assert_eq!(report.changed, 2);
+        assert_eq!(report.unchanged, 0);
         assert_eq!(
             state.active_surface().entries[0].per_file_values,
-            vec!["", ""]
+            vec!["1", "1"]
         );
-        assert_eq!(
-            state.active_surface().deleted,
-            vec![0],
-            "no-evidence auto-population must be a true no-op"
+        assert!(
+            state.active_surface().deleted.is_empty(),
+            "successful auto-population must restore a deleted standard field"
         );
     }
 

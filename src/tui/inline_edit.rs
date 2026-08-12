@@ -47,21 +47,37 @@ struct EditingCellStyles {
     cursor_selected: Style,
 }
 
+/// Canonical selected-text treatment for every inline editor surface.
+/// Keeping this derived from the active theme's normal foreground/background
+/// pair gives one high-contrast selection standard without per-field colors.
+pub(crate) fn editing_selection_style(theme: super::theme::Theme) -> Style {
+    Style::default().fg(theme.bg).bg(theme.text_bright)
+}
+
+/// Canonical embedded-cursor treatment, including the selected-cell variant.
+pub(crate) fn editing_cursor_style(theme: super::theme::Theme, selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(theme.text_bright)
+            .bg(theme.bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.editing_cursor_foreground())
+            .bg(theme.editing_cursor)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
 fn editing_cell_styles(theme: super::theme::Theme, normal: Style) -> EditingCellStyles {
     // Four deliberately different surfaces. In particular, the cursor must not
     // reuse the selection style: doing so made it disappear whenever the
     // terminal hardware cursor was hidden or low-contrast.
     EditingCellStyles {
         normal,
-        selection: Style::default().fg(theme.bg).bg(theme.text_bright),
-        cursor_unselected: Style::default()
-            .fg(theme.editing_cursor_foreground())
-            .bg(theme.editing_cursor)
-            .add_modifier(Modifier::BOLD),
-        cursor_selected: Style::default()
-            .fg(theme.text_bright)
-            .bg(theme.bg)
-            .add_modifier(Modifier::BOLD),
+        selection: editing_selection_style(theme),
+        cursor_unselected: editing_cursor_style(theme, false),
+        cursor_selected: editing_cursor_style(theme, true),
     }
 }
 

@@ -275,6 +275,109 @@ pub(crate) fn multiline_cursor_display_position(
     positions.get(boundary).copied().unwrap_or((0, 0))
 }
 
+/// Render one hard-wrapped row of a multiline `TextInputState` using the same
+/// selected-text and embedded-cursor styles as every single-line inline edit.
+/// Byte-range selection is mapped through CRLF normalization before display so
+/// copy/paste state and visible highlighting cannot diverge.
+fn multiline_edit_row_spans(
+    input: &super::text_input::TextInputState,
+    row: usize,
+    width: usize,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    let width = width.max(1);
+    let (normalized, original_boundaries) = normalized_text_with_original_boundaries(&input.text);
+    let positions = display_boundary_positions(&normalized, width);
+    let cursor_boundary = multiline_boundary_for_byte(
+        &original_boundaries,
+        input.cursor.min(input.text.len()),
+    );
+    let cursor_position = positions.get(cursor_boundary).copied().unwrap_or((0, 0));
+    let selection = input.selection_range();
+    let normal = Style::default()
+        .fg(theme.text_bright)
+        .bg(theme.dropdown_bg);
+    let selection_style = super::inline_edit::editing_selection_style(theme);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cell_col = 0usize;
+    let mut push = |text: String, style: Style| {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
+            last.content.to_mut().push_str(&text);
+        } else {
+            spans.push(Span::styled(text, style));
+        }
+    };
+
+    for (boundary, ch) in normalized.chars().enumerate() {
+        if ch == '\n' {
+            continue;
+        }
+        let Some((char_row, char_col)) = positions.get(boundary).copied() else {
+            break;
+        };
+        if char_row != row {
+            continue;
+        }
+        while cell_col < char_col.min(width) {
+            push(" ".to_string(), normal);
+            cell_col += 1;
+        }
+
+        let source_width = super::display_width::char_width(ch);
+        let (rendered, rendered_width) = if source_width > width {
+            ("…".to_string(), 1usize)
+        } else if source_width == 0 && cursor_boundary == boundary {
+            (format!("◌{ch}"), 1usize)
+        } else {
+            (ch.to_string(), source_width)
+        };
+        if rendered_width > 0 && cell_col.saturating_add(rendered_width) > width {
+            break;
+        }
+
+        let selected = selection.as_ref().is_some_and(|range| {
+            let start = original_boundaries.get(boundary).copied().unwrap_or(0);
+            let end = original_boundaries
+                .get(boundary + 1)
+                .copied()
+                .unwrap_or(start);
+            start < range.end && end > range.start
+        });
+        let cursor = cursor_boundary == boundary;
+        let style = if cursor {
+            super::inline_edit::editing_cursor_style(theme, selected)
+        } else if selected {
+            selection_style
+        } else {
+            normal
+        };
+        push(rendered, style);
+        cell_col = cell_col.saturating_add(rendered_width);
+    }
+
+    if cursor_position.0 == row && cursor_position.1 >= cell_col && cursor_position.1 < width {
+        while cell_col < cursor_position.1 {
+            push(" ".to_string(), normal);
+            cell_col += 1;
+        }
+        push(
+            " ".to_string(),
+            super::inline_edit::editing_cursor_style(theme, false),
+        );
+        cell_col += 1;
+    }
+    while cell_col < width {
+        push(" ".to_string(), normal);
+        cell_col += 1;
+    }
+    drop(push);
+    spans
+}
+
 pub(crate) fn multiline_byte_for_display_position(
     text: &str,
     target_row: usize,
@@ -5122,18 +5225,10 @@ fn draw_metadata_editor(
 
                 if (char_count > MULTILINE_EDIT_THRESHOLD || has_newlines) && val_max > 0 {
                     // ── Multiline drop-down for long/multi-line values ──
-                    // Normalize line endings and hard-wrap by terminal cells.
-                    let sanitized = input.text.replace("\r\n", "\n").replace('\r', "\n");
                     let cursor_byte = input.cursor.min(input.text.len());
-                    let sanitized_cursor = input.text[..cursor_byte]
-                        .replace("\r\n", "\n")
-                        .replace('\r', "\n")
-                        .chars()
-                        .count();
-                    let (display_rows, cursor_row, cursor_col_in_row) =
-                        wrap_display_rows_with_cursor(&sanitized, val_max, sanitized_cursor);
-
-                    let total_rows = display_rows.len();
+                    let total_rows = multiline_display_row_count(&input.text, val_max);
+                    let (cursor_row, _) =
+                        multiline_cursor_display_position(&input.text, cursor_byte, val_max);
                     let max_drop_rows = 8usize.min(total_rows).max(1);
                     let drop_scroll = if cursor_row < max_drop_rows {
                         0
@@ -5142,11 +5237,7 @@ fn draw_metadata_editor(
                     };
                     let visible_end = (drop_scroll + max_drop_rows).min(total_rows);
 
-                    let drop_bg = Style::default().bg(theme.dropdown_bg);
-
                     for row in drop_scroll..visible_end {
-                        let row_chars = &display_rows[row];
-
                         let prefix = if row == drop_scroll {
                             Span::styled(key_display.clone(), key_style)
                         } else {
@@ -5155,56 +5246,9 @@ fn draw_metadata_editor(
                                 Style::default().bg(theme.dropdown_bg),
                             )
                         };
-
-                        if row == cursor_row {
-                            let col = cursor_col_in_row;
-                            let before: String =
-                                row_chars[..col.min(row_chars.len())].iter().collect();
-                            let raw_cursor: String = if col < row_chars.len() {
-                                row_chars[col].to_string()
-                            } else {
-                                " ".to_string()
-                            };
-                            let cur_ch = if super::display_width::width(&raw_cursor) == 0 {
-                                format!("◌{raw_cursor}")
-                            } else {
-                                raw_cursor
-                            };
-                            let after: String = if col + 1 < row_chars.len() {
-                                row_chars[col + 1..].iter().collect()
-                            } else {
-                                String::new()
-                            };
-                            let used = super::display_width::width(&before)
-                                + super::display_width::width(&cur_ch)
-                                + super::display_width::width(&after);
-                            let pad = val_max.saturating_sub(used);
-                            lines.push(Line::from(vec![
-                                prefix,
-                                Span::styled(before, drop_bg.fg(theme.text_bright)),
-                                Span::styled(
-                                    cur_ch,
-                                    Style::default().fg(theme.bg).bg(theme.text_bright),
-                                ),
-                                Span::styled(
-                                    format!("{}{}", after, " ".repeat(pad)),
-                                    drop_bg.fg(theme.text_bright),
-                                ),
-                            ]));
-                        } else {
-                            let text: String = row_chars.iter().collect();
-                            lines.push(Line::from(vec![
-                                prefix,
-                                Span::styled(
-                                    super::display_width::pad_or_truncate(
-                                        &text,
-                                        val_max,
-                                        false,
-                                    ),
-                                    drop_bg.fg(theme.text_bright),
-                                ),
-                            ]));
-                        }
+                        let mut spans = vec![prefix];
+                        spans.extend(multiline_edit_row_spans(input, row, val_max, theme));
+                        lines.push(Line::from(spans));
                     }
                     let visible_row = visible_index.saturating_sub(scroll);
                     if visible_index >= scroll && visible_row < content_h {
@@ -9435,6 +9479,28 @@ mod multiline_display_width_tests {
         assert_eq!(rows[1].iter().collect::<String>(), "右");
     }
 
+
+    #[test]
+    fn multiline_comment_and_custom_fields_use_the_canonical_selection_style() {
+        let theme = super::super::theme::theme_by_slug_or_default(
+            super::super::theme::default_theme_slug(),
+        );
+        let selection_style = super::super::inline_edit::editing_selection_style(theme);
+
+        for text in [
+            "COMMENT first line\nsecond line",
+            "LINEAGE source one\nsource two",
+        ] {
+            let input = super::super::text_input::TextInputState::new_selected(text.to_string());
+            for row in 0..2 {
+                let spans = multiline_edit_row_spans(&input, row, 40, theme);
+                assert!(spans.iter().any(|span| {
+                    span.style == selection_style
+                        && span.content.chars().any(|ch| !ch.is_whitespace())
+                }), "selected text was not visibly highlighted for {text:?} row {row}");
+            }
+        }
+    }
 
     #[test]
     fn multiline_vertical_cursor_uses_display_columns_across_wraps() {

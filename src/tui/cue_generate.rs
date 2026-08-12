@@ -1150,6 +1150,7 @@ mod tests {
             artist_id: None,
             title: title.into(),
             artist: String::new(),
+            composer: None,
             isrc: isrc.map(String::from),
             length_ms,
         }
@@ -1174,6 +1175,7 @@ mod tests {
                 mb_track(2, "Track 2", Some(180_000), None),                 // 3:00
                 mb_track(3, "Track 3", Some(120_000), None),                 // 2:00
             ],
+            relationship_projection_complete: true,
             track_parse_error: None,
         };
         let cue = cue_from_mb_release(&release, "image.flac", "flac")
@@ -1222,6 +1224,7 @@ mod tests {
                 mb_track(1, "Track 1", Some(240_000), None),
                 mb_track(2, "Track 2", None, None),
             ],
+            relationship_projection_complete: true,
             track_parse_error: None,
         };
         let err = cue_from_mb_release(&release, "image.flac", "flac")
@@ -1248,6 +1251,7 @@ mod tests {
             barcode: None,
             disc_count: 1,
             tracks: vec![],
+            relationship_projection_complete: true,
             track_parse_error: None,
         };
         assert!(cue_from_mb_release(&release, "image.flac", "flac").is_err());

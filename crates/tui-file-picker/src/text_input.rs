@@ -1010,7 +1010,7 @@ fn next_boundary_after(text: &str, pos: usize) -> Option<usize> {
 ///   Ctrl+A or Alt+L=select all; Ctrl+/ or Ctrl+_=deselect;
 ///   Ctrl+Z or Alt+Z=undo; Ctrl+Y, Ctrl+Shift+Z, or Alt+Y=redo;
 ///   Ctrl+E=end, Ctrl+B=left, Ctrl+F=right,
-///   Ctrl+H=backspace, Ctrl+D=delete-fwd,
+///   Ctrl+H=delete-prev-word, Ctrl+D=delete-fwd,
 ///   Ctrl+W=delete-prev-word, Ctrl+U=kill-to-start, Ctrl+K=kill-to-end.
 /// Word-deletion alternatives: Ctrl+Backspace and Alt+Backspace also delete
 /// the previous word; Ctrl+Delete and Alt+D delete the next word.
@@ -1122,7 +1122,13 @@ pub fn handle_text_input_key_with_boundaries(
                 'e' => input.cursor_end(),
                 'b' => input.cursor_left(),
                 'f' => input.cursor_right(),
-                'h' => input.backspace(),
+                // Baseline terminals commonly encode the physical
+                // Ctrl+Backspace key as the C0 BS byte (0x08), which
+                // crossterm exposes as Ctrl+H. Treat that delivery form as
+                // the same strong-delete action as an enhanced-terminal
+                // Ctrl+Backspace event. Plain Backspace remains handled by
+                // the unmodified branch below and deletes one character.
+                'h' => input.delete_word_back(),
                 'd' => input.delete(),
                 'w' => input.delete_word_back(),
                 'u' => input.kill_to_start(),
@@ -1771,6 +1777,28 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_h_baseline_delivery_deletes_word_back() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor_end();
+        assert!(handle_text_input_key(
+            &mut s,
+            &key(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        ));
+        assert_eq!(s.text, "hello ");
+    }
+
+    #[test]
+    fn plain_backspace_still_deletes_one_character() {
+        let mut s = TextInputState::new("hello world".to_string());
+        s.cursor_end();
+        assert!(handle_text_input_key(
+            &mut s,
+            &key(KeyCode::Backspace, KeyModifiers::NONE),
+        ));
+        assert_eq!(s.text, "hello worl");
+    }
+
+    #[test]
     fn alt_backspace_deletes_word_back() {
         let mut s = TextInputState::new("hello world".to_string());
         s.cursor_end();
@@ -2262,6 +2290,20 @@ mod tests {
             // The removal is a recorded edit: undo restores the field.
             assert!(input.undo());
             assert_eq!(input.text, "whole field");
+        });
+    }
+
+    #[test]
+    fn multiline_copy_and_paste_round_trips_exact_text_through_shared_clipboard() {
+        with_scoped_shared_text_clipboard("", || {
+            let payload = "line one\nline two\nhttps://example.invalid/item";
+            let mut source = TextInputState::new_selected(payload.to_string());
+            assert!(source.copy_selection());
+            assert_eq!(read_shared_text_clipboard(), payload);
+
+            let mut destination = TextInputState::new_selected("replace me".to_string());
+            assert!(destination.paste_clipboard());
+            assert_eq!(destination.text, payload);
         });
     }
 

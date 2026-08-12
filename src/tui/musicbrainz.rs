@@ -39,6 +39,12 @@ pub struct MbRelease {
     /// (which can't be unambiguously embedded into one file).
     pub disc_count: usize,
     pub tracks: Vec<MbTrack>,
+    /// True when the response carried the recording/work relationship
+    /// projection required to distinguish "no composer credit" from
+    /// "composer relationships were not requested". Shallow search rows are
+    /// false and must be resolved through the release-detail endpoint before
+    /// metadata is applied.
+    pub relationship_projection_complete: bool,
     /// Parse-integrity failure for an advertised MB track list. Callers must
     /// refuse mutation rather than applying a silently truncated projection.
     pub track_parse_error: Option<String>,
@@ -52,6 +58,11 @@ pub struct MbTrack {
     pub artist_id: Option<String>,
     pub title: String,
     pub artist: String,
+    /// Composer credit derived from recording -> work -> artist
+    /// relationships. Multiple credited composers are represented as one
+    /// deterministic scalar string; the metadata editor's true repeated-tag
+    /// model remains intentionally out of scope.
+    pub composer: Option<String>,
     pub isrc: Option<String>,
     /// Track length in milliseconds, when MB exposes it. Required for
     /// generating an embedded CUESHEET tag on single-image rips.
@@ -83,6 +94,9 @@ pub fn build_mb_toc(sectors: &[u32]) -> Option<String> {
 
 const MB_BASE: &str = "https://musicbrainz.org/ws/2/discid/-";
 const MB_RELEASE_BASE: &str = "https://musicbrainz.org/ws/2/release/";
+const MB_RELEASE_BASE_INCLUDES: &str =
+    "artist-credits+isrcs+labels+recordings+release-groups";
+const MB_RELEASE_COMPOSER_INCLUDES: &str = "artist-credits+isrcs+labels+recordings+release-groups+recording-level-rels+work-rels+work-level-rels+artist-rels";
 const USER_AGENT: &str = concat!(
     "tonepoet/",
     env!("CARGO_PKG_VERSION"),
@@ -366,6 +380,7 @@ pub fn align_release_tracks_to_source(
             artist_id: None,
             title: String::new(),
             artist: String::new(),
+            composer: None,
             isrc: None,
             length_ms: None,
         })
@@ -406,6 +421,34 @@ pub async fn lookup_release_by_toc_cascading(
     candidates: &[TocCandidate],
     cached: Vec<Option<String>>,
 ) -> Result<MbCascadeOutcome, String> {
+    lookup_release_by_toc_cascading_with_projection(
+        candidates,
+        cached,
+        RelationshipProjection::Base,
+    )
+    .await
+}
+
+/// Metadata-editor variant of the TOC cascade. It requests the recording/work
+/// relation projection needed for COMPOSER, while CUE/grouping callers keep
+/// using the lean base projection through `lookup_release_by_toc_cascading`.
+pub async fn lookup_release_by_toc_cascading_with_relationships(
+    candidates: &[TocCandidate],
+    cached: Vec<Option<String>>,
+) -> Result<MbCascadeOutcome, String> {
+    lookup_release_by_toc_cascading_with_projection(
+        candidates,
+        cached,
+        RelationshipProjection::Composer,
+    )
+    .await
+}
+
+async fn lookup_release_by_toc_cascading_with_projection(
+    candidates: &[TocCandidate],
+    cached: Vec<Option<String>>,
+    projection: RelationshipProjection,
+) -> Result<MbCascadeOutcome, String> {
     let total = candidates
         .first()
         .map(|c| c.kept_indices.len())
@@ -413,7 +456,13 @@ pub async fn lookup_release_by_toc_cascading(
     let mut cache_writes = Vec::new();
     for (i, candidate) in candidates.iter().enumerate() {
         let cached_body = cached.get(i).cloned().flatten();
-        let outcome = match lookup_release_by_toc(&candidate.sectors, cached_body).await {
+        let outcome = match lookup_release_by_toc_with_projection(
+            &candidate.sectors,
+            cached_body,
+            projection,
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             // A transport failure aborts the cascade (rate limiting makes
             // hammering a failing endpoint pointless) and MUST surface as an
@@ -454,12 +503,36 @@ pub async fn lookup_release_by_toc_cascading(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationshipProjection {
+    Base,
+    Composer,
+}
+
+impl RelationshipProjection {
+    fn includes(self) -> &'static str {
+        match self {
+            Self::Base => MB_RELEASE_BASE_INCLUDES,
+            Self::Composer => MB_RELEASE_COMPOSER_INCLUDES,
+        }
+    }
+
+    fn cache_is_authoritative(self, body: &str) -> bool {
+        match self {
+            Self::Base => true,
+            Self::Composer => mb_payload_has_relationship_projection(body),
+        }
+    }
+}
+
 /// Look up the best-matching MusicBrainz release for a disc TOC.
 ///
 /// Database-free for use inside `tokio::spawn`: caller owns cache
 /// retrieval (pass the cached JSON body via `cached_response`) and cache
 /// storage (write `outcome.cache_response` back if `Some`). On cache hit
-/// the function does no HTTP.
+/// the function does no HTTP. This general-purpose variant keeps the lean
+/// release projection used by CUE/grouping workflows; metadata-editor TOC
+/// lookup uses the relationship-enriched cascading wrapper above.
 ///
 /// `Ok(MbLookupOutcome { releases: [], .. })` means "no release matched
 /// this TOC"; `Err(_)` is a transport/parse failure the caller should
@@ -468,11 +541,24 @@ pub async fn lookup_release_by_toc(
     sectors: &[u32],
     cached_response: Option<String>,
 ) -> Result<MbLookupOutcome, String> {
+    lookup_release_by_toc_with_projection(
+        sectors,
+        cached_response,
+        RelationshipProjection::Base,
+    )
+    .await
+}
+
+async fn lookup_release_by_toc_with_projection(
+    sectors: &[u32],
+    cached_response: Option<String>,
+    projection: RelationshipProjection,
+) -> Result<MbLookupOutcome, String> {
     let toc = build_mb_toc(sectors)
         .ok_or_else(|| "TOC must have at least 2 sector entries".to_string())?;
     let n_tracks = sectors.len() - 1;
 
-    if let Some(json) = cached_response {
+    if let Some(json) = cached_response.filter(|body| projection.cache_is_authoritative(body)) {
         return Ok(MbLookupOutcome {
             releases: parse_mb_response_all(&json, n_tracks)?,
             cache_response: None,
@@ -480,8 +566,10 @@ pub async fn lookup_release_by_toc(
     }
 
     let url = format!(
-        "{}?toc={}&inc=artist-credits+isrcs+labels+recordings+release-groups&fmt=json",
-        MB_BASE, toc,
+        "{}?toc={}&inc={}&fmt=json",
+        MB_BASE,
+        toc,
+        projection.includes(),
     );
 
     let client = reqwest::Client::builder()
@@ -797,7 +885,7 @@ pub async fn fetch_release_detail(
         return Err("fetch_release_detail requires a non-empty MBID".to_string());
     }
 
-    if let Some(body) = cached_body {
+    if let Some(body) = cached_body.filter(|body| mb_payload_has_relationship_projection(body)) {
         // Cache hit: skip the rate-limited HTTP call entirely.
         return Ok(MbDetailOutcome {
             release: Some(parse_mb_detail_response(&body, n_tracks)?),
@@ -816,8 +904,8 @@ pub async fn fetch_release_detail(
     // sub-entity split. Matches the TOC path's `format!` style for the
     // same reason. MBIDs from MB are UUIDs (hex + dashes, URL-safe).
     let url = format!(
-        "{}{}?inc=artist-credits+isrcs+labels+recordings+release-groups&fmt=json",
-        MB_RELEASE_BASE, mbid,
+        "{}{}?inc={}&fmt=json",
+        MB_RELEASE_BASE, mbid, MB_RELEASE_COMPOSER_INCLUDES,
     );
 
     mb_acquire().await;
@@ -865,9 +953,60 @@ pub struct MbDetailOutcome {
 
 /// Canonical cache key for a release-detail body. Shares the
 /// `musicbrainz_search_cache` table with text-search bodies; the
-/// `detail:v1:` prefix prevents collision with `search:v1:` rows.
+/// `detail:v2:` prefix invalidates pre-composer relationship payloads while
+/// preventing collision with `search:v1:` rows.
 pub fn detail_cache_key(mbid: &str) -> String {
-    format!("detail:v1:{}", mbid)
+    format!("detail:v2:{}", mbid)
+}
+
+fn release_has_relationship_projection(release: &serde_json::Value) -> bool {
+    let media = release
+        .get("media")
+        .and_then(|media| media.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    for medium in media {
+        let advertised_track_count = medium_track_count(medium);
+        let tracks = medium.get("tracks").and_then(|tracks| tracks.as_array());
+
+        // Search-endpoint rows commonly advertise a track count but omit the
+        // actual `tracks[]` projection. That shape cannot prove that composer
+        // relationships are absent, so it must be resolved through release
+        // detail before metadata is applied.
+        if advertised_track_count > 0 && tracks.is_none() {
+            return false;
+        }
+
+        for track in tracks.into_iter().flatten() {
+            let Some(recording) = track.get("recording") else {
+                return false;
+            };
+            if recording.get("relations").is_none() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Composer extraction requires relationship data on every recording in a
+/// detailed payload. Older cache entries predate those `inc=` expansions and
+/// are not authoritative for the absence of composer credits, so they must be
+/// refreshed. A genuine empty/no-match body remains a valid cache hit; shallow
+/// release rows do not.
+fn mb_payload_has_relationship_projection(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return true; // preserve existing parse-error reporting path
+    };
+    let releases: Vec<&serde_json::Value> = value
+        .get("releases")
+        .and_then(|releases| releases.as_array())
+        .map(|releases| releases.iter().collect())
+        .unwrap_or_else(|| vec![&value]);
+    releases
+        .into_iter()
+        .all(release_has_relationship_projection)
 }
 
 /// Parse a top-level MusicBrainz release object (detail endpoint).
@@ -971,6 +1110,7 @@ fn pick_medium_for_release<'a>(
 }
 
 fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
+    let relationship_projection_complete = release_has_relationship_projection(rel);
     let release_id = rel
         .get("id")
         .and_then(|v| v.as_str())
@@ -1129,6 +1269,7 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
         barcode,
         disc_count: media.len(),
         tracks,
+        relationship_projection_complete,
         track_parse_error,
     }
 }
@@ -1182,6 +1323,9 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let composer = t
+        .get("recording")
+        .and_then(composer_credit_from_recording);
     // Length in ms, preferring the track-level value (the disc-encoded
     // length); fall back to recording.length when the track doesn't
     // carry its own.
@@ -1202,9 +1346,66 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         artist_id,
         title,
         artist,
+        composer,
         isrc,
         length_ms,
     })
+}
+
+fn composer_credit_from_recording(recording: &serde_json::Value) -> Option<String> {
+    fn composer_name(relation: &serde_json::Value) -> Option<String> {
+        if !relation
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("composer"))
+        {
+            return None;
+        }
+        relation
+            .get("target-credit")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                relation
+                    .get("artist")
+                    .and_then(|artist| artist.get("name"))
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .map(str::to_string)
+    }
+
+    let mut credits = Vec::<String>::new();
+    let mut push_unique = |name: String| {
+        if !credits.iter().any(|existing| existing == &name) {
+            credits.push(name);
+        }
+    };
+
+    for relation in recording
+        .get("relations")
+        .and_then(|relations| relations.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = composer_name(relation) {
+            push_unique(name);
+        }
+        if let Some(work) = relation.get("work") {
+            for work_relation in work
+                .get("relations")
+                .and_then(|relations| relations.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(name) = composer_name(work_relation) {
+                    push_unique(name);
+                }
+            }
+        }
+    }
+
+    (!credits.is_empty()).then(|| credits.join("; "))
 }
 
 /// Populate a metadata editor state with the MB-only fields that the
@@ -2016,6 +2217,10 @@ pub fn populate_editor_from_mb_scoped(
     // one track in the release has data for that field.
     let any_title = release.tracks.iter().any(|t| !t.title.is_empty());
     let any_artist = release.tracks.iter().any(|t| !t.artist.is_empty());
+    let any_composer = release
+        .tracks
+        .iter()
+        .any(|t| t.composer.as_deref().is_some_and(|value| !value.is_empty()));
 
     let title_idx = if any_title {
         Some(find_or_create(
@@ -2032,6 +2237,20 @@ pub fn populate_editor_from_mb_scoped(
             &mut state.active_surface_mut().entries,
             "ARTIST",
             ItemKey::TrackArtist,
+            track_dim,
+        ))
+    } else {
+        None
+    };
+    // A guarded single-image fallback deliberately applies album-level data
+    // only. Do not create or reshape a COMPOSER row there: composer credits
+    // are recording-scoped and cannot be projected safely without the same
+    // per-track eligibility that gates TITLE/ARTIST mutation.
+    let composer_idx = if any_composer && (!single_image || per_track_populate) {
+        Some(find_or_create(
+            &mut state.active_surface_mut().entries,
+            "COMPOSER",
+            ItemKey::Composer,
             track_dim,
         ))
     } else {
@@ -2064,7 +2283,7 @@ pub fn populate_editor_from_mb_scoped(
     };
 
     if unified || per_track_populate {
-        for idx in [title_idx, artist_idx].into_iter().flatten() {
+        for idx in [title_idx, artist_idx, composer_idx].into_iter().flatten() {
             let entry = &mut state.active_surface_mut().entries[idx];
             entry.row_scope = crate::tui::probe::RowScope::Track;
             entry.clear_stored_value_provenance();
@@ -2086,6 +2305,9 @@ pub fn populate_editor_from_mb_scoped(
         if let Some(idx) = artist_idx {
             crate::tui::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[idx], track_dim);
         }
+        if let Some(idx) = composer_idx {
+            crate::tui::probe::ensure_dim_replicate(&mut state.active_surface_mut().entries[idx], track_dim);
+        }
     }
 
     if per_track_populate {
@@ -2101,6 +2323,12 @@ pub fn populate_editor_from_mb_scoped(
                 }
                 if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
                     state.active_surface_mut().entries[idx].per_file_values[i] = mt.artist.clone();
+                }
+                if let (Some(idx), Some(composer)) = (
+                    composer_idx,
+                    mt.composer.as_deref().filter(|value| !value.is_empty()),
+                ) {
+                    state.active_surface_mut().entries[idx].per_file_values[i] = composer.to_string();
                 }
             }
         }
@@ -2170,6 +2398,12 @@ pub fn populate_editor_from_mb_scoped(
                 if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
                     set_slot(state, idx, i, mt.artist.clone());
                 }
+                if let (Some(idx), Some(composer)) = (
+                    composer_idx,
+                    mt.composer.as_deref().filter(|value| !value.is_empty()),
+                ) {
+                    set_slot(state, idx, i, composer.to_string());
+                }
             }
             if let Some(idx) = album_idx {
                 set_slot(state, idx, i, release.title.clone());
@@ -2185,7 +2419,7 @@ pub fn populate_editor_from_mb_scoped(
         }
     }
 
-    for idx in [title_idx, artist_idx, album_idx, tn_idx, date_idx]
+    for idx in [title_idx, artist_idx, composer_idx, album_idx, tn_idx, date_idx]
         .iter()
         .filter_map(|x| *x)
     {
@@ -2586,6 +2820,7 @@ mod tests {
                     artist_id: None,
                     title: "Gaslighting Abbie".into(),
                     artist: "Steely Dan".into(),
+                    composer: None,
                     isrc: None,
                     length_ms: Some(354_000),
                 },
@@ -2596,6 +2831,7 @@ mod tests {
                     artist_id: None,
                     title: "What a Shame About Me".into(),
                     artist: "Steely Dan".into(),
+                    composer: None,
                     isrc: None,
                     length_ms: Some(317_000),
                 },
@@ -2764,6 +3000,7 @@ mod tests {
             barcode: None,
             disc_count: 1,
             tracks,
+            relationship_projection_complete: true,
             track_parse_error: None,
         }
     }
@@ -2777,6 +3014,7 @@ mod tests {
             artist_id: None,
             title: title.into(),
             artist: artist.into(),
+            composer: None,
             isrc: isrc.map(String::from),
             length_ms: None,
         }
@@ -2903,6 +3141,71 @@ mod tests {
     fn parse_mb_detail_response_surfaces_error_body() {
         let body = r#"{"error":"Not Found"}"#;
         assert!(parse_mb_detail_response(body, 0).is_err());
+    }
+
+    #[test]
+    fn parse_mb_extracts_composer_from_recording_work_relationships() {
+        let body = r#"{
+          "releases": [{
+            "id": "rid", "title": "Album",
+            "media": [{"tracks": [{
+              "position": 1, "title": "Movement I",
+              "recording": {"relations": [{
+                "type": "performance", "target-type": "work",
+                "work": {"relations": [
+                  {"type": "composer", "target-credit": "",
+                   "artist": {"name": "John Luther Adams"}},
+                  {"type": "composer", "target-credit": "J. L. Adams",
+                   "artist": {"name": "John Luther Adams"}}
+                ]}
+              }]}
+            }]}]
+          }]
+        }"#;
+
+        let release = parse_mb_response(body, 1).unwrap().expect("release");
+        assert_eq!(
+            release.tracks[0].composer.as_deref(),
+            Some("John Luther Adams; J. L. Adams")
+        );
+    }
+
+    #[test]
+    fn relationship_projection_detection_rejects_pre_composer_cache_payloads() {
+        let old = r#"{"releases":[{"media":[{"tracks":[{"recording":{"id":"r"}}]}]}]}"#;
+        let shallow_search = r#"{"releases":[{"id":"rid","media":[{"track-count":2}]}]}"#;
+        let enriched = r#"{"releases":[{"media":[{"track-count":1,"tracks":[{"recording":{"id":"r","relations":[]}}]}]}]}"#;
+        assert!(!mb_payload_has_relationship_projection(old));
+        assert!(!mb_payload_has_relationship_projection(shallow_search));
+        assert!(mb_payload_has_relationship_projection(enriched));
+        assert!(mb_payload_has_relationship_projection(r#"{"releases":[]}"#));
+    }
+
+    #[test]
+    fn parsed_search_rows_require_detail_before_metadata_apply() {
+        let shallow = r#"{
+            "releases": [{
+                "id": "rid",
+                "title": "Album",
+                "media": [{"track-count": 2}]
+            }]
+        }"#;
+        let release = parse_mb_response(shallow, 2).unwrap().expect("release");
+        assert!(!release.relationship_projection_complete);
+
+        let detail = r#"{
+            "id": "rid",
+            "title": "Album",
+            "media": [{
+                "track-count": 2,
+                "tracks": [
+                    {"position":1,"title":"A","recording":{"relations":[]}},
+                    {"position":2,"title":"B","recording":{"relations":[]}}
+                ]
+            }]
+        }"#;
+        let release = parse_mb_detail_response(detail, 2).unwrap();
+        assert!(release.relationship_projection_complete);
     }
 
     #[test]
@@ -3099,7 +3402,7 @@ mod tests {
         let detail = detail_cache_key(mbid);
         let search = search_cache_key(mbid, "", None, None);
         assert_ne!(detail, search);
-        assert!(detail.starts_with("detail:v1:"));
+        assert!(detail.starts_with("detail:v2:"));
     }
 
     #[tokio::test]
@@ -3113,7 +3416,10 @@ mod tests {
             "artist-credit": [{ "artist": { "id": "art-1", "name": "Artist" } }],
             "media": [{
                 "track-count": 1,
-                "tracks": [{ "position": 1, "title": "T1", "length": 200000 }]
+                "tracks": [{
+                    "position": 1, "title": "T1", "length": 200000,
+                    "recording": {"id": "rec-1", "relations": []}
+                }]
             }]
         }"#;
         let out = fetch_release_detail("abc-123", 1, Some(body.to_string()))
@@ -3371,6 +3677,70 @@ mod tests {
             .iter()
             .find(|e| e.display_key == "DATE")
             .is_none());
+    }
+
+    #[test]
+    fn populate_editor_from_mb_fills_composer_per_track_without_clobbering_missing_mb_data() {
+        let (mut state, _td) = empty_editor_state(2);
+        crate::tui::probe::ensure_standard_fields_present(&mut state.active_surface_mut().entries, 2);
+        let composer_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "COMPOSER")
+            .expect("COMPOSER row");
+        state.active_surface_mut().entries[composer_idx].per_file_values =
+            vec!["Old One".to_string(), "Old Two".to_string()];
+        state.active_surface_mut().entries[composer_idx].per_file_originals =
+            vec!["Old One".to_string(), "Old Two".to_string()];
+        crate::tui::keybindings::metadata_editor_recompute_entry_display(
+            &mut state.active_surface_mut().entries[composer_idx],
+        );
+
+        let mut release = rel(
+            "rid",
+            vec![trk(1, "One", "Artist", None), trk(2, "Two", "Artist", None)],
+        );
+        release.tracks[0].composer = Some("New Composer".to_string());
+        populate_editor_from_mb(&mut state, &release);
+
+        let composer = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "COMPOSER")
+            .expect("COMPOSER row after MB populate");
+        assert_eq!(composer.per_file_values, ["New Composer", "Old Two"]);
+    }
+
+    #[test]
+    fn populate_editor_from_mb_without_composer_data_leaves_composer_unchanged() {
+        let (mut state, _td) = empty_editor_state(2);
+        crate::tui::probe::ensure_standard_fields_present(&mut state.active_surface_mut().entries, 2);
+        let composer_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "COMPOSER")
+            .expect("COMPOSER row");
+        state.active_surface_mut().entries[composer_idx].per_file_values =
+            vec!["Existing A".to_string(), "Existing B".to_string()];
+        state.active_surface_mut().entries[composer_idx].per_file_originals =
+            vec!["Existing A".to_string(), "Existing B".to_string()];
+
+        let release = rel(
+            "rid",
+            vec![trk(1, "One", "Artist", None), trk(2, "Two", "Artist", None)],
+        );
+        populate_editor_from_mb(&mut state, &release);
+
+        let composer = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "COMPOSER")
+            .expect("COMPOSER row after MB populate");
+        assert_eq!(composer.per_file_values, ["Existing A", "Existing B"]);
     }
 
     #[test]

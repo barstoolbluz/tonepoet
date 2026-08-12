@@ -902,6 +902,18 @@ pub enum AppMessage {
         release_id: String,
         result: Result<crate::tui::musicbrainz::MbDetailOutcome, String>,
     },
+    /// Mandatory release-detail resolution for an accepted `:tags-mb`
+    /// candidate whose search row did not carry recording/work relations.
+    /// Unlike speculative picker prefetch, this message owns the complete
+    /// apply context so acceptance cannot race ahead of composer data.
+    MbSelectedDetailComplete {
+        operation_id: TagsMbOperationId,
+        releases: Vec<crate::tui::musicbrainz::MbRelease>,
+        selected: usize,
+        paths: Vec<std::path::PathBuf>,
+        editor_session: Option<MetadataEditorSessionGuard>,
+        result: Result<crate::tui::musicbrainz::MbDetailOutcome, String>,
+    },
 }
 
 /// Re-emission target form for `:cue-fill`. Captures whether the source
