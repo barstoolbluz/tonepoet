@@ -92,3 +92,52 @@ was rebuilt underneath it; relaunch tonepoet after any rebuild.
    mild worker-protocol version-skew nuance — let the reasoning model weigh whether it's worth it.
 
 ---
+
+## 3. Metadata stage `tool timed out after 30s` on a large multi-track conversion
+
+**Discovered:** 2026-08-12, on a Donna Summer conversion. Likely explains an earlier failure of a
+7-LP Allman Brothers box-set conversion (a few weeks prior) — same class (large, many-track, heavy
+concurrent load).
+
+**Symptom.** The conversion fails at the metadata stage with:
+`Metadata: tool error: tool timed out after 30.002571643s`
+
+**Problematic source (kept for reproduction):**
+`~/temp/external/Donna Summer - Bad Girls (1979) [FLAC] {Japan Victor VIP 9565-6 LP  24-192} [bazar]/`
+— a 15-track album (~3.0 GB of 24/192 FLACs, one file per track + sidecar `.cue`) on the
+`/dev/sdc2` **fuseblk** mount, alongside **enormous artwork** (`GF-Front.jpg` = 175 MB / **14796×7392 ≈ 109 MP**,
+`GF-Inside.jpg` = 179 MB / 14774×7389, plus 45–47 MB inserts). Likely same-class earlier case (also present
+under `~/temp/`):
+`The Allman Brothers Band - The 1971 Fillmore East Recordings (1971) [FLAC] {US Mercury B0020496-01 LP DSD256}`
+(a 7-LP set — many tracks, DSD256).
+
+**What was ruled OUT (measured — don't re-chase these):**
+- *Slow storage:* no — the fuseblk source reads at **2.8 GB/s**; a 179 MB copy is **~0.1 s**; staging/dest
+  are local `ext4` (`/dev/sda4`).
+- *The companion-folder copy (`companion_folders` preset):* **cannot** be this error — `copy_companion_artifacts_*_best_effort`
+  (`src/convert/pipeline/stages.rs:~29370`) is a synchronous `fs` copy with **no subprocess and no timeout**;
+  `tool timed out` is structurally a `ToolRunnerError` (`errors.rs:83`) from a spawned tool. (Copying the
+  ~470 MB of art to local ext4 is also sub-second.)
+- *The FLAC artwork embed:* not it — it's `ffmpeg` with `-c:a copy -c:v copy` (stream-copy, no decode) and a
+  **90 s** timeout (`cue_artwork_embed_command`, stages.rs:~5494); reproduced at **1.5 s** on the 109 MP JPEG,
+  ffprobe on it **0.6 s**.
+
+**Working root-cause hypothesis (unconfirmed).** The `30.002571643 s` is a **30 s-bounded metadata tool**
+(ffprobe duration `stages.rs:1619`, wvtag, a tag-write, or the generic `_ => Duration::from_secs(30)`
+`stages.rs:5408`) — not the copy and not the 90 s FLAC art embed. Every candidate is fast **in isolation**,
+so the timeout most plausibly arises from **concurrent-load starvation** during the real many-track run (many
+simultaneous resample/encode/tag processes on a large box set starving a 30 s-budget tool), or a tool getting
+stuck. Not reproducible from a single isolated call — needs an **instrumented full re-run** (trace logging on
+the exact conversion) to name the precise tool + args.
+
+**Fix direction.**
+1. **The fixed 30 s default tool timeout is too aggressive** for large/complex sources under load — a
+   legitimately-busy tool shouldn't be killed at 30 s. Consider raising the default and/or scaling it by
+   source size / making it configurable (the FLAC art embed already uses 90 s; the 30 s default is the
+   fragile one).
+2. **Confirm the exact failing tool** via an instrumented re-run before changing behavior.
+3. **(Separate, independent)** 109-megapixel embedded artwork is pathological — a sanity cap/downscale on
+   *embedded* art is worth considering, but the user wants companion *copies* to bring over all content
+   verbatim; keep those concerns separate.
+
+---
