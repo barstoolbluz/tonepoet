@@ -13319,11 +13319,7 @@ pub(super) fn spawn_tags_mb_toc_lookup(
 
     tokio::spawn(async move {
         let worker = tokio::spawn(async move {
-            super::musicbrainz::lookup_release_by_toc_cascading_with_relationships(
-                &candidates,
-                cached,
-            )
-            .await
+            super::musicbrainz::lookup_release_by_toc_cascading(&candidates, cached).await
         });
         let outcome = worker.await.unwrap_or_else(|err| {
             Err(format!("MusicBrainz TOC lookup worker failed: {err}"))

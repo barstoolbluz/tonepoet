@@ -12968,6 +12968,84 @@ mod musicbrainz_completion_dispatch_tests {
         );
     }
 
+    #[tokio::test]
+    async fn toc_single_match_resolves_composer_through_cached_release_detail() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut editor = single_source_file_editor();
+        editor.model.tags_mb_in_flight = true;
+        let editor_paths = editor.active_surface().paths.clone();
+        app.active_overlay = ActiveOverlay::MetadataEditor(editor);
+
+        let release_id = "toc-single-composer";
+        let detail_body = r#"{
+            "id": "toc-single-composer",
+            "title": "Album",
+            "artist-credit": [{"artist": {"id": "artist-1", "name": "Performer"}}],
+            "media": [{
+                "track-count": 1,
+                "tracks": [{
+                    "position": 1,
+                    "title": "Movement I",
+                    "recording": {
+                        "id": "recording-1",
+                        "relations": [{
+                            "type": "performance",
+                            "target-type": "work",
+                            "work": {"relations": [{
+                                "type": "composer",
+                                "artist": {"name": "World Class Composer"}
+                            }]}
+                        }]
+                    }
+                }]
+            }]
+        }"#;
+        app.db
+            .store_mb_search(
+                &crate::tui::musicbrainz::detail_cache_key(release_id),
+                detail_body,
+            )
+            .expect("seed release-detail cache");
+
+        let mut shallow = release(release_id, "Album");
+        shallow.relationship_projection_complete = false;
+        let ctx = ctx_for(&mut app, editor_paths, true);
+        let (tx, mut rx) = mpsc::channel(4);
+
+        handle_message(
+            &mut app,
+            AppMessage::TagsFromMbComplete {
+                outcome: crate::tui::message::MbOutcome::Toc {
+                    outcome: Ok(lookup_outcome(vec![shallow])),
+                },
+                ctx,
+            },
+            &tx,
+        );
+
+        let detail_completion =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("cached release detail should resolve promptly")
+        .expect("release-detail completion message");
+        assert!(matches!(
+            detail_completion,
+            AppMessage::MbSelectedDetailComplete { .. }
+        ));
+        handle_message(&mut app, detail_completion, &tx);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("single TOC match should reopen the populated metadata editor");
+        };
+        let composer = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "COMPOSER")
+            .expect("composer row populated from release detail");
+        assert_eq!(composer.per_file_values, ["World Class Composer"]);
+    }
+
     #[test]
     fn search_single_match_completion_uses_same_apply_all_handoff() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -13366,6 +13444,12 @@ mod musicbrainz_completion_dispatch_tests {
         let mut detail = shallow.clone();
         detail.title = "Authoritative release detail".to_string();
         detail.relationship_projection_complete = true;
+        detail.tracks = vec![crate::tui::musicbrainz::MbTrack {
+            position: 1,
+            title: "Movement I".to_string(),
+            composer: Some("Picker Composer".to_string()),
+            ..Default::default()
+        }];
 
         let mut picker = Box::new(crate::tui::app::MbSelectState::new(
             vec![shallow],
@@ -13382,6 +13466,10 @@ mod musicbrainz_completion_dispatch_tests {
         assert_eq!(pending.releases.len(), 1);
         assert_eq!(pending.releases[0].title, detail.title);
         assert!(pending.releases[0].relationship_projection_complete);
+        assert_eq!(
+            pending.releases[0].tracks[0].composer.as_deref(),
+            Some("Picker Composer")
+        );
         let ActiveOverlay::MbSelect(state) = &app.active_overlay else {
             panic!("accepted picker should remain visible while verification runs");
         };

@@ -94,7 +94,7 @@ pub fn build_mb_toc(sectors: &[u32]) -> Option<String> {
 
 const MB_BASE: &str = "https://musicbrainz.org/ws/2/discid/-";
 const MB_RELEASE_BASE: &str = "https://musicbrainz.org/ws/2/release/";
-const MB_RELEASE_BASE_INCLUDES: &str =
+const MB_DISCID_INCLUDES: &str =
     "artist-credits+isrcs+labels+recordings+release-groups";
 const MB_RELEASE_COMPOSER_INCLUDES: &str = "artist-credits+isrcs+labels+recordings+release-groups+recording-level-rels+work-rels+work-level-rels+artist-rels";
 const USER_AGENT: &str = concat!(
@@ -421,34 +421,6 @@ pub async fn lookup_release_by_toc_cascading(
     candidates: &[TocCandidate],
     cached: Vec<Option<String>>,
 ) -> Result<MbCascadeOutcome, String> {
-    lookup_release_by_toc_cascading_with_projection(
-        candidates,
-        cached,
-        RelationshipProjection::Base,
-    )
-    .await
-}
-
-/// Metadata-editor variant of the TOC cascade. It requests the recording/work
-/// relation projection needed for COMPOSER, while CUE/grouping callers keep
-/// using the lean base projection through `lookup_release_by_toc_cascading`.
-pub async fn lookup_release_by_toc_cascading_with_relationships(
-    candidates: &[TocCandidate],
-    cached: Vec<Option<String>>,
-) -> Result<MbCascadeOutcome, String> {
-    lookup_release_by_toc_cascading_with_projection(
-        candidates,
-        cached,
-        RelationshipProjection::Composer,
-    )
-    .await
-}
-
-async fn lookup_release_by_toc_cascading_with_projection(
-    candidates: &[TocCandidate],
-    cached: Vec<Option<String>>,
-    projection: RelationshipProjection,
-) -> Result<MbCascadeOutcome, String> {
     let total = candidates
         .first()
         .map(|c| c.kept_indices.len())
@@ -456,12 +428,7 @@ async fn lookup_release_by_toc_cascading_with_projection(
     let mut cache_writes = Vec::new();
     for (i, candidate) in candidates.iter().enumerate() {
         let cached_body = cached.get(i).cloned().flatten();
-        let outcome = match lookup_release_by_toc_with_projection(
-            &candidate.sectors,
-            cached_body,
-            projection,
-        )
-        .await
+        let outcome = match lookup_release_by_toc_inner(&candidate.sectors, cached_body).await
         {
             Ok(outcome) => outcome,
             // A transport failure aborts the cascade (rate limiting makes
@@ -503,26 +470,10 @@ async fn lookup_release_by_toc_cascading_with_projection(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelationshipProjection {
-    Base,
-    Composer,
-}
-
-impl RelationshipProjection {
-    fn includes(self) -> &'static str {
-        match self {
-            Self::Base => MB_RELEASE_BASE_INCLUDES,
-            Self::Composer => MB_RELEASE_COMPOSER_INCLUDES,
-        }
-    }
-
-    fn cache_is_authoritative(self, body: &str) -> bool {
-        match self {
-            Self::Base => true,
-            Self::Composer => mb_payload_has_relationship_projection(body),
-        }
-    }
+fn discid_lookup_url(toc: &str) -> String {
+    // Keep `+` separators literal. Query-pair encoding would escape them as
+    // `%2B`, while MusicBrainz expects the include list in this form.
+    format!("{MB_BASE}?toc={toc}&inc={MB_DISCID_INCLUDES}&fmt=json")
 }
 
 /// Look up the best-matching MusicBrainz release for a disc TOC.
@@ -530,9 +481,9 @@ impl RelationshipProjection {
 /// Database-free for use inside `tokio::spawn`: caller owns cache
 /// retrieval (pass the cached JSON body via `cached_response`) and cache
 /// storage (write `outcome.cache_response` back if `Some`). On cache hit
-/// the function does no HTTP. This general-purpose variant keeps the lean
-/// release projection used by CUE/grouping workflows; metadata-editor TOC
-/// lookup uses the relationship-enriched cascading wrapper above.
+/// the function does no HTTP. Disc-ID requests always use the lean base
+/// projection. Metadata-editor callers resolve recording/work relationships
+/// later from the release endpoint, where those include parameters are valid.
 ///
 /// `Ok(MbLookupOutcome { releases: [], .. })` means "no release matched
 /// this TOC"; `Err(_)` is a transport/parse failure the caller should
@@ -541,36 +492,25 @@ pub async fn lookup_release_by_toc(
     sectors: &[u32],
     cached_response: Option<String>,
 ) -> Result<MbLookupOutcome, String> {
-    lookup_release_by_toc_with_projection(
-        sectors,
-        cached_response,
-        RelationshipProjection::Base,
-    )
-    .await
+    lookup_release_by_toc_inner(sectors, cached_response).await
 }
 
-async fn lookup_release_by_toc_with_projection(
+async fn lookup_release_by_toc_inner(
     sectors: &[u32],
     cached_response: Option<String>,
-    projection: RelationshipProjection,
 ) -> Result<MbLookupOutcome, String> {
     let toc = build_mb_toc(sectors)
         .ok_or_else(|| "TOC must have at least 2 sector entries".to_string())?;
     let n_tracks = sectors.len() - 1;
 
-    if let Some(json) = cached_response.filter(|body| projection.cache_is_authoritative(body)) {
+    if let Some(json) = cached_response {
         return Ok(MbLookupOutcome {
             releases: parse_mb_response_all(&json, n_tracks)?,
             cache_response: None,
         });
     }
 
-    let url = format!(
-        "{}?toc={}&inc={}&fmt=json",
-        MB_BASE,
-        toc,
-        projection.includes(),
-    );
+    let url = discid_lookup_url(&toc);
 
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -3039,6 +2979,58 @@ mod tests {
         assert!(build_mb_toc(&[]).is_none());
         assert!(build_mb_toc(&[150]).is_none());
         assert!(build_mb_toc(&[150, 1000]).is_some());
+    }
+
+    #[test]
+    fn discid_lookup_request_uses_only_discid_valid_includes() {
+        let toc = "1+2+30000+150+15000";
+        let url = super::discid_lookup_url(toc);
+
+        assert_eq!(
+            url,
+            concat!(
+                "https://musicbrainz.org/ws/2/discid/-?toc=1+2+30000+150+15000",
+                "&inc=artist-credits+isrcs+labels+recordings+release-groups&fmt=json"
+            )
+        );
+        assert!(!url.contains("recording-level-rels"));
+        assert!(!url.contains("work-level-rels"));
+        assert!(!url.contains("work-rels"));
+        assert!(!url.contains("artist-rels"));
+        assert!(
+            !url.contains("%2B"),
+            "MusicBrainz include separators must remain literal '+'"
+        );
+    }
+
+    #[test]
+    fn release_detail_retains_composer_relationship_includes() {
+        assert!(MB_RELEASE_COMPOSER_INCLUDES.contains("recording-level-rels"));
+        assert!(MB_RELEASE_COMPOSER_INCLUDES.contains("work-rels"));
+        assert!(MB_RELEASE_COMPOSER_INCLUDES.contains("work-level-rels"));
+        assert!(MB_RELEASE_COMPOSER_INCLUDES.contains("artist-rels"));
+    }
+
+    #[test]
+    fn discid_base_projection_requires_release_detail_for_composer() {
+        let body = r#"{
+            "releases": [{
+                "id": "rid",
+                "title": "Album",
+                "media": [{
+                    "track-count": 1,
+                    "tracks": [{
+                        "position": 1,
+                        "title": "Movement I",
+                        "recording": {"id": "rec-1"}
+                    }]
+                }]
+            }]
+        }"#;
+
+        let release = super::parse_mb_response(body, 1).unwrap().expect("release");
+        assert!(!release.relationship_projection_complete);
+        assert!(release.tracks[0].composer.is_none());
     }
 
     #[test]
