@@ -141,3 +141,19 @@ the exact conversion) to name the precise tool + args.
    verbatim; keep those concerns separate.
 
 ---
+
+## 4. DSD-to-PCM auto-gain inflates DC-bias readings and flips `negligible`→`significant` — the DC threshold is absolute (level-dependent), not a conversion defect
+
+**Discovered:** 2026-08-13, converting Charles Mingus *Blues & Roots* SACD → FLAC (SoX rate `-u`, DSD64→176.4k, DSD→32-bit int, DSD gain **auto**, margin 0.15 dB).
+
+**Symptom.** With DSD auto-gain **enabled**, every track's DC-bias reading rises and some flip to `significant!`; with auto-gain **disabled**, all read `negligible`. Consistent across bit depths, sample rates, and SoX quality (ultra/insane). The redbook CD of the same album reads `negligible`. Raising the auto-gain margin (0.15→0.5 dB) drops one problem track just under the line (0.000996) but doesn't eliminate the effect. Example (track 1): no-gain DC `0.000353` (peak −10.1 dBFS) → auto-gain DC `0.001114` **significant** (peak −0.1 dBFS); redbook DC `0.000706` negligible (peak −4.1 dBFS).
+
+**Root cause — NOT a conversion bug; it's linear scaling + an absolute threshold.**
+- DC bias is measured as the mean sample value in **absolute full-scale units**: `let dc_bias = dc_sum / sample_count` (`src/tui/analyze.rs:394`). That is a **linear** property of the signal.
+- DSD auto-gain applies a **linear level gain** (peak-normalize to −margin). DSD→PCM here comes out low (peaks −8 to −10 dBFS), so auto-gain applies ~**+8 to +10 dB**, pushing peaks to ~−0.1 dBFS. Gain constants: `dsd_to_pcm_gain_db` / `dsd_to_pcm_auto_gain_margin_db` (`src/convert/pipeline/stages.rs:~9295`-`9296`).
+- Multiply every sample by gain G and the mean (DC) multiplies by G too — so the **absolute** DC scales by exactly the gain. **Proof from the field data:** per-track DC ratio (auto/no-gain) matches the gain factor to rounding (T1 3.16 vs 3.16; T4 3.20 vs 3.20; T5 2.55 vs 2.57). And **DC-relative-to-RMS is identical** across no-gain DSD, auto-gain DSD, *and* the redbook CD (per track: T1 −42.6 dB, T2 −41.3 dB, T5 −44.5 dB). So the DC offset is **intrinsic to the master** (the CD carries the same DC-to-signal ratio), not created by DSD→PCM or the gain stage — auto-gain merely amplifies it along with everything else.
+- The `negligible`/`significant` label uses an **absolute** threshold: `if r.dc_bias.abs() < 0.001` (`src/tui/draw_overlays.rs:4093` and `:4098`). Because absolute DC scales with level, louder-normalized content trips the fixed 0.001 line while identical quieter content (and the ~6–10 dB quieter redbook) stays under it. The analyzer's measurement is correct; the classification is level-dependent.
+
+**Fix direction.**
+1. **Make the DC-bias classification level-relative** so identical audio classifies consistently regardless of normalization: classify by DC relative to RMS/peak (e.g. "DC is N dB below RMS", or set the negligible/significant threshold relative to track RMS) rather than the absolute `< 0.001`. Under a relative basis, no-gain DSD, auto-gain DSD, and redbook all classify the same — the correct outcome. Keep **displaying** the absolute DC number too (absolute DC is the real headroom cost).
+2. **(Separate, optional, policy — not a bug fix)** an opt-in **DC-block** (sub-sonic high-pass ~1–5 Hz / DC removal) in the DSD→PCM path would strip the master's DC before it's amplified. But the DC is in the source master, so this is a deliberate signal alteration (a toggle), not a correctness fix.
