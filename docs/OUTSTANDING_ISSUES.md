@@ -218,3 +218,52 @@ migrating process polls, never finds a gap, and times out at 30 s.
 2. Or consciously **accept and document** the 30 s-timeout-then-retry behavior for the rare
    post-upgrade migration window, and surface a clearer, retry-suggesting error message at
    `src/db.rs:322`.
+
+---
+
+## 6. File-task startup recovery auto-replays every pending operation with no prompt and no supersession
+
+**Discovered:** 2026-08-13, restarting tonepoet after the several Ctrl+X cut/copy operations that
+had failed with the `current_exe()`-deleted helper-spawn error (issue #2). On relaunch, **all** of
+those failed operations were automatically re-queued and began replaying without the user being asked.
+
+**Symptom (field report).** After restart, the file-task recovery re-triggered every copy/cut that
+had failed in the stale instance. Two distinct problems: (a) some of the recovered operations should
+have been recognized as **superseded** (a later operation logically replaced an earlier one) and not
+replayed; (b) the replay **kicked off automatically** — the user was never prompted, and never shown
+a list of exactly which operations were teed up for replay.
+
+**Root cause — every reconstructable journal is auto-enqueued into the serial reconciliation queue.**
+At startup, when `startup_options.recover_pending_file_operations` is set (the default),
+`AppState` construction (`src/tui/app.rs:12361`–`12400`) calls
+`file_task_runtime::startup_file_task_recovery_inventory()` (`src/tui/file_task_runtime.rs:1212`),
+which returns **every** pending (non-terminal / `needs_reconciliation()`) journal — by design
+(`startup_recovery_inventory_surfaces_every_pending_journal`, `file_task_runtime.rs:2281`). The loop
+at `app.rs:12383`–`12400` then pushes **each** recovery into `file_transfers.queued` with
+`recovered: true`, which the serial transfer dispatcher processes **automatically**. There is:
+- **No confirmation prompt.** The enqueue happens directly during state construction — no dialog,
+  just a status line. (Contrast: the *archive* staged-edits recovery **does** prompt — the 4-button
+  `ARCHIVE_STARTUP_RECOVERY` dialog, see issue #1. File-task recovery has no equivalent.)
+- **No supersession / dedup.** Every pending journal is enqueued independently; nothing collapses two
+  journals for the same source→destination, or drops an operation a later one logically superseded.
+  Note the code *does* single out `recoveries.last()` (the newest) as the clipboard/retry surface
+  (`app.rs:12367`–`12373`) — but then still enqueues **all** recoveries, newest included, so the
+  "newest is current" intuition and the "replay everything" behavior coexist inconsistently.
+
+**Risk.** Not necessarily data loss, but auto-replaying stale/superseded operations can produce
+unwanted copies/moves and **destination-exists conflicts** (e.g., the same source cut/copied twice,
+or replayed into a destination that a later successful operation already populated). The user has no
+chance to veto before the filesystem work begins.
+
+**Fix direction.**
+1. **Prompt, don't auto-execute.** Gate file-task startup recovery behind a confirmation surface
+   (mirroring the archive-recovery prompt, issue #1) that **lists exactly which operations are teed
+   up for replay** — source → destination and kind (copy/cut) per item — and lets the user replay
+   all, replay a selected subset, or discard. Do not enqueue into the serial dispatcher until the
+   user chooses. (Design note: the fixed-height confirmation dialog in issue #1 would need the
+   size-to-content fix to list many operations.)
+2. **Supersession / dedup before enqueue.** Collapse or drop journals that are logically superseded —
+   e.g., multiple journals for the same source+destination pair, or an operation a later journal
+   overrides — so the replay list is the minimal correct set, not "every journal ever left pending."
+3. Reconcile the `recoveries.last()`-as-clipboard special-case (`app.rs:12367`) with whatever the
+   prompt presents, so the newest op isn't both "the clipboard" and "just another queued replay."
