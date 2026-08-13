@@ -61,18 +61,31 @@ Status: start isolated file-task helper: No such file or directory (os error 2)
 itself**:
 
 ```rust
-let executable_result = std::env::current_exe();          // src/tui/keybindings.rs:43518
-...
-Command::new(executable)                                    // :43531
+let executable_result = std::env::current_exe();          // src/tui/keybindings.rs:44365
+let executable = match executable_result { Ok(e) => e, Err(error) => { /* "resolve
+    tonepoet executable for file task: {error}" — a DIFFERENT error path, :44369 */ } };
+Command::new(executable)                                    // :44378
     .arg("__file-task-worker").arg("--journal").arg(journal.path())
-    .spawn()                                                // :43538 → ENOENT
+    .spawn()                                                // :44385 → ENOENT
+    // Err arm: format!("start isolated file-task helper: {error}")   // :44389
 ```
 
 `current_exe()` reads `/proc/self/exe`. If the running binary's on-disk file was **replaced or
 removed after the process started** (e.g. `cargo build` while the TUI is still open), that link
-resolves to `"<path> (deleted)"`, so `Command::new(...).spawn()` returns `os error 2` (ENOENT).
-Confirmed live: a stale instance's `/proc/<pid>/exe` pointed at
-`…/target/release/tonepoet (deleted)`.
+resolves to `"<path> (deleted)"`. Note the failure is at the **`.spawn()`** (`:44385`), **not** at
+`current_exe()` — `current_exe()` *succeeds* and returns the `"<path> (deleted)"` string; it is
+`Command::new(that path).spawn()` that returns `os error 2` (ENOENT) because no file exists at that
+literal path. That is why the user sees `start isolated file-task helper:` (`:44389`) rather than the
+`resolve tonepoet executable for file task:` message (`:44369`).
+
+**Field reports (recurring):**
+- 2026-08-09 — original, a stale instance's `/proc/<pid>/exe` at `…/target/release/tonepoet (deleted)`.
+- 2026-08-13 — Ctrl+X cut/paste, `~/temp` (ext4) → `~/temp/external` (an NTFS bind mount). Same error
+  verbatim. **Confirmed live at report time:** the user's running TUI **pid 842486** had
+  `/proc/842486/exe → /home/daedalus/dev/tonepoet/target/release/tonepoet (deleted)` (its release binary
+  had been rebuilt by this session's gate/build runs). The **ext4→NTFS bind-mount detail is a red
+  herring** — the spawn fails before any filesystem work touches the destination, so the source/dest
+  filesystems are irrelevant to this error; it is purely the rebuilt-while-running binary.
 
 This is the same **recompile-while-running** hazard family as the parked config-browsing-reset-on-
 recompile bug — an old process referencing on-disk state a rebuild pulled out from under it.
