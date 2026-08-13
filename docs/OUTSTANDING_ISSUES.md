@@ -157,3 +157,51 @@ the exact conversion) to name the precise tool + args.
 **Fix direction.**
 1. **Make the DC-bias classification level-relative** so identical audio classifies consistently regardless of normalization: classify by DC relative to RMS/peak (e.g. "DC is N dB below RMS", or set the negligible/significant threshold relative to track RMS) rather than the absolute `< 0.001`. Under a relative basis, no-gain DSD, auto-gain DSD, and redbook all classify the same — the correct outcome. Keep **displaying** the absolute DC number too (absolute DC is the real headroom cost).
 2. **(Separate, optional, policy — not a bug fix)** an opt-in **DC-block** (sub-sonic high-pass ~1–5 Hz / DC removal) in the DSD→PCM path would strip the master's DC before it's amplified. But the DC is in the source master, so this is a deliberate signal alteration (a toggle), not a correctness fix.
+
+---
+
+## 5. Cross-process DB init lock can time out during a schema migration under heavy concurrent load (self-recovering, no corruption)
+
+**Discovered:** 2026-08-13, during the adversarial audit of the multi-value Phase-1 cross-session DB-open hardening (`src/db.rs`, committed on `hardening` @ `3ae33e5`). Not observed in the field — a code-review finding on the new lock path, filed for completeness.
+
+**Symptom (predicted, not yet field-seen).** A metadata-journal DB open fails with
+`timed out after 30000 ms waiting for exclusive database initialization lock <db>.open-init.lock`
+(`src/db.rs:322`–`326`). The affected process's open errors out; **no data is corrupted** and a retry succeeds once contention clears.
+
+**Root cause — flock has no writer preference + a poll-based exclusive acquire.** The new
+cross-process design coordinates journal-DB opens via an adjacent sidecar lock
+`<db>.open-init.lock` with fs2 advisory locks (`acquire_open_init_file_lock`,
+`src/db.rs:293`–`339`):
+
+- **Steady state** (DB already WAL + `user_version == CURRENT_VERSION`, i.e. v23): opens take a
+  **shared** lock and do a microsecond-scale readiness check
+  (`file_backed_database_is_initialized`, `src/db.rs:345`–`356`). Many processes hold the shared
+  lock concurrently. This is the hot path and is not affected.
+- **First-open / non-WAL / migration** (e.g. a v22→v23 schema bump right after a tonepoet
+  upgrade): one process must take the **exclusive** lock to migrate alone.
+
+The exclusive lock is acquired by **polling** — `try_lock_exclusive` in a loop with 25 ms sleeps
+up to a 30 s cap (`DB_OPEN_INIT_LOCK_WAIT_LIMIT`/`DB_OPEN_INIT_LOCK_RETRY_DELAY`,
+`src/db.rs:160`–`161`; loop at `:310`–`338`). Under `flock(2)`, a pending `LOCK_EX` request does
+**not** block newly-arriving `LOCK_SH` grants (no writer queueing/preference). So if many other
+tonepoet processes keep taking brief shared locks (each just for its readiness check), they can
+keep the DB from ever being shared-lock-*free* for the instant the exclusive waiter needs — the
+migrating process polls, never finds a gap, and times out at 30 s.
+
+**Why it's low severity (why it did not block the commit).**
+- Occurs **only** during first-open or a real schema migration — never on the steady-state v23
+  path that runs day-to-day.
+- Each shared holder holds the lock for microseconds, so a shared-lock-free instant within 30 s
+  is overwhelmingly likely; it takes a genuinely dense storm of process launches landing exactly
+  during an upgrade to starve the waiter.
+- **Self-recovering** — the losing process just errors and can retry; the DB is untouched.
+
+**Fix direction (either suffices; neither is urgent).**
+1. Switch the exclusive acquisition from poll-based `try_lock_exclusive` to a **blocking**
+   `lock_exclusive` with a watchdog/deadline. A blocking `LOCK_EX` waiter is queued by the kernel
+   ahead of subsequently-arriving shared requests, eliminating the starvation entirely — at the
+   cost of needing a separate timeout mechanism (a watchdog thread or a blocking-lock-with-timeout
+   wrapper) since fs2's blocking call has no deadline.
+2. Or consciously **accept and document** the 30 s-timeout-then-retry behavior for the rare
+   post-upgrade migration window, and surface a clearer, retry-suggesting error message at
+   `src/db.rs:322`.
